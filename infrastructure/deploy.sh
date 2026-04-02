@@ -26,7 +26,8 @@ ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region 
 ROLE_ARN="${LAMBDA_ROLE_ARN:-arn:aws:iam::${ACCOUNT_ID}:role/alpha-engine-data-role}"
 ECR_REPO="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${FUNCTION_NAME}"
 
-# ── Lambda env vars from .env ──────────────────────────────────────────────
+# ── Lambda env vars from master .env ──────────────────────────────────────
+# This repo IS the master — .env here is the single source of truth.
 
 LAMBDA_ENV_FILE=".env"
 
