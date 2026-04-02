@@ -13,7 +13,7 @@
         "Parameters": {
           "commands": [
             "cd /home/ec2-user/alpha-engine-data",
-            "source /home/ec2-user/.alpha-engine.env",
+            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
             "python weekly_collector.py --daily 2>&1 | tee /var/log/daily-data.log",
             "echo \"EXIT_CODE=$?\""

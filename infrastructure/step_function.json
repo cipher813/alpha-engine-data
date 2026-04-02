@@ -13,7 +13,7 @@
         "Parameters": {
           "commands": [
             "cd /home/ec2-user/alpha-engine-data",
-            "source /home/ec2-user/.alpha-engine.env",
+            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
             "python weekly_collector.py --phase 1 2>&1 | tee /var/log/data-phase1.log",
             "echo \"EXIT_CODE=$?\""
@@ -186,7 +186,7 @@
         "Parameters": {
           "commands": [
             "cd /home/ec2-user/alpha-engine-predictor",
-            "source /home/ec2-user/.alpha-engine.env",
+            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "bash infrastructure/spot_train.sh --full-only 2>&1 | tee /var/log/predictor-training.log"
           ],
           "executionTimeout": ["5400"]
@@ -278,7 +278,7 @@
         "Parameters": {
           "commands": [
             "cd /home/ec2-user/alpha-engine-backtester",
-            "source /home/ec2-user/.alpha-engine.env",
+            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "bash infrastructure/spot_backtest.sh 2>&1 | tee /var/log/backtester.log"
           ],
           "executionTimeout": ["7200"]
