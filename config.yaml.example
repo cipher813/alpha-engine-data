@@ -23,6 +23,10 @@ universe_returns:
   sector_map_key: predictor/price_cache/sector_map.json
   # db_path: /tmp/research.db       # optional: override local DB path (auto-downloaded from S3)
 
+# Daily closes (weekday OHLCV archive)
+daily_closes:
+  s3_prefix: predictor/daily_closes/
+
 # Tickers that require a leading caret in yfinance (index/rate tickers)
 # Stored locally WITHOUT the caret (VIX.parquet, not ^VIX.parquet)
 caret_symbols:

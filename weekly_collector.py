@@ -10,10 +10,12 @@ Phase 2 runs as Lambda (< 10 min for ~30 tickers).
 Usage:
     python weekly_collector.py --phase 1              # Phase 1 only
     python weekly_collector.py --phase 2              # Phase 2 only
-    python weekly_collector.py                        # both phases (legacy)
+    python weekly_collector.py                        # Phase 1 (default)
     python weekly_collector.py --phase 1 --dry-run    # validate Phase 1
     python weekly_collector.py --phase 1 --only prices # single collector
     python weekly_collector.py --phase 2 --only alternative  # explicit
+    python weekly_collector.py --daily                # weekday daily closes
+    python weekly_collector.py --daily --dry-run      # validate daily
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ from pathlib import Path
 import boto3
 import yaml
 
-from collectors import constituents, prices, slim_cache, macro, universe_returns, alternative
+from collectors import constituents, prices, slim_cache, macro, universe_returns, alternative, daily_closes
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +48,12 @@ def load_config(path: str = "config.yaml") -> dict:
 
 
 def run_weekly(config: dict, args: argparse.Namespace) -> dict:
-    """Run weekly collectors based on phase selection."""
+    """Run collectors based on mode selection."""
+    if args.daily:
+        return _run_daily(config, args)
+
     phase = args.phase
     if phase is None:
-        # Legacy: run Phase 1 only (Phase 2 requires signals.json from research)
         phase = 1
 
     if phase == 1:
@@ -252,6 +256,85 @@ def _run_phase2(config: dict, args: argparse.Namespace) -> dict:
     return results
 
 
+def _run_daily(config: dict, args: argparse.Namespace) -> dict:
+    """Daily mode: capture today's OHLCV closes for all tracked tickers."""
+    bucket = config["bucket"]
+    run_date = args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    dry_run = args.dry_run
+    daily_cfg = config.get("daily_closes", {})
+
+    results: dict = {
+        "mode": "daily",
+        "date": run_date,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "collectors": {},
+    }
+
+    # Load tickers: S3 constituents → Wikipedia fallback
+    tickers: list[str] = []
+    market_prefix = config.get("market_data", {}).get("s3_prefix", "market_data/")
+    try:
+        existing = constituents.load_from_s3(bucket, market_prefix)
+        if existing:
+            tickers = existing.get("tickers", [])
+            logger.info("Loaded %d tickers from S3 constituents", len(tickers))
+    except Exception:
+        pass
+    if not tickers:
+        try:
+            tickers, _, _, _, _ = constituents._fetch_constituents()
+            logger.info("Loaded %d tickers from Wikipedia (S3 fallback)", len(tickers))
+        except Exception:
+            pass
+
+    if not tickers:
+        logger.error("No tickers available for daily closes")
+        results["status"] = "failed"
+        return results
+
+    logger.info("=" * 60)
+    logger.info("COLLECTING: daily closes")
+    logger.info("=" * 60)
+    try:
+        dc_result = daily_closes.collect(
+            bucket=bucket,
+            tickers=tickers,
+            run_date=run_date,
+            s3_prefix=daily_cfg.get("s3_prefix", "predictor/daily_closes/"),
+            dry_run=dry_run,
+        )
+        results["collectors"]["daily_closes"] = dc_result
+    except Exception as e:
+        logger.error("Daily closes collection failed: %s", e)
+        results["collectors"]["daily_closes"] = {"status": "error", "error": str(e)}
+
+    results["completed_at"] = datetime.now(timezone.utc).isoformat()
+
+    # Status
+    statuses = [r.get("status", "unknown") for r in results["collectors"].values()]
+    if all(s in ("ok", "ok_dry_run") for s in statuses):
+        results["status"] = "ok"
+    else:
+        results["status"] = "failed"
+
+    # Health marker
+    if not dry_run and results["status"] == "ok":
+        _write_health_marker(bucket, 0, run_date, "ok")
+
+    duration = ""
+    try:
+        start = datetime.fromisoformat(results["started_at"])
+        end = datetime.fromisoformat(results["completed_at"])
+        duration = f" in {(end - start).total_seconds():.0f}s"
+    except Exception:
+        pass
+    logger.info("Daily collection %s: %s%s", results["status"].upper(),
+                ", ".join(f"{k}={v.get('status', '?')}" for k, v in results["collectors"].items()),
+                duration)
+
+    return results
+
+
 def _finalize(
     results: dict,
     bucket: str,
@@ -344,12 +427,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Validate without writing to S3")
     parser.add_argument("--date", default=None, help="Override run date (YYYY-MM-DD)")
     parser.add_argument(
+        "--daily", action="store_true",
+        help="Daily mode: capture today's OHLCV closes for all tickers.",
+    )
+    parser.add_argument(
         "--phase", type=int, choices=[1, 2], default=None,
         help="Phase 1: pre-research data. Phase 2: post-research alternative data.",
     )
     parser.add_argument(
         "--only",
-        choices=["constituents", "prices", "slim", "macro", "universe_returns", "alternative"],
+        choices=["constituents", "prices", "slim", "macro", "universe_returns", "alternative", "daily_closes"],
         help="Run a single collector instead of all",
     )
     parser.add_argument(

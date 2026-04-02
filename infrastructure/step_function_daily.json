@@ -1,0 +1,174 @@
+{
+  "Comment": "Alpha Engine Weekday Pipeline — daily data collection, predictor inference, executor start. Runs Mon-Fri 6:05 AM PT (13:05 UTC).",
+  "StartAt": "DailyData",
+  "States": {
+
+    "DailyData": {
+      "Type": "Task",
+      "Comment": "Capture today's OHLCV closes for all tickers (EC2 via SSM)",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "commands": [
+            "cd /home/ec2-user/alpha-engine-data",
+            "source /home/ec2-user/.alpha-engine.env",
+            "source .venv/bin/activate",
+            "python weekly_collector.py --daily 2>&1 | tee /var/log/daily-data.log",
+            "echo \"EXIT_CODE=$?\""
+          ],
+          "executionTimeout": ["300"]
+        },
+        "TimeoutSeconds": 300
+      },
+      "TimeoutSeconds": 360,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.daily_data_result",
+      "Next": "WaitForDailyData"
+    },
+
+    "WaitForDailyData": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.daily_data_result.Command.CommandId",
+        "InstanceId.$": "$.ec2_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.InvocationDoesNotExistException"],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.daily_data_poll",
+      "Next": "CheckDailyDataStatus"
+    },
+
+    "CheckDailyDataStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.daily_data_poll.Status",
+          "StringEquals": "Success",
+          "Next": "PredictorInference"
+        },
+        {
+          "Variable": "$.daily_data_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "DailyDataWait"
+        },
+        {
+          "Variable": "$.daily_data_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "DailyDataWait"
+        }
+      ],
+      "Default": "HandleFailure"
+    },
+
+    "DailyDataWait": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "WaitForDailyData"
+    },
+
+    "PredictorInference": {
+      "Type": "Task",
+      "Comment": "Run daily GBM predictions + morning briefing email",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-predictor-inference:live",
+        "Payload": {
+          "action": "predict"
+        }
+      },
+      "TimeoutSeconds": 900,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.predictor_result",
+      "Next": "StartExecutorEC2"
+    },
+
+    "StartExecutorEC2": {
+      "Type": "Task",
+      "Comment": "Start the trading EC2 instance for executor + daemon",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:startInstances",
+      "Parameters": {
+        "InstanceIds.$": "$.trading_instance_id"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.ec2_start_result",
+      "End": true
+    },
+
+    "HandleFailure": {
+      "Type": "Task",
+      "Comment": "Failure alert via SNS",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekday Pipeline — FAILED",
+        "Message.$": "States.Format('Weekday pipeline failed. Error: {}', States.JsonToString($.error))"
+      },
+      "ResultPath": "$.failure_notify",
+      "Next": "FailExecution"
+    },
+
+    "FailExecution": {
+      "Type": "Fail",
+      "Error": "DailyPipelineFailure",
+      "Cause": "One or more weekday pipeline steps failed."
+    }
+  }
+}
