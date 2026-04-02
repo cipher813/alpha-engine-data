@@ -358,8 +358,27 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _load_dotenv() -> None:
+    """Load .env file into os.environ (lightweight, no dependency)."""
+    env_path = Path(".env")
+    if not env_path.exists():
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key, val = key.strip(), val.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                val = val[1:-1]
+            if key and val and key not in os.environ:
+                os.environ[key] = val
+
+
 def main() -> None:
     args = _parse_args()
+    _load_dotenv()
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
