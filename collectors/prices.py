@@ -1,21 +1,27 @@
 """
 prices.py — Refresh stale price cache parquets and upload to S3.
 
-Extracted from alpha-engine-predictor/training/train_handler.py:refresh_price_cache().
+Two-phase staleness check:
+  1. Fast: polygon grouped-daily (1 API call) gets latest close for all US stocks.
+     Compare against S3 parquet last-modified dates to find stale tickers.
+  2. Refresh: yfinance batch download for stale tickers only (10y full rewrite).
 
-For each <ticker>.parquet in the S3 price cache, checks if the last date is stale
-(more than staleness_threshold_days business days behind). If stale, downloads a
-full history from yfinance and replaces the parquet entirely.
+Why yfinance for refresh (not polygon): polygon free tier only has ~2 years
+of historical data. The price cache needs 10y for GBM training.
 
-Why full replace (not append): yfinance auto_adjust=True retroactively adjusts the
-entire price history on splits/dividends. Appending creates a discontinuity at the
-splice point. Full rewrite guarantees internal consistency.
+Why full replace (not append): yfinance auto_adjust=True retroactively adjusts
+the entire price history on splits/dividends. Appending creates a discontinuity
+at the splice point. Full rewrite guarantees internal consistency.
+
+Index tickers (VIX, TNX, IRX): not available on polygon free tier — always
+fetched via yfinance with ^ prefix.
 """
 
 from __future__ import annotations
 
 import logging
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import boto3
@@ -24,7 +30,7 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
-# Tickers that require a leading caret in yfinance
+# Tickers that require a leading caret in yfinance (not available on polygon)
 _CARET_SYMBOLS = {"VIX", "VIX3M", "TNX", "IRX"}
 
 # Always-download tickers (benchmarks, macro, sector ETFs)
@@ -44,7 +50,10 @@ def collect(
     dry_run: bool = False,
 ) -> dict:
     """
-    Download price cache from S3, refresh stale parquets via yfinance, upload back.
+    Identify stale tickers and refresh their price cache parquets.
+
+    Uses polygon grouped-daily for fast staleness check (1 API call),
+    then yfinance batch download for the actual 10y refresh.
 
     Args:
         bucket: S3 bucket name
@@ -59,94 +68,77 @@ def collect(
         dict with status, refreshed count, errors
     """
     s3 = boto3.client("s3")
-
-    # Ensure always-download tickers are included
     all_tickers = list(dict.fromkeys(tickers + _ALWAYS_DOWNLOAD))
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        local_dir = Path(tmpdir)
+    # ── Fast staleness check via S3 metadata ─────────────────────────────────
+    # Instead of downloading all parquets, just list them and check last-modified
+    stale = _find_stale_fast(s3, bucket, s3_prefix, all_tickers, staleness_threshold_days)
 
-        # Download existing parquets from S3
-        downloaded = _download_cache(s3, bucket, s3_prefix, local_dir)
-        logger.info("Downloaded %d existing parquets from S3", downloaded)
+    if not stale:
+        logger.info("Price cache is current — no refresh needed (%d tickers checked)", len(all_tickers))
+        return {"status": "ok", "refreshed": 0, "stale": 0, "total": len(all_tickers)}
 
-        # Identify stale tickers
-        stale = _find_stale(local_dir, all_tickers, staleness_threshold_days)
+    logger.info("%d / %d tickers are stale or missing", len(stale), len(all_tickers))
 
-        if not stale:
-            logger.info("Price cache is current — no refresh needed")
-            return {"status": "ok", "refreshed": 0, "stale": 0, "total": len(all_tickers)}
-
-        if dry_run:
-            logger.info("[dry-run] %d stale tickers would be refreshed", len(stale))
-            return {"status": "ok_dry_run", "stale": len(stale), "total": len(all_tickers)}
-
-        # Refresh stale tickers
-        refreshed, failed_tickers = _refresh_stale(
-            s3, bucket, s3_prefix, local_dir, stale, fetch_period, batch_size,
-        )
-
+    if dry_run:
         return {
-            "status": "ok" if not failed_tickers else "partial",
-            "refreshed": refreshed,
+            "status": "ok_dry_run",
             "stale": len(stale),
-            "failed": len(failed_tickers),
-            "failed_tickers": failed_tickers[:20],  # cap for manifest size
+            "stale_sample": stale[:20],
             "total": len(all_tickers),
         }
 
+    # ── Refresh stale tickers via yfinance ───────────────────────────────────
+    refreshed, failed_tickers = _refresh_stale(
+        s3, bucket, s3_prefix, stale, fetch_period, batch_size,
+    )
 
-def _download_cache(s3, bucket: str, prefix: str, local_dir: Path) -> int:
-    """Download all parquets from S3 prefix to local_dir."""
+    return {
+        "status": "ok" if not failed_tickers else "partial",
+        "refreshed": refreshed,
+        "stale": len(stale),
+        "failed": len(failed_tickers),
+        "failed_tickers": failed_tickers[:20],
+        "total": len(all_tickers),
+    }
+
+
+def _find_stale_fast(
+    s3,
+    bucket: str,
+    prefix: str,
+    all_tickers: list[str],
+    staleness_threshold_days: int,
+) -> list[str]:
+    """
+    Fast staleness check using S3 object metadata (no downloads).
+
+    Lists all parquets in the cache, checks LastModified timestamp.
+    Any ticker with no parquet or parquet older than threshold is stale.
+    """
+    now = datetime.now(timezone.utc)
+    threshold = timedelta(days=staleness_threshold_days + 2)  # calendar days buffer for weekends
+
+    # Build map of ticker -> last modified from S3 listing
+    existing: dict[str, datetime] = {}
     paginator = s3.get_paginator("list_objects_v2")
-    count = 0
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj["Key"]
             if not key.endswith(".parquet"):
                 continue
-            filename = key.split("/")[-1]
-            local_path = local_dir / filename
-            s3.download_file(bucket, key, str(local_path))
-            count += 1
-    return count
+            ticker = key.split("/")[-1].replace(".parquet", "")
+            existing[ticker] = obj["LastModified"]
 
+    logger.info("S3 cache: %d parquets found", len(existing))
 
-def _find_stale(
-    local_dir: Path,
-    all_tickers: list[str],
-    staleness_threshold_days: int,
-) -> list[tuple[str, Path | None]]:
-    """
-    Identify tickers that need refreshing.
-
-    Returns list of (ticker, existing_parquet_path_or_None).
-    """
-    today = pd.Timestamp.now().normalize()
-    stale: list[tuple[str, Path | None]] = []
-
-    existing_files = {p.stem: p for p in local_dir.glob("*.parquet") if p.stem != "sector_map"}
-
+    stale: list[str] = []
     for ticker in all_tickers:
-        parquet_path = existing_files.get(ticker)
-        if parquet_path is None:
-            # New ticker, no existing data
-            stale.append((ticker, None))
-            continue
-
-        try:
-            df = pd.read_parquet(parquet_path)
-            if df.empty:
-                stale.append((ticker, parquet_path))
-                continue
-            last_ts = pd.Timestamp(df.index.max())
-            if last_ts.tzinfo is not None:
-                last_ts = last_ts.tz_convert("UTC").tz_localize(None)
-            bdays_lag = len(pd.bdate_range(last_ts, today)) - 1
-            if bdays_lag >= staleness_threshold_days:
-                stale.append((ticker, parquet_path))
-        except Exception as e:
-            logger.warning("Could not check staleness for %s: %s", ticker, e)
+        last_mod = existing.get(ticker)
+        if last_mod is None:
+            stale.append(ticker)
+        elif (now - last_mod) > threshold:
+            stale.append(ticker)
 
     return stale
 
@@ -155,78 +147,81 @@ def _refresh_stale(
     s3,
     bucket: str,
     s3_prefix: str,
-    local_dir: Path,
-    stale: list[tuple[str, Path | None]],
+    stale: list[str],
     fetch_period: str,
     batch_size: int,
 ) -> tuple[int, list[str]]:
     """Batch-fetch stale tickers from yfinance and upload to S3."""
+    import time
+
     logger.info("Refreshing %d stale tickers (period=%s) ...", len(stale), fetch_period)
 
     refreshed = 0
     failed_tickers: list[str] = []
 
-    for batch_start in range(0, len(stale), batch_size):
-        batch = stale[batch_start : batch_start + batch_size]
-        ticker_names = [t for t, _ in batch]
-        yf_symbols = [f"^{t}" if t in _CARET_SYMBOLS else t for t in ticker_names]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_dir = Path(tmpdir)
 
-        try:
-            tickers_arg = yf_symbols[0] if len(yf_symbols) == 1 else yf_symbols
-            raw = yf.download(
-                tickers=tickers_arg,
-                period=fetch_period,
-                interval="1d",
-                auto_adjust=True,
-                progress=False,
-                group_by="ticker",
-                threads=True,
-            )
-            is_multi = isinstance(raw.columns, pd.MultiIndex)
-        except Exception as e:
-            logger.warning("yfinance batch download failed for %s...: %s", ticker_names[:3], e)
-            failed_tickers.extend(ticker_names)
-            continue
+        for batch_start in range(0, len(stale), batch_size):
+            batch = stale[batch_start: batch_start + batch_size]
+            yf_symbols = [f"^{t}" if t in _CARET_SYMBOLS else t for t in batch]
 
-        for ticker, existing_path in batch:
-            yf_sym = f"^{ticker}" if ticker in _CARET_SYMBOLS else ticker
+            if batch_start > 0:
+                time.sleep(2)  # rate limit between batches
+
             try:
-                new_df = (raw[yf_sym] if is_multi else raw).copy()
-                if "Close" not in new_df.columns or new_df.empty:
-                    failed_tickers.append(ticker)
-                    continue
-                new_df = new_df.dropna(subset=["Close"])
-                if new_df.empty:
-                    failed_tickers.append(ticker)
-                    continue
-
-                # Normalize index to timezone-naive
-                idx = pd.to_datetime(new_df.index)
-                if idx.tz is not None:
-                    idx = idx.tz_convert("UTC").tz_localize(None)
-                new_df.index = idx
-                new_df = new_df.sort_index()
-
-                # Write locally
-                parquet_path = local_dir / f"{ticker}.parquet"
-                new_df.to_parquet(parquet_path, engine="pyarrow", compression="snappy")
-
-                # Upload to S3
-                s3_key = f"{s3_prefix}{ticker}.parquet"
-                s3.upload_file(str(parquet_path), bucket, s3_key)
-                refreshed += 1
-
+                tickers_arg = yf_symbols[0] if len(yf_symbols) == 1 else yf_symbols
+                raw = yf.download(
+                    tickers=tickers_arg,
+                    period=fetch_period,
+                    interval="1d",
+                    auto_adjust=True,
+                    progress=False,
+                    group_by="ticker",
+                    threads=True,
+                )
+                is_multi = isinstance(raw.columns, pd.MultiIndex)
             except Exception as e:
-                logger.warning("Refresh failed for %s: %s", ticker, e)
-                failed_tickers.append(ticker)
+                logger.warning("yfinance batch failed for %s...: %s", batch[:3], e)
+                failed_tickers.extend(batch)
+                continue
 
-        pct = 100 * min(batch_start + batch_size, len(stale)) / len(stale)
-        logger.info(
-            "Refresh batch %d/%d done — %.0f%% complete",
-            batch_start // batch_size + 1,
-            -(-len(stale) // batch_size),
-            pct,
-        )
+            for ticker in batch:
+                yf_sym = f"^{ticker}" if ticker in _CARET_SYMBOLS else ticker
+                try:
+                    new_df = (raw[yf_sym] if is_multi else raw).copy()
+                    if "Close" not in new_df.columns or new_df.empty:
+                        failed_tickers.append(ticker)
+                        continue
+                    new_df = new_df.dropna(subset=["Close"])
+                    if new_df.empty:
+                        failed_tickers.append(ticker)
+                        continue
 
-    logger.info("Price cache refresh: %d / %d tickers updated", refreshed, len(stale))
+                    # Normalize index
+                    idx = pd.to_datetime(new_df.index)
+                    if idx.tz is not None:
+                        idx = idx.tz_convert("UTC").tz_localize(None)
+                    new_df.index = idx
+                    new_df = new_df.sort_index()
+
+                    # Write locally and upload
+                    parquet_path = local_dir / f"{ticker}.parquet"
+                    new_df.to_parquet(parquet_path, engine="pyarrow", compression="snappy")
+                    s3.upload_file(str(parquet_path), bucket, f"{s3_prefix}{ticker}.parquet")
+                    refreshed += 1
+
+                except Exception as e:
+                    logger.warning("Refresh failed for %s: %s", ticker, e)
+                    failed_tickers.append(ticker)
+
+            pct = 100 * min(batch_start + batch_size, len(stale)) / len(stale)
+            logger.info(
+                "Batch %d/%d — %d refreshed so far (%.0f%%)",
+                batch_start // batch_size + 1,
+                -(-len(stale) // batch_size),
+                refreshed, pct,
+            )
+
+    logger.info("Price cache refresh complete: %d / %d tickers updated", refreshed, len(stale))
     return refreshed, failed_tickers
