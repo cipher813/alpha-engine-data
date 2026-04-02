@@ -1,0 +1,395 @@
+{
+  "Comment": "Alpha Engine Saturday Pipeline — orchestrates weekly data collection, research, predictor training, and backtesting sequentially with fail-fast error handling. Backtester runs AFTER predictor training (depends on model weights).",
+  "StartAt": "DataPhase1",
+  "States": {
+
+    "DataPhase1": {
+      "Type": "Task",
+      "Comment": "Phase 1: prices, macro, constituents, universe returns (EC2 via SSM)",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "commands": [
+            "cd /home/ec2-user/alpha-engine-data",
+            "source /home/ec2-user/.alpha-engine.env",
+            "source .venv/bin/activate",
+            "python weekly_collector.py --phase 1 2>&1 | tee /var/log/data-phase1.log",
+            "echo \"EXIT_CODE=$?\""
+          ],
+          "executionTimeout": ["1800"]
+        },
+        "TimeoutSeconds": 1800
+      },
+      "TimeoutSeconds": 1860,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.data_phase1_result",
+      "Next": "WaitForDataPhase1"
+    },
+
+    "WaitForDataPhase1": {
+      "Type": "Task",
+      "Comment": "Poll SSM command until complete",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.data_phase1_result.Command.CommandId",
+        "InstanceId.$": "$.ec2_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.InvocationDoesNotExistException"],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.data_phase1_poll",
+      "Next": "CheckDataPhase1Status"
+    },
+
+    "CheckDataPhase1Status": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.data_phase1_poll.Status",
+          "StringEquals": "Success",
+          "Next": "Research"
+        },
+        {
+          "Variable": "$.data_phase1_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "DataPhase1Wait"
+        },
+        {
+          "Variable": "$.data_phase1_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "DataPhase1Wait"
+        }
+      ],
+      "Default": "HandleFailure"
+    },
+
+    "DataPhase1Wait": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "WaitForDataPhase1"
+    },
+
+    "Research": {
+      "Type": "Task",
+      "Comment": "Research Lambda — generates signals.json",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-research-runner:live",
+        "Payload": {
+          "weekly_run": true,
+          "force": true
+        }
+      },
+      "TimeoutSeconds": 900,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.research_result",
+      "Next": "CheckResearchStatus"
+    },
+
+    "CheckResearchStatus": {
+      "Type": "Choice",
+      "Comment": "Verify research returned OK (not ERROR)",
+      "Choices": [
+        {
+          "Variable": "$.research_result.Payload.status",
+          "StringEquals": "OK",
+          "Next": "DataPhase2"
+        },
+        {
+          "Variable": "$.research_result.Payload.status",
+          "StringEquals": "SKIPPED",
+          "Next": "DataPhase2"
+        }
+      ],
+      "Default": "HandleFailure"
+    },
+
+    "DataPhase2": {
+      "Type": "Task",
+      "Comment": "Phase 2: alternative data for promoted tickers (Lambda)",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-data-collector:live",
+        "Payload": {
+          "phase": 2
+        }
+      },
+      "TimeoutSeconds": 600,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.data_phase2_result",
+      "Next": "PredictorTraining"
+    },
+
+    "PredictorTraining": {
+      "Type": "Task",
+      "Comment": "GBM retrain on spot instance (launched from always-on EC2)",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "commands": [
+            "cd /home/ec2-user/alpha-engine-predictor",
+            "source /home/ec2-user/.alpha-engine.env",
+            "bash infrastructure/spot_train.sh --full-only 2>&1 | tee /var/log/predictor-training.log"
+          ],
+          "executionTimeout": ["5400"]
+        },
+        "TimeoutSeconds": 5400
+      },
+      "TimeoutSeconds": 5460,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 120,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.predictor_result",
+      "Next": "WaitForPredictorTraining"
+    },
+
+    "WaitForPredictorTraining": {
+      "Type": "Task",
+      "Comment": "Poll SSM command until predictor training complete",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.predictor_result.Command.CommandId",
+        "InstanceId.$": "$.ec2_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.InvocationDoesNotExistException"],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.predictor_poll",
+      "Next": "CheckPredictorStatus"
+    },
+
+    "CheckPredictorStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.predictor_poll.Status",
+          "StringEquals": "Success",
+          "Next": "Backtester"
+        },
+        {
+          "Variable": "$.predictor_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "PredictorWait"
+        },
+        {
+          "Variable": "$.predictor_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "PredictorWait"
+        }
+      ],
+      "Default": "HandleFailure"
+    },
+
+    "PredictorWait": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "WaitForPredictorTraining"
+    },
+
+    "Backtester": {
+      "Type": "Task",
+      "Comment": "Signal quality + param optimization on spot instance (after predictor training)",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "commands": [
+            "cd /home/ec2-user/alpha-engine-backtester",
+            "source /home/ec2-user/.alpha-engine.env",
+            "bash infrastructure/spot_backtest.sh 2>&1 | tee /var/log/backtester.log"
+          ],
+          "executionTimeout": ["7200"]
+        },
+        "TimeoutSeconds": 7200
+      },
+      "TimeoutSeconds": 7260,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 120,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.backtester_result",
+      "Next": "WaitForBacktester"
+    },
+
+    "WaitForBacktester": {
+      "Type": "Task",
+      "Comment": "Poll SSM command until backtester complete",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.backtester_result.Command.CommandId",
+        "InstanceId.$": "$.ec2_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.InvocationDoesNotExistException"],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.backtester_poll",
+      "Next": "CheckBacktesterStatus"
+    },
+
+    "CheckBacktesterStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.backtester_poll.Status",
+          "StringEquals": "Success",
+          "Next": "NotifyComplete"
+        },
+        {
+          "Variable": "$.backtester_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "BacktesterWait"
+        },
+        {
+          "Variable": "$.backtester_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "BacktesterWait"
+        }
+      ],
+      "Default": "HandleFailure"
+    },
+
+    "BacktesterWait": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "WaitForBacktester"
+    },
+
+    "NotifyComplete": {
+      "Type": "Task",
+      "Comment": "Success notification via SNS",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Saturday Pipeline — SUCCESS",
+        "Message": "All steps completed successfully. Check dashboard for results."
+      },
+      "ResultPath": "$.notify_result",
+      "End": true
+    },
+
+    "HandleFailure": {
+      "Type": "Task",
+      "Comment": "Failure alert via SNS — pipeline halts",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Saturday Pipeline — FAILED",
+        "Message.$": "States.Format('Pipeline failed. Error: {}. Use Step Functions console to redrive from failed step.', States.JsonToString($.error))"
+      },
+      "ResultPath": "$.failure_notify",
+      "Next": "FailExecution"
+    },
+
+    "FailExecution": {
+      "Type": "Fail",
+      "Error": "PipelineFailure",
+      "Cause": "One or more pipeline steps failed. Check CloudWatch logs and redrive from the Step Functions console."
+    }
+  }
+}

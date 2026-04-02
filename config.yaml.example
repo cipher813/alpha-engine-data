@@ -1,0 +1,53 @@
+# Alpha Engine Data Collector Configuration
+# Copy to config.yaml and customise. config.yaml is gitignored.
+
+# S3 bucket (shared across all alpha-engine modules)
+bucket: alpha-engine-research
+
+# Price cache settings (Phase 1)
+price_cache:
+  s3_prefix: predictor/price_cache/
+  slim_prefix: predictor/price_cache_slim/
+  fetch_period: "10y"               # yfinance period for full refresh
+  staleness_threshold_days: 3       # business days before a parquet is considered stale
+  slim_lookback_days: 730           # calendar days for slim cache (2 years)
+  refresh_batch_size: 50            # tickers per yfinance batch download
+
+# Market data output
+market_data:
+  s3_prefix: market_data/
+
+# Universe returns (Phase 1) — polygon.io forward return computation
+universe_returns:
+  signals_prefix: signals           # S3 prefix for signal dates
+  sector_map_key: predictor/price_cache/sector_map.json
+  # db_path: /tmp/research.db       # optional: override local DB path (auto-downloaded from S3)
+
+# Tickers that require a leading caret in yfinance (index/rate tickers)
+# Stored locally WITHOUT the caret (VIX.parquet, not ^VIX.parquet)
+caret_symbols:
+  - VIX
+  - VIX3M
+  - TNX
+  - IRX
+
+# Always-download tickers (benchmarks, macro, sector ETFs)
+always_download:
+  - SPY
+  - VIX
+  - VIX3M
+  - TNX
+  - IRX
+  - GLD
+  - USO
+  - XLK
+  - XLF
+  - XLE
+  - XLV
+  - XLI
+  - XLY
+  - XLP
+  - XLU
+  - XLB
+  - XLRE
+  - XLC
