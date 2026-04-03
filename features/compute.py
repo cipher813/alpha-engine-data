@@ -197,17 +197,17 @@ def _load_delta_from_daily_closes(
             obj = s3.get_object(Bucket=bucket, Key=key)
             buf = io.BytesIO(obj["Body"].read())
             day_df = pd.read_parquet(buf, engine="pyarrow")
-            # daily_closes: index=ticker (str), columns=[date, open, high, low, close, adj_close, volume]
+            # daily_closes: index=ticker (str), columns=[date, Open, High, Low, Close, Adj_Close, Volume]
             for ticker, row in day_df.iterrows():
                 if ticker not in ticker_rows:
                     ticker_rows[ticker] = []
                 ticker_rows[ticker].append({
                     "date":   pd.Timestamp(d),
-                    "Open":   float(row.get("open",      row.get("Open",      np.nan))),
-                    "High":   float(row.get("high",      row.get("High",      np.nan))),
-                    "Low":    float(row.get("low",       row.get("Low",       np.nan))),
-                    "Close":  float(row.get("close",     row.get("Close",     np.nan))),
-                    "Volume": int(row.get("volume",      row.get("Volume",    0))),
+                    "Open":   float(row.get("Open", np.nan)),
+                    "High":   float(row.get("High", np.nan)),
+                    "Low":    float(row.get("Low", np.nan)),
+                    "Close":  float(row.get("Close", np.nan)),
+                    "Volume": int(row.get("Volume", 0)),
                 })
         except Exception:
             log.debug("daily_closes/%s.parquet not found in S3 (non-trading day?)", d)

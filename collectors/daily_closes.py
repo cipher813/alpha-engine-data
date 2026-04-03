@@ -8,7 +8,7 @@ weekly slim cache and today's prices, avoiding a full 2-year yfinance fetch.
 Data source priority: polygon.io grouped-daily (1 API call for all US stocks),
 then yfinance batch download for any tickers polygon missed.
 
-Schema: index=ticker (str), columns=[date, open, high, low, close, adj_close, volume]
+Schema: index=ticker (str), columns=[date, Open, High, Low, Close, Adj_Close, Volume]
 """
 
 from __future__ import annotations
@@ -78,12 +78,12 @@ def collect(
                     records.append({
                         "ticker": store_ticker,
                         "date": run_date,
-                        "open": round(g["open"], 4),
-                        "high": round(g["high"], 4),
-                        "low": round(g["low"], 4),
-                        "close": round(g["close"], 4),
-                        "adj_close": round(g["close"], 4),
-                        "volume": int(g["volume"]),
+                        "Open": round(g["open"], 4),
+                        "High": round(g["high"], 4),
+                        "Low": round(g["low"], 4),
+                        "Close": round(g["close"], 4),
+                        "Adj_Close": round(g["close"], 4),
+                        "Volume": int(g["volume"]),
                     })
             polygon_count = len(records)
             logger.info("Polygon grouped-daily: %d/%d tickers", polygon_count, len(tickers))
@@ -185,12 +185,12 @@ def _fetch_yfinance_closes(
                     records.append({
                         "ticker": store_ticker,
                         "date": date_str,
-                        "open": round(float(last["Open"]), 4),
-                        "high": round(float(last["High"]), 4),
-                        "low": round(float(last["Low"]), 4),
-                        "close": round(float(last["Close"]), 4),
-                        "adj_close": round(adj_close, 4),
-                        "volume": int(last["Volume"]) if pd.notna(last.get("Volume")) else 0,
+                        "Open": round(float(last["Open"]), 4),
+                        "High": round(float(last["High"]), 4),
+                        "Low": round(float(last["Low"]), 4),
+                        "Close": round(float(last["Close"]), 4),
+                        "Adj_Close": round(adj_close, 4),
+                        "Volume": int(last["Volume"]) if pd.notna(last.get("Volume")) else 0,
                     })
                     count += 1
                 except Exception as e:
