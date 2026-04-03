@@ -12,7 +12,6 @@ Usage:
     python -m features.compute                          # today's date
     python -m features.compute --date 2026-04-03        # specific date
     python -m features.compute --dry-run                # compute but skip S3 write
-    python -m features.compute --source full            # use full 10y cache (Saturday)
 
 Data sources:
     Prices:       predictor/price_cache_slim/*.parquet + predictor/daily_closes/{date}.parquet
@@ -153,52 +152,8 @@ def _load_slim_cache(s3, bucket: str) -> dict[str, pd.DataFrame]:
     return price_data
 
 
-def _load_full_cache(s3, bucket: str) -> dict[str, pd.DataFrame]:
-    """
-    Load all parquets from predictor/price_cache/ (full 10y cache).
-
-    Same approach as slim but from the full cache prefix.
-    """
-    prefix = "predictor/price_cache/"
-
-    keys = []
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith(".parquet") and "slim" not in key:
-                keys.append(key)
-
-    if not keys:
-        log.warning("No parquets found in s3://%s/%s", bucket, prefix)
-        return {}
-
-    log.info("Downloading %d full cache parquets...", len(keys))
-
-    price_data: dict[str, pd.DataFrame] = {}
-    errors = 0
-
-    def _download(key: str) -> tuple[str, pd.DataFrame | None]:
-        ticker = key.split("/")[-1].replace(".parquet", "")
-        try:
-            df = _load_parquet_from_s3(s3, bucket, key)
-            if df.empty:
-                return ticker, None
-            return ticker, df
-        except Exception:
-            return ticker, None
-
-    with ThreadPoolExecutor(max_workers=20) as pool:
-        futures = {pool.submit(_download, k): k for k in keys}
-        for fut in as_completed(futures):
-            ticker, df = fut.result()
-            if df is not None:
-                price_data[ticker] = df
-            else:
-                errors += 1
-
-    log.info("Full cache loaded: %d tickers OK, %d errors", len(price_data), errors)
-    return price_data
+    # _load_full_cache removed — slim cache (2y) is sufficient for feature computation.
+    # Features only use the latest row; 2y provides enough warmup for all indicators.
 
 
 def _safe_last_date(idx: pd.Index) -> pd.Timestamp | None:
@@ -445,39 +400,21 @@ def _yf_fetch_tickers(tickers: list[str], period: str = "2y") -> dict[str, pd.Da
 
 
 def _load_prices_and_macro(
-    s3, bucket: str, date_str: str, source: str = "slim",
+    s3, bucket: str, date_str: str,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, pd.Series]]:
     """
-    Load price data and macro series from S3 cache.
+    Load price data and macro series from S3 slim cache + daily delta.
 
-    Matches the predictor's ``load_price_data_from_cache`` behaviour:
-    1. Download slim (or full) cache parquets with timezone normalization.
-    2. Load ALL daily_closes delta files between cache last date and target.
-    3. Merge with keep='last' so delta rows override cache.
-    4. Detect splits (>45% single-day return) and re-fetch from yfinance.
-    5. Build macro dict, detect stale series, re-fetch from yfinance.
-
-    Parameters
-    ----------
-    s3 : boto3 S3 client
-    bucket : S3 bucket name
-    date_str : Target date (YYYY-MM-DD)
-    source : "slim" (2y slim cache, default) or "full" (10y full cache)
-
-    Returns
-    -------
-    (price_data, macro) — dict of ticker->DataFrame, dict of key->Series
+    Steps:
+    1. Download slim cache parquets (2y, ~920 tickers) with timezone normalization
+    2. Load ALL daily_closes delta files between cache last date and target
+    3. Merge with keep='last' so delta rows override cache
+    4. Detect splits (>45% single-day return) and re-fetch from yfinance
+    5. Build macro dict, detect stale series, re-fetch from yfinance
     """
     today = pd.Timestamp(date_str).normalize()
 
-    if source == "slim":
-        slim_data = _load_slim_cache(s3, bucket)
-    elif source == "full":
-        slim_data = _load_full_cache(s3, bucket)
-    else:
-        log.error("Unknown source: %s (expected 'slim' or 'full')", source)
-        return {}, {}
-
+    slim_data = _load_slim_cache(s3, bucket)
     if not slim_data:
         return {}, {}
 
@@ -614,7 +551,6 @@ def _load_cached_alternative(s3, bucket: str) -> dict[str, dict]:
 def compute_and_write(
     date_str: str,
     bucket: str = DEFAULT_BUCKET,
-    source: str = "slim",
     dry_run: bool = False,
 ) -> dict:
     """
@@ -628,7 +564,7 @@ def compute_and_write(
     t0 = time.time()
 
     # ── 1. Load data ─────────────────────────────────────────────────────────
-    price_data, macro = _load_prices_and_macro(s3, bucket, date_str, source)
+    price_data, macro = _load_prices_and_macro(s3, bucket, date_str)
     if not price_data:
         log.error("No price data loaded — cannot compute features")
         return {"status": "error", "error": "no_price_data"}
@@ -781,10 +717,6 @@ def main():
         help="Target date (YYYY-MM-DD, default: today UTC)",
     )
     parser.add_argument(
-        "--source", choices=["slim", "full"], default="slim",
-        help="Price data source: slim (2y cache, default) or full (10y cache)",
-    )
-    parser.add_argument(
         "--dry-run", action="store_true",
         help="Compute features but skip S3 write",
     )
@@ -808,7 +740,6 @@ def main():
     result = compute_and_write(
         date_str=args.date,
         bucket=args.bucket,
-        source=args.source,
         dry_run=args.dry_run,
     )
 

@@ -189,7 +189,7 @@
             "cd /home/ec2-user/alpha-engine-data",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
-            "python -m features.compute --date $(date -u +%Y-%m-%d) --bucket alpha-engine-research --source slim 2>&1 | tee /var/log/feature-store.log",
+            "python -m features.compute --date $(date -u +%Y-%m-%d) --bucket alpha-engine-research 2>&1 | tee /var/log/feature-store.log",
             "echo \"EXIT_CODE=$?\""
           ],
           "executionTimeout": ["120"]
