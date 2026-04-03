@@ -237,6 +237,23 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                 logger.error("Fundamentals collection failed: %s", e)
                 results["collectors"]["fundamentals"] = {"status": "error", "error": str(e)}
 
+    # ── 7. Feature store compute ───────────────────────────────────────────
+    if only in (None, "features"):
+        logger.info("=" * 60)
+        logger.info("COMPUTING: feature store snapshot")
+        logger.info("=" * 60)
+        try:
+            from features.compute import compute_and_write
+            fs_result = compute_and_write(
+                date_str=run_date,
+                bucket=bucket,
+                dry_run=dry_run,
+            )
+            results["collectors"]["features"] = fs_result
+        except Exception as e:
+            logger.error("Feature store compute failed: %s", e)
+            results["collectors"]["features"] = {"status": "error", "error": str(e)}
+
     # ── Finalize ─────────────────────────────────────────────────────────────
     results["completed_at"] = datetime.now(timezone.utc).isoformat()
     _finalize(results, bucket, market_prefix, run_date, dry_run, only)
@@ -328,6 +345,22 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
     except Exception as e:
         logger.error("Daily closes collection failed: %s", e)
         results["collectors"]["daily_closes"] = {"status": "error", "error": str(e)}
+
+    # ── Feature store compute ───────────────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("COMPUTING: feature store snapshot")
+    logger.info("=" * 60)
+    try:
+        from features.compute import compute_and_write
+        fs_result = compute_and_write(
+            date_str=run_date,
+            bucket=bucket,
+            dry_run=dry_run,
+        )
+        results["collectors"]["features"] = fs_result
+    except Exception as e:
+        logger.error("Feature store compute failed: %s", e)
+        results["collectors"]["features"] = {"status": "error", "error": str(e)}
 
     results["completed_at"] = datetime.now(timezone.utc).isoformat()
 

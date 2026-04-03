@@ -46,8 +46,7 @@ log = logging.getLogger(__name__)
 DEFAULT_BUCKET = "alpha-engine-research"
 FEATURE_STORE_PREFIX = "features/"
 
-# Split detection: single-day return beyond ±45% triggers yfinance re-fetch
-# (matches predictor's config.SPLIT_RETURN_THRESHOLD)
+# Large-move warning threshold (>45% daily return, e.g. stock splits, VIX spikes)
 _SPLIT_RETURN_THRESHOLD = 0.45
 
 # Tickers that are macro/index series, not stocks
@@ -273,19 +272,18 @@ def _apply_daily_delta(
         # keep="last" so delta rows win on duplicate dates (matches predictor)
         combined = combined[~combined.index.duplicated(keep="last")].sort_index()
 
-        # Split detection: any single-day Close return beyond threshold
+        # Split detection: log warning but still use the data.
+        # The weekly price collector handles splits properly during
+        # Saturday DataPhase1; feature compute trusts upstream data.
         returns = combined["Close"].pct_change().dropna()
         if (returns.abs() > _SPLIT_RETURN_THRESHOLD).any():
-            log.info(
-                "Split/large-move detected in %s — will re-fetch from yfinance", ticker,
-            )
-            split_tickers.add(ticker)
-        else:
-            price_data[ticker] = combined
-            n_updated += 1
+            log.warning("Large move detected in %s (>45%% daily return) — using data as-is", ticker)
 
-    log.info("Applied daily delta: %d tickers updated, %d splits detected", n_updated, len(split_tickers))
-    return price_data, split_tickers
+        price_data[ticker] = combined
+        n_updated += 1
+
+    log.info("Applied daily delta: %d tickers updated", n_updated)
+    return price_data
 
 
 _MACRO_SLIM_KEYS = {
@@ -302,101 +300,25 @@ _MACRO_SLIM_KEYS = {
 def _extract_macro(
     price_data: dict[str, pd.DataFrame],
     slim_data: dict[str, pd.DataFrame],
-    today: pd.Timestamp,
-) -> tuple[dict[str, pd.Series], list[str]]:
+) -> dict[str, pd.Series]:
     """
     Extract macro series (SPY, VIX, TNX, IRX, GLD, USO, VIX3M) and sector ETFs
-    from the price data dict.
-
-    Also detects stale macro series (last date >1 day behind target) that need
-    yfinance re-fetch, matching the predictor's behaviour.
-
-    Returns (macro_dict, stale_yf_tickers).
+    from the price data dict. Trusts upstream DailyData for freshness.
     """
     macro: dict[str, pd.Series] = {}
-    stale_macros: list[str] = []
 
     for key, stem in _MACRO_SLIM_KEYS.items():
         source = price_data.get(stem) if stem in price_data else slim_data.get(stem)
         if source is not None and "Close" in source.columns:
-            last_date = _safe_last_date(source.index)
-            if last_date is None:
-                log.warning("Macro series %s has empty/NaT index — skipping", key)
-                continue
-            if (today - last_date).days > 1:
-                yf_sym = f"^{stem}" if stem in ("VIX", "VIX3M", "TNX", "IRX") else stem
-                stale_macros.append(yf_sym)
             macro[key] = source["Close"].dropna()
-        else:
-            log.debug("Macro series %s not in price data or slim cache", key)
 
     # Sector ETFs
     for stem, df in slim_data.items():
         if stem.startswith("XL") and "Close" in df.columns:
             source = price_data.get(stem) if stem in price_data else df
-            last_date = _safe_last_date(source.index)
-            if last_date is None:
-                continue
-            if (today - last_date).days > 1:
-                stale_macros.append(stem)
             macro[stem] = source["Close"].dropna()
 
-    return macro, stale_macros
-
-
-def _yf_fetch_tickers(tickers: list[str], period: str = "2y") -> dict[str, pd.DataFrame]:
-    """
-    Fetch price data from yfinance for a list of tickers.
-
-    Used as fallback for split-detected and missing tickers, matching the
-    predictor's ``fetch_today_prices`` behaviour.
-    """
-    try:
-        import yfinance as yf
-    except ImportError:
-        log.warning("yfinance not installed — cannot re-fetch split/stale tickers")
-        return {}
-
-    log.info("Fetching %d tickers from yfinance (period=%s)...", len(tickers), period)
-    result: dict[str, pd.DataFrame] = {}
-
-    batch_size = 50
-    batches = [tickers[i : i + batch_size] for i in range(0, len(tickers), batch_size)]
-
-    for batch in batches:
-        try:
-            if len(batch) == 1:
-                raw = yf.download(
-                    batch[0], period=period, interval="1d",
-                    auto_adjust=True, progress=False,
-                )
-                raw.index = pd.to_datetime(raw.index)
-                if hasattr(raw.index, "tz") and raw.index.tz is not None:
-                    raw.index = raw.index.tz_convert("UTC").tz_localize(None)
-                raw = raw.dropna(subset=["Close"])
-                result[batch[0]] = raw
-            else:
-                raw = yf.download(
-                    tickers=batch, period=period, interval="1d",
-                    auto_adjust=True, progress=False,
-                    group_by="ticker", threads=True,
-                )
-                for ticker in batch:
-                    try:
-                        df = raw[ticker].copy()
-                        df.index = pd.to_datetime(df.index)
-                        if hasattr(df.index, "tz") and df.index.tz is not None:
-                            df.index = df.index.tz_convert("UTC").tz_localize(None)
-                        df = df.dropna(subset=["Close"])
-                        result[ticker] = df
-                    except (KeyError, AttributeError):
-                        result[ticker] = pd.DataFrame()
-        except Exception as exc:
-            log.warning("yfinance batch fetch failed: %s", exc)
-
-    n_ok = sum(1 for df in result.values() if not df.empty)
-    log.info("yfinance fetch complete: %d / %d succeeded", n_ok, len(tickers))
-    return result
+    return macro
 
 
 def _load_prices_and_macro(
@@ -405,59 +327,17 @@ def _load_prices_and_macro(
     """
     Load price data and macro series from S3 slim cache + daily delta.
 
-    Steps:
-    1. Download slim cache parquets (2y, ~920 tickers) with timezone normalization
-    2. Load ALL daily_closes delta files between cache last date and target
-    3. Merge with keep='last' so delta rows override cache
-    4. Detect splits (>45% single-day return) and re-fetch from yfinance
-    5. Build macro dict, detect stale series, re-fetch from yfinance
+    Trusts upstream data quality — DailyData collects fresh prices,
+    Saturday DataPhase1 handles splits during full price refresh.
+    No yfinance calls; no external API dependencies.
     """
-    today = pd.Timestamp(date_str).normalize()
-
     slim_data = _load_slim_cache(s3, bucket)
     if not slim_data:
         return {}, {}
 
-    # Start with a copy of slim data as the working price_data
     price_data = dict(slim_data)
-
-    # Apply daily delta (loads all files, handles splits)
-    price_data, split_tickers = _apply_daily_delta(s3, bucket, date_str, price_data)
-
-    # Re-fetch split tickers from yfinance (with clean adjusted prices)
-    if split_tickers:
-        log.info(
-            "Re-fetching %d split/large-move tickers from yfinance: %s",
-            len(split_tickers), sorted(split_tickers)[:10],
-        )
-        # Map bare macro tickers to yfinance caret format
-        _CARET_MAP = {"VIX": "^VIX", "VIX3M": "^VIX3M", "TNX": "^TNX", "IRX": "^IRX"}
-        yf_tickers = [_CARET_MAP.get(t, t) for t in sorted(split_tickers)]
-        fresh = _yf_fetch_tickers(yf_tickers)
-        for yf_sym, df in fresh.items():
-            if not df.empty:
-                cache_key = yf_sym.lstrip("^")
-                price_data[cache_key] = df
-
-    # Extract macro series (with staleness detection)
-    macro, stale_macros = _extract_macro(price_data, slim_data, today)
-
-    # Re-fetch stale macro series from yfinance
-    if stale_macros:
-        log.info("Re-fetching %d stale macro series from yfinance: %s", len(stale_macros), stale_macros[:10])
-        fresh_macro = _yf_fetch_tickers(stale_macros)
-        for yf_sym, fresh_df in fresh_macro.items():
-            if fresh_df.empty:
-                continue
-            cache_key = yf_sym.lstrip("^")
-            # Find the macro dict key
-            macro_key = cache_key
-            if cache_key in _MACRO_SLIM_KEYS.values():
-                macro_key = next(k for k, v in _MACRO_SLIM_KEYS.items() if v == cache_key)
-            if "Close" in fresh_df.columns:
-                macro[macro_key] = fresh_df["Close"].dropna()
-                price_data[cache_key] = fresh_df
-        log.info("Macro refresh complete: %d series updated", len(fresh_macro))
+    price_data = _apply_daily_delta(s3, bucket, date_str, price_data)
+    macro = _extract_macro(price_data, slim_data)
 
     return price_data, macro
 
