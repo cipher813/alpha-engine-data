@@ -9,3 +9,5 @@ feedparser>=6.0
 beautifulsoup4>=4.12
 lxml>=5.0
 edgartools>=2.0
+psycopg2-binary>=2.9
+voyageai>=0.3
