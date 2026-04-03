@@ -142,7 +142,33 @@ def check_all(bucket: str = DEFAULT_BUCKET) -> list[dict]:
         "status": "ok" if age is not None and age <= threshold else "stale" if age is not None else "missing",
     })
 
-    # 6. Module health markers
+    # 6. Price cache slim
+    latest_date, age = _find_latest_prefix(s3, bucket, "predictor/price_cache_slim/")
+    threshold = THRESHOLDS["price_cache_slim"]
+    results.append({
+        "check": "price_cache_slim",
+        "last_updated": latest_date,
+        "age_days": age,
+        "threshold_days": threshold,
+        "status": "ok" if age is not None and age <= threshold else "stale" if age is not None else "missing",
+    })
+
+    # 7. Daily closes
+    today_str_dc = date.today().isoformat()
+    modified, age = _last_modified_age(s3, bucket, f"predictor/daily_closes/{today_str_dc}.parquet")
+    if modified is None:
+        yesterday_dc = (date.today() - timedelta(days=1)).isoformat()
+        modified, age = _last_modified_age(s3, bucket, f"predictor/daily_closes/{yesterday_dc}.parquet")
+    threshold = THRESHOLDS["daily_closes"]
+    results.append({
+        "check": "daily_closes",
+        "last_updated": modified,
+        "age_days": age,
+        "threshold_days": threshold,
+        "status": "ok" if age is not None and age <= threshold else "stale" if age is not None else "missing",
+    })
+
+    # 8. Module health markers
     for module in ["data_phase1", "data_phase2", "executor", "predictor"]:
         modified, age = _last_modified_age(s3, bucket, f"health/{module}.json")
         results.append({
@@ -202,7 +228,6 @@ def main():
     failures = [r for r in results if r["status"] != "ok"]
     if failures and args.alert:
         try:
-            sns = boto3.client("s3")
             topic_arn = os.environ.get("SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts")
             sns_client = boto3.client("sns", region_name="us-east-1")
             sns_client.publish(

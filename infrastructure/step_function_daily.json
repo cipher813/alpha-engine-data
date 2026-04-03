@@ -204,6 +204,63 @@
         }
       ],
       "ResultPath": "$.predictor_result",
+      "Next": "HealthCheck"
+    },
+
+    "HealthCheck": {
+      "Type": "Task",
+      "Comment": "Check data freshness — non-blocking (alerts on failure but does not halt pipeline)",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "commands": [
+            "cd /home/ec2-user/alpha-engine-data",
+            "source .venv/bin/activate",
+            "python health_checker.py --alert 2>&1 | tee /var/log/health-check.log"
+          ],
+          "executionTimeout": ["60"]
+        },
+        "TimeoutSeconds": 60
+      },
+      "TimeoutSeconds": 90,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "Health check failure is non-blocking — log and continue to executor",
+          "Next": "StartExecutorEC2",
+          "ResultPath": "$.health_check_error"
+        }
+      ],
+      "ResultPath": "$.health_check_result",
+      "Next": "WaitForHealthCheck"
+    },
+
+    "WaitForHealthCheck": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.health_check_result.Command.CommandId",
+        "InstanceId.$": "$.ec2_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.InvocationDoesNotExistException"],
+          "MaxAttempts": 5,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "Non-blocking — continue even if health check polling fails",
+          "Next": "StartExecutorEC2",
+          "ResultPath": "$.health_check_error"
+        }
+      ],
+      "ResultPath": "$.health_check_poll",
       "Next": "StartExecutorEC2"
     },
 
