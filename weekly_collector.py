@@ -31,7 +31,7 @@ from pathlib import Path
 import boto3
 import yaml
 
-from collectors import constituents, prices, slim_cache, macro, universe_returns, alternative, daily_closes
+from collectors import constituents, prices, slim_cache, macro, universe_returns, alternative, daily_closes, fundamentals
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +215,27 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
             except Exception as e:
                 logger.error("Universe returns collection failed: %s", e)
                 results["collectors"]["universe_returns"] = {"status": "error", "error": str(e)}
+
+    # ── 6. Fundamentals ───────────────────────────────────────────────────────
+    if only in (None, "fundamentals"):
+        logger.info("=" * 60)
+        logger.info("COLLECTING: fundamentals (FMP)")
+        logger.info("=" * 60)
+        if not tickers:
+            logger.warning("No tickers available — skipping fundamentals")
+            results["collectors"]["fundamentals"] = {"status": "skipped", "reason": "no tickers"}
+        else:
+            try:
+                fund_result = fundamentals.collect(
+                    bucket=bucket,
+                    tickers=tickers,
+                    run_date=run_date,
+                    dry_run=dry_run,
+                )
+                results["collectors"]["fundamentals"] = fund_result
+            except Exception as e:
+                logger.error("Fundamentals collection failed: %s", e)
+                results["collectors"]["fundamentals"] = {"status": "error", "error": str(e)}
 
     # ── Finalize ─────────────────────────────────────────────────────────────
     results["completed_at"] = datetime.now(timezone.utc).isoformat()
