@@ -1,5 +1,5 @@
 {
-  "Comment": "Alpha Engine Saturday Pipeline — orchestrates weekly data collection, research, predictor training, and backtesting sequentially with fail-fast error handling. Backtester runs AFTER predictor training (depends on model weights).",
+  "Comment": "Alpha Engine Saturday Pipeline — orchestrates weekly data collection, RAG ingestion, research, predictor training, and backtesting sequentially with fail-fast error handling. RAG runs before Research (fresh knowledge base). Backtester runs AFTER predictor training (depends on model weights).",
   "StartAt": "DataPhase1",
   "States": {
 
@@ -75,7 +75,7 @@
         {
           "Variable": "$.data_phase1_poll.Status",
           "StringEquals": "Success",
-          "Next": "Research"
+          "Next": "RAGIngestion"
         },
         {
           "Variable": "$.data_phase1_poll.Status",
@@ -95,6 +95,101 @@
       "Type": "Wait",
       "Seconds": 30,
       "Next": "WaitForDataPhase1"
+    },
+
+    "RAGIngestion": {
+      "Type": "Task",
+      "Comment": "RAG ingestion — SEC filings, 8-Ks, earnings, theses, filing changes (EC2 via SSM). Must run before Research so RAG data is fresh.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "commands": [
+            "cd /home/ec2-user/alpha-engine-research",
+            "git pull --ff-only 2>&1 || true",
+            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "source .venv/bin/activate",
+            "bash rag/pipelines/run_weekly_ingestion.sh 2>&1 | tee /var/log/rag-ingestion.log",
+            "echo \"EXIT_CODE=$?\""
+          ],
+          "executionTimeout": ["1800"]
+        },
+        "TimeoutSeconds": 1800
+      },
+      "TimeoutSeconds": 1860,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.rag_result",
+      "Next": "WaitForRAGIngestion"
+    },
+
+    "WaitForRAGIngestion": {
+      "Type": "Task",
+      "Comment": "Poll SSM command until RAG ingestion complete",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.rag_result.Command.CommandId",
+        "InstanceId.$": "$.ec2_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.InvocationDoesNotExistException"],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.rag_poll",
+      "Next": "CheckRAGStatus"
+    },
+
+    "CheckRAGStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.rag_poll.Status",
+          "StringEquals": "Success",
+          "Next": "Research"
+        },
+        {
+          "Variable": "$.rag_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "RAGWait"
+        },
+        {
+          "Variable": "$.rag_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "RAGWait"
+        }
+      ],
+      "Default": "HandleFailure"
+    },
+
+    "RAGWait": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "WaitForRAGIngestion"
     },
 
     "Research": {

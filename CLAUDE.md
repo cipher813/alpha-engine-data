@@ -80,6 +80,7 @@ EDGAR_IDENTITY        # SEC EDGAR User-Agent (format: "Name email@domain.com")
 ```
 Sat 00:00 UTC    EventBridge triggers Step Functions
   ├─ DataPhase1 (EC2)          → prices, macro, constituents, universe returns
+  ├─ RAGIngestion (EC2)        → SEC filings, 8-Ks, earnings, theses → research knowledge base
   ├─ Research (Lambda)         → signals.json
   ├─ DataPhase2 (Lambda)       → alternative data for promoted tickers
   ├─ Predictor Training (spot) → GBM retrain
@@ -116,6 +117,5 @@ s3://alpha-engine-research/
 # Deploy to EC2
 git push origin main && aem "cd ~/alpha-engine-data && git pull"
 
-# Register cron (idempotent) — will be replaced by Step Functions
-aem "cd ~/alpha-engine-data && bash infrastructure/add-cron.sh"
+# Legacy cron removed — now orchestrated by Step Functions (2026-04-02)
 ```

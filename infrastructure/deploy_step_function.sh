@@ -85,6 +85,11 @@ aws iam create-role \
   --region "$REGION" 2>/dev/null || echo "  Role already exists"
 
 # Inline policy: Lambda invoke, SSM, SNS, CloudWatch
+# Trading instance ID for weekday pipeline EC2 start
+TRADING_INSTANCE="${AE_TRADING_INSTANCE_ID:-i-018eb3307a21329bf}"
+
+# Shared policy for BOTH Saturday and Weekday pipelines.
+# Both deploy scripts write to the same role/policy — keep them in sync.
 POLICY='{
   "Version": "2012-10-17",
   "Statement": [
@@ -94,7 +99,8 @@ POLICY='{
       "Action": ["lambda:InvokeFunction"],
       "Resource": [
         "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-research-runner*",
-        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-data-collector*"
+        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-data-collector*",
+        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-predictor-inference*"
       ]
     },
     {
@@ -106,8 +112,15 @@ POLICY='{
       ],
       "Resource": [
         "arn:aws:ssm:'"$REGION"'::document/AWS-RunShellScript",
-        "arn:aws:ec2:'"$REGION"':'"$ACCOUNT_ID"':instance/'"$EC2_INSTANCE_ID"'"
+        "arn:aws:ec2:'"$REGION"':'"$ACCOUNT_ID"':instance/'"$EC2_INSTANCE_ID"'",
+        "arn:aws:ssm:'"$REGION"':'"$ACCOUNT_ID"':*"
       ]
+    },
+    {
+      "Sid": "EC2Start",
+      "Effect": "Allow",
+      "Action": ["ec2:StartInstances"],
+      "Resource": "arn:aws:ec2:'"$REGION"':'"$ACCOUNT_ID"':instance/'"$TRADING_INSTANCE"'"
     },
     {
       "Sid": "SNSPublish",
