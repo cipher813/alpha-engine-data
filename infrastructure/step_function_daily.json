@@ -1,7 +1,88 @@
 {
   "Comment": "Alpha Engine Weekday Pipeline — daily data collection, predictor inference, executor start. Runs Mon-Fri 6:05 AM PT (13:05 UTC).",
-  "StartAt": "DailyData",
+  "StartAt": "CheckTradingDay",
   "States": {
+
+    "CheckTradingDay": {
+      "Type": "Task",
+      "Comment": "Skip pipeline on NYSE holidays (Good Friday, MLK Day, etc.)",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "commands": [
+            "cd /home/ec2-user/alpha-engine-data",
+            "source .venv/bin/activate",
+            "python trading_calendar.py"
+          ],
+          "executionTimeout": ["30"]
+        },
+        "TimeoutSeconds": 30
+      },
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyHolidaySkip",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.trading_day_result",
+      "Next": "WaitForTradingDayCheck"
+    },
+
+    "WaitForTradingDayCheck": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.trading_day_result.Command.CommandId",
+        "InstanceId.$": "$.ec2_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.InvocationDoesNotExistException"],
+          "MaxAttempts": 5,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyHolidaySkip",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.trading_day_poll",
+      "Next": "CheckTradingDayResult"
+    },
+
+    "CheckTradingDayResult": {
+      "Type": "Choice",
+      "Comment": "Exit code 0 = trading day (proceed), non-zero = holiday (skip)",
+      "Choices": [
+        {
+          "Variable": "$.trading_day_poll.Status",
+          "StringEquals": "Success",
+          "Next": "DailyData"
+        }
+      ],
+      "Default": "NotifyHolidaySkip"
+    },
+
+    "NotifyHolidaySkip": {
+      "Type": "Task",
+      "Comment": "Notify that pipeline was skipped due to market holiday",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekday Pipeline — Skipped (Market Holiday)",
+        "Message": "Daily pipeline skipped — NYSE is closed today (market holiday or weekend). No data collection, inference, or trading."
+      },
+      "ResultPath": "$.holiday_notify",
+      "End": true
+    },
 
     "DailyData": {
       "Type": "Task",
