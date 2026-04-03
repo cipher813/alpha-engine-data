@@ -71,7 +71,7 @@ def collect(
     bucket: str,
     db_path: str,
     signals_prefix: str = "signals",
-    sector_map_key: str = "predictor/price_cache/sector_map.json",
+    sector_map_key: str = "data/sector_map.json",
     dry_run: bool = False,
 ) -> dict:
     """

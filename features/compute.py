@@ -16,7 +16,7 @@ Usage:
 Data sources:
     Prices:       predictor/price_cache_slim/*.parquet + predictor/daily_closes/{date}.parquet
     Macro:        SPY, VIX, TNX, IRX, GLD, USO, VIX3M (from slim cache)
-    Sector map:   predictor/price_cache/sector_map.json
+    Sector map:   data/sector_map.json
     Fundamentals: archive/fundamentals/{date}.json (cached by prior inference)
     Alt data:     market_data/weekly/{latest}/alternative/{TICKER}.json (from DataPhase2)
 """
@@ -69,7 +69,7 @@ def _is_sector_etf(ticker: str) -> bool:
 def _load_sector_map(s3, bucket: str) -> dict[str, str]:
     """Load ticker -> sector ETF mapping from S3."""
     try:
-        obj = s3.get_object(Bucket=bucket, Key="predictor/price_cache/sector_map.json")
+        obj = s3.get_object(Bucket=bucket, Key="data/sector_map.json")
         return json.loads(obj["Body"].read())
     except Exception as exc:
         log.warning("Failed to load sector_map.json: %s", exc)

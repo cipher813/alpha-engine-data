@@ -97,15 +97,14 @@ def collect(
     )
     logger.info("Wrote constituents.json to s3://%s/%s (%d tickers)", bucket, key, len(tickers))
 
-    # Also write sector_map.json to the predictor cache path (backward compat)
-    sector_map_key = "predictor/price_cache/sector_map.json"
-    s3.put_object(
-        Bucket=bucket,
-        Key=sector_map_key,
-        Body=json.dumps(sector_etf_map, indent=2, sort_keys=True),
-        ContentType="application/json",
-    )
-    logger.info("Wrote sector_map.json to s3://%s/%s", bucket, sector_map_key)
+    # Write sector_map.json to canonical data path + legacy predictor path
+    sector_map_body = json.dumps(sector_etf_map, indent=2, sort_keys=True)
+    for sector_map_key in ["data/sector_map.json", "predictor/price_cache/sector_map.json"]:
+        s3.put_object(
+            Bucket=bucket, Key=sector_map_key,
+            Body=sector_map_body, ContentType="application/json",
+        )
+    logger.info("Wrote sector_map.json to data/ and predictor/ paths")
 
     return {"status": "ok", "count": len(tickers)}
 
