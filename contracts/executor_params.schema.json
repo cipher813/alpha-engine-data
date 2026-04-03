@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Alpha Engine Executor Parameters",
+  "description": "Backtester-optimized executor parameters. Written by backtester to config/executor_params.json. Read by executor at runtime, merged with risk.yaml.",
+  "type": "object",
+  "properties": {
+    "min_score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Minimum trading score for new entries (backstop gate)"
+    },
+    "max_position_pct": {
+      "type": "number",
+      "minimum": 0.01,
+      "maximum": 0.25,
+      "description": "Maximum single position as fraction of NAV"
+    },
+    "atr_multiplier": {
+      "type": "number",
+      "minimum": 0.5,
+      "maximum": 5.0,
+      "description": "ATR trailing stop multiplier"
+    },
+    "time_decay_reduce_days": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 30,
+      "description": "Days held before position size reduction"
+    },
+    "time_decay_exit_days": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 60,
+      "description": "Days held before forced exit"
+    },
+    "updated_at": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "description": "Date backtester last updated these params"
+    },
+    "best_sharpe": {
+      "type": ["number", "null"],
+      "description": "Sharpe ratio of the best param combo"
+    },
+    "best_alpha": {
+      "type": ["number", "null"],
+      "description": "Alpha of the best param combo"
+    },
+    "n_combos_tested": {
+      "type": ["integer", "null"],
+      "description": "Number of parameter combinations tested"
+    },
+    "manual_override": {
+      "type": ["string", "null"],
+      "description": "Explanation if params were manually overridden"
+    }
+  }
+}
