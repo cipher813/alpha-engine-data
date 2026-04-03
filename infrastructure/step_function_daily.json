@@ -74,7 +74,7 @@
         {
           "Variable": "$.daily_data_poll.Status",
           "StringEquals": "Success",
-          "Next": "PredictorInference"
+          "Next": "FeatureStoreCompute"
         },
         {
           "Variable": "$.daily_data_poll.Status",
@@ -94,6 +94,99 @@
       "Type": "Wait",
       "Seconds": 15,
       "Next": "WaitForDailyData"
+    },
+
+    "FeatureStoreCompute": {
+      "Type": "Task",
+      "Comment": "Compute feature store snapshot for today (EC2 via SSM)",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "commands": [
+            "cd /home/ec2-user/alpha-engine-predictor",
+            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "source .venv/bin/activate",
+            "python -m feature_store.compute --date $(date -u +%Y-%m-%d) --bucket alpha-engine-research --source slim 2>&1 | tee /var/log/feature-store.log",
+            "echo \"EXIT_CODE=$?\""
+          ],
+          "executionTimeout": ["120"]
+        },
+        "TimeoutSeconds": 120
+      },
+      "TimeoutSeconds": 180,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.feature_store_result",
+      "Next": "WaitForFeatureStore"
+    },
+
+    "WaitForFeatureStore": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.feature_store_result.Command.CommandId",
+        "InstanceId.$": "$.ec2_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.InvocationDoesNotExistException"],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.feature_store_poll",
+      "Next": "CheckFeatureStoreStatus"
+    },
+
+    "CheckFeatureStoreStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.feature_store_poll.Status",
+          "StringEquals": "Success",
+          "Next": "PredictorInference"
+        },
+        {
+          "Variable": "$.feature_store_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "FeatureStoreWait"
+        },
+        {
+          "Variable": "$.feature_store_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "FeatureStoreWait"
+        }
+      ],
+      "Default": "HandleFailure"
+    },
+
+    "FeatureStoreWait": {
+      "Type": "Wait",
+      "Seconds": 10,
+      "Next": "WaitForFeatureStore"
     },
 
     "PredictorInference": {
