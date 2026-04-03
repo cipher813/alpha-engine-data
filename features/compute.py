@@ -36,7 +36,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from features.feature_engineer import FEATURES, MIN_ROWS_FOR_FEATURES, compute_features
+import hashlib
+
+from features.feature_engineer import FEATURES, FEATURE_CFG, MIN_ROWS_FOR_FEATURES, compute_features
 from features.registry import upload_registry
 from features.writer import write_feature_snapshot
 
@@ -562,9 +564,31 @@ def compute_and_write(
             prefix=FEATURE_STORE_PREFIX,
         )
         upload_registry(bucket, prefix=FEATURE_STORE_PREFIX)
+
+        # Write schema version alongside snapshot for training consistency checks
+        _schema_content = json.dumps({"features": FEATURES, "config": FEATURE_CFG}, sort_keys=True)
+        _schema_hash = hashlib.sha256(_schema_content.encode()).hexdigest()[:12]
+        _version_doc = {
+            "schema_version": 1,
+            "schema_hash": _schema_hash,
+            "n_features": len(FEATURES),
+            "features": FEATURES,
+            "date": date_str,
+        }
+        try:
+            import boto3 as _b3_ver
+            _b3_ver.client("s3").put_object(
+                Bucket=bucket,
+                Key=f"{FEATURE_STORE_PREFIX}{date_str}/schema_version.json",
+                Body=json.dumps(_version_doc, indent=2),
+                ContentType="application/json",
+            )
+        except Exception as _ver_exc:
+            log.debug("Schema version write failed (non-fatal): %s", _ver_exc)
+
         log.info(
-            "Feature snapshot + registry written to s3://%s/%s%s/",
-            bucket, FEATURE_STORE_PREFIX, date_str,
+            "Feature snapshot + registry written to s3://%s/%s%s/ (schema=%s)",
+            bucket, FEATURE_STORE_PREFIX, date_str, _schema_hash,
         )
 
     t_total = time.time() - t0
