@@ -106,10 +106,10 @@
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
           "commands": [
-            "cd /home/ec2-user/alpha-engine-predictor",
+            "cd /home/ec2-user/alpha-engine-data",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
-            "python -m feature_store.compute --date $(date -u +%Y-%m-%d) --bucket alpha-engine-research --source slim 2>&1 | tee /var/log/feature-store.log",
+            "python -m features.compute --date $(date -u +%Y-%m-%d) --bucket alpha-engine-research --source slim 2>&1 | tee /var/log/feature-store.log",
             "echo \"EXIT_CODE=$?\""
           ],
           "executionTimeout": ["120"]
