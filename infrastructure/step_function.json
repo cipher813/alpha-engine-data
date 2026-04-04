@@ -292,10 +292,11 @@
       "TimeoutSeconds": 5460,
       "Retry": [
         {
-          "ErrorEquals": ["States.TaskFailed"],
-          "MaxAttempts": 1,
-          "IntervalSeconds": 120,
-          "BackoffRate": 1.0
+          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 180,
+          "BackoffRate": 2.0,
+          "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry)"
         }
       ],
       "Catch": [
@@ -417,10 +418,11 @@
       "TimeoutSeconds": 7260,
       "Retry": [
         {
-          "ErrorEquals": ["States.TaskFailed"],
-          "MaxAttempts": 1,
-          "IntervalSeconds": 120,
-          "BackoffRate": 1.0
+          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 180,
+          "BackoffRate": 2.0,
+          "Comment": "Retry on failure/timeout — handles spot interruption (new instance on retry)"
         }
       ],
       "Catch": [
