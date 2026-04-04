@@ -342,7 +342,7 @@
         {
           "Variable": "$.predictor_poll.Status",
           "StringEquals": "Success",
-          "Next": "Backtester"
+          "Next": "DriftDetection"
         },
         {
           "Variable": "$.predictor_poll.Status",
@@ -362,6 +362,37 @@
       "Type": "Wait",
       "Seconds": 60,
       "Next": "WaitForPredictorTraining"
+    },
+
+    "DriftDetection": {
+      "Type": "Task",
+      "Comment": "Check feature + prediction drift after training (non-blocking). Uses data venv for numpy/boto3, PYTHONPATH for predictor module.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "commands": [
+            "export HOME=/home/ec2-user",
+            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "export PYTHONPATH=/home/ec2-user/alpha-engine-predictor",
+            "/home/ec2-user/alpha-engine-data/.venv/bin/python -m monitoring.drift_detector --alert 2>&1 | tee /var/log/drift-detection.log"
+          ],
+          "executionTimeout": ["300"]
+        },
+        "TimeoutSeconds": 300
+      },
+      "TimeoutSeconds": 330,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "Drift detection is non-blocking — continue to backtester",
+          "Next": "Backtester",
+          "ResultPath": "$.drift_error"
+        }
+      ],
+      "ResultPath": "$.drift_result",
+      "Next": "Backtester"
     },
 
     "Backtester": {
