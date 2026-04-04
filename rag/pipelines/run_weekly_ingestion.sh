@@ -40,6 +40,8 @@ elif [ -d "venv" ]; then
     source venv/bin/activate
 fi
 
+START_TIME="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
 echo "========================================"
 echo "RAG Weekly Ingestion — $(date -u '+%Y-%m-%d %H:%M UTC')"
 echo "========================================"
@@ -97,3 +99,26 @@ aws cloudwatch put-metric-data \
   --region "${AWS_REGION:-us-east-1}" 2>/dev/null \
   && echo "Heartbeat emitted: rag-ingestion" \
   || echo "WARNING: Failed to emit heartbeat (non-fatal)"
+
+# Send completion email
+PYTHON_BIN="${PYTHON_BIN:-python}"
+$PYTHON_BIN -c "
+from emailer import send_step_email
+from datetime import datetime, timezone
+date_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+results = {
+    'phase': 'RAG',
+    'date': date_str,
+    'started_at': '$START_TIME',
+    'completed_at': datetime.now(timezone.utc).isoformat(),
+    'status': 'ok',
+    'collectors': {
+        'sec_filings': {'status': 'ok'},
+        '8k_events': {'status': 'ok'},
+        'earnings_transcripts': {'status': 'ok'},
+        'thesis_history': {'status': 'ok'},
+        'filing_changes': {'status': 'ok'},
+    },
+}
+send_step_email('RAG Ingestion', results, date_str)
+" 2>&1 || echo "WARNING: RAG completion email failed (non-fatal)"

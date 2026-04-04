@@ -431,6 +431,15 @@ def _finalize(
         duration,
     )
 
+    # Send completion email (non-blocking)
+    if not dry_run and only is None:
+        try:
+            from emailer import send_step_email
+            step_name = f"Data Phase {phase}" if phase else "Data Collection"
+            send_step_email(step_name, results, run_date)
+        except Exception as exc:
+            logger.warning("Step email failed (non-fatal): %s", exc)
+
 
 def _write_manifest(bucket: str, s3_prefix: str, run_date: str, results: dict) -> None:
     """Write manifest.json and update latest_weekly.json pointer."""
