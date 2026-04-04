@@ -530,11 +530,9 @@ def main() -> None:
     args = _parse_args()
     _load_dotenv()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    from log_config import setup_logging
+    setup_logging("data-collector")
+    logging.getLogger().setLevel(getattr(logging, args.log_level))
 
     config = load_config(args.config)
     results = run_weekly(config, args)
