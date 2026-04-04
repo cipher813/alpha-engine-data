@@ -1,0 +1,425 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Alpha Engine orchestration infrastructure — Step Functions, EventBridge rules,
+  SNS topics, and CloudWatch alarms. Does NOT manage Lambda functions, EC2
+  instances, or IAM roles (those are managed separately via deploy scripts
+  and console). This template captures the "glue" that connects modules.
+
+# ============================================================================
+# Parameters
+# ============================================================================
+Parameters:
+  MicroInstanceId:
+    Type: String
+    Default: i-09b539c844515d549
+    Description: Always-on EC2 micro instance ID (runs data collection, dashboard)
+
+  TradingInstanceId:
+    Type: String
+    Default: i-018eb3307a21329bf
+    Description: Trading EC2 instance ID (runs executor, started/stopped daily)
+
+  ResearchLambdaArn:
+    Type: String
+    Default: arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-runner:live
+
+  DataCollectorLambdaArn:
+    Type: String
+    Default: arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-data-collector:live
+
+  PredictorLambdaArn:
+    Type: String
+    Default: arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-inference:live
+
+  AlertsLambdaArn:
+    Type: String
+    Default: arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-alerts
+
+  StepFunctionsRoleArn:
+    Type: String
+    Default: arn:aws:iam::711398986525:role/alpha-engine-step-functions-role
+
+  EventBridgeSfnRoleArn:
+    Type: String
+    Default: arn:aws:iam::711398986525:role/alpha-engine-eventbridge-sfn-role
+
+  EventBridgeEc2RoleArn:
+    Type: String
+    Default: arn:aws:iam::711398986525:role/alpha-engine-eventbridge-role
+
+  AlertEmail:
+    Type: String
+    Default: cipher813@gmail.com
+    Description: Email for SNS alert notifications
+
+# ============================================================================
+# Resources
+# ============================================================================
+Resources:
+
+  # --------------------------------------------------------------------------
+  # SNS Topics
+  # --------------------------------------------------------------------------
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: alpha-engine-alerts
+      DisplayName: Alpha Engine Alerts
+
+  AlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # --------------------------------------------------------------------------
+  # Step Functions — Saturday Pipeline
+  # --------------------------------------------------------------------------
+  SaturdayPipeline:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: alpha-engine-saturday-pipeline
+      RoleArn: !Ref StepFunctionsRoleArn
+      DefinitionS3Location:
+        Bucket: alpha-engine-research
+        Key: infrastructure/step_function.json
+      # Alternative: inline definition via DefinitionString
+      # Using S3 location so the JSON files in the repo are the source of truth.
+      # Deploy script uploads JSON to S3 then updates the state machine.
+
+  # --------------------------------------------------------------------------
+  # Step Functions — Weekday Pipeline
+  # --------------------------------------------------------------------------
+  WeekdayPipeline:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: alpha-engine-weekday-pipeline
+      RoleArn: !Ref StepFunctionsRoleArn
+      DefinitionS3Location:
+        Bucket: alpha-engine-research
+        Key: infrastructure/step_function_daily.json
+
+  # --------------------------------------------------------------------------
+  # EventBridge Rules — Pipeline Triggers
+  # --------------------------------------------------------------------------
+  SaturdayTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: alpha-engine-saturday
+      Description: Saturday 00:00 UTC — triggers full Alpha Engine pipeline
+      ScheduleExpression: 'cron(0 0 ? * SAT *)'
+      State: ENABLED
+      Targets:
+        - Id: saturday-pipeline
+          Arn: !Ref SaturdayPipeline
+          RoleArn: !Ref EventBridgeSfnRoleArn
+          Input: !Sub |
+            {
+              "ec2_instance_id": ["${MicroInstanceId}"],
+              "sns_topic_arn": "${AlertsTopic}"
+            }
+
+  WeekdayTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: alpha-engine-weekday
+      Description: Weekday 13:05 UTC (6:05 AM PT) — daily data + predictor + executor
+      ScheduleExpression: 'cron(5 13 ? * MON-FRI *)'
+      State: ENABLED
+      Targets:
+        - Id: weekday-pipeline
+          Arn: !Ref WeekdayPipeline
+          RoleArn: !Ref EventBridgeSfnRoleArn
+          Input: !Sub |
+            {
+              "ec2_instance_id": ["${MicroInstanceId}"],
+              "trading_instance_id": ["${TradingInstanceId}"],
+              "sns_topic_arn": "${AlertsTopic}"
+            }
+
+  # --------------------------------------------------------------------------
+  # EventBridge Rules — Independent Triggers
+  # --------------------------------------------------------------------------
+  ResearchAlerts:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: alpha-research-alerts
+      Description: Intraday price alerts every 30 min during market hours
+      ScheduleExpression: 'cron(0/30 13-21 ? * MON-FRI *)'
+      State: ENABLED
+      Targets:
+        - Id: alerts-lambda
+          Arn: !Ref AlertsLambdaArn
+
+  ResearchAlertsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AlertsLambdaArn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ResearchAlerts.Arn
+
+  # --------------------------------------------------------------------------
+  # EventBridge Scheduler — Stop Trading Instance
+  # --------------------------------------------------------------------------
+  # Note: EventBridge Scheduler uses a different API than EventBridge Rules.
+  # CloudFormation support for Scheduler is via AWS::Scheduler::Schedule.
+  StopTradingSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: alpha-engine-stop-trading
+      Description: Stop trading EC2 after market close (1:30 PM PT / 20:30 UTC)
+      ScheduleExpression: 'cron(30 13 ? * MON-FRI *)'
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      State: ENABLED
+      Target:
+        Arn: 'arn:aws:scheduler:::aws-sdk:ec2:stopInstances'
+        RoleArn: !Ref EventBridgeEc2RoleArn
+        Input: !Sub '{"InstanceIds": ["${TradingInstanceId}"]}'
+
+  # --------------------------------------------------------------------------
+  # CloudWatch Alarms
+  # --------------------------------------------------------------------------
+  HealthCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: AlphaEngine-HealthCheckFailures
+      AlarmDescription: Alert when any data health check fails
+      Namespace: AlphaEngine
+      MetricName: HealthChecksFailed
+      Statistic: Maximum
+      Period: 21600  # 6 hours
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  ResearchRunnerErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: alpha-engine-research-runner-errors
+      AlarmDescription: Research Lambda errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: alpha-engine-research-runner
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  ResearchRunnerNoInvocations:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: alpha-engine-research-runner-no-invocations
+      AlarmDescription: Research Lambda not invoked (expected weekly)
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - Name: FunctionName
+          Value: alpha-engine-research-runner
+      Statistic: Sum
+      Period: 604800  # 7 days
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  PredictorInferenceErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: alpha-engine-predictor-inference-errors
+      AlarmDescription: Predictor Lambda errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: alpha-engine-predictor-inference
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  PredictorNoInvocations:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: alpha-engine-predictor-inference-no-invocations
+      AlarmDescription: Predictor Lambda not invoked (expected daily)
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - Name: FunctionName
+          Value: alpha-engine-predictor-inference
+      Statistic: Sum
+      Period: 86400  # 1 day
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching  # weekends/holidays
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  # Heartbeat alarms for EC2-based processes
+  ExecutorMorningHeartbeat:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: alpha-engine-executor-morning-no-heartbeat
+      AlarmDescription: Executor morning planner did not emit heartbeat
+      Namespace: AlphaEngine
+      MetricName: Heartbeat
+      Dimensions:
+        - Name: Process
+          Value: executor-morning
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  ExecutorDaemonHeartbeat:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: alpha-engine-executor-daemon-no-heartbeat
+      AlarmDescription: Executor daemon did not emit heartbeat
+      Namespace: AlphaEngine
+      MetricName: Heartbeat
+      Dimensions:
+        - Name: Process
+          Value: executor-daemon
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  ExecutorEodHeartbeat:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: alpha-engine-executor-eod-no-heartbeat
+      AlarmDescription: EOD reconciliation did not emit heartbeat
+      Namespace: AlphaEngine
+      MetricName: Heartbeat
+      Dimensions:
+        - Name: Process
+          Value: executor-eod
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  PredictorTrainingHeartbeat:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: alpha-engine-predictor-training-no-heartbeat
+      AlarmDescription: Predictor training did not emit heartbeat (expected weekly)
+      Namespace: AlphaEngine
+      MetricName: Heartbeat
+      Dimensions:
+        - Name: Process
+          Value: predictor-training
+      Statistic: Sum
+      Period: 604800
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  BacktesterHeartbeat:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: alpha-engine-backtester-no-heartbeat
+      AlarmDescription: Backtester did not emit heartbeat (expected weekly)
+      Namespace: AlphaEngine
+      MetricName: Heartbeat
+      Dimensions:
+        - Name: Process
+          Value: backtester
+      Statistic: Sum
+      Period: 604800
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  RAGIngestionHeartbeat:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: alpha-engine-rag-ingestion-no-heartbeat
+      AlarmDescription: RAG ingestion did not emit heartbeat (expected weekly)
+      Namespace: AlphaEngine
+      MetricName: Heartbeat
+      Dimensions:
+        - Name: Process
+          Value: rag-ingestion
+      Statistic: Sum
+      Period: 604800
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  ResearchAlertsErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: alpha-engine-research-alerts-errors
+      AlarmDescription: Research alerts Lambda errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: alpha-engine-research-alerts
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+# ============================================================================
+# Outputs
+# ============================================================================
+Outputs:
+  AlertsTopicArn:
+    Value: !Ref AlertsTopic
+    Description: SNS topic for all Alpha Engine alerts
+
+  SaturdayPipelineArn:
+    Value: !Ref SaturdayPipeline
+    Description: Saturday pipeline state machine ARN
+
+  WeekdayPipelineArn:
+    Value: !Ref WeekdayPipeline
+    Description: Weekday pipeline state machine ARN
