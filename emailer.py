@@ -182,4 +182,14 @@ def _extract_details(name: str, info: dict) -> str:
     if "elapsed_s" in info:
         parts.append(f"{info['elapsed_s']:.0f}s")
 
+    # Validation results (from price/volume/gap checks)
+    val = info.get("validation", {})
+    if val:
+        n_anom = val.get("anomalies", 0)
+        n_total = val.get("total_validated", 0)
+        if n_anom > 0:
+            parts.append(f"⚠ {n_anom}/{n_total} anomalies")
+        else:
+            parts.append(f"✓ {n_total} validated")
+
     return " | ".join(parts) if parts else ""

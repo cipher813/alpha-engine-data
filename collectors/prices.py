@@ -93,7 +93,17 @@ def collect(
         s3, bucket, s3_prefix, stale, fetch_period, batch_size,
     )
 
-    return {
+    # ── Validate refreshed tickers ─────────────────────────────────────────
+    validation = {}
+    if refreshed > 0:
+        try:
+            from validators.price_validator import validate_refreshed
+            refreshed_tickers = [t for t in stale if t not in failed_tickers]
+            validation = validate_refreshed(s3, bucket, s3_prefix, refreshed_tickers)
+        except Exception as e:
+            logger.warning("Price validation failed (non-fatal): %s", e)
+
+    result = {
         "status": "ok" if not failed_tickers else "partial",
         "refreshed": refreshed,
         "stale": len(stale),
@@ -101,6 +111,9 @@ def collect(
         "failed_tickers": failed_tickers[:20],
         "total": len(all_tickers),
     }
+    if validation:
+        result["validation"] = validation
+    return result
 
 
 def _find_stale_fast(
