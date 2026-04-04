@@ -210,6 +210,49 @@ def format_report(results: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _emit_cloudwatch_metrics(results: list[dict]) -> None:
+    """Publish health check metrics to CloudWatch for dashboarding and alarms."""
+    try:
+        cw = boto3.client("cloudwatch", region_name="us-east-1")
+        metric_data = []
+
+        # Per-check staleness age
+        for r in results:
+            age = r.get("age_days")
+            if age is not None:
+                metric_data.append({
+                    "MetricName": "DataStalenessAge",
+                    "Dimensions": [{"Name": "Check", "Value": r["check"]}],
+                    "Value": float(age),
+                    "Unit": "Count",
+                })
+
+        # Aggregate: total OK vs failures
+        n_ok = sum(1 for r in results if r["status"] == "ok")
+        n_fail = sum(1 for r in results if r["status"] != "ok")
+        metric_data.append({
+            "MetricName": "HealthChecksOK",
+            "Value": float(n_ok),
+            "Unit": "Count",
+        })
+        metric_data.append({
+            "MetricName": "HealthChecksFailed",
+            "Value": float(n_fail),
+            "Unit": "Count",
+        })
+
+        if metric_data:
+            # CloudWatch PutMetricData max 20 per call
+            for i in range(0, len(metric_data), 20):
+                cw.put_metric_data(
+                    Namespace="AlphaEngine",
+                    MetricData=metric_data[i:i+20],
+                )
+            logger.info("Emitted %d CloudWatch metrics", len(metric_data))
+    except Exception as e:
+        logger.warning("CloudWatch metric emission failed (non-fatal): %s", e)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Check data pipeline health")
     parser.add_argument("--json", action="store_true", help="JSON output")
@@ -224,6 +267,9 @@ def main():
         print(json.dumps(results, indent=2, default=str))
     else:
         print(format_report(results))
+
+    # Emit CloudWatch metrics
+    _emit_cloudwatch_metrics(results)
 
     failures = [r for r in results if r["status"] != "ok"]
     if failures and args.alert:
