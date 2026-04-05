@@ -376,6 +376,7 @@
           "commands": [
             "export HOME=/home/ec2-user",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "set -o pipefail",
             "export PYTHONPATH=/home/ec2-user/alpha-engine-predictor",
             "/home/ec2-user/alpha-engine-data/.venv/bin/python -m monitoring.drift_detector --alert 2>&1 | tee /var/log/drift-detection.log"
           ],

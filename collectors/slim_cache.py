@@ -38,8 +38,10 @@ def collect(
         dry_run: if True, count files but don't write
 
     Returns:
-        dict with status, written count, failed count
+        dict with status, written count, failed count, validation summary
     """
+    from validators.price_validator import validate_parquet
+
     s3 = boto3.client("s3")
     cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=lookback_days)
 
@@ -60,12 +62,14 @@ def collect(
 
         written = 0
         failed = 0
+        validation_results: list[dict] = []
 
         for s3_key in parquet_keys:
             filename = s3_key.split("/")[-1]
             if filename == "sector_map.json":
                 continue
 
+            ticker = filename.replace(".parquet", "")
             local_path = local_dir / filename
             try:
                 s3.download_file(bucket, s3_key, str(local_path))
@@ -79,6 +83,9 @@ def collect(
                 if slim_df.empty:
                     local_path.unlink(missing_ok=True)
                     continue
+
+                # Validate the 2-year slice (what inference actually reads)
+                validation_results.append(validate_parquet(slim_df, ticker))
 
                 slim_path = local_dir / f"_slim_{filename}"
                 slim_df.to_parquet(slim_path, engine="pyarrow", compression="snappy")
@@ -100,8 +107,26 @@ def collect(
             fail_pct = failed / max(len(parquet_keys), 1) * 100
             logger.warning("Slim cache: %d/%d failed (%.1f%%)", failed, len(parquet_keys), fail_pct)
 
+        # Build validation summary
+        anomaly_tickers = [r for r in validation_results if r["status"] != "clean"]
+        validation = {
+            "total_validated": len(validation_results),
+            "clean": len(validation_results) - len(anomaly_tickers),
+            "anomalies": len(anomaly_tickers),
+            "anomaly_details": anomaly_tickers[:20],
+        }
+        if anomaly_tickers:
+            logger.warning("Slim cache validation: %d/%d tickers have anomalies", len(anomaly_tickers), len(validation_results))
+            for r in anomaly_tickers[:10]:
+                logger.warning("  %s: %s", r["ticker"], "; ".join(r["anomalies"]))
+        else:
+            logger.info("Slim cache validation: all %d tickers clean", len(validation_results))
+
         logger.info("Slim cache: %d / %d uploaded to s3://%s/%s", written, len(parquet_keys), bucket, slim_prefix)
-        return {"status": "ok" if failed == 0 else "partial", "written": written, "failed": failed}
+        result = {"status": "ok" if failed == 0 else "partial", "written": written, "failed": failed}
+        if validation_results:
+            result["validation"] = validation
+        return result
 
 
 def _list_parquets(s3, bucket: str, prefix: str) -> list[str]:

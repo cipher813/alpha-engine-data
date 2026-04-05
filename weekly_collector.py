@@ -408,6 +408,7 @@ def _finalize(
 
     if not dry_run and only is None:
         _write_manifest(bucket, market_prefix, run_date, results)
+        _write_validation_json(bucket, market_prefix, run_date, results)
 
     # Write health marker for Step Functions
     phase = results.get("phase")
@@ -463,6 +464,47 @@ def _write_manifest(bucket: str, s3_prefix: str, run_date: str, results: dict) -
         ContentType="application/json",
     )
     logger.info("Wrote manifest + latest pointer for %s", run_date)
+
+
+def _write_validation_json(
+    bucket: str, s3_prefix: str, run_date: str, results: dict,
+) -> None:
+    """Aggregate validation results from all collectors and write to S3."""
+    collectors = results.get("collectors", {})
+    validations: dict[str, dict] = {}
+
+    for name, info in collectors.items():
+        val = info.get("validation")
+        if val:
+            validations[name] = val
+
+    if not validations:
+        return
+
+    total_validated = sum(v.get("total_validated", 0) for v in validations.values())
+    total_anomalies = sum(v.get("anomalies", 0) for v in validations.values())
+    total_clean = sum(v.get("clean", 0) for v in validations.values())
+
+    payload = {
+        "date": run_date,
+        "total_validated": total_validated,
+        "total_clean": total_clean,
+        "total_anomalies": total_anomalies,
+        "collectors": validations,
+    }
+
+    s3 = boto3.client("s3")
+    key = f"{s3_prefix}weekly/{run_date}/validation.json"
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(payload, indent=2, default=str),
+        ContentType="application/json",
+    )
+    logger.info(
+        "Wrote validation.json: %d validated, %d anomalies → s3://%s/%s",
+        total_validated, total_anomalies, bucket, key,
+    )
 
 
 def _write_health_marker(bucket: str, phase: int, run_date: str, status: str) -> None:
