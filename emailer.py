@@ -161,16 +161,28 @@ def _extract_details(name: str, info: dict) -> str:
 
     if "tickers_refreshed" in info:
         parts.append(f"{info['tickers_refreshed']} refreshed")
+    elif "refreshed" in info:
+        parts.append(f"{info['refreshed']} refreshed")
+    if "stale" in info:
+        parts.append(f"{info['stale']} stale")
     if "tickers_skipped" in info:
         parts.append(f"{info['tickers_skipped']} skipped")
     if "tickers_failed" in info:
         n = info["tickers_failed"]
         if n > 0:
             parts.append(f"{n} failed")
+    elif "failed" in info:
+        n = info["failed"]
+        if n > 0:
+            parts.append(f"{n} failed")
     if "total_tickers" in info:
         parts.append(f"{info['total_tickers']} total")
+    elif "total" in info:
+        parts.append(f"{info['total']} total")
     if "n_tickers" in info:
         parts.append(f"{info['n_tickers']} tickers")
+    if "written" in info:
+        parts.append(f"{info['written']} written")
     if "sp500_count" in info:
         parts.append(f"S&P500: {info['sp500_count']}")
     if "sp400_count" in info:
