@@ -136,7 +136,6 @@ else
   echo "Sync complete with $FAILED failure(s). Check instance status."
 fi
 echo ""
-echo "Lambda env vars are synced separately during deploy:"
-echo "  cd ~/Development/alpha-engine-research && bash infrastructure/deploy.sh"
-echo "  cd ~/Development/alpha-engine-data && bash infrastructure/deploy.sh"
+echo "To push to Lambda + EC2 in one command, use push-secrets.sh instead:"
+echo "  bash infrastructure/push-secrets.sh"
 echo ""

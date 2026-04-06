@@ -8,7 +8,7 @@ weekly slim cache and today's prices, avoiding a full 2-year yfinance fetch.
 Data source priority: polygon.io grouped-daily (1 API call for all US stocks),
 then yfinance batch download for any tickers polygon missed.
 
-Schema: index=ticker (str), columns=[date, Open, High, Low, Close, Adj_Close, Volume]
+Schema: index=ticker (str), columns=[date, Open, High, Low, Close, Adj_Close, Volume, VWAP]
 """
 
 from __future__ import annotations
@@ -84,6 +84,7 @@ def collect(
                         "Close": round(g["close"], 4),
                         "Adj_Close": round(g["close"], 4),
                         "Volume": int(g["volume"]),
+                        "VWAP": round(g["vwap"], 4) if g.get("vwap") else None,
                     })
             polygon_count = len(records)
             logger.info("Polygon grouped-daily: %d/%d tickers", polygon_count, len(tickers))
@@ -191,6 +192,7 @@ def _fetch_yfinance_closes(
                         "Close": round(float(last["Close"]), 4),
                         "Adj_Close": round(adj_close, 4),
                         "Volume": int(last["Volume"]) if pd.notna(last.get("Volume")) else 0,
+                        "VWAP": None,
                     })
                     count += 1
                 except Exception as e:
