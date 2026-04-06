@@ -94,10 +94,11 @@ class PolygonClient:
     # -- Core endpoints ------------------------------------------------------
 
     def get_grouped_daily(self, date_str: str) -> dict[str, dict]:
-        """Fetch OHLCV for ALL US stocks on a single date.
+        """Fetch OHLCV + VWAP for ALL US stocks on a single date.
 
         Returns {ticker: {"open": float, "high": float, "low": float,
-                          "close": float, "volume": float}}
+                          "close": float, "volume": float,
+                          "vwap": float | None}}
         """
         data = self._get(
             f"/v2/aggs/grouped/locale/us/market/stocks/{date_str}",
@@ -111,6 +112,7 @@ class PolygonClient:
                 "low": r["l"],
                 "close": r["c"],
                 "volume": r["v"],
+                "vwap": r.get("vw"),
             }
             for r in results
             if "T" in r

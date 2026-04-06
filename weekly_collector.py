@@ -31,6 +31,9 @@ from pathlib import Path
 import boto3
 import yaml
 
+from ssm_secrets import load_secrets
+load_secrets()
+
 from collectors import constituents, prices, slim_cache, macro, universe_returns, alternative, daily_closes, fundamentals
 
 logger = logging.getLogger(__name__)
