@@ -257,6 +257,19 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
             logger.error("Feature store compute failed: %s", e)
             results["collectors"]["features"] = {"status": "error", "error": str(e)}
 
+    # ── 8. ArcticDB universe rebuild ─────────────────────────────────────────
+    if only in (None, "arcticdb"):
+        logger.info("=" * 60)
+        logger.info("REBUILDING: ArcticDB universe (full backfill)")
+        logger.info("=" * 60)
+        try:
+            from builders.backfill import backfill
+            arctic_result = backfill(bucket=bucket, dry_run=dry_run)
+            results["collectors"]["arcticdb"] = arctic_result
+        except Exception as e:
+            logger.error("ArcticDB backfill failed: %s", e)
+            results["collectors"]["arcticdb"] = {"status": "error", "error": str(e)}
+
     # ── Finalize ─────────────────────────────────────────────────────────────
     results["completed_at"] = datetime.now(timezone.utc).isoformat()
     _finalize(results, bucket, market_prefix, run_date, dry_run, only)
@@ -364,6 +377,22 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
     except Exception as e:
         logger.error("Feature store compute failed: %s", e)
         results["collectors"]["features"] = {"status": "error", "error": str(e)}
+
+    # ── ArcticDB daily append ────────────────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("APPENDING: ArcticDB universe (daily)")
+    logger.info("=" * 60)
+    try:
+        from builders.daily_append import daily_append
+        arctic_result = daily_append(
+            date_str=run_date,
+            bucket=bucket,
+            dry_run=dry_run,
+        )
+        results["collectors"]["arcticdb"] = arctic_result
+    except Exception as e:
+        logger.error("ArcticDB daily append failed: %s", e)
+        results["collectors"]["arcticdb"] = {"status": "error", "error": str(e)}
 
     results["completed_at"] = datetime.now(timezone.utc).isoformat()
 
@@ -544,7 +573,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--only",
-        choices=["constituents", "prices", "slim", "macro", "universe_returns", "alternative", "daily_closes"],
+        choices=["constituents", "prices", "slim", "macro", "universe_returns", "alternative", "daily_closes", "features", "arcticdb"],
         help="Run a single collector instead of all",
     )
     parser.add_argument(

@@ -12,3 +12,4 @@ edgartools>=2.0
 psycopg2-binary>=2.9
 voyageai>=0.3
 jsonschema>=4.20
+arcticdb>=6.11
