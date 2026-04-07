@@ -1,36 +1,37 @@
 #!/usr/bin/env bash
-# push-configs.sh — Push gitignored config files to S3 for EC2 boot-pull.
+# push-configs.sh — Sync local config files to the private alpha-engine-config repo.
 #
-# Configs are gitignored and never committed. Edit locally, push to S3 with
-# this script. EC2 instances pull from S3 on every boot (boot-pull.sh).
-#
-# S3 layout:
-#   s3://alpha-engine-research/config/risk.yaml         → trading EC2
-#   s3://alpha-engine-research/config/data.yaml          → micro EC2 (alpha-engine-data)
-#   s3://alpha-engine-research/config/backtester.yaml    → micro EC2 (backtester)
+# Copies gitignored configs from each module into alpha-engine-config/,
+# then commits and pushes. EC2 instances pull on boot via boot-pull.sh.
 #
 # Usage:
-#   bash infrastructure/push-configs.sh              # push all configs to S3
-#   bash infrastructure/push-configs.sh --dry-run    # show what would be pushed
+#   bash infrastructure/push-configs.sh              # sync + commit + push
+#   bash infrastructure/push-configs.sh --dry-run    # show what would be synced
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEV_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-REGION="${AWS_REGION:-us-east-1}"
-BUCKET="alpha-engine-research"
-S3_PREFIX="config"
+CONFIG_REPO="$DEV_ROOT/alpha-engine-config"
 
-# Config mapping: local_path → S3 key
+if [ ! -d "$CONFIG_REPO/.git" ]; then
+  echo "ERROR: alpha-engine-config not found at $CONFIG_REPO"
+  echo "Clone it: cd $DEV_ROOT && git clone git@github.com:cipher813/alpha-engine-config.git"
+  exit 1
+fi
+
+# Config mapping: source → config repo destination
 CONFIGS=(
-  "$DEV_ROOT/alpha-engine/config/risk.yaml:${S3_PREFIX}/risk.yaml"
-  "$DEV_ROOT/alpha-engine/flow-doctor.yaml:${S3_PREFIX}/flow-doctor-executor.yaml"
-  "$DEV_ROOT/alpha-engine-data/config.yaml:${S3_PREFIX}/data.yaml"
-  "$DEV_ROOT/alpha-engine-backtester/config.yaml:${S3_PREFIX}/backtester.yaml"
-  "$DEV_ROOT/alpha-engine-backtester/flow-doctor.yaml:${S3_PREFIX}/flow-doctor-backtester.yaml"
+  "$DEV_ROOT/alpha-engine/config/risk.yaml:executor/risk.yaml"
+  "$DEV_ROOT/alpha-engine/flow-doctor.yaml:executor/flow-doctor.yaml"
+  "$DEV_ROOT/alpha-engine-predictor/config/predictor.yaml:predictor/predictor.yaml"
+  "$DEV_ROOT/alpha-engine-research/config/universe.yaml:research/universe.yaml"
+  "$DEV_ROOT/alpha-engine-research/config/scoring.yaml:research/scoring.yaml"
+  "$DEV_ROOT/alpha-engine-research/config.py:research/config.py"
+  "$DEV_ROOT/alpha-engine-data/config.yaml:data/config.yaml"
+  "$DEV_ROOT/alpha-engine-backtester/config.yaml:backtester/config.yaml"
+  "$DEV_ROOT/alpha-engine-backtester/flow-doctor.yaml:backtester/flow-doctor.yaml"
 )
-
-# ── Parse args ──────────────────────────────────────────────────────────────
 
 DRY_RUN=false
 for arg in "$@"; do
@@ -40,47 +41,53 @@ for arg in "$@"; do
   esac
 done
 
-# ── Push to S3 ──────────────────────────────────────────────────────────────
-
-PUSHED=0
+SYNCED=0
 SKIPPED=0
-FAILED=0
 
-echo "Pushing configs to s3://${BUCKET}/${S3_PREFIX}/"
+echo "Syncing configs to $CONFIG_REPO"
 echo ""
 
 for entry in "${CONFIGS[@]}"; do
-  local_path="${entry%%:*}"
-  s3_key="${entry#*:}"
-  basename=$(basename "$local_path")
+  src="${entry%%:*}"
+  dst="$CONFIG_REPO/${entry#*:}"
+  name=$(basename "$src")
 
-  if [ ! -f "$local_path" ]; then
-    echo "  SKIP $basename (not found: $local_path)"
+  if [ ! -f "$src" ]; then
+    echo "  SKIP $name (not found: $src)"
     SKIPPED=$((SKIPPED + 1))
     continue
   fi
 
   if [ "$DRY_RUN" = true ]; then
-    echo "  $basename → s3://${BUCKET}/${s3_key}"
-    PUSHED=$((PUSHED + 1))
+    echo "  $name → ${entry#*:}"
+    SYNCED=$((SYNCED + 1))
     continue
   fi
 
-  if aws s3 cp "$local_path" "s3://${BUCKET}/${s3_key}" --region "$REGION" --quiet 2>/dev/null; then
-    echo "  OK   $basename → s3://${BUCKET}/${s3_key}"
-    PUSHED=$((PUSHED + 1))
-  else
-    echo "  FAIL $basename"
-    FAILED=$((FAILED + 1))
-  fi
+  cp "$src" "$dst"
+  echo "  OK   $name → ${entry#*:}"
+  SYNCED=$((SYNCED + 1))
 done
 
 echo ""
+
 if [ "$DRY_RUN" = true ]; then
-  echo "Would push $PUSHED config(s), $SKIPPED skipped. (dry-run — no changes made)"
+  echo "Would sync $SYNCED config(s), $SKIPPED skipped. (dry-run)"
+  exit 0
+fi
+
+# Commit and push if there are changes
+cd "$CONFIG_REPO"
+if git diff --quiet && git diff --cached --quiet; then
+  echo "No config changes to push."
 else
-  echo "Pushed $PUSHED config(s), $SKIPPED skipped, $FAILED failed."
+  git add -A
+  echo "Changes detected:"
+  git diff --cached --stat
   echo ""
-  echo "EC2 instances pull these on every boot (boot-pull.sh)."
-  echo "Changes take effect on next boot (or run: ae-trading 'bash ~/alpha-engine/infrastructure/pull-configs.sh')"
+  git commit -m "Sync configs from local modules ($(date +%Y-%m-%d))"
+  git push origin main
+  echo ""
+  echo "Configs pushed. EC2 picks up on next boot, or run:"
+  echo "  ae-trading \"cd ~/alpha-engine-config && git pull\""
 fi
