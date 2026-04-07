@@ -40,14 +40,20 @@ logger = logging.getLogger(__name__)
 
 
 def load_config(path: str = "config.yaml") -> dict:
-    """Load config.yaml with defaults."""
-    config_path = Path(path)
-    if not config_path.exists():
-        raise FileNotFoundError(
-            f"Config not found at {path}. Copy config.yaml.example to config.yaml."
-        )
-    with open(config_path) as f:
-        return yaml.safe_load(f)
+    """Load config.yaml from config repo or local fallback."""
+    # Search config repo first, then local
+    search_paths = [
+        Path.home() / "alpha-engine-config" / "data" / "config.yaml",
+        Path(__file__).parent.parent / "alpha-engine-config" / "data" / "config.yaml",
+        Path(path),
+    ]
+    for p in search_paths:
+        if p.exists():
+            with open(p) as f:
+                return yaml.safe_load(f)
+    raise FileNotFoundError(
+        f"Config not found. Searched: {[str(p) for p in search_paths]}"
+    )
 
 
 def run_weekly(config: dict, args: argparse.Namespace) -> dict:
