@@ -27,3 +27,8 @@ Thumbs.db
 
 # Design docs
 *-design-*.md
+
+# Gitleaks config (symlink to shared config)
+.gitleaks.toml
+
+.gitleaksbaseline.json
