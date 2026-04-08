@@ -2,7 +2,8 @@
 
 [![Python](https://img.shields.io/badge/python-3.13+-blue.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-56_passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-95_passing-brightgreen.svg)]()
+[![Coverage](https://img.shields.io/badge/coverage-82%25-green.svg)]()
 
 > Centralized data collection, storage, and distribution for the Alpha Engine system. Owns price data (ArcticDB), macro indicators, universe returns, and alternative data fetchers. Runs as the first step in both Saturday and daily Step Function pipelines.
 
