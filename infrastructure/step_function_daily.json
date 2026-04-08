@@ -204,6 +204,37 @@
         }
       ],
       "ResultPath": "$.predictor_result",
+      "Next": "PredictorHealthCheck"
+    },
+
+    "PredictorHealthCheck": {
+      "Type": "Task",
+      "Comment": "Daily predictor model health — IC, hit rate, calibration, retrain triggers",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-predictor-health-check:live",
+        "Payload": {
+          "action": "check"
+        }
+      },
+      "TimeoutSeconds": 180,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "Health check is non-blocking — continue to data health check and executor",
+          "Next": "HealthCheck",
+          "ResultPath": "$.predictor_health_error"
+        }
+      ],
+      "ResultPath": "$.predictor_health_result",
       "Next": "HealthCheck"
     },
 
