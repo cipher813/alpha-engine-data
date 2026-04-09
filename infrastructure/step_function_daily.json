@@ -24,7 +24,7 @@
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
-          "Next": "NotifyHolidaySkip",
+          "Next": "TradingDayCheckFailed",
           "ResultPath": "$.error"
         }
       ],
@@ -50,7 +50,7 @@
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
-          "Next": "NotifyHolidaySkip",
+          "Next": "TradingDayCheckFailed",
           "ResultPath": "$.error"
         }
       ],
@@ -60,20 +60,75 @@
 
     "CheckTradingDayResult": {
       "Type": "Choice",
-      "Comment": "Exit code 0 = trading day (proceed), non-zero = holiday (skip)",
+      "Comment": "Check SSM status first (InProgress/Pending = poll again), then check stdout for TRADING_DAY vs MARKET_CLOSED marker. Script always exits 0 — Failed means a real error.",
       "Choices": [
         {
           "Variable": "$.trading_day_poll.Status",
-          "StringEquals": "Success",
+          "StringEquals": "InProgress",
+          "Next": "TradingDayCheckWait"
+        },
+        {
+          "Variable": "$.trading_day_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "TradingDayCheckWait"
+        },
+        {
+          "Variable": "$.trading_day_poll.Status",
+          "StringEquals": "Failed",
+          "Next": "TradingDayCheckFailed"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.trading_day_poll.Status",
+              "StringEquals": "Success"
+            },
+            {
+              "Variable": "$.trading_day_poll.StandardOutputContent",
+              "StringMatches": "*MARKET_CLOSED*"
+            }
+          ],
+          "Next": "NotifyHolidaySkip"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.trading_day_poll.Status",
+              "StringEquals": "Success"
+            },
+            {
+              "Variable": "$.trading_day_poll.StandardOutputContent",
+              "StringMatches": "*TRADING DAY*"
+            }
+          ],
           "Next": "DailyData"
         }
       ],
-      "Default": "NotifyHolidaySkip"
+      "Default": "TradingDayCheckFailed"
+    },
+
+    "TradingDayCheckWait": {
+      "Type": "Wait",
+      "Seconds": 5,
+      "Next": "WaitForTradingDayCheck"
+    },
+
+    "TradingDayCheckFailed": {
+      "Type": "Task",
+      "Comment": "Trading day check failed for infrastructure reasons — alert and proceed (assume trading day)",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekday Pipeline — Trading Day Check Failed (Proceeding)",
+        "Message.$": "States.Format('Trading day check failed (SSM error, not a holiday detection). Pipeline proceeding as trading day. Error: {}', States.JsonToString($.error))"
+      },
+      "ResultPath": "$.trading_day_error_notify",
+      "Next": "DailyData"
     },
 
     "NotifyHolidaySkip": {
       "Type": "Task",
-      "Comment": "Notify that pipeline was skipped due to market holiday",
+      "Comment": "Notify that pipeline was skipped — trading_calendar.py stdout contains MARKET_CLOSED",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",

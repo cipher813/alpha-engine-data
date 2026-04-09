@@ -9,8 +9,11 @@ Usage:
     python trading_calendar.py 2026-04-03   # check specific date
 
 Exit codes:
-    0 = trading day
-    1 = not a trading day (weekend or holiday)
+    Always exits 0 — Step Function checks stdout markers, not exit code.
+
+Stdout markers:
+    "TRADING DAY"  = NYSE is open (proceed with pipeline)
+    "MARKET_CLOSED" = weekend or holiday (skip pipeline)
 """
 
 from __future__ import annotations
@@ -125,5 +128,7 @@ if __name__ == "__main__":
     else:
         reason = "weekend" if check_date.weekday() > 4 else "NYSE holiday"
         nxt = next_trading_day(check_date)
-        print(f"{check_date} ({day_name}): CLOSED ({reason}) — next trading day: {nxt}")
-        sys.exit(1)
+        print(f"{check_date} ({day_name}): MARKET_CLOSED ({reason}) — next trading day: {nxt}")
+        # Exit 0 so SSM reports Success — Step Function checks stdout marker
+        # instead of exit code to distinguish holidays from script crashes.
+        sys.exit(0)
