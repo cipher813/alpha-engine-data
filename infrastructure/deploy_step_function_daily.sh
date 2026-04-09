@@ -53,13 +53,20 @@ POLICY='{
       ]
     },
     {
-      "Sid": "SSMRunCommand",
+      "Sid": "SSMSendCommand",
       "Effect": "Allow",
-      "Action": ["ssm:SendCommand", "ssm:GetCommandInvocation"],
+      "Action": ["ssm:SendCommand"],
       "Resource": [
         "arn:aws:ssm:'"$REGION"'::document/AWS-RunShellScript",
-        "arn:aws:ec2:'"$REGION"':'"$ACCOUNT_ID"':instance/'"$MICRO_INSTANCE"'"
+        "arn:aws:ec2:'"$REGION"':'"$ACCOUNT_ID"':instance/'"$MICRO_INSTANCE"'",
+        "arn:aws:ec2:'"$REGION"':'"$ACCOUNT_ID"':instance/'"$TRADING_INSTANCE"'"
       ]
+    },
+    {
+      "Sid": "SSMGetCommandInvocation",
+      "Effect": "Allow",
+      "Action": ["ssm:GetCommandInvocation"],
+      "Resource": "*"
     },
     {
       "Sid": "EC2Start",
