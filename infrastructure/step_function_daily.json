@@ -352,7 +352,7 @@
 
     "StartExecutorEC2": {
       "Type": "Task",
-      "Comment": "Start the trading EC2 instance for executor + daemon",
+      "Comment": "Start the trading EC2 instance (no-op if already running)",
       "Resource": "arn:aws:states:::aws-sdk:ec2:startInstances",
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
@@ -373,7 +373,140 @@
         }
       ],
       "ResultPath": "$.ec2_start_result",
+      "Next": "WaitForInstanceReady"
+    },
+
+    "WaitForInstanceReady": {
+      "Type": "Wait",
+      "Comment": "Wait for instance to boot + IB Gateway to authenticate (~90s cold boot, ~0s if already running)",
+      "Seconds": 120,
+      "Next": "RunMorningPlanner"
+    },
+
+    "RunMorningPlanner": {
+      "Type": "Task",
+      "Comment": "Run morning order-book planner via SSM",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.trading_instance_id",
+        "Parameters": {
+          "commands": [
+            "cd /home/ec2-user/alpha-engine",
+            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "source .venv/bin/activate",
+            "/home/ec2-user/alpha-engine/infrastructure/wait-for-ibgateway.sh",
+            "python executor/main.py 2>&1 | tee -a /var/log/executor.log"
+          ],
+          "executionTimeout": ["300"]
+        },
+        "TimeoutSeconds": 300
+      },
+      "TimeoutSeconds": 360,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.planner_result",
+      "Next": "WaitForMorningPlanner"
+    },
+
+    "WaitForMorningPlanner": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.planner_result.Command.CommandId",
+        "InstanceId.$": "$.trading_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.InvocationDoesNotExistException"],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.planner_poll",
+      "Next": "CheckMorningPlannerStatus"
+    },
+
+    "CheckMorningPlannerStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.planner_poll.Status",
+          "StringEquals": "Success",
+          "Next": "RunDaemon"
+        },
+        {
+          "Variable": "$.planner_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "MorningPlannerWait"
+        },
+        {
+          "Variable": "$.planner_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "MorningPlannerWait"
+        }
+      ],
+      "Default": "HandleFailure"
+    },
+
+    "MorningPlannerWait": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "WaitForMorningPlanner"
+    },
+
+    "RunDaemon": {
+      "Type": "Task",
+      "Comment": "Restart the intraday daemon via SSM",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.trading_instance_id",
+        "Parameters": {
+          "commands": [
+            "sudo systemctl restart alpha-engine-daemon.service",
+            "echo 'Daemon restarted'"
+          ],
+          "executionTimeout": ["30"]
+        },
+        "TimeoutSeconds": 30
+      },
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "Daemon restart failure is non-fatal — systemd boot trigger is backup",
+          "Next": "PipelineComplete",
+          "ResultPath": "$.daemon_error"
+        }
+      ],
+      "ResultPath": "$.daemon_result",
       "End": true
+    },
+
+    "PipelineComplete": {
+      "Type": "Succeed"
     },
 
     "HandleFailure": {
