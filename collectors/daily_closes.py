@@ -183,16 +183,26 @@ def _fetch_yfinance_closes(
                     last = df.iloc[-1]
                     store_ticker = ticker.lstrip("^")
                     adj_close = float(last["Adj Close"]) if "Adj Close" in df.columns else float(last["Close"])
+                    high = float(last["High"])
+                    low = float(last["Low"])
+                    close = float(last["Close"])
+                    # Typical-price proxy for VWAP: (H + L + C) / 3. yfinance
+                    # does not expose true intraday VWAP for free, so we fall
+                    # back to the standard pre-tick-data proxy. Executor entry
+                    # triggers use this as a prior-day reference level, not
+                    # an intraday VWAP — the proxy is accurate enough for
+                    # that purpose and materially better than None.
+                    vwap_proxy = round((high + low + close) / 3.0, 4)
                     records.append({
                         "ticker": store_ticker,
                         "date": date_str,
                         "Open": round(float(last["Open"]), 4),
-                        "High": round(float(last["High"]), 4),
-                        "Low": round(float(last["Low"]), 4),
-                        "Close": round(float(last["Close"]), 4),
+                        "High": round(high, 4),
+                        "Low": round(low, 4),
+                        "Close": round(close, 4),
                         "Adj_Close": round(adj_close, 4),
                         "Volume": int(last["Volume"]) if pd.notna(last.get("Volume")) else 0,
-                        "VWAP": None,
+                        "VWAP": vwap_proxy,
                     })
                     count += 1
                 except Exception as e:
