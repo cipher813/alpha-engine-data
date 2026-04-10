@@ -34,7 +34,7 @@ import yaml
 from ssm_secrets import load_secrets
 load_secrets()
 
-from collectors import constituents, prices, slim_cache, macro, universe_returns, alternative, daily_closes, fundamentals
+from collectors import constituents, prices, slim_cache, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +224,28 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
             except Exception as e:
                 logger.error("Universe returns collection failed: %s", e)
                 results["collectors"]["universe_returns"] = {"status": "error", "error": str(e)}
+
+    # ── 5b. Signal returns (score_performance + predictor_outcomes) ────────────
+    if only in (None, "signal_returns"):
+        logger.info("=" * 60)
+        logger.info("COLLECTING: signal returns (score_performance + predictor_outcomes)")
+        logger.info("=" * 60)
+        # Reuse the same db_path from universe_returns (already pulled from S3)
+        sr_db_path = db_path
+        if sr_db_path:
+            try:
+                sr_result = signal_returns.collect(
+                    bucket=bucket,
+                    db_path=sr_db_path,
+                    signals_prefix=ur_cfg.get("signals_prefix", "signals"),
+                    dry_run=dry_run,
+                )
+                results["collectors"]["signal_returns"] = sr_result
+            except Exception as e:
+                logger.error("Signal returns collection failed: %s", e)
+                results["collectors"]["signal_returns"] = {"status": "error", "error": str(e)}
+        else:
+            results["collectors"]["signal_returns"] = {"status": "skipped", "reason": "no research.db"}
 
     # ── 6. Fundamentals ───────────────────────────────────────────────────────
     if only in (None, "fundamentals"):

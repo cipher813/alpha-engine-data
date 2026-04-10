@@ -55,10 +55,13 @@ CREATE TABLE IF NOT EXISTS universe_returns (
     close_price REAL,
     return_5d REAL,
     return_10d REAL,
+    return_30d REAL,
     spy_return_5d REAL,
     spy_return_10d REAL,
+    spy_return_30d REAL,
     beat_spy_5d INTEGER,
     beat_spy_10d INTEGER,
+    beat_spy_30d INTEGER,
     sector_etf TEXT,
     sector_etf_return_5d REAL,
     beat_sector_5d INTEGER,
@@ -199,10 +202,15 @@ def _load_sector_map(s3, bucket: str, key: str) -> dict[str, str] | None:
 # -- DB helpers ---------------------------------------------------------------
 
 def _ensure_table(db_path: str) -> None:
-    """Create universe_returns table if it doesn't exist."""
+    """Create universe_returns table if it doesn't exist, and add new columns."""
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(_CREATE_TABLE_SQL)
+        # Add 30d columns if they don't exist (migration for existing DBs)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(universe_returns)").fetchall()}
+        for col, col_type in [("return_30d", "REAL"), ("spy_return_30d", "REAL"), ("beat_spy_30d", "INTEGER")]:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE universe_returns ADD COLUMN {col} {col_type}")
         conn.commit()
     finally:
         conn.close()
@@ -227,15 +235,15 @@ def _insert_rows(db_path: str, rows: list[dict]) -> int:
             try:
                 conn.execute(
                     "INSERT OR IGNORE INTO universe_returns "
-                    "(ticker, eval_date, sector, close_price, return_5d, return_10d, "
-                    "spy_return_5d, spy_return_10d, beat_spy_5d, beat_spy_10d, "
+                    "(ticker, eval_date, sector, close_price, return_5d, return_10d, return_30d, "
+                    "spy_return_5d, spy_return_10d, spy_return_30d, beat_spy_5d, beat_spy_10d, beat_spy_30d, "
                     "sector_etf, sector_etf_return_5d, beat_sector_5d) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         row["ticker"], row["eval_date"], row["sector"],
-                        row["close_price"], row["return_5d"], row["return_10d"],
-                        row["spy_return_5d"], row["spy_return_10d"],
-                        row["beat_spy_5d"], row["beat_spy_10d"],
+                        row["close_price"], row["return_5d"], row["return_10d"], row["return_30d"],
+                        row["spy_return_5d"], row["spy_return_10d"], row["spy_return_30d"],
+                        row["beat_spy_5d"], row["beat_spy_10d"], row["beat_spy_30d"],
                         row["sector_etf"], row["sector_etf_return_5d"],
                         row["beat_sector_5d"],
                     ),
@@ -260,6 +268,7 @@ def _build_rows_for_date(
     eval_dt = date.fromisoformat(eval_date)
     fwd_5d = _add_business_days(eval_dt, 5)
     fwd_10d = _add_business_days(eval_dt, 10)
+    fwd_30d = _add_business_days(eval_dt, 30)
 
     # Check that forward dates are in the past (returns can be computed)
     today = date.today()
@@ -268,11 +277,13 @@ def _build_rows_for_date(
         return []
 
     has_10d = fwd_10d < today
+    has_30d = fwd_30d < today
 
     # Fetch grouped-daily prices for eval_date and forward dates
     prices_t0 = polygon_client.get_grouped_daily(eval_date)
     prices_5d = polygon_client.get_grouped_daily(str(fwd_5d))
     prices_10d = polygon_client.get_grouped_daily(str(fwd_10d)) if has_10d else {}
+    prices_30d = polygon_client.get_grouped_daily(str(fwd_30d)) if has_30d else {}
 
     if not prices_t0:
         logger.warning("No prices for eval_date %s — may be a non-trading day", eval_date)
@@ -286,9 +297,11 @@ def _build_rows_for_date(
     spy_t0 = prices_t0.get("SPY", {}).get("close")
     spy_5d = prices_5d.get("SPY", {}).get("close")
     spy_10d = prices_10d.get("SPY", {}).get("close") if has_10d else None
+    spy_30d = prices_30d.get("SPY", {}).get("close") if has_30d else None
 
     spy_ret_5d = _pct_return(spy_t0, spy_5d)
     spy_ret_10d = _pct_return(spy_t0, spy_10d) if has_10d else None
+    spy_ret_30d = _pct_return(spy_t0, spy_30d) if has_30d else None
 
     # Sector ETF returns
     sector_etf_returns_5d: dict[str, float | None] = {}
@@ -309,9 +322,11 @@ def _build_rows_for_date(
 
         close_5d = prices_5d.get(ticker, {}).get("close")
         close_10d = prices_10d.get(ticker, {}).get("close") if has_10d else None
+        close_30d = prices_30d.get(ticker, {}).get("close") if has_30d else None
 
         ret_5d = _pct_return(close_t0, close_5d)
         ret_10d = _pct_return(close_t0, close_10d) if has_10d else None
+        ret_30d = _pct_return(close_t0, close_30d) if has_30d else None
 
         # Sector classification
         sector_etf = sector_map.get(ticker) if sector_map else None
@@ -325,10 +340,13 @@ def _build_rows_for_date(
             "close_price": round(close_t0, 2),
             "return_5d": round(ret_5d, 4) if ret_5d is not None else None,
             "return_10d": round(ret_10d, 4) if ret_10d is not None else None,
+            "return_30d": round(ret_30d, 4) if ret_30d is not None else None,
             "spy_return_5d": round(spy_ret_5d, 4) if spy_ret_5d is not None else None,
             "spy_return_10d": round(spy_ret_10d, 4) if spy_ret_10d is not None else None,
+            "spy_return_30d": round(spy_ret_30d, 4) if spy_ret_30d is not None else None,
             "beat_spy_5d": int(ret_5d > spy_ret_5d) if ret_5d is not None and spy_ret_5d is not None else None,
             "beat_spy_10d": int(ret_10d > spy_ret_10d) if ret_10d is not None and spy_ret_10d is not None else None,
+            "beat_spy_30d": int(ret_30d > spy_ret_30d) if ret_30d is not None and spy_ret_30d is not None else None,
             "sector_etf": sector_etf,
             "sector_etf_return_5d": round(etf_ret_5d, 4) if etf_ret_5d is not None else None,
             "beat_sector_5d": int(ret_5d > etf_ret_5d) if ret_5d is not None and etf_ret_5d is not None else None,
