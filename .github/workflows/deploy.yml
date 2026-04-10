@@ -1,0 +1,63 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # Only rebuild + redeploy the Phase 2 Lambda when code that actually
+      # lands in the Docker image changes. DataPhase1 runs as EC2 SSM
+      # (not Lambda) so changes to phase1-only code would still require a
+      # separate deploy mechanism — see weekly_collector.py path guard.
+      - 'collectors/**'
+      - 'weekly_collector.py'
+      - 'polygon_client.py'
+      - 'config.py'
+      - 'requirements*.txt'
+      - 'Dockerfile*'
+      - 'infrastructure/deploy.sh'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Build + deploy Phase 2 Lambda
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Deploy Phase 2 Lambda (alpha-engine-data-collector)
+        run: bash infrastructure/deploy.sh
+
+      - name: Report deployed version
+        run: |
+          echo "Deployed commit: ${{ github.sha }}"
+          aws lambda get-function \
+            --function-name alpha-engine-data-collector \
+            --query "Configuration.[LastModified,CodeSha256]" \
+            --output text
