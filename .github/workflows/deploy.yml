@@ -12,6 +12,8 @@ on:
       - 'store/**'
       - 'weekly_collector.py'
       - 'polygon_client.py'
+      - 'ssm_secrets.py'
+      - 'lambda/**'
       - 'config.py'
       - 'requirements*.txt'
       - 'Dockerfile*'

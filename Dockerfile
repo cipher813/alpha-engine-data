@@ -11,6 +11,7 @@ COPY collectors/ ${LAMBDA_TASK_ROOT}/collectors/
 COPY polygon_client.py ${LAMBDA_TASK_ROOT}/
 COPY weekly_collector.py ${LAMBDA_TASK_ROOT}/
 COPY store/ ${LAMBDA_TASK_ROOT}/store/
+COPY ssm_secrets.py ${LAMBDA_TASK_ROOT}/
 
 # NOTE: config.yaml is intentionally NOT copied here. It is gitignored
 # (contains bucket names + prefixes that we keep out of the public repo)
