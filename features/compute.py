@@ -29,7 +29,6 @@ import json
 import logging
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -76,85 +75,15 @@ def _load_sector_map(s3, bucket: str) -> dict[str, str]:
         return {}
 
 
-def _load_parquet_from_s3(s3, bucket: str, key: str) -> pd.DataFrame:
-    """Download a single parquet file from S3 and return as DataFrame.
-
-    Normalizes to timezone-naive UTC DatetimeIndex, matching the predictor's
-    ``_load_ticker_parquet`` behaviour so that downstream reindex/join calls
-    don't raise TypeError when mixing tz-aware and tz-naive indices.
-    """
-    obj = s3.get_object(Bucket=bucket, Key=key)
-    buf = io.BytesIO(obj["Body"].read())
-    df = pd.read_parquet(buf, engine="pyarrow")
-    # Ensure DatetimeIndex
-    if not isinstance(df.index, pd.DatetimeIndex):
-        if "Date" in df.columns:
-            df["Date"] = pd.to_datetime(df["Date"])
-            df = df.set_index("Date")
-        elif "date" in df.columns:
-            df["date"] = pd.to_datetime(df["date"])
-            df = df.set_index("date")
-        else:
-            df.index = pd.to_datetime(df.index)
-    # Normalize timezone: convert to UTC then strip tz info (match predictor)
-    if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
-        df.index = df.index.tz_convert("UTC").tz_localize(None)
-    # Ensure sorted
-    if isinstance(df.index, pd.DatetimeIndex) and not df.index.is_monotonic_increasing:
-        df = df.sort_index()
-    return df
-
-
-def _load_slim_cache(s3, bucket: str) -> dict[str, pd.DataFrame]:
-    """
-    Load all parquets from predictor/price_cache_slim/ using concurrent downloads.
-
-    Returns dict of ticker -> DataFrame (OHLCV with DatetimeIndex).
-    """
-    prefix = "predictor/price_cache_slim/"
-
-    # List all parquet keys
-    keys = []
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            if obj["Key"].endswith(".parquet"):
-                keys.append(obj["Key"])
-
-    if not keys:
-        log.warning("No parquets found in s3://%s/%s", bucket, prefix)
-        return {}
-
-    log.info("Downloading %d slim cache parquets...", len(keys))
-
-    price_data: dict[str, pd.DataFrame] = {}
-    errors = 0
-
-    def _download(key: str) -> tuple[str, pd.DataFrame | None]:
-        ticker = key.split("/")[-1].replace(".parquet", "")
-        try:
-            df = _load_parquet_from_s3(s3, bucket, key)
-            if df.empty:
-                return ticker, None
-            return ticker, df
-        except Exception:
-            return ticker, None
-
-    with ThreadPoolExecutor(max_workers=20) as pool:
-        futures = {pool.submit(_download, k): k for k in keys}
-        for fut in as_completed(futures):
-            ticker, df = fut.result()
-            if df is not None:
-                price_data[ticker] = df
-            else:
-                errors += 1
-
-    log.info("Slim cache loaded: %d tickers OK, %d errors", len(price_data), errors)
-    return price_data
-
-
-    # _load_full_cache removed — slim cache (2y) is sufficient for feature computation.
-    # Features only use the latest row; 2y provides enough warmup for all indicators.
+# Shared S3 parquet loaders live in store.parquet_loader so non-feature
+# callers (e.g. collectors.macro's breadth computation) can reuse the same
+# normalized DataFrame shape without importing private helpers. Slim cache
+# (2y) is sufficient here — features only use the latest row and 2y gives
+# enough warmup for every indicator.
+from store.parquet_loader import (
+    load_parquet_from_s3 as _load_parquet_from_s3,
+    load_slim_cache as _load_slim_cache,
+)
 
 
 def _safe_last_date(idx: pd.Index) -> pd.Timestamp | None:

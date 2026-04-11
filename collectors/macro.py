@@ -25,6 +25,8 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+from store.parquet_loader import load_slim_cache
+
 logger = logging.getLogger(__name__)
 
 _FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
@@ -69,11 +71,27 @@ def collect(
     market = _fetch_market_prices()
     macro.update(market)
 
-    # Compute breadth if price data is available
+    # Compute breadth. If the caller did not pass in price_data, load the
+    # slim cache that Phase 1 just wrote to S3 so downstream Research still
+    # gets a real breadth reading. If that load fails for any reason, we
+    # OMIT the "breadth" key entirely rather than writing null — Research
+    # has its own fallback and macro_agent reads macro_data.get("breadth", {}),
+    # which only honors the default when the key is missing.
+    if price_data is None:
+        try:
+            s3_read = boto3.client("s3")
+            price_data = load_slim_cache(s3_read, bucket)
+        except Exception as exc:
+            logger.warning("Failed to load slim cache for breadth: %s", exc)
+            price_data = None
+
     if price_data:
         macro["breadth"] = _compute_market_breadth(price_data)
     else:
-        macro["breadth"] = None
+        logger.warning(
+            "No price data available for breadth — omitting breadth key "
+            "(research will fall back to its own computation)"
+        )
 
     macro["fetched_at"] = datetime.now(timezone.utc).isoformat()
 
