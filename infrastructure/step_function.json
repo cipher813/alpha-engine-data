@@ -88,7 +88,7 @@
           "Next": "DataPhase1Wait"
         }
       ],
-      "Default": "HandleFailure"
+      "Default": "ExtractDataPhase1Error"
     },
 
     "DataPhase1Wait": {
@@ -182,7 +182,7 @@
           "Next": "RAGWait"
         }
       ],
-      "Default": "HandleFailure"
+      "Default": "ExtractRAGError"
     },
 
     "RAGWait": {
@@ -237,7 +237,7 @@
           "Next": "DataPhase2"
         }
       ],
-      "Default": "HandleFailure"
+      "Default": "ExtractResearchError"
     },
 
     "DataPhase2": {
@@ -356,7 +356,7 @@
           "Next": "PredictorWait"
         }
       ],
-      "Default": "HandleFailure"
+      "Default": "ExtractPredictorError"
     },
 
     "PredictorWait": {
@@ -483,7 +483,7 @@
           "Next": "BacktesterWait"
         }
       ],
-      "Default": "HandleFailure"
+      "Default": "ExtractBacktesterError"
     },
 
     "BacktesterWait": {
@@ -560,6 +560,66 @@
       },
       "ResultPath": "$.notify_result",
       "End": true
+    },
+
+    "ExtractDataPhase1Error": {
+      "Type": "Pass",
+      "Comment": "Normalize DataPhase1 SSM non-Success poll into $.error so HandleFailure's States.Format template has something to serialize (the soft-failure path from CheckDataPhase1Status.Default does not populate $.error — only Task Catch blocks do).",
+      "Parameters": {
+        "phase": "DataPhase1",
+        "source": "CheckDataPhase1Status.Default",
+        "poll.$": "$.data_phase1_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
+
+    "ExtractRAGError": {
+      "Type": "Pass",
+      "Comment": "Normalize RAGIngestion SSM non-Success poll into $.error.",
+      "Parameters": {
+        "phase": "RAGIngestion",
+        "source": "CheckRAGStatus.Default",
+        "poll.$": "$.rag_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
+
+    "ExtractResearchError": {
+      "Type": "Pass",
+      "Comment": "Normalize Research Lambda soft-failure payload (status != OK) into $.error. Research handler always returns {status, date, error} on the ERROR path so copying the whole Payload is safe and preserves the real traceback string.",
+      "Parameters": {
+        "phase": "Research",
+        "source": "CheckResearchStatus.Default",
+        "payload.$": "$.research_result.Payload"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
+
+    "ExtractPredictorError": {
+      "Type": "Pass",
+      "Comment": "Normalize PredictorTraining SSM non-Success poll into $.error.",
+      "Parameters": {
+        "phase": "PredictorTraining",
+        "source": "CheckPredictorStatus.Default",
+        "poll.$": "$.predictor_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
+
+    "ExtractBacktesterError": {
+      "Type": "Pass",
+      "Comment": "Normalize Backtester SSM non-Success poll into $.error.",
+      "Parameters": {
+        "phase": "Backtester",
+        "source": "CheckBacktesterStatus.Default",
+        "poll.$": "$.backtester_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
     },
 
     "HandleFailure": {
