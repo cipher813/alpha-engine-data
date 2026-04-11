@@ -1,0 +1,70 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ECRAuth",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
+      "Sid": "ECRPush",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:PutImage",
+        "ecr:BatchGetImage",
+        "ecr:DescribeImages",
+        "ecr:DescribeRepositories"
+      ],
+      "Resource": [
+        "arn:aws:ecr:us-east-1:711398986525:repository/alpha-engine-research-runner",
+        "arn:aws:ecr:us-east-1:711398986525:repository/alpha-engine-research-alerts",
+        "arn:aws:ecr:us-east-1:711398986525:repository/alpha-engine-predictor",
+        "arn:aws:ecr:us-east-1:711398986525:repository/alpha-engine-data-collector",
+        "arn:aws:ecr:us-east-1:711398986525:repository/alpha-engine-health-check"
+      ]
+    },
+    {
+      "Sid": "LambdaUpdate",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:UpdateFunctionCode",
+        "lambda:UpdateFunctionConfiguration",
+        "lambda:GetFunction",
+        "lambda:GetFunctionConfiguration",
+        "lambda:PublishVersion",
+        "lambda:UpdateAlias"
+      ],
+      "Resource": [
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-runner",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-alerts",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-inference",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-data-collector",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-health-check"
+      ]
+    },
+    {
+      "Sid": "LambdaInvokeCanary",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:InvokeFunction"
+      ],
+      "Resource": [
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-runner",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-runner:*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-alerts",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-research-alerts:*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-inference",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-predictor-inference:*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-data-collector",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-data-collector:*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-health-check",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-health-check:*"
+      ]
+    }
+  ]
+}
