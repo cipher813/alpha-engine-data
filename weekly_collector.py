@@ -639,7 +639,19 @@ def main() -> None:
     config = load_config(args.config)
     results = run_weekly(config, args)
 
-    if results["status"] == "failed":
+    # Hard-fail on any non-ok status — strict form of the no-silent-fails
+    # rule applied while the system is unstable. `partial` previously exited
+    # 0 which let SSM report Success and the Step Function march forward on
+    # missing/corrupt data. See feedback_hard_fail_until_stable memory for
+    # rationale. Lift this back to == "failed" only after the system is
+    # demonstrably stable (multiple clean Saturday runs in a row).
+    if results["status"] != "ok":
+        logger.error(
+            "Weekly collection finished with non-ok status=%s — exiting 1 "
+            "to halt the pipeline. Per-collector statuses: %s",
+            results["status"],
+            {k: v.get("status", "?") for k, v in results.get("collectors", {}).items()},
+        )
         raise SystemExit(1)
 
 
