@@ -123,11 +123,47 @@ def collect(
             "dates_processed": 0,
             "rows_inserted": 0,
             "skipped": len(eval_dates),
+            "deferred": 0,
+        }
+
+    # Pre-filter dates whose 5d forward window has not yet closed. These are
+    # legitimately not computable yet (we need 5 trading days of forward
+    # prices to measure returns) and will be picked up in a future run — they
+    # are NOT errors. Classifying them as errors produced a spurious `partial`
+    # status that got silently swallowed by the old soft-fail path.
+    today = date.today()
+    deferred = [
+        d for d in dates_to_process
+        if _add_business_days(date.fromisoformat(d), 5) >= today
+    ]
+    deferred_set = set(deferred)
+    dates_to_process = [d for d in dates_to_process if d not in deferred_set]
+
+    if deferred:
+        logger.info(
+            "Deferring %d eval_dates — 5d forward window not yet complete "
+            "(will be picked up in a future run): %s",
+            len(deferred),
+            deferred if len(deferred) <= 5 else f"{deferred[:3]}...+{len(deferred)-3} more",
+        )
+
+    if not dates_to_process:
+        logger.info(
+            "No eval_dates ready to process (%d already in DB, %d deferred)",
+            len(existing), len(deferred),
+        )
+        return {
+            "status": "ok" if not dry_run else "ok_dry_run",
+            "dates_processed": 0,
+            "rows_inserted": 0,
+            "skipped": len(existing),
+            "deferred": len(deferred),
         }
 
     logger.info(
-        "Processing %d eval_dates for universe_returns (%d already exist)",
-        len(dates_to_process), len(existing),
+        "Processing %d eval_dates for universe_returns "
+        "(%d already exist, %d deferred)",
+        len(dates_to_process), len(existing), len(deferred),
     )
 
     total_inserted = 0
@@ -159,14 +195,22 @@ def collect(
         except Exception as e:
             logger.warning("Failed to upload research.db: %s", e)
 
-    status = "ok" if not errors else "partial"
-    if dry_run:
+    # Any real error (exception or "no rows computed" after pre-filter) is a
+    # hard failure under the no-silent-fails rule. The old `partial` path was
+    # being dropped by the Step Function. Deferred dates (5d forward window
+    # not yet complete) are NOT errors — they were pre-filtered out above.
+    if errors:
+        status = "error"
+    elif dry_run:
         status = "ok_dry_run"
+    else:
+        status = "ok"
 
     return {
         "status": status,
         "dates_processed": len(dates_to_process),
         "rows_inserted": total_inserted,
+        "deferred": len(deferred),
         "errors": errors[:20],
     }
 

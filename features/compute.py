@@ -214,7 +214,7 @@ def _apply_daily_delta(
         n_updated += 1
 
     log.info("Applied daily delta: %d tickers updated", n_updated)
-    return price_data
+    return price_data, split_tickers
 
 
 _MACRO_SLIM_KEYS = {
@@ -267,7 +267,7 @@ def _load_prices_and_macro(
         return {}, {}
 
     price_data = dict(slim_data)
-    price_data = _apply_daily_delta(s3, bucket, date_str, price_data)
+    price_data, _split_tickers = _apply_daily_delta(s3, bucket, date_str, price_data)
     macro = _extract_macro(price_data, slim_data)
 
     return price_data, macro
