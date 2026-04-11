@@ -9,6 +9,7 @@ on:
       # (not Lambda) so changes to phase1-only code would still require a
       # separate deploy mechanism — see weekly_collector.py path guard.
       - 'collectors/**'
+      - 'store/**'
       - 'weekly_collector.py'
       - 'polygon_client.py'
       - 'config.py'
