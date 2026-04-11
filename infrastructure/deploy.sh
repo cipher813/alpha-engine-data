@@ -196,45 +196,19 @@ if [ "$CANARY_STATUS" != "OK" ] && [ "$CANARY_STATUS" != "SKIPPED" ]; then
 fi
 echo "  Canary passed (status=$CANARY_STATUS)"
 
-# ── IAM role setup (create if doesn't exist) ──────────────────────────────
-
-echo ""
-echo "Checking IAM role: alpha-engine-data-role..."
-if ! aws iam get-role --role-name "alpha-engine-data-role" --region "$REGION" &>/dev/null; then
-  echo "  Creating IAM role..."
-  aws iam create-role \
-    --role-name "alpha-engine-data-role" \
-    --assume-role-policy-document '{
-      "Version": "2012-10-17",
-      "Statement": [
-        {"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}
-      ]
-    }' --region "$REGION" > /dev/null
-
-  aws iam put-role-policy \
-    --role-name "alpha-engine-data-role" \
-    --policy-name "alpha-engine-data-policy" \
-    --policy-document '{
-      "Version": "2012-10-17",
-      "Statement": [
-        {
-          "Sid": "S3Access",
-          "Effect": "Allow",
-          "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
-          "Resource": ["arn:aws:s3:::alpha-engine-research", "arn:aws:s3:::alpha-engine-research/*"]
-        },
-        {
-          "Sid": "CloudWatchLogs",
-          "Effect": "Allow",
-          "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
-          "Resource": "arn:aws:logs:*:*:*"
-        }
-      ]
-    }' --region "$REGION"
-  echo "  Created alpha-engine-data-role with S3 + CloudWatch access"
-else
-  echo "  Role exists"
-fi
+# NOTE: IAM role `alpha-engine-data-role` is a prerequisite (see header).
+# It currently exists in AWS and is the execution role for the live
+# alpha-engine-data-collector Lambda. A prior version of this script
+# tried to `aws iam get-role` as a "create-if-missing" bootstrap and
+# fell through to CreateRole when the GetRole call lacked permission —
+# masking the permission error as "role not found" (silent fail) and
+# then dying loudly on CreateRole. The github-actions-lambda-deploy
+# role intentionally lacks iam:* permissions (principle of least
+# privilege), so the bootstrap block had been dead code since day one
+# of the auto-deploy path. Provisioning this role is a one-time
+# operation — do it out of band with a privileged principal, ideally
+# by extending infrastructure/iam/ the way #17 did for
+# github-actions-lambda-deploy.
 
 echo ""
 echo "Deployment complete."
