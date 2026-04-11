@@ -12,11 +12,12 @@
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
           "commands": [
+            "set -eo pipefail",
             "cd /home/ec2-user/alpha-engine-data",
+            "git pull --ff-only origin main",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
-            "python weekly_collector.py --phase 1 2>&1 | tee /var/log/data-phase1.log",
-            "echo \"EXIT_CODE=$?\""
+            "python weekly_collector.py --phase 1 2>&1 | tee /var/log/data-phase1.log"
           ],
           "executionTimeout": ["1800"]
         },
@@ -106,11 +107,12 @@
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
           "commands": [
+            "set -eo pipefail",
             "cd /home/ec2-user/alpha-engine-data",
+            "git pull --ff-only origin main",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
-            "bash rag/pipelines/run_weekly_ingestion.sh 2>&1 | tee /var/log/rag-ingestion.log",
-            "echo \"EXIT_CODE=$?\""
+            "bash rag/pipelines/run_weekly_ingestion.sh 2>&1 | tee /var/log/rag-ingestion.log"
           ],
           "executionTimeout": ["1800"]
         },
@@ -279,10 +281,11 @@
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
           "commands": [
+            "set -eo pipefail",
             "cd /home/ec2-user/alpha-engine-predictor",
+            "git pull --ff-only origin main",
             "export HOME=/home/ec2-user",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "set -o pipefail",
             "bash infrastructure/spot_train.sh --full-only 2>&1 | tee /var/log/predictor-training.log"
           ],
           "executionTimeout": ["5400"]
@@ -374,9 +377,11 @@
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
           "commands": [
+            "set -eo pipefail",
             "export HOME=/home/ec2-user",
+            "cd /home/ec2-user/alpha-engine-data && git pull --ff-only origin main",
+            "cd /home/ec2-user/alpha-engine-predictor && git pull --ff-only origin main",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "set -o pipefail",
             "export PYTHONPATH=/home/ec2-user/alpha-engine-predictor",
             "/home/ec2-user/alpha-engine-data/.venv/bin/python -m monitoring.drift_detector --alert 2>&1 | tee /var/log/drift-detection.log"
           ],
@@ -406,10 +411,11 @@
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
           "commands": [
+            "set -eo pipefail",
             "cd /home/ec2-user/alpha-engine-backtester",
+            "git pull --ff-only origin main",
             "export HOME=/home/ec2-user",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "set -o pipefail",
             "bash infrastructure/spot_backtest.sh 2>&1 | tee /var/log/backtester.log"
           ],
           "executionTimeout": ["7200"]
@@ -501,7 +507,9 @@
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
           "commands": [
+            "set -eo pipefail",
             "cd /home/ec2-user/alpha-engine-data",
+            "git pull --ff-only origin main",
             "source .venv/bin/activate",
             "python health_checker.py --alert 2>&1 | tee /var/log/health-check.log"
           ],
