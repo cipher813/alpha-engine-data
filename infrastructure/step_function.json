@@ -13,8 +13,8 @@
         "Parameters": {
           "commands": [
             "set -eo pipefail",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
             "cd /home/ec2-user/alpha-engine-data",
-            "git pull --ff-only origin main",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
             "python weekly_collector.py --phase 1 2>&1 | tee /var/log/data-phase1.log"
@@ -108,8 +108,8 @@
         "Parameters": {
           "commands": [
             "set -eo pipefail",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
             "cd /home/ec2-user/alpha-engine-data",
-            "git pull --ff-only origin main",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
             "bash rag/pipelines/run_weekly_ingestion.sh 2>&1 | tee /var/log/rag-ingestion.log"
@@ -282,8 +282,8 @@
         "Parameters": {
           "commands": [
             "set -eo pipefail",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main",
             "cd /home/ec2-user/alpha-engine-predictor",
-            "git pull --ff-only origin main",
             "export HOME=/home/ec2-user",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "bash infrastructure/spot_train.sh --full-only 2>&1 | tee /var/log/predictor-training.log"
@@ -379,8 +379,8 @@
           "commands": [
             "set -eo pipefail",
             "export HOME=/home/ec2-user",
-            "cd /home/ec2-user/alpha-engine-data && git pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-predictor && git pull --ff-only origin main",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "export PYTHONPATH=/home/ec2-user/alpha-engine-predictor",
             "/home/ec2-user/alpha-engine-data/.venv/bin/python -m monitoring.drift_detector --alert 2>&1 | tee /var/log/drift-detection.log"
@@ -412,8 +412,8 @@
         "Parameters": {
           "commands": [
             "set -eo pipefail",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
             "cd /home/ec2-user/alpha-engine-backtester",
-            "git pull --ff-only origin main",
             "export HOME=/home/ec2-user",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "bash infrastructure/spot_backtest.sh 2>&1 | tee /var/log/backtester.log"
@@ -508,8 +508,8 @@
         "Parameters": {
           "commands": [
             "set -eo pipefail",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
             "cd /home/ec2-user/alpha-engine-data",
-            "git pull --ff-only origin main",
             "source .venv/bin/activate",
             "python health_checker.py --alert 2>&1 | tee /var/log/health-check.log"
           ],
