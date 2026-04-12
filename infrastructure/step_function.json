@@ -508,17 +508,18 @@
         "Parameters": {
           "commands": [
             "set -eo pipefail",
+            "export HOME=/home/ec2-user",
             "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
             "cd /home/ec2-user/alpha-engine-backtester",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
             "python evaluate.py --mode all --upload --log-level INFO 2>&1 | tee /var/log/evaluator.log"
           ],
-          "executionTimeout": ["300"]
+          "executionTimeout": ["1800"]
         },
-        "TimeoutSeconds": 300
+        "TimeoutSeconds": 1800
       },
-      "TimeoutSeconds": 330,
+      "TimeoutSeconds": 1860,
       "Retry": [
         {
           "ErrorEquals": ["States.TaskFailed"],
