@@ -492,14 +492,29 @@ def _finalize(
         duration,
     )
 
-    # Send completion email (non-blocking)
+    # Send completion email.
+    # send_step_email never raises (see emailer.py docstring) — it returns
+    # True/False. The old try/except was dead code, AND the False return
+    # was being silently dropped. If Gmail SMTP AND SES both fail, the
+    # caller needs to know so monitoring isn't blind to a successful run
+    # that silently had no notification.
     if not dry_run and only is None:
-        try:
-            from emailer import send_step_email
-            step_name = f"Data Phase {phase}" if phase else "Data Collection"
-            send_step_email(step_name, results, run_date)
-        except Exception as exc:
-            logger.warning("Step email failed (non-fatal): %s", exc)
+        from emailer import send_step_email
+        step_name = f"Data Phase {phase}" if phase else "Data Collection"
+        sent = send_step_email(step_name, results, run_date)
+        if not sent:
+            # Log at ERROR so CloudWatch alarms (if wired to ERROR-level)
+            # surface the missed email. Not raising because the data
+            # collection itself succeeded — only monitoring is affected.
+            # Downstream Step Function steps can still consume the S3 output.
+            logger.error(
+                "Step email '%s' failed to send — both Gmail SMTP and SES "
+                "fallback returned failure. Monitoring will be blind to "
+                "this run's result summary. Check EMAIL_SENDER, "
+                "EMAIL_RECIPIENTS, GMAIL_APP_PASSWORD env vars and SES "
+                "identity verification.",
+                step_name,
+            )
 
 
 def _write_manifest(bucket: str, s3_prefix: str, run_date: str, results: dict) -> None:
