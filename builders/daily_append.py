@@ -46,27 +46,27 @@ OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume"]
 
 
 def _load_daily_closes(s3, bucket: str, date_str: str) -> dict[str, dict]:
-    """Load today's daily_closes parquet from S3. Returns {ticker: {Open, High, Low, Close, Volume}}."""
+    """Load today's daily_closes parquet from S3. Raises if the file is missing or unreadable."""
     key = f"predictor/daily_closes/{date_str}.parquet"
-    try:
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        buf = io.BytesIO(obj["Body"].read())
-        df = pd.read_parquet(buf, engine="pyarrow")
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    buf = io.BytesIO(obj["Body"].read())
+    df = pd.read_parquet(buf, engine="pyarrow")
 
-        records = {}
-        for ticker, row in df.iterrows():
-            records[str(ticker)] = {
-                "Open": float(row.get("Open", np.nan)),
-                "High": float(row.get("High", np.nan)),
-                "Low": float(row.get("Low", np.nan)),
-                "Close": float(row.get("Close", np.nan)),
-                "Volume": int(row.get("Volume", 0)),
-            }
-        log.info("Loaded daily closes for %s: %d tickers", date_str, len(records))
-        return records
-    except Exception as exc:
-        log.error("Failed to load daily_closes/%s.parquet: %s", date_str, exc)
-        return {}
+    records = {}
+    for ticker, row in df.iterrows():
+        records[str(ticker)] = {
+            "Open": float(row.get("Open", np.nan)),
+            "High": float(row.get("High", np.nan)),
+            "Low": float(row.get("Low", np.nan)),
+            "Close": float(row.get("Close", np.nan)),
+            "Volume": int(row.get("Volume", 0)),
+        }
+    if not records:
+        raise RuntimeError(
+            f"daily_closes/{date_str}.parquet loaded zero tickers — upstream daily_closes collection is broken"
+        )
+    log.info("Loaded daily closes for %s: %d tickers", date_str, len(records))
+    return records
 
 
 def daily_append(
@@ -91,9 +91,8 @@ def daily_append(
     t0 = time.time()
 
     # ── 1. Load today's OHLCV ────────────────────────────────────────────────
+    # _load_daily_closes raises on missing/empty file; no need for status-return guard.
     closes = _load_daily_closes(s3, bucket, date_str)
-    if not closes:
-        return {"status": "error", "error": "no daily_closes for date"}
 
     # ── 2. Load supporting data ──────────────────────────────────────────────
     sector_map = _load_sector_map(s3, bucket)
@@ -115,35 +114,42 @@ def daily_append(
         for key in macro_keys:
             try:
                 mdf = macro_lib.read(key).data
-                if "Close" in mdf.columns:
-                    series = mdf["Close"].dropna()
-                    # Append today's close if available
-                    ticker_close = closes.get(key)
-                    if ticker_close and not np.isnan(ticker_close["Close"]):
-                        new_row = pd.Series(
-                            {"Close": ticker_close["Close"]},
-                            name=today_ts,
-                        )
-                        series = pd.concat([series, pd.Series([ticker_close["Close"]], index=[today_ts])])
-                        series = series[~series.index.duplicated(keep="last")]
-                    macro[key] = series
-            except Exception:
-                log.debug("Macro series %s not in ArcticDB", key)
+            except Exception as exc:
+                if key == "SPY":
+                    raise RuntimeError(
+                        f"SPY macro series unreadable from ArcticDB — cannot compute features: {exc}"
+                    ) from exc
+                log.warning("Macro series %s not in ArcticDB: %s", key, exc)
+                continue
+            if "Close" not in mdf.columns:
+                log.warning("Macro series %s has no Close column", key)
+                continue
+            series = mdf["Close"].dropna()
+            ticker_close = closes.get(key)
+            if ticker_close and not np.isnan(ticker_close["Close"]):
+                series = pd.concat([series, pd.Series([ticker_close["Close"]], index=[today_ts])])
+                series = series[~series.index.duplicated(keep="last")]
+            macro[key] = series
+
+        if "SPY" not in macro:
+            raise RuntimeError("SPY macro series missing after ArcticDB read — cannot compute sector-relative features")
 
         # Sector ETFs
         for sym in macro_lib.list_symbols():
             if sym.startswith("XL"):
                 try:
                     mdf = macro_lib.read(sym).data
-                    if "Close" in mdf.columns:
-                        series = mdf["Close"].dropna()
-                        ticker_close = closes.get(sym)
-                        if ticker_close and not np.isnan(ticker_close["Close"]):
-                            series = pd.concat([series, pd.Series([ticker_close["Close"]], index=[today_ts])])
-                            series = series[~series.index.duplicated(keep="last")]
-                        macro[sym] = series
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.warning("Sector ETF %s unreadable from ArcticDB: %s", sym, exc)
+                    continue
+                if "Close" not in mdf.columns:
+                    continue
+                series = mdf["Close"].dropna()
+                ticker_close = closes.get(sym)
+                if ticker_close and not np.isnan(ticker_close["Close"]):
+                    series = pd.concat([series, pd.Series([ticker_close["Close"]], index=[today_ts])])
+                    series = series[~series.index.duplicated(keep="last")]
+                macro[sym] = series
 
     t_load = time.time() - t0
     log.info("Data loaded in %.1fs: %d closes, %d macro series", t_load, len(closes), len(macro))
@@ -176,9 +182,9 @@ def daily_append(
 
             try:
                 hist = universe_lib.read(ticker).data
-            except Exception:
-                log.debug("Ticker %s not in ArcticDB — skipping", ticker)
-                n_skip += 1
+            except Exception as exc:
+                log.warning("Ticker %s not in ArcticDB: %s", ticker, exc)
+                n_err += 1
                 continue
 
             if len(hist) < MIN_ROWS_FOR_FEATURES:
@@ -246,7 +252,7 @@ def daily_append(
             n_ok += 1
 
         except Exception as exc:
-            log.debug("Failed to append %s: %s", ticker, exc)
+            log.warning("Failed to append %s: %s", ticker, exc)
             n_err += 1
 
     # ── 5. Update macro series ───────────────────────────────────────────────
@@ -262,7 +268,11 @@ def daily_append(
                     new_row.index.name = "date"
                     macro_lib.append(key, new_row)
                 except Exception as exc:
-                    log.debug("Failed to append macro %s: %s", key, exc)
+                    if key == "SPY":
+                        raise RuntimeError(
+                            f"Failed to append SPY macro bar for {date_str}: {exc}"
+                        ) from exc
+                    log.warning("Failed to append macro %s: %s", key, exc)
 
         # Sector ETFs
         for sym in closes:
@@ -277,7 +287,7 @@ def daily_append(
                         new_row.index.name = "date"
                         macro_lib.append(sym, new_row)
                     except Exception as exc:
-                        log.debug("Failed to append macro %s: %s", sym, exc)
+                        log.warning("Failed to append sector ETF %s: %s", sym, exc)
 
     t_total = time.time() - t0
 
@@ -292,7 +302,26 @@ def daily_append(
         "dry_run": dry_run,
     }
 
-    log.info("Daily append complete: %s", json.dumps(result, default=str))
+    log.info(
+        "ArcticDB daily_append: n_ok=%d n_skip=%d n_err=%d (of %d stock tickers, %.1fs total)",
+        n_ok, n_skip, n_err, len(stock_tickers), t_total,
+    )
+
+    # Hard-fail guards — prevent silently returning a no-op as success.
+    # dry_run is exempt because it short-circuits the per-ticker loop.
+    if not dry_run:
+        if n_ok == 0:
+            raise RuntimeError(
+                f"ArcticDB daily_append wrote zero tickers "
+                f"(n_skip={n_skip} n_err={n_err} of {len(stock_tickers)}) — treating as pipeline failure"
+            )
+        err_rate = n_err / max(len(stock_tickers), 1)
+        if err_rate > 0.05:
+            raise RuntimeError(
+                f"ArcticDB daily_append error rate {err_rate:.1%} exceeds 5% threshold "
+                f"(n_ok={n_ok} n_err={n_err} of {len(stock_tickers)}) — treating as pipeline failure"
+            )
+
     return result
 
 
