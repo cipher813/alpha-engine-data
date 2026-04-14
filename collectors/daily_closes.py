@@ -53,12 +53,18 @@ def collect(
     # Check if already written for this date
     key = f"{s3_prefix}{run_date}.parquet"
     if not dry_run:
+        from botocore.exceptions import ClientError
         try:
             s3.head_object(Bucket=bucket, Key=key)
             logger.info("Daily closes already exist for %s — skipping", run_date)
             return {"status": "ok", "tickers_captured": 0, "skipped": True}
-        except Exception:
-            pass  # Not found — proceed
+        except ClientError as exc:
+            err_code = exc.response.get("Error", {}).get("Code")
+            if err_code not in ("404", "NoSuchKey"):
+                # Auth failure, throttling, or network — not "file doesn't exist".
+                # Don't silently paper over it.
+                raise
+            # 404/NoSuchKey: expected case — file doesn't exist, proceed to write.
 
     if not tickers:
         return {"status": "error", "error": "no tickers provided"}
@@ -206,7 +212,7 @@ def _fetch_yfinance_closes(
                     })
                     count += 1
                 except Exception as e:
-                    logger.debug("yfinance close extract failed for %s: %s", ticker, e)
+                    logger.warning("yfinance close extract failed for %s: %s", ticker, e)
         except Exception as e:
             logger.warning("yfinance batch failed: %s", e)
 
