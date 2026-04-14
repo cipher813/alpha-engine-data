@@ -70,12 +70,20 @@ def execute_batch(sql: str, params_list: list[tuple]) -> None:
 
 
 def is_available() -> bool:
-    """Check if the RAG database is reachable. Never raises."""
+    """Check if the RAG database is reachable. Never raises.
+
+    NOTE (2026-04-14): currently has zero callers inside alpha-engine-data.
+    The ingestion pipelines call ``get_connection()`` directly, which
+    hard-fails on connect errors (correct behavior while the system is
+    unstable). Kept in the module in case retrieval-side consumers want
+    a non-raising probe; flag for deletion if still unused after the
+    cross-repo audit completes.
+    """
     try:
         with get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
         return True
     except Exception as e:
-        logger.debug("RAG database unavailable: %s", e)
+        logger.warning("RAG database unavailable: %s", e)
         return False

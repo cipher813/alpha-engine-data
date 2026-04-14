@@ -149,7 +149,11 @@ def _download_and_extract(url: str) -> str | None:
         # 8-Ks are typically short; cap at 15K chars
         return text[:15000] if len(text) > 15000 else text
     except Exception as e:
-        logger.debug("8-K download failed from %s: %s", url, e)
+        # Per-URL download failure: visible at WARNING so the rate of
+        # failures can be monitored in SSM logs. Caller treats None as
+        # "skip this filing" and continues; aggregated across all 8-Ks
+        # the caller already reports counts, so there's no hidden drift.
+        logger.warning("8-K download failed from %s: %s", url, e)
         return None
 
 
