@@ -403,7 +403,7 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         )
         results["collectors"]["features"] = fs_result
     except Exception as e:
-        logger.error("Feature store compute failed: %s", e)
+        logger.exception("Feature store compute failed")
         results["collectors"]["features"] = {"status": "error", "error": str(e)}
 
     # ── ArcticDB daily append ────────────────────────────────────────────────
@@ -419,7 +419,7 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         )
         results["collectors"]["arcticdb"] = arctic_result
     except Exception as e:
-        logger.error("ArcticDB daily append failed: %s", e)
+        logger.exception("ArcticDB daily append failed")
         results["collectors"]["arcticdb"] = {"status": "error", "error": str(e)}
 
     results["completed_at"] = datetime.now(timezone.utc).isoformat()
