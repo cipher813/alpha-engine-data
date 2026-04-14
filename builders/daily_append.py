@@ -307,14 +307,16 @@ def daily_append(
         n_ok, n_skip, n_err, len(stock_tickers), t_total,
     )
 
-    # Hard-fail guards — prevent silently returning a no-op as success.
+    # Hard-fail on high error rate. ``n_ok == 0`` alone is NOT a failure
+    # signal — it correctly occurs when every ticker hit the
+    # "today already in ArcticDB" skip path (a second same-day invocation,
+    # or a Step Function retry that runs after the first one succeeded).
+    # The real silent-fail we're guarding against (ArcticDB-wide auth /
+    # connectivity failure making every read throw) now registers as
+    # ``n_err`` rather than ``n_skip`` after PR #24, so the 5% error-rate
+    # threshold catches it without false positives on no-op reruns.
     # dry_run is exempt because it short-circuits the per-ticker loop.
     if not dry_run:
-        if n_ok == 0:
-            raise RuntimeError(
-                f"ArcticDB daily_append wrote zero tickers "
-                f"(n_skip={n_skip} n_err={n_err} of {len(stock_tickers)}) — treating as pipeline failure"
-            )
         err_rate = n_err / max(len(stock_tickers), 1)
         if err_rate > 0.05:
             raise RuntimeError(
