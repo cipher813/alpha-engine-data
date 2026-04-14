@@ -14,4 +14,4 @@ voyageai>=0.3
 jsonschema>=4.20
 arcticdb>=6.11
 # flow-doctor is pulled in transitively via alpha-engine-lib[flow_doctor].
-alpha-engine-lib[arcticdb,flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.1.0
+alpha-engine-lib[arcticdb,flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.1.1
