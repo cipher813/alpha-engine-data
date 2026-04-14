@@ -43,6 +43,10 @@ class DataPreflight(BasePreflight):
         self.check_s3_bucket()
 
         if self.mode == "daily":
-            # 4-day threshold would have caught the 2026-04-14 bug
-            # (ArcticDB silently not writing) by 2026-04-17.
-            self.check_arcticdb_fresh("universe", "SPY", max_stale_days=4)
+            # SPY lives in the `macro` library (market-wide series). The
+            # `universe` library holds per-stock OHLCV for S&P 500/400
+            # constituents. daily_append writes to both libraries, so
+            # macro/SPY freshness is a sufficient signal for the write
+            # path being healthy end-to-end.
+            # 4-day threshold covers Fri→Tue long weekends + 1 day of buffer.
+            self.check_arcticdb_fresh("macro", "SPY", max_stale_days=4)
