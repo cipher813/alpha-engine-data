@@ -127,8 +127,8 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
             if existing:
                 tickers = existing.get("tickers", [])
                 logger.info("Loaded %d tickers from existing constituents.json", len(tickers))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("S3 constituents load failed — will fall back to Wikipedia: %s", exc)
 
     # ── 2. Price cache refresh ───────────────────────────────────────────────
     if only in (None, "prices"):
@@ -360,14 +360,14 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         if existing:
             tickers = existing.get("tickers", [])
             logger.info("Loaded %d tickers from S3 constituents", len(tickers))
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("S3 constituents load failed — will try Wikipedia fallback: %s", exc)
     if not tickers:
         try:
             tickers, _, _, _, _ = constituents._fetch_constituents()
             logger.info("Loaded %d tickers from Wikipedia (S3 fallback)", len(tickers))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error("Wikipedia constituents fallback failed: %s", exc)
 
     if not tickers:
         logger.error("No tickers available for daily closes")

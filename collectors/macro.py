@@ -298,15 +298,18 @@ def _compute_market_breadth(price_data: dict[str, pd.DataFrame]) -> dict:
 
 
 def load_from_s3(bucket: str, s3_prefix: str = "market_data/") -> dict | None:
-    """Load the latest macro.json from S3. Returns None if not found."""
+    """Load the latest macro.json from S3. Returns None if the pointer is missing; raises on unexpected errors."""
+    from botocore.exceptions import ClientError
     s3 = boto3.client("s3")
     try:
         resp = s3.get_object(Bucket=bucket, Key=f"{s3_prefix}latest_weekly.json")
-        pointer = json.loads(resp["Body"].read())
-        date = pointer.get("date")
-        if not date:
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
             return None
-        resp = s3.get_object(Bucket=bucket, Key=f"{s3_prefix}weekly/{date}/macro.json")
-        return json.loads(resp["Body"].read())
-    except Exception:
+        raise
+    pointer = json.loads(resp["Body"].read())
+    date = pointer.get("date")
+    if not date:
         return None
+    resp = s3.get_object(Bucket=bucket, Key=f"{s3_prefix}weekly/{date}/macro.json")
+    return json.loads(resp["Body"].read())
