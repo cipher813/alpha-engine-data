@@ -39,6 +39,89 @@ from collectors import constituents, prices, slim_cache, macro, universe_returns
 logger = logging.getLogger(__name__)
 
 
+def _preflight(config: dict, mode: str) -> None:
+    """
+    Fast connectivity + env-var checks before any real work starts.
+
+    Raises RuntimeError on failure so ``main()`` exits non-zero and
+    flow-doctor captures the error. Kept deliberately scoped to
+    external-world handshakes (S3, ArcticDB, env vars) — correctness of
+    downstream data is still enforced by the hardened collectors
+    themselves. See ROADMAP / project_arcticdb_not_deployed for why this
+    exists: 2026-04-14 found that daily_append had been silently not
+    writing for two weekdays because the ArcticDB auth/import was failing
+    without surfacing. A freshness check on SPY would have caught it in
+    ~1s instead of ~2 weeks.
+
+    ``mode``: ``"daily"``, ``"phase1"``, or ``"phase2"`` — scopes checks
+    to what that run actually needs.
+    """
+    logger.info("Pre-flight checks (mode=%s)...", mode)
+
+    # ── Required env vars ────────────────────────────────────────────────
+    required_env = ["AWS_REGION"]
+    if mode == "phase1":
+        required_env += ["FRED_API_KEY", "POLYGON_API_KEY"]
+    elif mode == "phase2":
+        required_env += ["FMP_API_KEY", "EDGAR_IDENTITY"]
+    missing = [v for v in required_env if not os.environ.get(v)]
+    if missing:
+        raise RuntimeError(f"Pre-flight: required env vars missing: {missing}")
+
+    # ── S3 bucket reachable ──────────────────────────────────────────────
+    bucket = config.get("bucket")
+    if not bucket:
+        raise RuntimeError("Pre-flight: config['bucket'] missing")
+    try:
+        boto3.client("s3").head_bucket(Bucket=bucket)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Pre-flight: S3 bucket {bucket!r} unreachable: {exc}"
+        ) from exc
+
+    # ── ArcticDB freshness (daily mode only — the failure we just hit) ───
+    if mode == "daily":
+        try:
+            import arcticdb as adb
+            import pandas as pd
+        except ImportError as exc:
+            raise RuntimeError(
+                f"Pre-flight: arcticdb not importable — deploy image is missing the dep: {exc}"
+            ) from exc
+
+        region = os.environ.get("AWS_REGION", "us-east-1")
+        uri = f"s3s://s3.{region}.amazonaws.com:{bucket}?path_prefix=arcticdb&aws_auth=true"
+        try:
+            universe = adb.Arctic(uri).get_library("universe")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Pre-flight: ArcticDB universe library unreachable: {exc}"
+            ) from exc
+
+        try:
+            spy_df = universe.read("SPY").data
+        except Exception as exc:
+            raise RuntimeError(
+                f"Pre-flight: ArcticDB SPY read failed: {exc}"
+            ) from exc
+
+        if spy_df.empty:
+            raise RuntimeError("Pre-flight: ArcticDB SPY series is empty")
+
+        last_date = pd.Timestamp(spy_df.index[-1]).tz_localize(None) \
+            if getattr(spy_df.index[-1], "tzinfo", None) else pd.Timestamp(spy_df.index[-1])
+        today = pd.Timestamp(datetime.now(timezone.utc).date())
+        age_days = (today - last_date).days
+        # 4-day threshold covers Fri → Tue (long weekends) with 1 day of buffer.
+        if age_days > 4:
+            raise RuntimeError(
+                f"Pre-flight: ArcticDB SPY last date {last_date.date()} is "
+                f"{age_days} days stale (threshold 4) — daily_append is not writing"
+            )
+
+    logger.info("Pre-flight OK (mode=%s)", mode)
+
+
 def load_config(path: str = "config.yaml") -> dict:
     """Load config.yaml from config repo or local fallback."""
     # Search config repo first, then local
@@ -652,6 +735,12 @@ def main() -> None:
     logging.getLogger().setLevel(getattr(logging, args.log_level))
 
     config = load_config(args.config)
+
+    # Pre-flight: fail fast and loud on env / connectivity drift before
+    # starting 30 minutes of collection work.
+    mode = "daily" if args.daily else f"phase{args.phase or 1}"
+    _preflight(config, mode)
+
     results = run_weekly(config, args)
 
     # Hard-fail on any non-ok status — strict form of the no-silent-fails
