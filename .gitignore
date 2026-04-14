@@ -1,6 +1,11 @@
 # Config (contains bucket names, API keys)
 config.yaml
 
+# Flow Doctor config — references repo names + secrets via env var substitution.
+# The real file is staged from alpha-engine-config at deploy time (or copied
+# from flow-doctor.yaml.example locally).
+flow-doctor.yaml
+
 # Python
 __pycache__/
 *.pyc

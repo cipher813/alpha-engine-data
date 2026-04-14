@@ -13,3 +13,4 @@ psycopg2-binary>=2.9
 voyageai>=0.3
 jsonschema>=4.20
 arcticdb>=6.11
+flow-doctor[diagnosis]>=0.3.0,<0.4.0
