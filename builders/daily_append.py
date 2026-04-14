@@ -115,15 +115,13 @@ def daily_append(
             try:
                 mdf = macro_lib.read(key).data
             except Exception as exc:
-                if key == "SPY":
-                    raise RuntimeError(
-                        f"SPY macro series unreadable from ArcticDB — cannot compute features: {exc}"
-                    ) from exc
-                log.warning("Macro series %s not in ArcticDB: %s", key, exc)
-                continue
+                raise RuntimeError(
+                    f"Macro series {key} unreadable from ArcticDB — features depend on all macro inputs: {exc}"
+                ) from exc
             if "Close" not in mdf.columns:
-                log.warning("Macro series %s has no Close column", key)
-                continue
+                raise RuntimeError(
+                    f"Macro series {key} has no Close column — ArcticDB schema drift"
+                )
             series = mdf["Close"].dropna()
             ticker_close = closes.get(key)
             if ticker_close and not np.isnan(ticker_close["Close"]):
@@ -131,19 +129,21 @@ def daily_append(
                 series = series[~series.index.duplicated(keep="last")]
             macro[key] = series
 
-        if "SPY" not in macro:
-            raise RuntimeError("SPY macro series missing after ArcticDB read — cannot compute sector-relative features")
-
-        # Sector ETFs
+        # Sector ETFs — every XL* in the macro library must read cleanly.
+        # Missing any one corrupts sector-relative features for stocks in
+        # that sector.
         for sym in macro_lib.list_symbols():
             if sym.startswith("XL"):
                 try:
                     mdf = macro_lib.read(sym).data
                 except Exception as exc:
-                    log.warning("Sector ETF %s unreadable from ArcticDB: %s", sym, exc)
-                    continue
+                    raise RuntimeError(
+                        f"Sector ETF {sym} unreadable from ArcticDB: {exc}"
+                    ) from exc
                 if "Close" not in mdf.columns:
-                    continue
+                    raise RuntimeError(
+                        f"Sector ETF {sym} has no Close column — ArcticDB schema drift"
+                    )
                 series = mdf["Close"].dropna()
                 ticker_close = closes.get(sym)
                 if ticker_close and not np.isnan(ticker_close["Close"]):
@@ -268,11 +268,9 @@ def daily_append(
                     new_row.index.name = "date"
                     macro_lib.append(key, new_row)
                 except Exception as exc:
-                    if key == "SPY":
-                        raise RuntimeError(
-                            f"Failed to append SPY macro bar for {date_str}: {exc}"
-                        ) from exc
-                    log.warning("Failed to append macro %s: %s", key, exc)
+                    raise RuntimeError(
+                        f"Failed to append macro {key} bar for {date_str}: {exc}"
+                    ) from exc
 
         # Sector ETFs
         for sym in closes:
@@ -287,7 +285,9 @@ def daily_append(
                         new_row.index.name = "date"
                         macro_lib.append(sym, new_row)
                     except Exception as exc:
-                        log.warning("Failed to append sector ETF %s: %s", sym, exc)
+                        raise RuntimeError(
+                            f"Failed to append sector ETF {sym} bar for {date_str}: {exc}"
+                        ) from exc
 
     t_total = time.time() - t0
 
