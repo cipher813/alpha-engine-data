@@ -476,7 +476,7 @@
         {
           "Variable": "$.backtester_poll.Status",
           "StringEquals": "Success",
-          "Next": "SaturdayHealthCheck"
+          "Next": "Evaluator"
         },
         {
           "Variable": "$.backtester_poll.Status",
@@ -496,6 +496,115 @@
       "Type": "Wait",
       "Seconds": 60,
       "Next": "WaitForBacktester"
+    },
+
+    "Evaluator": {
+      "Type": "Task",
+      "Comment": "Signal quality, attribution, grading, config optimization. Runs on always-on EC2 (not spot) — reads simulation artifacts from S3. Split from Backtester step on 2026-04-12 so eval can run at a different cadence.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "commands": [
+            "set -eo pipefail",
+            "export HOME=/home/ec2-user",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+            "cd /home/ec2-user/alpha-engine-backtester",
+            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "source .venv/bin/activate",
+            "python evaluate.py --mode all --upload --log-level INFO 2>&1 | tee /var/log/evaluator.log"
+          ],
+          "executionTimeout": ["1800"]
+        },
+        "TimeoutSeconds": 1800
+      },
+      "TimeoutSeconds": 1860,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.evaluator_result",
+      "Next": "WaitForEvaluator"
+    },
+
+    "WaitForEvaluator": {
+      "Type": "Task",
+      "Comment": "Poll SSM command until evaluator complete",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.evaluator_result.Command.CommandId",
+        "InstanceId.$": "$.ec2_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.InvocationDoesNotExistException"],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.evaluator_poll",
+      "Next": "CheckEvaluatorStatus"
+    },
+
+    "CheckEvaluatorStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.evaluator_poll.Status",
+          "StringEquals": "Success",
+          "Next": "SaturdayHealthCheck"
+        },
+        {
+          "Variable": "$.evaluator_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "EvaluatorWait"
+        },
+        {
+          "Variable": "$.evaluator_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "EvaluatorWait"
+        }
+      ],
+      "Default": "ExtractEvaluatorError"
+    },
+
+    "EvaluatorWait": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "WaitForEvaluator"
+    },
+
+    "ExtractEvaluatorError": {
+      "Type": "Pass",
+      "Comment": "Normalize Evaluator SSM non-Success poll into $.error.",
+      "Result": {},
+      "ResultPath": "$.error",
+      "Parameters": {
+        "phase": "Evaluator",
+        "source": "CheckEvaluatorStatus.Default",
+        "poll.$": "$.evaluator_poll"
+      },
+      "Next": "HandleFailure"
     },
 
     "SaturdayHealthCheck": {
