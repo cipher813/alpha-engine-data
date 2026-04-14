@@ -1,9 +1,15 @@
 FROM --platform=linux/amd64 public.ecr.aws/lambda/python:3.12
 
-# Install dependencies (exclude boto3/botocore — pre-installed in Lambda)
+# Install dependencies (exclude boto3/botocore — pre-installed in Lambda).
+# alpha-engine-lib is excluded because the Phase 2 Lambda handler (lambda/handler.py)
+# doesn't import from it — only weekly_collector.main() (the EC2 entry point) does.
+# Including it would require wiring a GitHub PAT into the Docker build as a secret,
+# which is ceremony for zero benefit here. If a future Phase 2 change imports from
+# alpha-engine-lib, remove this filter and add --mount=type=secret,id=lib_token
+# plus the matching deploy.yml build-secrets wiring.
 COPY requirements.txt ${LAMBDA_TASK_ROOT}/
 RUN pip install --no-cache-dir \
-    $(grep -vE "^#|^$|^pytest|^python-dotenv|^boto3|^botocore|^s3transfer" requirements.txt) \
+    $(grep -vE "^#|^$|^pytest|^python-dotenv|^boto3|^botocore|^s3transfer|^alpha-engine-lib" requirements.txt) \
     && rm -rf /root/.cache/pip
 
 # Copy application code
