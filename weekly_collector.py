@@ -647,11 +647,21 @@ def main() -> None:
     args = _parse_args()
     _load_dotenv()
 
-    from log_config import setup_logging
-    setup_logging("data-collector")
+    from alpha_engine_lib.logging import setup_logging
+    setup_logging(
+        "data-collector",
+        flow_doctor_yaml=str(Path(__file__).parent / "flow-doctor.yaml"),
+    )
     logging.getLogger().setLevel(getattr(logging, args.log_level))
 
     config = load_config(args.config)
+
+    # Pre-flight: fail fast on env / connectivity drift before starting
+    # the real collection work. See alpha-engine-lib/README.md.
+    from preflight import DataPreflight
+    mode = "daily" if args.daily else f"phase{args.phase or 1}"
+    DataPreflight(config["bucket"], mode).run()
+
     results = run_weekly(config, args)
 
     # Hard-fail on any non-ok status — strict form of the no-silent-fails
