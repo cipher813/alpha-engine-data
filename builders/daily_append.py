@@ -248,7 +248,15 @@ def daily_append(
 
             today_row.index.name = "date"
 
-            universe_lib.append(ticker, today_row)
+            # Use update() rather than append() so a re-run on the same
+            # date overwrites instead of accumulating duplicate rows.
+            # 2026-04-15: diagnosed as root cause of the predictor training
+            # failure where 904/909 tickers had duplicate date rows when
+            # read back from ArcticDB. The read-check at line 195 was the
+            # only dedup guard; a race or concurrent pipeline invocation
+            # defeats it. update() is idempotent — same-date rows replace
+            # instead of append, regardless of race conditions.
+            universe_lib.update(ticker, today_row)
             n_ok += 1
 
         except Exception as exc:
@@ -256,6 +264,9 @@ def daily_append(
             n_err += 1
 
     # ── 5. Update macro series ───────────────────────────────────────────────
+    # update() semantics: same-date rows overwrite instead of appending. See
+    # commentary at the universe_lib.update() call above for the 2026-04-15
+    # duplicate-row diagnosis.
     if not dry_run:
         for key in macro_keys:
             bar = closes.get(key)
@@ -266,10 +277,10 @@ def daily_append(
                         index=pd.DatetimeIndex([today_ts]),
                     )
                     new_row.index.name = "date"
-                    macro_lib.append(key, new_row)
+                    macro_lib.update(key, new_row)
                 except Exception as exc:
                     raise RuntimeError(
-                        f"Failed to append macro {key} bar for {date_str}: {exc}"
+                        f"Failed to update macro {key} bar for {date_str}: {exc}"
                     ) from exc
 
         # Sector ETFs
@@ -283,10 +294,10 @@ def daily_append(
                             index=pd.DatetimeIndex([today_ts]),
                         )
                         new_row.index.name = "date"
-                        macro_lib.append(sym, new_row)
+                        macro_lib.update(sym, new_row)
                     except Exception as exc:
                         raise RuntimeError(
-                            f"Failed to append sector ETF {sym} bar for {date_str}: {exc}"
+                            f"Failed to update sector ETF {sym} bar for {date_str}: {exc}"
                         ) from exc
 
     t_total = time.time() - t0
