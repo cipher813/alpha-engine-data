@@ -40,3 +40,33 @@ def test_macro_lib_uses_update_not_append():
     assert "macro_lib.update(sym, new_row)" in src
     assert "macro_lib.append(key," not in src
     assert "macro_lib.append(sym," not in src
+
+
+def test_macro_missing_keys_raise():
+    """Missing macro key from today's closes must hard-fail, not silently skip.
+
+    Regression for 2026-04-15: daily_append returned status='ok' despite
+    macro/SPY going 5 days stale because closes.get('SPY') returned None
+    and the old code silently skipped the update. Pipeline claimed success,
+    inference preflight caught the staleness only after the fact.
+    """
+    src = _source()
+    # Must have the missing-keys tracker + raise
+    assert "macro_missing_from_closes" in src
+    assert "Macro/sector-ETF keys missing" in src
+
+
+def test_macro_verification_readback_present():
+    """After update(), the code must verify today landed in macro_lib."""
+    src = _source()
+    assert "verification_failures" in src
+    assert "Macro update verification failed" in src
+    assert "macro_updated + sector_updated" in src
+
+
+def test_sector_etfs_iterate_explicit_list():
+    """Sector ETF iteration must use explicit list (so missing keys surface)."""
+    src = _source()
+    # Old code: `for sym in closes: if sym.startswith("XL")` — missing keys
+    # silently don't iterate. New code: explicit list.
+    assert 'sector_etfs = ["XLB"' in src or 'sector_etfs = [\n' in src

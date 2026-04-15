@@ -267,38 +267,106 @@ def daily_append(
     # update() semantics: same-date rows overwrite instead of appending. See
     # commentary at the universe_lib.update() call above for the 2026-04-15
     # duplicate-row diagnosis.
+    #
+    # Per feedback_hard_fail_until_stable: count which keys got updated vs
+    # silently skipped due to missing closes data, verify the writes actually
+    # landed, and raise with a named reject list if anything went missing.
+    # Previous behavior: if closes.get(key) returned None (upstream collection
+    # gap), the update was silently skipped. Combined with stock tickers all
+    # hitting the "today already exists" skip path after a backfill, a run
+    # could return status="ok" with ZERO data actually written. 2026-04-15
+    # 08:39 PT manual rerun reproduced this — Step Function marked SUCCEEDED,
+    # macro/SPY stayed at 4/10 for 5 days until an inference-side preflight
+    # caught it.
+    macro_missing_from_closes: list[str] = []
+    macro_updated: list[str] = []
+    sector_updated: list[str] = []
+
     if not dry_run:
         for key in macro_keys:
             bar = closes.get(key)
-            if bar and not np.isnan(bar.get("Close", np.nan)):
-                try:
-                    new_row = pd.DataFrame(
-                        [{"Close": bar["Close"]}],
-                        index=pd.DatetimeIndex([today_ts]),
-                    )
-                    new_row.index.name = "date"
-                    macro_lib.update(key, new_row)
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"Failed to update macro {key} bar for {date_str}: {exc}"
-                    ) from exc
+            if bar is None or np.isnan(bar.get("Close", np.nan)):
+                macro_missing_from_closes.append(key)
+                continue
+            try:
+                new_row = pd.DataFrame(
+                    [{"Close": bar["Close"]}],
+                    index=pd.DatetimeIndex([today_ts]),
+                )
+                new_row.index.name = "date"
+                macro_lib.update(key, new_row)
+                macro_updated.append(key)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to update macro {key} bar for {date_str}: {exc}"
+                ) from exc
 
-        # Sector ETFs
-        for sym in closes:
-            if sym.startswith("XL") and len(sym) <= 4:
-                bar = closes[sym]
-                if not np.isnan(bar.get("Close", np.nan)):
-                    try:
-                        new_row = pd.DataFrame(
-                            [{"Close": bar["Close"]}],
-                            index=pd.DatetimeIndex([today_ts]),
-                        )
-                        new_row.index.name = "date"
-                        macro_lib.update(sym, new_row)
-                    except Exception as exc:
-                        raise RuntimeError(
-                            f"Failed to update sector ETF {sym} bar for {date_str}: {exc}"
-                        ) from exc
+        # Sector ETFs — iterate the expected list explicitly rather than
+        # filtering closes.keys(), so a missing XL* key surfaces as a loud
+        # reject instead of a silent skip.
+        sector_etfs = ["XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
+                       "XLP", "XLRE", "XLU", "XLV", "XLY"]
+        for sym in sector_etfs:
+            bar = closes.get(sym)
+            if bar is None or np.isnan(bar.get("Close", np.nan)):
+                macro_missing_from_closes.append(sym)
+                continue
+            try:
+                new_row = pd.DataFrame(
+                    [{"Close": bar["Close"]}],
+                    index=pd.DatetimeIndex([today_ts]),
+                )
+                new_row.index.name = "date"
+                macro_lib.update(sym, new_row)
+                sector_updated.append(sym)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to update sector ETF {sym} bar for {date_str}: {exc}"
+                ) from exc
+
+        # Hard-fail on any missing key — macro inputs are not optional.
+        # downstream feature compute + predictor preflight both depend on
+        # these being fresh.
+        if macro_missing_from_closes:
+            raise RuntimeError(
+                f"Macro/sector-ETF keys missing from today's daily_closes "
+                f"parquet: {macro_missing_from_closes}. Upstream daily_closes "
+                f"collection (polygon → FRED → yfinance fallback chain) did "
+                f"not produce bars for these tickers on {date_str}. Macro "
+                f"data is critical for downstream inference (SPY for "
+                f"return_vs_spy_5d, VIX for vix_level, sector ETFs for "
+                f"sector-relative features). Fix the upstream collection "
+                f"before claiming pipeline success."
+            )
+
+        # Verify writes landed. The update() call above is fire-and-forget
+        # (no return value surfaces a success flag), so we read back the
+        # latest row for each key we claimed to update. If the readback
+        # doesn't show today's date, something between update() and commit
+        # silently dropped the write — the 2026-04-15 failure mode where
+        # Step Function reported SUCCEEDED and macro stayed 5 days stale.
+        verification_failures: list[tuple[str, str]] = []
+        for key in macro_updated + sector_updated:
+            try:
+                readback = macro_lib.read(key).data
+            except Exception as exc:
+                verification_failures.append((key, f"readback error: {exc}"))
+                continue
+            if readback.empty:
+                verification_failures.append((key, "readback empty"))
+                continue
+            last_ts = pd.Timestamp(readback.index[-1]).normalize()
+            if last_ts != today_ts.normalize():
+                verification_failures.append(
+                    (key, f"last date {last_ts.date()} != expected {today_ts.date()}")
+                )
+        if verification_failures:
+            raise RuntimeError(
+                f"Macro update verification failed for {date_str}: "
+                f"{verification_failures}. update() calls completed without "
+                f"exception but readback shows stale data. Investigate "
+                f"ArcticDB commit / consistency semantics."
+            )
 
     t_total = time.time() - t0
 
@@ -314,8 +382,12 @@ def daily_append(
     }
 
     log.info(
-        "ArcticDB daily_append: n_ok=%d n_skip=%d n_err=%d (of %d stock tickers, %.1fs total)",
-        n_ok, n_skip, n_err, len(stock_tickers), t_total,
+        "ArcticDB daily_append: stocks n_ok=%d n_skip=%d n_err=%d (of %d) | "
+        "macro_updated=%d sector_updated=%d | %.1fs total",
+        n_ok, n_skip, n_err, len(stock_tickers),
+        len(macro_updated) if not dry_run else 0,
+        len(sector_updated) if not dry_run else 0,
+        t_total,
     )
 
     # Hard-fail on high error rate. ``n_ok == 0`` alone is NOT a failure
