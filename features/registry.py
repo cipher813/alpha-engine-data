@@ -85,6 +85,14 @@ CATALOG: list[FeatureEntry] = [
     FeatureEntry("iv_rank", "alternative", "IV percentile rank (0-1)", source="yfinance", refresh="weekly"),
     FeatureEntry("iv_vs_rv", "alternative", "Implied vol / realized vol ratio", source="yfinance", refresh="weekly"),
 
+    # ── v3.1 technical additions — horizon + decomposition + reversal-native ──
+    FeatureEntry("return_60d", "technical", "60-day price return (Close_t / Close_{t-60} - 1)", source="yfinance", refresh="daily"),
+    FeatureEntry("return_120d", "technical", "120-day price return (Close_t / Close_{t-120} - 1)", source="yfinance", refresh="daily"),
+    FeatureEntry("overnight_return_5d", "technical", "5d sum of overnight returns (Open_t vs Close_{t-1})", source="yfinance", refresh="daily"),
+    FeatureEntry("intraday_return_5d", "technical", "5d sum of intraday returns (Close_t vs Open_t)", source="yfinance", refresh="daily"),
+    FeatureEntry("dist_from_5d_high", "technical", "(Close - 5d rolling max High) / 5d rolling max High", source="yfinance", refresh="daily"),
+    FeatureEntry("dist_from_20d_high", "technical", "(Close - 20d rolling max High) / 20d rolling max High", source="yfinance", refresh="daily"),
+
     # ── Fundamental (8) — quarterly financials ────────────────────────────────
     FeatureEntry("pe_ratio", "fundamental", "Trailing P/E ratio, normalized (PE / 30)", source="fmp", refresh="quarterly"),
     FeatureEntry("pb_ratio", "fundamental", "Price-to-book ratio, normalized (PB / 5)", source="fmp", refresh="quarterly"),

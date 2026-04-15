@@ -120,6 +120,17 @@ FEATURES = [
     "gross_margin",
     "roe",
     "current_ratio",
+    # v3.1 additions — longer-horizon + overnight/intraday decomposition +
+    # reversal-native signals. Predictor ROADMAP P2: collapse FLAT +
+    # test whether 5d is reversal or momentum regime. 2026-04-15: neutral
+    # names chosen — meta ridge coefficient sign determines whether the
+    # feature behaves as reversal (positive coef) or momentum (negative).
+    "return_60d",
+    "return_120d",
+    "overnight_return_5d",
+    "intraday_return_5d",
+    "dist_from_5d_high",
+    "dist_from_20d_high",
 ]
 
 MIN_ROWS_FOR_FEATURES = 265  # 252 warmup + buffer
@@ -271,6 +282,55 @@ def compute_features(
     # ── 5-day momentum ─────────────────────────────────────────────────────────
     _mom_short = _FC["momentum_short"]
     df["momentum_5d"] = (close / close.shift(_mom_short)) - 1.0
+
+    # ── v3.1: Longer-horizon returns ──────────────────────────────────────────
+    # ROADMAP P2 diagnostic — test whether 5d is the right label horizon.
+    # Neutral naming: meta ridge coefficient sign determines reversal vs
+    # momentum regime. Positive coef → reversal (high past returns predict
+    # negative future returns). Negative coef → momentum persists at this
+    # horizon.
+    df["return_60d"] = (close / close.shift(60)) - 1.0
+    df["return_120d"] = (close / close.shift(120)) - 1.0
+
+    # ── v3.1: Overnight / intraday decomposition ──────────────────────────────
+    # Lou/Polk/Skouras 2019 "A Tug of War": overnight returns
+    # (Open_t vs Close_{t-1}) have been historically persistent and positive
+    # (earnings, news, macro), while intraday returns (Close_t vs Open_t)
+    # have been noisier and often negative (microstructure, flow). Total
+    # 5d return = overnight_5d + intraday_5d (approximately — compounding
+    # differences are small at 5d horizons and this additive sum is the
+    # form used in the source literature).
+    if "Open" in df.columns:
+        open_ = df["Open"].astype(float)
+        overnight_daily = (open_ / close.shift(1)) - 1.0
+        intraday_daily = (close / open_) - 1.0
+        df["overnight_return_5d"] = overnight_daily.rolling(
+            window=_mom_short, min_periods=_mom_short,
+        ).sum()
+        df["intraday_return_5d"] = intraday_daily.rolling(
+            window=_mom_short, min_periods=_mom_short,
+        ).sum()
+    else:
+        # Without Open, these features are undefined — NaN propagates and
+        # dropna will exclude the ticker. No silent zero-fill (per
+        # feedback_no_silent_fails).
+        df["overnight_return_5d"] = float("nan")
+        df["intraday_return_5d"] = float("nan")
+
+    # ── v3.1: Distance from recent highs (reversal-native) ────────────────────
+    # Distance from recent peak is a cleaner reversal signal than past
+    # returns: a stock at its 5d high has nowhere to "continue" in the
+    # short-term reversal regime, while a stock pulled back from its 5d
+    # high has more room to mean-revert. Negative values always (close
+    # cannot exceed max by definition). Closer to zero = near high.
+    if "High" in df.columns:
+        high_col = df["High"].astype(float)
+    else:
+        high_col = close
+    rolling_max_5 = high_col.rolling(window=5, min_periods=5).max()
+    rolling_max_20 = high_col.rolling(window=20, min_periods=20).max()
+    df["dist_from_5d_high"] = (close - rolling_max_5) / rolling_max_5
+    df["dist_from_20d_high"] = (close - rolling_max_20) / rolling_max_20
 
     # ── Relative volume ratio ──────────────────────────────────────────────────
     rolling_mean_vol_20 = volume.rolling(window=_vol_slow, min_periods=_vol_slow).mean()
