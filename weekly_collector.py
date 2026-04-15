@@ -374,6 +374,21 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         results["status"] = "failed"
         return results
 
+    # Macro symbols are not S&P constituents but are core daily predictor inputs
+    # (vix_level, vix_term_slope, yield_10y, yield_curve_slope, sector-relative
+    # features). Appending them here lets builders/daily_append.py update the
+    # ArcticDB macro library every weekday — pre-ArcticDB, the predictor Lambda
+    # fetched these from yfinance on each run; post-migration, the write path
+    # moved here. ETFs come from polygon; indices (^-prefix) fall through to
+    # FRED then yfinance in daily_closes.collect.
+    MACRO_DAILY_TICKERS = [
+        "SPY", "GLD", "USO",
+        "XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
+        "XLP", "XLRE", "XLU", "XLV", "XLY",
+        "^VIX", "^VIX3M", "^TNX", "^IRX",
+    ]
+    tickers = list(dict.fromkeys(tickers + MACRO_DAILY_TICKERS))
+
     logger.info("=" * 60)
     logger.info("COLLECTING: daily closes")
     logger.info("=" * 60)
