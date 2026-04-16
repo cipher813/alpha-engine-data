@@ -392,6 +392,7 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
     logger.info("=" * 60)
     logger.info("COLLECTING: daily closes")
     logger.info("=" * 60)
+    dc_started_at = datetime.now(timezone.utc)
     try:
         dc_result = daily_closes.collect(
             bucket=bucket,
@@ -404,6 +405,30 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
     except Exception as e:
         logger.error("Daily closes collection failed: %s", e)
         results["collectors"]["daily_closes"] = {"status": "error", "error": str(e)}
+
+    # Module health stamp for daily_data — scoped to daily_closes only. The
+    # executor gate at alpha-engine/executor/main.py reads this key to decide
+    # whether upstream data is fresh. Emitted on both ok and failure paths
+    # so downstream can distinguish "ran and failed" from "hasn't run".
+    if not dry_run:
+        _dc = results["collectors"]["daily_closes"]
+        _dc_status = _dc.get("status", "unknown")
+        _dc_ok = _dc_status in ("ok", "ok_dry_run")
+        _dc_duration = (datetime.now(timezone.utc) - dc_started_at).total_seconds()
+        _write_module_health(
+            bucket,
+            module_name="daily_data",
+            run_date=run_date,
+            status="ok" if _dc_ok else "failed",
+            summary={
+                "tickers_captured": _dc.get("tickers_captured", 0),
+                "polygon": _dc.get("polygon", 0),
+                "fred": _dc.get("fred", 0),
+                "yfinance": _dc.get("yfinance", 0),
+            },
+            error=None if _dc_ok else _dc.get("error", f"daily_closes status={_dc_status}"),
+            duration_seconds=_dc_duration,
+        )
 
     # ── Feature store compute ───────────────────────────────────────────────
     logger.info("=" * 60)
@@ -598,7 +623,7 @@ def _write_validation_json(
 
 
 def _write_health_marker(bucket: str, phase: int, run_date: str, status: str) -> None:
-    """Write health marker for Step Functions dependency checking."""
+    """Write phase-based health marker (legacy) for Step Functions dependency checking."""
     s3 = boto3.client("s3")
     key = f"health/data_phase{phase}.json"
     marker = {
@@ -614,6 +639,48 @@ def _write_health_marker(bucket: str, phase: int, run_date: str, status: str) ->
         ContentType="application/json",
     )
     logger.info("Wrote health marker: s3://%s/%s", bucket, key)
+
+
+def _write_module_health(
+    bucket: str,
+    module_name: str,
+    run_date: str,
+    status: str,
+    *,
+    summary: dict | None = None,
+    warnings: list | None = None,
+    error: str | None = None,
+    duration_seconds: float = 0.0,
+) -> None:
+    """Write module-scoped health stamp consumed by the executor's
+    check_upstream_health() (alpha-engine/executor/health_status.py:91).
+
+    Schema matches executor's write_health() — key pattern
+    `health/{module_name}.json` with `last_success` nulled on failure so
+    downstream staleness checks can distinguish "ran and failed today" from
+    "hasn't run in N hours". Called on both success AND failure paths so the
+    stamp reflects the actual last run outcome.
+    """
+    s3 = boto3.client("s3")
+    key = f"health/{module_name}.json"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "module": module_name,
+        "status": status,
+        "last_success": now_iso if status != "failed" else None,
+        "run_date": run_date,
+        "duration_seconds": round(duration_seconds, 1),
+        "summary": summary or {},
+        "warnings": warnings or [],
+        "error": error,
+    }
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(payload, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+    logger.info("Wrote module health: s3://%s/%s (%s)", bucket, key, status)
 
 
 def _parse_args() -> argparse.Namespace:
