@@ -50,6 +50,12 @@ FEATURE_STORE_PREFIX = "features/"
 # Large-move warning threshold (>45% daily return, e.g. stock splits, VIX spikes)
 _SPLIT_RETURN_THRESHOLD = 0.45
 
+# Rows to keep per ticker before feature computation. The longest rolling
+# window is 252 rows (52w high/low); 280 provides a small buffer. Trimming
+# before the compute loop cuts base memory ~44% vs the full 2y slim cache
+# and lets each ticker's DataFrame be freed incrementally via pop().
+_FEATURE_WARMUP_ROWS = 280
+
 # Tickers that are macro/index series, not stocks
 _SKIP_TICKERS = {
     "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
@@ -407,6 +413,15 @@ def compute_and_write(
         len(fundamentals), len(alt_data),
     )
 
+    # Trim price DataFrames to the last _FEATURE_WARMUP_ROWS rows before the
+    # compute loop. The longest rolling window is 252 rows; keeping 280 is
+    # sufficient. Trimming here reduces peak RSS on t3.micro by ~40%+ vs
+    # holding the full 2y slim cache in memory during feature computation.
+    for _t in list(price_data.keys()):
+        df = price_data[_t]
+        if len(df) > _FEATURE_WARMUP_ROWS:
+            price_data[_t] = df.iloc[-_FEATURE_WARMUP_ROWS:]
+
     # ── 2. Compute features for each ticker ──────────────────────────────────
     store_rows: list[dict] = []
     n_ok = 0
@@ -435,7 +450,7 @@ def compute_and_write(
 
     for ticker in universe_tickers:
         try:
-            df = price_data[ticker]
+            df = price_data.pop(ticker)  # release as we go to avoid holding all 900 DFs
             sector_etf_sym = sector_map.get(ticker)
             sector_etf_series = macro.get(sector_etf_sym) if sector_etf_sym else None
 
@@ -477,6 +492,7 @@ def compute_and_write(
         except Exception as exc:
             log.warning("Feature computation failed for %s: %s", ticker, exc)
             n_err += 1
+            price_data.pop(ticker, None)  # still release on error path
 
     t_compute = time.time() - t0 - t_load
     log.info(
