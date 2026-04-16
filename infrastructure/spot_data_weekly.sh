@@ -267,7 +267,9 @@ $REMOTE_PYTHON -c "import weekly_collector; print('import OK')"
 
 echo ""
 echo "==> Smoke: weekly_collector.py --phase 1 --dry-run"
-$REMOTE_PYTHON weekly_collector.py --phase 1 --dry-run 2>&1 | tail -30
+# Show full output (was tail -30 — truncated error tracebacks from early
+# collectors so their failure mode was invisible during debugging).
+$REMOTE_PYTHON weekly_collector.py --phase 1 --dry-run 2>&1
 SMOKE
 
     echo "==> Smoke complete — instance will be terminated."
