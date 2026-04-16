@@ -212,7 +212,7 @@ def _trading_days_to_process(
     Returns ISO dates sorted chronologically. The trading-calendar module
     at the repo root handles holiday awareness (market closures through 2030).
     """
-    from trading_calendar import is_trading_day as nyse_is_trading_day
+    from alpha_engine_lib.trading_calendar import is_trading_day as nyse_is_trading_day
 
     out: list[str] = []
     d = today
