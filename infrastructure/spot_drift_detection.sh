@@ -80,10 +80,8 @@ if [ ! -f "$KEY_FILE" ]; then
     echo "ERROR: SSH key not found at $KEY_FILE"
     exit 1
 fi
-if [ -z "${ALPHA_ENGINE_LIB_TOKEN:-}" ]; then
-    echo "ERROR: ALPHA_ENGINE_LIB_TOKEN not set in .env"
-    exit 1
-fi
+# Note: alpha-engine-lib PAT is fetched by the spot itself from SSM
+# (/alpha-engine/lib-token) during the DEPS step — dispatcher never touches it.
 
 # ── Launch spot ──────────────────────────────────────────────────────────────
 echo "==> Requesting spot instance ($INSTANCE_TYPE)..."
@@ -170,8 +168,9 @@ scp $SSH_OPTS -i "$KEY_FILE" \
     "$ENV_FILE" \
     ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine-data/.env
 
-# ── Install dependencies (data repo's requirements suffice — drift_detector
-#    uses numpy/boto3/pandas from the shared universe) ───────────────────────
+# ── Install dependencies ─────────────────────────────────────────────────────
+# Spot pulls its own alpha-engine-lib PAT from SSM (/alpha-engine/lib-token),
+# mirroring ae-trading's boot-pull.sh. Dispatcher never handles the secret.
 echo "==> Installing Python dependencies..."
 run_remote bash -s <<'DEPS'
 set -euo pipefail
@@ -181,7 +180,14 @@ set -a
 # shellcheck disable=SC1091
 source /home/ec2-user/alpha-engine-data/.env
 set +a
-git config --global url."https://x-access-token:${ALPHA_ENGINE_LIB_TOKEN}@github.com/cipher813/alpha-engine-lib".insteadOf "https://github.com/cipher813/alpha-engine-lib"
+
+LIB_TOKEN=$(aws ssm get-parameter --name /alpha-engine/lib-token --with-decryption --query 'Parameter.Value' --output text --region us-east-1 2>/dev/null || echo "")
+if [ -z "$LIB_TOKEN" ]; then
+    echo "ERROR: could not fetch /alpha-engine/lib-token from SSM — required for alpha-engine-lib pip install"
+    exit 1
+fi
+git config --global url."https://x-access-token:${LIB_TOKEN}@github.com/cipher813/alpha-engine-lib".insteadOf "https://github.com/cipher813/alpha-engine-lib"
+unset LIB_TOKEN
 
 if command -v python3.12 &>/dev/null; then
     PIP="python3.12 -m pip"
