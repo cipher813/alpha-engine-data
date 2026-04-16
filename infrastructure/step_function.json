@@ -5,7 +5,7 @@
 
     "DataPhase1": {
       "Type": "Task",
-      "Comment": "Phase 1: prices, macro, constituents, universe returns (EC2 via SSM)",
+      "Comment": "Phase 1: prices, macro, constituents, universe returns (launches spot EC2; micro is the dispatcher)",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -15,15 +15,15 @@
             "set -eo pipefail",
             "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
             "cd /home/ec2-user/alpha-engine-data",
+            "export HOME=/home/ec2-user",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "source .venv/bin/activate",
-            "python weekly_collector.py --phase 1 2>&1 | tee /var/log/data-phase1.log"
+            "bash infrastructure/spot_data_phase1.sh 2>&1 | tee /var/log/data-phase1.log"
           ],
-          "executionTimeout": ["1800"]
+          "executionTimeout": ["2700"]
         },
-        "TimeoutSeconds": 1800
+        "TimeoutSeconds": 2700
       },
-      "TimeoutSeconds": 1860,
+      "TimeoutSeconds": 2760,
       "Retry": [
         {
           "ErrorEquals": ["States.TaskFailed"],
@@ -609,7 +609,7 @@
 
     "SaturdayHealthCheck": {
       "Type": "Task",
-      "Comment": "Check data freshness after full pipeline — non-blocking (alerts on failure but does not halt)",
+      "Comment": "Check data freshness after full pipeline — non-blocking (alerts on failure but does not halt). Runs from alpha-engine-dashboard post-2026-04-16 health_checker migration.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -617,8 +617,8 @@
         "Parameters": {
           "commands": [
             "set -eo pipefail",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-data",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main",
+            "cd /home/ec2-user/alpha-engine-dashboard",
             "source .venv/bin/activate",
             "python health_checker.py --alert 2>&1 | tee /var/log/health-check.log"
           ],
