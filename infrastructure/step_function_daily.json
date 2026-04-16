@@ -12,7 +12,7 @@
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
           "commands": [
-            "cd /home/ec2-user/alpha-engine-data",
+            "cd /home/ec2-user/alpha-engine-dashboard",
             "source .venv/bin/activate",
             "python trading_calendar.py"
           ],
@@ -336,7 +336,7 @@
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
           "commands": [
-            "cd /home/ec2-user/alpha-engine-data",
+            "cd /home/ec2-user/alpha-engine-dashboard",
             "source .venv/bin/activate",
             "python health_checker.py --alert 2>&1 | tee /var/log/health-check.log"
           ],
