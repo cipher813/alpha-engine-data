@@ -69,9 +69,9 @@ POLICY='{
       "Resource": "*"
     },
     {
-      "Sid": "EC2Start",
+      "Sid": "EC2StartStop",
       "Effect": "Allow",
-      "Action": ["ec2:StartInstances"],
+      "Action": ["ec2:StartInstances", "ec2:StopInstances"],
       "Resource": "arn:aws:ec2:'"$REGION"':'"$ACCOUNT_ID"':instance/'"$TRADING_INSTANCE"'"
     },
     {
