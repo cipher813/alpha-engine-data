@@ -5,7 +5,7 @@
 
     "DataPhase1": {
       "Type": "Task",
-      "Comment": "Phase 1: prices, macro, constituents, universe returns (EC2 via SSM)",
+      "Comment": "Bundled weekly data: DataPhase1 + RAGIngestion on a single spot EC2. Micro is the dispatcher (launches spot via bash + AWS CLI; no heavy venv needed). One bootstrap cycle serves both workloads — saves ~7 min vs separate spots.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -15,15 +15,15 @@
             "set -eo pipefail",
             "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
             "cd /home/ec2-user/alpha-engine-data",
+            "export HOME=/home/ec2-user",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "source .venv/bin/activate",
-            "python weekly_collector.py --phase 1 2>&1 | tee /var/log/data-phase1.log"
+            "bash infrastructure/spot_data_weekly.sh 2>&1 | tee /var/log/data-weekly.log"
           ],
-          "executionTimeout": ["1800"]
+          "executionTimeout": ["3600"]
         },
-        "TimeoutSeconds": 1800
+        "TimeoutSeconds": 3600
       },
-      "TimeoutSeconds": 1860,
+      "TimeoutSeconds": 3660,
       "Retry": [
         {
           "ErrorEquals": ["States.TaskFailed"],
@@ -76,7 +76,7 @@
         {
           "Variable": "$.data_phase1_poll.Status",
           "StringEquals": "Success",
-          "Next": "RAGIngestion"
+          "Next": "Research"
         },
         {
           "Variable": "$.data_phase1_poll.Status",
@@ -96,101 +96,6 @@
       "Type": "Wait",
       "Seconds": 30,
       "Next": "WaitForDataPhase1"
-    },
-
-    "RAGIngestion": {
-      "Type": "Task",
-      "Comment": "RAG ingestion — SEC filings, 8-Ks, earnings, theses, filing changes (EC2 via SSM). Must run before Research so RAG data is fresh.",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
-      "Parameters": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds.$": "$.ec2_instance_id",
-        "Parameters": {
-          "commands": [
-            "set -eo pipefail",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-data",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "source .venv/bin/activate",
-            "bash rag/pipelines/run_weekly_ingestion.sh 2>&1 | tee /var/log/rag-ingestion.log"
-          ],
-          "executionTimeout": ["1800"]
-        },
-        "TimeoutSeconds": 1800
-      },
-      "TimeoutSeconds": 1860,
-      "Retry": [
-        {
-          "ErrorEquals": ["States.TaskFailed"],
-          "MaxAttempts": 1,
-          "IntervalSeconds": 60,
-          "BackoffRate": 1.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "Next": "HandleFailure",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultPath": "$.rag_result",
-      "Next": "WaitForRAGIngestion"
-    },
-
-    "WaitForRAGIngestion": {
-      "Type": "Task",
-      "Comment": "Poll SSM command until RAG ingestion complete",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
-      "Parameters": {
-        "CommandId.$": "$.rag_result.Command.CommandId",
-        "InstanceId.$": "$.ec2_instance_id[0]"
-      },
-      "Retry": [
-        {
-          "ErrorEquals": ["Ssm.InvocationDoesNotExistException"],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 30,
-          "BackoffRate": 1.5
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "Next": "HandleFailure",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultPath": "$.rag_poll",
-      "Next": "CheckRAGStatus"
-    },
-
-    "CheckRAGStatus": {
-      "Type": "Choice",
-      "Choices": [
-        {
-          "Variable": "$.rag_poll.Status",
-          "StringEquals": "Success",
-          "Next": "Research"
-        },
-        {
-          "Variable": "$.rag_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "RAGWait"
-        },
-        {
-          "Variable": "$.rag_poll.Status",
-          "StringEquals": "Pending",
-          "Next": "RAGWait"
-        }
-      ],
-      "Default": "ExtractRAGError"
-    },
-
-    "RAGWait": {
-      "Type": "Wait",
-      "Seconds": 30,
-      "Next": "WaitForRAGIngestion"
     },
 
     "Research": {
@@ -370,7 +275,7 @@
 
     "DriftDetection": {
       "Type": "Task",
-      "Comment": "Check feature + prediction drift after training (non-blocking). Uses data venv for numpy/boto3, PYTHONPATH for predictor module.",
+      "Comment": "Feature + prediction drift check on spot EC2 (non-blocking). Micro is the dispatcher; launcher clones data + predictor on a fresh spot, runs monitoring.drift_detector, terminates.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -378,18 +283,17 @@
         "Parameters": {
           "commands": [
             "set -eo pipefail",
-            "export HOME=/home/ec2-user",
             "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main",
+            "cd /home/ec2-user/alpha-engine-data",
+            "export HOME=/home/ec2-user",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "export PYTHONPATH=/home/ec2-user/alpha-engine-predictor",
-            "/home/ec2-user/alpha-engine-data/.venv/bin/python -m monitoring.drift_detector --alert 2>&1 | tee /var/log/drift-detection.log"
+            "bash infrastructure/spot_drift_detection.sh 2>&1 | tee /var/log/drift-detection.log"
           ],
-          "executionTimeout": ["300"]
+          "executionTimeout": ["1200"]
         },
-        "TimeoutSeconds": 300
+        "TimeoutSeconds": 1200
       },
-      "TimeoutSeconds": 330,
+      "TimeoutSeconds": 1260,
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
@@ -609,7 +513,7 @@
 
     "SaturdayHealthCheck": {
       "Type": "Task",
-      "Comment": "Check data freshness after full pipeline — non-blocking (alerts on failure but does not halt)",
+      "Comment": "Check data freshness after full pipeline — non-blocking (alerts on failure but does not halt). Runs from alpha-engine-dashboard post-2026-04-16 health_checker migration.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -617,8 +521,8 @@
         "Parameters": {
           "commands": [
             "set -eo pipefail",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-data",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main",
+            "cd /home/ec2-user/alpha-engine-dashboard",
             "source .venv/bin/activate",
             "python health_checker.py --alert 2>&1 | tee /var/log/health-check.log"
           ],
@@ -686,18 +590,6 @@
         "phase": "DataPhase1",
         "source": "CheckDataPhase1Status.Default",
         "poll.$": "$.data_phase1_poll"
-      },
-      "ResultPath": "$.error",
-      "Next": "HandleFailure"
-    },
-
-    "ExtractRAGError": {
-      "Type": "Pass",
-      "Comment": "Normalize RAGIngestion SSM non-Success poll into $.error.",
-      "Parameters": {
-        "phase": "RAGIngestion",
-        "source": "CheckRAGStatus.Default",
-        "poll.$": "$.rag_poll"
       },
       "ResultPath": "$.error",
       "Next": "HandleFailure"
