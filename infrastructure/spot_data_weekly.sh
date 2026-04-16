@@ -187,11 +187,27 @@ echo "==> Cloning alpha-engine-data (branch: $BRANCH)..."
 # HTTPS clone with PAT — matches the lib-install pattern below.
 run_remote "git clone --depth 1 --branch $BRANCH https://github.com/cipher813/alpha-engine-data.git /home/ec2-user/alpha-engine-data"
 
-# ── Upload .env BEFORE pip install (for ALPHA_ENGINE_LIB_TOKEN) ──────────────
+# ── Upload .env BEFORE pip install ──────────────────────────────────────────
 echo "==> Uploading .env to spot..."
 scp $SSH_OPTS -i "$KEY_FILE" \
     "$ENV_FILE" \
     ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine-data/.env
+
+# ── Upload alpha-engine-config/data/config.yaml ─────────────────────────────
+# weekly_collector.py's load_config() searches /home/ec2-user/alpha-engine-config/data/config.yaml
+# first. Private config repo — SCP from the dispatcher's clone (pulled daily by
+# ae-dashboard's boot-pull) rather than cloning it on the spot (which would
+# require broader git-auth setup than the lib-only insteadOf we use here).
+CONFIG_SRC="/home/ec2-user/alpha-engine-config/data/config.yaml"
+if [ ! -f "$CONFIG_SRC" ]; then
+    echo "ERROR: dispatcher config not found at $CONFIG_SRC — is alpha-engine-config cloned + pulled?"
+    exit 1
+fi
+echo "==> Uploading alpha-engine-config/data/config.yaml to spot..."
+run_remote "mkdir -p /home/ec2-user/alpha-engine-config/data"
+scp $SSH_OPTS -i "$KEY_FILE" \
+    "$CONFIG_SRC" \
+    ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine-config/data/config.yaml
 
 # ── Install python deps ──────────────────────────────────────────────────────
 # The spot pulls its own alpha-engine-lib PAT from SSM (same pattern as
