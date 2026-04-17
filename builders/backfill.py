@@ -49,8 +49,32 @@ from store.arctic_store import get_universe_lib, get_macro_lib
 
 log = logging.getLogger(__name__)
 
-# OHLCV columns to keep alongside features in ArcticDB
-OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume"]
+# OHLCV columns to keep alongside features in ArcticDB.
+# VWAP added 2026-04-17 — backfill source (``predictor/price_cache/*.parquet``)
+# is OHLCV only, so historical VWAP is populated via the ``(H+L+C)/3``
+# typical-price proxy below (same proxy used in ``collectors/daily_closes.py:293``
+# when yfinance is the source and polygon's true ``vw`` isn't available).
+# Production daily_append uses polygon's true VWAP when available — proxy is
+# only used for historical backfill rows predating polygon adoption.
+OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume", "VWAP"]
+
+
+def _ensure_vwap_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Populate VWAP column with ``(H+L+C)/3`` typical-price proxy if absent.
+
+    The legacy ``predictor/price_cache/`` parquets used by backfill are OHLCV
+    only. Populating a proxy here ensures ArcticDB's VWAP column has coverage
+    across the full 10y history, so downstream consumers never encounter
+    unexpected NaN for pre-polygon dates.
+    """
+    if "VWAP" in df.columns:
+        return df
+    required = {"High", "Low", "Close"}
+    if not required.issubset(df.columns):
+        return df
+    out = df.copy()
+    out["VWAP"] = ((out["High"] + out["Low"] + out["Close"]) / 3.0).round(4)
+    return out
 
 
 def _load_full_cache(s3, bucket: str, prefix: str = "predictor/price_cache/") -> dict[str, pd.DataFrame]:
@@ -233,7 +257,7 @@ def backfill(
 
     for i, ticker in enumerate(universe_tickers):
         try:
-            df = price_data[ticker]
+            df = _ensure_vwap_column(price_data[ticker])
             sector_etf_sym = sector_map.get(ticker)
             sector_etf_series = macro.get(sector_etf_sym) if sector_etf_sym else None
 

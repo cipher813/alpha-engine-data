@@ -42,11 +42,18 @@ from store.arctic_store import get_universe_lib, get_macro_lib
 
 log = logging.getLogger(__name__)
 
-OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume"]
+OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume", "VWAP"]
 
 
 def _load_daily_closes(s3, bucket: str, date_str: str) -> dict[str, dict]:
-    """Load today's daily_closes parquet from S3. Raises if the file is missing or unreadable."""
+    """Load today's daily_closes parquet from S3. Raises if the file is missing or unreadable.
+
+    VWAP (2026-04-17): extracted from the parquet alongside OHLCV so it materializes
+    into ArcticDB as a first-class column. Source is polygon grouped-daily's `vw`
+    field when available, else `(H+L+C)/3` typical-price proxy — both are populated
+    upstream in ``collectors/daily_closes.py``. Missing VWAP for a ticker becomes
+    ``NaN`` in the output (not an error); downstream consumers handle NaN.
+    """
     key = f"predictor/daily_closes/{date_str}.parquet"
     obj = s3.get_object(Bucket=bucket, Key=key)
     buf = io.BytesIO(obj["Body"].read())
@@ -54,12 +61,14 @@ def _load_daily_closes(s3, bucket: str, date_str: str) -> dict[str, dict]:
 
     records = {}
     for ticker, row in df.iterrows():
+        vwap_raw = row.get("VWAP")
         records[str(ticker)] = {
             "Open": float(row.get("Open", np.nan)),
             "High": float(row.get("High", np.nan)),
             "Low": float(row.get("Low", np.nan)),
             "Close": float(row.get("Close", np.nan)),
             "Volume": int(row.get("Volume", 0)),
+            "VWAP": float(vwap_raw) if pd.notna(vwap_raw) else np.nan,
         }
     if not records:
         raise RuntimeError(
