@@ -90,6 +90,24 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
         "collectors": {},
     }
 
+    # ── Preflight: fail-fast dependency checks ───────────────────────────────
+    # Runs BEFORE any collector to catch credential drift, outages, or
+    # misconfiguration in ~10s rather than ~55min into a doomed spot run.
+    # Dry-run still executes preflight — misconfiguration should fail CI/local
+    # dry-runs too. See validators/preflight.py for the contract.
+    if only is None:  # Skip preflight only when running a single collector via --only
+        from validators.preflight import DataPreflight, PreflightError
+        try:
+            DataPreflight(bucket=bucket, phase=1).run()
+        except PreflightError as exc:
+            logger.error("DataPhase1 preflight failed: %s", exc)
+            results["status"] = "preflight_failed"
+            results["preflight_error"] = str(exc)
+            results["finished_at"] = datetime.now(timezone.utc).isoformat()
+            # Hard-fail: write no health marker, no collectors ran, nothing
+            # to finalize. Return early so main() can exit non-zero.
+            return results
+
     # ── 1. Constituents ──────────────────────────────────────────────────────
     tickers: list[str] = []
     if only in (None, "constituents"):
