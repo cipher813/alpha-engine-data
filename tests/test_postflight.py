@@ -158,6 +158,61 @@ class TestConstituentsJson:
             pf._check_constituents_json_contract()
 
 
+# ── short_interest.json shape check ───────────────────────────────────────────
+
+class TestShortInterestJson:
+    def test_ok_with_well_populated_payload(self):
+        pf = _make_postflight()
+        pf._s3 = MagicMock()
+        pf._s3.head_object.return_value = {}  # exists
+        pf._s3.get_object.return_value = {
+            "Body": MagicMock(read=MagicMock(return_value=json.dumps({
+                "ticker_count": 900,
+                "ok_count": 700,  # 78% populated
+                "data": {f"T{i}": {"short_pct_float": 5.0} for i in range(900)},
+            }).encode()))
+        }
+        pf._check_short_interest_json_contract()
+
+    def test_fails_below_50pct_populated(self):
+        pf = _make_postflight()
+        pf._s3 = MagicMock()
+        pf._s3.head_object.return_value = {}
+        pf._s3.get_object.return_value = {
+            "Body": MagicMock(read=MagicMock(return_value=json.dumps({
+                "ticker_count": 900,
+                "ok_count": 300,  # 33% populated
+                "data": {},
+            }).encode()))
+        }
+        with pytest.raises(PostflightError, match="yfinance outage suspected"):
+            pf._check_short_interest_json_contract()
+
+    def test_fails_when_data_dict_missing(self):
+        pf = _make_postflight()
+        pf._s3 = MagicMock()
+        pf._s3.head_object.return_value = {}
+        pf._s3.get_object.return_value = {
+            "Body": MagicMock(read=MagicMock(return_value=json.dumps({
+                "ticker_count": 900,
+                "ok_count": 700,
+                # data dict missing
+            }).encode()))
+        }
+        with pytest.raises(PostflightError, match="missing 'data' dict"):
+            pf._check_short_interest_json_contract()
+
+    def test_absent_file_skips_check(self):
+        """Soft-launch path: collector disabled → file missing → skip."""
+        pf = _make_postflight()
+        pf._s3 = MagicMock()
+        pf._s3.head_object.side_effect = RuntimeError("NoSuchKey")
+        # No raise — should log + skip
+        pf._check_short_interest_json_contract()
+        # get_object should never be called when head_object fails
+        pf._s3.get_object.assert_not_called()
+
+
 # ── ArcticDB macro.SPY freshness ──────────────────────────────────────────────
 
 class TestMacroSpyFresh:
