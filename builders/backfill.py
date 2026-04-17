@@ -49,8 +49,16 @@ from store.arctic_store import get_universe_lib, get_macro_lib
 
 log = logging.getLogger(__name__)
 
-# OHLCV columns to keep alongside features in ArcticDB
-OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume"]
+# OHLCV columns to keep alongside features in ArcticDB.
+# VWAP added 2026-04-17 (Phase 7 VWAP centralization). Backfill source
+# (``predictor/price_cache/*.parquet``) is OHLCV only and predates polygon
+# adoption, so historical rows have no source for true volume-weighted VWAP.
+# Per the 2026-04-17 decision, we do NOT synthesize a ``(H+L+C)/3`` proxy —
+# that misrepresents arithmetic typical price as VWAP. Historical rows get
+# NaN VWAP; the column becomes populated from the first daily_append run
+# against a polygon-sourced daily_closes parquet. See ROADMAP "VWAP
+# centralization" for the full rationale.
+OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume", "VWAP"]
 
 
 def _load_full_cache(s3, bucket: str, prefix: str = "predictor/price_cache/") -> dict[str, pd.DataFrame]:

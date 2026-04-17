@@ -1,11 +1,23 @@
-"""Regression tests for the daily_closes VWAP fallback.
+"""Regression tests for the daily_closes VWAP semantics.
 
-Pins the behavior added after the 2026-04-10 incident: when polygon.io
-fails (rate limit, auth, empty response) and the collector falls back to
-yfinance, the VWAP column must be populated with a typical-price proxy
-instead of None. The old code set VWAP=None on all yfinance rows, which
-caused the executor to log "has no VWAP column — skipping" for up to 5
-consecutive days whenever polygon was unhealthy.
+Contract as of 2026-04-17 (Phase 7 VWAP centralization):
+
+  * Polygon grouped-daily (`vw` field) → true volume-weighted VWAP is written.
+  * yfinance fallback → VWAP is None. yfinance does not expose true VWAP and
+    the previous `(H+L+C)/3` typical-price proxy silently misrepresented
+    arithmetic typical price as VWAP, which contaminated the ArcticDB
+    universe column once Phase 7 migration started materializing VWAP there.
+  * FRED fallback → VWAP is None. FRED returns a single daily close value;
+    there is no trade distribution to weight, so passing Close off as VWAP
+    would be misrepresentation.
+
+The previous contract (introduced after the 2026-04-10 incident) populated
+VWAP with the proxy on yfinance fallback to prevent the executor from logging
+"no VWAP column — skipping" for up to 5 consecutive days during polygon
+outages. Per the 2026-04-17 decision, we accept that consequence rather than
+perpetuate the proxy. `executor/price_cache.py::load_daily_vwap` already
+looks back up to 5 prior trading days for a populated VWAP, which covers the
+rare polygon-outage-on-multiple-consecutive-days scenario.
 """
 
 import pandas as pd
@@ -32,8 +44,8 @@ def _make_yf_frame(rows):
     return df
 
 
-def test_yfinance_fallback_populates_vwap_with_typical_price():
-    """The yfinance fallback should compute VWAP as (H + L + C) / 3."""
+def test_yfinance_fallback_writes_none_vwap():
+    """yfinance fallback must write VWAP=None, not a (H+L+C)/3 proxy."""
     records = []
     fake_frame = _make_yf_frame([
         ("2026-04-10", 100.0, 105.0, 99.0, 103.0, 1_000_000),
@@ -51,16 +63,16 @@ def test_yfinance_fallback_populates_vwap_with_typical_price():
     assert len(records) == 1
     row = records[0]
     assert row["ticker"] == "AAPL"
-    # VWAP should be typical price: (105 + 99 + 103) / 3 = 102.333...
-    expected_vwap = round((105.0 + 99.0 + 103.0) / 3.0, 4)
-    assert row["VWAP"] == expected_vwap
-    assert row["VWAP"] is not None
+    assert row["VWAP"] is None, (
+        "yfinance fallback must write VWAP=None. Writing (H+L+C)/3 as VWAP "
+        "silently misrepresents arithmetic typical price as volume-weighted "
+        "VWAP — see 2026-04-17 Phase 7 VWAP centralization decision."
+    )
 
 
-def test_yfinance_fallback_vwap_not_none_multi_ticker():
-    """VWAP must be non-None for every row produced by the fallback."""
+def test_yfinance_fallback_multi_ticker_vwap_none():
+    """VWAP must be None for every row produced by the fallback."""
     records = []
-    # yfinance returns a MultiIndex-columned frame for multi-ticker downloads
     index = pd.DatetimeIndex(["2026-04-10"])
     multi = pd.DataFrame(
         {
@@ -91,6 +103,4 @@ def test_yfinance_fallback_vwap_not_none_multi_ticker():
 
     assert count == 2
     for row in records:
-        assert row["VWAP"] is not None, f"VWAP is None for {row['ticker']}"
-        # Typical-price invariant: Low <= VWAP <= High
-        assert row["Low"] <= row["VWAP"] <= row["High"]
+        assert row["VWAP"] is None, f"VWAP should be None (not proxy) for {row['ticker']}"
