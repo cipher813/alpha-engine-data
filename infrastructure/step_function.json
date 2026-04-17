@@ -19,11 +19,11 @@
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "bash infrastructure/spot_data_weekly.sh 2>&1 | tee /var/log/data-weekly.log"
           ],
-          "executionTimeout": ["3600"]
+          "executionTimeout": ["5400"]
         },
-        "TimeoutSeconds": 3600
+        "TimeoutSeconds": 5400
       },
-      "TimeoutSeconds": 3660,
+      "TimeoutSeconds": 5460,
       "Retry": [
         {
           "ErrorEquals": ["States.TaskFailed"],
