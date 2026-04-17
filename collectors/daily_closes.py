@@ -226,7 +226,10 @@ def _fetch_fred_closes(
                 "Close": round(close, 4),
                 "Adj_Close": round(close, 4),
                 "Volume": 0,
-                "VWAP": round(close, 4),
+                # VWAP only meaningful from polygon grouped-daily (volume-weighted
+                # across trades). FRED single-value closes give us no distribution
+                # to VWAP, so None rather than passing Close off as VWAP.
+                "VWAP": None,
             })
             count += 1
         except Exception as e:
@@ -284,13 +287,14 @@ def _fetch_yfinance_closes(
                     high = float(last["High"])
                     low = float(last["Low"])
                     close = float(last["Close"])
-                    # Typical-price proxy for VWAP: (H + L + C) / 3. yfinance
-                    # does not expose true intraday VWAP for free, so we fall
-                    # back to the standard pre-tick-data proxy. Executor entry
-                    # triggers use this as a prior-day reference level, not
-                    # an intraday VWAP — the proxy is accurate enough for
-                    # that purpose and materially better than None.
-                    vwap_proxy = round((high + low + close) / 3.0, 4)
+                    # VWAP is None on yfinance fallback. yfinance does not expose
+                    # true volume-weighted VWAP; the previous (H+L+C)/3 proxy
+                    # misrepresented proxy values as VWAP and contaminated the
+                    # ArcticDB universe column once Phase 7 migration started
+                    # materializing VWAP there. Per 2026-04-17 decision: only
+                    # polygon-sourced true VWAP is written. See ROADMAP "VWAP
+                    # centralization". Executor `load_daily_vwap` already handles
+                    # None by looking back up to 5 prior trading days.
                     records.append({
                         "ticker": store_ticker,
                         "date": date_str,
@@ -300,7 +304,7 @@ def _fetch_yfinance_closes(
                         "Close": round(close, 4),
                         "Adj_Close": round(adj_close, 4),
                         "Volume": int(last["Volume"]) if pd.notna(last.get("Volume")) else 0,
-                        "VWAP": vwap_proxy,
+                        "VWAP": None,
                     })
                     count += 1
                 except Exception as e:
