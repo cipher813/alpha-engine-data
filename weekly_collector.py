@@ -34,7 +34,7 @@ import yaml
 from ssm_secrets import load_secrets
 load_secrets()
 
-from collectors import constituents, prices, slim_cache, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals
+from collectors import constituents, prices, slim_cache, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +188,46 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
         except Exception as e:
             logger.error("Macro collection failed: %s", e)
             results["collectors"]["macro"] = {"status": "error", "error": str(e)}
+
+    # ── 4b. Short interest ───────────────────────────────────────────────────
+    # Per-ticker yfinance Ticker.info scrape for the full S&P 500+400 universe.
+    # FINRA data is bi-monthly (15th + EoM) so weekly Saturday cadence captures
+    # every refresh with a buffer. ~10 min on the spot; the constituents list
+    # was already fetched earlier in this phase.
+    #
+    # Gated by config["short_interest"]["enabled"] (default True). Disabling
+    # lets the operator soft-launch a new collector without blocking the
+    # whole pipeline if yfinance has trouble on the first Saturday — set
+    # enabled=false in config, run once manually with --only short_interest,
+    # then flip back to true once stable.
+    si_cfg = config.get("short_interest", {})
+    si_enabled = si_cfg.get("enabled", True)
+    if only in (None, "short_interest") and si_enabled:
+        logger.info("=" * 60)
+        logger.info("COLLECTING: short interest")
+        logger.info("=" * 60)
+        if not tickers:
+            logger.warning("No tickers available — skipping short interest")
+            results["collectors"]["short_interest"] = {
+                "status": "skipped", "reason": "no tickers",
+            }
+        else:
+            try:
+                si_result = short_interest.collect(
+                    bucket=bucket,
+                    tickers=tickers,
+                    s3_prefix=market_prefix,
+                    run_date=run_date,
+                    inter_request_delay=si_cfg.get("inter_request_delay", 0.4),
+                    dry_run=dry_run,
+                )
+                results["collectors"]["short_interest"] = si_result
+            except Exception as e:
+                logger.error("Short interest collection failed: %s", e)
+                results["collectors"]["short_interest"] = {"status": "error", "error": str(e)}
+    elif only in (None, "short_interest") and not si_enabled:
+        logger.info("short_interest collector disabled via config — skipping")
+        results["collectors"]["short_interest"] = {"status": "ok", "skipped": "disabled_in_config"}
 
     # ── 5. Universe returns ──────────────────────────────────────────────────
     if only in (None, "universe_returns"):
@@ -726,7 +766,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--only",
-        choices=["constituents", "prices", "slim", "macro", "universe_returns", "alternative", "daily_closes", "features", "arcticdb"],
+        choices=["constituents", "prices", "slim", "macro", "short_interest", "universe_returns", "alternative", "daily_closes", "features", "arcticdb"],
         help="Run a single collector instead of all",
     )
     parser.add_argument(

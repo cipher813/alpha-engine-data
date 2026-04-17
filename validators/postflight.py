@@ -257,6 +257,54 @@ class DataPostflight:
             )
         log.info("postflight: macro.json OK (fed_funds_rate=%s)", data["fed_funds_rate"])
 
+    def _check_short_interest_json_contract(self) -> None:
+        """Consumer: research short-interest reader (Phase 7c follow-up).
+
+        Asserts ``market_data/weekly/<run_date>/short_interest.json`` exists,
+        is parseable JSON, and has at least 50% of its requested tickers
+        populated. Mirrors the collector's ``_MIN_OK_RATIO`` gate so an upstream
+        partial-write that bypassed the collector's own status check still
+        fails postflight.
+
+        Soft-launch tolerance: if the file is absent (collector disabled via
+        ``config["short_interest"]["enabled"] = false``), log + skip rather
+        than hard-fail. Once research wires up the consumer, missing-file
+        will become a hard-fail — but until then, the collector is an
+        opt-out feature that shouldn't break the pipeline by being absent.
+        """
+        key = f"{self.market_prefix}weekly/{self.run_date}/short_interest.json"
+        s3 = self._s3_client()
+        try:
+            s3.head_object(Bucket=self.bucket, Key=key)
+        except Exception:
+            log.info(
+                "postflight: short_interest.json absent (collector likely disabled) "
+                "— skipping check. Will become hard-fail once research consumer ships."
+            )
+            return
+
+        data = self._fetch_json(key, name="short_interest.json")
+        if not isinstance(data.get("data"), dict):
+            raise PostflightError(
+                f"s3://{self.bucket}/{key} missing 'data' dict — schema violation."
+            )
+        ticker_count = data.get("ticker_count", 0)
+        ok_count = data.get("ok_count", 0)
+        if ticker_count == 0:
+            raise PostflightError(
+                f"s3://{self.bucket}/{key} ticker_count=0 — collector wrote an empty payload."
+            )
+        ok_ratio = ok_count / ticker_count
+        if ok_ratio < 0.50:
+            raise PostflightError(
+                f"s3://{self.bucket}/{key} only {ok_count}/{ticker_count} tickers "
+                f"populated ({ok_ratio:.1%}) — yfinance outage suspected."
+            )
+        log.info(
+            "postflight: short_interest.json OK (%d/%d tickers populated, %.1f%%)",
+            ok_count, ticker_count, ok_ratio * 100,
+        )
+
     def _check_constituents_json_contract(self) -> None:
         """Consumer: research ``price_fetcher.fetch_sp500_sp400_with_sectors``.
 
@@ -355,6 +403,7 @@ class DataPostflight:
         self._check_latest_weekly_pointer()
         self._check_macro_json_contract()
         self._check_constituents_json_contract()
+        self._check_short_interest_json_contract()
         self._check_macro_spy_fresh()
         self._check_universe_sample_fresh()
         log.info("postflight: all DataPhase1 consumer contracts satisfied")

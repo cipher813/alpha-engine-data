@@ -32,6 +32,7 @@ collectors/slim_cache.py           # 2y slice writer for inference Lambda
 collectors/macro.py                # FRED series + commodity/index prices + market breadth
 collectors/universe_returns.py     # Full-population forward returns (polygon.io)
 collectors/alternative.py          # Analyst, revisions, options, insider, institutional, news
+collectors/short_interest.py       # FINRA short-float (yfinance Ticker.info), bi-monthly cadence
 config.yaml                        # GITIGNORED — local config
 config.yaml.example                # template
 infrastructure/add-cron.sh         # idempotent cron registration on EC2
