@@ -510,8 +510,36 @@ def _finalize(
         _write_manifest(bucket, market_prefix, run_date, results)
         _write_validation_json(bucket, market_prefix, run_date, results)
 
-    # Write health marker for Step Functions
+    # Postflight: producer-side hard-fail if the outputs we just wrote
+    # don't satisfy the consumer contracts downstream modules will enforce
+    # at their own preflight. Fails before any downstream Lambda cold-start
+    # or spot-EC2 bootstrap. See validators/postflight.py for the full
+    # contract spec and the ROADMAP item that motivates it.
     phase = results.get("phase")
+    if (
+        not dry_run
+        and phase == 1  # Only DataPhase1 is gated today; Phase 2 gets its own postflight.
+        and only is None
+        and results["status"] == "ok"
+    ):
+        from validators.postflight import DataPostflight, PostflightError
+        try:
+            DataPostflight(
+                bucket=bucket,
+                run_date=run_date,
+                market_prefix=market_prefix,
+                phase=phase,
+            ).run()
+        except PostflightError as exc:
+            logger.error(
+                "DataPhase%d POSTFLIGHT FAILED: %s — consumer contracts not met. "
+                "Refusing to signal Step Function success.",
+                phase, exc,
+            )
+            results["status"] = "postflight_failed"
+            results["postflight_error"] = str(exc)
+
+    # Write health marker for Step Functions
     if not dry_run and phase and only is None:
         _write_health_marker(bucket, phase, run_date, results["status"])
 
