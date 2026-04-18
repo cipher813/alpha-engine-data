@@ -249,7 +249,12 @@ echo "Dependencies installed."
 DEPS
 
 REMOTE_PYTHON=$(run_remote "command -v python3.12 || command -v python3")
-ENV_SOURCE='set -a; [ -f /home/ec2-user/alpha-engine-data/.env ] && source /home/ec2-user/alpha-engine-data/.env; set +a; export XDG_CACHE_HOME=/tmp;'
+# Export PYTHON_BIN so downstream bash scripts (e.g.
+# rag/pipelines/run_weekly_ingestion.sh) inherit the interpreter we
+# bootstrapped. AL2023 spots install python3.12 but have no bare `python`
+# symlink — the RAG script's `python -m ...` fails without this. Origin:
+# 2026-04-17 Saturday Step Function failure in RAG step-0 preflight.
+ENV_SOURCE="set -a; [ -f /home/ec2-user/alpha-engine-data/.env ] && source /home/ec2-user/alpha-engine-data/.env; set +a; export XDG_CACHE_HOME=/tmp; export PYTHON_BIN=$REMOTE_PYTHON;"
 
 # ── Smoke-only: imports + --phase 1 --dry-run ────────────────────────────────
 if [ "$RUN_MODE" = "smoke-only" ]; then
