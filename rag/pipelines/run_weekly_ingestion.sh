@@ -44,6 +44,26 @@ elif [ -d "venv" ]; then
     source venv/bin/activate
 fi
 
+# Resolve python binary. Callers (e.g. spot_data_weekly.sh dispatcher) can
+# export PYTHON_BIN so we inherit whichever interpreter they bootstrapped
+# (Amazon Linux 2023 spots install python3.12 but have no bare `python`
+# symlink, which caused the 2026-04-17 Saturday RAG failure). Fall back to
+# python3 → python3.12 → python so local/manual runs and venv-activated
+# runs still work.
+if [ -z "${PYTHON_BIN:-}" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+        PYTHON_BIN="python3"
+    elif command -v python3.12 >/dev/null 2>&1; then
+        PYTHON_BIN="python3.12"
+    elif command -v python >/dev/null 2>&1; then
+        PYTHON_BIN="python"
+    else
+        echo "ERROR: no python interpreter found (tried python3, python3.12, python)" >&2
+        exit 1
+    fi
+fi
+echo "Using PYTHON_BIN=$PYTHON_BIN ($($PYTHON_BIN --version 2>&1))"
+
 START_TIME="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
 echo "========================================"
@@ -53,35 +73,35 @@ echo "========================================"
 # ── Step 0: Preflight — fail fast on env / connectivity drift ────────────────
 echo ""
 echo "==> Step 0/5: Preflight checks..."
-python -m rag.preflight
+$PYTHON_BIN -m rag.preflight
 
 # ── Step 1: SEC filings (10-K/10-Q) ─────────────────────────────────────────
 echo ""
 echo "==> Step 1/5: SEC filings (10-K/10-Q)..."
-python -m rag.pipelines.ingest_sec_filings --from-signals --lookback-years 2 $DRY_RUN
+$PYTHON_BIN -m rag.pipelines.ingest_sec_filings --from-signals --lookback-years 2 $DRY_RUN
 
 # ── Step 2: 8-K material events ─────────────────────────────────────────────
 echo ""
 echo "==> Step 2/5: 8-K material events..."
-python -m rag.pipelines.ingest_8k_filings --from-signals --lookback-days 365 $DRY_RUN
+$PYTHON_BIN -m rag.pipelines.ingest_8k_filings --from-signals --lookback-days 365 $DRY_RUN
 
 # ── Step 3: Earnings transcripts (Finnhub) ──────────────────────────────────
 # FINNHUB_API_KEY is verified by preflight; no runtime skip branch.
 echo ""
 echo "==> Step 3/5: Earnings transcripts (Finnhub)..."
-python -m rag.pipelines.ingest_earnings_finnhub --from-signals --max-per-ticker 8 $DRY_RUN
+$PYTHON_BIN -m rag.pipelines.ingest_earnings_finnhub --from-signals --max-per-ticker 8 $DRY_RUN
 
 # ── Step 4: Thesis history (v2 quant/qual from signals.json) ─────────────────
 echo ""
 echo "==> Step 4/5: Thesis history..."
 SINCE=$(date -u -d '14 days ago' '+%Y-%m-%d' 2>/dev/null || date -u -v-14d '+%Y-%m-%d')
-python -m rag.pipelines.ingest_theses --signals --since "$SINCE" $DRY_RUN
+$PYTHON_BIN -m rag.pipelines.ingest_theses --signals --since "$SINCE" $DRY_RUN
 
 # ── Step 5: Filing change detection ──────────────────────────────────────────
 echo ""
 echo "==> Step 5/5: Filing change detection..."
 if [ -z "$DRY_RUN" ]; then
-    python -m rag.pipelines.filing_change_detection --output-s3
+    $PYTHON_BIN -m rag.pipelines.filing_change_detection --output-s3
 else
     echo "  SKIPPED in dry-run mode"
 fi
@@ -103,8 +123,7 @@ echo "Heartbeat emitted: rag-ingestion"
 
 # Send completion email. With `set -euo pipefail` active, reaching this
 # point means all 5 pipelines succeeded — the hardcoded 'ok' statuses
-# are truthful rather than aspirational.
-PYTHON_BIN="${PYTHON_BIN:-python}"
+# are truthful rather than aspirational. PYTHON_BIN resolved at top of script.
 $PYTHON_BIN -c "
 from emailer import send_step_email
 from datetime import datetime, timezone
