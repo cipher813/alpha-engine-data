@@ -74,10 +74,11 @@ SUBNET_ID="subnet-e07166ec"
 IAM_PROFILE="alpha-engine-executor-profile"
 
 # ── Parse flags ──────────────────────────────────────────────────────────────
-RUN_MODE="full"  # full | smoke-only
+RUN_MODE="full"  # full | smoke-only | rag-smoke-only
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --smoke-only) RUN_MODE="smoke-only"; shift ;;
+        --rag-smoke-only) RUN_MODE="rag-smoke-only"; shift ;;
         --instance-type) INSTANCE_TYPE="$2"; shift 2 ;;
         --branch) BRANCH="$2"; shift 2 ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
@@ -278,6 +279,65 @@ $REMOTE_PYTHON weekly_collector.py --phase 1 --dry-run 2>&1
 SMOKE
 
     echo "==> Smoke complete — instance will be terminated."
+    exit 0
+fi
+
+# ── RAG-smoke-only: SSM fetch + preflight + submodule imports + dry-run ──────
+# Exercises the RAG-via-SSM path end-to-end on a real AL2023 spot without
+# hitting production external state (no SEC fetches, no Voyage embeddings,
+# no Postgres writes — everything gated by --dry-run in the submodules).
+# Validates:
+#   1. IAM: spot can fetch the 4 RAG secrets from SSM
+#   2. PYTHON_BIN resolution under python3.12 on AL2023
+#   3. All 5 env vars pass rag/preflight.py::RAGPreflight.check_env_vars
+#   4. All 5 RAG submodules import under python3.12
+#   5. run_weekly_ingestion.sh --dry-run executes each pipeline's CLI path
+# Does NOT validate: Postgres reachability (dry-run doesn't connect),
+# external API quotas (dry-run doesn't hit them), runtime bugs that only
+# trigger on production-shape data.
+if [ "$RUN_MODE" = "rag-smoke-only" ]; then
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "  RAG SMOKE TEST"
+    echo "═══════════════════════════════════════════════════════════════"
+    run_remote bash -s <<RAG_SMOKE
+set -euo pipefail
+cd /home/ec2-user/alpha-engine-data
+${ENV_SOURCE}
+
+echo "==> RAG smoke: fetching secrets from SSM"
+for name in VOYAGE_API_KEY FINNHUB_API_KEY EDGAR_IDENTITY RAG_DATABASE_URL; do
+    val=\$(aws ssm get-parameter --name /alpha-engine/\$name --with-decryption --query 'Parameter.Value' --output text --region "\${AWS_REGION:-us-east-1}" 2>/dev/null || echo "")
+    if [ -z "\$val" ]; then
+        echo "ERROR: could not fetch /alpha-engine/\$name from SSM" >&2
+        exit 1
+    fi
+    export \$name="\$val"
+    unset val
+done
+echo "RAG secrets fetched: VOYAGE_API_KEY, FINNHUB_API_KEY, EDGAR_IDENTITY, RAG_DATABASE_URL"
+
+echo ""
+echo "==> RAG smoke: preflight env-var check"
+\$PYTHON_BIN -m rag.preflight
+
+echo ""
+echo "==> RAG smoke: import all 5 RAG submodules"
+\$PYTHON_BIN -c "
+import rag.pipelines.ingest_sec_filings
+import rag.pipelines.ingest_8k_filings
+import rag.pipelines.ingest_earnings_finnhub
+import rag.pipelines.ingest_theses
+import rag.pipelines.filing_change_detection
+print('all 5 rag submodules imported OK')
+"
+
+echo ""
+echo "==> RAG smoke: run_weekly_ingestion.sh --dry-run"
+bash rag/pipelines/run_weekly_ingestion.sh --dry-run 2>&1
+RAG_SMOKE
+
+    echo "==> RAG smoke complete — instance will be terminated."
     exit 0
 fi
 
