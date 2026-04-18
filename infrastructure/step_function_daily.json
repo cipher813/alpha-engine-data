@@ -1,5 +1,5 @@
 {
-  "Comment": "Alpha Engine Weekday Pipeline — daily data collection, predictor inference, executor start. Runs Mon-Fri 6:05 AM PT (13:05 UTC).",
+  "Comment": "Alpha Engine Weekday Pipeline — predictor inference and executor start. Runs Mon-Fri 6:05 AM PT (13:05 UTC). DailyData moved to post-close (1:05 PM PT) systemd timer on ae-trading — see alpha-engine repo's alpha-engine-daily-data.timer (2026-04-17 incident: pre-market polygon grouped-daily silently returned T-1 data labeled as T).",
   "StartAt": "CheckTradingDay",
   "States": {
 
@@ -167,103 +167,9 @@
 
     "WaitForInstanceReady": {
       "Type": "Wait",
-      "Comment": "Wait for SSM agent to register (~30s typical). IB Gateway authenticates in the background during DailyData — wait-for-ibgateway.sh handles it before RunMorningPlanner.",
+      "Comment": "Wait for SSM agent to register (~30s typical). IB Gateway authenticates in the background; wait-for-ibgateway.sh handles it before RunMorningPlanner.",
       "Seconds": 60,
-      "Next": "DailyData"
-    },
-
-    "DailyData": {
-      "Type": "Task",
-      "Comment": "Capture today's OHLCV closes for all tickers (runs on ae-trading t3.small — 2 GB RAM for feature computation)",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
-      "Parameters": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds.$": "$.trading_instance_id",
-        "Parameters": {
-          "commands": [
-            "set -eo pipefail",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-data",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "source .venv/bin/activate",
-            "python weekly_collector.py --daily 2>&1 | tee /var/log/daily-data.log"
-          ],
-          "executionTimeout": ["600"]
-        },
-        "TimeoutSeconds": 600
-      },
-      "TimeoutSeconds": 660,
-      "Retry": [
-        {
-          "ErrorEquals": ["States.TaskFailed"],
-          "MaxAttempts": 1,
-          "IntervalSeconds": 60,
-          "BackoffRate": 1.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "Next": "HandleFailure",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultPath": "$.daily_data_result",
-      "Next": "WaitForDailyData"
-    },
-
-    "WaitForDailyData": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
-      "Parameters": {
-        "CommandId.$": "$.daily_data_result.Command.CommandId",
-        "InstanceId.$": "$.trading_instance_id[0]"
-      },
-      "Retry": [
-        {
-          "ErrorEquals": ["Ssm.InvocationDoesNotExistException"],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 10,
-          "BackoffRate": 1.5
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "Next": "HandleFailure",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultPath": "$.daily_data_poll",
-      "Next": "CheckDailyDataStatus"
-    },
-
-    "CheckDailyDataStatus": {
-      "Type": "Choice",
-      "Choices": [
-        {
-          "Variable": "$.daily_data_poll.Status",
-          "StringEquals": "Success",
-          "Next": "PredictorInference"
-        },
-        {
-          "Variable": "$.daily_data_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "DailyDataWait"
-        },
-        {
-          "Variable": "$.daily_data_poll.Status",
-          "StringEquals": "Pending",
-          "Next": "DailyDataWait"
-        }
-      ],
-      "Default": "HandleFailure"
-    },
-
-    "DailyDataWait": {
-      "Type": "Wait",
-      "Seconds": 15,
-      "Next": "WaitForDailyData"
+      "Next": "PredictorInference"
     },
 
     "PredictorInference": {
