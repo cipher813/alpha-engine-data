@@ -50,6 +50,12 @@ class PolygonClient:
         self._call_times: deque[float] = deque()
         self._session = requests.Session()
         self._session.params = {"apiKey": self._api_key}  # type: ignore[assignment]
+        # Per-process cache for grouped-daily responses. Historical grouped-daily
+        # data is immutable, and callers (universe_returns) fetch the same
+        # calendar dates repeatedly across overlapping eval_date windows
+        # (t0, +5d, +10d, +30d). Dedup'ing here cuts the free-tier 5 calls/min
+        # rate-limit tax by ~3.5× on backfill runs.
+        self._grouped_daily_cache: dict[str, dict[str, dict]] = {}
 
     # -- Rate limiter --------------------------------------------------------
 
@@ -99,13 +105,18 @@ class PolygonClient:
         Returns {ticker: {"open": float, "high": float, "low": float,
                           "close": float, "volume": float,
                           "vwap": float | None}}
+
+        Responses are cached per-instance (see __init__). Empty results
+        (non-trading days) are cached too — same URL returns the same answer.
         """
+        if date_str in self._grouped_daily_cache:
+            return self._grouped_daily_cache[date_str]
         data = self._get(
             f"/v2/aggs/grouped/locale/us/market/stocks/{date_str}",
             params={"adjusted": "true"},
         )
         results = data.get("results", [])
-        return {
+        parsed = {
             r["T"]: {
                 "open": r["o"],
                 "high": r["h"],
@@ -117,6 +128,8 @@ class PolygonClient:
             for r in results
             if "T" in r
         }
+        self._grouped_daily_cache[date_str] = parsed
+        return parsed
 
     def get_daily_bars(
         self,
