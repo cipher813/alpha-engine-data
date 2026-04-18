@@ -70,3 +70,39 @@ def test_sector_etfs_iterate_explicit_list():
     # Old code: `for sym in closes: if sym.startswith("XL")` — missing keys
     # silently don't iterate. New code: explicit list.
     assert 'sector_etfs = ["XLB"' in src or 'sector_etfs = [\n' in src
+
+
+def test_no_skip_guard_on_existing_today_row():
+    """daily_append must NOT skip tickers whose history already contains today_ts.
+
+    Regression for 2026-04-18: a `if today_ts in hist.index: skip` guard
+    defeated the idempotency guarantee that update() provides. Symptom was
+    discovered during the 2026-04-17 incident recovery — the poisoned
+    morning run had already written T-1 data under index=T, and a re-run
+    with correct polygon data couldn't overwrite because every ticker
+    tripped the skip guard.
+
+    update() is explicitly chosen (see the comment at the update call site)
+    BECAUSE it replaces same-date rows. The guard was redundant at best,
+    actively harmful at worst. This test locks the removal so a future
+    well-intentioned refactor doesn't re-introduce it.
+    """
+    src = _source()
+    # Must not have the exact skip pattern. Allow comments that document
+    # why the guard was removed (they reference today_ts in hist.index).
+    # The test looks for the executable pattern: an `if today_ts in hist.index`
+    # immediately followed by `n_skip += 1` in the next 2 lines.
+    lines = src.splitlines()
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue  # skip comments
+        if "today_ts in hist.index" in stripped and stripped.startswith("if "):
+            # Check if this is followed by `n_skip += 1 ... continue` (the
+            # skip pattern). If so, the guard was reintroduced.
+            following = "\n".join(lines[i:i+4])
+            assert "n_skip" not in following, (
+                f"Found skip-on-existing-today guard at line {i+1}. Remove it — "
+                "update() already handles same-date idempotency. See "
+                "2026-04-17 label-bug incident."
+            )
