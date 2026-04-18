@@ -303,6 +303,29 @@ echo "DataPhase1 complete at \$(date)"
 
 echo ""
 echo "──────────────────────────────────────────────────────────────"
+echo "Fetching RAG secrets from SSM at \$(date)"
+echo "──────────────────────────────────────────────────────────────"
+# Phase 2 SSM migration — RAG secrets come from SSM Parameter Store, NOT
+# from the SCP'd .env. Origin: 2026-04-17 Saturday Step Function failure
+# where RAG_DATABASE_URL silently truncated at an unquoted & in the .env
+# (a Postgres DSN query-param). Bash source on AL2023 spots dropped the
+# tail of the value after the shell metachar. SSM stores the value as an
+# opaque string — no shell-parse fragility, no cross-instance sync via
+# push-secrets.sh needed, and the spot's IAM profile already has
+# ssm:GetParameter (pattern already in use above for /alpha-engine/lib-token).
+for name in VOYAGE_API_KEY FINNHUB_API_KEY EDGAR_IDENTITY RAG_DATABASE_URL; do
+    val=\$(aws ssm get-parameter --name /alpha-engine/\$name --with-decryption --query 'Parameter.Value' --output text --region "\${AWS_REGION:-us-east-1}" 2>/dev/null || echo "")
+    if [ -z "\$val" ]; then
+        echo "ERROR: could not fetch /alpha-engine/\$name from SSM — required for RAG ingestion" >&2
+        exit 1
+    fi
+    export \$name="\$val"
+    unset val
+done
+echo "RAG secrets fetched: VOYAGE_API_KEY, FINNHUB_API_KEY, EDGAR_IDENTITY, RAG_DATABASE_URL"
+
+echo ""
+echo "──────────────────────────────────────────────────────────────"
 echo "Starting rag/pipelines/run_weekly_ingestion.sh at \$(date)"
 echo "──────────────────────────────────────────────────────────────"
 if ! bash rag/pipelines/run_weekly_ingestion.sh 2>&1; then
