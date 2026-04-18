@@ -200,10 +200,18 @@ def daily_append(
                 n_skip += 1
                 continue
 
-            # Check if today already exists
-            if today_ts in hist.index:
-                n_skip += 1
-                continue
+            # Re-running daily_append for the same date MUST overwrite the
+            # existing row, not skip it. universe_lib.update() is idempotent
+            # (same-date rows replace instead of accumulate — see the comment
+            # at the update() call below), so there's nothing to guard against.
+            #
+            # Prior to 2026-04-18, a `today_ts in hist.index: skip` guard here
+            # silently no-op'd every re-run. That masked the 2026-04-17 label
+            # incident: after Polygon-grouped-daily returned T-1 data stamped
+            # as T in the morning DailyData run, a re-run with fresh polygon
+            # data couldn't repair the poisoned rows — every ticker was
+            # skipped. Removing the guard restores the idempotency guarantee
+            # that update() was chosen to provide.
 
             # Build today's OHLCV row
             bar = closes[ticker]
