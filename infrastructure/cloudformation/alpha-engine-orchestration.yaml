@@ -274,6 +274,29 @@ Resources:
       AlarmActions:
         - !Ref AlertsTopic
 
+  # Research↔Predictor coverage gap. Emitted by the executor's signal_reader
+  # on every run (value 0 on success, >0 when buy_candidates have no
+  # prediction row). A positive value means the weekday Step Function's
+  # coverage-gap self-heal (CheckPredictorCoverage → ReinvokePredictor) also
+  # failed to close the gap before the executor read predictions.json —
+  # indicates a regression of that orchestration. First observed as a silent
+  # veto bypass on 2026-04-20 (4 of 5 entries bypassed the GBM veto).
+  UnscoredBuyCandidatesGap:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: alpha-engine-predictor-unscored-buy-candidates
+      AlarmDescription: Executor saw buy_candidates without a prediction row — Step Function coverage-gap self-heal may have regressed
+      Namespace: AlphaEngine/Predictor
+      MetricName: unscored_buy_candidates_count
+      Statistic: Maximum
+      Period: 3600  # 1 hour
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching  # executor not running off-hours is expected
+      AlarmActions:
+        - !Ref AlertsTopic
+
   # Heartbeat alarms for EC2-based processes
   ExecutorMorningHeartbeat:
     Type: AWS::CloudWatch::Alarm
