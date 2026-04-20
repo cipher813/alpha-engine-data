@@ -113,13 +113,14 @@ POLICY='{
       "Resource": [
         "arn:aws:ssm:'"$REGION"'::document/AWS-RunShellScript",
         "arn:aws:ec2:'"$REGION"':'"$ACCOUNT_ID"':instance/'"$EC2_INSTANCE_ID"'",
+        "arn:aws:ec2:'"$REGION"':'"$ACCOUNT_ID"':instance/'"$TRADING_INSTANCE"'",
         "arn:aws:ssm:'"$REGION"':'"$ACCOUNT_ID"':*"
       ]
     },
     {
-      "Sid": "EC2Start",
+      "Sid": "EC2StartStop",
       "Effect": "Allow",
-      "Action": ["ec2:StartInstances"],
+      "Action": ["ec2:StartInstances", "ec2:StopInstances"],
       "Resource": "arn:aws:ec2:'"$REGION"':'"$ACCOUNT_ID"':instance/'"$TRADING_INSTANCE"'"
     },
     {
