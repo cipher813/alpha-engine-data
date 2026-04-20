@@ -204,21 +204,39 @@ def backfill(
     )
 
     # ── 2. Filter to stock tickers ───────────────────────────────────────────
+    # Two-tier filter:
+    #   universe_tickers: every non-skip stock ticker with data — gets written
+    #     to ArcticDB universe as raw OHLCV. Lets Research scan fresh listings
+    #     (e.g. recent S&P 500/400 additions with <1y of history) which only
+    #     need OHLCV columns, not engineered features.
+    #   tickers_with_features: subset with enough history for feature
+    #     computation (rolling 252-day vol/momentum etc.). Only these get
+    #     OHLCV + feature columns written; short-history tickers get OHLCV
+    #     only, and are skipped by feature-consuming predictors downstream.
     universe_tickers = [
         t for t in price_data
         if t not in _SKIP_TICKERS
         and not _is_sector_etf(t)
         and price_data[t] is not None
-        and len(price_data[t]) >= MIN_ROWS_FOR_FEATURES
     ]
+    tickers_with_features = {
+        t for t in universe_tickers
+        if len(price_data[t]) >= MIN_ROWS_FOR_FEATURES
+    }
 
     if ticker_filter:
         if ticker_filter not in universe_tickers:
-            log.error("Ticker %s not found in universe (or insufficient history)", ticker_filter)
+            log.error("Ticker %s not found in universe (no data or in skip list)", ticker_filter)
             return {"status": "error", "error": f"ticker_not_found: {ticker_filter}"}
         universe_tickers = [ticker_filter]
+        # tickers_with_features auto-narrows via set intersection below
 
-    log.info("Computing features for %d tickers...", len(universe_tickers))
+    log.info(
+        "Writing %d tickers to ArcticDB (%d with features, %d OHLCV-only fresh listings)",
+        len(universe_tickers),
+        sum(1 for t in universe_tickers if t in tickers_with_features),
+        sum(1 for t in universe_tickers if t not in tickers_with_features),
+    )
 
     # ── 3. Extract macro series ──────────────────────────────────────────────
     spy_series = macro.get("SPY")
@@ -239,57 +257,81 @@ def backfill(
     n_err = 0
     t_compute_start = time.time()
 
+    n_ok_features = 0
+    n_ok_ohlcv_only = 0
     for i, ticker in enumerate(universe_tickers):
         try:
             df = price_data[ticker]
-            sector_etf_sym = sector_map.get(ticker)
-            sector_etf_series = macro.get(sector_etf_sym) if sector_etf_sym else None
 
-            ticker_alt = alt_data.get(ticker, {})
+            if ticker in tickers_with_features:
+                sector_etf_sym = sector_map.get(ticker)
+                sector_etf_series = macro.get(sector_etf_sym) if sector_etf_sym else None
+                ticker_alt = alt_data.get(ticker, {})
 
-            featured_df = compute_features(
-                df,
-                spy_series=spy_series,
-                vix_series=vix_series,
-                sector_etf_series=sector_etf_series,
-                tnx_series=tnx_series,
-                irx_series=irx_series,
-                gld_series=gld_series,
-                uso_series=uso_series,
-                vix3m_series=vix3m_series,
-                earnings_data=ticker_alt.get("earnings"),
-                revision_data=ticker_alt.get("revisions"),
-                options_data=ticker_alt.get("options"),
-                fundamental_data=fundamentals.get(ticker),
-            )
+                featured_df = compute_features(
+                    df,
+                    spy_series=spy_series,
+                    vix_series=vix_series,
+                    sector_etf_series=sector_etf_series,
+                    tnx_series=tnx_series,
+                    irx_series=irx_series,
+                    gld_series=gld_series,
+                    uso_series=uso_series,
+                    vix3m_series=vix3m_series,
+                    earnings_data=ticker_alt.get("earnings"),
+                    revision_data=ticker_alt.get("revisions"),
+                    options_data=ticker_alt.get("options"),
+                    fundamental_data=fundamentals.get(ticker),
+                )
 
-            if featured_df.empty:
-                n_skip += 1
-                continue
+                if featured_df.empty:
+                    n_skip += 1
+                    continue
 
-            # Keep OHLCV + all feature columns
-            keep_cols = [c for c in OHLCV_COLS if c in featured_df.columns] + \
-                        [f for f in FEATURES if f in featured_df.columns]
-            symbol_df = featured_df[keep_cols].copy()
+                keep_cols = [c for c in OHLCV_COLS if c in featured_df.columns] + \
+                            [f for f in FEATURES if f in featured_df.columns]
+                symbol_df = featured_df[keep_cols].copy()
 
-            # Ensure float32 for feature columns (OHLCV stays float64/int64)
-            for f in FEATURES:
-                if f in symbol_df.columns:
-                    symbol_df[f] = symbol_df[f].astype("float32")
+                for f in FEATURES:
+                    if f in symbol_df.columns:
+                        symbol_df[f] = symbol_df[f].astype("float32")
 
-            symbol_df.index.name = "date"
+                symbol_df.index.name = "date"
 
-            if not dry_run:
-                universe_lib.write(ticker, symbol_df)
+                if not dry_run:
+                    universe_lib.write(ticker, symbol_df)
 
-            n_ok += 1
+                n_ok_features += 1
+            else:
+                # Fresh listing: too little history for features; write raw OHLCV
+                # so Research's 3-month price scan can include it. Predictor
+                # ticker filters skip these until they accumulate MIN_ROWS_FOR_FEATURES.
+                keep_cols = [c for c in OHLCV_COLS if c in df.columns]
+                symbol_df = df[keep_cols].copy()
+                symbol_df.index.name = "date"
+
+                if not dry_run:
+                    universe_lib.write(ticker, symbol_df)
+
+                n_ok_ohlcv_only += 1
+
+            n_ok = n_ok_features + n_ok_ohlcv_only
 
             if (i + 1) % 100 == 0:
-                log.info("Progress: %d / %d tickers processed (%d OK)", i + 1, len(universe_tickers), n_ok)
+                log.info(
+                    "Progress: %d / %d tickers processed (%d features, %d OHLCV-only)",
+                    i + 1, len(universe_tickers), n_ok_features, n_ok_ohlcv_only,
+                )
 
         except Exception as exc:
-            log.warning("Failed to compute features for %s: %s", ticker, exc)
+            log.warning("Failed to write %s: %s", ticker, exc)
             n_err += 1
+
+    n_ok = n_ok_features + n_ok_ohlcv_only
+    log.info(
+        "Backfill write complete: %d with features, %d OHLCV-only (fresh listings), %d skipped, %d errors",
+        n_ok_features, n_ok_ohlcv_only, n_skip, n_err,
+    )
 
     t_compute = time.time() - t_compute_start
 
