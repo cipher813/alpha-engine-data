@@ -114,6 +114,25 @@ echo "==> Deploying CloudFormation stack..."
 # Check if stack exists
 STACK_STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].StackStatus" --output text 2>/dev/null || echo "DOES_NOT_EXIST")
 
+# Terminal / unusable states surface loudly instead of being silently
+# skipped. 2026-04-20 incident: a stack sitting in ROLLBACK_COMPLETE
+# was masked by the old `|| echo "no updates needed"` catch — the new
+# UnscoredBuyCandidatesGap alarm from PR #72 was never actually created
+# but the deploy script reported success. Never again.
+case "$STACK_STATUS" in
+    ROLLBACK_COMPLETE | ROLLBACK_FAILED | UPDATE_ROLLBACK_FAILED | CREATE_FAILED | DELETE_FAILED)
+        echo "  ERROR: stack $STACK_NAME is in terminal state $STACK_STATUS — CloudFormation refuses to update."
+        echo "         Remediation (one-time): run the import change-set flow to adopt pre-existing resources."
+        echo "         See infrastructure/cloudformation/resources-to-import.json + the README section"
+        echo "         'Recovering from ROLLBACK_COMPLETE' for the exact aws commands."
+        exit 1
+        ;;
+    "" )
+        echo "  ERROR: empty stack status from describe-stacks — aborting to avoid acting on partial state."
+        exit 1
+        ;;
+esac
+
 if [ "$STACK_STATUS" = "DOES_NOT_EXIST" ]; then
     echo "  Creating new stack..."
     aws cloudformation create-stack \
@@ -126,16 +145,30 @@ if [ "$STACK_STATUS" = "DOES_NOT_EXIST" ]; then
     aws cloudformation wait stack-create-complete --stack-name "$STACK_NAME"
 else
     echo "  Updating existing stack (current status: $STACK_STATUS)..."
+    UPDATE_OUT="$(mktemp)"
+    trap "rm -f '$UPDATE_OUT'" EXIT
+    set +e
     aws cloudformation update-stack \
         --stack-name "$STACK_NAME" \
         --template-body "file://$TEMPLATE" \
         --capabilities CAPABILITY_NAMED_IAM \
         --tags "Key=git-sha,Value=$GIT_SHA" \
-        --query "StackId" --output text 2>/dev/null || {
-        # update-stack refuses when template AND tags are both unchanged. In
-        # that case the SHA is already current — no-op is correct.
+        --query "StackId" --output text > "$UPDATE_OUT" 2>&1
+    UPDATE_RC=$?
+    set -e
+    if [ $UPDATE_RC -eq 0 ]; then
+        echo "  update-stack submitted — waiting for completion..."
+        aws cloudformation wait stack-update-complete --stack-name "$STACK_NAME"
+    elif grep -q "No updates are to be performed" "$UPDATE_OUT"; then
+        # Only one AWS response is an acceptable no-op: template + tags unchanged.
+        # Every other error (including IAM denial, validation, rollback state)
+        # still exits non-zero because it means the deploy DIDN'T happen.
         echo "  No updates needed (template + git-sha tag both current)."
-    }
+    else
+        echo "  ERROR: update-stack failed with rc=$UPDATE_RC:"
+        cat "$UPDATE_OUT"
+        exit 1
+    fi
 fi
 
 echo ""
