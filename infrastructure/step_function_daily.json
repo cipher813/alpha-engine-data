@@ -120,7 +120,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekday Pipeline — Trading Day Check Failed (Proceeding)",
-        "Message.$": "States.Format('Trading day check failed (SSM error, not a holiday detection). Pipeline proceeding as trading day. Error: {}', States.JsonToString($.error))"
+        "Message.$": "States.Format('Trading day check failed (SSM error, not a holiday detection). Pipeline proceeding as trading day. State: {}', States.JsonToString($))"
       },
       "ResultPath": "$.trading_day_error_notify",
       "Next": "StartExecutorEC2"
@@ -423,7 +423,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekday Pipeline — FAILED",
-        "Message.$": "States.Format('Weekday pipeline failed. Error: {}', States.JsonToString($.error))"
+        "Message.$": "States.Format('Weekday pipeline failed. State: {}', States.JsonToString($))"
       },
       "ResultPath": "$.failure_notify",
       "Next": "FailExecution"
