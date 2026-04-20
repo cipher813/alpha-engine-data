@@ -1,7 +1,17 @@
 {
   "Comment": "Alpha Engine Saturday Pipeline — orchestrates weekly data collection, RAG ingestion, research, predictor training, and backtesting sequentially with fail-fast error handling. RAG runs before Research (fresh knowledge base). Backtester runs AFTER predictor training (depends on model weights). Supports partial execution via boolean skip_* flags on input (e.g. {\"skip_data_phase1\": true}); a missing flag is treated as false, so scheduled runs are unaffected.",
-  "StartAt": "CheckSkipDataPhase1",
+  "StartAt": "InitializeInput",
   "States": {
+
+    "InitializeInput": {
+      "Type": "Pass",
+      "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + ec2_instance_id explicitly; manual runs for partial-execution testing often omit sns_topic_arn, which previously caused HandleFailure/NotifyComplete to error on missing JSONPath. States.JsonMerge with user-input as the second arg lets explicit values win.",
+      "Parameters": {
+        "merged.$": "States.JsonMerge(States.StringToJson('{\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'), $$.Execution.Input, false)"
+      },
+      "OutputPath": "$.merged",
+      "Next": "CheckSkipDataPhase1"
+    },
 
     "CheckSkipDataPhase1": {
       "Type": "Choice",
