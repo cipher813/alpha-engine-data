@@ -1,7 +1,22 @@
 {
-  "Comment": "Alpha Engine Saturday Pipeline — orchestrates weekly data collection, RAG ingestion, research, predictor training, and backtesting sequentially with fail-fast error handling. RAG runs before Research (fresh knowledge base). Backtester runs AFTER predictor training (depends on model weights).",
-  "StartAt": "DataPhase1",
+  "Comment": "Alpha Engine Saturday Pipeline — orchestrates weekly data collection, RAG ingestion, research, predictor training, and backtesting sequentially with fail-fast error handling. RAG runs before Research (fresh knowledge base). Backtester runs AFTER predictor training (depends on model weights). Supports partial execution via boolean skip_* flags on input (e.g. {\"skip_data_phase1\": true}); a missing flag is treated as false, so scheduled runs are unaffected.",
+  "StartAt": "CheckSkipDataPhase1",
   "States": {
+
+    "CheckSkipDataPhase1": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. Input like {\"skip_data_phase1\": true} routes past DataPhase1 directly to the next skip-gate. Missing flag = run as normal.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_data_phase1", "IsPresent": true},
+            {"Variable": "$.skip_data_phase1", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipResearch"
+        }
+      ],
+      "Default": "DataPhase1"
+    },
 
     "DataPhase1": {
       "Type": "Task",
@@ -76,7 +91,7 @@
         {
           "Variable": "$.data_phase1_poll.Status",
           "StringEquals": "Success",
-          "Next": "Research"
+          "Next": "CheckSkipResearch"
         },
         {
           "Variable": "$.data_phase1_poll.Status",
@@ -96,6 +111,21 @@
       "Type": "Wait",
       "Seconds": 30,
       "Next": "WaitForDataPhase1"
+    },
+
+    "CheckSkipResearch": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. {\"skip_research\": true} bypasses the research Lambda and jumps to DataPhase2's skip-gate.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_research", "IsPresent": true},
+            {"Variable": "$.skip_research", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipDataPhase2"
+        }
+      ],
+      "Default": "Research"
     },
 
     "Research": {
@@ -136,15 +166,30 @@
         {
           "Variable": "$.research_result.Payload.status",
           "StringEquals": "OK",
-          "Next": "DataPhase2"
+          "Next": "CheckSkipDataPhase2"
         },
         {
           "Variable": "$.research_result.Payload.status",
           "StringEquals": "SKIPPED",
-          "Next": "DataPhase2"
+          "Next": "CheckSkipDataPhase2"
         }
       ],
       "Default": "ExtractResearchError"
+    },
+
+    "CheckSkipDataPhase2": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. {\"skip_data_phase2\": true} bypasses the Phase 2 Lambda and jumps to PredictorTraining's skip-gate.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_data_phase2", "IsPresent": true},
+            {"Variable": "$.skip_data_phase2", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipPredictorTraining"
+        }
+      ],
+      "Default": "DataPhase2"
     },
 
     "DataPhase2": {
@@ -174,7 +219,22 @@
         }
       ],
       "ResultPath": "$.data_phase2_result",
-      "Next": "PredictorTraining"
+      "Next": "CheckSkipPredictorTraining"
+    },
+
+    "CheckSkipPredictorTraining": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. {\"skip_predictor_training\": true} bypasses GBM retrain and jumps to DriftDetection's skip-gate.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_predictor_training", "IsPresent": true},
+            {"Variable": "$.skip_predictor_training", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipDriftDetection"
+        }
+      ],
+      "Default": "PredictorTraining"
     },
 
     "PredictorTraining": {
@@ -251,7 +311,7 @@
         {
           "Variable": "$.predictor_poll.Status",
           "StringEquals": "Success",
-          "Next": "DriftDetection"
+          "Next": "CheckSkipDriftDetection"
         },
         {
           "Variable": "$.predictor_poll.Status",
@@ -271,6 +331,21 @@
       "Type": "Wait",
       "Seconds": 60,
       "Next": "WaitForPredictorTraining"
+    },
+
+    "CheckSkipDriftDetection": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. {\"skip_drift_detection\": true} bypasses drift detection and jumps to Backtester's skip-gate.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_drift_detection", "IsPresent": true},
+            {"Variable": "$.skip_drift_detection", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipBacktester"
+        }
+      ],
+      "Default": "DriftDetection"
     },
 
     "DriftDetection": {
@@ -298,12 +373,27 @@
         {
           "ErrorEquals": ["States.ALL"],
           "Comment": "Drift detection is non-blocking — continue to backtester",
-          "Next": "Backtester",
+          "Next": "CheckSkipBacktester",
           "ResultPath": "$.drift_error"
         }
       ],
       "ResultPath": "$.drift_result",
-      "Next": "Backtester"
+      "Next": "CheckSkipBacktester"
+    },
+
+    "CheckSkipBacktester": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. {\"skip_backtester\": true} bypasses the backtester and jumps to Evaluator's skip-gate.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_backtester", "IsPresent": true},
+            {"Variable": "$.skip_backtester", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipEvaluator"
+        }
+      ],
+      "Default": "Backtester"
     },
 
     "Backtester": {
@@ -380,7 +470,7 @@
         {
           "Variable": "$.backtester_poll.Status",
           "StringEquals": "Success",
-          "Next": "Evaluator"
+          "Next": "CheckSkipEvaluator"
         },
         {
           "Variable": "$.backtester_poll.Status",
@@ -400,6 +490,21 @@
       "Type": "Wait",
       "Seconds": 60,
       "Next": "WaitForBacktester"
+    },
+
+    "CheckSkipEvaluator": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. {\"skip_evaluator\": true} bypasses the evaluator and jumps to the Saturday health check. SaturdayHealthCheck is always run.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_evaluator", "IsPresent": true},
+            {"Variable": "$.skip_evaluator", "BooleanEquals": true}
+          ],
+          "Next": "SaturdayHealthCheck"
+        }
+      ],
+      "Default": "Evaluator"
     },
 
     "Evaluator": {
