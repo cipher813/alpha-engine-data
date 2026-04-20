@@ -201,7 +201,10 @@ scp $SSH_OPTS -i "$KEY_FILE" \
 # require broader git-auth setup than the lib-only insteadOf we use here).
 CONFIG_SRC="/home/ec2-user/alpha-engine-config/data/config.yaml"
 if [ ! -f "$CONFIG_SRC" ]; then
-    echo "ERROR: dispatcher config not found at $CONFIG_SRC — is alpha-engine-config cloned + pulled?"
+    CONFIG_SRC="$HOME/Development/alpha-engine-config/data/config.yaml"
+fi
+if [ ! -f "$CONFIG_SRC" ]; then
+    echo "ERROR: dispatcher config not found at /home/ec2-user/alpha-engine-config/data/config.yaml or $HOME/Development/alpha-engine-config/data/config.yaml — is alpha-engine-config cloned + pulled?"
     exit 1
 fi
 echo "==> Uploading alpha-engine-config/data/config.yaml to spot..."
