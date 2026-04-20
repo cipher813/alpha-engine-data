@@ -74,11 +74,12 @@ SUBNET_ID="subnet-e07166ec"
 IAM_PROFILE="alpha-engine-executor-profile"
 
 # ── Parse flags ──────────────────────────────────────────────────────────────
-RUN_MODE="full"  # full | smoke-only | rag-smoke-only
+RUN_MODE="full"  # full | smoke-only | rag-smoke-only | rag-only
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --smoke-only) RUN_MODE="smoke-only"; shift ;;
         --rag-smoke-only) RUN_MODE="rag-smoke-only"; shift ;;
+        --rag-only) RUN_MODE="rag-only"; shift ;;
         --instance-type) INSTANCE_TYPE="$2"; shift 2 ;;
         --branch) BRANCH="$2"; shift 2 ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
@@ -341,6 +342,62 @@ bash rag/pipelines/run_weekly_ingestion.sh --dry-run 2>&1
 RAG_SMOKE
 
     echo "==> RAG smoke complete — instance will be terminated."
+    exit 0
+fi
+
+# ── RAG-only: skip DataPhase1, run only RAG ingestion ───────────────────────
+# Use when DataPhase1 succeeded earlier (e.g. last Saturday's SF cleared
+# DataPhase1 but RAG failed downstream and needs a standalone re-run). Fetches
+# secrets from SSM, runs the real (non-dry-run) RAG ingestion, emits only the
+# rag-ingestion heartbeat so CloudWatch state accurately reflects what ran.
+if [ "$RUN_MODE" = "rag-only" ]; then
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "  RAG-ONLY RUN (skipping DataPhase1)"
+    echo "═══════════════════════════════════════════════════════════════"
+    run_remote bash -s <<RAG_ONLY
+set -euo pipefail
+cd /home/ec2-user/alpha-engine-data
+${ENV_SOURCE}
+
+echo "──────────────────────────────────────────────────────────────"
+echo "Fetching RAG secrets from SSM at \$(date)"
+echo "──────────────────────────────────────────────────────────────"
+for name in VOYAGE_API_KEY FINNHUB_API_KEY EDGAR_IDENTITY RAG_DATABASE_URL; do
+    val=\$(aws ssm get-parameter --name /alpha-engine/\$name --with-decryption --query 'Parameter.Value' --output text --region "\${AWS_REGION:-us-east-1}" 2>/dev/null || echo "")
+    if [ -z "\$val" ]; then
+        echo "ERROR: could not fetch /alpha-engine/\$name from SSM — required for RAG ingestion" >&2
+        exit 1
+    fi
+    export \$name="\$val"
+    unset val
+done
+echo "RAG secrets fetched: VOYAGE_API_KEY, FINNHUB_API_KEY, EDGAR_IDENTITY, RAG_DATABASE_URL"
+
+echo ""
+echo "──────────────────────────────────────────────────────────────"
+echo "Starting rag/pipelines/run_weekly_ingestion.sh at \$(date)"
+echo "──────────────────────────────────────────────────────────────"
+if ! bash rag/pipelines/run_weekly_ingestion.sh 2>&1; then
+    echo "ERROR: run_weekly_ingestion.sh failed." >&2
+    exit 1
+fi
+echo "RAGIngestion complete at \$(date)"
+RAG_ONLY
+
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "  RAG-only run complete. Instance will be terminated."
+    echo "═══════════════════════════════════════════════════════════════"
+
+    aws cloudwatch put-metric-data \
+        --namespace "AlphaEngine" \
+        --metric-name "Heartbeat" \
+        --dimensions "Process=rag-ingestion" \
+        --value 1 --unit "Count" \
+        --region "${AWS_REGION:-us-east-1}" 2>/dev/null \
+        && echo "Heartbeat emitted: rag-ingestion" \
+        || echo "WARNING: Failed to emit heartbeat for rag-ingestion (non-fatal)"
     exit 0
 fi
 
