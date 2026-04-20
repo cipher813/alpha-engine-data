@@ -218,7 +218,124 @@
         }
       ],
       "ResultPath": "$.predictor_result",
-      "Next": "PredictorHealthCheck"
+      "Next": "CheckPredictorCoverage"
+    },
+
+    "CheckPredictorCoverage": {
+      "Type": "Task",
+      "Comment": "Self-healing coverage gate: detect buy_candidates in signals.json that lack a prediction row. Primary guard against the 2026-04-20 silent-veto-bypass bug. If any are missing, ReinvokePredictor scores them and RecheckCoverage verifies before we proceed to executor.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-predictor-inference:live",
+        "Payload": {
+          "action": "check_coverage"
+        }
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 15,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.coverage_result",
+      "Next": "CoverageGapChoice"
+    },
+
+    "CoverageGapChoice": {
+      "Type": "Choice",
+      "Comment": "If buy_candidates have unscored tickers, re-invoke the predictor with --tickers. Otherwise advance to PredictorHealthCheck.",
+      "Choices": [
+        {
+          "Variable": "$.coverage_result.Payload.has_gap",
+          "BooleanEquals": true,
+          "Next": "ReinvokePredictor"
+        }
+      ],
+      "Default": "PredictorHealthCheck"
+    },
+
+    "ReinvokePredictor": {
+      "Type": "Task",
+      "Comment": "Supplemental-scoring re-invoke for the tickers CheckPredictorCoverage flagged as missing. Predictor merges the new predictions into predictions/{date}.json (re-ranks the union).",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-predictor-inference:live",
+        "Payload": {
+          "action": "predict",
+          "tickers.$": "$.coverage_result.Payload.missing_tickers"
+        }
+      },
+      "TimeoutSeconds": 900,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.reinvoke_result",
+      "Next": "RecheckCoverage"
+    },
+
+    "RecheckCoverage": {
+      "Type": "Task",
+      "Comment": "Second coverage check after ReinvokePredictor. If the gap persists (e.g. some ticker genuinely cannot be scored), bail out instead of looping — HandleFailure fires the SNS alert.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-predictor-inference:live",
+        "Payload": {
+          "action": "check_coverage"
+        }
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 15,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.coverage_recheck_result",
+      "Next": "FinalCoverageGate"
+    },
+
+    "FinalCoverageGate": {
+      "Type": "Choice",
+      "Comment": "After one re-invocation attempt, either coverage is complete (proceed) or we have a deeper problem (fail). No further retry loop — prevents runaway invocations if a ticker is un-scorable by the model.",
+      "Choices": [
+        {
+          "Variable": "$.coverage_recheck_result.Payload.has_gap",
+          "BooleanEquals": true,
+          "Next": "HandleFailure"
+        }
+      ],
+      "Default": "PredictorHealthCheck"
     },
 
     "PredictorHealthCheck": {
