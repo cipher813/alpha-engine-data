@@ -504,7 +504,63 @@
           "Next": "SaturdayHealthCheck"
         }
       ],
+      "Default": "CheckEvaluatorFreeze"
+    },
+
+    "CheckEvaluatorFreeze": {
+      "Type": "Choice",
+      "Comment": "Freeze-gate. {\"freeze_evaluator\": true} routes to EvaluatorFrozen (--freeze flag suppresses per-optimizer S3 config writes; report artifacts + email still upload). Use for off-cycle test runs so mid-week sweeps don't auto-promote weights/params/thresholds against Monday trading.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.freeze_evaluator", "IsPresent": true},
+            {"Variable": "$.freeze_evaluator", "BooleanEquals": true}
+          ],
+          "Next": "EvaluatorFrozen"
+        }
+      ],
       "Default": "Evaluator"
+    },
+
+    "EvaluatorFrozen": {
+      "Type": "Task",
+      "Comment": "Frozen evaluator — same runtime as Evaluator but with --freeze. Per-optimizer config writes (scoring_weights.json, executor_params.json, predictor_params.json, etc.) are skipped; apply_result reports 'frozen (--freeze flag)'. Report CSVs + markdown + email still upload via --upload.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "commands": [
+            "set -eo pipefail",
+            "export HOME=/home/ec2-user",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+            "cd /home/ec2-user/alpha-engine-backtester",
+            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "source .venv/bin/activate",
+            "python evaluate.py --mode all --upload --freeze --log-level INFO 2>&1 | tee /var/log/evaluator.log"
+          ],
+          "executionTimeout": ["1800"]
+        },
+        "TimeoutSeconds": 1800
+      },
+      "TimeoutSeconds": 1860,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.evaluator_result",
+      "Next": "WaitForEvaluator"
     },
 
     "Evaluator": {
