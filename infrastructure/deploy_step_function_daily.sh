@@ -183,7 +183,6 @@ aws iam put-role-policy \
 
 INPUT_JSON=$(cat <<EOF
 {
-  "ec2_instance_id": ["$MICRO_INSTANCE"],
   "trading_instance_id": ["$TRADING_INSTANCE"],
   "sns_topic_arn": "$SNS_TOPIC_ARN"
 }
@@ -224,6 +223,6 @@ echo ""
 echo "To test manually:"
 echo "  aws stepfunctions start-execution \\"
 echo "    --state-machine-arn $SM_ARN \\"
-echo "    --input '{\"ec2_instance_id\": [\"$MICRO_INSTANCE\"], \"trading_instance_id\": [\"$TRADING_INSTANCE\"], \"sns_topic_arn\": \"$SNS_TOPIC_ARN\"}' \\"
+echo "    --input '{\"trading_instance_id\": [\"$TRADING_INSTANCE\"], \"sns_topic_arn\": \"$SNS_TOPIC_ARN\"}' \\"
 echo "    --region $REGION"
 echo ""
