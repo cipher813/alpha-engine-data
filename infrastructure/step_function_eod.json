@@ -19,11 +19,11 @@
             "python weekly_collector.py --daily --only daily_closes 2>&1 | tee /var/log/postmarket-data.log",
             "python -m builders.daily_append 2>&1 | tee -a /var/log/postmarket-data.log"
           ],
-          "executionTimeout": ["180"]
+          "executionTimeout": ["1200"]
         },
-        "TimeoutSeconds": 180
+        "TimeoutSeconds": 1200
       },
-      "TimeoutSeconds": 240,
+      "TimeoutSeconds": 1260,
       "Retry": [
         {
           "ErrorEquals": ["States.TaskFailed"],
@@ -95,7 +95,22 @@
           "Next": "PostMarketWait"
         }
       ],
-      "Default": "HandleFailure"
+      "Default": "PostMarketStatusError"
+    },
+
+    "PostMarketStatusError": {
+      "Type": "Pass",
+      "Comment": "Choice Default path — synthesize $.error from poll result so HandleFailure's JsonToString($.error) has something to stringify.",
+      "Parameters": {
+        "source": "post_market_status",
+        "status.$": "$.postmarket_poll.Status",
+        "status_details.$": "$.postmarket_poll.StatusDetails",
+        "response_code.$": "$.postmarket_poll.ResponseCode",
+        "command_id.$": "$.postmarket_poll.CommandId",
+        "instance_id.$": "$.postmarket_poll.InstanceId"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
     },
 
     "PostMarketWait": {
@@ -194,7 +209,22 @@
           "Next": "EODWait"
         }
       ],
-      "Default": "HandleFailure"
+      "Default": "EODStatusError"
+    },
+
+    "EODStatusError": {
+      "Type": "Pass",
+      "Comment": "Choice Default path — synthesize $.error from poll result so HandleFailure's JsonToString($.error) has something to stringify.",
+      "Parameters": {
+        "source": "eod_status",
+        "status.$": "$.eod_poll.Status",
+        "status_details.$": "$.eod_poll.StatusDetails",
+        "response_code.$": "$.eod_poll.ResponseCode",
+        "command_id.$": "$.eod_poll.CommandId",
+        "instance_id.$": "$.eod_poll.InstanceId"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
     },
 
     "EODWait": {
