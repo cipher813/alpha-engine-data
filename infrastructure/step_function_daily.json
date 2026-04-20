@@ -1,7 +1,50 @@
 {
   "Comment": "Alpha Engine Weekday Pipeline — predictor inference and executor start. Runs Mon-Fri 6:05 AM PT (13:05 UTC). DailyData moved to post-close (1:05 PM PT) systemd timer on ae-trading. Policy: all SSM steps run on ae-trading (trading_instance_id); ae-dashboard is reserved for Streamlit + nginx + spot-launcher only.",
-  "StartAt": "StartExecutorEC2",
+  "StartAt": "DeployDriftCheck",
   "States": {
+
+    "DeployDriftCheck": {
+      "Type": "Task",
+      "Comment": "Verify the deployed SF definition + CloudFormation stack SHAs match alpha-engine-data@main HEAD. Halts the pipeline when infrastructure code has merged but deploy-infrastructure.sh never ran. Degraded modes (missing stamps, GitHub outage) set has_drift=false so legacy artifacts and API outages do not block trading-hours runs.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-predictor-inference:live",
+        "Payload": {
+          "action": "check_deploy_drift"
+        }
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 15,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.drift_result",
+      "Next": "DeployDriftGate"
+    },
+
+    "DeployDriftGate": {
+      "Type": "Choice",
+      "Comment": "Hard-fail when the drift probe reports has_drift=true. Surfaces deploy lag loudly instead of silently running new SF definitions against stale Lambda images (or vice versa).",
+      "Choices": [
+        {
+          "Variable": "$.drift_result.Payload.has_drift",
+          "BooleanEquals": true,
+          "Next": "HandleFailure"
+        }
+      ],
+      "Default": "StartExecutorEC2"
+    },
 
     "CheckTradingDay": {
       "Type": "Task",
