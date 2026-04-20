@@ -5,13 +5,14 @@
 
     "PostMarketData": {
       "Type": "Task",
-      "Comment": "Capture today's closing prices from polygon + append to ArcticDB (runs on micro EC2)",
+      "Comment": "Capture today's closing prices from polygon + append to ArcticDB (runs on ae-trading). Hard-fails on non-zero exit via pipefail so tee does not mask python failures.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
-        "InstanceIds.$": "$.ec2_instance_id",
+        "InstanceIds.$": "$.trading_instance_id",
         "Parameters": {
           "commands": [
+            "set -o pipefail",
             "cd /home/ec2-user/alpha-engine-data",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
@@ -34,9 +35,9 @@
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
-          "Comment": "PostMarketData failure is non-blocking — EOD can still use IB Gateway prices as fallback",
-          "Next": "EODReconcile",
-          "ResultPath": "$.postmarket_error"
+          "Comment": "Hard-fail: EOD reconcile requires fresh ArcticDB closes (price_cache raises RuntimeError on miss). Don't paper over a PostMarketData failure.",
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
         }
       ],
       "ResultPath": "$.postmarket_result",
@@ -48,7 +49,7 @@
       "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
       "Parameters": {
         "CommandId.$": "$.postmarket_result.Command.CommandId",
-        "InstanceId.$": "$.ec2_instance_id[0]"
+        "InstanceId.$": "$.trading_instance_id[0]"
       },
       "Retry": [
         {
@@ -61,8 +62,8 @@
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
-          "Next": "EODReconcile",
-          "ResultPath": "$.postmarket_error"
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
         }
       ],
       "ResultPath": "$.postmarket_poll",
@@ -71,6 +72,7 @@
 
     "CheckPostMarketStatus": {
       "Type": "Choice",
+      "Comment": "Default routes to HandleFailure so any unexpected SSM status (Failed, Cancelled, TimedOut, ...) is surfaced, not silently swallowed.",
       "Choices": [
         {
           "Variable": "$.postmarket_poll.Status",
@@ -86,9 +88,14 @@
           "Variable": "$.postmarket_poll.Status",
           "StringEquals": "Pending",
           "Next": "PostMarketWait"
+        },
+        {
+          "Variable": "$.postmarket_poll.Status",
+          "StringEquals": "Delayed",
+          "Next": "PostMarketWait"
         }
       ],
-      "Default": "EODReconcile"
+      "Default": "HandleFailure"
     },
 
     "PostMarketWait": {
@@ -99,13 +106,14 @@
 
     "EODReconcile": {
       "Type": "Task",
-      "Comment": "Run EOD reconciliation on trading EC2 — reads closes from S3, computes P&L, sends email",
+      "Comment": "Run EOD reconciliation on trading EC2 — reads closes from ArcticDB, computes P&L, sends email. pipefail surfaces python crashes that tee would otherwise mask.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.trading_instance_id",
         "Parameters": {
           "commands": [
+            "set -o pipefail",
             "cd /home/ec2-user/alpha-engine",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
@@ -127,8 +135,8 @@
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
-          "Next": "StopTradingInstance",
-          "ResultPath": "$.eod_error"
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
         }
       ],
       "ResultPath": "$.eod_result",
@@ -153,8 +161,8 @@
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
-          "Next": "StopTradingInstance",
-          "ResultPath": "$.eod_error"
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
         }
       ],
       "ResultPath": "$.eod_poll",
@@ -163,6 +171,7 @@
 
     "CheckEODStatus": {
       "Type": "Choice",
+      "Comment": "Default routes to HandleFailure so any unexpected SSM status (Failed, Cancelled, TimedOut, ...) is surfaced, not silently swallowed.",
       "Choices": [
         {
           "Variable": "$.eod_poll.Status",
@@ -178,9 +187,14 @@
           "Variable": "$.eod_poll.Status",
           "StringEquals": "Pending",
           "Next": "EODWait"
+        },
+        {
+          "Variable": "$.eod_poll.Status",
+          "StringEquals": "Delayed",
+          "Next": "EODWait"
         }
       ],
-      "Default": "StopTradingInstance"
+      "Default": "HandleFailure"
     },
 
     "EODWait": {
