@@ -47,10 +47,13 @@ def handler(event, context):
     _start = time.time()
 
     try:
-        # Validate required env vars
+        # Validate required env vars. FINNHUB_API_KEY required since
+        # 2026-04-20 — analyst rating + price target now come from
+        # Finnhub because FMP /stable moved those behind a paid tier.
         missing = []
-        if not os.environ.get("FMP_API_KEY"):
-            missing.append("FMP_API_KEY")
+        for name in ("FMP_API_KEY", "FINNHUB_API_KEY"):
+            if not os.environ.get(name):
+                missing.append(name)
         # EDGAR_IDENTITY and POLYGON_API_KEY are optional (graceful degradation)
 
         if missing:
