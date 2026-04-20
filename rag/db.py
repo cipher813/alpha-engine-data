@@ -14,6 +14,7 @@ from contextlib import contextmanager
 
 import psycopg2
 import psycopg2.extras
+from pgvector.psycopg2 import register_vector
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,12 @@ def get_connection():
     server-side). Commits on success, rolls back on exception.
     """
     conn = psycopg2.connect(_get_url())
+    # Register pgvector type codecs so SELECTs on `vector` columns return
+    # numpy arrays instead of stringified lists. Without this, reads like
+    # rag/pipelines/filing_change_detection.py crash with
+    # "could not convert string to float" on np.array(embedding). Must run
+    # per-connection because psycopg2 scopes type adapters to the connection.
+    register_vector(conn)
     try:
         yield conn
         conn.commit()
