@@ -5,12 +5,28 @@ Phase 2 collector: runs AFTER research produces signals.json to fetch
 alternative data for the ~25-30 promoted tickers (buy candidates + tracked).
 
 Data sources:
-  - Analyst consensus (FMP stable API)
-  - EPS revisions (FMP v3)
+  - Analyst rating (Finnhub ``/stock/recommendation`` — free tier)
+  - Earnings surprises (Finnhub ``/stock/earnings`` — free tier)
+  - EPS estimates (FMP ``/stable/analyst-estimates?period=annual`` — free tier)
   - Options flow (yfinance)
   - Insider trading (SEC EDGAR Form 4)
   - Institutional 13F (edgartools)
   - News headlines (Yahoo RSS + EDGAR 8-K)
+
+Provider notes (2026-04-20)
+---------------------------
+FMP v3 sunsetted on 2025-08-31; all FMP calls go to /stable with
+query-string tickers. On /stable, these endpoints are paid-tier (HTTP
+402 / 403 on free), so the corresponding features are sourced elsewhere
+or left null:
+
+  - ``grades-consensus`` → Finnhub ``/stock/recommendation``
+  - ``price-target-consensus`` → no free source available; ``target_price``
+    is left ``None``. Finnhub's ``/stock/price-target`` is also paid.
+  - ``earnings-surprises-bulk`` → Finnhub ``/stock/earnings`` (richer
+    historical data anyway)
+  - ``analyst-estimates?period=quarter`` → FMP ``period=annual`` still
+    works on free tier.
 
 Output: one JSON file per ticker at market_data/weekly/{date}/alternative/{TICKER}.json
 plus a manifest at market_data/weekly/{date}/alternative/manifest.json.
@@ -227,32 +243,43 @@ def _fetch_all_alternative(ticker: str, run_date: str, bucket: str) -> dict:
 
 # -- Individual fetchers (self-contained, no cross-repo imports) -------------
 
-# ---- FMP rate limiter (shared across analyst + revisions) ----
+# ---- FMP + Finnhub rate limiters ----
 
 _FMP_STABLE = "https://financialmodelingprep.com/stable"
-_FMP_V3 = "https://financialmodelingprep.com/api/v3"
 _fmp_lock = threading.Lock()
 _fmp_last_call = 0.0
 _fmp_daily_count = 0
 _FMP_DAILY_LIMIT = 250
 _FMP_MIN_INTERVAL = 1.0
 
+_FINNHUB_BASE = "https://finnhub.io/api/v1"
+_finnhub_lock = threading.Lock()
+_finnhub_last_call = 0.0
+# Finnhub free tier: 60 req/min — give ourselves a small margin.
+_FINNHUB_MIN_INTERVAL = 1.1
 
-def _fmp_get(endpoint: str, params: dict | None = None, base: str = _FMP_STABLE) -> dict | list:
-    """Rate-limited FMP API call."""
+
+def _fmp_get(endpoint: str, params: dict | None = None) -> dict | list:
+    """Rate-limited FMP /stable API call.
+
+    Returns ``[]`` if ``FMP_API_KEY`` is missing, the daily budget is
+    exhausted, or a 429 trips the per-minute limit. All other errors
+    propagate — the caller's try/except must log at WARNING so silent
+    endpoint sunsets (the 2026-04 incident) can't hide.
+    """
     global _fmp_last_call, _fmp_daily_count
     api_key = os.environ.get("FMP_API_KEY", "")
     if not api_key:
         return []
 
-    url = f"{base}/{endpoint}"
+    url = f"{_FMP_STABLE}/{endpoint}"
     p = {"apikey": api_key}
     if params:
         p.update(params)
 
     with _fmp_lock:
         if _fmp_daily_count >= _FMP_DAILY_LIMIT:
-            logger.debug("FMP daily budget exhausted")
+            logger.warning("FMP daily budget exhausted (%d calls)", _FMP_DAILY_LIMIT)
             return []
         now = time.monotonic()
         wait = _FMP_MIN_INTERVAL - (now - _fmp_last_call)
@@ -270,10 +297,42 @@ def _fmp_get(endpoint: str, params: dict | None = None, base: str = _FMP_STABLE)
     return resp.json()
 
 
+def _finnhub_get(endpoint: str, params: dict | None = None) -> dict | list:
+    """Rate-limited Finnhub API call. Returns ``[]`` on missing key."""
+    global _finnhub_last_call
+    api_key = os.environ.get("FINNHUB_API_KEY", "")
+    if not api_key:
+        return []
+
+    url = f"{_FINNHUB_BASE}/{endpoint}"
+    p = {"token": api_key}
+    if params:
+        p.update(params)
+
+    with _finnhub_lock:
+        now = time.monotonic()
+        wait = _FINNHUB_MIN_INTERVAL - (now - _finnhub_last_call)
+        if wait > 0:
+            time.sleep(wait)
+        _finnhub_last_call = time.monotonic()
+
+    resp = requests.get(url, params=p, timeout=10)
+    if resp.status_code == 429:
+        logger.warning("Finnhub 429 rate-limited on %s", endpoint)
+        return []
+    resp.raise_for_status()
+    return resp.json()
+
+
 # ---- 1. Analyst consensus ----
 
 def _fetch_analyst(ticker: str) -> dict:
-    """Fetch analyst consensus from FMP."""
+    """Fetch analyst rating (Finnhub) + earnings surprises (Finnhub).
+
+    ``target_price`` is left ``None`` — no free-tier source is available
+    since FMP moved ``price-target-consensus`` to paid and Finnhub's
+    ``/stock/price-target`` also returns 403 on free.
+    """
     result = {
         "rating": None,
         "target_price": None,
@@ -281,42 +340,50 @@ def _fetch_analyst(ticker: str) -> dict:
         "earnings_surprises": [],
     }
 
+    # Finnhub analyst recommendation: list of {buy, hold, sell, strongBuy,
+    # strongSell, period, symbol}. Most recent is first.
     try:
-        data = _fmp_get("grades-consensus", {"symbol": ticker})
+        data = _finnhub_get("stock/recommendation", {"symbol": ticker})
         if isinstance(data, list) and data:
-            g = data[0]
-            result["rating"] = g.get("consensus")
-            total = sum(g.get(k, 0) or 0 for k in ("strongBuy", "buy", "hold", "sell", "strongSell"))
-            result["num_analysts"] = total or None
+            latest = data[0]
+            totals = {k: latest.get(k, 0) or 0 for k in ("strongBuy", "buy", "hold", "sell", "strongSell")}
+            total = sum(totals.values())
+            bullish = totals["strongBuy"] + totals["buy"]
+            bearish = totals["sell"] + totals["strongSell"]
+            if total > 0:
+                if bullish > bearish and bullish >= totals["hold"]:
+                    result["rating"] = "Buy"
+                elif bearish > bullish:
+                    result["rating"] = "Sell"
+                else:
+                    result["rating"] = "Hold"
+                result["num_analysts"] = total
     except Exception as e:
-        logger.debug("Analyst grades failed for %s: %s", ticker, e)
+        logger.warning("Finnhub recommendation failed for %s: %s", ticker, e)
 
+    # Finnhub historical earnings surprises: list of {actual, estimate,
+    # surprise, surprisePercent, period, quarter, symbol, year}, most
+    # recent first. Richer than FMP /stable/earnings (which is the
+    # forward-looking calendar).
     try:
-        data = _fmp_get("price-target-consensus", {"symbol": ticker})
-        if isinstance(data, list) and data:
-            result["target_price"] = data[0].get("targetConsensus")
-    except Exception as e:
-        logger.debug("Price target failed for %s: %s", ticker, e)
-
-    try:
-        data = _fmp_get(f"earning_surprises/{ticker}", base=_FMP_V3)
+        data = _finnhub_get("stock/earnings", {"symbol": ticker})
         if isinstance(data, list) and data:
             surprises = []
             for entry in data[:4]:
-                actual = entry.get("actualEarningResult")
-                estimated = entry.get("estimatedEarning")
-                surprise_pct = None
-                if actual is not None and estimated is not None and estimated != 0:
+                actual = entry.get("actual")
+                estimated = entry.get("estimate")
+                surprise_pct = entry.get("surprisePercent")
+                if surprise_pct is None and actual is not None and estimated not in (None, 0):
                     surprise_pct = round((actual - estimated) / abs(estimated) * 100, 2)
                 surprises.append({
-                    "date": entry.get("date", ""),
+                    "date": entry.get("period", ""),
                     "actual": actual,
                     "estimated": estimated,
                     "surprise_pct": surprise_pct,
                 })
             result["earnings_surprises"] = surprises
     except Exception as e:
-        logger.debug("Earnings surprises failed for %s: %s", ticker, e)
+        logger.warning("Finnhub earnings failed for %s: %s", ticker, e)
 
     return result
 
@@ -331,12 +398,20 @@ def _fetch_revisions(ticker: str, bucket: str, run_date: str) -> dict:
         "streak": 0,
     }
 
+    # /stable requires period=annual on free tier; quarter is 402 paid.
     try:
-        data = _fmp_get(f"analyst-estimates/{ticker}", params={"limit": 1}, base=_FMP_V3)
+        data = _fmp_get(
+            "analyst-estimates",
+            params={"symbol": ticker, "period": "annual", "limit": 1},
+        )
         if isinstance(data, list) and data:
-            result["current_estimate"] = data[0].get("estimatedEpsAvg")
+            # /stable renames the field vs v3 — accept either shape.
+            result["current_estimate"] = (
+                data[0].get("epsAvg")
+                or data[0].get("estimatedEpsAvg")
+            )
     except Exception as e:
-        logger.debug("EPS estimate failed for %s: %s", ticker, e)
+        logger.warning("EPS estimate failed for %s: %s", ticker, e)
 
     # Load prior snapshot for revision comparison
     try:
@@ -461,7 +536,7 @@ def _fetch_options(ticker: str, run_date: str) -> dict:
     except ImportError:
         logger.debug("yfinance/numpy not available for options data")
     except Exception as e:
-        logger.debug("Options fetch failed for %s: %s", ticker, e)
+        logger.warning("Options fetch failed for %s: %s", ticker, e)
 
     return result
 
@@ -597,7 +672,7 @@ def _fetch_institutional(ticker: str) -> dict:
                             elif current_value < prev_value:
                                 n_decreasing += 1
         except Exception as e:
-            logger.debug("13F comparison failed for %s: %s", ticker, e)
+            logger.warning("13F comparison failed for %s: %s", ticker, e)
 
         result["funds_increasing"] = n_accumulating
         result["funds_decreasing"] = n_decreasing
@@ -606,7 +681,7 @@ def _fetch_institutional(ticker: str) -> dict:
     except ImportError:
         logger.debug("edgartools not available for 13F data")
     except Exception as e:
-        logger.debug("Institutional fetch failed for %s: %s", ticker, e)
+        logger.warning("Institutional fetch failed for %s: %s", ticker, e)
 
     return result
 
@@ -644,7 +719,7 @@ def _fetch_news(ticker: str) -> dict:
     except ImportError:
         logger.debug("feedparser not available for news")
     except Exception as e:
-        logger.debug("Yahoo RSS failed for %s: %s", ticker, e)
+        logger.warning("Yahoo RSS failed for %s: %s", ticker, e)
 
     # EDGAR 8-K
     try:
@@ -666,6 +741,6 @@ def _fetch_news(ticker: str) -> dict:
                 "form_type": src.get("form_type", "8-K"),
             })
     except Exception as e:
-        logger.debug("EDGAR 8-K failed for %s: %s", ticker, e)
+        logger.warning("EDGAR 8-K failed for %s: %s", ticker, e)
 
     return result

@@ -8,9 +8,27 @@ Runs weekly in DataPhase1. Cached to S3 at archive/fundamentals/{date}.json.
 Daily pipeline reads the cached file (fundamentals are quarterly — don't
 change within a week).
 
-FMP free tier: 250 req/day. Each ticker uses 2 calls (key-metrics-ttm,
-income-statement). ~30 promoted tickers = ~60 calls, well within budget.
-Rate limited at 4 req/sec to stay under FMP's 5/sec limit.
+Endpoint contract
+-----------------
+FMP sunset the v3 API on 2025-08-31. All calls target the `/stable`
+endpoint with query-string tickers, e.g.:
+
+    /stable/key-metrics-ttm?symbol=AAPL   # FCF yield, current ratio, ROE
+    /stable/ratios-ttm?symbol=AAPL        # P/E, P/B, debt/equity
+    /stable/income-statement?symbol=AAPL&period=quarter&limit=5
+
+v3 crammed P/E / P/B / D/E into ``key-metrics-ttm`` alongside the
+efficiency ratios; /stable split them across two endpoints and renamed
+a few fields (``roeTTM`` → ``returnOnEquityTTM``).
+
+Failure semantics
+-----------------
+Per-ticker errors are logged at WARNING and fall through to NEUTRAL
+values, but the collector hard-fails (``status="error"``) if fewer than
+``_MIN_OK_RATIO`` of tickers produced real (non-NEUTRAL) data — which
+catches a recurrence of the silent-zeros bug that went undetected for
+two weeks in April 2026 when the v3 endpoints started returning 403.
+Matches the ``short_interest`` collector's guard.
 """
 
 from __future__ import annotations
@@ -24,9 +42,16 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-_FMP_BASE = "https://financialmodelingprep.com/api/v3"
+_FMP_BASE = "https://financialmodelingprep.com/stable"
 _TIMEOUT = 10
 _RATE_LIMIT_DELAY = 0.25  # 4 req/sec
+
+# Minimum fraction of requested tickers that must produce real fundamentals
+# (at least one non-zero field) for the run to be considered OK. Below
+# this threshold the endpoint is probably broken (sunsetted, paid-tier,
+# quota hit) — don't let a silently-zeroed output flow into the predictor
+# feature store and research scoring.
+_MIN_OK_RATIO = 0.90
 
 
 def _fmp_get(endpoint: str, api_key: str, params: dict | None = None) -> dict | list:
@@ -67,21 +92,34 @@ NEUTRAL = {
 
 def _fetch_single_ticker(ticker: str, api_key: str) -> dict:
     """Fetch and normalize fundamental data for a single ticker."""
-    metrics = _fmp_get(f"key-metrics-ttm/{ticker}", api_key)
+    metrics = _fmp_get("key-metrics-ttm", api_key, params={"symbol": ticker})
     time.sleep(_RATE_LIMIT_DELAY)
 
     if not isinstance(metrics, list) or not metrics:
         return NEUTRAL.copy()
 
     m = metrics[0]
-    pe_raw = _safe_float(m.get("peRatioTTM"))
-    pb_raw = _safe_float(m.get("pbRatioTTM"))
-    roe_raw = _safe_float(m.get("roeTTM"))
+    # roeTTM renamed on /stable. Accept both for forward-compat.
+    roe_raw = _safe_float(m.get("returnOnEquityTTM") or m.get("roeTTM"))
     fcf_yield_raw = _safe_float(m.get("freeCashFlowYieldTTM"))
     current_ratio_raw = _safe_float(m.get("currentRatioTTM"))
-    de_raw = _safe_float(m.get("debtToEquityTTM"))
 
-    income = _fmp_get(f"income-statement/{ticker}", api_key, params={"period": "quarter", "limit": 5})
+    # P/E, P/B, D/E moved to /stable/ratios-ttm (v3 had them in key-metrics).
+    ratios = _fmp_get("ratios-ttm", api_key, params={"symbol": ticker})
+    time.sleep(_RATE_LIMIT_DELAY)
+    if isinstance(ratios, list) and ratios:
+        r = ratios[0]
+        pe_raw = _safe_float(r.get("priceToEarningsRatioTTM") or r.get("peRatioTTM"))
+        pb_raw = _safe_float(r.get("priceToBookRatioTTM") or r.get("pbRatioTTM"))
+        de_raw = _safe_float(r.get("debtToEquityRatioTTM") or r.get("debtToEquityTTM"))
+    else:
+        pe_raw = pb_raw = de_raw = 0.0
+
+    income = _fmp_get(
+        "income-statement",
+        api_key,
+        params={"symbol": ticker, "period": "quarter", "limit": 5},
+    )
     time.sleep(_RATE_LIMIT_DELAY)
 
     revenue_growth = 0.0
@@ -122,16 +160,21 @@ def collect(
     """
     Fetch fundamentals for all tickers and cache to S3.
 
-    Returns summary dict with counts.
+    Returns summary dict with counts. ``status="error"`` if the ok_ratio
+    gate is breached — downstream orchestrator treats the phase as failed.
     """
     import boto3
 
     api_key = os.environ.get("FMP_API_KEY", "")
     if not api_key:
-        logger.warning("FMP_API_KEY not set — skipping fundamentals collection")
-        return {"status": "skipped", "reason": "no_api_key"}
+        # Preflight is expected to catch this earlier; hard-fail here too
+        # so a missing key can never land as "0 OK / N errors / all-zeros".
+        return {
+            "status": "error",
+            "error": "FMP_API_KEY not set — refusing to write all-NEUTRAL fundamentals",
+        }
 
-    logger.info("Fetching fundamentals for %d tickers from FMP...", len(tickers))
+    logger.info("Fetching fundamentals for %d tickers from FMP (%s)...", len(tickers), _FMP_BASE)
     t0 = time.time()
 
     results: dict[str, dict] = {}
@@ -145,15 +188,34 @@ def collect(
             if data != NEUTRAL:
                 n_ok += 1
         except Exception as e:
-            logger.debug("Fundamental fetch failed for %s: %s", ticker, e)
+            logger.warning("Fundamental fetch failed for %s: %s", ticker, e)
             results[ticker] = NEUTRAL.copy()
             n_err += 1
 
     elapsed = time.time() - t0
+    ok_ratio = n_ok / max(len(tickers), 1)
     logger.info(
-        "Fundamentals fetched in %.1fs: %d OK, %d errors, %d total",
-        elapsed, n_ok, n_err, len(results),
+        "Fundamentals fetched in %.1fs: %d populated, %d errors, %d total (ok_ratio=%.1f%%)",
+        elapsed, n_ok, n_err, len(results), ok_ratio * 100,
     )
+
+    if ok_ratio < _MIN_OK_RATIO:
+        msg = (
+            f"only {n_ok}/{len(tickers)} tickers ({ok_ratio:.1%}) had populated "
+            f"fundamentals — below {_MIN_OK_RATIO:.0%} threshold. FMP endpoint "
+            f"likely sunsetted, moved to paid tier, or quota exhausted. Refusing "
+            f"to write a mostly-zero fundamentals snapshot that would silently "
+            f"degrade the predictor + research scoring layers."
+        )
+        logger.error(msg)
+        return {
+            "status": "error",
+            "error": msg,
+            "n_tickers": len(results),
+            "n_ok": n_ok,
+            "n_errors": n_err,
+            "elapsed_seconds": round(elapsed, 1),
+        }
 
     if dry_run:
         logger.info("[dry-run] Would write fundamentals for %d tickers", len(results))
