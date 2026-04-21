@@ -72,55 +72,83 @@ def test_sector_etfs_iterate_explicit_list():
     assert 'sector_etfs = ["XLB"' in src or 'sector_etfs = [\n' in src
 
 
-def test_short_history_writes_ohlcv_not_skipped():
-    """Short-history tickers (new listings, spinoffs) must get an OHLCV-only
-    row written, never silently skipped.
+def test_unified_path_no_min_rows_gate():
+    """daily_append must have ONE loop path for all tickers — no
+    ``len(hist) < MIN_ROWS_FOR_FEATURES`` branch that bypasses
+    ``compute_features``.
 
-    Regression for 2026-04-21 SNDK incident: the 2026 WDC flash-memory
-    spinoff re-listed SNDK with ~44 rows of history. daily_append's
-    `len(hist) < MIN_ROWS_FOR_FEATURES` branch silently n_skip++'d without
-    writing any row. EOD reconcile then hard-failed on every held
-    short-history ticker because authoritative close was missing from
-    ArcticDB. New listings are a normal market event (20-40 S&P
-    constituent changes/year; every spinoff creates one). They are a
-    first-class supported state.
+    The Phase 2 fix (2026-04-21) removed the implicit
+    ``df.dropna(subset=FEATURES)`` in ``compute_features`` and the
+    corresponding short-history-only write branch in daily_append. Every
+    ticker now runs through the same pipeline: compute whatever features
+    are computable, write the row with NaN for the rest, log loudly.
 
-    The fix writes OHLCV + NaN-for-every-feature-column when below the
-    warmup threshold, logs loudly with a structured `short-history
-    ticker=X rows=N` message, and increments a dedicated ``n_partial``
-    counter (not ``n_skip``, not ``n_err`` — short history is neither).
+    A regression that re-introduces the gate would undo first-class
+    short-history support and resurrect the 2026-04-21 SNDK executor
+    crash (NaN ``atr_14_pct`` from a ticker that WAS supposed to get
+    one because ATR-14 only needs ≥14 rows).
     """
     src = _source()
-
-    # Loud warning with structured key=val tags so coverage gaps surface.
-    assert "short-history ticker=" in src, (
-        "short-history branch must log `short-history ticker=X rows=N` — "
-        "silent fallback is forbidden (feedback_no_silent_fails)."
-    )
-
-    # Write path must exist — ticker gets OHLCV, not a skip.
-    assert "n_partial" in src, (
-        "short-history path must track a dedicated n_partial counter, "
-        "distinct from n_skip (legitimate skips) and n_err (read errors)."
-    )
-
-    # Skip-only pattern (the bug) must be gone: the old `if len(hist) <
-    # MIN_ROWS_FOR_FEATURES: n_skip += 1; continue` with no write.
-    # Check the short-history branch reaches universe_lib.update().
     lines = src.splitlines()
     for i, line in enumerate(lines):
-        if "len(hist) < MIN_ROWS_FOR_FEATURES" in line:
-            window = "\n".join(lines[i:i + 60])
-            assert "universe_lib.update(ticker" in window, (
-                "short-history branch must reach universe_lib.update() — "
-                "writing OHLCV-only is the whole point of the fix."
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if "len(hist) < MIN_ROWS_FOR_FEATURES" in stripped:
+            raise AssertionError(
+                f"Line {i+1}: re-introduced the `len(hist) < "
+                f"MIN_ROWS_FOR_FEATURES` gate. This branches short-history "
+                f"tickers away from compute_features and brings back the "
+                f"2026-04-21 SNDK executor crash. Let every ticker go "
+                f"through the unified path; compute_features no longer "
+                f"drops rows."
             )
-            assert "n_partial" in window, (
-                "short-history branch must increment n_partial."
-            )
+
+
+def test_partial_features_are_loudly_logged():
+    """Every row written with ≥1 NaN feature must emit a structured
+    ``partial-features ticker=X rows=N nan=M/... features=[...]`` log.
+
+    Silent partial coverage is forbidden per feedback_no_silent_fails.
+    The log message shape (key=value tags + feature list) is what lets
+    us grep production logs for coverage drift.
+    """
+    src = _source()
+    assert "partial-features ticker=" in src, (
+        "daily_append must log `partial-features ticker=X rows=N` when a "
+        "row is written with NaN features — silent fallback is forbidden."
+    )
+    assert "n_partial" in src, (
+        "dedicated n_partial counter required, distinct from n_skip "
+        "(legitimate skips) and n_err (read errors)."
+    )
+
+
+def test_counters_increment_after_successful_write():
+    """n_ok and n_partial must be incremented AFTER universe_lib.update()
+    so an exception rolls the iteration back cleanly into n_err.
+
+    Locks the 2026-04-21 rewrite where counters were hoisted post-write
+    to prevent double-counting when update() throws.
+    """
+    src = _source()
+    # The update() call site + increments must appear in that order.
+    # Find the update call for universe_lib.update(ticker, today_row) —
+    # the committed increment happens on the same side.
+    lines = src.splitlines()
+    update_idx = None
+    for i, line in enumerate(lines):
+        if "universe_lib.update(ticker, today_row)" in line:
+            update_idx = i
             break
-    else:
-        raise AssertionError("short-history branch not found in daily_append.py")
+    assert update_idx is not None, (
+        "universe_lib.update(ticker, today_row) call site not found"
+    )
+    window_after = "\n".join(lines[update_idx:update_idx + 20])
+    assert "n_partial += 1" in window_after and "n_ok += 1" in window_after, (
+        "n_ok / n_partial must be incremented AFTER the update() call, "
+        "not before. Increments before write cause miscount on exception."
+    )
 
 
 def test_short_history_matches_stored_dtype():
