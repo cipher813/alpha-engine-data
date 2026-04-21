@@ -93,6 +93,40 @@ def test_dry_run_does_not_write():
         raise AssertionError("universe_lib.write() call site not found")
 
 
+def test_supporting_data_loaders_get_real_s3_client():
+    """The sector_map / fundamentals / alternative loaders must receive
+    a real boto3 client — not ``None``.
+
+    Regression for the 2026-04-21 PR #79 dry-run: passing ``None`` to
+    the S3-backed loaders caused them to log a warning and return empty
+    dicts. ``compute_features`` then silently computed 0 (not NaN) for
+    every sector-relative, fundamental, and alternative feature (~15
+    of 59 features). The migration would have claimed success while
+    writing the wrong feature values for every candidate. Exactly the
+    failure mode feedback_no_silent_fails forbids — a fallback that
+    quietly bypasses the ideal flow.
+    """
+    src = _source()
+    # A real boto3 client must be constructed and passed to the loaders.
+    assert "boto3.client(\"s3\")" in src, (
+        "promote_ohlcv_only_schema must construct a real boto3 S3 client "
+        "before calling _load_sector_map / _load_cached_fundamentals / "
+        "_load_cached_alternative. Passing None defaults features to 0."
+    )
+    # None must not be passed to any of the supporting-data loaders.
+    forbidden = [
+        "_load_sector_map(None",
+        "_load_cached_fundamentals(\n        None",
+        "_load_cached_fundamentals(None",
+        "_load_cached_alternative(None",
+    ]
+    for bad in forbidden:
+        assert bad not in src, (
+            f"Found `{bad}` — passing None causes silent feature zeroing. "
+            f"Use boto3.client('s3')."
+        )
+
+
 def test_partial_coverage_is_logged_loudly():
     """Symbols promoted with NaN features (short history) must emit a
     structured ``partial-features ticker=X nan=N/total features=[...]``

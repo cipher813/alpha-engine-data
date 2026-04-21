@@ -46,6 +46,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
+import boto3
 import numpy as np
 import pandas as pd
 
@@ -232,13 +233,19 @@ def promote_schemas(
             "dry_run": dry_run,
         }
 
-    # Load supporting data only when we actually have work to do.
-    sector_map = _load_sector_map(None, bucket) if not dry_run or candidates else {}
+    # Load supporting data. Must use a real boto3 S3 client — passing
+    # None causes the loaders to silently default sector_map / fundamentals
+    # / alternative to empty dicts, which would compute_features then
+    # silently write 0 (not NaN) for every sector-relative / fundamental /
+    # alternative feature. Silent zeroing of half the feature schema is
+    # the exact failure mode feedback_no_silent_fails forbids.
+    s3 = boto3.client("s3")
+    sector_map = _load_sector_map(s3, bucket)
     fundamentals = _load_cached_fundamentals(
-        None, bucket,
+        s3, bucket,
         datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-    ) if not dry_run or candidates else {}
-    alt_data = _load_cached_alternative(None, bucket) if not dry_run or candidates else {}
+    )
+    alt_data = _load_cached_alternative(s3, bucket)
     macro = _load_macro_series(macro_lib, bucket)
 
     results: list[dict] = []
