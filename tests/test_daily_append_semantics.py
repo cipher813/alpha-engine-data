@@ -72,6 +72,57 @@ def test_sector_etfs_iterate_explicit_list():
     assert 'sector_etfs = ["XLB"' in src or 'sector_etfs = [\n' in src
 
 
+def test_short_history_writes_ohlcv_not_skipped():
+    """Short-history tickers (new listings, spinoffs) must get an OHLCV-only
+    row written, never silently skipped.
+
+    Regression for 2026-04-21 SNDK incident: the 2026 WDC flash-memory
+    spinoff re-listed SNDK with ~44 rows of history. daily_append's
+    `len(hist) < MIN_ROWS_FOR_FEATURES` branch silently n_skip++'d without
+    writing any row. EOD reconcile then hard-failed on every held
+    short-history ticker because authoritative close was missing from
+    ArcticDB. New listings are a normal market event (20-40 S&P
+    constituent changes/year; every spinoff creates one). They are a
+    first-class supported state.
+
+    The fix writes OHLCV + NaN-for-every-feature-column when below the
+    warmup threshold, logs loudly with a structured `short-history
+    ticker=X rows=N` message, and increments a dedicated ``n_partial``
+    counter (not ``n_skip``, not ``n_err`` — short history is neither).
+    """
+    src = _source()
+
+    # Loud warning with structured key=val tags so coverage gaps surface.
+    assert "short-history ticker=" in src, (
+        "short-history branch must log `short-history ticker=X rows=N` — "
+        "silent fallback is forbidden (feedback_no_silent_fails)."
+    )
+
+    # Write path must exist — ticker gets OHLCV, not a skip.
+    assert "n_partial" in src, (
+        "short-history path must track a dedicated n_partial counter, "
+        "distinct from n_skip (legitimate skips) and n_err (read errors)."
+    )
+
+    # Skip-only pattern (the bug) must be gone: the old `if len(hist) <
+    # MIN_ROWS_FOR_FEATURES: n_skip += 1; continue` with no write.
+    # Check the short-history branch reaches universe_lib.update().
+    lines = src.splitlines()
+    for i, line in enumerate(lines):
+        if "len(hist) < MIN_ROWS_FOR_FEATURES" in line:
+            window = "\n".join(lines[i:i + 60])
+            assert "universe_lib.update(ticker" in window, (
+                "short-history branch must reach universe_lib.update() — "
+                "writing OHLCV-only is the whole point of the fix."
+            )
+            assert "n_partial" in window, (
+                "short-history branch must increment n_partial."
+            )
+            break
+    else:
+        raise AssertionError("short-history branch not found in daily_append.py")
+
+
 def test_no_skip_guard_on_existing_today_row():
     """daily_append must NOT skip tickers whose history already contains today_ts.
 
