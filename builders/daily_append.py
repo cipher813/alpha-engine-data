@@ -181,6 +181,7 @@ def daily_append(
     n_ok = 0
     n_skip = 0
     n_err = 0
+    n_partial = 0  # short-history tickers: OHLCV-only written, features NaN
 
     for ticker in stock_tickers:
         try:
@@ -197,7 +198,50 @@ def daily_append(
                 continue
 
             if len(hist) < MIN_ROWS_FOR_FEATURES:
-                n_skip += 1
+                # Short-history tickers (new listings, IPOs, spinoffs — e.g.
+                # SNDK after the 2026 WDC flash-memory spinoff) are a
+                # first-class supported state, not a skip. Below the feature
+                # warmup threshold we write an OHLCV-only row with NaN for
+                # every feature column. Downstream consumers that need
+                # features (training, inference) see NaN and handle
+                # accordingly; consumers that only read prices (EOD
+                # reconcile, attribution) get the authoritative close.
+                #
+                # Prior behavior silently skipped the row entirely — no
+                # OHLCV written, no warning — which made EOD reconcile
+                # hard-fail on every held short-history ticker. See
+                # 2026-04-21 SNDK incident.
+                bar = closes[ticker]
+                if np.isnan(bar["Close"]):
+                    n_skip += 1
+                    continue
+
+                new_row = pd.DataFrame(
+                    [{col: bar.get(col, np.nan) for col in OHLCV_COLS}],
+                    index=pd.DatetimeIndex([today_ts], name="date"),
+                )
+                # Align to the stored schema: NaN for every non-OHLCV column
+                # the library already has for this ticker.
+                for col in hist.columns:
+                    if col not in new_row.columns:
+                        new_row[col] = np.nan
+                new_row = new_row[hist.columns]
+                for col in new_row.columns:
+                    if col in OHLCV_COLS:
+                        if col == "Volume":
+                            new_row[col] = new_row[col].astype("int64")
+                        else:
+                            new_row[col] = new_row[col].astype("float64")
+                    else:
+                        new_row[col] = new_row[col].astype("float32")
+
+                log.warning(
+                    "short-history ticker=%s rows=%d min_required=%d "
+                    "— writing OHLCV-only row with NaN features",
+                    ticker, len(hist), MIN_ROWS_FOR_FEATURES,
+                )
+                universe_lib.update(ticker, new_row)
+                n_partial += 1
                 continue
 
             # Re-running daily_append for the same date MUST overwrite the
@@ -391,6 +435,7 @@ def daily_append(
         "status": "ok",
         "date": date_str,
         "tickers_appended": n_ok,
+        "tickers_partial": n_partial,
         "tickers_skipped": n_skip,
         "tickers_errored": n_err,
         "load_seconds": round(t_load, 1),
@@ -399,9 +444,9 @@ def daily_append(
     }
 
     log.info(
-        "ArcticDB daily_append: stocks n_ok=%d n_skip=%d n_err=%d (of %d) | "
+        "ArcticDB daily_append: stocks n_ok=%d n_partial=%d n_skip=%d n_err=%d (of %d) | "
         "macro_updated=%d sector_updated=%d | %.1fs total",
-        n_ok, n_skip, n_err, len(stock_tickers),
+        n_ok, n_partial, n_skip, n_err, len(stock_tickers),
         len(macro_updated) if not dry_run else 0,
         len(sector_updated) if not dry_run else 0,
         t_total,
