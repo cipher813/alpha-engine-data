@@ -10,7 +10,7 @@
     "ResourceType": "AWS::SNS::Subscription",
     "LogicalResourceId": "AlertsSubscription",
     "ResourceIdentifier": {
-      "SubscriptionArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts:82016217-193c-48c6-81a3-693b63f770e1"
+      "Arn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts:82016217-193c-48c6-81a3-693b63f770e1"
     }
   },
   {
@@ -31,21 +31,21 @@
     "ResourceType": "AWS::Events::Rule",
     "LogicalResourceId": "SaturdayTrigger",
     "ResourceIdentifier": {
-      "Name": "alpha-engine-saturday"
+      "Arn": "arn:aws:events:us-east-1:711398986525:rule/alpha-engine-saturday"
     }
   },
   {
     "ResourceType": "AWS::Events::Rule",
     "LogicalResourceId": "WeekdayTrigger",
     "ResourceIdentifier": {
-      "Name": "alpha-engine-weekday"
+      "Arn": "arn:aws:events:us-east-1:711398986525:rule/alpha-engine-weekday"
     }
   },
   {
     "ResourceType": "AWS::Events::Rule",
     "LogicalResourceId": "ResearchAlerts",
     "ResourceIdentifier": {
-      "Name": "alpha-research-alerts"
+      "Arn": "arn:aws:events:us-east-1:711398986525:rule/alpha-research-alerts"
     }
   },
   {
@@ -102,6 +102,41 @@
     "LogicalResourceId": "ExecutorDaemonHeartbeat",
     "ResourceIdentifier": {
       "AlarmName": "alpha-engine-executor-daemon-no-heartbeat"
+    }
+  },
+  {
+    "ResourceType": "AWS::CloudWatch::Alarm",
+    "LogicalResourceId": "ExecutorEodHeartbeat",
+    "ResourceIdentifier": {
+      "AlarmName": "alpha-engine-executor-eod-no-heartbeat"
+    }
+  },
+  {
+    "ResourceType": "AWS::CloudWatch::Alarm",
+    "LogicalResourceId": "PredictorTrainingHeartbeat",
+    "ResourceIdentifier": {
+      "AlarmName": "alpha-engine-predictor-training-no-heartbeat"
+    }
+  },
+  {
+    "ResourceType": "AWS::CloudWatch::Alarm",
+    "LogicalResourceId": "BacktesterHeartbeat",
+    "ResourceIdentifier": {
+      "AlarmName": "alpha-engine-backtester-no-heartbeat"
+    }
+  },
+  {
+    "ResourceType": "AWS::CloudWatch::Alarm",
+    "LogicalResourceId": "RAGIngestionHeartbeat",
+    "ResourceIdentifier": {
+      "AlarmName": "alpha-engine-rag-ingestion-no-heartbeat"
+    }
+  },
+  {
+    "ResourceType": "AWS::CloudWatch::Alarm",
+    "LogicalResourceId": "ResearchAlertsErrors",
+    "ResourceIdentifier": {
+      "AlarmName": "alpha-engine-research-alerts-errors"
     }
   }
 ]

@@ -79,6 +79,34 @@ aws cloudwatch describe-alarms \
 Expected: `StackStatus=UPDATE_COMPLETE`, `Tags` contains `git-sha=<sha>`,
 alarm name returns (not "None").
 
+## Gotchas (learned empirically on 2026-04-20)
+
+1. **Identifier name varies by resource type.** The primary identifier CF
+   expects in `ResourceIdentifier` is not always `Arn` or `Name` — it's
+   whatever the resource type's CFN schema designates. If the change-set
+   rejects a resource with `Invalid resource identifier for resource type
+   X. Expected [Y]`, use `Y` (CF tells you).
+     - `AWS::SNS::Subscription` → `Arn` (NOT `SubscriptionArn`)
+     - `AWS::Events::Rule` → `Arn` (NOT `Name`)
+     - `AWS::Scheduler::Schedule` → `Name` (NOT `Arn`)
+     - `AWS::CloudWatch::Alarm` → `AlarmName`
+     - `AWS::StepFunctions::StateMachine` → `Arn`
+     - `AWS::SNS::Topic` → `TopicArn`
+2. **Every imported resource needs `DeletionPolicy: Retain`** (and
+   `UpdateReplacePolicy: Retain` is idiomatic pair) in the template.
+   CF import refuses without it. Our trimmed template adds this
+   automatically — see the python snippet in step 2 below.
+3. **`Outputs:` is forbidden in an import change-set template.** Strip
+   it from the trimmed template; the follow-up update-stack with the
+   full template re-adds it.
+4. **Probe alarm/resource names against the TEMPLATE's properties**,
+   not against assumed conventions. The 2026-04-20 recovery initially
+   missed `ResearchAlertsErrors` because I probed `alpha-research-alerts-errors`
+   (wrong, by analogy to the EventBridge rule name) when the template
+   actually uses `alpha-engine-research-alerts-errors`. Result: one
+   wasted rollback cycle. Always `cfnlint.decode` the template + read
+   `Properties.AlarmName` / equivalent.
+
 ## Keeping `resources-to-import.json` current
 
 When adding a new resource to `alpha-engine-orchestration.yaml`:
