@@ -123,6 +123,37 @@ def test_short_history_writes_ohlcv_not_skipped():
         raise AssertionError("short-history branch not found in daily_append.py")
 
 
+def test_short_history_matches_stored_dtype():
+    """Short-history branch must astype every column to ``hist.dtypes[col]``
+    — never hardcode a dtype.
+
+    Regression for 2026-04-21 shipping of PR #76: the short-history
+    branch hardcoded ``Volume → int64``. ArcticDB rejects updates whose
+    column dtypes don't match the existing version. Stored Volume dtype
+    varies across tickers (some int64, some float64, depending on when
+    they were first backfilled) — SOLS, ULS, and one other short-history
+    ticker all failed the update with a FLOAT64/INT64 mismatch.
+
+    The only correct approach is to match the stored dtype per-column
+    via ``hist.dtypes[col]``, which is authoritative by construction.
+    """
+    src = _source()
+
+    # The per-column astype loop must reference hist.dtypes so every
+    # column matches the ticker's current storage schema.
+    assert "astype(hist.dtypes[col])" in src, (
+        "short-history branch must astype(hist.dtypes[col]) to match "
+        "the stored schema — hardcoded dtypes cause ArcticDB to reject "
+        "updates when stored dtype differs (SOLS/ULS 2026-04-21)."
+    )
+
+    # Hardcoded Volume casts are forbidden — they were the original bug.
+    assert 'astype("int64")' not in src, (
+        "hardcoded astype(\"int64\") — almost certainly the Volume-dtype "
+        "regression. Use hist.dtypes[col] instead."
+    )
+
+
 def test_no_skip_guard_on_existing_today_row():
     """daily_append must NOT skip tickers whose history already contains today_ts.
 

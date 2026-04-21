@@ -221,19 +221,22 @@ def daily_append(
                     index=pd.DatetimeIndex([today_ts], name="date"),
                 )
                 # Align to the stored schema: NaN for every non-OHLCV column
-                # the library already has for this ticker.
+                # the library already has for this ticker, and match the
+                # stored dtype per-column. ArcticDB rejects updates whose
+                # column dtypes don't match the existing version — and the
+                # schema varies across tickers (some store Volume as int64,
+                # others as float64, depending on when they were first
+                # backfilled). Matching ``hist.dtypes[col]`` is the only
+                # way to stay compatible with every ticker's current
+                # storage. Regression of the 2026-04-21 shipped fix where
+                # hardcoded Volume→int64 rejected writes for SOLS, ULS,
+                # and one other ticker whose stored Volume was float64.
                 for col in hist.columns:
                     if col not in new_row.columns:
                         new_row[col] = np.nan
                 new_row = new_row[hist.columns]
                 for col in new_row.columns:
-                    if col in OHLCV_COLS:
-                        if col == "Volume":
-                            new_row[col] = new_row[col].astype("int64")
-                        else:
-                            new_row[col] = new_row[col].astype("float64")
-                    else:
-                        new_row[col] = new_row[col].astype("float32")
+                    new_row[col] = new_row[col].astype(hist.dtypes[col])
 
                 log.warning(
                     "short-history ticker=%s rows=%d min_required=%d "
