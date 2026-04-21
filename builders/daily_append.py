@@ -27,7 +27,6 @@ import pandas as pd
 
 from features.feature_engineer import (
     FEATURES,
-    MIN_ROWS_FOR_FEATURES,
     compute_features,
 )
 from features.compute import (
@@ -178,10 +177,10 @@ def daily_append(
         if t not in _SKIP_TICKERS and not _is_sector_etf(t)
     ]
 
-    n_ok = 0
-    n_skip = 0
-    n_err = 0
-    n_partial = 0  # short-history tickers: OHLCV-only written, features NaN
+    n_ok = 0       # fully-featured rows (all FEATURES finite)
+    n_skip = 0     # legitimate skips (dry_run, NaN close from upstream)
+    n_err = 0      # ArcticDB read failures
+    n_partial = 0  # rows written with ≥1 NaN feature (short-history, etc.)
 
     for ticker in stock_tickers:
         try:
@@ -197,68 +196,17 @@ def daily_append(
                 n_err += 1
                 continue
 
-            if len(hist) < MIN_ROWS_FOR_FEATURES:
-                # Short-history tickers (new listings, IPOs, spinoffs — e.g.
-                # SNDK after the 2026 WDC flash-memory spinoff) are a
-                # first-class supported state, not a skip. Below the feature
-                # warmup threshold we write an OHLCV-only row with NaN for
-                # every feature column. Downstream consumers that need
-                # features (training, inference) see NaN and handle
-                # accordingly; consumers that only read prices (EOD
-                # reconcile, attribution) get the authoritative close.
-                #
-                # Prior behavior silently skipped the row entirely — no
-                # OHLCV written, no warning — which made EOD reconcile
-                # hard-fail on every held short-history ticker. See
-                # 2026-04-21 SNDK incident.
-                bar = closes[ticker]
-                if np.isnan(bar["Close"]):
-                    n_skip += 1
-                    continue
-
-                new_row = pd.DataFrame(
-                    [{col: bar.get(col, np.nan) for col in OHLCV_COLS}],
-                    index=pd.DatetimeIndex([today_ts], name="date"),
-                )
-                # Align to the stored schema: NaN for every non-OHLCV column
-                # the library already has for this ticker, and match the
-                # stored dtype per-column. ArcticDB rejects updates whose
-                # column dtypes don't match the existing version — and the
-                # schema varies across tickers (some store Volume as int64,
-                # others as float64, depending on when they were first
-                # backfilled). Matching ``hist.dtypes[col]`` is the only
-                # way to stay compatible with every ticker's current
-                # storage. Regression of the 2026-04-21 shipped fix where
-                # hardcoded Volume→int64 rejected writes for SOLS, ULS,
-                # and one other ticker whose stored Volume was float64.
-                for col in hist.columns:
-                    if col not in new_row.columns:
-                        new_row[col] = np.nan
-                new_row = new_row[hist.columns]
-                for col in new_row.columns:
-                    new_row[col] = new_row[col].astype(hist.dtypes[col])
-
-                log.warning(
-                    "short-history ticker=%s rows=%d min_required=%d "
-                    "— writing OHLCV-only row with NaN features",
-                    ticker, len(hist), MIN_ROWS_FOR_FEATURES,
-                )
-                universe_lib.update(ticker, new_row)
-                n_partial += 1
-                continue
-
             # Re-running daily_append for the same date MUST overwrite the
             # existing row, not skip it. universe_lib.update() is idempotent
-            # (same-date rows replace instead of accumulate — see the comment
-            # at the update() call below), so there's nothing to guard against.
+            # (same-date rows replace instead of accumulate), so there's
+            # nothing to guard against.
             #
-            # Prior to 2026-04-18, a `today_ts in hist.index: skip` guard here
-            # silently no-op'd every re-run. That masked the 2026-04-17 label
-            # incident: after Polygon-grouped-daily returned T-1 data stamped
-            # as T in the morning DailyData run, a re-run with fresh polygon
-            # data couldn't repair the poisoned rows — every ticker was
-            # skipped. Removing the guard restores the idempotency guarantee
-            # that update() was chosen to provide.
+            # Prior to 2026-04-18, a `today_ts in hist.index: skip` guard
+            # silently no-op'd every re-run. That masked the 2026-04-17
+            # label incident: after Polygon returned T-1 data stamped as T
+            # in the morning DailyData run, a re-run with fresh polygon
+            # data couldn't repair the poisoned rows. Removing the guard
+            # restores the idempotency guarantee that update() provides.
 
             # Build today's OHLCV row
             bar = closes[ticker]
@@ -276,7 +224,12 @@ def daily_append(
             combined = pd.concat([hist_ohlcv, new_row])
             combined = combined[~combined.index.duplicated(keep="last")].sort_index()
 
-            # Compute features on the combined series
+            # Compute features on the combined series. `compute_features`
+            # returns rows with NaN for features whose rolling-window
+            # warmup exceeds the available history (short-history tickers
+            # get ATR-14 computed on ≥14 rows, while 252-day features
+            # stay NaN). Rows are never dropped — see 2026-04-21 docstring
+            # in features/feature_engineer.py.
             sector_etf_sym = sector_map.get(ticker)
             sector_etf_series = macro.get(sector_etf_sym) if sector_etf_sym else None
             ticker_alt = alt_data.get(ticker, {})
@@ -297,18 +250,48 @@ def daily_append(
                 fundamental_data=fundamentals.get(ticker),
             )
 
-            if featured.empty or today_ts not in featured.index:
-                n_skip += 1
+            if today_ts not in featured.index:
+                # Only possible if combined had a genuine upstream data
+                # issue (today's row disappeared during feature compute).
+                log.warning(
+                    "Ticker %s: today_ts missing from featured frame — "
+                    "unexpected after compute_features stopped dropping rows",
+                    ticker,
+                )
+                n_err += 1
                 continue
 
-            # Extract today's row with OHLCV + features
+            # Extract today's row with OHLCV + every feature that has
+            # a column in the featured frame. Features that failed to
+            # compute arrive as NaN and are written as NaN — first-class
+            # support for partial coverage.
             keep_cols = [c for c in OHLCV_COLS if c in featured.columns] + \
                         [f for f in FEATURES if f in featured.columns]
             today_row = featured.loc[[today_ts], keep_cols].copy()
 
-            for f in FEATURES:
-                if f in today_row.columns:
-                    today_row[f] = today_row[f].astype("float32")
+            # Per-ticker coverage observability: count NaN features now
+            # so the eventual log + counter reflects exactly what's
+            # being written. Silent partial coverage is forbidden
+            # (feedback_no_silent_fails). Increment is deferred until
+            # after universe_lib.update() so an exception rolls back
+            # cleanly into n_err.
+            nan_features = [
+                f for f in FEATURES
+                if f in today_row.columns and today_row[f].isna().iloc[0]
+            ]
+
+            # Match stored schema dtype per-column. ArcticDB rejects
+            # updates whose column dtypes don't match the existing
+            # version; stored dtype varies across tickers (some Volume
+            # int64, some float64 depending on backfill vintage).
+            # hist.dtypes[col] is authoritative by construction.
+            # Feature columns that aren't yet in storage default to
+            # float32 — matches the predictor training schema.
+            for col in today_row.columns:
+                if col in hist.columns:
+                    today_row[col] = today_row[col].astype(hist.dtypes[col])
+                elif col in FEATURES:
+                    today_row[col] = today_row[col].astype("float32")
 
             today_row.index.name = "date"
 
@@ -316,12 +299,21 @@ def daily_append(
             # date overwrites instead of accumulating duplicate rows.
             # 2026-04-15: diagnosed as root cause of the predictor training
             # failure where 904/909 tickers had duplicate date rows when
-            # read back from ArcticDB. The read-check at line 195 was the
-            # only dedup guard; a race or concurrent pipeline invocation
-            # defeats it. update() is idempotent — same-date rows replace
-            # instead of append, regardless of race conditions.
+            # read back from ArcticDB. update() is idempotent — same-date
+            # rows replace instead of append, regardless of race conditions.
             universe_lib.update(ticker, today_row)
-            n_ok += 1
+
+            # Increment coverage counter + emit the partial-features log
+            # only after the write landed.
+            if nan_features:
+                log.warning(
+                    "partial-features ticker=%s rows=%d nan=%d/%d features=%s",
+                    ticker, len(hist), len(nan_features), len(FEATURES),
+                    nan_features,
+                )
+                n_partial += 1
+            else:
+                n_ok += 1
 
         except Exception as exc:
             log.warning("Failed to append %s: %s", ticker, exc)

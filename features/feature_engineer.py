@@ -217,8 +217,19 @@ def compute_features(
 
     Returns
     -------
-    pd.DataFrame with original columns plus feature columns. Rows without
-    sufficient history are dropped.
+    pd.DataFrame with original columns plus feature columns. Features
+    whose rolling-window warmup exceeds the available history stay NaN
+    for the affected rows; no rows are dropped. Callers apply their own
+    policy — daily_append writes partial-feature rows with loud
+    per-ticker coverage logging; training may dropna at its layer.
+
+    2026-04-21: removed the implicit ``df.dropna(subset=FEATURES)``
+    epilogue. It caused every row of short-history tickers (new
+    listings, spinoffs — e.g. SNDK with 44 rows) to be dropped because
+    252-day features were always NaN, which cascaded into the executor
+    crashing at ``load_atr_14_pct`` despite ATR-14 being computable on
+    ≥14 rows. First-class support for partial features requires
+    returning them.
     """
     if df.empty:
         return df.copy()
@@ -575,9 +586,11 @@ def compute_features(
         df["roe"] = 0.0
         df["current_ratio"] = 0.0
 
-    # ── Drop rows with any NaN in the feature columns ─────────────────────────
-    df = df.dropna(subset=FEATURES)
-
+    # Rows with NaN features are NOT dropped — see module docstring. A
+    # feature whose rolling-window warmup exceeds the available history
+    # stays NaN for the affected rows; short-history tickers therefore
+    # produce rows with partial feature coverage rather than being
+    # filtered out entirely.
     return df
 
 
