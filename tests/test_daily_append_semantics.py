@@ -72,21 +72,26 @@ def test_sector_etfs_iterate_explicit_list():
     assert 'sector_etfs = ["XLB"' in src or 'sector_etfs = [\n' in src
 
 
-def test_unified_path_no_min_rows_gate():
-    """daily_append must have ONE loop path for all tickers — no
-    ``len(hist) < MIN_ROWS_FOR_FEATURES`` branch that bypasses
-    ``compute_features``.
+def test_unified_path_no_min_rows_skip():
+    """daily_append must not BYPASS ``compute_features`` for short-history
+    tickers. A branch that ENRICHES the warmup context (e.g. the
+    parquet-warmup path added 2026-04-22) and then falls through to the
+    shared compute_features / update() is allowed — what's forbidden is
+    a branch that sets ``n_skip`` / writes an OHLCV-only row and
+    ``continue``s past compute_features.
 
-    The Phase 2 fix (2026-04-21) removed the implicit
+    History: the Phase 2 fix (2026-04-21) removed the implicit
     ``df.dropna(subset=FEATURES)`` in ``compute_features`` and the
-    corresponding short-history-only write branch in daily_append. Every
-    ticker now runs through the same pipeline: compute whatever features
-    are computable, write the row with NaN for the rest, log loudly.
+    short-history-only write branch. Every ticker runs through the same
+    feature pipeline and writes whatever's computable. The parquet-warmup
+    branch added 2026-04-22 preserves that invariant — it unions the
+    weekly 10y parquet into the warmup frame but still hands the result
+    to compute_features.
 
-    A regression that re-introduces the gate would undo first-class
-    short-history support and resurrect the 2026-04-21 SNDK executor
-    crash (NaN ``atr_14_pct`` from a ticker that WAS supposed to get
-    one because ATR-14 only needs ≥14 rows).
+    A regression that re-introduces the SKIP / OHLCV-only-and-continue
+    branch would undo first-class short-history support and resurrect
+    the 2026-04-21 SNDK executor crash (NaN ``atr_14_pct`` from a ticker
+    that WAS supposed to get one because ATR-14 only needs ≥14 rows).
     """
     src = _source()
     lines = src.splitlines()
@@ -94,14 +99,29 @@ def test_unified_path_no_min_rows_gate():
         stripped = line.strip()
         if stripped.startswith("#"):
             continue
-        if "len(hist) < MIN_ROWS_FOR_FEATURES" in stripped:
+        if "MIN_ROWS_FOR_FEATURES" not in stripped:
+            continue
+        if not stripped.startswith("if "):
+            continue
+        # Found an `if ... MIN_ROWS_FOR_FEATURES ...:` branch. Look at the
+        # next ~6 lines. If that block increments n_skip / n_partial /
+        # writes to universe_lib AND then `continue`s — it's the forbidden
+        # bypass pattern. If it reassigns the warmup source and falls
+        # through — it's the allowed parquet-warmup pattern.
+        window = "\n".join(lines[i:i + 30])
+        bypass_signals = (
+            "n_skip += 1" in window
+            or "n_partial += 1" in window
+            or "universe_lib.update(" in window
+        )
+        if bypass_signals and "continue" in window:
             raise AssertionError(
-                f"Line {i+1}: re-introduced the `len(hist) < "
-                f"MIN_ROWS_FOR_FEATURES` gate. This branches short-history "
-                f"tickers away from compute_features and brings back the "
-                f"2026-04-21 SNDK executor crash. Let every ticker go "
-                f"through the unified path; compute_features no longer "
-                f"drops rows."
+                f"Line {i+1}: re-introduced the `MIN_ROWS_FOR_FEATURES` "
+                f"SKIP branch. Any branch gated on MIN_ROWS_FOR_FEATURES "
+                f"must enrich warmup context and fall through to the "
+                f"shared compute_features / update() path — it must not "
+                f"`continue` past compute_features. See the 2026-04-22 "
+                f"parquet-warmup design."
             )
 
 

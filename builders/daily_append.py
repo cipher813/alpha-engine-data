@@ -25,8 +25,11 @@ import boto3
 import numpy as np
 import pandas as pd
 
+from botocore.exceptions import ClientError
+
 from features.feature_engineer import (
     FEATURES,
+    MIN_ROWS_FOR_FEATURES,
     compute_features,
 )
 from features.compute import (
@@ -38,10 +41,39 @@ from features.compute import (
     _load_cached_alternative,
 )
 from store.arctic_store import get_universe_lib, get_macro_lib
+from store.parquet_loader import load_parquet_from_s3
 
 log = logging.getLogger(__name__)
 
 OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume", "VWAP"]
+PRICE_CACHE_PREFIX = "predictor/price_cache/"
+
+
+def _load_parquet_warmup(s3, bucket: str, ticker: str) -> pd.DataFrame | None:
+    """Load a ticker's 10y price-cache parquet for feature warmup.
+
+    Returns None when the parquet doesn't exist (new constituent that hasn't
+    been picked up by the weekly backfill yet). Hard-fails on any other
+    error shape — NoSilentFails.
+    """
+    key = f"{PRICE_CACHE_PREFIX}{ticker}.parquet"
+    try:
+        df = load_parquet_from_s3(s3, bucket, key)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404"):
+            return None
+        raise RuntimeError(
+            f"parquet-warmup read failed for {ticker} (bucket={bucket}, "
+            f"key={key}): {exc}"
+        ) from exc
+
+    if df.empty or "Close" not in df.columns:
+        raise RuntimeError(
+            f"parquet-warmup for {ticker}: parquet exists but invalid shape "
+            f"(empty={df.empty}, cols={list(df.columns)[:6]})"
+        )
+    return df
 
 
 def _load_daily_closes(s3, bucket: str, date_str: str) -> dict[str, dict]:
@@ -177,10 +209,11 @@ def daily_append(
         if t not in _SKIP_TICKERS and not _is_sector_etf(t)
     ]
 
-    n_ok = 0       # fully-featured rows (all FEATURES finite)
-    n_skip = 0     # legitimate skips (dry_run, NaN close from upstream)
-    n_err = 0      # ArcticDB read failures
-    n_partial = 0  # rows written with ≥1 NaN feature (short-history, etc.)
+    n_ok = 0              # fully-featured rows (all FEATURES finite)
+    n_skip = 0            # legitimate skips (dry_run, NaN close from upstream)
+    n_err = 0             # ArcticDB read failures
+    n_partial = 0         # rows written with ≥1 NaN feature (short-history, etc.)
+    n_parquet_warmup = 0  # rows whose feature compute used parquet-enriched context
 
     for ticker in stock_tickers:
         try:
@@ -219,8 +252,61 @@ def daily_append(
                 index=pd.DatetimeIndex([today_ts]),
             )
 
-            # Combine history OHLCV + today's bar for feature computation
-            hist_ohlcv = hist[[c for c in OHLCV_COLS if c in hist.columns]]
+            # Warmup context — ArcticDB by default; parquet-enriched when the
+            # ArcticDB history is too short for full feature warmup.
+            #
+            # Before this change, short-history tickers (new listings, spinoffs,
+            # recent constituent adds) accumulated feature coverage one day at
+            # a time — features with 252-day rolling windows stayed NaN for
+            # up to a year after the ticker entered ArcticDB, even though the
+            # weekly backfill's 10y parquet held the full series. That state
+            # routinely caused manual polygon backfills (8 tickers in one day,
+            # 2026-04-22) just to unblock downstream consumers.
+            #
+            # When len(hist) is below the feature-warmup threshold we union
+            # the ticker's `predictor/price_cache/{T}.parquet` (full 10y
+            # adjusted OHLCV, rebuilt every Saturday by backfill.py) with
+            # ArcticDB by date. ArcticDB wins on overlapping dates because
+            # daily_append writes there every weekday — it's fresher than a
+            # parquet that can be up to 6 days old. Full-history tickers
+            # (~99% of the universe on a steady-state day) skip the parquet
+            # read entirely.
+            #
+            # `hist` (the original ArcticDB read) remains authoritative for
+            # the write schema (dtype matching via hist.dtypes[col] at the
+            # update() call below). Only the feature-compute context is
+            # enriched.
+            warmup_source = hist
+            if len(hist) < MIN_ROWS_FOR_FEATURES:
+                parquet_df = _load_parquet_warmup(s3, bucket, ticker)
+                if parquet_df is None:
+                    log.warning(
+                        "short-history-no-parquet ticker=%s arctic_rows=%d "
+                        "— falling through to NaN-feature degrade",
+                        ticker, len(hist),
+                    )
+                else:
+                    parquet_ohlcv = parquet_df[
+                        [c for c in OHLCV_COLS if c in parquet_df.columns]
+                    ]
+                    arctic_ohlcv = hist[
+                        [c for c in OHLCV_COLS if c in hist.columns]
+                    ]
+                    warmup_source = pd.concat([parquet_ohlcv, arctic_ohlcv])
+                    warmup_source = warmup_source[
+                        ~warmup_source.index.duplicated(keep="last")
+                    ].sort_index()
+                    n_parquet_warmup += 1
+                    log.info(
+                        "parquet-warmup ticker=%s arctic_rows=%d "
+                        "parquet_rows=%d stitched_rows=%d",
+                        ticker, len(hist), len(parquet_df), len(warmup_source),
+                    )
+
+            # Combine warmup OHLCV + today's bar for feature computation
+            hist_ohlcv = warmup_source[
+                [c for c in OHLCV_COLS if c in warmup_source.columns]
+            ]
             combined = pd.concat([hist_ohlcv, new_row])
             combined = combined[~combined.index.duplicated(keep="last")].sort_index()
 
@@ -433,15 +519,16 @@ def daily_append(
         "tickers_partial": n_partial,
         "tickers_skipped": n_skip,
         "tickers_errored": n_err,
+        "tickers_parquet_warmup": n_parquet_warmup,
         "load_seconds": round(t_load, 1),
         "total_seconds": round(t_total, 1),
         "dry_run": dry_run,
     }
 
     log.info(
-        "ArcticDB daily_append: stocks n_ok=%d n_partial=%d n_skip=%d n_err=%d (of %d) | "
-        "macro_updated=%d sector_updated=%d | %.1fs total",
-        n_ok, n_partial, n_skip, n_err, len(stock_tickers),
+        "ArcticDB daily_append: stocks n_ok=%d n_partial=%d n_skip=%d n_err=%d "
+        "n_parquet_warmup=%d (of %d) | macro_updated=%d sector_updated=%d | %.1fs total",
+        n_ok, n_partial, n_skip, n_err, n_parquet_warmup, len(stock_tickers),
         len(macro_updated) if not dry_run else 0,
         len(sector_updated) if not dry_run else 0,
         t_total,
