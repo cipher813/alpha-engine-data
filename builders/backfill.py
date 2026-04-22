@@ -167,6 +167,7 @@ def backfill(
     dry_run: bool = False,
     ticker_filter: str | None = None,
     validate: bool = False,
+    rebuild_macro: bool = False,
 ) -> dict:
     """
     Run the full historical backfill: load 10y prices, compute features, write to ArcticDB.
@@ -176,6 +177,9 @@ def backfill(
         dry_run: compute but skip ArcticDB writes
         ticker_filter: if set, only process this single ticker (for testing)
         validate: if True, run spot-check validation after backfill
+        rebuild_macro: when ticker_filter is set, also rewrite the macro
+            library from parquet (opt-in override — defaults to False so
+            per-ticker patches don't regress macro freshness)
 
     Returns:
         Summary dict with counts and timing.
@@ -219,23 +223,31 @@ def backfill(
         and not _is_sector_etf(t)
         and price_data[t] is not None
     ]
-    tickers_with_features = {
-        t for t in universe_tickers
-        if len(price_data[t]) >= MIN_ROWS_FOR_FEATURES
-    }
+    # Post-PR-#78: ``compute_features`` returns rows with NaN for features
+    # whose rolling-window warmup exceeds available history (e.g. ATR-14
+    # computes on 14 rows; dist_from_52w_high stays NaN under 252 rows).
+    # We no longer split into "feature" vs "OHLCV-only" paths — every
+    # ticker gets the unified schema with per-feature graceful degrade.
+    # ``n_short_history`` is retained as an observability counter so the
+    # completion log still reports how many tickers got partial features.
+    n_short_history_in_scope = sum(
+        1 for t in universe_tickers
+        if len(price_data[t]) < MIN_ROWS_FOR_FEATURES
+    )
 
     if ticker_filter:
         if ticker_filter not in universe_tickers:
             log.error("Ticker %s not found in universe (no data or in skip list)", ticker_filter)
             return {"status": "error", "error": f"ticker_not_found: {ticker_filter}"}
         universe_tickers = [ticker_filter]
-        # tickers_with_features auto-narrows via set intersection below
+        n_short_history_in_scope = (
+            1 if len(price_data[ticker_filter]) < MIN_ROWS_FOR_FEATURES else 0
+        )
 
     log.info(
-        "Writing %d tickers to ArcticDB (%d with features, %d OHLCV-only fresh listings)",
+        "Writing %d tickers to ArcticDB (%d below MIN_ROWS_FOR_FEATURES — partial-feature rows expected)",
         len(universe_tickers),
-        sum(1 for t in universe_tickers if t in tickers_with_features),
-        sum(1 for t in universe_tickers if t not in tickers_with_features),
+        n_short_history_in_scope,
     )
 
     # ── 3. Extract macro series ──────────────────────────────────────────────
@@ -255,107 +267,132 @@ def backfill(
     n_ok = 0
     n_skip = 0
     n_err = 0
+    n_partial = 0  # written successfully with ≥1 NaN feature (short-history warmup)
     t_compute_start = time.time()
 
-    n_ok_features = 0
-    n_ok_ohlcv_only = 0
     for i, ticker in enumerate(universe_tickers):
         try:
             df = price_data[ticker]
 
-            if ticker in tickers_with_features:
-                sector_etf_sym = sector_map.get(ticker)
-                sector_etf_series = macro.get(sector_etf_sym) if sector_etf_sym else None
-                ticker_alt = alt_data.get(ticker, {})
+            # Unified path (post-PR-#78): every ticker goes through
+            # ``compute_features``. Rolling features whose warmup exceeds
+            # the ticker's available history return NaN for the affected
+            # rows; the row itself is preserved. Downstream consumers
+            # (predictor training, research scanner) apply their own NaN
+            # policy. The previous "OHLCV-only fresh listing" fork would
+            # regress PR #79's schema migration on the next Saturday run
+            # by writing a stripped-column frame that ``lib.update()``
+            # then rejected.
+            sector_etf_sym = sector_map.get(ticker)
+            sector_etf_series = macro.get(sector_etf_sym) if sector_etf_sym else None
+            ticker_alt = alt_data.get(ticker, {})
 
-                featured_df = compute_features(
-                    df,
-                    spy_series=spy_series,
-                    vix_series=vix_series,
-                    sector_etf_series=sector_etf_series,
-                    tnx_series=tnx_series,
-                    irx_series=irx_series,
-                    gld_series=gld_series,
-                    uso_series=uso_series,
-                    vix3m_series=vix3m_series,
-                    earnings_data=ticker_alt.get("earnings"),
-                    revision_data=ticker_alt.get("revisions"),
-                    options_data=ticker_alt.get("options"),
-                    fundamental_data=fundamentals.get(ticker),
+            featured_df = compute_features(
+                df,
+                spy_series=spy_series,
+                vix_series=vix_series,
+                sector_etf_series=sector_etf_series,
+                tnx_series=tnx_series,
+                irx_series=irx_series,
+                gld_series=gld_series,
+                uso_series=uso_series,
+                vix3m_series=vix3m_series,
+                earnings_data=ticker_alt.get("earnings"),
+                revision_data=ticker_alt.get("revisions"),
+                options_data=ticker_alt.get("options"),
+                fundamental_data=fundamentals.get(ticker),
+            )
+
+            if featured_df.empty:
+                n_skip += 1
+                continue
+
+            keep_cols = [c for c in OHLCV_COLS if c in featured_df.columns] + \
+                        [f for f in FEATURES if f in featured_df.columns]
+            symbol_df = featured_df[keep_cols].copy()
+
+            for f in FEATURES:
+                if f in symbol_df.columns:
+                    symbol_df[f] = symbol_df[f].astype("float32")
+
+            symbol_df.index.name = "date"
+
+            feature_cols_present = [f for f in FEATURES if f in symbol_df.columns]
+            last_row_nan_features = [
+                f for f in feature_cols_present
+                if pd.isna(symbol_df[f].iloc[-1])
+            ]
+            if last_row_nan_features:
+                n_partial += 1
+                log.info(
+                    "partial-features ticker=%s rows=%d nan_last_row=%d/%d features=%s",
+                    ticker, len(symbol_df), len(last_row_nan_features),
+                    len(feature_cols_present),
+                    last_row_nan_features[:5] + (["..."] if len(last_row_nan_features) > 5 else []),
                 )
 
-                if featured_df.empty:
-                    n_skip += 1
-                    continue
+            if not dry_run:
+                universe_lib.write(ticker, symbol_df)
 
-                keep_cols = [c for c in OHLCV_COLS if c in featured_df.columns] + \
-                            [f for f in FEATURES if f in featured_df.columns]
-                symbol_df = featured_df[keep_cols].copy()
-
-                for f in FEATURES:
-                    if f in symbol_df.columns:
-                        symbol_df[f] = symbol_df[f].astype("float32")
-
-                symbol_df.index.name = "date"
-
-                if not dry_run:
-                    universe_lib.write(ticker, symbol_df)
-
-                n_ok_features += 1
-            else:
-                # Fresh listing: too little history for features; write raw OHLCV
-                # so Research's 3-month price scan can include it. Predictor
-                # ticker filters skip these until they accumulate MIN_ROWS_FOR_FEATURES.
-                keep_cols = [c for c in OHLCV_COLS if c in df.columns]
-                symbol_df = df[keep_cols].copy()
-                symbol_df.index.name = "date"
-
-                if not dry_run:
-                    universe_lib.write(ticker, symbol_df)
-
-                n_ok_ohlcv_only += 1
-
-            n_ok = n_ok_features + n_ok_ohlcv_only
+            n_ok += 1
 
             if (i + 1) % 100 == 0:
                 log.info(
-                    "Progress: %d / %d tickers processed (%d features, %d OHLCV-only)",
-                    i + 1, len(universe_tickers), n_ok_features, n_ok_ohlcv_only,
+                    "Progress: %d / %d tickers processed (%d ok, %d partial-features)",
+                    i + 1, len(universe_tickers), n_ok, n_partial,
                 )
 
         except Exception as exc:
             log.warning("Failed to write %s: %s", ticker, exc)
             n_err += 1
 
-    n_ok = n_ok_features + n_ok_ohlcv_only
     log.info(
-        "Backfill write complete: %d with features, %d OHLCV-only (fresh listings), %d skipped, %d errors",
-        n_ok_features, n_ok_ohlcv_only, n_skip, n_err,
+        "Backfill write complete: %d ok (%d with partial features on last row), %d skipped, %d errors",
+        n_ok, n_partial, n_skip, n_err,
     )
 
     t_compute = time.time() - t_compute_start
 
     # ── 5. Write macro features ──────────────────────────────────────────────
-    macro_df = _build_macro_features_df(macro)
-    if not macro_df.empty and not dry_run:
-        macro_lib.write("features", macro_df)
-        log.info("Wrote macro features: %d dates", len(macro_df))
+    # Macro writes are a SIDE EFFECT of full-universe backfill. On a
+    # single-ticker invocation (``--ticker X``) we skip them: the parquet
+    # price cache's macro series may be stale relative to what
+    # daily_append has been appending into ArcticDB, so rewriting macro
+    # from parquet during a per-ticker patch would silently regress SPY/
+    # VIX/XL* last_date (this is exactly what happened 2026-04-22 when a
+    # SOLS backfill knocked macro back from 4/20 to 4/17). Operators who
+    # genuinely want to rebuild macro must run a full-universe backfill
+    # (``--rebuild-macro`` opt-in with ``--ticker`` is an explicit override).
+    skip_macro = (ticker_filter is not None) and (not rebuild_macro)
+    macro_df = pd.DataFrame()  # populated below when we do write macro
+    if skip_macro:
+        log.info(
+            "Skipping macro library rewrite — ticker_filter=%s is set and "
+            "--rebuild-macro was not passed. Macro library is preserved as "
+            "last written by daily_append / full-universe backfill.",
+            ticker_filter,
+        )
+    else:
+        macro_df = _build_macro_features_df(macro)
+        if not macro_df.empty and not dry_run:
+            macro_lib.write("features", macro_df)
+            log.info("Wrote macro features: %d dates", len(macro_df))
 
-    # Write raw macro series (SPY, VIX, etc.) for consumers that need them
-    if not dry_run:
-        for key in ["SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO"]:
-            series = macro.get(key)
-            if series is not None:
-                macro_series_df = pd.DataFrame({"Close": series}, index=series.index)
-                macro_series_df.index.name = "date"
-                macro_lib.write(key, macro_series_df)
+        # Write raw macro series (SPY, VIX, etc.) for consumers that need them
+        if not dry_run:
+            for key in ["SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO"]:
+                series = macro.get(key)
+                if series is not None:
+                    macro_series_df = pd.DataFrame({"Close": series}, index=series.index)
+                    macro_series_df.index.name = "date"
+                    macro_lib.write(key, macro_series_df)
 
-        # Write sector ETFs
-        for key in macro:
-            if key.startswith("XL"):
-                sector_df = pd.DataFrame({"Close": macro[key]}, index=macro[key].index)
-                sector_df.index.name = "date"
-                macro_lib.write(key, sector_df)
+            # Write sector ETFs
+            for key in macro:
+                if key.startswith("XL"):
+                    sector_df = pd.DataFrame({"Close": macro[key]}, index=macro[key].index)
+                    sector_df.index.name = "date"
+                    macro_lib.write(key, sector_df)
 
     # ── 6. Snapshot ──────────────────────────────────────────────────────────
     if not dry_run:
@@ -474,6 +511,15 @@ def main():
     parser.add_argument("--ticker", default=None, help="Process single ticker (for testing)")
     parser.add_argument("--validate", action="store_true", help="Run spot-check validation after backfill")
     parser.add_argument("--bucket", default=DEFAULT_BUCKET, help=f"S3 bucket (default: {DEFAULT_BUCKET})")
+    parser.add_argument(
+        "--rebuild-macro",
+        action="store_true",
+        help=(
+            "Force macro-library rewrite even when --ticker is set. "
+            "Default: per-ticker invocations SKIP macro writes to avoid "
+            "regressing SPY/XL* freshness from the stale parquet cache."
+        ),
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
 
     args = parser.parse_args()
@@ -489,6 +535,7 @@ def main():
         dry_run=args.dry_run,
         ticker_filter=args.ticker,
         validate=args.validate,
+        rebuild_macro=args.rebuild_macro,
     )
 
     if result["status"] != "ok":
