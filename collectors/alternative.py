@@ -6,6 +6,7 @@ alternative data for the ~25-30 promoted tickers (buy candidates + tracked).
 
 Data sources:
   - Analyst rating (Finnhub ``/stock/recommendation`` — free tier)
+  - Analyst price target (yfinance ``Ticker.info.targetMeanPrice`` — free)
   - Earnings surprises (Finnhub ``/stock/earnings`` — free tier)
   - EPS estimates (FMP ``/stable/analyst-estimates?period=annual`` — free tier)
   - Options flow (yfinance)
@@ -13,16 +14,17 @@ Data sources:
   - Institutional 13F (edgartools)
   - News headlines (Yahoo RSS + EDGAR 8-K)
 
-Provider notes (2026-04-20)
----------------------------
+Provider notes (updated 2026-04-22)
+-----------------------------------
 FMP v3 sunsetted on 2025-08-31; all FMP calls go to /stable with
 query-string tickers. On /stable, these endpoints are paid-tier (HTTP
-402 / 403 on free), so the corresponding features are sourced elsewhere
-or left null:
+402 / 403 on free), so the corresponding features are sourced elsewhere:
 
   - ``grades-consensus`` → Finnhub ``/stock/recommendation``
-  - ``price-target-consensus`` → no free source available; ``target_price``
-    is left ``None``. Finnhub's ``/stock/price-target`` is also paid.
+  - ``price-target-consensus`` → yfinance ``Ticker.info`` exposes
+    ``targetMeanPrice`` + ``numberOfAnalystOpinions`` on free. Finnhub's
+    ``/stock/price-target`` is paid-only. yfinance ``.info`` is the same
+    per-ticker pattern ``short_interest.py`` uses.
   - ``earnings-surprises-bulk`` → Finnhub ``/stock/earnings`` (richer
     historical data anyway)
   - ``analyst-estimates?period=quarter`` → FMP ``period=annual`` still
@@ -327,11 +329,13 @@ def _finnhub_get(endpoint: str, params: dict | None = None) -> dict | list:
 # ---- 1. Analyst consensus ----
 
 def _fetch_analyst(ticker: str) -> dict:
-    """Fetch analyst rating (Finnhub) + earnings surprises (Finnhub).
+    """Fetch analyst rating + target price + earnings surprises.
 
-    ``target_price`` is left ``None`` — no free-tier source is available
-    since FMP moved ``price-target-consensus`` to paid and Finnhub's
-    ``/stock/price-target`` also returns 403 on free.
+    Sources: Finnhub ``/stock/recommendation`` for rating + bull/bear
+    analyst counts; yfinance ``Ticker.info`` for the consensus price
+    target (Finnhub's ``/stock/price-target`` and FMP's
+    ``/stable/price-target-consensus`` are both paid-tier); Finnhub
+    ``/stock/earnings`` for historical surprises.
     """
     result = {
         "rating": None,
@@ -384,6 +388,26 @@ def _fetch_analyst(ticker: str) -> dict:
             result["earnings_surprises"] = surprises
     except Exception as e:
         logger.warning("Finnhub earnings failed for %s: %s", ticker, e)
+
+    # yfinance Ticker.info: ``targetMeanPrice`` is the consensus price target;
+    # ``numberOfAnalystOpinions`` is the count of analysts covering the name
+    # (a different denominator than the Finnhub rating counts above — Finnhub's
+    # ``num_analysts`` is the sum of current-period rating buckets, used for
+    # the Buy/Hold/Sell classification; yfinance's count is the analyst
+    # coverage universe for the price-target aggregation). Populate
+    # ``num_analysts`` from yfinance only if Finnhub did not supply one.
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info
+        target = info.get("targetMeanPrice")
+        if target is not None:
+            result["target_price"] = round(float(target), 2)
+        if result["num_analysts"] is None:
+            n = info.get("numberOfAnalystOpinions")
+            if n is not None:
+                result["num_analysts"] = int(n)
+    except Exception as e:
+        logger.warning("yfinance target_price failed for %s: %s", ticker, e)
 
     return result
 
