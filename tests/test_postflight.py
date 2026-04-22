@@ -30,6 +30,26 @@ BUCKET = "test-bucket"
 MARKET_PREFIX = "market_data/"
 
 
+@pytest.fixture(autouse=True)
+def _block_real_email(monkeypatch):
+    """Hard guarantee no test in this module emits a real completion email.
+
+    Background: on 2026-04-22 a test with a hardcoded "polygon 503" fixture
+    and dry_run=False was run locally with EMAIL_SENDER/EMAIL_RECIPIENTS/
+    GMAIL_APP_PASSWORD in the shell env. _finalize() unconditionally called
+    send_step_email and a real "Alpha Engine Data Phase 1 | 2026-04-18 |
+    FAILED" email landed in the operator's inbox. Patching inside each test
+    is error-prone; this autouse fixture makes the safety net module-wide.
+    """
+    from unittest.mock import MagicMock
+    monkeypatch.setattr(
+        "weekly_collector.send_step_email",
+        MagicMock(return_value=True),
+        raising=False,
+    )
+    monkeypatch.setattr("emailer.send_step_email", MagicMock(return_value=True))
+
+
 def _make_postflight() -> DataPostflight:
     return DataPostflight(
         bucket=BUCKET,
@@ -378,6 +398,7 @@ class TestFinalizeWiring:
         with patch("weekly_collector._write_manifest"), \
              patch("weekly_collector._write_validation_json"), \
              patch("weekly_collector._write_health_marker"), \
+             patch("weekly_collector.send_step_email", create=True) as _mock_email, \
              patch("validators.postflight.DataPostflight.run") as mock_run:
             _finalize(
                 results=results,
