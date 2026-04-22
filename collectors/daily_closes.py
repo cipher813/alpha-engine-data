@@ -19,13 +19,16 @@ import io
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timezone
+from zoneinfo import ZoneInfo
 
 import boto3
 import pandas as pd
 import requests
 
 logger = logging.getLogger(__name__)
+
+_NYSE_TZ = ZoneInfo("America/New_York")
 
 _YFINANCE_BATCH_SIZE = 100
 _YFINANCE_BATCH_DELAY = 2  # seconds between batches
@@ -43,6 +46,17 @@ _FRED_INDEX_MAP = {
     "TNX": "DGS10",
     "IRX": "DTB3",
 }
+
+
+def _is_post_close_write(last_modified: datetime, run_date: str) -> bool:
+    """Return True if ``last_modified`` is at or after the NYSE close for ``run_date``.
+
+    NYSE closes at 16:00 America/New_York. ``zoneinfo`` resolves EST/EDT
+    automatically so this is correct year-round without explicit DST logic.
+    """
+    run_day = datetime.strptime(run_date, "%Y-%m-%d").date()
+    close_et = datetime.combine(run_day, dtime(16, 0), tzinfo=_NYSE_TZ)
+    return last_modified >= close_et
 
 
 def collect(
@@ -68,14 +82,16 @@ def collect(
     run_date = run_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     s3 = boto3.client("s3")
 
-    # Check if already written for this date
+    # Check if already written for this date. Only skip if the existing
+    # parquet was written AFTER the NYSE close for run_date — a pre-close
+    # write is a morning-side stale fetch (polygon returns T-1's aggregate
+    # stamped under today's key) and must not shadow the authoritative
+    # post-close collection. See 2026-04-20 incident / ROADMAP P0.
     key = f"{s3_prefix}{run_date}.parquet"
     if not dry_run:
         from botocore.exceptions import ClientError
         try:
-            s3.head_object(Bucket=bucket, Key=key)
-            logger.info("Daily closes already exist for %s — skipping", run_date)
-            return {"status": "ok", "tickers_captured": 0, "skipped": True}
+            head = s3.head_object(Bucket=bucket, Key=key)
         except ClientError as exc:
             err_code = exc.response.get("Error", {}).get("Code")
             if err_code not in ("404", "NoSuchKey"):
@@ -83,6 +99,20 @@ def collect(
                 # Don't silently paper over it.
                 raise
             # 404/NoSuchKey: expected case — file doesn't exist, proceed to write.
+        else:
+            last_modified = head["LastModified"]
+            if _is_post_close_write(last_modified, run_date):
+                logger.info(
+                    "Daily closes already exist for %s (post-close at %s) — skipping",
+                    run_date, last_modified.isoformat(),
+                )
+                return {"status": "ok", "tickers_captured": 0, "skipped": True}
+            logger.warning(
+                "Existing %s was written pre-close at %s — refusing to skip; "
+                "re-collecting authoritative post-close data",
+                key, last_modified.isoformat(),
+            )
+            # fall through to re-fetch + overwrite
 
     if not tickers:
         return {"status": "error", "error": "no tickers provided"}
