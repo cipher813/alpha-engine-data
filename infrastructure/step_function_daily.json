@@ -1,7 +1,17 @@
 {
   "Comment": "Alpha Engine Weekday Pipeline — predictor inference and executor start. Runs Mon-Fri 6:05 AM PT (13:05 UTC). DailyData moved to post-close (1:05 PM PT) systemd timer on ae-trading. Policy: all SSM steps run on ae-trading (trading_instance_id); ae-dashboard is reserved for Streamlit + nginx + spot-launcher only.",
-  "StartAt": "DeployDriftCheck",
+  "StartAt": "InitializeInput",
   "States": {
+
+    "InitializeInput": {
+      "Type": "Pass",
+      "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + trading_instance_id explicitly; manual reruns (which happened multiple times 2026-04-23) often omit sns_topic_arn, which caused HandleFailure to error on missing $.sns_topic_arn JSONPath. Mirrors the Saturday SF InitializeInput pattern — States.JsonMerge with user-input as the second arg lets explicit values win.",
+      "Parameters": {
+        "merged.$": "States.JsonMerge(States.StringToJson('{\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'), $$.Execution.Input, false)"
+      },
+      "OutputPath": "$.merged",
+      "Next": "DeployDriftCheck"
+    },
 
     "DeployDriftCheck": {
       "Type": "Task",
