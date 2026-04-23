@@ -1,0 +1,58 @@
+name: Deploy Infrastructure
+
+# Stamp + deploy the orchestration SF + CF stack on every push to main so the
+# deploy-drift preflight never halts the weekday/Saturday pipelines on a stale
+# SHA. The drift probe's contract is "SF/CF stamp == origin/main HEAD" — any
+# commit to main that doesn't rebuild this stack breaks that contract.
+#
+# No path filter: every main commit restamps, regardless of whether the
+# commit touched infrastructure/. This is the deliberate trade-off. 30s of
+# no-op CF update-stack + SF update-state-machine per merge in exchange for
+# eliminating the entire drift class. Cost is ~nothing; benefit is the
+# pipeline never silently halts on stamp drift again.
+#
+# Template-content changes (adding an alarm, modifying a rule) still work
+# here because apply.sh in alpha-engine-data/infrastructure/iam/ is the
+# source of truth for the GHA role's policy and will have been applied
+# before the PR merges.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-infrastructure-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy-infrastructure:
+    name: Stamp SF + CF with main HEAD
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Deploy orchestration infrastructure
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: bash infrastructure/deploy-infrastructure.sh
+
+      - name: Report deployed stamp
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name alpha-engine-orchestration \
+            --query "Stacks[0].[StackStatus,Tags[?Key=='git-sha'].Value|[0]]" \
+            --output text

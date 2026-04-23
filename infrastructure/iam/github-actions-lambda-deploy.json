@@ -65,6 +65,80 @@
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-health-check",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-health-check:*"
       ]
+    },
+    {
+      "Sid": "InfraDeployValidateTemplate",
+      "Effect": "Allow",
+      "Action": "cloudformation:ValidateTemplate",
+      "Resource": "*"
+    },
+    {
+      "Sid": "InfraDeployStack",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:DescribeStacks",
+        "cloudformation:DescribeStackEvents",
+        "cloudformation:GetTemplate",
+        "cloudformation:CreateStack",
+        "cloudformation:UpdateStack",
+        "cloudformation:CreateChangeSet",
+        "cloudformation:DescribeChangeSet",
+        "cloudformation:DeleteChangeSet"
+      ],
+      "Resource": "arn:aws:cloudformation:us-east-1:711398986525:stack/alpha-engine-orchestration/*"
+    },
+    {
+      "Sid": "InfraDeployS3",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research/infrastructure/*"
+    },
+    {
+      "Sid": "InfraDeploySFDefinition",
+      "Effect": "Allow",
+      "Action": [
+        "states:UpdateStateMachine",
+        "states:DescribeStateMachine",
+        "states:ListTagsForResource",
+        "states:TagResource",
+        "states:UntagResource"
+      ],
+      "Resource": [
+        "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekday-pipeline"
+      ]
+    },
+    {
+      "Sid": "InfraDeployTagPropagation",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:TagResource",
+        "cloudwatch:UntagResource",
+        "cloudwatch:ListTagsForResource",
+        "events:TagResource",
+        "events:UntagResource",
+        "events:ListTagsForResource",
+        "sns:TagResource",
+        "sns:UntagResource",
+        "sns:ListTagsForResource",
+        "scheduler:TagResource",
+        "scheduler:UntagResource",
+        "scheduler:ListTagsForResource"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "InfraDeployLambdaPermission",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:AddPermission",
+        "lambda:RemovePermission",
+        "lambda:GetPolicy"
+      ],
+      "Resource": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-*"
     }
   ]
 }
