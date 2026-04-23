@@ -112,18 +112,32 @@
       ]
     },
     {
-      "Sid": "InfraDeployTagPropagation",
+      "Sid": "InfraDeployResourceCRUD",
       "Effect": "Allow",
       "Action": [
+        "cloudwatch:PutMetricAlarm",
+        "cloudwatch:DeleteAlarms",
         "cloudwatch:TagResource",
         "cloudwatch:UntagResource",
         "cloudwatch:ListTagsForResource",
+        "events:PutRule",
+        "events:DeleteRule",
+        "events:PutTargets",
+        "events:RemoveTargets",
         "events:TagResource",
         "events:UntagResource",
         "events:ListTagsForResource",
+        "sns:CreateTopic",
+        "sns:DeleteTopic",
+        "sns:SetTopicAttributes",
+        "sns:Subscribe",
+        "sns:Unsubscribe",
         "sns:TagResource",
         "sns:UntagResource",
         "sns:ListTagsForResource",
+        "scheduler:CreateSchedule",
+        "scheduler:UpdateSchedule",
+        "scheduler:DeleteSchedule",
         "scheduler:TagResource",
         "scheduler:UntagResource",
         "scheduler:ListTagsForResource"
@@ -155,13 +169,17 @@
       "Resource": "*"
     },
     {
-      "Sid": "InfraDeployPassSFRole",
+      "Sid": "InfraDeployPassRole",
       "Effect": "Allow",
       "Action": "iam:PassRole",
-      "Resource": "arn:aws:iam::711398986525:role/alpha-engine-step-functions-role",
+      "Resource": "arn:aws:iam::711398986525:role/alpha-engine-*",
       "Condition": {
         "StringEquals": {
-          "iam:PassedToService": "states.amazonaws.com"
+          "iam:PassedToService": [
+            "states.amazonaws.com",
+            "scheduler.amazonaws.com",
+            "events.amazonaws.com"
+          ]
         }
       }
     }
