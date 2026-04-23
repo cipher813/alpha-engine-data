@@ -139,6 +139,31 @@
         "lambda:GetPolicy"
       ],
       "Resource": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-*"
+    },
+    {
+      "Sid": "InfraDeployResourceRead",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:DescribeAlarms",
+        "events:DescribeRule",
+        "events:ListTargetsByRule",
+        "scheduler:GetSchedule",
+        "sns:GetTopicAttributes",
+        "sns:GetSubscriptionAttributes",
+        "sns:ListSubscriptionsByTopic"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "InfraDeployPassSFRole",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::711398986525:role/alpha-engine-step-functions-role",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "states.amazonaws.com"
+        }
+      }
     }
   ]
 }
