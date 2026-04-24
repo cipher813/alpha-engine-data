@@ -1,5 +1,5 @@
 {
-  "Comment": "Alpha Engine Weekday Pipeline — predictor inference and executor start. Runs Mon-Fri 6:05 AM PT (13:05 UTC). DailyData moved to post-close (1:05 PM PT) systemd timer on ae-trading. Policy: all SSM steps run on ae-trading (trading_instance_id); ae-dashboard is reserved for Streamlit + nginx + spot-launcher only.",
+  "Comment": "Alpha Engine Weekday Pipeline — morning polygon enrichment, predictor inference, executor start. Runs Mon-Fri 6:05 AM PT (13:05 UTC). MorningEnrich (added 2026-04-24) overwrites the prior trading day's ArcticDB row with polygon's authoritative OHLCV+VWAP before predictor inference reads it — fixes the 2026-04-17→2026-04-23 silent VWAP outage where the EOD yfinance pass was the only source. EOD yfinance collection runs via the post-close EOD SF on ae-trading. Policy: all SSM steps run on ae-trading (trading_instance_id); ae-dashboard is reserved for Streamlit + nginx + spot-launcher only.",
   "StartAt": "InitializeInput",
   "States": {
 
@@ -154,10 +154,95 @@
               "StringMatches": "*TRADING DAY*"
             }
           ],
-          "Next": "PredictorInference"
+          "Next": "MorningEnrich"
         }
       ],
       "Default": "TradingDayCheckFailed"
+    },
+
+    "MorningEnrich": {
+      "Type": "Task",
+      "Comment": "Polygon morning enrichment — overwrites the prior trading day's daily_closes parquet + ArcticDB row with polygon's authoritative OHLCV+VWAP. Hard-fails on PolygonForbiddenError (no yfinance fallback masks polygon outages). Predictor inference reads ArcticDB right after this step and must see polygon-corrected data, so failure → HandleFailure (do NOT proceed to PredictorInference with stale yfinance values). See alpha-engine-data/collectors/daily_closes.py for source-mode contract.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.trading_instance_id",
+        "Parameters": {
+          "commands": [
+            "cd /home/ec2-user/alpha-engine-data",
+            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "source .venv/bin/activate",
+            "python weekly_collector.py --morning-enrich 2>&1 | tee -a /var/log/morning-enrich.log"
+          ],
+          "executionTimeout": ["720"]
+        },
+        "TimeoutSeconds": 720
+      },
+      "TimeoutSeconds": 780,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.morning_enrich_result",
+      "Next": "WaitForMorningEnrich"
+    },
+
+    "WaitForMorningEnrich": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.morning_enrich_result.Command.CommandId",
+        "InstanceId.$": "$.trading_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.InvocationDoesNotExistException"],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.morning_enrich_poll",
+      "Next": "CheckMorningEnrichStatus"
+    },
+
+    "CheckMorningEnrichStatus": {
+      "Type": "Choice",
+      "Comment": "Block predictor inference until polygon enrichment confirms the prior trading day's row is overwritten with authoritative VWAP. SSM Failed → HandleFailure (must not proceed to inference on uncorrected data per feedback_no_silent_fails).",
+      "Choices": [
+        {
+          "Variable": "$.morning_enrich_poll.Status",
+          "StringEquals": "Success",
+          "Next": "PredictorInference"
+        },
+        {
+          "Variable": "$.morning_enrich_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "MorningEnrichWait"
+        },
+        {
+          "Variable": "$.morning_enrich_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "MorningEnrichWait"
+        }
+      ],
+      "Default": "HandleFailure"
+    },
+
+    "MorningEnrichWait": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "WaitForMorningEnrich"
     },
 
     "TradingDayCheckWait": {
@@ -168,7 +253,7 @@
 
     "TradingDayCheckFailed": {
       "Type": "Task",
-      "Comment": "Trading day check failed for infrastructure reasons — alert and proceed (assume trading day)",
+      "Comment": "Trading day check failed for infrastructure reasons — alert and proceed (assume trading day). Routes to MorningEnrich same as the trading-day success path; predictor inference still gated on enrichment success.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
@@ -176,7 +261,7 @@
         "Message.$": "States.Format('Trading day check failed (SSM error, not a holiday detection). Pipeline proceeding as trading day. State: {}', States.JsonToString($))"
       },
       "ResultPath": "$.trading_day_error_notify",
-      "Next": "PredictorInference"
+      "Next": "MorningEnrich"
     },
 
     "StopExecutorOnHoliday": {
