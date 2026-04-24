@@ -1,27 +1,28 @@
 {
-  "Comment": "Alpha Engine EOD Pipeline — post-market data capture (yfinance OHLCV, VWAP=NaN), reconciliation, instance shutdown. Triggered by daemon shutdown on ae-trading. PostMarketData runs the FULL daily flow (closes + features + ArcticDB append) so this SF is now the sole canonical EOD path — the alpha-engine-daily-data systemd timer was deleted as part of the same change. Daily VWAP gets filled the next morning by the weekday SF's MorningEnrich step (polygon overwrite).",
+  "Comment": "Alpha Engine EOD Pipeline — post-market data capture, reconciliation, instance shutdown. Triggered by daemon shutdown on trading EC2.",
   "StartAt": "PostMarketData",
   "States": {
 
     "PostMarketData": {
       "Type": "Task",
-      "Comment": "Run the full daily flow on ae-trading: yfinance-only daily_closes, feature store snapshot, ArcticDB daily_append. Replaced the prior split-command pattern (closes + append separately) after PR 1 unified --daily under source=yfinance_only. Runs on ae-trading (was micro pre-2026-04-24) so the t3.small RAM avoids the 2026-04-16 OOM regression that originally moved DailyData off the micro instance.",
+      "Comment": "Capture today's closing prices from polygon + append to ArcticDB (runs on micro EC2)",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
-        "InstanceIds.$": "$.trading_instance_id",
+        "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
           "commands": [
             "cd /home/ec2-user/alpha-engine-data",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
             "source .venv/bin/activate",
-            "python weekly_collector.py --daily 2>&1 | tee -a /var/log/postmarket-data.log"
+            "python weekly_collector.py --daily --only daily_closes 2>&1 | tee /var/log/postmarket-data.log",
+            "python -m builders.daily_append 2>&1 | tee -a /var/log/postmarket-data.log"
           ],
-          "executionTimeout": ["720"]
+          "executionTimeout": ["180"]
         },
-        "TimeoutSeconds": 720
+        "TimeoutSeconds": 180
       },
-      "TimeoutSeconds": 780,
+      "TimeoutSeconds": 240,
       "Retry": [
         {
           "ErrorEquals": ["States.TaskFailed"],
@@ -47,7 +48,7 @@
       "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
       "Parameters": {
         "CommandId.$": "$.postmarket_result.Command.CommandId",
-        "InstanceId.$": "$.trading_instance_id[0]"
+        "InstanceId.$": "$.ec2_instance_id[0]"
       },
       "Retry": [
         {
