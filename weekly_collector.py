@@ -14,8 +14,10 @@ Usage:
     python weekly_collector.py --phase 1 --dry-run    # validate Phase 1
     python weekly_collector.py --phase 1 --only prices # single collector
     python weekly_collector.py --phase 2 --only alternative  # explicit
-    python weekly_collector.py --daily                # weekday daily closes
+    python weekly_collector.py --daily                # weekday EOD pass (yfinance OHLCV, no VWAP)
     python weekly_collector.py --daily --dry-run      # validate daily
+    python weekly_collector.py --morning-enrich       # morning polygon overwrite (prior trading day)
+    python weekly_collector.py --morning-enrich --date 2026-04-23  # backfill specific date
 """
 
 from __future__ import annotations
@@ -58,6 +60,9 @@ def load_config(path: str = "config.yaml") -> dict:
 
 def run_weekly(config: dict, args: argparse.Namespace) -> dict:
     """Run collectors based on mode selection."""
+    if getattr(args, "morning_enrich", False):
+        return _run_morning_enrich(config, args)
+
     if args.daily:
         return _run_daily(config, args)
 
@@ -396,6 +401,145 @@ def _run_phase2(config: dict, args: argparse.Namespace) -> dict:
     return results
 
 
+def _previous_trading_day(reference: datetime | None = None) -> str:
+    """Find the most recent trading day strictly before ``reference`` (UTC).
+
+    Used by --morning-enrich to determine which date polygon's grouped-daily
+    should be fetched for. Free tier won't serve today's data, so we always
+    enrich the prior session. Walks back at most 10 calendar days as a
+    runaway guard against a broken trading-calendar implementation.
+    """
+    from alpha_engine_lib.trading_calendar import is_trading_day
+    from datetime import timedelta
+
+    ref = reference or datetime.now(timezone.utc)
+    d = ref.date() - timedelta(days=1)
+    for _ in range(10):
+        if is_trading_day(d):
+            return d.strftime("%Y-%m-%d")
+        d -= timedelta(days=1)
+    raise RuntimeError(
+        f"Could not find a trading day in the 10 calendar days before {ref.date()} — "
+        f"trading_calendar.is_trading_day appears broken or NYSE has been closed for >1 week."
+    )
+
+
+def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
+    """Morning polygon enrichment: overwrite the prior trading day's parquet
+    + ArcticDB row with polygon's authoritative OHLCV+VWAP.
+
+    Called by the new MorningEnrich Lambda step in the weekday SF (and
+    available via --morning-enrich for backfills). Hard-fails on any polygon
+    failure — predictor inference reads ArcticDB right after this runs and
+    must see polygon-corrected data, not silently-stale yfinance values.
+
+    Skips the feature_store snapshot step (that already ran with yfinance EOD;
+    re-running it is expensive and the polygon delta on OHLCV is typically <1%).
+    daily_append's per-ticker compute_features call recomputes per-ticker
+    features inside ArcticDB based on the polygon-overwritten row, which is
+    what downstream consumers actually read.
+    """
+    bucket = config["bucket"]
+    target_date = args.date or _previous_trading_day()
+    dry_run = args.dry_run
+    daily_cfg = config.get("daily_closes", {})
+
+    results: dict = {
+        "mode": "morning_enrich",
+        "date": target_date,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "collectors": {},
+    }
+
+    # Reuse the same ticker-loading logic as _run_daily so the polygon overwrite
+    # covers exactly the same universe.
+    tickers: list[str] = []
+    market_prefix = config.get("market_data", {}).get("s3_prefix", "market_data/")
+    try:
+        existing = constituents.load_from_s3(bucket, market_prefix)
+        if existing:
+            tickers = existing.get("tickers", [])
+            logger.info("Loaded %d tickers from S3 constituents", len(tickers))
+    except Exception as exc:
+        logger.warning("S3 constituents load failed — will try Wikipedia fallback: %s", exc)
+    if not tickers:
+        try:
+            tickers, _, _, _, _ = constituents._fetch_constituents()
+            logger.info("Loaded %d tickers from Wikipedia (S3 fallback)", len(tickers))
+        except Exception as exc:
+            logger.error("Wikipedia constituents fallback failed: %s", exc)
+
+    if not tickers:
+        logger.error("No tickers available for morning enrichment")
+        results["status"] = "failed"
+        return results
+
+    MACRO_DAILY_TICKERS = [
+        "SPY", "GLD", "USO",
+        "XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
+        "XLP", "XLRE", "XLU", "XLV", "XLY",
+        "^VIX", "^VIX3M", "^TNX", "^IRX",
+    ]
+    tickers = list(dict.fromkeys(tickers + MACRO_DAILY_TICKERS))
+
+    logger.info("=" * 60)
+    logger.info("MORNING ENRICH: polygon overwrite for %s (prior trading day)", target_date)
+    logger.info("=" * 60)
+    try:
+        dc_result = daily_closes.collect(
+            bucket=bucket,
+            tickers=tickers,
+            run_date=target_date,
+            s3_prefix=daily_cfg.get("s3_prefix", "predictor/daily_closes/"),
+            dry_run=dry_run,
+            source="polygon_only",
+        )
+        results["collectors"]["daily_closes"] = dc_result
+    except Exception as e:
+        logger.exception("Morning polygon enrichment failed for %s", target_date)
+        results["collectors"]["daily_closes"] = {"status": "error", "error": str(e)}
+        results["status"] = "failed"
+        results["completed_at"] = datetime.now(timezone.utc).isoformat()
+        return results
+
+    # ── Re-append to ArcticDB so the polygon-overwritten row replaces the
+    # yfinance row written at EOD. universe_lib.update() is idempotent for
+    # same-date overwrites (see daily_append.py:232-242 for the design intent).
+    logger.info("=" * 60)
+    logger.info("APPENDING: ArcticDB universe (morning enrich, %s)", target_date)
+    logger.info("=" * 60)
+    try:
+        from builders.daily_append import daily_append
+        arctic_result = daily_append(
+            date_str=target_date,
+            bucket=bucket,
+            dry_run=dry_run,
+        )
+        results["collectors"]["arcticdb"] = arctic_result
+    except Exception as e:
+        logger.exception("ArcticDB daily_append (morning enrich) failed for %s", target_date)
+        results["collectors"]["arcticdb"] = {"status": "error", "error": str(e)}
+
+    results["completed_at"] = datetime.now(timezone.utc).isoformat()
+    statuses = [r.get("status", "unknown") for r in results["collectors"].values()]
+    results["status"] = "ok" if all(s in ("ok", "ok_dry_run") for s in statuses) else "failed"
+
+    duration = ""
+    try:
+        start = datetime.fromisoformat(results["started_at"])
+        end = datetime.fromisoformat(results["completed_at"])
+        duration = f" in {(end - start).total_seconds():.0f}s"
+    except Exception:
+        pass
+    logger.info(
+        "Morning enrichment %s for %s: %s%s",
+        results["status"].upper(), target_date,
+        ", ".join(f"{k}={v.get('status', '?')}" for k, v in results["collectors"].items()),
+        duration,
+    )
+    return results
+
+
 def _run_daily(config: dict, args: argparse.Namespace) -> dict:
     """Daily mode: capture today's OHLCV closes for all tracked tickers."""
     bucket = config["bucket"]
@@ -452,12 +596,18 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
     logger.info("=" * 60)
     dc_started_at = datetime.now(timezone.utc)
     try:
+        # EOD pass uses yfinance_only — polygon free-tier 403's same-day, and
+        # silently substituting yfinance was the 2026-04-17 → 2026-04-23 VWAP
+        # outage. Morning polygon_only enrichment (separate SF step) fills VWAP
+        # the next morning by overwriting these rows with polygon's authoritative
+        # OHLCV+VWAP. See module docstring on collectors/daily_closes.py.
         dc_result = daily_closes.collect(
             bucket=bucket,
             tickers=tickers,
             run_date=run_date,
             s3_prefix=daily_cfg.get("s3_prefix", "predictor/daily_closes/"),
             dry_run=dry_run,
+            source="yfinance_only",
         )
         results["collectors"]["daily_closes"] = dc_result
     except Exception as e:
@@ -776,7 +926,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--date", default=None, help="Override run date (YYYY-MM-DD)")
     parser.add_argument(
         "--daily", action="store_true",
-        help="Daily mode: capture today's OHLCV closes for all tickers.",
+        help="Daily mode: capture today's OHLCV closes for all tickers (yfinance-only EOD pass).",
+    )
+    parser.add_argument(
+        "--morning-enrich", dest="morning_enrich", action="store_true",
+        help="Morning polygon enrichment: overwrite the prior trading day's parquet + ArcticDB row "
+             "with polygon's authoritative OHLCV+VWAP. Hard-fails on polygon failure (no yfinance "
+             "fallback). --date overrides which trading day to enrich (default: previous trading day).",
     )
     parser.add_argument(
         "--phase", type=int, choices=[1, 2], default=None,
@@ -827,7 +983,12 @@ def main() -> None:
     # Pre-flight: fail fast on env / connectivity drift before starting
     # the real collection work. See alpha-engine-lib/README.md.
     from preflight import DataPreflight
-    mode = "daily" if args.daily else f"phase{args.phase or 1}"
+    if getattr(args, "morning_enrich", False):
+        mode = "daily"  # same dep footprint: constituents + polygon + arcticdb
+    elif args.daily:
+        mode = "daily"
+    else:
+        mode = f"phase{args.phase or 1}"
     DataPreflight(config["bucket"], mode).run()
 
     results = run_weekly(config, args)
