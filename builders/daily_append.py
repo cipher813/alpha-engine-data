@@ -79,11 +79,25 @@ def _load_parquet_warmup(s3, bucket: str, ticker: str) -> pd.DataFrame | None:
 def _load_daily_closes(s3, bucket: str, date_str: str) -> dict[str, dict]:
     """Load today's daily_closes parquet from S3. Raises if the file is missing or unreadable.
 
-    VWAP (2026-04-17): extracted from the parquet alongside OHLCV so it materializes
-    into ArcticDB as a first-class column. Source is polygon grouped-daily's `vw`
-    field when available, else `(H+L+C)/3` typical-price proxy — both are populated
-    upstream in ``collectors/daily_closes.py``. Missing VWAP for a ticker becomes
-    ``NaN`` in the output (not an error); downstream consumers handle NaN.
+    VWAP semantics (per the 2026-04-17 Phase 7 VWAP centralization decision,
+    refined by the 2026-04-23 split-by-source PR):
+
+      * Polygon grouped-daily (collected via ``daily_closes --source polygon_only``
+        in the morning enrichment pass) → true volume-weighted VWAP from
+        polygon's ``vw`` field.
+
+      * yfinance EOD pass (``daily_closes --source yfinance_only``, ~1:05 PM PT)
+        → VWAP=None. yfinance does not expose true VWAP and the (H+L+C)/3
+        typical-price proxy was explicitly REJECTED in 2026-04-17 because it
+        misrepresented arithmetic typical price as volume-weighted VWAP.
+        Morning polygon enrichment overwrites the row to fill VWAP.
+
+      * FRED fallback for indices (VIX/VIX3M/TNX/IRX) → VWAP=None. Single
+        daily Close value with no trade distribution to weight.
+
+    Missing VWAP becomes ``NaN`` in the output (not an error); downstream
+    consumers (executor's ``load_daily_vwap``) handle NaN by walking back up
+    to 5 trading days for a populated value.
     """
     key = f"predictor/daily_closes/{date_str}.parquet"
     obj = s3.get_object(Bucket=bucket, Key=key)

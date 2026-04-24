@@ -5,10 +5,26 @@ Writes one parquet per trading day at predictor/daily_closes/{date}.parquet.
 The predictor inference Lambda uses these to bridge the gap between the
 weekly slim cache and today's prices, avoiding a full 2-year yfinance fetch.
 
-Data source priority:
-  1. polygon.io grouped-daily (1 API call, covers all US stocks + ETFs)
-  2. FRED (covers the 4 index tickers not on polygon free tier: VIX, VIX3M, TNX, IRX)
-  3. yfinance batch download (fallback for whatever remains)
+Two collection modes (selected via the ``source`` parameter):
+
+  * ``yfinance_only`` (EOD pass, ~1:05 PM PT) — same-day OHLCV via yfinance
+    for stocks + FRED for the 4 index tickers (VIX/VIX3M/TNX/IRX). Polygon
+    is skipped entirely because free tier returns 403 "before end of day"
+    for same-day grouped-daily. ``VWAP`` writes as ``None`` for everything;
+    the morning enrichment fills it. Hard-fails on yfinance failure.
+
+  * ``polygon_only`` (morning pass, ~5:30 AM PT next trading day) —
+    polygon.io grouped-daily for stocks (with VWAP) + FRED for indices.
+    ``PolygonForbiddenError`` propagates loudly — no yfinance fallback
+    masks the failure. When an existing parquet is being overwritten
+    (the yfinance EOD pass wrote first), per-ticker Close discrepancy
+    is logged so corporate-action drift / data-quality issues are visible.
+
+  * ``auto`` (default, legacy) — historical behavior: polygon → FRED →
+    yfinance fallback chain. Kept for backfill and one-shot scripts that
+    don't care about the source distinction. Per-PR-1 design decision:
+    operational pipelines (EOD SF, morning SF) MUST specify a mode
+    explicitly so the failure semantics are deterministic.
 
 Schema: index=ticker (str), columns=[date, Open, High, Low, Close, Adj_Close, Volume, VWAP]
 """
@@ -59,15 +75,23 @@ def _is_post_close_write(last_modified: datetime, run_date: str) -> bool:
     return last_modified >= close_et
 
 
+_VALID_SOURCES = ("auto", "yfinance_only", "polygon_only")
+_YFINANCE_MIN_COVERAGE = 0.95   # below this, yfinance_only mode hard-fails
+_POLYGON_MIN_COVERAGE = 0.95    # below this, polygon_only mode hard-fails
+_DISCREPANCY_WARN_PCT = 0.01    # |polygon_close - yfinance_close| / yfinance_close
+_DISCREPANCY_ERROR_PCT = 0.05
+
+
 def collect(
     bucket: str,
     tickers: list[str],
     run_date: str | None = None,
     s3_prefix: str = "predictor/daily_closes/",
     dry_run: bool = False,
+    source: str = "auto",
 ) -> dict:
     """
-    Fetch today's OHLCV for all tickers and write to S3.
+    Fetch OHLCV for all tickers and write to S3.
 
     Args:
         bucket: S3 bucket name
@@ -75,38 +99,79 @@ def collect(
         run_date: YYYY-MM-DD (defaults to today)
         s3_prefix: S3 key prefix for daily closes
         dry_run: if True, fetch but don't write to S3
+        source: ``yfinance_only`` (EOD pass — polygon skipped, no VWAP),
+                ``polygon_only`` (morning pass — polygon required, FRED for indices,
+                no yfinance fallback), or ``auto`` (legacy chain). See module
+                docstring for full rationale.
 
     Returns:
-        dict with status, tickers_captured, method breakdown
+        dict with status, tickers_captured, method breakdown.
+
+    Raises:
+        ValueError: invalid ``source``
+        PolygonForbiddenError: polygon 403 in ``polygon_only`` or ``auto`` mode
+        RuntimeError: per-mode coverage threshold breached
     """
+    if source not in _VALID_SOURCES:
+        raise ValueError(
+            f"Invalid source={source!r}. Must be one of {_VALID_SOURCES}."
+        )
+
     run_date = run_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     s3 = boto3.client("s3")
-
-    # Check if already written for this date. Only skip if the existing
-    # parquet was written AFTER the NYSE close for run_date — a pre-close
-    # write is a morning-side stale fetch (polygon returns T-1's aggregate
-    # stamped under today's key) and must not shadow the authoritative
-    # post-close collection. See 2026-04-20 incident / ROADMAP P0.
     key = f"{s3_prefix}{run_date}.parquet"
-    if not dry_run:
-        from botocore.exceptions import ClientError
-        try:
-            head = s3.head_object(Bucket=bucket, Key=key)
-        except ClientError as exc:
-            err_code = exc.response.get("Error", {}).get("Code")
-            if err_code not in ("404", "NoSuchKey"):
-                # Auth failure, throttling, or network — not "file doesn't exist".
-                # Don't silently paper over it.
-                raise
-            # 404/NoSuchKey: expected case — file doesn't exist, proceed to write.
-        else:
-            last_modified = head["LastModified"]
-            if _is_post_close_write(last_modified, run_date):
+
+    # Existing-parquet inspection — mode-aware. Runs in both dry_run and live
+    # mode so dry_run can surface "this would skip" / "this would overwrite
+    # with these discrepancies" before the user commits to a real write.
+    #
+    # Skip-on-exists short-circuit (yfinance_only + auto only) returns inside
+    # the live branch since dry_run by definition isn't going to write.
+    existing_close_for_discrepancy: dict[str, float] | None = None
+    from botocore.exceptions import ClientError
+    head = None
+    try:
+        head = s3.head_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        err_code = exc.response.get("Error", {}).get("Code")
+        if err_code not in ("404", "NoSuchKey"):
+            # Auth failure, throttling, or network — not "file doesn't exist".
+            # Don't silently paper over it.
+            raise
+        # 404/NoSuchKey: expected case — file doesn't exist, proceed to write.
+
+    if head is not None:
+        last_modified = head["LastModified"]
+        if source == "polygon_only":
+            # Read existing rows so we can log Close-discrepancy after the
+            # polygon overwrite. Failures here are non-fatal — discrepancy
+            # logging is observability, not a write blocker.
+            try:
+                obj = s3.get_object(Bucket=bucket, Key=key)
+                existing_df = pd.read_parquet(io.BytesIO(obj["Body"].read()), engine="pyarrow")
+                existing_close_for_discrepancy = {
+                    str(t): float(existing_df.loc[t, "Close"])
+                    for t in existing_df.index
+                    if pd.notna(existing_df.loc[t, "Close"])
+                }
                 logger.info(
-                    "Daily closes already exist for %s (post-close at %s) — skipping",
-                    run_date, last_modified.isoformat(),
+                    "polygon_only: found existing parquet (last_modified=%s, %d tickers) — "
+                    "will overwrite and log Close discrepancies",
+                    last_modified.isoformat(), len(existing_close_for_discrepancy),
                 )
-                return {"status": "ok", "tickers_captured": 0, "skipped": True}
+            except Exception as exc:
+                logger.warning(
+                    "polygon_only: failed to read existing parquet for discrepancy logging "
+                    "(%s) — proceeding with overwrite without discrepancy comparison",
+                    exc,
+                )
+        elif not dry_run and _is_post_close_write(last_modified, run_date):
+            logger.info(
+                "Daily closes already exist for %s (post-close at %s, source=%s) — skipping",
+                run_date, last_modified.isoformat(), source,
+            )
+            return {"status": "ok", "tickers_captured": 0, "skipped": True, "source": source}
+        elif not dry_run:
             logger.warning(
                 "Existing %s was written pre-close at %s — refusing to skip; "
                 "re-collecting authoritative post-close data",
@@ -115,40 +180,22 @@ def collect(
             # fall through to re-fetch + overwrite
 
     if not tickers:
-        return {"status": "error", "error": "no tickers provided"}
+        return {"status": "error", "error": "no tickers provided", "source": source}
 
     records: list[dict] = []
 
-    # ── Step 1: Try polygon.io grouped-daily (1 API call for all US stocks) ──
+    # ── Step 1: polygon.io grouped-daily ─────────────────────────────────────
+    # Skipped in yfinance_only mode (free tier returns 403 same-day; deferring
+    # to the morning polygon_only enrichment is the canonical path).
     polygon_count = 0
-    try:
-        from polygon_client import polygon_client
-        grouped = polygon_client().get_grouped_daily(run_date)
-        if grouped:
-            for ticker in tickers:
-                store_ticker = ticker.lstrip("^")
-                g = grouped.get(store_ticker)
-                if g:
-                    records.append({
-                        "ticker": store_ticker,
-                        "date": run_date,
-                        "Open": round(g["open"], 4),
-                        "High": round(g["high"], 4),
-                        "Low": round(g["low"], 4),
-                        "Close": round(g["close"], 4),
-                        "Adj_Close": round(g["close"], 4),
-                        "Volume": int(g["volume"]),
-                        "VWAP": round(g["vwap"], 4) if g.get("vwap") else None,
-                    })
-            polygon_count = len(records)
-            logger.info("Polygon grouped-daily: %d/%d tickers", polygon_count, len(tickers))
-    except Exception as e:
-        logger.warning("Polygon grouped-daily failed: %s — falling back to yfinance", e)
+    if source != "yfinance_only":
+        polygon_count = _fetch_polygon_closes(tickers, run_date, records, source=source)
 
-    # ── Step 2: FRED fallback for index tickers ──────────────────────────────
-    # VIX/VIX3M/TNX/IRX are not on polygon free tier. FRED has same-scale
-    # equivalents (VIXCLS/VXVCLS/DGS10/DTB3) that typically publish T-1 values
-    # by the time the daily pipeline runs at 6:05 AM PT.
+    # ── Step 2: FRED for the 4 indices polygon never serves ──────────────────
+    # VIX/VIX3M/TNX/IRX are not on polygon free tier (and won't be on paid either
+    # for the index symbols we use). FRED has same-scale equivalents
+    # (VIXCLS/VXVCLS/DGS10/DTB3) that publish T-1 values reliably. Runs in
+    # every mode — these tickers have no other source.
     captured_tickers = {r["ticker"] for r in records}
     fred_missing = [
         t for t in tickers
@@ -158,23 +205,53 @@ def collect(
     if fred_missing:
         fred_count = _fetch_fred_closes(fred_missing, run_date, records)
 
-    # ── Step 3: yfinance fallback for anything still missing ─────────────────
+    # ── Step 3: yfinance — only in auto + yfinance_only modes ────────────────
+    # polygon_only refuses yfinance fallback per feedback_no_silent_fails: a
+    # silent yfinance fill would hide polygon outages and re-introduce the
+    # 2026-04-17 → 2026-04-23 VWAP=None contamination.
     captured_tickers = {r["ticker"] for r in records}
     missing = [t for t in tickers if t.lstrip("^") not in captured_tickers]
     yfinance_count = 0
-
-    if missing:
+    if missing and source != "polygon_only":
         yfinance_count = _fetch_yfinance_closes(missing, run_date, records)
 
+    # ── Coverage gates — per-mode hard-fails ─────────────────────────────────
+    n_stock_tickers = sum(1 for t in tickers if t.lstrip("^") not in _FRED_INDEX_MAP)
+    n_stock_records = sum(
+        1 for r in records if r["ticker"] not in _FRED_INDEX_MAP
+    )
+    stock_coverage = (n_stock_records / n_stock_tickers) if n_stock_tickers else 1.0
+
+    if source == "yfinance_only" and stock_coverage < _YFINANCE_MIN_COVERAGE:
+        raise RuntimeError(
+            f"yfinance_only mode for {run_date}: stock coverage {stock_coverage:.1%} "
+            f"below {_YFINANCE_MIN_COVERAGE:.0%} threshold ({n_stock_records}/{n_stock_tickers}). "
+            f"yfinance batch download must be failing — investigate before letting "
+            f"the EOD pipeline write a sparse parquet that EOD reconcile + tomorrow's "
+            f"morning enrichment will both have to compensate for."
+        )
+    if source == "polygon_only" and stock_coverage < _POLYGON_MIN_COVERAGE:
+        raise RuntimeError(
+            f"polygon_only mode for {run_date}: stock coverage {stock_coverage:.1%} "
+            f"below {_POLYGON_MIN_COVERAGE:.0%} threshold ({n_stock_records}/{n_stock_tickers}). "
+            f"Polygon grouped-daily returned fewer tickers than expected — check "
+            f"polygon API status / quota / date validity. NOT falling back to yfinance "
+            f"by design (per feedback_no_silent_fails)."
+        )
+
     if not records:
-        logger.warning("No closes captured for %s", run_date)
-        return {"status": "error", "error": "no data fetched", "tickers_captured": 0}
+        logger.warning("No closes captured for %s (source=%s)", run_date, source)
+        return {"status": "error", "error": "no data fetched", "tickers_captured": 0, "source": source}
 
     closes_df = pd.DataFrame(records).set_index("ticker")
     logger.info(
-        "Daily closes: %d tickers for %s (polygon=%d, fred=%d, yfinance=%d)",
-        len(closes_df), run_date, polygon_count, fred_count, yfinance_count,
+        "Daily closes: %d tickers for %s source=%s (polygon=%d, fred=%d, yfinance=%d)",
+        len(closes_df), run_date, source, polygon_count, fred_count, yfinance_count,
     )
+
+    # Discrepancy logging (polygon_only mode, when overwriting an existing parquet)
+    if existing_close_for_discrepancy and polygon_count > 0:
+        _log_close_discrepancies(closes_df, existing_close_for_discrepancy, run_date)
 
     if dry_run:
         return {
@@ -183,9 +260,10 @@ def collect(
             "polygon": polygon_count,
             "fred": fred_count,
             "yfinance": yfinance_count,
+            "source": source,
         }
 
-    # ── Step 3: Write to S3 ──────────────────────────────────────────────────
+    # ── Step 4: Write to S3 ──────────────────────────────────────────────────
     try:
         buf = io.BytesIO()
         closes_df.to_parquet(buf, engine="pyarrow", compression="snappy", index=True)
@@ -196,17 +274,136 @@ def collect(
             Body=buf.getvalue(),
             ContentType="application/octet-stream",
         )
-        logger.info("Written to s3://%s/%s (%d tickers)", bucket, key, len(closes_df))
+        logger.info(
+            "Written to s3://%s/%s (%d tickers, source=%s)",
+            bucket, key, len(closes_df), source,
+        )
         return {
             "status": "ok",
             "tickers_captured": len(closes_df),
             "polygon": polygon_count,
             "fred": fred_count,
             "yfinance": yfinance_count,
+            "source": source,
         }
     except Exception as e:
         logger.error("Failed to write daily closes: %s", e)
-        return {"status": "error", "error": str(e), "tickers_captured": len(closes_df)}
+        return {
+            "status": "error",
+            "error": str(e),
+            "tickers_captured": len(closes_df),
+            "source": source,
+        }
+
+
+def _fetch_polygon_closes(
+    tickers: list[str],
+    run_date: str,
+    records: list[dict],
+    source: str,
+) -> int:
+    """Fetch OHLCV+VWAP from polygon grouped-daily.
+
+    In ``polygon_only`` mode, ``PolygonForbiddenError`` propagates — caller
+    must handle (no silent yfinance fallback).
+
+    In ``auto`` mode, polygon failures are caught and logged so the legacy
+    chain (FRED → yfinance) can fill the gap. Note: this is the historical
+    silent-fall-through behavior. New operational code paths should use
+    ``polygon_only`` or ``yfinance_only`` to make failure semantics explicit.
+    """
+    from polygon_client import polygon_client, PolygonForbiddenError
+
+    try:
+        grouped = polygon_client().get_grouped_daily(run_date)
+    except PolygonForbiddenError:
+        if source == "polygon_only":
+            raise
+        logger.warning(
+            "Polygon 403 in auto mode — falling back to FRED+yfinance "
+            "(this is the historical silent-fallback path; new pipelines "
+            "should use --source polygon_only to surface the failure)"
+        )
+        return 0
+    except Exception as e:
+        if source == "polygon_only":
+            raise
+        logger.warning("Polygon grouped-daily failed in auto mode: %s — falling back", e)
+        return 0
+
+    if not grouped:
+        if source == "polygon_only":
+            raise RuntimeError(
+                f"polygon grouped-daily returned 0 tickers for {run_date} — "
+                f"likely a non-trading day or polygon API outage. polygon_only "
+                f"mode refuses to fall through (see feedback_no_silent_fails)."
+            )
+        return 0
+
+    polygon_count = 0
+    for ticker in tickers:
+        store_ticker = ticker.lstrip("^")
+        g = grouped.get(store_ticker)
+        if g:
+            records.append({
+                "ticker": store_ticker,
+                "date": run_date,
+                "Open": round(g["open"], 4),
+                "High": round(g["high"], 4),
+                "Low": round(g["low"], 4),
+                "Close": round(g["close"], 4),
+                "Adj_Close": round(g["close"], 4),
+                "Volume": int(g["volume"]),
+                "VWAP": round(g["vwap"], 4) if g.get("vwap") else None,
+            })
+            polygon_count += 1
+    logger.info("Polygon grouped-daily: %d/%d tickers", polygon_count, len(tickers))
+    return polygon_count
+
+
+def _log_close_discrepancies(
+    new_df: pd.DataFrame,
+    prior_close: dict[str, float],
+    run_date: str,
+) -> None:
+    """Log per-ticker Close discrepancy when polygon overwrites yfinance.
+
+    A small drift (<1%) is normal — different feeds, slight tick-time offsets,
+    consolidated tape coverage variance. Larger drifts (>1% WARN, >5% ERROR)
+    typically indicate corporate-action timing differences or one-source data
+    quality issues worth a human eyeball.
+    """
+    n_compared = 0
+    n_warn = 0
+    n_error = 0
+    biggest: tuple[str, float] = ("", 0.0)
+    for ticker in new_df.index:
+        prior = prior_close.get(str(ticker))
+        new_close = new_df.loc[ticker, "Close"]
+        if prior is None or pd.isna(new_close) or prior == 0:
+            continue
+        n_compared += 1
+        pct_diff = abs(float(new_close) - prior) / prior
+        if pct_diff > _DISCREPANCY_ERROR_PCT:
+            logger.error(
+                "polygon_only OVERWRITE %s @ %s: Close %.4f → %.4f (%.2f%% diff vs prior parquet) — "
+                "investigate before downstream consumers re-read",
+                ticker, run_date, prior, float(new_close), pct_diff * 100,
+            )
+            n_error += 1
+        elif pct_diff > _DISCREPANCY_WARN_PCT:
+            logger.warning(
+                "polygon_only OVERWRITE %s @ %s: Close %.4f → %.4f (%.2f%% diff vs prior parquet)",
+                ticker, run_date, prior, float(new_close), pct_diff * 100,
+            )
+            n_warn += 1
+        if pct_diff > biggest[1]:
+            biggest = (str(ticker), pct_diff)
+    logger.info(
+        "polygon_only discrepancy summary for %s: compared=%d warn(>1%%)=%d error(>5%%)=%d "
+        "biggest=%s@%.2f%%",
+        run_date, n_compared, n_warn, n_error, biggest[0] or "n/a", biggest[1] * 100,
+    )
 
 
 def _fetch_fred_closes(
