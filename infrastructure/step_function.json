@@ -393,14 +393,14 @@
 
     "CheckSkipBacktester": {
       "Type": "Choice",
-      "Comment": "Skip-gate. {\"skip_backtester\": true} bypasses the backtester and jumps to Evaluator's skip-gate.",
+      "Comment": "Skip-gate. {\"skip_backtester\": true} bypasses the backtester step (which runs backtest + parity + evaluator as consolidated spot stages post-2026-04-24) and jumps directly to the Saturday health check. The legacy {\"skip_evaluator\": true} and {\"freeze_evaluator\": true} inputs are no longer honored; freeze-evaluator is now a spot CLI flag (--freeze-evaluator) invoked manually outside the SF.",
       "Choices": [
         {
           "And": [
             {"Variable": "$.skip_backtester", "IsPresent": true},
             {"Variable": "$.skip_backtester", "BooleanEquals": true}
           ],
-          "Next": "CheckSkipEvaluator"
+          "Next": "SaturdayHealthCheck"
         }
       ],
       "Default": "Backtester"
@@ -408,7 +408,7 @@
 
     "Backtester": {
       "Type": "Task",
-      "Comment": "Signal quality + param optimization on spot instance (after predictor training)",
+      "Comment": "Consolidated backtest + parity + evaluator on spot instance (after predictor training). Post-2026-04-24 spot_backtest.sh runs all three stages in sequence; the previous dedicated Evaluator SF state was retired. Evaluator runs in live-apply mode by default (no --freeze-evaluator flag passed); for diagnostic-only off-cycle runs, invoke spot_backtest.sh manually with --freeze-evaluator and --skip-stages=backtest,parity.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -480,7 +480,7 @@
         {
           "Variable": "$.backtester_poll.Status",
           "StringEquals": "Success",
-          "Next": "CheckSkipEvaluator"
+          "Next": "SaturdayHealthCheck"
         },
         {
           "Variable": "$.backtester_poll.Status",
@@ -500,186 +500,6 @@
       "Type": "Wait",
       "Seconds": 60,
       "Next": "WaitForBacktester"
-    },
-
-    "CheckSkipEvaluator": {
-      "Type": "Choice",
-      "Comment": "Skip-gate. {\"skip_evaluator\": true} bypasses the evaluator and jumps to the Saturday health check. SaturdayHealthCheck is always run.",
-      "Choices": [
-        {
-          "And": [
-            {"Variable": "$.skip_evaluator", "IsPresent": true},
-            {"Variable": "$.skip_evaluator", "BooleanEquals": true}
-          ],
-          "Next": "SaturdayHealthCheck"
-        }
-      ],
-      "Default": "CheckEvaluatorFreeze"
-    },
-
-    "CheckEvaluatorFreeze": {
-      "Type": "Choice",
-      "Comment": "Freeze-gate. {\"freeze_evaluator\": true} routes to EvaluatorFrozen (--freeze flag suppresses per-optimizer S3 config writes; report artifacts + email still upload). Use for off-cycle test runs so mid-week sweeps don't auto-promote weights/params/thresholds against Monday trading.",
-      "Choices": [
-        {
-          "And": [
-            {"Variable": "$.freeze_evaluator", "IsPresent": true},
-            {"Variable": "$.freeze_evaluator", "BooleanEquals": true}
-          ],
-          "Next": "EvaluatorFrozen"
-        }
-      ],
-      "Default": "Evaluator"
-    },
-
-    "EvaluatorFrozen": {
-      "Type": "Task",
-      "Comment": "Frozen evaluator — same runtime as Evaluator but with --freeze. Per-optimizer config writes (scoring_weights.json, executor_params.json, predictor_params.json, etc.) are skipped; apply_result reports 'frozen (--freeze flag)'. Report CSVs + markdown + email still upload via --upload.",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
-      "Parameters": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds.$": "$.ec2_instance_id",
-        "Parameters": {
-          "commands": [
-            "set -eo pipefail",
-            "export HOME=/home/ec2-user",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-backtester",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "source .venv/bin/activate",
-            "python evaluate.py --mode all --upload --freeze --log-level INFO 2>&1 | tee /var/log/evaluator.log"
-          ],
-          "executionTimeout": ["1800"]
-        },
-        "TimeoutSeconds": 1800
-      },
-      "TimeoutSeconds": 1860,
-      "Retry": [
-        {
-          "ErrorEquals": ["States.TaskFailed"],
-          "MaxAttempts": 1,
-          "IntervalSeconds": 30,
-          "BackoffRate": 1.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "Next": "HandleFailure",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultPath": "$.evaluator_result",
-      "Next": "WaitForEvaluator"
-    },
-
-    "Evaluator": {
-      "Type": "Task",
-      "Comment": "Signal quality, attribution, grading, config optimization. Runs on always-on EC2 (not spot) — reads simulation artifacts from S3. Split from Backtester step on 2026-04-12 so eval can run at a different cadence.",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
-      "Parameters": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds.$": "$.ec2_instance_id",
-        "Parameters": {
-          "commands": [
-            "set -eo pipefail",
-            "export HOME=/home/ec2-user",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-backtester",
-            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "source .venv/bin/activate",
-            "python evaluate.py --mode all --upload --log-level INFO 2>&1 | tee /var/log/evaluator.log"
-          ],
-          "executionTimeout": ["1800"]
-        },
-        "TimeoutSeconds": 1800
-      },
-      "TimeoutSeconds": 1860,
-      "Retry": [
-        {
-          "ErrorEquals": ["States.TaskFailed"],
-          "MaxAttempts": 1,
-          "IntervalSeconds": 30,
-          "BackoffRate": 1.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "Next": "HandleFailure",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultPath": "$.evaluator_result",
-      "Next": "WaitForEvaluator"
-    },
-
-    "WaitForEvaluator": {
-      "Type": "Task",
-      "Comment": "Poll SSM command until evaluator complete",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
-      "Parameters": {
-        "CommandId.$": "$.evaluator_result.Command.CommandId",
-        "InstanceId.$": "$.ec2_instance_id[0]"
-      },
-      "Retry": [
-        {
-          "ErrorEquals": ["Ssm.InvocationDoesNotExistException"],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 10,
-          "BackoffRate": 1.5
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "Next": "HandleFailure",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultPath": "$.evaluator_poll",
-      "Next": "CheckEvaluatorStatus"
-    },
-
-    "CheckEvaluatorStatus": {
-      "Type": "Choice",
-      "Choices": [
-        {
-          "Variable": "$.evaluator_poll.Status",
-          "StringEquals": "Success",
-          "Next": "SaturdayHealthCheck"
-        },
-        {
-          "Variable": "$.evaluator_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "EvaluatorWait"
-        },
-        {
-          "Variable": "$.evaluator_poll.Status",
-          "StringEquals": "Pending",
-          "Next": "EvaluatorWait"
-        }
-      ],
-      "Default": "ExtractEvaluatorError"
-    },
-
-    "EvaluatorWait": {
-      "Type": "Wait",
-      "Seconds": 15,
-      "Next": "WaitForEvaluator"
-    },
-
-    "ExtractEvaluatorError": {
-      "Type": "Pass",
-      "Comment": "Normalize Evaluator SSM non-Success poll into $.error.",
-      "Result": {},
-      "ResultPath": "$.error",
-      "Parameters": {
-        "phase": "Evaluator",
-        "source": "CheckEvaluatorStatus.Default",
-        "poll.$": "$.evaluator_poll"
-      },
-      "Next": "HandleFailure"
     },
 
     "SaturdayHealthCheck": {
