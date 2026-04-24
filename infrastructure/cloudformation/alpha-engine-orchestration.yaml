@@ -297,6 +297,42 @@ Resources:
       AlarmActions:
         - !Ref AlertsTopic
 
+  # Parity-test divergence alarm — pairs with the backtester spot stage's
+  # AlphaEngine.ParityTestFailure metric (emitted by infrastructure/spot_backtest.sh
+  # on every Saturday SF run; value=1 on parity failure, value=0 on pass).
+  #
+  # Parity is a diagnostic gate post-2026-04-24 soft-fail consolidation:
+  # the backtester ↔ executor replay diff is reported but does NOT block the
+  # downstream evaluator stage. This alarm gives parity its own alerting
+  # channel so divergence is visible without conflating with real pipeline
+  # failures (which still fire alpha-engine-saturday-sf-failed).
+  #
+  # Investigation entry point on alarm: review
+  #   s3://alpha-engine-research/backtest/{run_date}/parity_report.json
+  # for trade_count / ticker_set / field-level violations. Common causes:
+  # date-tagging drift (DATE_CONVENTIONS migration not yet complete),
+  # universe-drop tickers in historical signals, score-data scrubbing.
+  ParityTestFailure:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: alpha-engine-parity-test-failure
+      AlarmDescription: |
+        Backtester ↔ executor parity replay detected divergence. Diagnostic
+        only (does not block pipeline). Review parity_report.json in S3.
+      Namespace: AlphaEngine
+      MetricName: ParityTestFailure
+      Dimensions:
+        - Name: Process
+          Value: backtester
+      Statistic: Maximum
+      Period: 3600  # 1 hour — matches UnscoredBuyCandidatesGap pattern
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching  # weekly cadence — off-cycle hours are expected
+      AlarmActions:
+        - !Ref AlertsTopic
+
   # Heartbeat alarms for EC2-based processes
   ExecutorMorningHeartbeat:
     Type: AWS::CloudWatch::Alarm
