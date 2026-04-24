@@ -39,6 +39,17 @@ class PolygonRateLimitError(Exception):
     """Raised when rate limit is exhausted and caller should backoff."""
 
 
+class PolygonForbiddenError(Exception):
+    """Raised when polygon returns 403 (free-tier "before end of day", missing/invalid key, etc.).
+
+    Previously `_get` swallowed 403's and returned an empty `{"results": []}` dict,
+    which caused `collectors/daily_closes.py` to silently fall through to yfinance —
+    masking the real failure (free tier can't access today's data) and silently
+    writing VWAP=None for every stock. Per `feedback_no_silent_fails`, callers
+    must see the failure and decide whether to abort or escalate.
+    """
+
+
 class PolygonClient:
     """Rate-limited polygon.io REST client with dividend adjustment."""
 
@@ -89,10 +100,20 @@ class PolygonClient:
                 self._call_times.clear()  # Reset window after forced wait
                 continue
             if resp.status_code == 403:
-                data = resp.json()
-                msg = data.get("message", "Not authorized")
-                logger.warning("Polygon 403: %s (path=%s)", msg, path)
-                return {"results": [], "resultsCount": 0, "status": "FORBIDDEN"}
+                # Free tier returns 403 for same-day grouped-daily ("before end
+                # of day"). Raise so callers can decide whether to abort the
+                # whole pipeline or fall back to a different source — never
+                # silently return an empty result set (the prior behavior
+                # masked the 2026-04-17 → 2026-04-23 VWAP outage by letting
+                # daily_closes.collect fall through to yfinance, which writes
+                # VWAP=None).
+                try:
+                    msg = resp.json().get("message", "Not authorized")
+                except (ValueError, KeyError):
+                    msg = resp.text[:200] or "Not authorized"
+                raise PolygonForbiddenError(
+                    f"Polygon 403 on {path}: {msg}"
+                )
             resp.raise_for_status()
             return resp.json()
         raise PolygonRateLimitError("Rate limited after 3 retries")
