@@ -22,22 +22,40 @@ def _source() -> str:
 
 
 def test_universe_lib_uses_update_not_append():
+    """Per-ticker write must go through _write_row_backfill_safe, which
+    uses lib.update() for the append case (steady-state daily pass) and
+    lib.write() for the backfill case (historical row in middle of series).
+    Direct lib.append() must never appear — it accumulates duplicate
+    same-date rows and caused the 2026-04-15 retrain outage.
+    """
     src = _source()
-    assert "universe_lib.update(ticker, today_row)" in src, (
-        "daily_append must call universe_lib.update() — append() accumulates "
-        "duplicate same-date rows and caused the 2026-04-15 retrain outage."
+    assert "_write_row_backfill_safe(\n                universe_lib, ticker, today_row" in src or \
+           "_write_row_backfill_safe(universe_lib, ticker, today_row" in src, (
+        "Per-ticker write must call _write_row_backfill_safe(universe_lib, ticker, today_row, ...) "
+        "— the helper picks update() for append + write() for backfill. "
+        "Calling universe_lib.update() directly skips the backfill-safe path "
+        "and breaks historical rewrites with 'index must be monotonic' "
+        "(see 2026-04-24 polygon VWAP repair)."
     )
-    assert "universe_lib.append(ticker, today_row)" not in src, (
+    # Inside the helper, the append branch must use update() (not append()).
+    assert "lib.update(symbol, new_row)" in src, (
+        "_write_row_backfill_safe must call lib.update() in the append "
+        "branch — append() accumulates duplicate same-date rows "
+        "(2026-04-15 retrain outage)."
+    )
+    assert "universe_lib.append(" not in src, (
         "Found universe_lib.append() — this is the duplicate-row bug. "
-        "Use update() instead."
+        "Use _write_row_backfill_safe() (which routes to update() for append)."
     )
 
 
 def test_macro_lib_uses_update_not_append():
+    """Macro + sector ETF writes must also route through
+    _write_row_backfill_safe so historical macro backfills work."""
     src = _source()
-    # Both key-path and sym-path (sector ETFs) must use update.
-    assert "macro_lib.update(key, new_row)" in src
-    assert "macro_lib.update(sym, new_row)" in src
+    # Both key-path and sym-path (sector ETFs) must use the helper.
+    assert "_write_row_backfill_safe(macro_lib, key, new_row)" in src
+    assert "_write_row_backfill_safe(macro_lib, sym, new_row)" in src
     assert "macro_lib.append(key," not in src
     assert "macro_lib.append(sym," not in src
 
@@ -145,28 +163,34 @@ def test_partial_features_are_loudly_logged():
 
 
 def test_counters_increment_after_successful_write():
-    """n_ok and n_partial must be incremented AFTER universe_lib.update()
+    """n_ok and n_partial must be incremented AFTER the per-ticker write
     so an exception rolls the iteration back cleanly into n_err.
 
     Locks the 2026-04-21 rewrite where counters were hoisted post-write
-    to prevent double-counting when update() throws.
+    to prevent double-counting when the write throws.
     """
     src = _source()
-    # The update() call site + increments must appear in that order.
-    # Find the update call for universe_lib.update(ticker, today_row) —
-    # the committed increment happens on the same side.
+    # The write call site + increments must appear in that order.
+    # Find the _write_row_backfill_safe(universe_lib, ticker, today_row) call.
     lines = src.splitlines()
-    update_idx = None
+    write_idx = None
     for i, line in enumerate(lines):
-        if "universe_lib.update(ticker, today_row)" in line:
-            update_idx = i
+        if "_write_row_backfill_safe(" in line and "universe_lib" in line:
+            write_idx = i
             break
-    assert update_idx is not None, (
-        "universe_lib.update(ticker, today_row) call site not found"
+        # Multi-line call form: line ends with `_write_row_backfill_safe(`
+        if line.rstrip().endswith("_write_row_backfill_safe("):
+            # Look ahead a few lines for `universe_lib`
+            ahead = "\n".join(lines[i:i+5])
+            if "universe_lib, ticker, today_row" in ahead:
+                write_idx = i
+                break
+    assert write_idx is not None, (
+        "_write_row_backfill_safe(universe_lib, ticker, today_row, ...) call site not found"
     )
-    window_after = "\n".join(lines[update_idx:update_idx + 20])
+    window_after = "\n".join(lines[write_idx:write_idx + 25])
     assert "n_partial += 1" in window_after and "n_ok += 1" in window_after, (
-        "n_ok / n_partial must be incremented AFTER the update() call, "
+        "n_ok / n_partial must be incremented AFTER the write call, "
         "not before. Increments before write cause miscount on exception."
     )
 

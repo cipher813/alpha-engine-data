@@ -49,6 +49,54 @@ OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume", "VWAP"]
 PRICE_CACHE_PREFIX = "predictor/price_cache/"
 
 
+def _write_row_backfill_safe(
+    lib,
+    symbol: str,
+    new_row: pd.DataFrame,
+    existing_series: pd.DataFrame | None = None,
+) -> str:
+    """Write a single-date row to ArcticDB, handling both append and backfill cases.
+
+    Returns the mode used: ``"append"`` (target_date > all existing dates,
+    used update() — fast) or ``"backfill"`` (target_date is in the middle
+    of an existing series, used read+splice+write() — necessary because
+    update() requires monotonic insertion at the head).
+
+    The backfill path is ~10-100x slower per ticker (full series read +
+    full rewrite vs. single-row update) but fires only for rare backfill
+    operations like the 2026-04-24 historical VWAP repair after the
+    polygon outage.
+    """
+    target_ts = new_row.index[0]
+
+    # If caller already has the existing series (the per-ticker loop in
+    # daily_append already reads `hist` for feature warmup), reuse it
+    # instead of double-reading.
+    if existing_series is None:
+        try:
+            existing_series = lib.read(symbol).data
+        except Exception:
+            # Symbol doesn't exist yet — first write is always an append.
+            lib.write(symbol, new_row, prune_previous_versions=True)
+            return "append"
+
+    if existing_series.empty or target_ts > existing_series.index.max():
+        # Append at head — fast path. update() is idempotent for same-date
+        # rows (replaces in place rather than appending duplicates).
+        lib.update(symbol, new_row)
+        return "append"
+
+    # Backfill — splice new_row into existing series, write back full
+    # series. Required because ArcticDB's update() refuses non-monotonic
+    # insertion ("index must be monotonic increasing or decreasing").
+    # Same-date rows are deduped with keep="last" so the new row wins
+    # over any existing row at target_ts (matches update() semantics).
+    combined = pd.concat([existing_series, new_row])
+    combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+    lib.write(symbol, combined, prune_previous_versions=True)
+    return "backfill"
+
+
 def _load_parquet_warmup(s3, bucket: str, ticker: str) -> pd.DataFrame | None:
     """Load a ticker's 10y price-cache parquet for feature warmup.
 
@@ -395,13 +443,18 @@ def daily_append(
 
             today_row.index.name = "date"
 
-            # Use update() rather than append() so a re-run on the same
-            # date overwrites instead of accumulating duplicate rows.
-            # 2026-04-15: diagnosed as root cause of the predictor training
-            # failure where 904/909 tickers had duplicate date rows when
-            # read back from ArcticDB. update() is idempotent — same-date
-            # rows replace instead of append, regardless of race conditions.
-            universe_lib.update(ticker, today_row)
+            # Backfill-safe write — picks update() when target_date is at
+            # the head of the series (the steady-state daily pass), and
+            # falls back to read+splice+write() when target_date is in
+            # the middle (historical backfill). The 2026-04-24 polygon
+            # VWAP repair surfaced the need: ArcticDB's update() raises
+            # "index must be monotonic increasing or decreasing" when
+            # asked to insert behind the latest stored date.
+            # `hist` is already in scope from the per-ticker warmup read
+            # above, so the helper reuses it instead of double-reading.
+            _write_row_backfill_safe(
+                universe_lib, ticker, today_row, existing_series=hist
+            )
 
             # Increment coverage counter + emit the partial-features log
             # only after the write landed.
@@ -438,6 +491,12 @@ def daily_append(
     macro_updated: list[str] = []
     sector_updated: list[str] = []
 
+    # Track per-symbol write mode (append vs backfill) so the verification
+    # check below can apply the right correctness assertion. Append: last
+    # readback row should equal target_ts. Backfill: target_ts should be
+    # in the readback index (could be anywhere in the middle).
+    macro_write_modes: dict[str, str] = {}
+
     if not dry_run:
         for key in macro_keys:
             bar = closes.get(key)
@@ -450,8 +509,9 @@ def daily_append(
                     index=pd.DatetimeIndex([today_ts]),
                 )
                 new_row.index.name = "date"
-                macro_lib.update(key, new_row)
+                mode = _write_row_backfill_safe(macro_lib, key, new_row)
                 macro_updated.append(key)
+                macro_write_modes[key] = mode
             except Exception as exc:
                 raise RuntimeError(
                     f"Failed to update macro {key} bar for {date_str}: {exc}"
@@ -473,8 +533,9 @@ def daily_append(
                     index=pd.DatetimeIndex([today_ts]),
                 )
                 new_row.index.name = "date"
-                macro_lib.update(sym, new_row)
+                mode = _write_row_backfill_safe(macro_lib, sym, new_row)
                 sector_updated.append(sym)
+                macro_write_modes[sym] = mode
             except Exception as exc:
                 raise RuntimeError(
                     f"Failed to update sector ETF {sym} bar for {date_str}: {exc}"
@@ -495,12 +556,17 @@ def daily_append(
                 f"before claiming pipeline success."
             )
 
-        # Verify writes landed. The update() call above is fire-and-forget
-        # (no return value surfaces a success flag), so we read back the
-        # latest row for each key we claimed to update. If the readback
-        # doesn't show today's date, something between update() and commit
-        # silently dropped the write — the 2026-04-15 failure mode where
-        # Step Function reported SUCCEEDED and macro stayed 5 days stale.
+        # Verify writes landed. The update() / write() calls above are
+        # fire-and-forget (no return value surfaces a success flag), so
+        # we read back each key and assert target_ts is present. The
+        # check is mode-aware:
+        #   - append mode: last readback row should equal target_ts
+        #     (catches the 2026-04-15 silent-stale failure where SSM
+        #     reported SUCCEEDED but macro/SPY stayed 5 days behind)
+        #   - backfill mode: target_ts should be IN the readback index,
+        #     anywhere (last date is naturally future relative to
+        #     target_ts when we backfill an old date)
+        target_ts_norm = today_ts.normalize()
         verification_failures: list[tuple[str, str]] = []
         for key in macro_updated + sector_updated:
             try:
@@ -511,16 +577,26 @@ def daily_append(
             if readback.empty:
                 verification_failures.append((key, "readback empty"))
                 continue
-            last_ts = pd.Timestamp(readback.index[-1]).normalize()
-            if last_ts != today_ts.normalize():
-                verification_failures.append(
-                    (key, f"last date {last_ts.date()} != expected {today_ts.date()}")
-                )
+            mode = macro_write_modes.get(key, "append")
+            if mode == "backfill":
+                # Target date should be present somewhere in the series.
+                index_norm = pd.DatetimeIndex(readback.index).normalize()
+                if target_ts_norm not in index_norm:
+                    verification_failures.append(
+                        (key, f"backfill target {target_ts_norm.date()} not in readback index "
+                              f"(last={pd.Timestamp(readback.index[-1]).date()})")
+                    )
+            else:
+                last_ts = pd.Timestamp(readback.index[-1]).normalize()
+                if last_ts != target_ts_norm:
+                    verification_failures.append(
+                        (key, f"last date {last_ts.date()} != expected {target_ts_norm.date()}")
+                    )
         if verification_failures:
             raise RuntimeError(
                 f"Macro update verification failed for {date_str}: "
-                f"{verification_failures}. update() calls completed without "
-                f"exception but readback shows stale data. Investigate "
+                f"{verification_failures}. update()/write() calls completed without "
+                f"exception but readback shows the row is missing. Investigate "
                 f"ArcticDB commit / consistency semantics."
             )
 
