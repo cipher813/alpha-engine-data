@@ -254,11 +254,7 @@ _fmp_daily_count = 0
 _FMP_DAILY_LIMIT = 250
 _FMP_MIN_INTERVAL = 1.0
 
-_FINNHUB_BASE = "https://finnhub.io/api/v1"
-_finnhub_lock = threading.Lock()
-_finnhub_last_call = 0.0
-# Finnhub free tier: 60 req/min — give ourselves a small margin.
-_FINNHUB_MIN_INTERVAL = 1.1
+# Finnhub state moved to collectors/finnhub_client.py (2026-04-24).
 
 
 def _fmp_get(endpoint: str, params: dict | None = None) -> dict | list:
@@ -299,31 +295,10 @@ def _fmp_get(endpoint: str, params: dict | None = None) -> dict | list:
     return resp.json()
 
 
-def _finnhub_get(endpoint: str, params: dict | None = None) -> dict | list:
-    """Rate-limited Finnhub API call. Returns ``[]`` on missing key."""
-    global _finnhub_last_call
-    api_key = os.environ.get("FINNHUB_API_KEY", "")
-    if not api_key:
-        return []
-
-    url = f"{_FINNHUB_BASE}/{endpoint}"
-    p = {"token": api_key}
-    if params:
-        p.update(params)
-
-    with _finnhub_lock:
-        now = time.monotonic()
-        wait = _FINNHUB_MIN_INTERVAL - (now - _finnhub_last_call)
-        if wait > 0:
-            time.sleep(wait)
-        _finnhub_last_call = time.monotonic()
-
-    resp = requests.get(url, params=p, timeout=10)
-    if resp.status_code == 429:
-        logger.warning("Finnhub 429 rate-limited on %s", endpoint)
-        return []
-    resp.raise_for_status()
-    return resp.json()
+# Finnhub HTTP client extracted to collectors.finnhub_client (2026-04-24)
+# so fundamentals.py can share the same rate-limited state. Local alias
+# preserves call-site readability without duplicating throttle logic.
+from .finnhub_client import finnhub_get as _finnhub_get  # noqa: E402
 
 
 # ---- 1. Analyst consensus ----

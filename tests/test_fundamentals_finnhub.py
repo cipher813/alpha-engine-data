@@ -1,0 +1,255 @@
+"""Tests for collectors/fundamentals.py — Finnhub /stock/metric migration.
+
+Covers:
+  * Field mapping from Finnhub schema to the existing 8-field output.
+  * TTM-preferred / annual-fallback logic per field.
+  * FCF yield computation from raw FCF + market cap.
+  * NEUTRAL fallback for missing tickers + malformed payloads.
+  * NEUTRAL fallback when both required FCF inputs are missing.
+  * ok_ratio hard-fail gate (silent-zeros guard).
+  * S3 write only on dry_run=False.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from collectors import fundamentals
+from collectors.fundamentals import (
+    NEUTRAL,
+    _clip,
+    _fetch_single_ticker,
+    _pick,
+    _safe_float,
+)
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+
+def _aapl_payload(**overrides):
+    """A representative Finnhub /stock/metric response for AAPL."""
+    metric = {
+        "peTTM": 28.5,
+        "peExclExtraTTM": 27.9,
+        "pbAnnual": 35.2,
+        "pbQuarterly": 36.1,
+        "totalDebt/totalEquityAnnual": 1.95,
+        "totalDebt/totalEquityQuarterly": 2.01,
+        "revenueGrowthTTMYoy": 0.025,  # 2.5%
+        "revenueGrowthQuarterlyYoy": 0.018,
+        "freeCashFlowTTM": 100_000_000_000.0,  # $100B
+        "marketCapitalization": 3_000_000_000_000.0,  # $3T → 3.33% yield
+        "grossMarginTTM": 0.42,
+        "grossMarginAnnual": 0.41,
+        "roeTTM": 0.62,  # 62% — extreme but exists
+        "roeRfy": 0.61,
+        "currentRatioAnnual": 0.93,
+        "currentRatioQuarterly": 0.95,
+    }
+    metric.update(overrides)
+    return {"metric": metric, "metricType": "all", "symbol": "AAPL"}
+
+
+# ── _safe_float, _clip, _pick ───────────────────────────────────────────────
+
+
+class TestSafeFloat:
+    def test_none_returns_default(self):
+        assert _safe_float(None) == 0.0
+        assert _safe_float(None, default=1.0) == 1.0
+
+    def test_string_number_parses(self):
+        assert _safe_float("3.14") == 3.14
+
+    def test_invalid_returns_default(self):
+        assert _safe_float("nope") == 0.0
+        assert _safe_float("nope", default=-1.0) == -1.0
+
+
+class TestClip:
+    def test_clip_high(self):
+        assert _clip(5.0, -1.0, 1.0) == 1.0
+
+    def test_clip_low(self):
+        assert _clip(-5.0, -1.0, 1.0) == -1.0
+
+    def test_clip_inside(self):
+        assert _clip(0.5, -1.0, 1.0) == 0.5
+
+
+class TestPick:
+    def test_first_present_wins(self):
+        assert _pick({"a": 1.0, "b": 2.0}, "a", "b") == 1.0
+
+    def test_falls_through_to_next(self):
+        assert _pick({"b": 2.0}, "a", "b") == 2.0
+
+    def test_skips_none_values(self):
+        assert _pick({"a": None, "b": 2.0}, "a", "b") == 2.0
+
+    def test_returns_default_when_all_missing(self):
+        assert _pick({}, "a", "b", default=99.0) == 99.0
+
+
+# ── _fetch_single_ticker — field mapping ────────────────────────────────────
+
+
+class TestFetchSingleTicker:
+    def test_full_payload_maps_all_fields(self):
+        with patch.object(fundamentals, "finnhub_get", return_value=_aapl_payload()):
+            data = _fetch_single_ticker("AAPL")
+        # Each field is non-zero / non-NEUTRAL.
+        assert data["pe_ratio"] != 0.0
+        assert data["pb_ratio"] != 0.0
+        assert data["debt_to_equity"] != 0.0
+        assert data["revenue_growth_yoy"] != 0.0
+        assert data["fcf_yield"] != 0.0
+        assert data["gross_margin"] != 0.0
+        assert data["roe"] != 0.0
+        assert data["current_ratio"] != 0.0
+
+    def test_pe_uses_ttm_preferred(self):
+        with patch.object(fundamentals, "finnhub_get", return_value=_aapl_payload(peTTM=30.0, peExclExtraTTM=999.0)):
+            data = _fetch_single_ticker("AAPL")
+        # 30.0 / 30 = 1.0
+        assert data["pe_ratio"] == pytest.approx(1.0)
+
+    def test_pe_falls_back_to_excl_extra(self):
+        payload = _aapl_payload()
+        payload["metric"]["peTTM"] = None
+        payload["metric"]["peExclExtraTTM"] = 30.0
+        with patch.object(fundamentals, "finnhub_get", return_value=payload):
+            data = _fetch_single_ticker("AAPL")
+        assert data["pe_ratio"] == pytest.approx(1.0)
+
+    def test_debt_equity_handles_slashed_keyname(self):
+        # Finnhub uses literal slash in the field name. Verify _pick handles it.
+        payload = _aapl_payload()
+        payload["metric"]["totalDebt/totalEquityAnnual"] = 4.0
+        with patch.object(fundamentals, "finnhub_get", return_value=payload):
+            data = _fetch_single_ticker("AAPL")
+        # 4.0 / 2 = 2.0
+        assert data["debt_to_equity"] == pytest.approx(2.0)
+
+    def test_fcf_yield_computed_from_raw(self):
+        payload = _aapl_payload(freeCashFlowTTM=10.0, marketCapitalization=200.0)
+        with patch.object(fundamentals, "finnhub_get", return_value=payload):
+            data = _fetch_single_ticker("AAPL")
+        # 10/200 = 0.05
+        assert data["fcf_yield"] == pytest.approx(0.05)
+
+    def test_fcf_yield_neutral_when_market_cap_zero(self):
+        payload = _aapl_payload(freeCashFlowTTM=10.0, marketCapitalization=0.0)
+        with patch.object(fundamentals, "finnhub_get", return_value=payload):
+            data = _fetch_single_ticker("AAPL")
+        assert data["fcf_yield"] == 0.0
+
+    def test_fcf_yield_neutral_when_fcf_missing(self):
+        payload = _aapl_payload()
+        payload["metric"]["freeCashFlowTTM"] = None
+        payload["metric"]["freeCashFlowAnnual"] = None
+        with patch.object(fundamentals, "finnhub_get", return_value=payload):
+            data = _fetch_single_ticker("AAPL")
+        assert data["fcf_yield"] == 0.0
+
+    def test_clipping_extremes(self):
+        # Insanely high P/E should clip to 3.0 (pe_raw / 30 capped at 3)
+        payload = _aapl_payload(peTTM=10000.0)
+        with patch.object(fundamentals, "finnhub_get", return_value=payload):
+            data = _fetch_single_ticker("AAPL")
+        assert data["pe_ratio"] == 3.0
+
+    def test_empty_payload_returns_neutral(self):
+        with patch.object(fundamentals, "finnhub_get", return_value={}):
+            data = _fetch_single_ticker("UNKNOWN")
+        assert data == NEUTRAL
+
+    def test_payload_with_empty_metric_returns_neutral(self):
+        with patch.object(fundamentals, "finnhub_get", return_value={"metric": {}}):
+            data = _fetch_single_ticker("UNKNOWN")
+        assert data == NEUTRAL
+
+    def test_payload_with_null_metric_returns_neutral(self):
+        with patch.object(fundamentals, "finnhub_get", return_value={"metric": None}):
+            data = _fetch_single_ticker("UNKNOWN")
+        assert data == NEUTRAL
+
+    def test_list_response_returns_neutral(self):
+        # Finnhub typically returns dict; defensive: list response = malformed.
+        with patch.object(fundamentals, "finnhub_get", return_value=[]):
+            data = _fetch_single_ticker("UNKNOWN")
+        assert data == NEUTRAL
+
+
+# ── collect() — full collection flow ────────────────────────────────────────
+
+
+class TestCollect:
+    def test_dry_run_does_not_write_to_s3(self, monkeypatch):
+        monkeypatch.setenv("FINNHUB_API_KEY", "test-key")
+        with patch.object(fundamentals, "_fetch_single_ticker", return_value={"pe_ratio": 1.0, **{k: NEUTRAL[k] for k in NEUTRAL if k != "pe_ratio"}}):
+            with patch("boto3.client") as mock_boto:
+                result = fundamentals.collect(
+                    bucket="test", tickers=["AAPL", "MSFT"], run_date="2026-04-25", dry_run=True,
+                )
+        assert result["status"] == "ok"
+        assert result.get("dry_run") is True
+        mock_boto.assert_not_called()
+
+    def test_missing_api_key_returns_error(self, monkeypatch):
+        monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+        result = fundamentals.collect(
+            bucket="test", tickers=["AAPL"], run_date="2026-04-25", dry_run=True,
+        )
+        assert result["status"] == "error"
+        assert "FINNHUB_API_KEY" in result["error"]
+
+    def test_low_ok_ratio_hard_fails(self, monkeypatch):
+        """Most tickers returning NEUTRAL → status=error (silent-zeros guard)."""
+        monkeypatch.setenv("FINNHUB_API_KEY", "test-key")
+        # Only 1 of 10 returns real data → 10% < 90% threshold
+        side_effect = [{"pe_ratio": 1.0, **{k: NEUTRAL[k] for k in NEUTRAL if k != "pe_ratio"}}] + [NEUTRAL.copy() for _ in range(9)]
+        with patch.object(fundamentals, "_fetch_single_ticker", side_effect=side_effect):
+            result = fundamentals.collect(
+                bucket="test", tickers=[f"T{i}" for i in range(10)],
+                run_date="2026-04-25", dry_run=True,
+            )
+        assert result["status"] == "error"
+        assert "below" in result["error"].lower() or "threshold" in result["error"].lower()
+
+    def test_high_ok_ratio_passes(self, monkeypatch):
+        monkeypatch.setenv("FINNHUB_API_KEY", "test-key")
+        # 10 of 10 return real data
+        with patch.object(
+            fundamentals, "_fetch_single_ticker",
+            return_value={"pe_ratio": 1.0, **{k: NEUTRAL[k] for k in NEUTRAL if k != "pe_ratio"}}
+        ):
+            result = fundamentals.collect(
+                bucket="test", tickers=[f"T{i}" for i in range(10)],
+                run_date="2026-04-25", dry_run=True,
+            )
+        assert result["status"] == "ok"
+        assert result["n_ok"] == 10
+
+    def test_per_ticker_exception_falls_through_to_neutral(self, monkeypatch):
+        """A single ticker raising shouldn't kill the whole collection — log + NEUTRAL."""
+        monkeypatch.setenv("FINNHUB_API_KEY", "test-key")
+        # 9 OK + 1 raises = 90% ok ratio (right at threshold; should still pass)
+        good = {"pe_ratio": 1.0, **{k: NEUTRAL[k] for k in NEUTRAL if k != "pe_ratio"}}
+        side_effect = [good] * 9 + [Exception("network blip")]
+        with patch.object(fundamentals, "_fetch_single_ticker", side_effect=side_effect):
+            result = fundamentals.collect(
+                bucket="test", tickers=[f"T{i}" for i in range(10)],
+                run_date="2026-04-25", dry_run=True,
+            )
+        # 90% ok ratio passes the 90% threshold (>= test in collect.py)
+        assert result["status"] == "ok"
+        assert result["n_ok"] == 9
+        assert result["n_errors"] == 1
