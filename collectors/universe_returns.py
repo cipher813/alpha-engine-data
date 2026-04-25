@@ -224,7 +224,7 @@ def _trading_days_to_process(
         if nyse_is_trading_day(d):
             trading_days_seen += 1
             iso = d.isoformat()
-            fwd_5d = _add_business_days(d, 5)
+            fwd_5d = _add_trading_days(d, 5)
             if fwd_5d < today and iso not in existing:
                 out.append(iso)
         d -= timedelta(days=1)
@@ -328,9 +328,9 @@ def _build_rows_for_date(
 ) -> list[dict]:
     """Build universe_returns rows for a single eval_date."""
     eval_dt = date.fromisoformat(eval_date)
-    fwd_5d = _add_business_days(eval_dt, 5)
-    fwd_10d = _add_business_days(eval_dt, 10)
-    fwd_30d = _add_business_days(eval_dt, 30)
+    fwd_5d = _add_trading_days(eval_dt, 5)
+    fwd_10d = _add_trading_days(eval_dt, 10)
+    fwd_30d = _add_trading_days(eval_dt, 30)
 
     # Check that forward dates are in the past (returns can be computed)
     today = date.today()
@@ -350,7 +350,7 @@ def _build_rows_for_date(
     if not prices_t0:
         logger.warning("No prices for eval_date %s — may be a non-trading day", eval_date)
         # Try next business day
-        next_day = _add_business_days(eval_dt, 1)
+        next_day = _add_trading_days(eval_dt, 1)
         prices_t0 = polygon_client.get_grouped_daily(str(next_day))
         if not prices_t0:
             return []
@@ -426,12 +426,19 @@ def _pct_return(price_start: float | None, price_end: float | None) -> float | N
     return (price_end / price_start) - 1.0
 
 
-def _add_business_days(start: date, n: int) -> date:
-    """Add n business days to a date (skipping weekends)."""
+def _add_trading_days(start: date, n: int) -> date:
+    """Add n NYSE trading days to a date (skipping weekends + NYSE holidays).
+
+    Calendar-business-day arithmetic (Mon-Fri only, no holiday awareness)
+    silently mis-labels forward returns when the window crosses a holiday —
+    e.g. eval_date=2026-04-02 with `_add_business_days(.,5)` returned 2026-04-09
+    (counting Good Friday 2026-04-03 as a BD), so `return_5d` would actually
+    be a 4-trading-day return. Use NYSE-calendar-aware arithmetic so the
+    column label matches the column meaning.
+    """
+    from alpha_engine_lib.trading_calendar import next_trading_day
+
     current = start
-    added = 0
-    while added < n:
-        current += timedelta(days=1)
-        if current.weekday() < 5:  # Mon-Fri
-            added += 1
+    for _ in range(n):
+        current = next_trading_day(current)
     return current
