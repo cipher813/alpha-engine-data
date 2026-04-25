@@ -23,6 +23,7 @@ from pathlib import Path
 
 import boto3
 import pandas as pd
+from alpha_engine_lib.trading_calendar import add_trading_days as _add_trading_days
 
 logger = logging.getLogger(__name__)
 
@@ -424,21 +425,3 @@ def _pct_return(price_start: float | None, price_end: float | None) -> float | N
     if price_start is None or price_end is None or price_start <= 0:
         return None
     return (price_end / price_start) - 1.0
-
-
-def _add_trading_days(start: date, n: int) -> date:
-    """Add n NYSE trading days to a date (skipping weekends + NYSE holidays).
-
-    Calendar-business-day arithmetic (Mon-Fri only, no holiday awareness)
-    silently mis-labels forward returns when the window crosses a holiday —
-    e.g. eval_date=2026-04-02 with `_add_business_days(.,5)` returned 2026-04-09
-    (counting Good Friday 2026-04-03 as a BD), so `return_5d` would actually
-    be a 4-trading-day return. Use NYSE-calendar-aware arithmetic so the
-    column label matches the column meaning.
-    """
-    from alpha_engine_lib.trading_calendar import next_trading_day
-
-    current = start
-    for _ in range(n):
-        current = next_trading_day(current)
-    return current
