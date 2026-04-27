@@ -162,7 +162,7 @@
 
     "MorningEnrich": {
       "Type": "Task",
-      "Comment": "Polygon morning enrichment — overwrites the prior trading day's daily_closes parquet + ArcticDB row with polygon's authoritative OHLCV+VWAP. Hard-fails on PolygonForbiddenError (no yfinance fallback masks polygon outages). Predictor inference reads ArcticDB right after this step and must see polygon-corrected data, so failure → HandleFailure (do NOT proceed to PredictorInference with stale yfinance values). See alpha-engine-data/collectors/daily_closes.py for source-mode contract.",
+      "Comment": "Polygon morning enrichment — overwrites the prior trading day's daily_closes parquet + ArcticDB row with polygon's authoritative OHLCV+VWAP. Hard-fails on PolygonForbiddenError (no yfinance fallback masks polygon outages). Predictor inference reads ArcticDB right after this step and must see polygon-corrected data, so failure → HandleFailure (do NOT proceed to PredictorInference with stale yfinance values). See alpha-engine-data/collectors/daily_closes.py for source-mode contract. Timeout 1800s: 2026-04-27 the prior 720s cap killed the wrapper after the universe append's actual write completed (~12 min); bumping to 30 min absorbs the daily_append tail without masking real hangs (predictor still gated on Success status).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -174,11 +174,11 @@
             "source .venv/bin/activate",
             "python weekly_collector.py --morning-enrich 2>&1 | tee -a /var/log/morning-enrich.log"
           ],
-          "executionTimeout": ["720"]
+          "executionTimeout": ["1800"]
         },
-        "TimeoutSeconds": 720
+        "TimeoutSeconds": 1800
       },
-      "TimeoutSeconds": 780,
+      "TimeoutSeconds": 1860,
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
