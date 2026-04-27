@@ -103,6 +103,85 @@ def test_missing_from_closes_counter_in_summary():
     )
 
 
+def test_macro_write_runs_before_universe_coverage_guard():
+    """Macro / sector-ETF write must execute BEFORE the universe-coverage
+    guard so a stock-universe gap can't blackout SPY/VIX freshness.
+
+    Regression for 2026-04-27: 7 stock tickers (PAYC, ASGN, LW, GTM, MOH,
+    KMPR, MTCH) went missing from daily_closes; the universe-coverage guard
+    raised at threshold>5 BEFORE the macro write block ran, so SPY never
+    landed in ArcticDB for the day. The EOD reconcile then hard-failed on
+    stale SPY (by design — alpha against stale SPY is meaningless) and the
+    EOD email did not go out. Independent macro freshness + loud universe
+    failure is the intent: macro writes first, universe guard still raises
+    on threshold violations, pipeline still exits non-zero.
+
+    Locks the source-order invariant: the offset of the macro write site
+    must precede the offset of the missing-from-closes raise.
+    """
+    src = _source()
+    macro_write_idx = src.find("_write_row_backfill_safe(macro_lib, key, new_row)")
+    guard_raise_idx = src.find("missing from today's daily_closes parquet")
+    assert macro_write_idx != -1, "macro write call site not found"
+    assert guard_raise_idx != -1, "missing-from-closes raise not found"
+    assert macro_write_idx < guard_raise_idx, (
+        f"Macro write at offset {macro_write_idx} must precede the "
+        f"missing-from-closes guard at offset {guard_raise_idx}. The "
+        f"reordered design ensures SPY/VIX/sector freshness is independent "
+        f"of stock-universe coverage — a regression here resurrects the "
+        f"2026-04-27 EOD-email blackout."
+    )
+
+
+def test_macro_write_does_not_block_on_universe_coverage(monkeypatch):
+    """Functional: even when stock universe coverage trips the hard-fail,
+    the macro write must have completed first (SPY/VIX/sector ETFs land
+    in ArcticDB before the guard raises).
+
+    Direct simulation of the 2026-04-27 failure mode: 10 stocks missing
+    from closes (well above threshold 5), but macro keys + sector ETFs are
+    all present. The function must raise on the universe guard, but the
+    macro_lib must have received its writes first.
+    """
+    from builders import daily_append as _da
+    from builders.daily_append import daily_append
+
+    universe = [f"TKR{i}" for i in range(12)] + ["AAPL", "MSFT"]
+    universe_lib, macro_lib = _patch_targets(
+        monkeypatch,
+        universe_symbols=universe,
+        closes_tickers=["AAPL", "MSFT"],
+    )
+
+    # Spy on the macro write helper so we can confirm it ran before the raise.
+    write_calls: list[tuple] = []
+
+    def _spy_write(lib, sym, df, existing_series=None):
+        write_calls.append((lib, sym))
+        return "append"
+
+    monkeypatch.setattr(_da, "_write_row_backfill_safe", _spy_write)
+
+    with pytest.raises(RuntimeError, match=r"missing from today's daily_closes"):
+        daily_append(date_str="2026-04-28")
+
+    # Macro keys (7) + sector ETFs (11) = 18 expected writes BEFORE the
+    # universe-coverage raise. If the macro write were still ordered
+    # AFTER the guard, write_calls would be empty.
+    macro_keys = {"SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO"}
+    sector_etfs = {"XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
+                   "XLP", "XLRE", "XLU", "XLV", "XLY"}
+    written_syms = {sym for _, sym in write_calls}
+    assert macro_keys.issubset(written_syms), (
+        f"Macro keys not all written before universe-guard raise. "
+        f"Missing: {macro_keys - written_syms}. write_calls={write_calls}"
+    )
+    assert sector_etfs.issubset(written_syms), (
+        f"Sector ETFs not all written before universe-guard raise. "
+        f"Missing: {sector_etfs - written_syms}. write_calls={write_calls}"
+    )
+
+
 # ── 2. Functional: end-to-end behavior ─────────────────────────────────────────
 
 
