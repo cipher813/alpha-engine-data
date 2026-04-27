@@ -50,12 +50,12 @@ def _block_real_email(monkeypatch):
     monkeypatch.setattr("emailer.send_step_email", MagicMock(return_value=True))
 
 
-def _make_postflight() -> DataPostflight:
+def _make_postflight(phase: int = 1) -> DataPostflight:
     return DataPostflight(
         bucket=BUCKET,
         run_date=RUN_DATE,
         market_prefix=MARKET_PREFIX,
-        phase=1,
+        phase=phase,
     )
 
 
@@ -321,15 +321,148 @@ class TestUniverseSample:
 # ── Phase gating ──────────────────────────────────────────────────────────────
 
 class TestPhaseGating:
-    def test_phase2_is_skipped(self):
+    def test_phase3_or_higher_is_skipped(self):
+        """Unknown phase values short-circuit. Phase 1 and Phase 2 each have
+        their own check sets (see TestPhase2AlternativeManifest below)."""
         pf = DataPostflight(
             bucket=BUCKET,
             run_date=RUN_DATE,
             market_prefix=MARKET_PREFIX,
-            phase=2,
+            phase=3,
         )
-        # No mocks needed — run() should early-return for phase != 1.
+        # No mocks needed — run() should early-return for unknown phases.
         pf.run()
+
+
+# ── Phase 2 alternative manifest contract ────────────────────────────────────
+
+
+def _alt_manifest_payload(
+    *,
+    n_tickers: int = 25,
+    overrides: dict[str, float] | None = None,
+) -> dict:
+    """Build a fully-populated alternative/manifest.json mirroring what
+    ``collectors.alternative.collect`` writes."""
+    floors = {
+        "analyst_consensus": 0.80,
+        "eps_revision":      0.50,
+        "options_flow":      0.30,
+        "insider_activity":  0.10,
+        "institutional":     0.20,
+        "news":              0.50,
+    }
+    # Default: all sources at 100% coverage
+    ratios = {k: 1.0 for k in floors}
+    if overrides:
+        ratios.update(overrides)
+    return {
+        "run_date": RUN_DATE,
+        "tickers_requested": n_tickers,
+        "tickers_succeeded": n_tickers,
+        "tickers_failed": 0,
+        "source_ok_counts": {k: int(ratios[k] * n_tickers) for k in floors},
+        "source_ok_ratios": ratios,
+        "source_min_ok_ratios": floors,
+        "errors": [],
+    }
+
+
+class TestPhase2AlternativeManifest:
+    """The Phase 2 postflight re-verifies the per-source ok_ratio contract
+    Phase 2's collector already enforced. Belt-and-suspenders against a
+    partial write that bypassed the collector's status check."""
+
+    def test_ok_when_all_sources_above_floor(self):
+        pf = _make_postflight(phase=2)
+        pf._s3 = MagicMock()
+        pf._s3.head_object.return_value = {}
+        payload = _alt_manifest_payload()
+        pf._s3.get_object.return_value = {
+            "Body": MagicMock(read=MagicMock(return_value=json.dumps(payload).encode())),
+        }
+        pf._check_alternative_manifest_contract()  # must not raise
+
+    def test_fails_when_one_source_below_floor(self):
+        pf = _make_postflight(phase=2)
+        pf._s3 = MagicMock()
+        pf._s3.head_object.return_value = {}
+        payload = _alt_manifest_payload(overrides={"analyst_consensus": 0.4})
+        pf._s3.get_object.return_value = {
+            "Body": MagicMock(read=MagicMock(return_value=json.dumps(payload).encode())),
+        }
+        with pytest.raises(PostflightError, match="analyst_consensus"):
+            pf._check_alternative_manifest_contract()
+
+    def test_fails_with_all_breached_sources_named(self):
+        """Multiple breaches must be listed together so the operator
+        knows every provider that failed in one shot."""
+        pf = _make_postflight(phase=2)
+        pf._s3 = MagicMock()
+        pf._s3.head_object.return_value = {}
+        payload = _alt_manifest_payload(overrides={
+            "analyst_consensus": 0.0, "eps_revision": 0.0,
+        })
+        pf._s3.get_object.return_value = {
+            "Body": MagicMock(read=MagicMock(return_value=json.dumps(payload).encode())),
+        }
+        with pytest.raises(PostflightError) as excinfo:
+            pf._check_alternative_manifest_contract()
+        assert "analyst_consensus" in str(excinfo.value)
+        assert "eps_revision" in str(excinfo.value)
+
+    def test_fails_when_zero_tickers_requested(self):
+        pf = _make_postflight(phase=2)
+        pf._s3 = MagicMock()
+        pf._s3.head_object.return_value = {}
+        payload = _alt_manifest_payload()
+        payload["tickers_requested"] = 0
+        pf._s3.get_object.return_value = {
+            "Body": MagicMock(read=MagicMock(return_value=json.dumps(payload).encode())),
+        }
+        with pytest.raises(PostflightError, match="empty payload"):
+            pf._check_alternative_manifest_contract()
+
+    def test_fails_when_schema_missing_floors_block(self):
+        """If the collector writes a manifest without the per-source floors
+        block, the gate's contract is broken — postflight must hard-fail
+        rather than silently pass."""
+        pf = _make_postflight(phase=2)
+        pf._s3 = MagicMock()
+        pf._s3.head_object.return_value = {}
+        payload = _alt_manifest_payload()
+        del payload["source_min_ok_ratios"]
+        pf._s3.get_object.return_value = {
+            "Body": MagicMock(read=MagicMock(return_value=json.dumps(payload).encode())),
+        }
+        with pytest.raises(PostflightError, match="schema violation"):
+            pf._check_alternative_manifest_contract()
+
+    def test_absent_manifest_skips_check(self):
+        """Soft-launch: if Phase 2 hasn't run for this run_date yet, the
+        manifest doesn't exist — log + skip rather than break a Phase-1-only
+        invocation. Mirrors short_interest opt-out path."""
+        pf = _make_postflight(phase=2)
+        pf._s3 = MagicMock()
+        pf._s3.head_object.side_effect = RuntimeError("NoSuchKey")
+        pf._check_alternative_manifest_contract()  # must not raise
+        pf._s3.get_object.assert_not_called()
+
+    def test_phase2_run_invokes_alternative_check(self):
+        """Calling run() with phase=2 must dispatch to the alternative
+        manifest check (not phase-1's check set)."""
+        pf = _make_postflight(phase=2)
+        pf._s3 = MagicMock()
+        pf._s3.head_object.return_value = {}
+        payload = _alt_manifest_payload()
+        pf._s3.get_object.return_value = {
+            "Body": MagicMock(read=MagicMock(return_value=json.dumps(payload).encode())),
+        }
+        pf.run()  # must not raise
+        # Ensure phase-1 ArcticDB checks did NOT run (lazy lib handles
+        # would have been initialized otherwise).
+        assert pf._universe_lib is None
+        assert pf._macro_lib is None
 
 
 # ── _finalize wiring ──────────────────────────────────────────────────────────

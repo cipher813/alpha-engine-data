@@ -388,22 +388,96 @@ class DataPostflight:
                 f"s3://{self.bucket}/{key} is not valid JSON: {exc}"
             ) from exc
 
+    def _check_alternative_manifest_contract(self) -> None:
+        """Consumer: research scoring's qual sub-score reads
+        ``market_data/weekly/<run_date>/alternative/<TICKER>.json`` per
+        promoted ticker.
+
+        Phase 2's collector (``collectors/alternative.py::collect``) ships
+        a per-source ``ok_ratio`` gate — if any of the 6 sub-fetchers
+        (analyst_consensus, eps_revision, options_flow, insider_activity,
+        institutional, news) drops below its source-specific floor, the
+        collector returns ``status="error"``. This postflight check
+        re-verifies the manifest's per-source ratios meet the same
+        contract — belt-and-suspenders against a partial write that
+        bypassed the collector's own status check.
+
+        Soft-launch tolerance: if the manifest is absent (Phase 2 not yet
+        run for this ``run_date`` on a Phase-1-only postflight invocation,
+        or the alternative collector was disabled), log + skip rather
+        than hard-fail. Mirrors the ``short_interest`` opt-out path.
+        """
+        key = f"{self.market_prefix}weekly/{self.run_date}/alternative/manifest.json"
+        s3 = self._s3_client()
+        try:
+            s3.head_object(Bucket=self.bucket, Key=key)
+        except Exception:
+            log.info(
+                "postflight: alternative/manifest.json absent (Phase 2 likely "
+                "not yet run for %s) — skipping check.", self.run_date,
+            )
+            return
+
+        data = self._fetch_json(key, name="alternative/manifest.json")
+        n_tickers = data.get("tickers_requested", 0)
+        if n_tickers == 0:
+            raise PostflightError(
+                f"s3://{self.bucket}/{key} tickers_requested=0 — "
+                f"Phase 2 collector wrote an empty payload."
+            )
+
+        floors = data.get("source_min_ok_ratios") or {}
+        observed = data.get("source_ok_ratios") or {}
+        if not floors or not observed:
+            raise PostflightError(
+                f"s3://{self.bucket}/{key} missing source_min_ok_ratios "
+                f"or source_ok_ratios — schema violation. Phase 2 collector "
+                f"must emit both fields per the per-source ok_ratio gate."
+            )
+
+        breached: list[str] = []
+        for source, floor in floors.items():
+            ratio = observed.get(source)
+            if ratio is None:
+                breached.append(f"{source}: missing from manifest")
+            elif ratio < floor:
+                breached.append(
+                    f"{source}: {ratio:.1%} < {floor:.0%} threshold"
+                )
+
+        if breached:
+            raise PostflightError(
+                f"s3://{self.bucket}/{key} per-source ok_ratio gate breached "
+                f"for {len(breached)} of {len(floors)} sources — {breached}. "
+                f"Research scoring would silently degrade. Phase 2 collector "
+                f"already returned status=error; this check is the "
+                f"belt-and-suspenders verification."
+            )
+        log.info(
+            "postflight: alternative/manifest.json OK (%d tickers, %d sources "
+            "all above per-source floors)",
+            n_tickers, len(floors),
+        )
+
     # ── Entry point ──────────────────────────────────────────────────────────
 
     def run(self) -> None:
         """Run every check in sequence. Fail on the first contract violation."""
-        if self.phase != 1:
+        if self.phase == 1:
+            # Ordered so the cheapest + most-likely-to-fail checks run first.
+            self._check_latest_weekly_pointer()
+            self._check_macro_json_contract()
+            self._check_constituents_json_contract()
+            self._check_short_interest_json_contract()
+            self._check_macro_spy_fresh()
+            self._check_universe_sample_fresh()
+            log.info("postflight: all DataPhase1 consumer contracts satisfied")
+        elif self.phase == 2:
+            self._check_alternative_manifest_contract()
+            log.info("postflight: all DataPhase2 consumer contracts satisfied")
+        else:
             log.info(
-                "postflight: phase=%d is not gated today (only Phase 1). Skipping.",
+                "postflight: phase=%d is not gated today. Skipping.",
                 self.phase,
             )
             return
-
-        # Ordered so the cheapest + most-likely-to-fail checks run first.
-        self._check_latest_weekly_pointer()
-        self._check_macro_json_contract()
-        self._check_constituents_json_contract()
-        self._check_short_interest_json_contract()
-        self._check_macro_spy_fresh()
-        self._check_universe_sample_fresh()
-        log.info("postflight: all DataPhase1 consumer contracts satisfied")

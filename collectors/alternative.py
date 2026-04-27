@@ -50,6 +50,136 @@ import requests
 logger = logging.getLogger(__name__)
 
 
+# ── Per-source populated-ratio gate ──────────────────────────────────────────
+#
+# `_fetch_all_alternative` aggregates 6 heterogeneous sources for each
+# ticker. A single source going dark (Finnhub auth fail, FMP 402, SEC
+# rate-limit ban, etc.) silently nulls out only its sub-section of the
+# output dict — overall `_fetch_all_alternative` still returns successfully,
+# the manifest writes "ok", and downstream Research scoring picks up a
+# mostly-empty alt-data snapshot that degrades the qual sub-score.
+#
+# The gate below tracks per-source "did this ticker get real data?"
+# coverage and hard-fails the run if ANY source's populated ratio falls
+# below its source-specific floor. Thresholds are deliberately
+# heterogeneous because the 6 sources have very different baseline
+# coverage in the S&P 500/400 universe:
+#
+#   - analyst_consensus: most large-caps have analyst coverage → 0.80
+#   - eps_revision:      coverage drops for newer / smaller listings → 0.50
+#   - options_flow:      large-caps mostly options-listed but low-vol
+#                        days produce flat-line metrics → 0.30
+#   - insider_activity:  Form 4 filings are episodic (insiders don't
+#                        trade every quarter) → 0.10
+#   - institutional:     13F filings are quarterly + ~45-day lag, so
+#                        many tickers have no fresh accumulation
+#                        signal in any given week → 0.20
+#   - news:              most names produce some news weekly via
+#                        Yahoo RSS or 8-K → 0.50
+#
+# A FLAT ok_ratio across all sources would false-positive on tickers
+# that are legitimately sparse on a source (a small-cap with no 13F
+# filings is not a provider failure). Source-specific floors avoid that.
+#
+# Override at runtime via the `ALT_MIN_OK_RATIOS` env var (JSON dict),
+# e.g. `{"institutional": 0.05}` to relax the 13F floor during a known
+# edgartools outage without code changes.
+
+_DEFAULT_MIN_OK_RATIOS: dict[str, float] = {
+    "analyst_consensus": 0.80,
+    "eps_revision":      0.50,
+    "options_flow":      0.30,
+    "insider_activity":  0.10,
+    "institutional":     0.20,
+    "news":              0.50,
+}
+
+
+def _load_min_ok_ratios() -> dict[str, float]:
+    """Resolve per-source thresholds. Env override merges over defaults."""
+    overrides_raw = os.environ.get("ALT_MIN_OK_RATIOS", "")
+    if not overrides_raw:
+        return dict(_DEFAULT_MIN_OK_RATIOS)
+    try:
+        overrides = json.loads(overrides_raw)
+    except json.JSONDecodeError as exc:
+        # Malformed override hard-fails — silent fallback to defaults
+        # would leave operators thinking their tuning landed when it
+        # didn't. NoSilentFails.
+        raise RuntimeError(
+            f"ALT_MIN_OK_RATIOS env var is not valid JSON: {exc}. "
+            f"Expected a dict like '{{\"institutional\": 0.05}}'."
+        ) from exc
+    if not isinstance(overrides, dict):
+        raise RuntimeError(
+            f"ALT_MIN_OK_RATIOS must be a JSON object, got {type(overrides).__name__}"
+        )
+    unknown = set(overrides) - set(_DEFAULT_MIN_OK_RATIOS)
+    if unknown:
+        raise RuntimeError(
+            f"ALT_MIN_OK_RATIOS contains unknown sources: {sorted(unknown)}. "
+            f"Valid sources: {sorted(_DEFAULT_MIN_OK_RATIOS)}"
+        )
+    merged = dict(_DEFAULT_MIN_OK_RATIOS)
+    for k, v in overrides.items():
+        if not isinstance(v, (int, float)) or not (0.0 <= v <= 1.0):
+            raise RuntimeError(
+                f"ALT_MIN_OK_RATIOS[{k!r}] must be a number in [0.0, 1.0], "
+                f"got {v!r}"
+            )
+        merged[k] = float(v)
+    return merged
+
+
+# Predicates: did this source produce real (non-default) data for the
+# ticker? "Real" is deliberately loose — any non-empty / non-zero field
+# in the source-specific output schema counts as a populated ticker.
+# The goal is to detect "provider went dark" (every ticker gets
+# defaults) vs "this ticker's sources are sparse" (a few defaults
+# scattered across a mostly-populated batch).
+
+def _has_analyst_data(d: dict) -> bool:
+    return (
+        d.get("rating") is not None
+        or d.get("target_price") is not None
+        or d.get("num_analysts") is not None
+        or bool(d.get("earnings_surprises"))
+    )
+
+
+def _has_revision_data(d: dict) -> bool:
+    return d.get("current_estimate") is not None
+
+
+def _has_options_data(d: dict) -> bool:
+    return any(
+        d.get(k) is not None
+        for k in ("put_call_ratio", "iv_rank", "expected_move_pct")
+    )
+
+
+def _has_insider_data(d: dict) -> bool:
+    return bool(d.get("transactions")) or d.get("net_shares_30d", 0) != 0
+
+
+def _has_institutional_data(d: dict) -> bool:
+    return d.get("funds_increasing", 0) > 0 or d.get("funds_decreasing", 0) > 0
+
+
+def _has_news_data(d: dict) -> bool:
+    return bool(d.get("articles")) or bool(d.get("sec_filings_8k"))
+
+
+_HAS_DATA_PREDICATES = {
+    "analyst_consensus": _has_analyst_data,
+    "eps_revision":      _has_revision_data,
+    "options_flow":      _has_options_data,
+    "insider_activity":  _has_insider_data,
+    "institutional":     _has_institutional_data,
+    "news":              _has_news_data,
+}
+
+
 def collect(
     bucket: str,
     s3_prefix: str,
@@ -97,6 +227,10 @@ def collect(
     succeeded = 0
     failed = 0
     errors = []
+    # Per-source populated counts. Increment only when the source for
+    # this ticker carried real (non-default) data — see _HAS_DATA_PREDICATES
+    # commentary above for the silent-fail surface this protects against.
+    source_ok_counts: dict[str, int] = {k: 0 for k in _HAS_DATA_PREDICATES}
 
     for ticker in tickers:
         try:
@@ -109,18 +243,46 @@ def collect(
                 ContentType="application/json",
             )
             succeeded += 1
+            for source_name, predicate in _HAS_DATA_PREDICATES.items():
+                if predicate(data.get(source_name, {}) or {}):
+                    source_ok_counts[source_name] += 1
             logger.info("Alternative data: %s -> s3://%s/%s", ticker, bucket, key)
         except Exception as e:
             failed += 1
             errors.append({"ticker": ticker, "error": str(e)})
             logger.warning("Alternative data failed for %s: %s", ticker, e)
 
-    # Write manifest
+    # ── Per-source ok_ratio gate ────────────────────────────────────────────
+    # Mirrors `fundamentals.py::_MIN_OK_RATIO` and
+    # `short_interest.py::_MIN_OK_RATIO` patterns — every alt-data source
+    # that has its own potential failure mode (provider auth, quota, schema
+    # change) gets its own threshold. A breach is a hard-fail on the whole
+    # collector return so the orchestrator treats Phase 2 as failed instead
+    # of the manifest landing as "ok" with a silent half-empty payload.
+    min_ok_ratios = _load_min_ok_ratios()
+    n_total = len(tickers)
+    source_ratios: dict[str, float] = {
+        source: source_ok_counts[source] / max(n_total, 1)
+        for source in _HAS_DATA_PREDICATES
+    }
+    breached = [
+        (source, source_ratios[source], min_ok_ratios[source])
+        for source in _HAS_DATA_PREDICATES
+        if source_ratios[source] < min_ok_ratios[source]
+    ]
+
+    # Write manifest BEFORE the gate raises — operators triaging a
+    # gate breach need the manifest's per-source counts to identify
+    # which provider failed. (This mirrors fundamentals.py: status is
+    # the gate decision, but the diagnostic payload always lands.)
     manifest = {
         "run_date": run_date,
-        "tickers_requested": len(tickers),
+        "tickers_requested": n_total,
         "tickers_succeeded": succeeded,
         "tickers_failed": failed,
+        "source_ok_counts": source_ok_counts,
+        "source_ok_ratios": {k: round(v, 4) for k, v in source_ratios.items()},
+        "source_min_ok_ratios": min_ok_ratios,
         "errors": errors[:20],
     }
     manifest_key = f"{s3_prefix}weekly/{run_date}/alternative/manifest.json"
@@ -131,11 +293,47 @@ def collect(
         ContentType="application/json",
     )
 
+    if breached:
+        breach_lines = [
+            f"{src}: {ratio:.1%} < {floor:.0%} threshold "
+            f"({source_ok_counts[src]}/{n_total} populated)"
+            for src, ratio, floor in breached
+        ]
+        msg = (
+            "alternative.collect: per-source populated-ratio gate breached "
+            "for " + str(len(breached)) + " of " + str(len(_HAS_DATA_PREDICATES))
+            + " sources — " + "; ".join(breach_lines)
+            + ". Likely a provider outage (Finnhub auth/quota, FMP 402, SEC "
+            "rate-limit) silently nulled out a sub-section of the alt-data "
+            "snapshot. Refusing to mark Phase 2 as ok with a half-empty "
+            "payload that would degrade the research scoring layer."
+        )
+        logger.error(msg)
+        return {
+            "status": "error",
+            "error": msg,
+            "tickers_processed": succeeded,
+            "tickers_failed": failed,
+            "source_ok_counts": source_ok_counts,
+            "source_ok_ratios": {k: round(v, 4) for k, v in source_ratios.items()},
+            "source_min_ok_ratios": min_ok_ratios,
+            "breached_sources": [src for src, _, _ in breached],
+            "errors": errors[:20],
+        }
+
     status = "ok" if failed == 0 else "partial"
+    logger.info(
+        "alternative.collect: %d tickers, per-source coverage %s",
+        n_total,
+        ", ".join(f"{k}={source_ratios[k]:.0%}" for k in _HAS_DATA_PREDICATES),
+    )
     return {
         "status": status,
         "tickers_processed": succeeded,
         "tickers_failed": failed,
+        "source_ok_counts": source_ok_counts,
+        "source_ok_ratios": {k: round(v, 4) for k, v in source_ratios.items()},
+        "source_min_ok_ratios": min_ok_ratios,
         "errors": errors[:20],
     }
 
