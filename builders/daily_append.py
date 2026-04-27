@@ -17,8 +17,10 @@ import argparse
 import io
 import json
 import logging
+import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import boto3
@@ -311,6 +313,12 @@ def daily_append(
             len(hists_by_ticker), len(stock_tickers), time.time() - t_read0,
         )
 
+    # ── 4b. Phase 1 — sequential compute pass ────────────────────────────────
+    # Per-ticker feature compute stays sequential so we don't have to reason
+    # about pandas/numpy thread safety on the shared macro series. The
+    # bottleneck this PR targets is the I/O-bound write phase below; CPU
+    # parallelism is a separate (higher-risk) lever to pull later if needed.
+    write_tasks: list[tuple[str, pd.DataFrame, pd.DataFrame, list[str]]] = []
     for ticker in stock_tickers:
         try:
             # Read recent history from ArcticDB (need ~265 rows for feature warmup)
@@ -476,34 +484,60 @@ def daily_append(
 
             today_row.index.name = "date"
 
-            # Backfill-safe write — picks update() when target_date is at
-            # the head of the series (the steady-state daily pass), and
-            # falls back to read+splice+write() when target_date is in
-            # the middle (historical backfill). The 2026-04-24 polygon
-            # VWAP repair surfaced the need: ArcticDB's update() raises
-            # "index must be monotonic increasing or decreasing" when
-            # asked to insert behind the latest stored date.
-            # `hist` is already in scope from the per-ticker warmup read
-            # above, so the helper reuses it instead of double-reading.
-            _write_row_backfill_safe(
-                universe_lib, ticker, today_row, existing_series=hist
-            )
+            # Defer the actual ArcticDB write — collected here so Phase 2
+            # can run them in parallel via a thread pool. The previous
+            # sequential per-ticker `_write_row_backfill_safe` call took
+            # ~300-400ms × 900 = ~5 minutes wall time, the residual half
+            # of the budget after the read_batch optimization in PR #99.
+            write_tasks.append((ticker, today_row, hist, nan_features))
 
-            # Increment coverage counter + emit the partial-features log
-            # only after the write landed.
+        except Exception as exc:
+            log.warning("Failed to compute %s: %s", ticker, exc)
+            n_err += 1
+
+    # ── 4c. Phase 2 — parallel writes via ThreadPoolExecutor ─────────────────
+    # ArcticDB writes against different symbols are independent, and the
+    # underlying S3 round-trip releases the GIL on every network op, so a
+    # thread pool is a clean fit for the per-ticker write fan-out. Worker
+    # count is overridable via env var so prod can tune without a redeploy
+    # if the boto3 connection-pool ceiling changes.
+    write_workers = int(os.environ.get("DAILY_APPEND_WRITE_WORKERS", "16"))
+
+    def _do_write(task):
+        _ticker, _today_row, _hist, _nan_features = task
+        try:
+            _write_row_backfill_safe(
+                universe_lib, _ticker, _today_row, existing_series=_hist
+            )
+            return ("ok", _ticker, _nan_features, len(_hist), None)
+        except Exception as exc:  # pragma: no cover — covered by err test
+            return ("err", _ticker, None, len(_hist), exc)
+
+    if write_tasks:
+        t_write0 = time.time()
+        with ThreadPoolExecutor(max_workers=write_workers) as pool:
+            write_results = list(pool.map(_do_write, write_tasks))
+        log.info(
+            "Threadpooled writes: %d tickers in %.1fs (workers=%d)",
+            len(write_tasks), time.time() - t_write0, write_workers,
+        )
+
+        # Aggregation runs on the main thread — counter mutation stays
+        # single-threaded so we don't need locks.
+        for status, ticker, nan_features, hist_rows, exc in write_results:
+            if status == "err":
+                log.warning("Failed to append %s: %s", ticker, exc)
+                n_err += 1
+                continue
             if nan_features:
                 log.warning(
                     "partial-features ticker=%s rows=%d nan=%d/%d features=%s",
-                    ticker, len(hist), len(nan_features), len(FEATURES),
+                    ticker, hist_rows, len(nan_features), len(FEATURES),
                     nan_features,
                 )
                 n_partial += 1
             else:
                 n_ok += 1
-
-        except Exception as exc:
-            log.warning("Failed to append %s: %s", ticker, exc)
-            n_err += 1
 
     # ── 5. Update macro series ───────────────────────────────────────────────
     # update() semantics: same-date rows overwrite instead of appending. See
