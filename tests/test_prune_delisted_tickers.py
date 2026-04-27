@@ -1,0 +1,472 @@
+"""Tests for builders/prune_delisted_tickers.py.
+
+Two-condition guard:
+  (A) ticker absent from latest constituents.json::tickers
+  (B) last_date older than --absent-days threshold
+
+Either condition alone must NOT prune — that's the no-flapping invariant.
+A Wikipedia parsing hiccup (constituents missing a real ticker) or a
+multi-week daily_closes outage (last_date stale on a still-listed ticker)
+would otherwise blow up valid universe entries.
+"""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import MagicMock, patch
+
+import pandas as pd
+import pytest
+
+from builders import prune_delisted_tickers as _mod
+
+
+def _build_pointer_payload(weekly_date: str = "2026-04-25") -> dict:
+    return {
+        "date": weekly_date,
+        "s3_prefix": f"market_data/weekly/{weekly_date}/",
+    }
+
+
+def _build_constituents_payload(tickers: list[str]) -> dict:
+    return {
+        "date": "2026-04-25",
+        "tickers": list(tickers),
+        "sector_map": {t: "Industrials" for t in tickers},
+    }
+
+
+def _stub_s3(*, constituents_tickers: list[str], weekly_date: str = "2026-04-25"):
+    """Return a MagicMock s3 client whose get_object serves pointer +
+    constituents.json + records put_object calls."""
+    s3 = MagicMock()
+    pointer_body = json.dumps(_build_pointer_payload(weekly_date)).encode()
+    constituents_body = json.dumps(_build_constituents_payload(constituents_tickers)).encode()
+
+    def fake_get_object(**kwargs):
+        key = kwargs["Key"]
+        if key == "market_data/latest_weekly.json":
+            return {"Body": MagicMock(read=lambda: pointer_body)}
+        if key.endswith("/constituents.json"):
+            return {"Body": MagicMock(read=lambda: constituents_body)}
+        raise KeyError(f"unexpected key {key}")
+
+    s3.get_object.side_effect = fake_get_object
+    return s3
+
+
+def _stub_universe_lib(*, symbols: list[str], last_dates: dict[str, str]):
+    """Return a MagicMock universe_lib whose tail() returns a frame with
+    a single row at the given last_date for each symbol."""
+    lib = MagicMock()
+    lib.list_symbols.return_value = symbols
+
+    def fake_tail(symbol, n):
+        if symbol not in last_dates:
+            return MagicMock(data=pd.DataFrame())
+        idx = pd.DatetimeIndex([last_dates[symbol]])
+        return MagicMock(data=pd.DataFrame({"Close": [100.0]}, index=idx))
+
+    lib.tail.side_effect = fake_tail
+    return lib
+
+
+def _patch_targets(monkeypatch, *, s3_mock, universe_lib_mock):
+    """Common patch surface — stub boto3.client + get_universe_lib."""
+    monkeypatch.setattr(
+        _mod, "boto3", MagicMock(client=lambda *a, **k: s3_mock),
+    )
+    monkeypatch.setattr(_mod, "get_universe_lib", lambda *a, **k: universe_lib_mock)
+
+
+# ── A. Two-condition invariant ─────────────────────────────────────────────────
+
+
+def test_absent_from_constituents_AND_stale_prunes(monkeypatch):
+    """Both conditions met → ticker pruned."""
+    s3 = _stub_s3(constituents_tickers=["AAPL", "MSFT"])
+    lib = _stub_universe_lib(
+        symbols=["AAPL", "MSFT", "HOLX"],
+        last_dates={
+            "AAPL": "2026-04-25", "MSFT": "2026-04-25",
+            "HOLX": "2026-04-06",  # 22 days stale @ today=2026-04-28
+        },
+    )
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=14, apply=True,
+        today=pd.Timestamp("2026-04-28"),
+    )
+
+    assert summary["pruned_count"] == 1
+    assert summary["pruned"][0]["ticker"] == "HOLX"
+    lib.delete.assert_called_once_with("HOLX")
+
+
+def test_absent_but_recent_does_not_prune(monkeypatch):
+    """Absent from constituents but last_date is recent → flapping
+    guard fires, no prune. This is the 'Wikipedia hiccup' scenario."""
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    lib = _stub_universe_lib(
+        symbols=["AAPL", "MSFT"],
+        # MSFT is missing from constituents (simulated parsing miss)
+        # but its data is fresh — must not be deleted.
+        last_dates={"AAPL": "2026-04-25", "MSFT": "2026-04-25"},
+    )
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=14, apply=True,
+        today=pd.Timestamp("2026-04-28"),
+    )
+
+    assert summary["pruned_count"] == 0
+    assert summary["skipped_recent_count"] == 1
+    assert summary["skipped_recent"][0]["ticker"] == "MSFT"
+    lib.delete.assert_not_called()
+
+
+def test_present_in_constituents_but_stale_does_not_prune(monkeypatch):
+    """Present in constituents → never a candidate, even if last_date
+    is stale. This is the 'daily_closes outage' scenario."""
+    s3 = _stub_s3(constituents_tickers=["AAPL", "MSFT"])
+    lib = _stub_universe_lib(
+        symbols=["AAPL", "MSFT"],
+        # MSFT is in constituents but data is 22d old (e.g. polygon
+        # 403 streak). Must not delete a still-listed ticker.
+        last_dates={"AAPL": "2026-04-25", "MSFT": "2026-04-06"},
+    )
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=14, apply=True,
+        today=pd.Timestamp("2026-04-28"),
+    )
+
+    assert summary["pruned_count"] == 0
+    assert summary["candidates_count"] == 0
+    lib.delete.assert_not_called()
+
+
+# ── B. Macro / sector ETF protection ───────────────────────────────────────────
+
+
+def test_macro_keys_never_pruned(monkeypatch):
+    """SPY, VIX, etc. live in macro_lib, but if any leaked into
+    universe_lib by accident, they must never be touched here. Their
+    absence from the equity constituents list is by design."""
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    lib = _stub_universe_lib(
+        symbols=["AAPL", "SPY", "VIX", "GLD"],
+        last_dates={
+            "AAPL": "2026-04-25", "SPY": "2026-04-06",
+            "VIX": "2026-04-06", "GLD": "2026-04-06",
+        },
+    )
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=14, apply=True,
+        today=pd.Timestamp("2026-04-28"),
+    )
+
+    assert summary["pruned_count"] == 0
+    lib.delete.assert_not_called()
+
+
+def test_sector_etfs_never_pruned(monkeypatch):
+    """XLK / XLE / XLF / etc. — same protection as macro keys."""
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    lib = _stub_universe_lib(
+        symbols=["AAPL", "XLK", "XLE", "XLF"],
+        last_dates={
+            "AAPL": "2026-04-25",
+            "XLK": "2026-04-06", "XLE": "2026-04-06", "XLF": "2026-04-06",
+        },
+    )
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=14, apply=True,
+        today=pd.Timestamp("2026-04-28"),
+    )
+
+    assert summary["pruned_count"] == 0
+    lib.delete.assert_not_called()
+
+
+# ── C. Dry-run vs apply ────────────────────────────────────────────────────────
+
+
+def test_dry_run_does_not_call_delete(monkeypatch):
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    lib = _stub_universe_lib(
+        symbols=["AAPL", "HOLX"],
+        last_dates={"AAPL": "2026-04-25", "HOLX": "2026-04-06"},
+    )
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=14, apply=False,
+        today=pd.Timestamp("2026-04-28"),
+    )
+
+    assert summary["pruned_count"] == 1  # plan still records it
+    assert summary["applied"] is False
+    lib.delete.assert_not_called()
+
+
+def test_apply_calls_delete_per_ticker(monkeypatch):
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    lib = _stub_universe_lib(
+        symbols=["AAPL", "HOLX", "RACE"],
+        last_dates={
+            "AAPL": "2026-04-25",
+            "HOLX": "2026-04-06", "RACE": "2026-04-01",
+        },
+    )
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=14, apply=True,
+        today=pd.Timestamp("2026-04-28"),
+    )
+
+    assert summary["pruned_count"] == 2
+    assert lib.delete.call_count == 2
+    deleted = sorted(call.args[0] for call in lib.delete.call_args_list)
+    assert deleted == ["HOLX", "RACE"]
+
+
+# ── D. Override path ───────────────────────────────────────────────────────────
+
+
+def test_tickers_override_skips_constituents_diff(monkeypatch):
+    """--tickers HOLX bypasses the constituents diff but still gates on
+    last_date staleness — operator can't blow up a fresh symbol via typo."""
+    # Note: constituents could even contain HOLX — override skips that check.
+    s3 = _stub_s3(constituents_tickers=["AAPL", "HOLX"])
+    lib = _stub_universe_lib(
+        symbols=["AAPL", "HOLX"],
+        last_dates={"AAPL": "2026-04-25", "HOLX": "2026-04-06"},
+    )
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=14, apply=True,
+        tickers_override=["HOLX"],
+        today=pd.Timestamp("2026-04-28"),
+    )
+
+    assert summary["pruned_count"] == 1
+    assert summary["pruned"][0]["ticker"] == "HOLX"
+
+
+def test_tickers_override_still_gates_on_staleness(monkeypatch):
+    """Even with explicit override, a fresh-data ticker is NOT deleted —
+    refuses to blow up a still-active symbol via operator typo."""
+    s3 = _stub_s3(constituents_tickers=["AAPL", "MSFT"])
+    lib = _stub_universe_lib(
+        symbols=["AAPL", "MSFT"],
+        last_dates={"AAPL": "2026-04-25", "MSFT": "2026-04-25"},
+    )
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=14, apply=True,
+        tickers_override=["MSFT"],  # operator typo — MSFT is fresh + listed
+        today=pd.Timestamp("2026-04-28"),
+    )
+
+    assert summary["pruned_count"] == 0
+    assert summary["skipped_recent_count"] == 1
+    lib.delete.assert_not_called()
+
+
+def test_tickers_override_ignores_unknown_symbols(monkeypatch):
+    """A symbol not in ArcticDB gets logged but doesn't raise — the
+    override is a hint, not a contract."""
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    lib = _stub_universe_lib(
+        symbols=["AAPL"], last_dates={"AAPL": "2026-04-25"},
+    )
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=14, apply=True,
+        tickers_override=["NONEXISTENT"],
+        today=pd.Timestamp("2026-04-28"),
+    )
+
+    assert summary["pruned_count"] == 0
+    assert summary["candidates_count"] == 0
+
+
+# ── E. Refuse-to-delete-what-we-cant-verify ────────────────────────────────────
+
+
+def test_unreadable_tail_skips_not_prunes(monkeypatch):
+    """If tail(1) raises, refuse to delete — we can't verify staleness.
+    Operator must investigate manually."""
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    lib = MagicMock()
+    lib.list_symbols.return_value = ["AAPL", "BROKEN"]
+    # AAPL reads fine; BROKEN raises.
+    def fake_tail(symbol, n):
+        if symbol == "AAPL":
+            idx = pd.DatetimeIndex(["2026-04-25"])
+            return MagicMock(data=pd.DataFrame({"Close": [100.0]}, index=idx))
+        raise RuntimeError("ArcticDB read failed")
+    lib.tail.side_effect = fake_tail
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=14, apply=True,
+        today=pd.Timestamp("2026-04-28"),
+    )
+
+    assert summary["pruned_count"] == 0
+    assert summary["skipped_unreadable_count"] == 1
+    assert "BROKEN" in summary["skipped_unreadable"]
+    lib.delete.assert_not_called()
+
+
+def test_empty_series_skips(monkeypatch):
+    """Empty DataFrame from tail(1) → can't verify last_date → skip."""
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    lib = MagicMock()
+    lib.list_symbols.return_value = ["AAPL", "EMPTYSYMB"]
+    def fake_tail(symbol, n):
+        if symbol == "AAPL":
+            idx = pd.DatetimeIndex(["2026-04-25"])
+            return MagicMock(data=pd.DataFrame({"Close": [100.0]}, index=idx))
+        return MagicMock(data=pd.DataFrame())
+    lib.tail.side_effect = fake_tail
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=14, apply=True,
+        today=pd.Timestamp("2026-04-28"),
+    )
+
+    assert summary["pruned_count"] == 0
+    assert summary["skipped_unreadable_count"] == 1
+
+
+# ── F. Hard-fail on bad input ──────────────────────────────────────────────────
+
+
+def test_empty_constituents_raises(monkeypatch):
+    """An empty constituents.json::tickers list would mean every ArcticDB
+    symbol becomes a candidate — refuse loudly. This is a defensive check
+    against a constituents-fetch regression."""
+    s3 = MagicMock()
+    pointer_body = json.dumps(_build_pointer_payload()).encode()
+    bad_constituents = json.dumps({"tickers": [], "date": "2026-04-25"}).encode()
+
+    def fake_get_object(**kwargs):
+        if kwargs["Key"] == "market_data/latest_weekly.json":
+            return {"Body": MagicMock(read=lambda: pointer_body)}
+        return {"Body": MagicMock(read=lambda: bad_constituents)}
+    s3.get_object.side_effect = fake_get_object
+
+    lib = _stub_universe_lib(symbols=["AAPL"], last_dates={"AAPL": "2026-04-25"})
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    with pytest.raises(RuntimeError, match="empty universe"):
+        _mod.prune_delisted_tickers(
+            absent_days=14, apply=True,
+            today=pd.Timestamp("2026-04-28"),
+        )
+
+
+def test_arctic_delete_failure_propagates(monkeypatch):
+    """If lib.delete() raises mid-loop, propagate so the operator sees a
+    half-pruned state and investigates rather than silently 'completing'."""
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    lib = MagicMock()
+    lib.list_symbols.return_value = ["AAPL", "HOLX", "RACE"]
+
+    def fake_tail(symbol, n):
+        if symbol == "AAPL":
+            idx = pd.DatetimeIndex(["2026-04-25"])
+        else:
+            idx = pd.DatetimeIndex(["2026-04-06"])
+        return MagicMock(data=pd.DataFrame({"Close": [100.0]}, index=idx))
+
+    lib.tail.side_effect = fake_tail
+    # First delete succeeds, second raises
+    lib.delete.side_effect = [None, RuntimeError("S3 5xx")]
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    with pytest.raises(RuntimeError, match="Failed to delete"):
+        _mod.prune_delisted_tickers(
+            absent_days=14, apply=True,
+            today=pd.Timestamp("2026-04-28"),
+        )
+
+
+# ── G. Audit trail ─────────────────────────────────────────────────────────────
+
+
+def test_audit_written_on_dry_run(monkeypatch):
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    lib = _stub_universe_lib(
+        symbols=["AAPL", "HOLX"],
+        last_dates={"AAPL": "2026-04-25", "HOLX": "2026-04-06"},
+    )
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    _mod.prune_delisted_tickers(
+        absent_days=14, apply=False,
+        today=pd.Timestamp("2026-04-28"),
+    )
+
+    s3.put_object.assert_called_once()
+    call = s3.put_object.call_args
+    assert call.kwargs["Key"].startswith("builders/prune_audit/2026-04-28-")
+    assert call.kwargs["Key"].endswith("-dryrun.json")
+    body = json.loads(call.kwargs["Body"])
+    assert body["pruned_count"] == 1
+    assert body["pruned"][0]["ticker"] == "HOLX"
+
+
+def test_audit_written_on_apply(monkeypatch):
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    lib = _stub_universe_lib(
+        symbols=["AAPL", "HOLX"],
+        last_dates={"AAPL": "2026-04-25", "HOLX": "2026-04-06"},
+    )
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    _mod.prune_delisted_tickers(
+        absent_days=14, apply=True,
+        today=pd.Timestamp("2026-04-28"),
+    )
+
+    s3.put_object.assert_called_once()
+    call = s3.put_object.call_args
+    assert call.kwargs["Key"].endswith("-apply.json")
+
+
+def test_audit_failure_does_not_block_prune(monkeypatch):
+    """put_object failure is observability — must not cause the prune
+    operation to roll back. The operator already saw the WARN log of the
+    delete; the audit miss is a downstream concern."""
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    s3.put_object.side_effect = RuntimeError("S3 down")
+    lib = _stub_universe_lib(
+        symbols=["AAPL", "HOLX"],
+        last_dates={"AAPL": "2026-04-25", "HOLX": "2026-04-06"},
+    )
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=14, apply=True,
+        today=pd.Timestamp("2026-04-28"),
+    )
+
+    # Prune still happened; audit failure was swallowed with WARN.
+    assert summary["pruned_count"] == 1
+    lib.delete.assert_called_once_with("HOLX")

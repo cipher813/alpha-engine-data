@@ -293,6 +293,10 @@ echo "==> Smoke: python import weekly_collector"
 $REMOTE_PYTHON -c "import weekly_collector; print('import OK')"
 
 echo ""
+echo "==> Smoke: python import builders.prune_delisted_tickers"
+$REMOTE_PYTHON -c "from builders import prune_delisted_tickers; print('import OK')"
+
+echo ""
 echo "==> Smoke: weekly_collector.py --phase 1 --dry-run"
 # Show full output (was tail -30 — truncated error tracebacks from early
 # collectors so their failure mode was invisible during debugging).
@@ -440,6 +444,23 @@ echo "DataPhase1 complete at \$(date)"
 
 echo ""
 echo "──────────────────────────────────────────────────────────────"
+echo "Starting builders.prune_delisted_tickers at \$(date)"
+echo "──────────────────────────────────────────────────────────────"
+# Prune delisted tickers from ArcticDB universe. Two-condition guard
+# (constituents-absent AND last_date stale) prevents flapping; audit
+# JSON is written to s3://alpha-engine-research/builders/prune_audit/.
+# Composes with daily_append's missing-from-closes hard-fail (PR #101)
+# — closes the loop on legit delistings so the threshold doesn't keep
+# getting bumped or symbols manually deleted. Constituents.json was
+# just refreshed by Phase 1 above, so this read is fresh.
+if ! $REMOTE_PYTHON -m builders.prune_delisted_tickers --apply 2>&1; then
+    echo "ERROR: prune_delisted_tickers failed — aborting bundle before RAG." >&2
+    exit 1
+fi
+echo "UniversePrune complete at \$(date)"
+
+echo ""
+echo "──────────────────────────────────────────────────────────────"
 echo "Fetching RAG secrets from SSM at \$(date)"
 echo "──────────────────────────────────────────────────────────────"
 # Phase 2 SSM migration — RAG secrets come from SSM Parameter Store, NOT
@@ -478,8 +499,8 @@ echo "  Weekly data bundle complete. Instance will be terminated."
 echo "═══════════════════════════════════════════════════════════════"
 
 # Heartbeat — one metric per sub-workload so CloudWatch alarms can
-# distinguish between a missed Phase 1 and a missed RAG.
-for proc in data-phase1 rag-ingestion; do
+# distinguish between a missed Phase 1, a missed prune, and a missed RAG.
+for proc in data-phase1 universe-prune rag-ingestion; do
     aws cloudwatch put-metric-data \
         --namespace "AlphaEngine" \
         --metric-name "Heartbeat" \
