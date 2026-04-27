@@ -40,6 +40,9 @@ from features.compute import (
     _load_cached_fundamentals,
     _load_cached_alternative,
 )
+from arcticdb.version_store.library import ReadRequest
+from arcticdb_ext.version_store import DataError
+
 from store.arctic_store import get_universe_lib, get_macro_lib
 from store.parquet_loader import load_parquet_from_s3
 
@@ -277,6 +280,37 @@ def daily_append(
     n_partial = 0         # rows written with ≥1 NaN feature (short-history, etc.)
     n_parquet_warmup = 0  # rows whose feature compute used parquet-enriched context
 
+    # ── 4a. Batch-read every ticker's full universe history upfront ──────────
+    # Replaces the prior per-ticker `universe_lib.read(ticker)` loop. ArcticDB's
+    # read_batch parallelizes the underlying S3 round-trips internally, cutting
+    # ~900 sequential reads at ~0.3-0.5s each (5-7 minutes wall time) down to a
+    # single batched call. The full series (no date_range slice) is required
+    # because `_write_row_backfill_safe` rewrites the full symbol on the
+    # backfill path, and most MorningEnrich runs hit backfill (target_ts is
+    # the prior trading day, already written by post-close DailyData).
+    # Missing symbols come back as DataError objects (not exceptions) — they're
+    # filtered into n_err with the same semantics as the old per-ticker
+    # `try/except Exception` branch.
+    hists_by_ticker: dict[str, pd.DataFrame] = {}
+    if not dry_run and stock_tickers:
+        t_read0 = time.time()
+        read_results = universe_lib.read_batch(
+            [ReadRequest(symbol=t) for t in stock_tickers]
+        )
+        for ticker, result in zip(stock_tickers, read_results):
+            if isinstance(result, DataError):
+                log.warning(
+                    "Ticker %s not in ArcticDB: %s",
+                    ticker, result.exception_string,
+                )
+                n_err += 1
+                continue
+            hists_by_ticker[ticker] = result.data
+        log.info(
+            "Batched universe read: %d/%d tickers in %.1fs",
+            len(hists_by_ticker), len(stock_tickers), time.time() - t_read0,
+        )
+
     for ticker in stock_tickers:
         try:
             # Read recent history from ArcticDB (need ~265 rows for feature warmup)
@@ -284,11 +318,10 @@ def daily_append(
                 n_skip += 1
                 continue
 
-            try:
-                hist = universe_lib.read(ticker).data
-            except Exception as exc:
-                log.warning("Ticker %s not in ArcticDB: %s", ticker, exc)
-                n_err += 1
+            hist = hists_by_ticker.get(ticker)
+            if hist is None:
+                # Ticker was missing from ArcticDB — already counted into
+                # n_err during the batch read above, skip silently.
                 continue
 
             # Re-running daily_append for the same date MUST overwrite the
