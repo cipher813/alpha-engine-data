@@ -129,3 +129,28 @@ def test_batch_request_shape():
         "ReadRequest list must preserve stock_tickers order so the "
         "zip(stock_tickers, read_results) loop pairs them correctly."
     )
+
+
+# ── ThreadPool source-grep checks ───────────────────────────────────────────
+
+
+def test_writes_use_threadpool_executor():
+    """The per-ticker write fan-out must run inside a ThreadPoolExecutor —
+    the residual half of the 2026-04-27 12-min budget after read_batch was
+    ~5 min of sequential ~300-400ms ArcticDB writes × 900 tickers.
+    """
+    src = _source()
+    assert "ThreadPoolExecutor" in src, (
+        "Per-ticker writes must fan out through ThreadPoolExecutor so the "
+        "S3 round-trip cost parallelizes (Arctic releases the GIL on every "
+        "network op). Sequential writes were the dominant residual budget "
+        "after PR #99's read_batch optimization."
+    )
+    assert "from concurrent.futures import ThreadPoolExecutor" in src
+    # Worker count must be env-overridable so prod can tune without a
+    # redeploy if the boto3 connection-pool ceiling changes.
+    assert "DAILY_APPEND_WRITE_WORKERS" in src, (
+        "Threadpool worker count must be env-overridable — prod boto3 "
+        "connection-pool ceilings vary and tuning shouldn't require a "
+        "code change + redeploy."
+    )

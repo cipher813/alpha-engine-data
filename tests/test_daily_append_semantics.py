@@ -27,11 +27,21 @@ def test_universe_lib_uses_update_not_append():
     lib.write() for the backfill case (historical row in middle of series).
     Direct lib.append() must never appear — it accumulates duplicate
     same-date rows and caused the 2026-04-15 retrain outage.
+
+    The 2026-04-27 threadpool refactor moved the write call into an inner
+    closure for parallel execution, so this test locks the semantic
+    invariant (write goes through the helper with `universe_lib` as first
+    arg) rather than the literal call shape.
     """
+    import re
     src = _source()
-    assert "_write_row_backfill_safe(\n                universe_lib, ticker, today_row" in src or \
-           "_write_row_backfill_safe(universe_lib, ticker, today_row" in src, (
-        "Per-ticker write must call _write_row_backfill_safe(universe_lib, ticker, today_row, ...) "
+    # Match `_write_row_backfill_safe(<whitespace>universe_lib<rest>)` —
+    # tolerates the call being inlined OR moved into a helper closure.
+    assert re.search(
+        r"_write_row_backfill_safe\s*\(\s*universe_lib\b",
+        src,
+    ), (
+        "Per-ticker write must call _write_row_backfill_safe(universe_lib, ...) "
         "— the helper picks update() for append + write() for backfill. "
         "Calling universe_lib.update() directly skips the backfill-safe path "
         "and breaks historical rewrites with 'index must be monotonic' "
@@ -167,31 +177,39 @@ def test_counters_increment_after_successful_write():
     so an exception rolls the iteration back cleanly into n_err.
 
     Locks the 2026-04-21 rewrite where counters were hoisted post-write
-    to prevent double-counting when the write throws.
+    to prevent double-counting when the write throws. After the 2026-04-27
+    threadpool refactor, the write call lives inside an inner closure and
+    the counters increment in a post-pool aggregation loop driven by the
+    closure's status string — same semantic guarantee, different shape.
     """
+    import re
     src = _source()
-    # The write call site + increments must appear in that order.
-    # Find the _write_row_backfill_safe(universe_lib, ticker, today_row) call.
-    lines = src.splitlines()
-    write_idx = None
-    for i, line in enumerate(lines):
-        if "_write_row_backfill_safe(" in line and "universe_lib" in line:
-            write_idx = i
-            break
-        # Multi-line call form: line ends with `_write_row_backfill_safe(`
-        if line.rstrip().endswith("_write_row_backfill_safe("):
-            # Look ahead a few lines for `universe_lib`
-            ahead = "\n".join(lines[i:i+5])
-            if "universe_lib, ticker, today_row" in ahead:
-                write_idx = i
-                break
-    assert write_idx is not None, (
-        "_write_row_backfill_safe(universe_lib, ticker, today_row, ...) call site not found"
+    # Find the write call (now inside the _do_write closure).
+    write_match = re.search(
+        r"_write_row_backfill_safe\s*\(\s*universe_lib\b",
+        src,
     )
-    window_after = "\n".join(lines[write_idx:write_idx + 25])
-    assert "n_partial += 1" in window_after and "n_ok += 1" in window_after, (
-        "n_ok / n_partial must be incremented AFTER the write call, "
+    assert write_match is not None, (
+        "_write_row_backfill_safe(universe_lib, ...) call site not found"
+    )
+    after_write = src[write_match.end():]
+    # The closure must return a status before the aggregation loop touches
+    # n_ok / n_partial — i.e. the increments live AFTER the write site
+    # in source order, not before.
+    assert 'return ("ok"' in after_write, (
+        "Closure must return a success status string from the write path "
+        "so the aggregation loop can route to n_ok / n_partial. Without it "
+        "the threadpool path can't tell ok from err and counters lose the "
+        "exception-rolls-into-n_err invariant."
+    )
+    assert "n_partial += 1" in after_write and "n_ok += 1" in after_write, (
+        "n_ok / n_partial must be incremented AFTER the write call site, "
         "not before. Increments before write cause miscount on exception."
+    )
+    # Exception path must still route to n_err — locks the rollback invariant.
+    assert "n_err += 1" in after_write, (
+        "Aggregation must increment n_err on closure-status='err' so write "
+        "exceptions don't silently inflate n_ok."
     )
 
 
