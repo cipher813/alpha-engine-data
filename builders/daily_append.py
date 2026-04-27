@@ -102,6 +102,35 @@ def _write_row_backfill_safe(
     return "backfill"
 
 
+def _emit_missing_from_closes_metric(count: int) -> None:
+    """Emit ``AlphaEngine/Data/missing_from_closes_count`` gauge.
+
+    Best-effort: CloudWatch errors WARN but don't fail the pipeline — the
+    hard-fail above the threshold is the load-bearing path, the metric +
+    alarm catches slow drift below the threshold (1-2 silently-missing
+    tickers per day adds up to a regression like the 2026-04-25 incident
+    if uncaught). Pattern mirrors ``_emit_admission_refused_metric`` in
+    alpha-engine/executor/signal_reader.py.
+    """
+    try:
+        cw = boto3.client("cloudwatch")
+        cw.put_metric_data(
+            Namespace="AlphaEngine/Data",
+            MetricData=[{
+                "MetricName": "missing_from_closes_count",
+                "Value": float(count),
+                "Unit": "Count",
+            }],
+        )
+    except Exception as exc:
+        log.warning(
+            "CloudWatch missing_from_closes_count metric failed: %s. "
+            "Not blocking daily_append — the threshold check above already "
+            "surfaced the count.",
+            exc,
+        )
+
+
 def _load_parquet_warmup(s3, bucket: str, ticker: str) -> pd.DataFrame | None:
     """Load a ticker's 10y price-cache parquet for feature warmup.
 
@@ -212,6 +241,65 @@ def daily_append(
     else:
         universe_lib = None
         macro_lib = None
+
+    # ── 2b. Detect tickers that exist in ArcticDB universe but are missing
+    #        from today's daily_closes parquet ─────────────────────────────────
+    # Without this guard, the line ~274 ``stock_tickers = [t for t in closes ...]``
+    # filter silently drops every ArcticDB symbol absent from today's closes —
+    # no counter increments, no WARN log. That class was the recurring "8
+    # tickers regressed to 4/01" failure mode (ROADMAP 2026-04-25 P1) — daily
+    # closes upstream stops returning a ticker, daily_append silently no-ops
+    # writes for it across many weekdays, and the regression only surfaces
+    # when an unrelated freshness preflight catches it days later.
+    #
+    # Mirrors the macro/sector hard-fail at line ~614 — same architectural
+    # rule, just for the larger stock set. Threshold default (5) matches the
+    # absolute count of the 2026-04-25 regression; env-overridable so prod
+    # can tune without a redeploy.
+    n_missing_from_closes = 0
+    if not dry_run:
+        try:
+            arctic_stock_symbols = set(universe_lib.list_symbols())
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not list ArcticDB universe symbols (needed for "
+                f"missing-from-closes check): {exc}"
+            ) from exc
+        # closes contains everything: stocks + macro keys + sector ETFs.
+        # Reduce to the stock set so the diff is apples-to-apples with
+        # universe_lib's contents (which holds only stocks). Same predicate
+        # as the line ~274 stock_tickers filter — keep them in lockstep.
+        closes_stock_keys = {
+            t for t in closes
+            if t not in _SKIP_TICKERS and not _is_sector_etf(t)
+        }
+        missing_from_closes = sorted(arctic_stock_symbols - closes_stock_keys)
+        n_missing_from_closes = len(missing_from_closes)
+        # Always emit a metric — silent regression in the slow-drift band
+        # (1-2 tickers) won't trip the hard-fail but is still observable.
+        _emit_missing_from_closes_metric(n_missing_from_closes)
+        threshold = int(
+            os.environ.get("DAILY_APPEND_MISSING_THRESHOLD", "5")
+        )
+        if n_missing_from_closes > threshold:
+            raise RuntimeError(
+                f"daily_append: {n_missing_from_closes} tickers in ArcticDB "
+                f"universe missing from today's daily_closes parquet "
+                f"(threshold={threshold}). Missing: {missing_from_closes}. "
+                f"Either upstream daily_closes collection stopped emitting "
+                f"these tickers (most common — polygon/yfinance hiccup or "
+                f"ticker-listing change), or these tickers are legitimately "
+                f"delisted and need to be pruned from ArcticDB universe "
+                f"(see ROADMAP P2 'ArcticDB universe pruning'). "
+                f"Override threshold via DAILY_APPEND_MISSING_THRESHOLD env "
+                f"var if you've already triaged the list."
+            )
+        elif n_missing_from_closes > 0:
+            log.warning(
+                "daily_append: %d tickers in ArcticDB universe missing from "
+                "closes (below %d hard-fail threshold) — %s",
+                n_missing_from_closes, threshold, missing_from_closes,
+            )
 
     # ── 3. Load macro series from ArcticDB ───────────────────────────────────
     macro: dict[str, pd.Series] = {}
@@ -677,6 +765,7 @@ def daily_append(
         "tickers_skipped": n_skip,
         "tickers_errored": n_err,
         "tickers_parquet_warmup": n_parquet_warmup,
+        "tickers_missing_from_closes": n_missing_from_closes,
         "load_seconds": round(t_load, 1),
         "total_seconds": round(t_total, 1),
         "dry_run": dry_run,
@@ -684,8 +773,10 @@ def daily_append(
 
     log.info(
         "ArcticDB daily_append: stocks n_ok=%d n_partial=%d n_skip=%d n_err=%d "
-        "n_parquet_warmup=%d (of %d) | macro_updated=%d sector_updated=%d | %.1fs total",
-        n_ok, n_partial, n_skip, n_err, n_parquet_warmup, len(stock_tickers),
+        "n_parquet_warmup=%d n_missing_from_closes=%d (of %d) | "
+        "macro_updated=%d sector_updated=%d | %.1fs total",
+        n_ok, n_partial, n_skip, n_err, n_parquet_warmup,
+        n_missing_from_closes, len(stock_tickers),
         len(macro_updated) if not dry_run else 0,
         len(sector_updated) if not dry_run else 0,
         t_total,
