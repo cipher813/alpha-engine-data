@@ -242,6 +242,150 @@ def daily_append(
         universe_lib = None
         macro_lib = None
 
+    # ── 2a. Update macro / sector-ETF series in ArcticDB ─────────────────────
+    # This block was previously the final write step (old "step 5") and ran
+    # AFTER the universe-coverage guard at step 2b. That ordering coupled
+    # macro/SPY freshness to stock-coverage correctness: a 7-stock universe
+    # gap on 2026-04-27 raised at the guard before SPY ever got written, which
+    # then hard-failed the EOD reconcile (alpha against stale SPY is by-design
+    # rejected) and blacked out the EOD email + alpha tracking for the day.
+    #
+    # Macro keys are a fixed list of ~18 well-known tickers (SPY, VIX, sector
+    # ETFs); their freshness has nothing to do with whether 5 or 50 stocks
+    # went missing in the universe collection. Doing the macro write FIRST
+    # decouples the two concerns: macro lands in ArcticDB regardless of
+    # downstream stock-side issues, and the universe guard still raises
+    # non-zero so operators get paged on the universe gap. Net effect on
+    # 2026-04-27-style failures: EOD email goes out, daily-data still exits 1.
+    #
+    # update() semantics: same-date rows overwrite instead of appending. See
+    # _write_row_backfill_safe — it routes append vs backfill correctly.
+    #
+    # Per feedback_hard_fail_until_stable: count which keys got updated vs
+    # silently skipped due to missing closes data, verify the writes actually
+    # landed, and raise with a named reject list if anything went missing.
+    # Previous behavior: if closes.get(key) returned None (upstream collection
+    # gap), the update was silently skipped. Combined with stock tickers all
+    # hitting the "today already exists" skip path after a backfill, a run
+    # could return status="ok" with ZERO data actually written. 2026-04-15
+    # 08:39 PT manual rerun reproduced this — Step Function marked SUCCEEDED,
+    # macro/SPY stayed at 4/10 for 5 days until an inference-side preflight
+    # caught it.
+    macro_missing_from_closes: list[str] = []
+    macro_updated: list[str] = []
+    sector_updated: list[str] = []
+
+    # Track per-symbol write mode (append vs backfill) so the verification
+    # check below can apply the right correctness assertion. Append: last
+    # readback row should equal target_ts. Backfill: target_ts should be
+    # in the readback index (could be anywhere in the middle).
+    macro_write_modes: dict[str, str] = {}
+
+    macro_keys = ["SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO"]
+
+    if not dry_run:
+        for key in macro_keys:
+            bar = closes.get(key)
+            if bar is None or np.isnan(bar.get("Close", np.nan)):
+                macro_missing_from_closes.append(key)
+                continue
+            try:
+                new_row = pd.DataFrame(
+                    [{"Close": bar["Close"]}],
+                    index=pd.DatetimeIndex([today_ts]),
+                )
+                new_row.index.name = "date"
+                mode = _write_row_backfill_safe(macro_lib, key, new_row)
+                macro_updated.append(key)
+                macro_write_modes[key] = mode
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to update macro {key} bar for {date_str}: {exc}"
+                ) from exc
+
+        # Sector ETFs — iterate the expected list explicitly rather than
+        # filtering closes.keys(), so a missing XL* key surfaces as a loud
+        # reject instead of a silent skip.
+        sector_etfs = ["XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
+                       "XLP", "XLRE", "XLU", "XLV", "XLY"]
+        for sym in sector_etfs:
+            bar = closes.get(sym)
+            if bar is None or np.isnan(bar.get("Close", np.nan)):
+                macro_missing_from_closes.append(sym)
+                continue
+            try:
+                new_row = pd.DataFrame(
+                    [{"Close": bar["Close"]}],
+                    index=pd.DatetimeIndex([today_ts]),
+                )
+                new_row.index.name = "date"
+                mode = _write_row_backfill_safe(macro_lib, sym, new_row)
+                sector_updated.append(sym)
+                macro_write_modes[sym] = mode
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to update sector ETF {sym} bar for {date_str}: {exc}"
+                ) from exc
+
+        # Hard-fail on any missing key — macro inputs are not optional.
+        # downstream feature compute + predictor preflight both depend on
+        # these being fresh.
+        if macro_missing_from_closes:
+            raise RuntimeError(
+                f"Macro/sector-ETF keys missing from today's daily_closes "
+                f"parquet: {macro_missing_from_closes}. Upstream daily_closes "
+                f"collection (polygon → FRED → yfinance fallback chain) did "
+                f"not produce bars for these tickers on {date_str}. Macro "
+                f"data is critical for downstream inference (SPY for "
+                f"return_vs_spy_5d, VIX for vix_level, sector ETFs for "
+                f"sector-relative features). Fix the upstream collection "
+                f"before claiming pipeline success."
+            )
+
+        # Verify writes landed. The update() / write() calls above are
+        # fire-and-forget (no return value surfaces a success flag), so
+        # we read back each key and assert target_ts is present. The
+        # check is mode-aware:
+        #   - append mode: last readback row should equal target_ts
+        #     (catches the 2026-04-15 silent-stale failure where SSM
+        #     reported SUCCEEDED but macro/SPY stayed 5 days behind)
+        #   - backfill mode: target_ts should be IN the readback index,
+        #     anywhere (last date is naturally future relative to
+        #     target_ts when we backfill an old date)
+        target_ts_norm = today_ts.normalize()
+        verification_failures: list[tuple[str, str]] = []
+        for key in macro_updated + sector_updated:
+            try:
+                readback = macro_lib.read(key).data
+            except Exception as exc:
+                verification_failures.append((key, f"readback error: {exc}"))
+                continue
+            if readback.empty:
+                verification_failures.append((key, "readback empty"))
+                continue
+            mode = macro_write_modes.get(key, "append")
+            if mode == "backfill":
+                # Target date should be present somewhere in the series.
+                index_norm = pd.DatetimeIndex(readback.index).normalize()
+                if target_ts_norm not in index_norm:
+                    verification_failures.append(
+                        (key, f"backfill target {target_ts_norm.date()} not in readback index "
+                              f"(last={pd.Timestamp(readback.index[-1]).date()})")
+                    )
+            else:
+                last_ts = pd.Timestamp(readback.index[-1]).normalize()
+                if last_ts != target_ts_norm:
+                    verification_failures.append(
+                        (key, f"last date {last_ts.date()} != expected {target_ts_norm.date()}")
+                    )
+        if verification_failures:
+            raise RuntimeError(
+                f"Macro update verification failed for {date_str}: "
+                f"{verification_failures}. update()/write() calls completed without "
+                f"exception but readback shows the row is missing. Investigate "
+                f"ArcticDB commit / consistency semantics."
+            )
+
     # ── 2b. Detect tickers that exist in ArcticDB universe but are missing
     #        from today's daily_closes parquet ─────────────────────────────────
     # Without this guard, the line ~274 ``stock_tickers = [t for t in closes ...]``
@@ -252,8 +396,11 @@ def daily_append(
     # writes for it across many weekdays, and the regression only surfaces
     # when an unrelated freshness preflight catches it days later.
     #
-    # Mirrors the macro/sector hard-fail at line ~614 — same architectural
-    # rule, just for the larger stock set. Threshold default (5) matches the
+    # Runs AFTER the macro write at step 2a so a stock-universe gap can't
+    # block macro/SPY freshness — see the rationale on the 2a header for the
+    # 2026-04-27 EOD blackout that motivated decoupling these two concerns.
+    # This guard still raises non-zero on threshold violations; pipelines
+    # exit 1 and operators get paged. Threshold default (5) matches the
     # absolute count of the 2026-04-25 regression; env-overridable so prod
     # can tune without a redeploy.
     n_missing_from_closes = 0
@@ -301,9 +448,14 @@ def daily_append(
                 n_missing_from_closes, threshold, missing_from_closes,
             )
 
-    # ── 3. Load macro series from ArcticDB ───────────────────────────────────
+    # ── 3. Load macro series from ArcticDB into in-memory dict ───────────────
+    # Read-only on ArcticDB. Builds a multi-day series per macro key for the
+    # per-stock feature loop (return_vs_spy_5d, vix_level, etc., which need
+    # context not just today's value). After step 2a's write, today's row is
+    # already in ArcticDB — the pd.concat below is now redundant in the happy
+    # path, but kept defensively so this block remains correct if step 2a is
+    # ever skipped or factored out.
     macro: dict[str, pd.Series] = {}
-    macro_keys = ["SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO"]
 
     if not dry_run:
         for key in macro_keys:
@@ -626,134 +778,6 @@ def daily_append(
                 n_partial += 1
             else:
                 n_ok += 1
-
-    # ── 5. Update macro series ───────────────────────────────────────────────
-    # update() semantics: same-date rows overwrite instead of appending. See
-    # commentary at the universe_lib.update() call above for the 2026-04-15
-    # duplicate-row diagnosis.
-    #
-    # Per feedback_hard_fail_until_stable: count which keys got updated vs
-    # silently skipped due to missing closes data, verify the writes actually
-    # landed, and raise with a named reject list if anything went missing.
-    # Previous behavior: if closes.get(key) returned None (upstream collection
-    # gap), the update was silently skipped. Combined with stock tickers all
-    # hitting the "today already exists" skip path after a backfill, a run
-    # could return status="ok" with ZERO data actually written. 2026-04-15
-    # 08:39 PT manual rerun reproduced this — Step Function marked SUCCEEDED,
-    # macro/SPY stayed at 4/10 for 5 days until an inference-side preflight
-    # caught it.
-    macro_missing_from_closes: list[str] = []
-    macro_updated: list[str] = []
-    sector_updated: list[str] = []
-
-    # Track per-symbol write mode (append vs backfill) so the verification
-    # check below can apply the right correctness assertion. Append: last
-    # readback row should equal target_ts. Backfill: target_ts should be
-    # in the readback index (could be anywhere in the middle).
-    macro_write_modes: dict[str, str] = {}
-
-    if not dry_run:
-        for key in macro_keys:
-            bar = closes.get(key)
-            if bar is None or np.isnan(bar.get("Close", np.nan)):
-                macro_missing_from_closes.append(key)
-                continue
-            try:
-                new_row = pd.DataFrame(
-                    [{"Close": bar["Close"]}],
-                    index=pd.DatetimeIndex([today_ts]),
-                )
-                new_row.index.name = "date"
-                mode = _write_row_backfill_safe(macro_lib, key, new_row)
-                macro_updated.append(key)
-                macro_write_modes[key] = mode
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Failed to update macro {key} bar for {date_str}: {exc}"
-                ) from exc
-
-        # Sector ETFs — iterate the expected list explicitly rather than
-        # filtering closes.keys(), so a missing XL* key surfaces as a loud
-        # reject instead of a silent skip.
-        sector_etfs = ["XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
-                       "XLP", "XLRE", "XLU", "XLV", "XLY"]
-        for sym in sector_etfs:
-            bar = closes.get(sym)
-            if bar is None or np.isnan(bar.get("Close", np.nan)):
-                macro_missing_from_closes.append(sym)
-                continue
-            try:
-                new_row = pd.DataFrame(
-                    [{"Close": bar["Close"]}],
-                    index=pd.DatetimeIndex([today_ts]),
-                )
-                new_row.index.name = "date"
-                mode = _write_row_backfill_safe(macro_lib, sym, new_row)
-                sector_updated.append(sym)
-                macro_write_modes[sym] = mode
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Failed to update sector ETF {sym} bar for {date_str}: {exc}"
-                ) from exc
-
-        # Hard-fail on any missing key — macro inputs are not optional.
-        # downstream feature compute + predictor preflight both depend on
-        # these being fresh.
-        if macro_missing_from_closes:
-            raise RuntimeError(
-                f"Macro/sector-ETF keys missing from today's daily_closes "
-                f"parquet: {macro_missing_from_closes}. Upstream daily_closes "
-                f"collection (polygon → FRED → yfinance fallback chain) did "
-                f"not produce bars for these tickers on {date_str}. Macro "
-                f"data is critical for downstream inference (SPY for "
-                f"return_vs_spy_5d, VIX for vix_level, sector ETFs for "
-                f"sector-relative features). Fix the upstream collection "
-                f"before claiming pipeline success."
-            )
-
-        # Verify writes landed. The update() / write() calls above are
-        # fire-and-forget (no return value surfaces a success flag), so
-        # we read back each key and assert target_ts is present. The
-        # check is mode-aware:
-        #   - append mode: last readback row should equal target_ts
-        #     (catches the 2026-04-15 silent-stale failure where SSM
-        #     reported SUCCEEDED but macro/SPY stayed 5 days behind)
-        #   - backfill mode: target_ts should be IN the readback index,
-        #     anywhere (last date is naturally future relative to
-        #     target_ts when we backfill an old date)
-        target_ts_norm = today_ts.normalize()
-        verification_failures: list[tuple[str, str]] = []
-        for key in macro_updated + sector_updated:
-            try:
-                readback = macro_lib.read(key).data
-            except Exception as exc:
-                verification_failures.append((key, f"readback error: {exc}"))
-                continue
-            if readback.empty:
-                verification_failures.append((key, "readback empty"))
-                continue
-            mode = macro_write_modes.get(key, "append")
-            if mode == "backfill":
-                # Target date should be present somewhere in the series.
-                index_norm = pd.DatetimeIndex(readback.index).normalize()
-                if target_ts_norm not in index_norm:
-                    verification_failures.append(
-                        (key, f"backfill target {target_ts_norm.date()} not in readback index "
-                              f"(last={pd.Timestamp(readback.index[-1]).date()})")
-                    )
-            else:
-                last_ts = pd.Timestamp(readback.index[-1]).normalize()
-                if last_ts != target_ts_norm:
-                    verification_failures.append(
-                        (key, f"last date {last_ts.date()} != expected {target_ts_norm.date()}")
-                    )
-        if verification_failures:
-            raise RuntimeError(
-                f"Macro update verification failed for {date_str}: "
-                f"{verification_failures}. update()/write() calls completed without "
-                f"exception but readback shows the row is missing. Investigate "
-                f"ArcticDB commit / consistency semantics."
-            )
 
     t_total = time.time() - t0
 
