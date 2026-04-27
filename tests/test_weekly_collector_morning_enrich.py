@@ -167,6 +167,100 @@ def test_morning_enrich_default_date_uses_previous_trading_day():
     assert result["date"] == "2026-04-23"
 
 
+# ── daily_data health stamp refresh ─────────────────────────────────────────
+
+
+def test_morning_enrich_refreshes_daily_data_stamp_on_success():
+    """On success, _run_morning_enrich must call _write_module_health to refresh
+    the `daily_data` stamp. Without this the executor's 26h staleness gate trips
+    on Monday mornings (post-close stamp from Friday afternoon → ~65h on Monday
+    open). Regression: 2026-04-27 weekday SF aborted on this exact gap."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-04-24", dry_run=False, morning_enrich=True)
+
+    fake_constituents = MagicMock()
+    fake_constituents.load_from_s3.return_value = {"tickers": ["AAPL"]}
+
+    health_calls = []
+    def fake_write_health(bucket, module_name, run_date, status, **kwargs):
+        health_calls.append({
+            "bucket": bucket, "module_name": module_name,
+            "run_date": run_date, "status": status, **kwargs,
+        })
+
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("weekly_collector.daily_closes.collect",
+               return_value={"status": "ok", "polygon": 913, "fred": 4,
+                             "yfinance": 0, "tickers_captured": 917,
+                             "source": "polygon_only"}), \
+         patch("builders.daily_append.daily_append",
+               return_value={"status": "ok"}), \
+         patch("weekly_collector._write_module_health", side_effect=fake_write_health):
+        result = weekly_collector._run_morning_enrich(config, args)
+
+    assert result["status"] == "ok"
+    assert len(health_calls) == 1, "expected exactly one daily_data stamp write"
+    stamp = health_calls[0]
+    assert stamp["module_name"] == "daily_data"
+    assert stamp["run_date"] == "2026-04-24"
+    assert stamp["status"] == "ok"
+    assert stamp["summary"]["morning_enrich"] is True
+    assert stamp["summary"]["polygon"] == 913
+
+
+def test_morning_enrich_does_not_stamp_on_polygon_failure():
+    """If polygon fails the prior stamp must be left in place — executor's
+    staleness gate then fires correctly. Writing a fresh "ok" stamp on failure
+    would mask the outage."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-04-24", dry_run=False, morning_enrich=True)
+
+    fake_constituents = MagicMock()
+    fake_constituents.load_from_s3.return_value = {"tickers": ["AAPL"]}
+
+    health_calls = []
+    def fake_write_health(*args_, **kwargs):
+        health_calls.append(kwargs)
+
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("weekly_collector.daily_closes.collect",
+               side_effect=PolygonForbiddenError("403 simulation")), \
+         patch("weekly_collector._write_module_health", side_effect=fake_write_health):
+        result = weekly_collector._run_morning_enrich(config, args)
+
+    assert result["status"] == "failed"
+    assert health_calls == [], (
+        "morning_enrich must NOT refresh daily_data stamp on failure — would "
+        "mask outages from the executor's staleness gate"
+    )
+
+
+def test_morning_enrich_does_not_stamp_in_dry_run():
+    """Dry runs (CLI --dry-run, backfill rehearsals) must not touch S3 stamps."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-04-24", dry_run=True, morning_enrich=True)
+
+    fake_constituents = MagicMock()
+    fake_constituents.load_from_s3.return_value = {"tickers": ["AAPL"]}
+
+    health_calls = []
+    def fake_write_health(*args_, **kwargs):
+        health_calls.append(kwargs)
+
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("weekly_collector.daily_closes.collect",
+               return_value={"status": "ok_dry_run", "polygon": 1, "fred": 0,
+                             "yfinance": 0, "tickers_captured": 1,
+                             "source": "polygon_only"}), \
+         patch("builders.daily_append.daily_append",
+               return_value={"status": "ok"}), \
+         patch("weekly_collector._write_module_health", side_effect=fake_write_health):
+        result = weekly_collector._run_morning_enrich(config, args)
+
+    assert result["status"] == "ok"
+    assert health_calls == []
+
+
 # ── --daily routes through yfinance_only ────────────────────────────────────
 
 

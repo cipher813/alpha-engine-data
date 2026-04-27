@@ -524,6 +524,36 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     statuses = [r.get("status", "unknown") for r in results["collectors"].values()]
     results["status"] = "ok" if all(s in ("ok", "ok_dry_run") for s in statuses) else "failed"
 
+    # Refresh the `daily_data` health stamp on success. Without this the
+    # executor's 26h staleness gate trips on Monday mornings (post-close stamp
+    # is from Friday ~13h before market close → ~65h on Monday open). Only
+    # write on success — a failed morning_enrich must leave the prior stamp
+    # in place so the gate fires correctly. Post-close DailyData run still
+    # writes the canonical stamp; this is a refresh after the polygon overwrite.
+    if not dry_run and results["status"] == "ok":
+        _dc = results["collectors"].get("daily_closes", {})
+        try:
+            _morning_duration = (
+                datetime.fromisoformat(results["completed_at"])
+                - datetime.fromisoformat(results["started_at"])
+            ).total_seconds()
+        except Exception:
+            _morning_duration = 0.0
+        _write_module_health(
+            bucket,
+            module_name="daily_data",
+            run_date=target_date,
+            status="ok",
+            summary={
+                "tickers_captured": _dc.get("tickers_captured", 0),
+                "polygon": _dc.get("polygon", 0),
+                "fred": _dc.get("fred", 0),
+                "yfinance": _dc.get("yfinance", 0),
+                "morning_enrich": True,
+            },
+            duration_seconds=_morning_duration,
+        )
+
     duration = ""
     try:
         start = datetime.fromisoformat(results["started_at"])
