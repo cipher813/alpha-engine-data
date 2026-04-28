@@ -107,8 +107,11 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: alpha-engine-saturday
-      Description: Saturday 00:00 UTC — triggers full Alpha Engine pipeline
-      ScheduleExpression: 'cron(0 0 ? * SAT *)'
+      # Schedule chosen so polygon's Friday daily aggregate has settled
+      # (T+1 lag) before MorningEnrich + DataPhase1 fetch it.
+      # 09:00 UTC = 02:00 AM PT Sat (PDT) / 01:00 AM PT Sat (PST).
+      Description: Saturday 09:00 UTC (02:00 AM PT) — triggers full Alpha Engine pipeline after polygon T+1 settle
+      ScheduleExpression: 'cron(0 9 ? * SAT *)'
       State: ENABLED
       Targets:
         - Id: saturday-pipeline

@@ -213,9 +213,9 @@ echo "Creating EventBridge rule: $EVENTBRIDGE_RULE..."
 
 aws events put-rule \
   --name "$EVENTBRIDGE_RULE" \
-  --schedule-expression "cron(0 0 ? * SAT *)" \
+  --schedule-expression "cron(0 9 ? * SAT *)" \
   --state ENABLED \
-  --description "Saturday 00:00 UTC (Friday 5/8pm PT) — triggers full Alpha Engine pipeline" \
+  --description "Saturday 09:00 UTC (02:00 AM PT Sat) — triggers full Alpha Engine pipeline. Schedule chosen so polygon's Friday daily aggregate has settled (T+1 lag) before MorningEnrich + DataPhase1 fetch it." \
   --region "$REGION"
 
 # EventBridge needs a role to start Step Functions executions
@@ -274,7 +274,7 @@ aws events put-targets \
   }]' \
   --region "$REGION"
 
-echo "  EventBridge rule: cron(0 0 ? * SAT *) -> $STATE_MACHINE_NAME"
+echo "  EventBridge rule: cron(0 9 ? * SAT *) -> $STATE_MACHINE_NAME"
 
 # ── 5. Disable old crons (optional) ────────────────────────────────────────
 

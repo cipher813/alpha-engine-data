@@ -433,6 +433,31 @@ set -euo pipefail
 cd /home/ec2-user/alpha-engine-data
 ${ENV_SOURCE}
 
+# ── Morning enrich (Saturday-morning polygon-T+1 fill) ────────────────
+# Polygon's grouped-daily aggregate for date T isn't fully settled
+# until the next calendar day (T+1). The Friday weekday-SF run
+# (Friday ~13:05 PT) collects daily_closes pre-settlement, so Friday's
+# row in S3 + ArcticDB may carry stale / partial polygon data.
+#
+# By the time the Saturday SF kicks off (09:00 UTC = 02:00 AM PT Sat),
+# polygon's Friday data IS settled. This step re-fetches Friday's
+# daily_closes via polygon (same code path the weekday SF MorningEnrich
+# Lambda uses) and re-appends to ArcticDB so all downstream Saturday
+# work (Phase 1 prices, RAG, predictor training, backtester) reads
+# polygon-authoritative Friday closes.
+#
+# Order matters: must run BEFORE Phase 1 + builders.prune_delisted_tickers
+# so universe-state reflects the corrected Friday data.
+echo "──────────────────────────────────────────────────────────────"
+echo "Starting weekly_collector.py --morning-enrich (Friday polygon-T+1 fill) at \$(date)"
+echo "──────────────────────────────────────────────────────────────"
+if ! $REMOTE_PYTHON weekly_collector.py --morning-enrich 2>&1; then
+    echo "ERROR: weekly_collector.py --morning-enrich failed — Friday's polygon-authoritative daily_closes not collected. Aborting Saturday pipeline so downstream consumers don't read stale data." >&2
+    exit 1
+fi
+echo "MorningEnrich complete at \$(date)"
+
+echo ""
 echo "──────────────────────────────────────────────────────────────"
 echo "Starting weekly_collector.py --phase 1 at \$(date)"
 echo "──────────────────────────────────────────────────────────────"
