@@ -57,6 +57,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import boto3
@@ -69,6 +72,7 @@ log = logging.getLogger(__name__)
 
 OHLCV_COLS_CANONICAL = ["Open", "High", "Low", "Close", "Volume", "VWAP"]
 AUDIT_PREFIX = "builders/migrate_universe_vwap_audit/"
+DEFAULT_WORKERS = 16
 
 
 def _canonical_column_order(existing_cols: list[str]) -> list[str]:
@@ -149,30 +153,39 @@ def migrate_universe_vwap(
     already_canonical: list[str] = []
     errors: list[dict] = []
 
-    for ticker in targets:
+    # Each per-symbol op is read → transform → write — all S3-bound, GIL
+    # released on every network call. Mirror daily_append's Phase 2 fan-out:
+    # one ThreadPoolExecutor across all symbols, env-overridable worker count
+    # so prod can tune without a redeploy. The first apply run on the full
+    # 904-symbol universe at sequential speed (~8/min) hit the SSM 1-hour
+    # ceiling at 60% complete; threading at 16 workers brings it to ~10 min.
+    workers = int(os.environ.get("MIGRATE_UNIVERSE_VWAP_WORKERS", str(DEFAULT_WORKERS)))
+
+    def _migrate_one(ticker: str) -> dict:
+        """Read → transform → (optionally) write a single symbol.
+
+        Returns a per-ticker outcome dict so the main thread can aggregate.
+        Exceptions are captured into the dict (not raised) so one bad symbol
+        never aborts the batch.
+        """
         try:
             df = universe_lib.read(ticker).data
         except Exception as exc:
-            log.error("Could not read %s: %s", ticker, exc)
-            errors.append({"ticker": ticker, "stage": "read", "error": str(exc)})
-            continue
+            return {"ticker": ticker, "outcome": "read_error", "error": str(exc)}
 
         existing_cols = list(df.columns)
         if _is_canonical(existing_cols):
-            already_canonical.append(ticker)
-            continue
+            return {"ticker": ticker, "outcome": "already_canonical"}
 
-        # Add VWAP if absent. FLOAT64 matches the daily_append write dtype
-        # (pandas-inferred from the closes parquet) so future update() calls
-        # don't trip the dtype-mismatch path.
         if "VWAP" not in df.columns:
-            df["VWAP"] = np.nan  # float64 by default
+            df["VWAP"] = np.nan  # float64 by default — matches daily_append dtype
 
         canonical = _canonical_column_order(list(df.columns))
         df = df[canonical]
 
         record = {
             "ticker": ticker,
+            "outcome": "migrated",
             "rows": len(df),
             "had_vwap": "VWAP" in existing_cols,
             "previous_vwap_idx": (
@@ -180,24 +193,44 @@ def migrate_universe_vwap(
             ),
             "new_vwap_idx": canonical.index("VWAP"),
         }
-
         if apply:
             try:
                 universe_lib.write(ticker, df, prune_previous_versions=True)
             except Exception as exc:
-                log.error("Failed to write %s: %s", ticker, exc)
-                errors.append({"ticker": ticker, "stage": "write", "error": str(exc)})
-                continue
+                return {"ticker": ticker, "outcome": "write_error", "error": str(exc)}
+        return record
+
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(_migrate_one, targets))
+    elapsed = time.time() - t0
+    log.info(
+        "Threadpooled migration: %d targets in %.1fs (workers=%d)",
+        len(targets), elapsed, workers,
+    )
+
+    # Aggregation runs on the main thread — counter mutation stays
+    # single-threaded so we don't need locks (mirrors daily_append).
+    for r in results:
+        outcome = r["outcome"]
+        if outcome == "already_canonical":
+            already_canonical.append(r["ticker"])
+        elif outcome == "migrated":
+            log_prefix = "MIGRATED" if apply else "DRY-RUN would migrate"
             log.info(
-                "MIGRATED ticker=%s rows=%d previous_vwap_idx=%s -> new_vwap_idx=%d",
-                ticker, len(df), record["previous_vwap_idx"], record["new_vwap_idx"],
+                "%s ticker=%s rows=%d previous_vwap_idx=%s -> new_vwap_idx=%d",
+                log_prefix, r["ticker"], r["rows"],
+                r["previous_vwap_idx"], r["new_vwap_idx"],
             )
+            migrated.append(r)
+        elif outcome == "read_error":
+            log.error("Could not read %s: %s", r["ticker"], r["error"])
+            errors.append({"ticker": r["ticker"], "stage": "read", "error": r["error"]})
+        elif outcome == "write_error":
+            log.error("Failed to write %s: %s", r["ticker"], r["error"])
+            errors.append({"ticker": r["ticker"], "stage": "write", "error": r["error"]})
         else:
-            log.info(
-                "DRY-RUN would migrate ticker=%s rows=%d previous_vwap_idx=%s -> new_vwap_idx=%d",
-                ticker, len(df), record["previous_vwap_idx"], record["new_vwap_idx"],
-            )
-        migrated.append(record)
+            raise RuntimeError(f"unexpected outcome={outcome!r} for {r['ticker']}")
 
     summary = {
         "status": "ok" if not errors else "partial",
@@ -207,6 +240,8 @@ def migrate_universe_vwap(
         "migrated_count": len(migrated),
         "already_canonical_count": len(already_canonical),
         "errors_count": len(errors),
+        "elapsed_seconds": round(elapsed, 1),
+        "workers": workers,
         "migrated": migrated,
         "already_canonical": already_canonical,
         "errors": errors,
@@ -214,8 +249,9 @@ def migrate_universe_vwap(
 
     log.info(
         "migrate_universe_vwap: applied=%s targets=%d migrated=%d "
-        "already_canonical=%d errors=%d",
-        apply, len(targets), len(migrated), len(already_canonical), len(errors),
+        "already_canonical=%d errors=%d elapsed=%.1fs workers=%d",
+        apply, len(targets), len(migrated), len(already_canonical),
+        len(errors), elapsed, workers,
     )
 
     _write_audit(s3, bucket, summary)

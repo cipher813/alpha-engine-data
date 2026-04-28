@@ -261,3 +261,124 @@ def test_migration_preserves_feature_block_order(monkeypatch):
         "Open", "High", "Low", "Close", "Volume", "VWAP",
         "feat_z", "feat_a", "feat_m",
     ]
+
+
+# ── threading invariants ─────────────────────────────────────────────────────
+
+
+def test_migration_uses_threadpool_executor():
+    """Source-text invariant: the per-symbol fan-out must use
+    ThreadPoolExecutor.
+
+    Locks the speedup. The first prod run hit the SSM 1-hour ceiling at
+    sequential speed (~8 symbols/min over 904 universe symbols, ~120 min
+    needed); a regression to single-threaded would re-introduce that
+    timeout class. Mirrors daily_append's Phase 2 fan-out pattern.
+    """
+    from pathlib import Path
+    src = Path(__file__).parent.parent.joinpath(
+        "builders", "migrate_universe_vwap.py"
+    ).read_text()
+    assert "from concurrent.futures import ThreadPoolExecutor" in src, (
+        "ThreadPoolExecutor import missing — fan-out has been reverted to "
+        "sequential and will hit SSM's 1-hour timeout on a full-universe run."
+    )
+    assert "ThreadPoolExecutor(max_workers=workers)" in src, (
+        "ThreadPoolExecutor not used — see daily_append.py Phase 2 for the "
+        "canonical fan-out pattern."
+    )
+
+
+def test_migration_workers_env_overridable():
+    """Worker count must be tunable via env var without a redeploy —
+    mirrors DAILY_APPEND_WRITE_WORKERS so prod can react if the boto3
+    connection-pool ceiling changes."""
+    from pathlib import Path
+    src = Path(__file__).parent.parent.joinpath(
+        "builders", "migrate_universe_vwap.py"
+    ).read_text()
+    assert "MIGRATE_UNIVERSE_VWAP_WORKERS" in src, (
+        "Env-var override missing — prod can't tune worker count without "
+        "a code change + redeploy."
+    )
+
+
+def test_migration_threaded_all_writes_succeed(monkeypatch):
+    """Functional: with N>1 symbols, all writes complete and all results
+    aggregate correctly. Catches a regression where the threaded result
+    aggregation drops some symbols (e.g. iterating a generator twice)."""
+    frames = {
+        f"TKR{i}": _stock_frame([
+            "Open", "High", "Low", "Close", "Volume",
+            "rsi_14", "macd_cross",
+        ])
+        for i in range(20)
+    }
+    universe_lib, state = _patch_libs(monkeypatch, frames)
+    result = migrate_universe_vwap(apply=True)
+    assert result["migrated_count"] == 20
+    assert result["errors_count"] == 0
+    assert universe_lib.write.call_count == 20
+    # Every symbol now has VWAP at idx=5
+    for ticker in frames:
+        assert list(state[ticker].columns)[5] == "VWAP"
+
+
+def test_migration_threaded_summary_includes_elapsed_and_workers(monkeypatch):
+    """Summary must include elapsed_seconds + workers for ops observability —
+    SSM-timeout-vs-finish requires knowing both."""
+    frames = {
+        "AAPL": _stock_frame([
+            "Open", "High", "Low", "Close", "Volume", "rsi_14",
+        ]),
+    }
+    _patch_libs(monkeypatch, frames)
+    result = migrate_universe_vwap(apply=True)
+    assert "elapsed_seconds" in result
+    assert "workers" in result
+    assert result["workers"] >= 1
+
+
+def test_migration_threaded_aggregates_mixed_outcomes(monkeypatch):
+    """Mixed-outcome run: some symbols already canonical, some need
+    migration, one read-fails, one write-fails. All should aggregate
+    cleanly into the correct buckets."""
+    canonical_cols = [
+        "Open", "High", "Low", "Close", "Volume", "VWAP",
+        "rsi_14",
+    ]
+    needs_migration_cols = [
+        "Open", "High", "Low", "Close", "Volume", "rsi_14",
+    ]
+    frames = {
+        "ALREADY_OK": _stock_frame(canonical_cols),
+        "NEEDS_FIX_1": _stock_frame(needs_migration_cols),
+        "NEEDS_FIX_2": _stock_frame(needs_migration_cols),
+        "READ_BREAKS": _stock_frame(needs_migration_cols),
+        "WRITE_BREAKS": _stock_frame(needs_migration_cols),
+    }
+    universe_lib, state = _patch_libs(monkeypatch, frames)
+
+    original_read = universe_lib.read.side_effect
+
+    def _selective_read(ticker):
+        if ticker == "READ_BREAKS":
+            raise RuntimeError("simulated arctic read failure")
+        return original_read(ticker)
+
+    universe_lib.read.side_effect = _selective_read
+
+    def _selective_write(ticker, df, prune_previous_versions=False):
+        if ticker == "WRITE_BREAKS":
+            raise RuntimeError("simulated arctic write failure")
+        state[ticker] = df.copy()
+
+    universe_lib.write.side_effect = _selective_write
+
+    result = migrate_universe_vwap(apply=True)
+    assert result["migrated_count"] == 2  # NEEDS_FIX_1, NEEDS_FIX_2
+    assert result["already_canonical_count"] == 1  # ALREADY_OK
+    assert result["errors_count"] == 2  # READ_BREAKS + WRITE_BREAKS
+    error_tickers = {e["ticker"] for e in result["errors"]}
+    assert error_tickers == {"READ_BREAKS", "WRITE_BREAKS"}
+    assert result["status"] == "partial"
