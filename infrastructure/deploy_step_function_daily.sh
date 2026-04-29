@@ -150,12 +150,12 @@ echo "  State machine ARN: $SM_ARN"
 
 echo "Creating EventBridge rule: $EVENTBRIDGE_RULE..."
 
-# 13:05 UTC = 6:05 AM PT (Mon-Fri)
+# 13:00 UTC = 6:00 AM PT (Mon-Fri)
 aws events put-rule \
   --name "$EVENTBRIDGE_RULE" \
-  --schedule-expression "cron(5 13 ? * MON-FRI *)" \
+  --schedule-expression "cron(0 13 ? * MON-FRI *)" \
   --state ENABLED \
-  --description "Weekday 13:05 UTC (6:05 AM PT) — daily data + predictor + executor start" \
+  --description "Weekday 13:00 UTC (6:00 AM PT) — daily data + predictor + executor start" \
   --region "$REGION"
 
 # Reuse EventBridge role from Saturday pipeline
@@ -199,7 +199,7 @@ aws events put-targets \
   }]' \
   --region "$REGION"
 
-echo "  EventBridge rule: cron(5 13 ? * MON-FRI *) -> $STATE_MACHINE_NAME"
+echo "  EventBridge rule: cron(0 13 ? * MON-FRI *) -> $STATE_MACHINE_NAME"
 
 # ── Disable old rules (optional) ───────────────────────────────────────────
 

@@ -127,8 +127,8 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: alpha-engine-weekday
-      Description: Weekday 13:05 UTC (6:05 AM PT) — daily data + predictor + executor
-      ScheduleExpression: 'cron(5 13 ? * MON-FRI *)'
+      Description: Weekday 13:00 UTC (6:00 AM PT) — daily data + predictor + executor
+      ScheduleExpression: 'cron(0 13 ? * MON-FRI *)'
       State: ENABLED
       Targets:
         - Id: weekday-pipeline
