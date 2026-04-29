@@ -490,7 +490,7 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
             bucket=bucket,
             tickers=tickers,
             run_date=target_date,
-            s3_prefix=daily_cfg.get("s3_prefix", "predictor/daily_closes/"),
+            s3_prefix=daily_cfg.get("s3_prefix", "staging/daily_closes/"),
             dry_run=dry_run,
             source="polygon_only",
         )
@@ -635,7 +635,7 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
             bucket=bucket,
             tickers=tickers,
             run_date=run_date,
-            s3_prefix=daily_cfg.get("s3_prefix", "predictor/daily_closes/"),
+            s3_prefix=daily_cfg.get("s3_prefix", "staging/daily_closes/"),
             dry_run=dry_run,
             source="yfinance_only",
         )

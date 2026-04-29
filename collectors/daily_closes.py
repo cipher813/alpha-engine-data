@@ -1,9 +1,14 @@
 """
 collectors/daily_closes.py — Daily OHLCV archive for all tracked tickers.
 
-Writes one parquet per trading day at predictor/daily_closes/{date}.parquet.
-The predictor inference Lambda uses these to bridge the gap between the
-weekly slim cache and today's prices, avoiding a full 2-year yfinance fetch.
+Writes one parquet per trading day at staging/daily_closes/{date}.parquet.
+The parquet is the in-flight checkpoint between the API fetch (polygon /
+FRED / yfinance) and ArcticDB ingest by ``builders/daily_append.py``.
+Lives under ``staging/`` (not ``predictor/``) because it is intermediate
+state, not authoritative storage — the canonical home for daily OHLCV
+is ArcticDB universe library. S3 lifecycle policy on ``staging/`` expires
+parquets after 7 days; the parquet's only role is restartability when
+daily_append fails after the upstream fetch succeeded.
 
 Two collection modes (selected via the ``source`` parameter):
 
@@ -86,7 +91,7 @@ def collect(
     bucket: str,
     tickers: list[str],
     run_date: str | None = None,
-    s3_prefix: str = "predictor/daily_closes/",
+    s3_prefix: str = "staging/daily_closes/",
     dry_run: bool = False,
     source: str = "auto",
 ) -> dict:
