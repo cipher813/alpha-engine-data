@@ -3,7 +3,7 @@
 Phase 7 VWAP centralization contract:
 
   * Polygon grouped-daily produces true volume-weighted VWAP. That value flows
-    via ``collectors/daily_closes.py`` → ``predictor/daily_closes/*.parquet``
+    via ``collectors/daily_closes.py`` → ``staging/daily_closes/*.parquet``
     → ``builders/daily_append.py::_load_daily_closes`` → ArcticDB universe.
   * Any other source (yfinance fallback, FRED single-close, legacy backfill
     price_cache) writes ``None`` / NaN for VWAP. No ``(H+L+C)/3`` proxy.

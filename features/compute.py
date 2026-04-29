@@ -14,7 +14,7 @@ Usage:
     python -m features.compute --dry-run                # compute but skip S3 write
 
 Data sources:
-    Prices:       predictor/price_cache_slim/*.parquet + predictor/daily_closes/{date}.parquet
+    Prices:       predictor/price_cache_slim/*.parquet + staging/daily_closes/{date}.parquet
     Macro:        SPY, VIX, TNX, IRX, GLD, USO, VIX3M (from slim cache)
     Sector map:   data/sector_map.json
     Fundamentals: archive/fundamentals/{date}.json (cached by prior inference)
@@ -130,7 +130,7 @@ def _load_delta_from_daily_closes(
 
     n_missing_dates = 0
     for d in delta_dates:
-        key = f"predictor/daily_closes/{d}.parquet"
+        key = f"staging/daily_closes/{d}.parquet"
         try:
             obj = s3.get_object(Bucket=bucket, Key=key)
         except s3.exceptions.NoSuchKey:

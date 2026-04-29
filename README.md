@@ -150,7 +150,7 @@ pytest tests/ -v  # 56 tests
 |------|---------|-----------|
 | `arcticdb/universe/` | 10y OHLCV for 909 tickers | Weekly |
 | `arcticdb/universe_slim/` | 2y OHLCV slices | Weekly |
-| `predictor/daily_closes/{date}.parquet` | Daily OHLCV | Daily |
+| `staging/daily_closes/{date}.parquet` | Daily OHLCV — intermediate staging (7-day lifecycle); canonical home is ArcticDB universe | Daily |
 | `predictor/feature_store/{date}/` | 54 features x 903 tickers | Weekly + Daily |
 | `market_data/weekly/{date}/` | Constituents, macro, alternative data | Weekly |
 | `health/data_phase1.json` | Phase 1 completion marker | Weekly |

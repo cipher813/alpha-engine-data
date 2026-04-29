@@ -181,7 +181,7 @@ def _load_daily_closes(s3, bucket: str, date_str: str) -> dict[str, dict]:
     consumers (executor's ``load_daily_vwap``) handle NaN by walking back up
     to 5 trading days for a populated value.
     """
-    key = f"predictor/daily_closes/{date_str}.parquet"
+    key = f"staging/daily_closes/{date_str}.parquet"
     obj = s3.get_object(Bucket=bucket, Key=key)
     buf = io.BytesIO(obj["Body"].read())
     df = pd.read_parquet(buf, engine="pyarrow")
