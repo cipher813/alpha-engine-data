@@ -1,5 +1,4 @@
 {
-  "_comment": "S3 lifecycle policy for the staging/ prefix on alpha-engine-research bucket. The staging/daily_closes/ parquets are intermediate state between API fetch (polygon/FRED/yfinance) and ArcticDB ingest by builders/daily_append.py — their only role is restartability when daily_append fails after the upstream fetch succeeded. Canonical home for daily OHLCV is the ArcticDB universe library, not S3 parquet. 7-day expiration is generous compared to the typical retry window (same-day) but absorbs cold-storage debugging usage (aws s3 cp parquet locally for incident triage) without letting old parquets accumulate.",
   "Rules": [
     {
       "ID": "expire-staging-after-7-days",
@@ -12,6 +11,22 @@
       },
       "AbortIncompleteMultipartUpload": {
         "DaysAfterInitiation": 1
+      }
+    },
+    {
+      "ID": "feature-store-retention",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "features/"
+      },
+      "Transitions": [
+        {
+          "Days": 90,
+          "StorageClass": "STANDARD_IA"
+        }
+      ],
+      "Expiration": {
+        "Days": 365
       }
     }
   ]

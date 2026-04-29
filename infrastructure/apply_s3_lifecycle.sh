@@ -2,9 +2,18 @@
 #
 # apply_s3_lifecycle.sh — Apply S3 lifecycle policy on alpha-engine-research.
 #
-# The current policy expires the staging/ prefix after 7 days; see
-# s3_lifecycle_staging.json for rationale. Idempotent — put-bucket-lifecycle-
-# configuration replaces the full policy body, so re-running is safe.
+# The policy file (s3_lifecycle_staging.json) is the single source of truth
+# for ALL bucket lifecycle rules — put-bucket-lifecycle-configuration replaces
+# the entire document on apply. Current rules:
+#
+#   - staging/        7-day expiration (added 2026-04-29 in PR #112; the
+#                     daily_closes parquet is intermediate state between API
+#                     fetch and ArcticDB ingest by builders/daily_append.py).
+#   - features/       90-day STANDARD_IA transition + 365-day expiration
+#                     (pre-existing rule, preserved when staging/ was added).
+#
+# Add new rules INTO this file's Rules array — never split across files.
+# Idempotent — re-running pushes the same policy.
 #
 # Usage:
 #   ./infrastructure/apply_s3_lifecycle.sh                 # apply
