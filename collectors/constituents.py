@@ -68,6 +68,14 @@ def collect(
     if not tickers:
         return {"status": "error", "error": "No tickers fetched"}
 
+    unmapped = [t for t in tickers if t not in sector_map]
+    if unmapped:
+        raise RuntimeError(
+            f"Sector mapping incomplete: {len(unmapped)} of {len(tickers)} tickers "
+            f"missing GICS sector. Sample: {unmapped[:10]}. EOD reconcile sector "
+            f"attribution depends on full coverage; aborting before write."
+        )
+
     result = {
         "date": run_date,
         "tickers": tickers,
@@ -155,21 +163,26 @@ def _fetch_constituents() -> tuple[list[str], dict[str, str], dict[str, str], in
             else:
                 sp400_count = len(batch)
 
-            # Extract GICS sector mapping from S&P 500 table
-            if index_name == "S&P 500":
-                sector_col = next(
-                    (c for c in df.columns if "gics" in str(c).lower() and "sector" in str(c).lower()
-                     and "sub" not in str(c).lower()),
-                    None,
+            sector_col = next(
+                (c for c in df.columns if "gics" in str(c).lower() and "sector" in str(c).lower()
+                 and "sub" not in str(c).lower()),
+                None,
+            )
+            if sector_col is None:
+                raise RuntimeError(
+                    f"GICS sector column missing from {index_name} Wikipedia table "
+                    f"(columns: {list(df.columns)}). Column-name drift — extractor needs update."
                 )
-                if sector_col:
-                    for ticker, sector in zip(batch, df[sector_col].astype(str).tolist()):
-                        sector_name = sector.strip()
-                        sector_map[ticker] = sector_name
-                        etf = GICS_TO_ETF.get(sector_name)
-                        if etf:
-                            sector_etf_map[ticker] = etf
-                    logger.info("Sector map: %d tickers mapped", len(sector_etf_map))
+            for ticker, sector in zip(batch, df[sector_col].astype(str).tolist()):
+                sector_name = sector.strip()
+                sector_map[ticker] = sector_name
+                etf = GICS_TO_ETF.get(sector_name)
+                if etf:
+                    sector_etf_map[ticker] = etf
+            logger.info(
+                "[%s] Sector map: %d added (running total: %d sectors, %d ETFs)",
+                index_name, len(batch), len(sector_map), len(sector_etf_map),
+            )
 
         tickers = list(dict.fromkeys(tickers))  # deduplicate, preserve order
 
