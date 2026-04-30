@@ -3,19 +3,28 @@ Data-module preflight: connectivity + freshness checks run at the top of
 ``weekly_collector.main()`` before any real collection work starts.
 
 Primitives live in ``alpha_engine_lib.preflight.BasePreflight``; this
-module only composes them into a mode-specific sequence. See the
-alpha-engine-lib README for the rationale and the 2026-04-14 failure
-mode that motivated the library.
+module composes them with module-specific HTTP probes (polygon, FRED,
+FMP /stable) + an ArcticDB-libraries-present gate.
+
+Consolidated 2026-04-30 — the legacy ``validators/preflight.py`` has been
+retired. Both files were running back-to-back from ``weekly_collector``
+in the phase1 path with overlapping scope; the lib-based path is now
+the single source of truth. See alpha-engine-lib README for the
+2026-04-14 failure mode that motivated the library.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import uuid
+from typing import Any
 
 from alpha_engine_lib.preflight import BasePreflight
 
 log = logging.getLogger(__name__)
+
+_HTTP_TIMEOUT_SECS = 10.0
 
 # FMP /stable probe: cheapest auth-gated call that distinguishes
 # (a) valid key on /stable from (b) a key that still works on the
@@ -26,7 +35,15 @@ log = logging.getLogger(__name__)
 # before detection.
 _FMP_STABLE_PROBE_URL = "https://financialmodelingprep.com/stable/key-metrics-ttm"
 _FMP_STABLE_PROBE_SYMBOL = "AAPL"
-_HTTP_TIMEOUT_SECS = 10.0
+
+# Polygon.io reference-data probe — cheapest auth-gated call that
+# validates both network reachability AND API-key validity.
+_POLYGON_PROBE_URL = "https://api.polygon.io/v3/reference/tickers/AAPL"
+
+# FRED observation probe — DFF (Federal Funds Rate) is a well-known
+# series guaranteed to exist; matches collectors/macro.py usage.
+_FRED_PROBE_URL = "https://api.stlouisfed.org/fred/series/observations"
+_FRED_PROBE_SERIES = "DFF"
 
 
 class DataPreflight(BasePreflight):
@@ -51,14 +68,35 @@ class DataPreflight(BasePreflight):
         self.mode = mode
 
     def run(self) -> None:
+        # Order: cheapest first so a trivially-broken run fails in <1s.
+        # 1. env vars (local lookup)
+        # 2. S3 bucket (~ms, IAM)
+        # 3. mode-specific HTTP probes (~200ms each)
+        # 4. ArcticDB checks (~100ms list_libraries; ~seconds for read)
         self.check_env_vars("AWS_REGION")
         if self.mode == "phase1":
             self.check_env_vars("FRED_API_KEY", "POLYGON_API_KEY")
         elif self.mode == "phase2":
             self.check_env_vars("FMP_API_KEY", "FINNHUB_API_KEY", "EDGAR_IDENTITY")
-            self._check_fmp_stable_reachable()
 
         self.check_s3_bucket()
+
+        if self.mode == "phase1":
+            # Catch credential drift / upstream outages BEFORE 30 min of
+            # collector work. Net ~400ms across both probes.
+            self._check_polygon_reachable()
+            self._check_fred_reachable()
+            # Bucket policies + IAM denies that HEAD doesn't catch:
+            # PUT a sentinel + DELETE it. ~50ms. Caught the 2026-04-12
+            # IAM-deny class on the spot's executor-role inline policy.
+            self._check_s3_writeable_sentinel()
+            # Phase 1 BUILDS ArcticDB universe + macro on first run, but
+            # subsequent runs need both libraries already present. Enforce
+            # that they exist so a typo in path_prefix fails in 100ms not
+            # 50min into the run. Catches the 2026-04-14 silent-skip class.
+            self._check_arcticdb_libraries_present(("universe", "macro"))
+        elif self.mode == "phase2":
+            self._check_fmp_stable_reachable()
 
         if self.mode == "daily":
             # SPY lives in the `macro` library (market-wide series). The
@@ -68,6 +106,9 @@ class DataPreflight(BasePreflight):
             # path being healthy end-to-end.
             # 4-day threshold covers Fri→Tue long weekends + 1 day of buffer.
             self.check_arcticdb_fresh("macro", "SPY", max_stale_days=4)
+            # Both libraries must be present — same gate as phase1 for
+            # operator-clarity on partial-deploy scenarios.
+            self._check_arcticdb_libraries_present(("universe", "macro"))
 
     # ── Mode-specific primitives ─────────────────────────────────────────
 
@@ -122,3 +163,160 @@ class DataPreflight(BasePreflight):
                 f"for {_FMP_STABLE_PROBE_SYMBOL}: {str(payload)[:200]}"
             )
         log.info("preflight: FMP /stable reachable + auth valid (HTTP 200)")
+
+    def _check_polygon_reachable(self) -> None:
+        """Validate polygon.io network + auth via reference-data call.
+
+        Catches expired API key, polygon outage, blocked egress. Does NOT
+        catch rate-limit ceiling (next collector call will retry/fail
+        loudly by design).
+        """
+        import requests
+
+        api_key = os.environ.get("POLYGON_API_KEY", "").strip()
+        try:
+            resp = requests.get(
+                _POLYGON_PROBE_URL,
+                params={"apiKey": api_key},
+                timeout=_HTTP_TIMEOUT_SECS,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"Pre-flight: polygon.io unreachable: {exc} — network outage or egress blocked."
+            ) from exc
+
+        if resp.status_code in (401, 403):
+            raise RuntimeError(
+                f"Pre-flight: polygon.io auth failed (HTTP {resp.status_code}): "
+                f"POLYGON_API_KEY is invalid or revoked."
+            )
+        if resp.status_code >= 500:
+            raise RuntimeError(
+                f"Pre-flight: polygon.io returned HTTP {resp.status_code} on a reference-data call "
+                f"— upstream outage. Check status.polygon.io."
+            )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Pre-flight: polygon.io returned unexpected HTTP {resp.status_code} "
+                f"on {_POLYGON_PROBE_URL}: {resp.text[:200]}"
+            )
+        log.info("preflight: polygon.io reachable + auth valid (HTTP 200)")
+
+    def _check_fred_reachable(self) -> None:
+        """Validate FRED network + auth via single-observation DFF call."""
+        import requests
+
+        api_key = os.environ.get("FRED_API_KEY", "").strip()
+        try:
+            resp = requests.get(
+                _FRED_PROBE_URL,
+                params={
+                    "series_id": _FRED_PROBE_SERIES,
+                    "api_key": api_key,
+                    "file_type": "json",
+                    "sort_order": "desc",
+                    "limit": 1,
+                },
+                timeout=_HTTP_TIMEOUT_SECS,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"Pre-flight: FRED unreachable: {exc} — network outage or egress blocked."
+            ) from exc
+
+        if resp.status_code == 400:
+            # FRED returns 400 with body containing "api_key" on bad key
+            body = resp.text[:200].lower()
+            if "api_key" in body or "invalid" in body:
+                raise RuntimeError(
+                    f"Pre-flight: FRED auth failed (HTTP 400): FRED_API_KEY is invalid. "
+                    f"Response: {resp.text[:200]}"
+                )
+        if resp.status_code >= 500:
+            raise RuntimeError(
+                f"Pre-flight: FRED returned HTTP {resp.status_code} on DFF call "
+                f"— upstream outage."
+            )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Pre-flight: FRED returned unexpected HTTP {resp.status_code}: {resp.text[:200]}"
+            )
+        log.info("preflight: FRED reachable + auth valid (HTTP 200)")
+
+    def _check_s3_writeable_sentinel(self) -> None:
+        """Validate S3 bucket grants PUT + DELETE via a sentinel object.
+
+        ``BasePreflight.check_s3_bucket()`` only HEADs the bucket; that
+        passes when IAM grants ListBucket but denies PutObject (bucket
+        policy or scoped role). Surfacing the deny here saves ~40 min of
+        spot time burning on collectors that all silently write 0 rows.
+        """
+        import boto3
+
+        s3 = boto3.client("s3", region_name=self.region)
+        sentinel_key = f"preflight/sentinel-{uuid.uuid4().hex}.txt"
+        try:
+            s3.put_object(
+                Bucket=self.bucket,
+                Key=sentinel_key,
+                Body=b"preflight-sentinel",
+                ContentType="text/plain",
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Pre-flight: S3 PUT s3://{self.bucket}/{sentinel_key} failed: {exc} — "
+                f"IAM lacks s3:PutObject or bucket policy blocks writes."
+            ) from exc
+
+        try:
+            s3.delete_object(Bucket=self.bucket, Key=sentinel_key)
+        except Exception as exc:
+            # Non-fatal: PUT (the load-bearing op for collectors) succeeded;
+            # missing DELETE means sentinels accumulate but writes work.
+            log.warning(
+                "preflight: sentinel DELETE failed (%s) — preflight-sentinel objects "
+                "may accumulate in s3://%s/preflight/. Check s3:DeleteObject IAM grant.",
+                exc, self.bucket,
+            )
+        log.info("preflight: S3 bucket s3://%s read + write OK", self.bucket)
+
+    def _check_arcticdb_libraries_present(self, expected: tuple[str, ...]) -> None:
+        """Validate ArcticDB connection + that ``expected`` libraries exist.
+
+        ``BasePreflight.check_arcticdb_fresh()`` covers freshness on a
+        specific library/symbol pair, but the libraries-existence gate
+        is a separate concern — useful at the cold-start / partial-deploy
+        boundary where a typo in path_prefix or a half-applied infra
+        change leaves the bucket reachable but the libraries absent.
+        """
+        try:
+            import arcticdb as adb
+        except ImportError as exc:
+            raise RuntimeError(
+                f"Pre-flight: arcticdb not importable — install "
+                f"alpha-engine-lib[arcticdb] or add arcticdb to the deploy image: {exc}"
+            ) from exc
+
+        uri = (
+            f"s3s://s3.{self.region}.amazonaws.com:{self.bucket}"
+            "?path_prefix=arcticdb&aws_auth=true"
+        )
+        try:
+            arctic = adb.Arctic(uri)
+            libs = set(arctic.list_libraries())
+        except Exception as exc:
+            raise RuntimeError(
+                f"Pre-flight: ArcticDB connection failed at {uri}: {exc}. "
+                f"Check s3 prefix + credentials + arcticdb version."
+            ) from exc
+
+        missing = set(expected) - libs
+        if missing:
+            raise RuntimeError(
+                f"Pre-flight: ArcticDB missing expected libraries: {sorted(missing)} "
+                f"(found: {sorted(libs)}). Run backfill or verify path_prefix."
+            )
+        log.info(
+            "preflight: ArcticDB connectable, libraries present: %s",
+            sorted(expected),
+        )
