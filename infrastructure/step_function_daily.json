@@ -23,7 +23,7 @@
           "action": "check_deploy_drift"
         }
       },
-      "TimeoutSeconds": 60,
+      "TimeoutSeconds": 300,
       "Retry": [
         {
           "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
