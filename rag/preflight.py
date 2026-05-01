@@ -20,6 +20,22 @@ import sys
 from alpha_engine_lib.logging import setup_logging
 from alpha_engine_lib.preflight import BasePreflight
 
+# Structured logging + flow-doctor singleton via alpha-engine-lib (shared
+# pattern across all 5 entrypoints; see executor/main.py for reference).
+# Module-top so any import-time error in BasePreflight or downstream
+# pipelines invoked after preflight is captured by flow-doctor's ERROR
+# handler. flow-doctor.yaml lives at the repo root (one dir above rag/).
+_FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
+_FLOW_DOCTOR_YAML = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "flow-doctor.yaml",
+)
+setup_logging(
+    "rag-preflight",
+    flow_doctor_yaml=_FLOW_DOCTOR_YAML,
+    exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -53,13 +69,8 @@ class RAGPreflight(BasePreflight):
 
 def main() -> int:
     """CLI entrypoint invoked by run_weekly_ingestion.sh."""
-    setup_logging(
-        "rag-preflight",
-        flow_doctor_yaml=os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "flow-doctor.yaml",
-        ),
-    )
+    # setup_logging already ran at module-top (see comment near the
+    # alpha_engine_lib.logging import).
     bucket = os.environ.get("ALPHA_ENGINE_BUCKET", "alpha-engine-research")
     RAGPreflight(bucket).run()
     log.info("RAG pre-flight OK")
