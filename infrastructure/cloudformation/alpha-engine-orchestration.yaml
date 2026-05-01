@@ -74,6 +74,128 @@ Resources:
       Endpoint: !Ref AlertEmail
 
   # --------------------------------------------------------------------------
+  # Changelog incident-mirror Lambda — every SNS alert gets mirrored as one
+  # JSON object at s3://alpha-engine-research/changelog/incidents/, parallel
+  # to the deploy entries written by the alpha-engine-docs append-changelog
+  # composite action. Closes the event-mining loop: deploys + incidents +
+  # manual + recovery all interleave by timestamp in the daily-aggregated
+  # CHANGELOG.md.
+  # --------------------------------------------------------------------------
+  ChangelogIncidentMirrorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: alpha-engine-changelog-incident-mirror
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: changelog-incident-mirror-s3
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: arn:aws:s3:::alpha-engine-research/changelog/incidents/*
+
+  ChangelogIncidentMirrorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: alpha-engine-changelog-incident-mirror
+      Description: Mirrors every alpha-engine-alerts SNS message as a JSON entry under s3://alpha-engine-research/changelog/incidents/ for cross-event-source mining.
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.handler
+      Role: !GetAtt ChangelogIncidentMirrorRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          CHANGELOG_BUCKET: alpha-engine-research
+          CHANGELOG_PREFIX: changelog/incidents
+      Code:
+        ZipFile: |
+          """SNS-to-S3 mirror for the system-wide changelog."""
+          import json
+          import os
+          from datetime import datetime, timezone
+          from hashlib import sha1
+
+          import boto3
+
+          _S3 = boto3.client("s3")
+          _BUCKET = os.environ["CHANGELOG_BUCKET"]
+          _PREFIX = os.environ.get("CHANGELOG_PREFIX", "changelog/incidents")
+
+          def handler(event, context):
+              wrote = 0
+              for record in event.get("Records", []):
+                  sns = record.get("Sns", {})
+                  message = sns.get("Message", "") or ""
+                  subject = sns.get("Subject", "") or ""
+                  topic_arn = sns.get("TopicArn", "") or ""
+                  message_id = sns.get("MessageId", "") or ""
+                  ts_iso = sns.get("Timestamp") or datetime.now(timezone.utc).isoformat()
+
+                  ts_iso_clean = ts_iso.replace("Z", "+00:00")
+                  try:
+                      ts = datetime.fromisoformat(ts_iso_clean)
+                  except ValueError:
+                      ts = datetime.now(timezone.utc)
+
+                  ts_utc = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+                  ts_key = ts.strftime("%Y/%m/%dT%H-%M-%S")
+
+                  topic_name = topic_arn.split(":")[-1] if topic_arn else "sns"
+                  summary_src = subject or (message.splitlines()[0] if message else "(empty)")
+                  summary = summary_src[:240]
+
+                  hash_id = sha1(message_id.encode()).hexdigest()[:7] if message_id else "0000000"
+
+                  entry = {
+                      "ts_utc": ts_utc,
+                      "event_type": "incident",
+                      "source": topic_name,
+                      "subject": subject,
+                      "summary": summary,
+                      "details": message,
+                      "sns_message_id": message_id,
+                      "topic_arn": topic_arn,
+                  }
+
+                  key = f"{_PREFIX}/{ts_key}_{topic_name}_{hash_id}.json"
+                  _S3.put_object(
+                      Bucket=_BUCKET,
+                      Key=key,
+                      Body=json.dumps(entry).encode("utf-8"),
+                      ContentType="application/json",
+                  )
+                  print(f"Wrote s3://{_BUCKET}/{key} subject={subject[:80]!r}")
+                  wrote += 1
+
+              return {"statusCode": 200, "wrote": wrote}
+
+  ChangelogIncidentMirrorSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: lambda
+      Endpoint: !GetAtt ChangelogIncidentMirrorFunction.Arn
+
+  ChangelogIncidentMirrorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ChangelogIncidentMirrorFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AlertsTopic
+
+  # --------------------------------------------------------------------------
   # Step Functions — Saturday Pipeline
   # --------------------------------------------------------------------------
   SaturdayPipeline:
