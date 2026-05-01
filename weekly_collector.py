@@ -33,8 +33,47 @@ from pathlib import Path
 import boto3
 import yaml
 
+def _load_dotenv() -> None:
+    """Load .env file into os.environ (lightweight, no dependency).
+
+    Defined at module-top so it can run before setup_logging() — local-dev
+    workflows put FLOW_DOCTOR_ENABLED + FLOW_DOCTOR_GITHUB_TOKEN in .env,
+    and the flow-doctor handler attach reads those at import time.
+    Production (Lambda/EC2) gets env from SSM/systemd before Python starts;
+    .env is the local-dev fallback.
+    """
+    env_path = Path(".env")
+    if not env_path.exists():
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key, val = key.strip(), val.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                val = val[1:-1]
+            if key and val and key not in os.environ:
+                os.environ[key] = val
+
+
 from ssm_secrets import load_secrets
 load_secrets()
+_load_dotenv()
+
+# Structured logging + flow-doctor singleton via alpha-engine-lib (shared
+# pattern across all 5 entrypoints; see executor/main.py for reference).
+# Module-top so import-time errors in the collectors block below are also
+# captured by flow-doctor's ERROR handler.
+from alpha_engine_lib.logging import setup_logging
+_FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
+_FLOW_DOCTOR_YAML = str(Path(__file__).parent / "flow-doctor.yaml")
+setup_logging(
+    "data-collector",
+    flow_doctor_yaml=_FLOW_DOCTOR_YAML,
+    exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
+)
 
 from collectors import constituents, prices, slim_cache, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest
 
@@ -967,33 +1006,10 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _load_dotenv() -> None:
-    """Load .env file into os.environ (lightweight, no dependency)."""
-    env_path = Path(".env")
-    if not env_path.exists():
-        return
-    with open(env_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, val = line.split("=", 1)
-            key, val = key.strip(), val.strip()
-            if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
-                val = val[1:-1]
-            if key and val and key not in os.environ:
-                os.environ[key] = val
-
-
 def main() -> None:
     args = _parse_args()
-    _load_dotenv()
-
-    from alpha_engine_lib.logging import setup_logging
-    setup_logging(
-        "data-collector",
-        flow_doctor_yaml=str(Path(__file__).parent / "flow-doctor.yaml"),
-    )
+    # _load_dotenv() + setup_logging() already ran at module-top so import-time
+    # errors in the collectors block are captured. Apply user-requested level.
     logging.getLogger().setLevel(getattr(logging, args.log_level))
 
     config = load_config(args.config)
