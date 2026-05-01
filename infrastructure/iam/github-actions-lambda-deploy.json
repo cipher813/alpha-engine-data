@@ -175,6 +175,21 @@
       "Resource": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-*"
     },
     {
+      "Sid": "InfraDeployTagOps",
+      "Effect": "Allow",
+      "Action": [
+        "iam:TagRole",
+        "iam:UntagRole",
+        "lambda:TagResource",
+        "lambda:UntagResource",
+        "lambda:ListTags"
+      ],
+      "Resource": [
+        "arn:aws:iam::711398986525:role/alpha-engine-*",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-*"
+      ]
+    },
+    {
       "Sid": "InfraDeployResourceRead",
       "Effect": "Allow",
       "Action": [
