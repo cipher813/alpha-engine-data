@@ -1,16 +1,29 @@
 FROM --platform=linux/amd64 public.ecr.aws/lambda/python:3.12
 
-# Install dependencies (exclude boto3/botocore — pre-installed in Lambda).
-# alpha-engine-lib is excluded because the Phase 2 Lambda handler (lambda/handler.py)
-# doesn't import from it — only weekly_collector.main() (the EC2 entry point) does.
-# Including it would require wiring a GitHub PAT into the Docker build as a secret,
-# which is ceremony for zero benefit here. If a future Phase 2 change imports from
-# alpha-engine-lib, remove this filter and add --mount=type=secret,id=lib_token
-# plus the matching deploy.yml build-secrets wiring.
+# Stage alpha-engine-lib from a local vendor directory.
+# infrastructure/deploy.sh populates vendor/alpha-engine-lib from a
+# sibling checkout (local dev) or GitHub Actions checkout (CI) before
+# Docker build. Mirrors the alpha-engine-research / alpha-engine-predictor
+# pattern — the private repo reaches the build context without needing a
+# GitHub PAT or Docker build secret. [flow_doctor] pulls flow-doctor
+# transitively for lambda/handler.py's setup_logging call. The arcticdb
+# extra is intentionally NOT pulled here — only weekly_collector.py /
+# builders/ use ArcticDB, and those run on EC2 (not in this Lambda image).
+COPY vendor/alpha-engine-lib /tmp/alpha-engine-lib
+
+# Install dependencies. Exclude pytest / python-dotenv / pre-installed
+# Lambda runtime deps (boto3 etc.). Filter alpha-engine-lib out of
+# requirements.txt and install it from the staged vendor path with the
+# [flow_doctor] extra. Filtered list is written to a requirements file
+# and consumed by `pip install -r` so pip's own parser handles inline
+# comments — `$(grep ...)` shell substitution would word-split a
+# `pkg # comment` line into separate args and pip would reject the
+# bare `#` as an invalid requirement.
 COPY requirements.txt ${LAMBDA_TASK_ROOT}/
-RUN pip install --no-cache-dir \
-    $(grep -vE "^#|^$|^pytest|^python-dotenv|^boto3|^botocore|^s3transfer|^alpha-engine-lib" requirements.txt) \
-    && rm -rf /root/.cache/pip
+RUN pip install --no-cache-dir /tmp/alpha-engine-lib[flow_doctor] && \
+    grep -vE "^#|^$|^pytest|^python-dotenv|^boto3|^botocore|^s3transfer|^alpha-engine-lib" requirements.txt > /tmp/req-lambda.txt && \
+    pip install --no-cache-dir -r /tmp/req-lambda.txt && \
+    rm -rf /root/.cache/pip /tmp/alpha-engine-lib /tmp/req-lambda.txt
 
 # Copy application code
 COPY collectors/ ${LAMBDA_TASK_ROOT}/collectors/
@@ -18,6 +31,11 @@ COPY polygon_client.py ${LAMBDA_TASK_ROOT}/
 COPY weekly_collector.py ${LAMBDA_TASK_ROOT}/
 COPY store/ ${LAMBDA_TASK_ROOT}/store/
 COPY ssm_secrets.py ${LAMBDA_TASK_ROOT}/
+
+# flow-doctor.yaml at LAMBDA_TASK_ROOT is loaded by setup_logging() at
+# module-top of lambda/handler.py. The path resolves via:
+#   os.environ.get("LAMBDA_TASK_ROOT", os.path.dirname(...)) / "flow-doctor.yaml"
+COPY flow-doctor.yaml ${LAMBDA_TASK_ROOT}/
 
 # NOTE: config.yaml is intentionally NOT copied here. It is gitignored
 # (contains bucket names + prefixes that we keep out of the public repo)
