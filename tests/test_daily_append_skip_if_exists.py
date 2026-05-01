@@ -297,10 +297,40 @@ def test_cli_skip_if_exists_flag_present():
     )
 
 
-# NOTE: SF-JSON wiring (passing --skip-if-exists in the deployed SSM
-# command) is intentionally out of scope for this PR. The EOD SF
-# definition lives in two infrastructure files
-# (infrastructure/step_function_eod.json + update_eod_pipeline_sf.sh)
-# and updating them requires a redeploy via update_eod_pipeline_sf.sh.
-# That's tracked separately so this PR can land cleanly behind
-# weekly_collector wiring while the SF-redeploy is sequenced.
+def test_eod_ssm_script_has_no_redundant_daily_append():
+    """The deployed SSM script for the EOD SF must not invoke
+    ``python -m builders.daily_append`` after ``weekly_collector --daily``.
+
+    History: the EOD SSM had two python invocations back-to-back —
+    ``weekly_collector --daily --only daily_closes`` followed by a bare
+    ``python -m builders.daily_append``. The second one was redundant
+    (``_run_daily`` runs ``daily_closes`` + ``feature_store`` +
+    ``daily_append`` regardless of ``--only``, so the second invocation
+    just ran daily_append again — without ``skip_if_exists`` exposed via
+    a flag, so on re-runs it took the slow backfill path on every ticker
+    and timed out the SSM 1200s ceiling on the 2026-05-01 EOD recovery).
+
+    Locks the simplification: a single ``weekly_collector --daily``
+    invocation is canonical; the redundant second call must not return.
+    """
+    sf_eod = Path(__file__).parent.parent / "infrastructure" / "step_function_eod.json"
+    deploy_sh = Path(__file__).parent.parent / "infrastructure" / "update_eod_pipeline_sf.sh"
+    for src_path in (sf_eod, deploy_sh):
+        if not src_path.exists():
+            continue
+        src = src_path.read_text()
+        # The bare CLI invocation appearing as an SSM command line is the
+        # redundant pattern. Allow the substring in comments / other
+        # contexts but not as an executable command (`tee` marks the SSM
+        # runner pattern).
+        executable_lines = [
+            line for line in src.splitlines()
+            if "python -m builders.daily_append" in line
+            and "tee" in line
+        ]
+        assert executable_lines == [], (
+            f"{src_path.name} still contains redundant invocation(s): "
+            f"{executable_lines}. weekly_collector._run_daily already "
+            f"runs daily_append; the second SSM call is dead weight and "
+            f"reintroduces the 2026-05-01 timeout regression."
+        )
