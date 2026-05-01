@@ -307,6 +307,17 @@ def backfill(
                 n_skip += 1
                 continue
 
+            # NaN-fill VWAP when missing from the input parquet so the
+            # written schema is canonical [O,H,L,C,V,VWAP, FEATURES]. The
+            # predictor/price_cache parquets are yfinance-sourced and have
+            # no VWAP column; without this, keep_cols silently drops VWAP
+            # and the next daily_append's update() rejects every ticker
+            # with a column-position mismatch (incident 2026-05-01: full
+            # 904/904 EOD failure traced to backfill-2026-04-30 dropping
+            # VWAP across the universe).
+            if "VWAP" not in featured_df.columns:
+                featured_df["VWAP"] = np.nan
+
             keep_cols = [c for c in OHLCV_COLS if c in featured_df.columns] + \
                         [f for f in FEATURES if f in featured_df.columns]
             symbol_df = featured_df[keep_cols].copy()
