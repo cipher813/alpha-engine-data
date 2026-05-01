@@ -712,6 +712,13 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         results["collectors"]["features"] = {"status": "error", "error": str(e)}
 
     # ── ArcticDB daily append ────────────────────────────────────────────────
+    # EOD post-market path: yfinance closes are immutable once written, so
+    # re-runs short-circuit on tickers whose target-date row already lives
+    # in ArcticDB. skip_if_exists=True keeps re-runs cheap (microsecond
+    # in-memory check vs. 904 × ~1.5s slow lib.write rewrites — the path
+    # that timed out the 2026-05-01 EOD SF rerun at the SSM 1200s ceiling).
+    # MorningEnrich runs (_run_morning_enrich, polygon source) leave the
+    # default False so polygon's true VWAP overwrites yfinance's NaN.
     logger.info("=" * 60)
     logger.info("APPENDING: ArcticDB universe (daily)")
     logger.info("=" * 60)
@@ -721,6 +728,7 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
             date_str=run_date,
             bucket=bucket,
             dry_run=dry_run,
+            skip_if_exists=True,
         )
         results["collectors"]["arcticdb"] = arctic_result
     except Exception as e:
