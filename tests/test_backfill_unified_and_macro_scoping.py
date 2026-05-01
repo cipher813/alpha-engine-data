@@ -286,3 +286,83 @@ def test_short_history_ticker_gets_feature_columns_written():
         "Short-history NaN feature must stay NaN after the write — "
         "dropna / zero-fill would violate the PR #78 contract."
     )
+
+
+def test_backfill_writes_vwap_when_input_parquet_lacks_it():
+    """Regression for the 2026-05-01 EOD-pipeline failure.
+
+    The ``predictor/price_cache/{ticker}.parquet`` snapshots are
+    yfinance-sourced and have no VWAP column. ``compute_features`` does
+    not synthesize VWAP either (it's an OHLCV column, not a feature).
+
+    Without an explicit NaN-fill, ``keep_cols`` silently drops VWAP from
+    the written frame. The next daily_append's ``_write_row_backfill_safe``
+    then concats ``existing_no_VWAP`` + ``new_row_with_VWAP`` and
+    ``pd.concat`` appends VWAP at the end of the column list — flipping
+    the universe back to legacy ``[O,H,L,C,V, FEATURES, VWAP]`` ordering.
+    Subsequent ``daily_append.update()`` calls reject every ticker with
+    a column-position mismatch (n_err=904, 100% > 5% gate, EOD SF fails).
+
+    Contract: backfill must write canonical ``[O,H,L,C,V,VWAP, FEATURES]``
+    even when the source parquet has no VWAP. NaN-filled VWAP is correct;
+    a missing VWAP column is not.
+    """
+    from builders import backfill as _bf
+    from features.feature_engineer import FEATURES
+
+    # _minimal_ohlcv produces O/H/L/C/Adj_Close/Volume — no VWAP column,
+    # mirroring the real predictor/price_cache parquet shape.
+    price_data = {"AAPL": _minimal_ohlcv(n_rows=400)}
+    assert "VWAP" not in price_data["AAPL"].columns, (
+        "Test setup invariant: the fixture must not contain VWAP — "
+        "otherwise we're not exercising the regression scenario."
+    )
+
+    macro = _stub_macro(n_rows=400)
+    sector_map = {"AAPL": "XLK"}
+
+    universe_lib = MagicMock()
+    macro_lib = MagicMock()
+
+    def _fake_compute_features(df, **_):
+        # Mirror real compute_features: returns input + feature columns,
+        # never synthesizes VWAP. The contract under test depends on
+        # backfill itself NaN-filling VWAP before the keep_cols slice.
+        out = df.copy()
+        for col in ("atr_14_pct", "rsi_14"):
+            out[col] = 0.5
+        return out
+
+    with patch.object(_bf, "_load_full_cache", return_value=price_data), \
+         patch.object(_bf, "_extract_macro_series", return_value=macro), \
+         patch.object(_bf, "_load_sector_map", return_value=sector_map), \
+         patch.object(_bf, "_load_cached_fundamentals", return_value={}), \
+         patch.object(_bf, "_load_cached_alternative", return_value={}), \
+         patch.object(_bf, "_build_macro_features_df", return_value=pd.DataFrame()), \
+         patch.object(_bf, "compute_features", side_effect=_fake_compute_features), \
+         patch.object(_bf, "get_universe_lib", return_value=universe_lib), \
+         patch.object(_bf, "get_macro_lib", return_value=macro_lib), \
+         patch("builders.backfill.boto3.client") as mock_boto:
+        mock_boto.return_value = MagicMock()
+        result = _bf.backfill(ticker_filter="AAPL")
+
+    assert result["status"] == "ok"
+    universe_lib.write.assert_called_once()
+    _, written_df = universe_lib.write.call_args[0]
+
+    cols = list(written_df.columns)
+    assert "VWAP" in cols, (
+        "VWAP must appear in the written schema even when the input "
+        "parquet lacks it — silent drop reproduces the 2026-05-01 incident."
+    )
+    # Canonical position: right after Volume, before any feature column.
+    assert cols.index("VWAP") == 5, (
+        f"VWAP must land at idx=5 (canonical [O,H,L,C,V,VWAP] prefix); "
+        f"got idx={cols.index('VWAP')}, full order={cols[:8]}"
+    )
+    # Values must be NaN (no synthetic (H+L+C)/3 proxy).
+    assert written_df["VWAP"].isna().all(), (
+        "Synthetic VWAP is forbidden — yfinance-sourced rows write NaN. "
+        "See feedback_no_silent_fails: a proxy here would corrupt the "
+        "executor's VWAP-discount entry trigger."
+    )
