@@ -97,6 +97,26 @@
       "Resource": "arn:aws:s3:::alpha-engine-research/infrastructure/*"
     },
     {
+      "Sid": "SystemChangelogAppend",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research/changelog/*"
+    },
+    {
+      "Sid": "SystemChangelogList",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["changelog/", "changelog/*"]
+        }
+      }
+    },
+    {
       "Sid": "InfraDeploySFDefinition",
       "Effect": "Allow",
       "Action": [
