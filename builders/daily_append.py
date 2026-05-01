@@ -131,6 +131,116 @@ def _emit_missing_from_closes_metric(count: int) -> None:
         )
 
 
+UNIVERSE_FRESHNESS_RECEIPT_KEY = "health/universe_freshness.json"
+UNIVERSE_FRESHNESS_MAX_STALE_DAYS = 5
+_UNIVERSE_SCAN_WORKERS = 20
+
+
+def _scan_universe_and_emit_freshness_receipt(
+    s3,
+    bucket: str,
+    universe_lib,
+    max_stale_days: int = UNIVERSE_FRESHNESS_MAX_STALE_DAYS,
+) -> dict:
+    """Producer-side post-write validation: every universe symbol's
+    last-row date must be within ``max_stale_days`` of today (UTC).
+
+    On all-fresh: writes ``s3://{bucket}/health/universe_freshness.json``
+    so downstream consumers (predictor inference, executor, backtester)
+    read a single O(1) artifact instead of re-running this 200s scan
+    themselves on every Lambda invocation. The 2026-05-01 weekday SF
+    timeout cascade traced back to PR #68 adding this same scan to the
+    predictor inference preflight, multiplying the cost.
+
+    On any stale: hard-raises ``RuntimeError`` so the SF MorningEnrich
+    step fails. The 2026-04-21 ASGN/MOH incident class — partial-write
+    where macro/SPY stays fresh while individual tickers stall — is
+    exactly what this catches at the producer.
+
+    Returns scan metadata (also embedded in the receipt) for logging
+    by the caller. Skipped automatically on dry_run.
+    """
+    syms = list(universe_lib.list_symbols())
+    if not syms:
+        raise RuntimeError(
+            f"Universe-freshness scan: library is empty on bucket {bucket!r}; "
+            "upstream pipeline has not written anything."
+        )
+
+    today = datetime.now(timezone.utc).date()
+
+    def _last_date_for(sym: str) -> tuple[str, "pd.Timestamp | None", "str | None"]:
+        try:
+            df = universe_lib.tail(sym, n=1).data
+        except Exception as exc:  # pragma: no cover — surfaces below
+            return sym, None, f"{type(exc).__name__}: {exc}"
+        if df.empty:
+            return sym, None, "empty frame"
+        last_ts = pd.Timestamp(df.index[-1])
+        if last_ts.tzinfo is not None:
+            last_ts = last_ts.tz_convert("UTC").tz_localize(None)
+        return sym, last_ts.normalize(), None
+
+    t0 = time.time()
+    rows: list[tuple[str, "pd.Timestamp | None", "str | None"]] = []
+    with ThreadPoolExecutor(max_workers=_UNIVERSE_SCAN_WORKERS) as ex:
+        rows = list(ex.map(_last_date_for, syms))
+    scan_seconds = time.time() - t0
+
+    read_errors = [(s, err) for s, _, err in rows if err is not None]
+    if read_errors:
+        head = ", ".join(f"{s}({e[:40]})" for s, e in read_errors[:5])
+        raise RuntimeError(
+            f"Universe-freshness scan: {len(read_errors)} symbol(s) failed to read "
+            f"(threshold 0): {head}"
+            + ("…" if len(read_errors) > 5 else "")
+        )
+
+    ages = []  # (sym, last_date, age_days)
+    for sym, last_date, _ in rows:
+        age_days = (today - last_date.date()).days
+        ages.append((sym, last_date.date().isoformat(), age_days))
+
+    stale = [(s, d, a) for s, d, a in ages if a > max_stale_days]
+    stalest = max(ages, key=lambda r: r[2])
+
+    if stale:
+        stale.sort(key=lambda r: -r[2])
+        head = ", ".join(f"{s}({a}d, last={d})" for s, d, a in stale[:10])
+        raise RuntimeError(
+            f"Universe-freshness scan: {len(stale)} symbol(s) older than "
+            f"{max_stale_days}d threshold (stalest first): {head}"
+            + ("…" if len(stale) > 10 else "")
+        )
+
+    receipt = {
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "library": "universe",
+        "bucket": bucket,
+        "n_symbols_checked": len(syms),
+        "max_stale_days_threshold": max_stale_days,
+        "all_fresh": True,
+        "stalest_symbol": stalest[0],
+        "stalest_last_date": stalest[1],
+        "stalest_age_days": stalest[2],
+        "scan_seconds": round(scan_seconds, 1),
+        "writer": "alpha-engine-data:builders/daily_append.py",
+    }
+
+    s3.put_object(
+        Bucket=bucket,
+        Key=UNIVERSE_FRESHNESS_RECEIPT_KEY,
+        Body=json.dumps(receipt, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+    log.info(
+        "Universe-freshness receipt written: n=%d all_fresh stalest=%s(%dd) scan=%.1fs",
+        len(syms), stalest[0], stalest[2], scan_seconds,
+    )
+    return receipt
+
+
 def _load_parquet_warmup(s3, bucket: str, ticker: str) -> pd.DataFrame | None:
     """Load a ticker's 10y price-cache parquet for feature warmup.
 
@@ -822,6 +932,22 @@ def daily_append(
                 f"ArcticDB daily_append error rate {err_rate:.1%} exceeds 5% threshold "
                 f"(n_ok={n_ok} n_err={n_err} of {len(stock_tickers)}) — treating as pipeline failure"
             )
+
+        # Producer-side post-write validation. Catches the partial-write
+        # class (2026-04-21 ASGN/MOH) that the per-ticker error-rate gate
+        # above misses — symbols not in today's batch but stale from
+        # earlier silent skips. Emits health/universe_freshness.json so
+        # consumers don't repeat this 200s scan on every Lambda
+        # invocation (the cause of the 2026-05-01 SF timeout cascade).
+        receipt = _scan_universe_and_emit_freshness_receipt(
+            s3, bucket, universe_lib,
+        )
+        result["universe_freshness_receipt"] = {
+            "n_symbols_checked": receipt["n_symbols_checked"],
+            "stalest_symbol": receipt["stalest_symbol"],
+            "stalest_age_days": receipt["stalest_age_days"],
+            "scan_seconds": receipt["scan_seconds"],
+        }
 
     return result
 
