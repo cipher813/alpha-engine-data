@@ -68,6 +68,41 @@ LAMBDA_ENV_JSON=$(build_lambda_env_json)
 
 echo "=== Building container image for $FUNCTION_NAME ==="
 
+# Stage alpha-engine-lib into vendor/ so the Dockerfile can COPY it.
+# alpha-engine-lib is a private repo — Dockerfile installs via local pip
+# path rather than git+https to avoid wiring a Docker build secret.
+# flow-doctor is pulled in transitively via the [flow_doctor] extra.
+# Mirrors alpha-engine-research/infrastructure/deploy.sh staging pattern.
+LIB_REPO_DIR="${LIB_REPO_DIR:-$(dirname "$(pwd)")/alpha-engine-lib}"
+LIB_STAGED_FROM_REPO=0
+if [ -d "vendor/alpha-engine-lib" ]; then
+  echo "Using existing vendor/alpha-engine-lib (local dev workflow)"
+elif [ -d "$LIB_REPO_DIR" ]; then
+  echo "Staging vendor/alpha-engine-lib from $LIB_REPO_DIR..."
+  mkdir -p vendor
+  cp -R "$LIB_REPO_DIR" vendor/alpha-engine-lib
+  LIB_STAGED_FROM_REPO=1
+else
+  echo "ERROR: alpha-engine-lib not found — tried:"
+  echo "  vendor/alpha-engine-lib (local dev)"
+  echo "  $LIB_REPO_DIR (sibling checkout)"
+  echo "Hint: clone cipher813/alpha-engine-lib as a sibling directory,"
+  echo "      or set LIB_REPO_DIR=/path/to/alpha-engine-lib"
+  exit 1
+fi
+
+# Always clean up the staged vendor/ on exit so a re-run from a fresh
+# clone doesn't pick up a stale copy. Local-dev workflow with a real
+# vendor/alpha-engine-lib tree present takes the early-return branch
+# above and never sets LIB_STAGED_FROM_REPO=1, so its tree is preserved.
+cleanup_lib_staging() {
+  if [ "$LIB_STAGED_FROM_REPO" = "1" ] && [ -d vendor/alpha-engine-lib ]; then
+    rm -rf vendor/alpha-engine-lib
+    rmdir vendor 2>/dev/null || true
+  fi
+}
+trap cleanup_lib_staging EXIT
+
 docker build --platform linux/amd64 --provenance=false -t "$FUNCTION_NAME:latest" .
 
 echo "Authenticating with ECR..."

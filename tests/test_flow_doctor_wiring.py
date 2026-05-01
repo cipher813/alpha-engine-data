@@ -93,11 +93,36 @@ class TestFlowDoctorYamlPresence:
         assert (REPO_ROOT / "flow-doctor.yaml").is_file()
 
     def test_yaml_path_resolved_by_lambda_handler_exists(self):
-        # Mirrors lambda/handler.py's path computation:
+        # Mirrors lambda/handler.py's path computation in the local-dev
+        # branch (LAMBDA_TASK_ROOT unset):
         #   os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         handler_path = REPO_ROOT / "lambda" / "handler.py"
         resolved = Path(os.path.dirname(os.path.dirname(os.path.abspath(handler_path)))) / "flow-doctor.yaml"
         assert resolved.is_file(), f"Lambda handler resolves to {resolved}"
+
+    def test_yaml_path_resolved_by_lambda_handler_under_lambda_runtime(self, tmp_path, monkeypatch):
+        # Lambda flattens lambda/handler.py to /var/task/handler.py, so
+        # the original two-dirs-up resolution would land at /var/ — wrong.
+        # The handler must honor LAMBDA_TASK_ROOT first. Simulate by
+        # placing flow-doctor.yaml under a stand-in task root and
+        # asserting the same os.environ.get(...) pattern resolves to it.
+        fake_task_root = tmp_path / "fake_lambda_task_root"
+        fake_task_root.mkdir()
+        (fake_task_root / "flow-doctor.yaml").write_text("flow_name: test\n")
+        monkeypatch.setenv("LAMBDA_TASK_ROOT", str(fake_task_root))
+        # Use the literal expression from lambda/handler.py so any drift
+        # in the source breaks this test.
+        resolved = os.path.join(
+            os.environ.get(
+                "LAMBDA_TASK_ROOT",
+                "/should-not-fall-back",
+            ),
+            "flow-doctor.yaml",
+        )
+        assert os.path.isfile(resolved), (
+            "Lambda handler must honor LAMBDA_TASK_ROOT — flattened image "
+            "layout means dirname(dirname(__file__)) lands at /var, not /var/task"
+        )
 
     def test_yaml_path_resolved_by_weekly_collector_exists(self):
         # Mirrors weekly_collector.py's path computation:

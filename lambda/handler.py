@@ -28,11 +28,19 @@ load_secrets()
 # pattern across all 5 entrypoints; see executor/main.py for reference).
 # When FLOW_DOCTOR_ENABLED=1, attaches a FlowDoctorHandler at ERROR so every
 # log.error() call routes through flow-doctor's dispatch (email + GitHub
-# issue with dedup + rate limits per flow-doctor.yaml at the repo root).
+# issue with dedup + rate limits per flow-doctor.yaml).
+#
+# Path resolution: LAMBDA_TASK_ROOT (=/var/task in the Lambda image,
+# where Dockerfile COPYs flow-doctor.yaml) takes precedence; falls back
+# to two-dirs-up from this file for local dev (lambda/handler.py →
+# repo root). Mirrors alpha-engine-research/lambda/handler.py.
 from alpha_engine_lib.logging import setup_logging
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    os.environ.get(
+        "LAMBDA_TASK_ROOT",
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ),
     "flow-doctor.yaml",
 )
 setup_logging(

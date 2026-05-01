@@ -15,6 +15,7 @@ on:
       - 'ssm_secrets.py'
       - 'lambda/**'
       - 'config.py'
+      - 'flow-doctor.yaml'
       - 'requirements*.txt'
       - 'Dockerfile*'
       - 'infrastructure/deploy.sh'
@@ -36,8 +37,23 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Checkout
+      - name: Checkout data repo
         uses: actions/checkout@v4
+        with:
+          path: alpha-engine-data
+
+      # deploy.sh stages alpha-engine-lib into vendor/alpha-engine-lib
+      # so the Dockerfile can COPY it. The lib is a private repo —
+      # needs a PAT with Contents: read on cipher813/alpha-engine-lib,
+      # stored as the ALPHA_ENGINE_LIB_TOKEN repository secret. Mirrors
+      # the alpha-engine-research deploy.yml pattern; flow-doctor ships
+      # transitively via alpha-engine-lib[flow_doctor].
+      - name: Checkout alpha-engine-lib
+        uses: actions/checkout@v4
+        with:
+          repository: cipher813/alpha-engine-lib
+          path: alpha-engine-lib
+          token: ${{ secrets.ALPHA_ENGINE_LIB_TOKEN }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -55,9 +71,17 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Deploy Phase 2 Lambda (alpha-engine-data-collector)
+        working-directory: alpha-engine-data
+        env:
+          # deploy.sh defaults LIB_REPO_DIR to ../alpha-engine-lib relative
+          # to its CWD — ${{ github.workspace }}/alpha-engine-lib here,
+          # exactly where the checkout step above placed it. Explicit
+          # export is belt-and-suspenders for readers.
+          LIB_REPO_DIR: ${{ github.workspace }}/alpha-engine-lib
         run: bash infrastructure/deploy.sh
 
       - name: Report deployed version
+        working-directory: alpha-engine-data
         run: |
           echo "Deployed commit: ${{ github.sha }}"
           aws lambda get-function \
