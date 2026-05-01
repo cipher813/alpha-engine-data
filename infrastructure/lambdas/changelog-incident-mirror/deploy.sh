@@ -33,7 +33,7 @@ for arg in "$@"; do
   esac
 done
 
-# Validate index.py syntax locally before shipping.
+# Validate index.py syntax + run handler smoke tests locally before shipping.
 python3 -c "
 import ast, sys
 src = open('${SCRIPT_DIR}/index.py').read()
@@ -44,6 +44,17 @@ except SyntaxError as e:
     sys.exit(1)
 print('index.py syntax OK')
 "
+
+if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
+  echo "Running handler smoke tests..."
+  python3 "${SCRIPT_DIR}/test_handler.py" >/dev/null
+  echo "  ✓ Smoke tests pass"
+fi
+
+# Ensure the live Lambda env has the new structured-prefix var. Idempotent —
+# overwrites in place, so re-running with no diff is harmless. Skipped on
+# --dry-run.
+ENV_PAYLOAD='Variables={CHANGELOG_BUCKET=alpha-engine-research,CHANGELOG_PREFIX=changelog/incidents,CHANGELOG_STRUCTURED_PREFIX=changelog/entries}'
 
 # Package the handler into a zip in /tmp.
 PKG=$(mktemp -d)
@@ -68,6 +79,21 @@ aws lambda update-function-code \
 
 # Wait for update to settle.
 echo "Waiting for update to complete..."
+aws lambda wait function-updated \
+  --function-name "${FUNCTION_NAME}" \
+  --region "${REGION}"
+
+# Update env config to include CHANGELOG_STRUCTURED_PREFIX (added in PR 2 of
+# the schema-discipline arc). Idempotent — overwriting in place is a no-op
+# if all 3 vars already match. --query suppresses the JSON dump that would
+# otherwise leak env values to stdout per CLAUDE.md "CLI Output Safety".
+echo "Ensuring env config includes CHANGELOG_STRUCTURED_PREFIX..."
+aws lambda update-function-configuration \
+  --function-name "${FUNCTION_NAME}" \
+  --environment "${ENV_PAYLOAD}" \
+  --region "${REGION}" \
+  --query 'LastUpdateStatus' --output text
+
 aws lambda wait function-updated \
   --function-name "${FUNCTION_NAME}" \
   --region "${REGION}"
