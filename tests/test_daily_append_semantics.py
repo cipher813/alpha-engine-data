@@ -244,37 +244,43 @@ def test_short_history_matches_stored_dtype():
     )
 
 
-def test_no_skip_guard_on_existing_today_row():
-    """daily_append must NOT skip tickers whose history already contains today_ts.
+def test_no_unconditional_skip_guard_on_existing_today_row():
+    """daily_append must NOT *unconditionally* skip tickers whose history
+    already contains today_ts.
 
-    Regression for 2026-04-18: a `if today_ts in hist.index: skip` guard
-    defeated the idempotency guarantee that update() provides. Symptom was
-    discovered during the 2026-04-17 incident recovery — the poisoned
-    morning run had already written T-1 data under index=T, and a re-run
-    with correct polygon data couldn't overwrite because every ticker
-    tripped the skip guard.
+    Regression for 2026-04-18: an unconditional ``if today_ts in
+    hist.index: skip`` guard defeated the idempotency guarantee that
+    update() provides. Symptom surfaced during the 2026-04-17 incident
+    recovery — the poisoned morning run had written T-1 data under
+    index=T, and a re-run with correct polygon data couldn't overwrite
+    because every ticker tripped the skip guard.
 
-    update() is explicitly chosen (see the comment at the update call site)
-    BECAUSE it replaces same-date rows. The guard was redundant at best,
-    actively harmful at worst. This test locks the removal so a future
-    well-intentioned refactor doesn't re-introduce it.
+    The 2026-05-01 follow-up introduced an opt-in gate
+    (``skip_if_exists`` parameter) so EOD post-market re-runs don't
+    redundantly rewrite all 904 tickers via the slow lib.write backfill
+    path (see test_daily_append_skip_if_exists.py for that contract).
+    The opt-in form ``if skip_if_exists and today_ts in hist.index:``
+    is allowed; an unconditional ``if today_ts in hist.index:`` is not.
     """
     src = _source()
-    # Must not have the exact skip pattern. Allow comments that document
-    # why the guard was removed (they reference today_ts in hist.index).
-    # The test looks for the executable pattern: an `if today_ts in hist.index`
-    # immediately followed by `n_skip += 1` in the next 2 lines.
     lines = src.splitlines()
     for i, line in enumerate(lines):
         stripped = line.strip()
         if stripped.startswith("#"):
-            continue  # skip comments
-        if "today_ts in hist.index" in stripped and stripped.startswith("if "):
-            # Check if this is followed by `n_skip += 1 ... continue` (the
-            # skip pattern). If so, the guard was reintroduced.
-            following = "\n".join(lines[i:i+4])
-            assert "n_skip" not in following, (
-                f"Found skip-on-existing-today guard at line {i+1}. Remove it — "
-                "update() already handles same-date idempotency. See "
-                "2026-04-17 label-bug incident."
-            )
+            continue
+        if "today_ts in hist.index" not in stripped:
+            continue
+        if not stripped.startswith("if "):
+            continue
+        # Allow the explicit opt-in gate: caller has to pass skip_if_exists=True.
+        if "skip_if_exists" in stripped:
+            continue
+        # Bare ``if today_ts in hist.index:`` followed by skip is the
+        # forbidden pattern — the 2026-04-17 polygon-relabel bug recurs
+        # if a future PR reintroduces it without gating.
+        following = "\n".join(lines[i:i+4])
+        assert "n_skip" not in following, (
+            f"Found UNCONDITIONAL skip-on-existing-today guard at line "
+            f"{i+1}. Gate it behind ``skip_if_exists`` (see the 2026-05-01 "
+            f"design note in daily_append.py) or remove it."
+        )
