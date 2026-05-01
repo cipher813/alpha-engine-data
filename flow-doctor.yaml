@@ -11,6 +11,14 @@ notify:
   - type: github
     repo: cipher813/alpha-engine-data
     token: ${FLOW_DOCTOR_GITHUB_TOKEN}
+  # System-wide changelog corpus — every flow-doctor report lands as a
+  # schema-1.0.0 entry at s3://alpha-engine-research/changelog/entries/
+  # alongside CI deploy entries + SNS-mirrored alarm entries. Closes
+  # Gap 1 of the changelog event-mining coverage gaps ROADMAP item.
+  - type: s3
+    bucket: alpha-engine-research
+    subsystem: data_pipeline
+    default_root_cause_category: code_bug
 store:
   type: sqlite
   path: /tmp/flow_doctor.db

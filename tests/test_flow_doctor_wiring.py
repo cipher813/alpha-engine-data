@@ -31,8 +31,17 @@ def stub_flow_doctor_env(monkeypatch):
 
     flow_doctor.init() substitutes these at load time. Stubs are non-empty
     strings; nothing actually contacts SMTP/GitHub since no report() fires.
+
+    FLOW_DOCTOR_SKIP_PREFLIGHT=1 is required because flow-doctor 0.4.0
+    added strict token preflight on GitHubNotifier.validate() (calls
+    api.github.com /user with the configured token at init time). With a
+    stub token like "stub-token" the call returns 401 and raises — which
+    is correct behavior in production (catches revoked PATs at startup)
+    but breaks tests that don't intend to fire the network call. Same
+    knob applies to S3Notifier's bucket head-check in 0.4.0+.
     """
     monkeypatch.setenv("FLOW_DOCTOR_ENABLED", "1")
+    monkeypatch.setenv("FLOW_DOCTOR_SKIP_PREFLIGHT", "1")
     monkeypatch.setenv("EMAIL_SENDER", "test@example.com")
     monkeypatch.setenv("EMAIL_RECIPIENTS", "test@example.com")
     monkeypatch.setenv("GMAIL_APP_PASSWORD", "stub-password")
