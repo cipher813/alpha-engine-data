@@ -1,9 +1,21 @@
 # `changelog-incident-mirror` Lambda
 
 Subscribed to `arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts`.
-Mirrors every SNS message as one JSON entry under
-`s3://alpha-engine-research/changelog/incidents/{YYYY}/{MM}/{DD}T{HH-MM-SS}_{topic}_{hash7}.json`
-for the system-wide event-mining changelog.
+For every SNS message, **dual-writes** two JSON entries (PR 2 of the
+schema-discipline arc, 2026-05-01 evening):
+
+1. **Structured corpus** (source-of-truth going forward, schema 1.0.0):
+   `s3://alpha-engine-research/changelog/entries/{YYYY-MM-DD}/{event_id}.json`
+2. **Legacy event-typed prefix** (back-compat window per CLAUDE.md S3 contract):
+   `s3://alpha-engine-research/changelog/incidents/{YYYY}/{MM}/{DD}T{HH-MM-SS}_{topic}_{hash7}.json`
+
+The structured entry carries controlled-vocab fields
+(`severity=high`, `subsystem=infrastructure`, `root_cause_category=infrastructure_failure`,
+`auto_emitted=true`) chosen as sensible defaults — most SNS-mirrored
+alerts are SF/Lambda failures. Operator can refine via a follow-up
+`changelog-log --event-type investigation` entry. Aggregator switches
+to reading `entries/` exclusively in PR 4 of the arc; legacy emits
+stop in PR 5.
 
 ## Why this lives outside CloudFormation
 
@@ -40,7 +52,7 @@ Their config:
 
 | Resource | Identifier | Notes |
 |---|---|---|
-| Function | `alpha-engine-changelog-incident-mirror` | Python 3.12, arm64, 256 MB, 30s, env vars: `CHANGELOG_BUCKET=alpha-engine-research`, `CHANGELOG_PREFIX=changelog/incidents` |
+| Function | `alpha-engine-changelog-incident-mirror` | Python 3.12, arm64, 256 MB, 30s, env vars: `CHANGELOG_BUCKET=alpha-engine-research`, `CHANGELOG_PREFIX=changelog/incidents`, `CHANGELOG_STRUCTURED_PREFIX=changelog/entries` |
 | Execution role | `alpha-engine-changelog-incident-mirror` | Trust: `lambda.amazonaws.com`. Managed: `AWSLambdaBasicExecutionRole`. Inline: `changelog-incident-mirror-s3` (see `iam-policy.json`) |
 | SNS subscription | `alpha-engine-alerts` topic, lambda protocol | Endpoint = function ARN |
 | Lambda permission | `lambda:InvokeFunction` from `sns.amazonaws.com` | SourceArn = AlertsTopic ARN |
@@ -92,7 +104,7 @@ aws lambda create-function \
   --handler index.handler \
   --role "arn:aws:iam::711398986525:role/alpha-engine-changelog-incident-mirror" \
   --timeout 30 --memory-size 256 \
-  --environment "Variables={CHANGELOG_BUCKET=alpha-engine-research,CHANGELOG_PREFIX=changelog/incidents}" \
+  --environment "Variables={CHANGELOG_BUCKET=alpha-engine-research,CHANGELOG_PREFIX=changelog/incidents,CHANGELOG_STRUCTURED_PREFIX=changelog/entries}" \
   --zip-file fileb:///tmp/fn.zip
 
 # 3. Subscribe to SNS topic
