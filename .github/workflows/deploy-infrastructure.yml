@@ -56,3 +56,10 @@ jobs:
             --stack-name alpha-engine-orchestration \
             --query "Stacks[0].[StackStatus,Tags[?Key=='git-sha'].Value|[0]]" \
             --output text
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: cipher813/alpha-engine-docs/.github/actions/append-changelog@main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: deploy-infrastructure.yml
