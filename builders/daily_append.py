@@ -319,6 +319,7 @@ def daily_append(
     date_str: str | None = None,
     bucket: str = DEFAULT_BUCKET,
     dry_run: bool = False,
+    skip_if_exists: bool = False,
 ) -> dict:
     """
     Append today's features to ArcticDB universe.
@@ -328,6 +329,25 @@ def daily_append(
     2. Append today's OHLCV row
     3. Compute features for the combined series
     4. Extract the last row (today) and append to ArcticDB
+
+    Parameters
+    ----------
+    skip_if_exists
+        When True, tickers whose ``date_str`` row is already in ArcticDB
+        skip the read/compute/write cycle entirely (counted as ``n_skip``).
+        Use for re-runs of EOD post-market (yfinance source) where today's
+        row is final and re-writing it is a wasteful full-series rewrite
+        via the backfill path. Always leave False for MorningEnrich
+        (polygon source) — that path must overwrite to apply polygon's
+        true volume-weighted VWAP over yfinance's NaN.
+
+        Background: a re-run with ``skip_if_exists=False`` enters
+        ``_write_row_backfill_safe``'s backfill branch on every ticker
+        (target_ts == existing.index.max()), which calls
+        ``lib.write(combined, prune_previous_versions=True)`` per ticker.
+        904 × ~1.5s = ~22 min — over the SSM 1200s timeout. The 2026-05-01
+        EOD SF rerun timed out exactly here after our manual recovery
+        run had already written today's rows.
 
     Returns summary dict.
     """
@@ -683,16 +703,23 @@ def daily_append(
                 continue
 
             # Re-running daily_append for the same date MUST overwrite the
-            # existing row, not skip it. universe_lib.update() is idempotent
-            # (same-date rows replace instead of accumulate), so there's
-            # nothing to guard against.
+            # existing row by default — universe_lib.update() is idempotent
+            # for same-date rows, but the 2026-04-17 polygon-label incident
+            # showed the path matters: when MorningEnrich's polygon refresh
+            # arrives, it must overwrite yfinance's NaN-VWAP row with
+            # polygon's true volume-weighted VWAP.
             #
-            # Prior to 2026-04-18, a `today_ts in hist.index: skip` guard
-            # silently no-op'd every re-run. That masked the 2026-04-17
-            # label incident: after Polygon returned T-1 data stamped as T
-            # in the morning DailyData run, a re-run with fresh polygon
-            # data couldn't repair the poisoned rows. Removing the guard
-            # restores the idempotency guarantee that update() provides.
+            # ``skip_if_exists`` is the source-aware opt-out: EOD post-market
+            # passes True (yfinance, immutable once written), MorningEnrich
+            # leaves False (polygon, must overwrite). Without this, an EOD
+            # re-run on a day whose row already exists hits the backfill
+            # branch in ``_write_row_backfill_safe`` (target_ts ==
+            # existing.index.max()) and rewrites the full series per ticker
+            # — 904 × ~1.5s blew the 1200s SSM timeout on the 2026-05-01
+            # EOD recovery rerun.
+            if skip_if_exists and today_ts in hist.index:
+                n_skip += 1
+                continue
 
             # Build today's OHLCV row
             bar = closes[ticker]
@@ -958,6 +985,15 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Compute but skip ArcticDB writes")
     parser.add_argument("--bucket", default=DEFAULT_BUCKET, help=f"S3 bucket (default: {DEFAULT_BUCKET})")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+        "--skip-if-exists",
+        action="store_true",
+        help=(
+            "Skip tickers whose target-date row is already in ArcticDB. "
+            "Use for EOD post-market re-runs (yfinance, immutable). Leave "
+            "off for MorningEnrich runs (polygon must overwrite)."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -971,6 +1007,7 @@ def main():
         date_str=args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         bucket=args.bucket,
         dry_run=args.dry_run,
+        skip_if_exists=args.skip_if_exists,
     )
 
     if result["status"] != "ok":
