@@ -20,6 +20,7 @@ behavior — same style as the rest of the daily_append test suite.
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -233,6 +234,16 @@ def _patch_targets(monkeypatch, *, universe_symbols: list[str], closes_tickers: 
     universe_lib.read_batch.return_value = [
         MagicMock(spec=[], data=hist_df.copy()) for _ in closes_tickers
     ]
+    # _scan_universe_and_emit_freshness_receipt calls tail(sym, n=1) per
+    # symbol after the daily writes. Mock it to return today's row so the
+    # post-write freshness scan passes (these tests are about the pre-loop
+    # missing-from-closes check, not the post-write scan, which has its
+    # own dedicated test_daily_append_universe_freshness.py).
+    today_row = pd.DataFrame(
+        {"Close": [100.0]},
+        index=[pd.Timestamp(datetime.now(timezone.utc).date())],
+    )
+    universe_lib.tail.return_value = MagicMock(spec=[], data=today_row)
 
     macro_lib = MagicMock()
     # macro reads return a frame with a "Close" column so macro-load passes.
