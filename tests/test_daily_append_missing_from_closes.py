@@ -403,3 +403,142 @@ def test_metric_emitted_even_when_zero(monkeypatch):
 
     daily_append(date_str="2026-04-28")
     metric_emit.assert_called_once_with(0)
+
+
+# ── 3. expected_tickers scoping (2026-05-02 incident) ──────────────────────────
+
+
+def test_expected_tickers_excludes_arctic_only_stragglers_from_check(monkeypatch):
+    """The 2026-05-02 SF-halt scenario:
+
+    8 tickers got dropped from S&P 500/400 this past week (ASGN, GTM, HOLX,
+    KMPR, LW, MOH, MTCH, PAYC). They're still in ArcticDB universe (awaiting
+    next prune cycle); they're absent from the new constituents.json
+    MorningEnrich just rewrote; MorningEnrich didn't request them from
+    polygon, so they're absent from closes. Without expected_tickers
+    scoping, the missing-from-closes check sees 8 + 4 chronic = 12 misses,
+    trips the threshold of 5, and halts the SF.
+
+    With expected_tickers=[the constituents-derived request list], the 8
+    stragglers fall outside the relevant set and only the 4 chronic
+    polygon-coverage tickers (well below threshold) are flagged.
+    """
+    from builders.daily_append import daily_append
+
+    # Universe holds 9 stocks: 4 chronic-missing + 5 churn-out stragglers.
+    chronic = ["BF-B", "BRK-B", "MOG-A", "PSTG"]
+    stragglers = ["ASGN", "GTM", "HOLX", "KMPR", "LW"]
+    constituents = ["AAPL", "MSFT"] + chronic  # what the caller actually requested
+
+    universe_symbols = constituents + stragglers  # 9 in arctic
+    closes_tickers = ["AAPL", "MSFT"]  # polygon returned these (not chronic, not stragglers)
+
+    _patch_targets(
+        monkeypatch,
+        universe_symbols=universe_symbols,
+        closes_tickers=closes_tickers,
+    )
+
+    # Must NOT raise: 4 chronic missing (in constituents but absent from closes)
+    # is below the threshold of 5; 5 stragglers are excluded entirely.
+    result = daily_append(date_str="2026-04-28", expected_tickers=constituents)
+    assert result["status"] == "ok"
+    assert result["tickers_missing_from_closes"] == 4
+
+
+def test_expected_tickers_still_raises_on_real_constituents_gap(monkeypatch):
+    """expected_tickers must NOT silence genuine data gaps. If polygon drops
+    8 real S&P 500 names from one call, those are in expected_tickers AND in
+    arctic AND missing from closes — the threshold must still trip.
+    """
+    from builders.daily_append import daily_append
+
+    constituents = ["AAPL", "MSFT"] + [f"REAL{i}" for i in range(8)]
+    universe_symbols = constituents  # all in arctic
+    closes_tickers = ["AAPL", "MSFT"]  # 8 REAL* tickers missing from closes
+
+    with pytest.raises(RuntimeError, match=r"missing from today's daily_closes"):
+        _patch_targets(
+            monkeypatch,
+            universe_symbols=universe_symbols,
+            closes_tickers=closes_tickers,
+        )
+        daily_append(date_str="2026-04-28", expected_tickers=constituents)
+
+
+def test_expected_tickers_strips_caret_prefix(monkeypatch):
+    """Caller may pass index tickers (^TNX/^VIX) in expected_tickers; the
+    scoping comparison must apply the same lstrip the per-ticker fallback
+    + closes_stock_keys filter use, so '^TNX' in expected matches 'TNX' in
+    arctic — even though indices are FRED-handled and rarely in arctic
+    anyway, mismatched key shapes would silently break the scoping."""
+    from builders.daily_append import daily_append
+
+    constituents = ["AAPL", "MSFT", "^TNX", "^VIX"]
+    universe_symbols = ["AAPL", "MSFT", "STRAGGLER"]
+    closes_tickers = ["AAPL", "MSFT"]
+
+    _patch_targets(
+        monkeypatch,
+        universe_symbols=universe_symbols,
+        closes_tickers=closes_tickers,
+    )
+
+    # STRAGGLER is in arctic but not in expected (after lstrip both ways) →
+    # excluded. AAPL/MSFT both in expected and in closes → no missing.
+    # No raise, missing count = 0.
+    result = daily_append(date_str="2026-04-28", expected_tickers=constituents)
+    assert result["tickers_missing_from_closes"] == 0
+
+
+def test_expected_tickers_none_preserves_legacy_behavior(monkeypatch):
+    """Backward compat: callers that don't pass expected_tickers get the
+    pre-PR behavior (scope = whole arctic universe). Lets unrelated callers
+    (older entry points, tests) keep working."""
+    from builders.daily_append import daily_append
+
+    # 8 stragglers in arctic, none in closes → without scoping, 8 missing
+    # which is above threshold (5) → raise.
+    universe_symbols = [f"TKR{i}" for i in range(8)] + ["AAPL"]
+
+    with pytest.raises(RuntimeError, match=r"missing from today's daily_closes"):
+        _patch_targets(
+            monkeypatch,
+            universe_symbols=universe_symbols,
+            closes_tickers=["AAPL"],
+        )
+        # No expected_tickers → legacy path → all 8 TKR* count → raise.
+        daily_append(date_str="2026-04-28")
+
+
+def test_expected_tickers_logs_straggler_count(monkeypatch, caplog):
+    """When stragglers are excluded, log them at INFO so operators see
+    drift building up between prune cycles. Silent exclusion is its own
+    silent-fail risk."""
+    import logging
+    from builders.daily_append import daily_append
+
+    chronic = ["BF-B"]
+    stragglers = ["ASGN", "HOLX", "PAYC"]
+    constituents = ["AAPL"] + chronic
+    universe_symbols = constituents + stragglers
+    closes_tickers = ["AAPL"]
+
+    _patch_targets(
+        monkeypatch,
+        universe_symbols=universe_symbols,
+        closes_tickers=closes_tickers,
+    )
+
+    with caplog.at_level(logging.INFO, logger="builders.daily_append"):
+        daily_append(date_str="2026-04-28", expected_tickers=constituents)
+
+    straggler_logs = [r for r in caplog.records if "stragglers" in r.message]
+    assert straggler_logs, (
+        f"Expected an INFO log mentioning 'stragglers'; got: "
+        f"{[r.message for r in caplog.records]}"
+    )
+    # All 3 stragglers should appear in the logged sample (≤20 cap).
+    msg = straggler_logs[0].message
+    for s in stragglers:
+        assert s in msg, f"straggler {s} missing from log: {msg}"

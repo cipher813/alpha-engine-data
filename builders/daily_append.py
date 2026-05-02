@@ -320,6 +320,7 @@ def daily_append(
     bucket: str = DEFAULT_BUCKET,
     dry_run: bool = False,
     skip_if_exists: bool = False,
+    expected_tickers: list[str] | None = None,
 ) -> dict:
     """
     Append today's features to ArcticDB universe.
@@ -348,6 +349,24 @@ def daily_append(
         904 × ~1.5s = ~22 min — over the SSM 1200s timeout. The 2026-05-01
         EOD SF rerun timed out exactly here after our manual recovery
         run had already written today's rows.
+    expected_tickers
+        When provided, the missing-from-closes hard-fail at step 2b is
+        scoped to ``arctic_universe ∩ expected_tickers`` instead of the
+        full ArcticDB universe. Lets the caller (MorningEnrich /
+        weekday DailyData) say "these are the tickers I asked polygon
+        for" so S&P churn-out stragglers (still in ArcticDB awaiting a
+        prune cycle, no longer in current constituents.json) don't trip
+        the threshold. 2026-05-02 incident: 8 tickers got dropped from
+        the index this past week (ASGN, GTM, HOLX, KMPR, LW, MOH,
+        MTCH, PAYC); ArcticDB universe still had them; MorningEnrich
+        no longer requested them; missing-from-closes saw 12 vs the
+        threshold of 5 and halted the SF. With expected_tickers passed,
+        only the 4 chronic polygon-coverage gaps (BF-B, BRK-B, MOG-A,
+        PSTG) trip the check, all under threshold.
+
+        When None (default — preserves the prior behavior for any caller
+        not yet updated), the check uses the full ArcticDB universe as
+        the expected set.
 
     Returns summary dict.
     """
@@ -550,7 +569,32 @@ def daily_append(
             t for t in closes
             if t not in _SKIP_TICKERS and not _is_sector_etf(t)
         }
-        missing_from_closes = sorted(arctic_stock_symbols - closes_stock_keys)
+        # Scope "expected" to the intersection of ArcticDB universe and the
+        # caller's request list. A ticker dropped from S&P this week (still
+        # in ArcticDB awaiting prune, no longer in constituents.json) was
+        # never asked for from polygon — its absence from closes is by
+        # design, not a data gap. Without this, every S&P churn week trips
+        # the threshold (2026-05-02: 8 churn-out tickers + 4 chronic =
+        # 12 > 5 → SF halt). With it, only tickers we both want to track
+        # AND have history for can flag the alarm.
+        if expected_tickers is not None:
+            expected_stocks = {
+                t.lstrip("^") for t in expected_tickers
+                if t.lstrip("^") not in _SKIP_TICKERS
+                and not _is_sector_etf(t.lstrip("^"))
+            }
+            relevant_arctic = arctic_stock_symbols & expected_stocks
+            stragglers = arctic_stock_symbols - expected_stocks
+            if stragglers:
+                log.info(
+                    "daily_append: %d ArcticDB stock symbols absent from "
+                    "expected_tickers (S&P churn-out stragglers, awaiting "
+                    "prune) — excluded from missing-from-closes check: %s",
+                    len(stragglers), sorted(stragglers)[:20],
+                )
+        else:
+            relevant_arctic = arctic_stock_symbols
+        missing_from_closes = sorted(relevant_arctic - closes_stock_keys)
         n_missing_from_closes = len(missing_from_closes)
         # Always emit a metric — silent regression in the slow-drift band
         # (1-2 tickers) won't trip the hard-fail but is still observable.

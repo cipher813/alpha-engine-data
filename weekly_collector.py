@@ -541,6 +541,7 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
             date_str=target_date,
             bucket=bucket,
             dry_run=dry_run,
+            expected_tickers=tickers,
         )
         results["collectors"]["arcticdb"] = arctic_result
     except Exception as e:
@@ -729,6 +730,7 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
             bucket=bucket,
             dry_run=dry_run,
             skip_if_exists=True,
+            expected_tickers=tickers,
         )
         results["collectors"]["arcticdb"] = arctic_result
     except Exception as e:
