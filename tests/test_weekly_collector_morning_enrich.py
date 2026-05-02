@@ -180,6 +180,10 @@ def test_morning_enrich_refreshes_daily_data_stamp_on_success():
 
     fake_constituents = MagicMock()
     fake_constituents.load_from_s3.return_value = {"tickers": ["AAPL"]}
+    # Pre-MorningEnrich preflight: refresh constituents in-process.
+    fake_constituents.collect.return_value = {
+        "status": "ok", "tickers": ["AAPL"], "date": "2026-04-24",
+    }
 
     health_calls = []
     def fake_write_health(bucket, module_name, run_date, status, **kwargs):
@@ -189,6 +193,9 @@ def test_morning_enrich_refreshes_daily_data_stamp_on_success():
         })
 
     with patch("weekly_collector.constituents", fake_constituents), \
+         patch("builders.prune_delisted_tickers.prune_delisted_tickers",
+               return_value={"status": "ok", "pruned_count": 0,
+                             "skipped_recent_count": 0}), \
          patch("weekly_collector.daily_closes.collect",
                return_value={"status": "ok", "polygon": 913, "fred": 4,
                              "yfinance": 0, "tickers_captured": 917,
@@ -217,12 +224,18 @@ def test_morning_enrich_does_not_stamp_on_polygon_failure():
 
     fake_constituents = MagicMock()
     fake_constituents.load_from_s3.return_value = {"tickers": ["AAPL"]}
+    fake_constituents.collect.return_value = {
+        "status": "ok", "tickers": ["AAPL"], "date": "2026-04-24",
+    }
 
     health_calls = []
     def fake_write_health(*args_, **kwargs):
         health_calls.append(kwargs)
 
     with patch("weekly_collector.constituents", fake_constituents), \
+         patch("builders.prune_delisted_tickers.prune_delisted_tickers",
+               return_value={"status": "ok", "pruned_count": 0,
+                             "skipped_recent_count": 0}), \
          patch("weekly_collector.daily_closes.collect",
                side_effect=PolygonForbiddenError("403 simulation")), \
          patch("weekly_collector._write_module_health", side_effect=fake_write_health):
@@ -294,3 +307,183 @@ def test_daily_mode_calls_collect_with_yfinance_only_source():
         "(per the 2026-04-23 split-by-source design — polygon free-tier 403's "
         "same-day, morning enrichment fills VWAP overnight)."
     )
+
+
+# ── Preflight: refresh-constituents + prune-stragglers ─────────────────────────
+
+
+def test_morning_enrich_refreshes_constituents_before_collect():
+    """Pre-flight architectural fix (2026-05-02 incident): MorningEnrich must
+    call constituents.collect() in-process BEFORE the daily_closes call so
+    polygon is asked about the freshest S&P membership, not last week's. The
+    bandage scoping in PR #132/#133 then becomes a quiet no-op rather than
+    the load-bearing path."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-04-24", dry_run=False, morning_enrich=True)
+
+    fake_constituents = MagicMock()
+    fake_constituents.collect.return_value = {
+        "status": "ok",
+        "tickers": ["AAPL", "MSFT", "NVDA"],  # fresh, post-churn list
+        "date": "2026-04-24",
+    }
+
+    captured_dc = {}
+    def fake_dc_collect(**kwargs):
+        captured_dc.update(kwargs)
+        return {"status": "ok", "polygon": 3, "fred": 0, "yfinance": 0,
+                "tickers_captured": 3, "source": "polygon_only"}
+
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("builders.prune_delisted_tickers.prune_delisted_tickers",
+               return_value={"status": "ok", "pruned_count": 0,
+                             "skipped_recent_count": 0}), \
+         patch("weekly_collector.daily_closes.collect", side_effect=fake_dc_collect), \
+         patch("builders.daily_append.daily_append",
+               return_value={"status": "ok"}), \
+         patch("weekly_collector._write_module_health"):
+        weekly_collector._run_morning_enrich(config, args)
+
+    fake_constituents.collect.assert_called_once()
+    # daily_closes must use the fresh tickers + macro additions, NOT
+    # load_from_s3's stale snapshot.
+    sent_tickers = captured_dc["tickers"]
+    assert "AAPL" in sent_tickers and "MSFT" in sent_tickers and "NVDA" in sent_tickers
+    fake_constituents.load_from_s3.assert_not_called()
+
+
+def test_morning_enrich_prunes_stragglers_before_daily_append():
+    """Prune must run BEFORE daily_closes/daily_append so the missing-from-
+    closes + freshness checks see a coherent universe. Use the in-process
+    constituents_override (not the public latest_weekly.json pointer) so
+    cross-module readers don't see a half-updated pointer mid-SF."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-04-24", dry_run=False, morning_enrich=True)
+
+    fake_constituents = MagicMock()
+    fake_constituents.collect.return_value = {
+        "status": "ok", "tickers": ["AAPL", "MSFT"], "date": "2026-04-24",
+    }
+
+    prune_calls = []
+    def fake_prune(**kwargs):
+        prune_calls.append(kwargs)
+        return {"status": "ok", "pruned_count": 0, "skipped_recent_count": 0}
+
+    da_calls = []
+    def fake_daily_append(**kwargs):
+        # By the time daily_append fires, prune must already have run.
+        assert prune_calls, "prune must run before daily_append"
+        da_calls.append(kwargs)
+        return {"status": "ok"}
+
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("builders.prune_delisted_tickers.prune_delisted_tickers",
+               side_effect=fake_prune), \
+         patch("weekly_collector.daily_closes.collect",
+               return_value={"status": "ok", "polygon": 2, "fred": 0,
+                             "yfinance": 0, "tickers_captured": 2,
+                             "source": "polygon_only"}), \
+         patch("builders.daily_append.daily_append", side_effect=fake_daily_append), \
+         patch("weekly_collector._write_module_health"):
+        weekly_collector._run_morning_enrich(config, args)
+
+    assert len(prune_calls) == 1
+    assert prune_calls[0]["apply"] is True
+    assert prune_calls[0]["absent_days"] == 5  # tighter than the 14d default
+    assert prune_calls[0]["constituents_override"] == {"AAPL", "MSFT"}
+    assert len(da_calls) == 1
+
+
+def test_morning_enrich_aborts_if_constituents_refresh_fails():
+    """Constituents refresh is the source of truth for prune + daily_closes
+    request list. If it fails, we cannot proceed safely — Wikipedia outages,
+    schema drift, or sector-mapping completeness failures all warrant a
+    hard-fail per feedback_no_silent_fails."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-04-24", dry_run=False, morning_enrich=True)
+
+    fake_constituents = MagicMock()
+    fake_constituents.collect.side_effect = RuntimeError("Wikipedia 503")
+
+    dc_calls = []
+    def fake_dc(**kwargs):
+        dc_calls.append(kwargs)
+        return {"status": "ok"}
+
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("builders.prune_delisted_tickers.prune_delisted_tickers"), \
+         patch("weekly_collector.daily_closes.collect", side_effect=fake_dc), \
+         patch("builders.daily_append.daily_append",
+               return_value={"status": "ok"}), \
+         patch("weekly_collector._write_module_health"):
+        result = weekly_collector._run_morning_enrich(config, args)
+
+    assert result["status"] == "failed"
+    assert result["collectors"]["constituents_preflight"]["status"] == "error"
+    assert "Wikipedia 503" in result["collectors"]["constituents_preflight"]["error"]
+    assert dc_calls == [], "daily_closes must NOT run if constituents refresh failed"
+
+
+def test_morning_enrich_continues_if_prune_fails():
+    """Prune is best-effort here — daily_append's expected_tickers scoping
+    (PR #132/#133) still tolerates stragglers as a fallback. A prune failure
+    must surface loudly (ERROR log + result entry) but must NOT block the
+    rest of the enrich pipeline tonight."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-04-24", dry_run=False, morning_enrich=True)
+
+    fake_constituents = MagicMock()
+    fake_constituents.collect.return_value = {
+        "status": "ok", "tickers": ["AAPL"], "date": "2026-04-24",
+    }
+
+    da_called = []
+
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("builders.prune_delisted_tickers.prune_delisted_tickers",
+               side_effect=RuntimeError("ArcticDB transient")), \
+         patch("weekly_collector.daily_closes.collect",
+               return_value={"status": "ok", "polygon": 1, "fred": 0,
+                             "yfinance": 0, "tickers_captured": 1,
+                             "source": "polygon_only"}), \
+         patch("builders.daily_append.daily_append",
+               side_effect=lambda **k: (da_called.append(k), {"status": "ok"})[1]), \
+         patch("weekly_collector._write_module_health"):
+        result = weekly_collector._run_morning_enrich(config, args)
+
+    assert result["prune_preflight_warning"]["status"] == "error"
+    assert "ArcticDB transient" in result["prune_preflight_warning"]["error"]
+    assert "prune_preflight" not in result["collectors"], (
+        "prune failure must NOT land in results['collectors'] — that key feeds "
+        "the status aggregator and would make the whole MorningEnrich fail"
+    )
+    assert len(da_called) == 1, "daily_append must still run when prune fails"
+    assert result["status"] == "ok"
+
+
+def test_morning_enrich_dry_run_skips_preflight_writes():
+    """Dry runs must not refresh constituents.json or prune ArcticDB —
+    side-effect-free is the contract."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-04-24", dry_run=True, morning_enrich=True)
+
+    fake_constituents = MagicMock()
+    fake_constituents.load_from_s3.return_value = {"tickers": ["AAPL"]}
+    # collect MUST NOT be called in dry-run.
+
+    prune_called = []
+
+    with patch("weekly_collector.constituents", fake_constituents), \
+         patch("builders.prune_delisted_tickers.prune_delisted_tickers",
+               side_effect=lambda **k: (prune_called.append(k), {})[1]), \
+         patch("weekly_collector.daily_closes.collect",
+               return_value={"status": "ok_dry_run", "polygon": 1, "fred": 0,
+                             "yfinance": 0, "tickers_captured": 1,
+                             "source": "polygon_only"}), \
+         patch("builders.daily_append.daily_append",
+               return_value={"status": "ok"}):
+        weekly_collector._run_morning_enrich(config, args)
+
+    fake_constituents.collect.assert_not_called()
+    assert prune_called == []

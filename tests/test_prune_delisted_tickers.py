@@ -470,3 +470,102 @@ def test_audit_failure_does_not_block_prune(monkeypatch):
     # Prune still happened; audit failure was swallowed with WARN.
     assert summary["pruned_count"] == 1
     lib.delete.assert_called_once_with("HOLX")
+
+
+# ── E. constituents_override (in-process freshness reference) ──────────────────
+
+
+def test_constituents_override_uses_in_process_set(monkeypatch):
+    """When the caller passes constituents_override, the latest_weekly.json
+    pointer read is bypassed entirely — the in-process set is authoritative.
+    Lets a caller that just refreshed constituents in-process (e.g.
+    pre-MorningEnrich preflight) prune against the freshest membership
+    without updating the public pointer (which has cross-module fan-out)."""
+    s3 = MagicMock()
+    # If the override is honored, get_object must NOT be called for the pointer
+    # — pointer fetch would hit the side_effect and raise.
+    s3.get_object.side_effect = AssertionError(
+        "pointer S3 read must not happen when constituents_override is set"
+    )
+    lib = _stub_universe_lib(
+        symbols=["AAPL", "STRAGGLER"],
+        last_dates={"AAPL": "2026-04-25", "STRAGGLER": "2026-04-20"},
+    )
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=5, apply=True,
+        today=pd.Timestamp("2026-04-28"),
+        constituents_override={"AAPL"},  # STRAGGLER absent from this set
+    )
+
+    assert summary["pruned_count"] == 1
+    assert summary["pruned"][0]["ticker"] == "STRAGGLER"
+    assert summary["constituents_date"] == "(in-process override)"
+
+
+def test_constituents_override_accepts_list_or_set(monkeypatch):
+    """Accept either set or list for ergonomic caller flexibility — the
+    pre-MorningEnrich code path has the tickers as a list and shouldn't
+    have to convert to a set just to satisfy the parameter type."""
+    s3 = MagicMock()
+    s3.put_object = MagicMock()
+    lib = _stub_universe_lib(
+        symbols=["AAPL"],
+        last_dates={"AAPL": "2026-04-25"},
+    )
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    # Both invocations should succeed without TypeError.
+    _mod.prune_delisted_tickers(
+        absent_days=5, apply=False,
+        today=pd.Timestamp("2026-04-28"),
+        constituents_override=["AAPL"],  # list
+    )
+    _mod.prune_delisted_tickers(
+        absent_days=5, apply=False,
+        today=pd.Timestamp("2026-04-28"),
+        constituents_override={"AAPL"},  # set
+    )
+
+
+def test_constituents_override_still_gates_on_last_date(monkeypatch):
+    """Override only swaps the freshness reference — the last_date staleness
+    gate still applies. A ticker absent from the override but with a fresh
+    last_date stays put. Locks the no-flapping invariant for the override
+    code path too."""
+    s3 = MagicMock()
+    lib = _stub_universe_lib(
+        symbols=["AAPL", "FRESH_BUT_ABSENT"],
+        last_dates={
+            "AAPL": "2026-04-25",
+            "FRESH_BUT_ABSENT": "2026-04-27",  # 1 day stale, well under threshold
+        },
+    )
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    summary = _mod.prune_delisted_tickers(
+        absent_days=5, apply=True,
+        today=pd.Timestamp("2026-04-28"),
+        constituents_override={"AAPL"},
+    )
+
+    assert summary["pruned_count"] == 0
+    assert summary["skipped_recent_count"] == 1
+
+
+def test_tickers_override_and_constituents_override_mutually_exclusive(monkeypatch):
+    """Two semantically distinct overrides must not be mixed — the former
+    targets a delete list, the latter swaps the freshness reference. Mixing
+    them would silently use only one and the other's intent would be lost."""
+    s3 = MagicMock()
+    lib = _stub_universe_lib(symbols=["AAPL"], last_dates={"AAPL": "2026-04-25"})
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _mod.prune_delisted_tickers(
+            absent_days=5, apply=False,
+            today=pd.Timestamp("2026-04-28"),
+            tickers_override=["AAPL"],
+            constituents_override={"AAPL"},
+        )

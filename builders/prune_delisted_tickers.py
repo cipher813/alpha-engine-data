@@ -99,6 +99,7 @@ def prune_delisted_tickers(
     absent_days: int = DEFAULT_ABSENT_DAYS,
     apply: bool = False,
     tickers_override: list[str] | None = None,
+    constituents_override: "set[str] | list[str] | None" = None,
     today: pd.Timestamp | None = None,
 ) -> dict:
     """Prune ArcticDB universe symbols that are confirmed delistings.
@@ -116,6 +117,15 @@ def prune_delisted_tickers(
         Skip the constituents-diff and target a specific list. Still
         gated on the last_date staleness check — operator can't blow
         up a fresh symbol via a typo.
+    constituents_override
+        Skip the ``latest_weekly.json`` pointer read and use this set as
+        the authoritative current-constituents reference for the diff.
+        Lets a caller that just refreshed constituents in-process (e.g.
+        the pre-MorningEnrich preflight) prune against the freshest
+        membership without needing to update the public pointer first
+        (which has cross-module read fan-out — alternative/macro/
+        features/compute all depend on it). Mutually exclusive with
+        ``tickers_override``.
     today
         Override the staleness reference date for testing. Defaults to
         UTC midnight today.
@@ -132,6 +142,13 @@ def prune_delisted_tickers(
     arctic_symbols = set(universe_lib.list_symbols())
     log.info("ArcticDB universe holds %d symbols", len(arctic_symbols))
 
+    if tickers_override is not None and constituents_override is not None:
+        raise ValueError(
+            "tickers_override and constituents_override are mutually exclusive — "
+            "the former targets a specific delete list, the latter swaps the "
+            "freshness reference. Pass at most one."
+        )
+
     if tickers_override is not None:
         candidates = sorted(set(tickers_override) & arctic_symbols)
         ignored = sorted(set(tickers_override) - arctic_symbols)
@@ -143,11 +160,19 @@ def prune_delisted_tickers(
             )
         weekly_date = "(override)"
     else:
-        constituents, weekly_date = _load_latest_constituents(s3, bucket)
-        log.info(
-            "Latest constituents (date=%s): %d tickers",
-            weekly_date, len(constituents),
-        )
+        if constituents_override is not None:
+            constituents = set(constituents_override)
+            weekly_date = "(in-process override)"
+            log.info(
+                "Constituents from in-process override: %d tickers",
+                len(constituents),
+            )
+        else:
+            constituents, weekly_date = _load_latest_constituents(s3, bucket)
+            log.info(
+                "Latest constituents (date=%s): %d tickers",
+                weekly_date, len(constituents),
+            )
         # Only stocks can be pruned — never touch macro/index series or
         # sector ETFs (those aren't constituents-tracked but are still
         # required by daily_append's macro-load path).

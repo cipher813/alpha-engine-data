@@ -478,23 +478,105 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
         "collectors": {},
     }
 
-    # Reuse the same ticker-loading logic as _run_daily so the polygon overwrite
-    # covers exactly the same universe.
-    tickers: list[str] = []
+    # ── Pre-flight: refresh constituents + prune ArcticDB stragglers ─────────
+    # Order matters. Without these, MorningEnrich loads last week's
+    # constituents.json (Phase 1's writer hasn't run yet this Saturday), so
+    # any S&P churn-out from the past week is invisible — the ticker stays
+    # in the request list, polygon doesn't have it (now-delisted), and the
+    # downstream missing-from-closes + freshness checks have to defend
+    # against the drift via ``expected_tickers`` scoping (PR #132 + PR #133
+    # are exactly that defense). Refreshing constituents + pruning here
+    # makes the universe coherent BEFORE any check fires, so the bandages
+    # become a quiet no-op rather than the load-bearing path.
+    #
+    # 2026-05-02 redrive #4 (after PR #132/#133 shipped) is the validation
+    # window: with the reorder, prune drops the 8 churn-outs (ASGN, GTM,
+    # HOLX, KMPR, LW, MOH, MTCH, PAYC) before MorningEnrich's writes;
+    # downstream checks see a coherent universe without needing the
+    # ``expected_tickers`` scoping at all.
     market_prefix = config.get("market_data", {}).get("s3_prefix", "market_data/")
-    try:
-        existing = constituents.load_from_s3(bucket, market_prefix)
-        if existing:
-            tickers = existing.get("tickers", [])
-            logger.info("Loaded %d tickers from S3 constituents", len(tickers))
-    except Exception as exc:
-        logger.warning("S3 constituents load failed — will try Wikipedia fallback: %s", exc)
-    if not tickers:
+    if not dry_run:
+        logger.info("=" * 60)
+        logger.info("REFRESHING: constituents (pre-MorningEnrich)")
+        logger.info("=" * 60)
         try:
-            tickers, _, _, _, _ = constituents._fetch_constituents()
-            logger.info("Loaded %d tickers from Wikipedia (S3 fallback)", len(tickers))
+            cons_result = constituents.collect(
+                bucket=bucket,
+                s3_prefix=market_prefix,
+                run_date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                dry_run=False,
+            )
+            results["collectors"]["constituents_preflight"] = cons_result
+            tickers = cons_result.get("tickers", [])
+            logger.info(
+                "Pre-MorningEnrich constituents refresh: %d tickers", len(tickers),
+            )
         except Exception as exc:
-            logger.error("Wikipedia constituents fallback failed: %s", exc)
+            logger.exception("Pre-MorningEnrich constituents refresh failed")
+            results["collectors"]["constituents_preflight"] = {
+                "status": "error", "error": str(exc),
+            }
+            results["status"] = "failed"
+            results["completed_at"] = datetime.now(timezone.utc).isoformat()
+            return results
+
+        logger.info("=" * 60)
+        logger.info("PRUNING: ArcticDB universe stragglers (pre-MorningEnrich)")
+        logger.info("=" * 60)
+        try:
+            from builders.prune_delisted_tickers import prune_delisted_tickers
+            # Use absent_days=5 to match the post-write freshness scan
+            # threshold — consistent with what daily_append considers
+            # "stale enough to drop". The post-Phase-1 prune still runs
+            # later with the conservative 14d default for any newcomers
+            # the SF picked up between MorningEnrich and Phase 1.
+            prune_result = prune_delisted_tickers(
+                bucket=bucket,
+                absent_days=5,
+                apply=True,
+                constituents_override=set(tickers),
+            )
+            results["collectors"]["prune_preflight"] = prune_result
+            logger.info(
+                "Pre-MorningEnrich prune: pruned %d stragglers (skipped_recent=%d)",
+                prune_result.get("pruned_count", 0),
+                prune_result.get("skipped_recent_count", 0),
+            )
+        except Exception as exc:
+            # Prune failure is non-fatal here — the bandage scoping in
+            # daily_append (PR #132/#133) still tolerates stragglers, and
+            # the post-Phase-1 prune gets another shot. Surface it
+            # loudly per feedback_no_silent_fails — operator should
+            # investigate, but the SF can complete tonight on the
+            # bandages alone.
+            #
+            # Recorded under top-level ``prune_preflight_warning`` rather
+            # than ``results["collectors"]`` because the per-collector
+            # status aggregator treats any ``error`` entry there as a
+            # whole-pipeline failure. The prune side-effect is best-effort
+            # observability, not a blocking step.
+            logger.error(
+                "Pre-MorningEnrich prune failed: %s. Falling through to "
+                "MorningEnrich; daily_append's expected_tickers scoping "
+                "will still tolerate stragglers, but please investigate "
+                "the prune failure.", exc,
+            )
+            results["prune_preflight_warning"] = {
+                "status": "error", "error": str(exc),
+            }
+    else:
+        # Dry-run: skip side effects but still load tickers for the
+        # downstream daily_closes call.
+        try:
+            existing = constituents.load_from_s3(bucket, market_prefix)
+            tickers = existing.get("tickers", []) if existing else []
+        except Exception:
+            tickers = []
+        if not tickers:
+            try:
+                tickers, _, _, _, _ = constituents._fetch_constituents()
+            except Exception as exc:
+                logger.error("Wikipedia constituents fallback failed: %s", exc)
 
     if not tickers:
         logger.error("No tickers available for morning enrichment")
