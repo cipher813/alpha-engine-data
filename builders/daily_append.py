@@ -141,6 +141,7 @@ def _scan_universe_and_emit_freshness_receipt(
     bucket: str,
     universe_lib,
     max_stale_days: int = UNIVERSE_FRESHNESS_MAX_STALE_DAYS,
+    expected_tickers: list[str] | None = None,
 ) -> dict:
     """Producer-side post-write validation: every universe symbol's
     last-row date must be within ``max_stale_days`` of today (UTC).
@@ -157,15 +158,51 @@ def _scan_universe_and_emit_freshness_receipt(
     where macro/SPY stays fresh while individual tickers stall — is
     exactly what this catches at the producer.
 
+    When ``expected_tickers`` is provided, the scan is scoped to
+    ``arctic_universe ∩ expected_tickers`` — same scoping the pre-write
+    missing-from-closes check uses (see ``daily_append`` docstring for
+    the full rationale). S&P churn-out stragglers (in arctic awaiting
+    prune, no longer in current constituents) are excluded so they don't
+    trip the post-write scan after the pre-write check correctly let
+    them through. 2026-05-02 incident: the pre-write check correctly
+    excluded 8 churn-outs, daily writes completed (n_ok=898), then this
+    scan tripped on the same 8 stragglers (one 25d stale) and halted
+    the SF.
+
     Returns scan metadata (also embedded in the receipt) for logging
     by the caller. Skipped automatically on dry_run.
     """
-    syms = list(universe_lib.list_symbols())
-    if not syms:
+    all_syms = list(universe_lib.list_symbols())
+    if not all_syms:
         raise RuntimeError(
             f"Universe-freshness scan: library is empty on bucket {bucket!r}; "
             "upstream pipeline has not written anything."
         )
+
+    if expected_tickers is not None:
+        expected_set = {
+            t.lstrip("^") for t in expected_tickers
+            if t.lstrip("^") not in _SKIP_TICKERS
+            and not _is_sector_etf(t.lstrip("^"))
+        }
+        syms = [s for s in all_syms if s in expected_set]
+        excluded = [s for s in all_syms if s not in expected_set]
+        if excluded:
+            log.info(
+                "Universe-freshness scan: excluding %d ArcticDB symbols absent "
+                "from expected_tickers (S&P churn-out stragglers, awaiting "
+                "prune): %s",
+                len(excluded), sorted(excluded)[:20],
+            )
+        if not syms:
+            raise RuntimeError(
+                f"Universe-freshness scan: zero symbols after expected_tickers "
+                f"intersection (arctic={len(all_syms)}, expected_set={len(expected_set)}). "
+                "Either expected_tickers is empty or the constituents collector "
+                "broke the schema."
+            )
+    else:
+        syms = all_syms
 
     today = datetime.now(timezone.utc).date()
 
@@ -1012,6 +1049,7 @@ def daily_append(
         # invocation (the cause of the 2026-05-01 SF timeout cascade).
         receipt = _scan_universe_and_emit_freshness_receipt(
             s3, bucket, universe_lib,
+            expected_tickers=expected_tickers,
         )
         result["universe_freshness_receipt"] = {
             "n_symbols_checked": receipt["n_symbols_checked"],

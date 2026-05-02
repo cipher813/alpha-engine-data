@@ -139,3 +139,119 @@ class TestUniverseFreshnessReceipt:
         })
         with pytest.raises(RuntimeError, match="EDGE"):
             _scan_universe_and_emit_freshness_receipt(s3, "test-bucket", lib2)
+
+
+class TestExpectedTickersScoping:
+    """The 2026-05-02 incident's second-layer fix.
+
+    The pre-write missing-from-closes check (PR #132) correctly excludes
+    S&P churn-out stragglers via expected_tickers. The post-write
+    freshness scan must apply the same scoping or it'll re-trip on the
+    same stragglers (one was 25 days stale on 2026-05-02 — HOLX). With
+    expected_tickers passed through, only the symbols we actually expect
+    to be fresh today get audited; stragglers are excluded and logged at
+    INFO so operators see drift building up between prune cycles.
+    """
+
+    def test_stragglers_excluded_from_scan(self):
+        """ArcticDB has fresh + stragglers; expected_tickers omits stragglers
+        → scan only checks the fresh ones → all_fresh=True, receipt written."""
+        s3 = MagicMock()
+        lib = _mock_lib_with_dates({
+            "AAPL": _today_str(0),
+            "MSFT": _today_str(1),
+            "ASGN": _today_str(8),    # straggler, 8d stale
+            "HOLX": _today_str(25),   # straggler, 25d stale
+        })
+
+        receipt = _scan_universe_and_emit_freshness_receipt(
+            s3, "test-bucket", lib,
+            expected_tickers=["AAPL", "MSFT"],
+        )
+
+        assert receipt["all_fresh"] is True
+        assert receipt["n_symbols_checked"] == 2  # stragglers excluded from count
+        s3.put_object.assert_called_once()
+
+    def test_stale_symbol_in_expected_still_raises(self):
+        """expected_tickers must NOT mask a real freshness gap. A stale
+        symbol that IS in expected_tickers must still trip the scan."""
+        s3 = MagicMock()
+        lib = _mock_lib_with_dates({
+            "AAPL": _today_str(0),
+            "MSFT": _today_str(UNIVERSE_FRESHNESS_MAX_STALE_DAYS + 3),  # genuinely stale
+            "STRAGGLER": _today_str(20),  # ignored
+        })
+
+        with pytest.raises(RuntimeError, match="MSFT"):
+            _scan_universe_and_emit_freshness_receipt(
+                s3, "test-bucket", lib,
+                expected_tickers=["AAPL", "MSFT"],
+            )
+        s3.put_object.assert_not_called()
+
+    def test_scoping_logs_excluded_stragglers(self, caplog):
+        """When stragglers are excluded, log them at INFO so operators see
+        drift building up between prune cycles. Silent exclusion = silent fail."""
+        import logging
+        s3 = MagicMock()
+        lib = _mock_lib_with_dates({
+            "AAPL": _today_str(0),
+            "STRAGGLER1": _today_str(8),
+            "STRAGGLER2": _today_str(20),
+        })
+
+        with caplog.at_level(logging.INFO, logger="builders.daily_append"):
+            _scan_universe_and_emit_freshness_receipt(
+                s3, "test-bucket", lib, expected_tickers=["AAPL"],
+            )
+
+        excluded_logs = [r for r in caplog.records if "excluding" in r.message]
+        assert excluded_logs, (
+            f"Expected an INFO log mentioning 'excluding'; got: "
+            f"{[r.message for r in caplog.records]}"
+        )
+        msg = excluded_logs[0].message
+        assert "STRAGGLER1" in msg and "STRAGGLER2" in msg
+
+    def test_scoping_strips_caret_prefix(self):
+        """Index tickers (^TNX) carry caret in expected_tickers but arctic
+        symbols don't — same lstrip the pre-write check uses."""
+        s3 = MagicMock()
+        lib = _mock_lib_with_dates({
+            "AAPL": _today_str(0),
+        })
+
+        receipt = _scan_universe_and_emit_freshness_receipt(
+            s3, "test-bucket", lib,
+            expected_tickers=["AAPL", "^VIX", "^TNX"],
+        )
+        assert receipt["all_fresh"] is True
+
+    def test_no_expected_preserves_legacy_full_scan(self):
+        """Backward compat: expected_tickers=None → scan the whole library
+        (the pre-PR behavior). Lets unrelated callers keep working."""
+        s3 = MagicMock()
+        lib = _mock_lib_with_dates({
+            "AAPL": _today_str(0),
+            "STRAGGLER": _today_str(20),  # would be excluded if scoping fired
+        })
+
+        with pytest.raises(RuntimeError, match="STRAGGLER"):
+            _scan_universe_and_emit_freshness_receipt(s3, "test-bucket", lib)
+
+    def test_empty_intersection_raises(self):
+        """If expected_tickers is non-empty but disjoint from arctic, the
+        scan would silently pass (zero symbols → no stale found). Hard-fail
+        instead so operators catch the misconfiguration loudly."""
+        s3 = MagicMock()
+        lib = _mock_lib_with_dates({
+            "ONLY_IN_ARCTIC": _today_str(0),
+        })
+
+        with pytest.raises(RuntimeError, match="zero symbols after expected_tickers"):
+            _scan_universe_and_emit_freshness_receipt(
+                s3, "test-bucket", lib,
+                expected_tickers=["ONLY_IN_EXPECTED"],
+            )
+        s3.put_object.assert_not_called()
