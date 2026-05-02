@@ -272,10 +272,24 @@ def check_universe_drift(ctx: PreflightContext) -> CheckResult:
         else:
             will_skip.append({**entry, "reason": "below_5d_threshold"})
 
+    # Escalate to FAIL if any straggler is "old enough to prune" (>5d stale)
+    # AND we're about to launch a recovery SF that skips MorningEnrich (the
+    # only place prune currently runs). The 2026-05-02 SF redrive #6 caught
+    # this: skip_data_phase1=true bypassed prune, Backtester preflight
+    # halted on the same stragglers. The post-PR-loop fix in backfill.py
+    # closes the regenerative loop on the DataPhase1 path; this check
+    # gates the manual-recovery path so operators don't burn a 120-min
+    # spot to re-discover stragglers we can see right here.
+    status = "fail" if will_prune else "ok"
+    message_prefix = (
+        f"{len(will_prune)} ticker(s) need pruning before any SF launch — "
+        if will_prune else ""
+    )
     return CheckResult(
         name="universe_drift",
-        status="ok",
+        status=status,
         message=(
+            f"{message_prefix}"
             f"{len(candidates)} arctic stragglers; {len(will_prune)} would be pruned, "
             f"{len(will_skip)} too fresh to drop"
         ),
@@ -284,6 +298,11 @@ def check_universe_drift(ctx: PreflightContext) -> CheckResult:
             "would_prune_count": len(will_prune),
             "would_prune": will_prune[:20],
             "would_skip_count": len(will_skip),
+            "remediation": (
+                "Run MorningEnrich (full SF) OR manually invoke "
+                "prune_delisted_tickers --apply --absent-days 5 against the "
+                "would_prune list before launching Backtester / recovery SFs."
+            ) if will_prune else None,
         },
         elapsed_seconds=time.time() - t0,
     )

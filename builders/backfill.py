@@ -62,6 +62,32 @@ log = logging.getLogger(__name__)
 OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume", "VWAP"]
 
 
+def _load_current_constituents(s3, bucket: str) -> set[str]:
+    """Load the current S&P 500 / 400 constituents set via the
+    ``market_data/latest_weekly.json`` pointer.
+
+    Used by ``backfill`` to filter out tickers absent from the current
+    investable universe before writing arctic rows. Mirrors the
+    ``prune_delisted_tickers`` lookup so the two sites agree on what's
+    "in the universe today".
+    """
+    pointer_obj = s3.get_object(Bucket=bucket, Key="market_data/latest_weekly.json")
+    pointer = json.loads(pointer_obj["Body"].read())
+    weekly_date = pointer["date"]
+    prefix = pointer["s3_prefix"].rstrip("/")
+    cons_obj = s3.get_object(Bucket=bucket, Key=f"{prefix}/constituents.json")
+    payload = json.loads(cons_obj["Body"].read())
+    tickers = payload.get("tickers")
+    if not tickers:
+        raise RuntimeError(
+            f"constituents.json at s3://{bucket}/{prefix}/constituents.json "
+            f"(weekly_date={weekly_date}) has no `tickers` field — refusing "
+            f"to filter against an empty constituents set (would write zero "
+            f"tickers to arctic universe)."
+        )
+    return set(tickers)
+
+
 def _load_full_cache(s3, bucket: str, prefix: str = "predictor/price_cache/") -> dict[str, pd.DataFrame]:
     """Load all 10-year price cache parquets from S3 (concurrent)."""
     keys = []
@@ -362,12 +388,61 @@ def backfill(
     #     computation (rolling 252-day vol/momentum etc.). Only these get
     #     OHLCV + feature columns written; short-history tickers get OHLCV
     #     only, and are skipped by feature-consuming predictors downstream.
+    #
+    # Constituents filter: drop any price_cache ticker that isn't in the
+    # current S&P 500 / 400 constituents. Without this, backfill recreates
+    # ArcticDB rows for tickers that were just pruned by
+    # ``builders.prune_delisted_tickers`` because their parquet files still
+    # exist in ``predictor/price_cache/`` (price_cache parquets are kept for
+    # historical lookup; arctic represents the active investable universe).
+    # The 2026-05-02 SF redrive #6 caught this: pre-MorningEnrich prune
+    # dropped 8 stragglers, then Phase 1 step 8 (this function) recreated
+    # them, then Backtester's universe-freshness preflight halted on 7 of
+    # them being 8 days stale. Filtering here closes the loop so prune +
+    # backfill stay coherent.
+    if not dry_run:
+        try:
+            constituents_set = _load_current_constituents(s3, bucket)
+            log.info(
+                "Loaded current constituents: %d tickers — backfill will only "
+                "write tickers in this set",
+                len(constituents_set),
+            )
+        except Exception as exc:
+            # Fail loud — without a constituents reference we'd silently
+            # recreate every parquet-backed ticker, undoing prune work.
+            raise RuntimeError(
+                f"Backfill could not load current constituents (needed to "
+                f"filter the universe write set): {exc}. Without this, "
+                f"backfill would recreate any pruned ticker that still has "
+                f"a price_cache parquet — see PR closing the prune+backfill "
+                f"loop. Refresh constituents.json upstream and retry."
+            ) from exc
+    else:
+        constituents_set = set(price_data)  # dry-run: don't restrict
+
     universe_tickers = [
         t for t in price_data
         if t not in _SKIP_TICKERS
         and not _is_sector_etf(t)
         and price_data[t] is not None
+        and t in constituents_set
     ]
+    excluded_by_constituents = sorted(
+        t for t in price_data
+        if t not in _SKIP_TICKERS
+        and not _is_sector_etf(t)
+        and price_data[t] is not None
+        and t not in constituents_set
+    )
+    if excluded_by_constituents:
+        log.info(
+            "Backfill skipping %d price_cache ticker(s) absent from current "
+            "constituents (parquet preserved for historical lookup; arctic "
+            "row not written): %s",
+            len(excluded_by_constituents),
+            excluded_by_constituents[:20],
+        )
     # Post-PR-#78: ``compute_features`` returns rows with NaN for features
     # whose rolling-window warmup exceeds available history (e.g. ATR-14
     # computes on 14 rows; dist_from_52w_high stays NaN under 252 rows).

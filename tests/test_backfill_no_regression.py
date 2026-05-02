@@ -178,6 +178,7 @@ def test_full_backfill_calls_apply_daily_delta():
     with patch.object(_bf, "_load_full_cache", return_value=price_data), \
          patch.object(_bf, "_apply_daily_delta", delta_mock), \
          patch.object(_bf, "_assert_no_arctic_regression"), \
+         patch.object(_bf, "_load_current_constituents", return_value=set(price_data.keys())), \
          patch.object(_bf, "_extract_macro_series", return_value=macro), \
          patch.object(_bf, "_load_sector_map", return_value={"AAPL": "XLK"}), \
          patch.object(_bf, "_load_cached_fundamentals", return_value={}), \
@@ -208,6 +209,7 @@ def test_full_backfill_calls_regression_preflight():
     with patch.object(_bf, "_load_full_cache", return_value=price_data), \
          patch.object(_bf, "_apply_daily_delta", side_effect=lambda s3, b, d, pd_: (pd_, set())), \
          patch.object(_bf, "_assert_no_arctic_regression", regression_mock), \
+         patch.object(_bf, "_load_current_constituents", return_value=set(price_data.keys())), \
          patch.object(_bf, "_extract_macro_series", return_value={}), \
          patch.object(_bf, "_load_sector_map", return_value={"AAPL": "XLK"}), \
          patch.object(_bf, "_load_cached_fundamentals", return_value={}), \
@@ -240,6 +242,7 @@ def test_ticker_filter_skips_regression_preflight():
     with patch.object(_bf, "_load_full_cache", return_value=price_data), \
          patch.object(_bf, "_apply_daily_delta", side_effect=lambda s3, b, d, pd_: (pd_, set())), \
          patch.object(_bf, "_assert_no_arctic_regression", regression_mock), \
+         patch.object(_bf, "_load_current_constituents", return_value=set(price_data.keys())), \
          patch.object(_bf, "_extract_macro_series", return_value={}), \
          patch.object(_bf, "_load_sector_map", return_value={"AAPL": "XLK"}), \
          patch.object(_bf, "_load_cached_fundamentals", return_value={}), \
@@ -269,6 +272,7 @@ def test_dry_run_skips_delta_and_preflight():
     with patch.object(_bf, "_load_full_cache", return_value=price_data), \
          patch.object(_bf, "_apply_daily_delta", delta_mock), \
          patch.object(_bf, "_assert_no_arctic_regression", regression_mock), \
+         patch.object(_bf, "_load_current_constituents", return_value=set(price_data.keys())), \
          patch.object(_bf, "_extract_macro_series", return_value={}), \
          patch.object(_bf, "_load_sector_map", return_value={"AAPL": "XLK"}), \
          patch.object(_bf, "_load_cached_fundamentals", return_value={}), \
@@ -280,3 +284,100 @@ def test_dry_run_skips_delta_and_preflight():
 
     delta_mock.assert_not_called()
     regression_mock.assert_not_called()
+
+
+# ── constituents filter (PR closing the prune+backfill loop) ─────────────────
+
+
+def test_backfill_skips_tickers_absent_from_constituents():
+    """The 2026-05-02 SF redrive #6 root cause: pre-MorningEnrich prune
+    drops 8 stragglers, then Phase 1 step 8 (this function) recreates
+    them because their parquet files still exist in price_cache. With
+    the constituents filter, backfill writes only tickers in the current
+    investable universe. Stragglers stay pruned."""
+    from builders import backfill as _bf
+
+    price_data = {
+        "AAPL": _ohlcv("2024-01-01", n=400),
+        "MSFT": _ohlcv("2024-01-01", n=400),
+        "STRAGGLER": _ohlcv("2024-01-01", n=400),  # parquet exists, not in constituents
+    }
+    universe_lib = MagicMock()
+    macro_lib = MagicMock()
+
+    with patch.object(_bf, "_load_full_cache", return_value=price_data), \
+         patch.object(_bf, "_apply_daily_delta", side_effect=lambda s3, b, d, pd_: (pd_, set())), \
+         patch.object(_bf, "_assert_no_arctic_regression"), \
+         patch.object(_bf, "_load_current_constituents",
+                      return_value={"AAPL", "MSFT"}), \
+         patch.object(_bf, "_extract_macro_series", return_value={}), \
+         patch.object(_bf, "_load_sector_map", return_value={"AAPL": "XLK", "MSFT": "XLK"}), \
+         patch.object(_bf, "_load_cached_fundamentals", return_value={}), \
+         patch.object(_bf, "_load_cached_alternative", return_value={}), \
+         patch.object(_bf, "_build_macro_features_df", return_value=pd.DataFrame()), \
+         patch.object(_bf, "compute_features", side_effect=lambda df, **_: df), \
+         patch.object(_bf, "get_universe_lib", return_value=universe_lib), \
+         patch.object(_bf, "get_macro_lib", return_value=macro_lib), \
+         patch("builders.backfill.boto3.client") as mock_boto:
+        mock_boto.return_value = MagicMock()
+        result = _bf.backfill(ticker_filter=None)
+
+    # universe_lib.write should be called for AAPL + MSFT only — NOT STRAGGLER.
+    written_tickers = {
+        call.args[0] for call in universe_lib.write.call_args_list
+    }
+    assert "AAPL" in written_tickers
+    assert "MSFT" in written_tickers
+    assert "STRAGGLER" not in written_tickers, (
+        "STRAGGLER absent from constituents must NOT be written to arctic — "
+        "would undo the prune and re-trip Backtester preflight"
+    )
+    assert result["status"] == "ok"
+
+
+def test_backfill_hard_fails_when_constituents_load_fails():
+    """Failing to load constituents must NOT silently proceed (which would
+    write everything in price_cache and undo all prune work). Hard-fail
+    per feedback_no_silent_fails."""
+    from builders import backfill as _bf
+
+    price_data = {"AAPL": _ohlcv("2024-01-01", n=400)}
+
+    with patch.object(_bf, "_load_full_cache", return_value=price_data), \
+         patch.object(_bf, "_apply_daily_delta", side_effect=lambda s3, b, d, pd_: (pd_, set())), \
+         patch.object(_bf, "_assert_no_arctic_regression"), \
+         patch.object(_bf, "_load_current_constituents",
+                      side_effect=RuntimeError("S3 503")), \
+         patch.object(_bf, "_extract_macro_series", return_value={}), \
+         patch.object(_bf, "_load_sector_map", return_value={}), \
+         patch.object(_bf, "_load_cached_fundamentals", return_value={}), \
+         patch.object(_bf, "_load_cached_alternative", return_value={}), \
+         patch("builders.backfill.boto3.client") as mock_boto:
+        mock_boto.return_value = MagicMock()
+        with pytest.raises(RuntimeError, match="could not load current constituents"):
+            _bf.backfill(ticker_filter=None)
+
+
+def test_backfill_dry_run_does_not_filter_by_constituents():
+    """Dry-run must work even without S3 constituents access (CI / local
+    smoke). Falls back to writing everything in price_cache (since dry-run
+    doesn't actually write)."""
+    from builders import backfill as _bf
+
+    price_data = {"AAPL": _ohlcv("2024-01-01", n=400)}
+    constituents_calls = MagicMock()
+
+    with patch.object(_bf, "_load_full_cache", return_value=price_data), \
+         patch.object(_bf, "_load_current_constituents", constituents_calls), \
+         patch.object(_bf, "_extract_macro_series", return_value={}), \
+         patch.object(_bf, "_load_sector_map", return_value={"AAPL": "XLK"}), \
+         patch.object(_bf, "_load_cached_fundamentals", return_value={}), \
+         patch.object(_bf, "_load_cached_alternative", return_value={}), \
+         patch.object(_bf, "compute_features", side_effect=lambda df, **_: df), \
+         patch("builders.backfill.boto3.client") as mock_boto:
+        mock_boto.return_value = MagicMock()
+        _bf.backfill(dry_run=True)
+
+    # In dry_run, _load_current_constituents must NOT be called — we use
+    # the price_data keys directly so dry-run works without S3.
+    constituents_calls.assert_not_called()
