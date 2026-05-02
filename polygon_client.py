@@ -152,6 +152,41 @@ class PolygonClient:
         self._grouped_daily_cache[date_str] = parsed
         return parsed
 
+    def get_single_day_bar(self, ticker: str, date_str: str) -> dict | None:
+        """Fetch a single-day OHLCV+VWAP bar for one ticker.
+
+        Same source and shape as ``get_grouped_daily``'s per-ticker dict,
+        but hits the per-ticker ``/aggs/ticker`` endpoint instead of the
+        bulk grouped one. Used as a fallback for tickers that polygon's
+        grouped-daily endpoint sometimes drops — observed 2026-05-02
+        when two grouped calls 4h apart returned non-overlapping
+        913-ticker subsets of the same 921 requested. The per-ticker
+        endpoint is a different code path on polygon's side and recovers
+        most of the transient misses without leaving polygon source.
+
+        Returns ``{"open", "high", "low", "close", "volume", "vwap"}``
+        on success, or ``None`` on no-data / 403.
+        """
+        try:
+            data = self._get(
+                f"/v2/aggs/ticker/{ticker}/range/1/day/{date_str}/{date_str}",
+                params={"adjusted": "true"},
+            )
+        except PolygonForbiddenError:
+            return None
+        results = data.get("results") or []
+        if not results:
+            return None
+        r = results[0]
+        return {
+            "open": r["o"],
+            "high": r["h"],
+            "low": r["l"],
+            "close": r["c"],
+            "volume": r["v"],
+            "vwap": r.get("vw"),
+        }
+
     def get_daily_bars(
         self,
         ticker: str,

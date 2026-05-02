@@ -363,7 +363,73 @@ def _fetch_polygon_closes(
             })
             polygon_count += 1
     logger.info("Polygon grouped-daily: %d/%d tickers", polygon_count, len(tickers))
+
+    # ── Per-ticker fallback for tickers polygon's bulk endpoint dropped ────
+    # Polygon's grouped-daily endpoint returns inconsistent ticker sets across
+    # calls (observed 2026-05-02: two calls 4h apart returned 913-ticker
+    # subsets that differed by 8 tickers — all real S&P 500/400 names). Hit
+    # the per-ticker /aggs/ticker endpoint for the gaps so a transient bulk
+    # miss doesn't tip MorningEnrich's missing-from-closes hard-fail. Stays
+    # within polygon source — no silent yfinance fallback.
+    captured = {r["ticker"] for r in records}
+    missing_stocks = [
+        t for t in tickers
+        if t.lstrip("^") not in captured and t.lstrip("^") not in _FRED_INDEX_MAP
+    ]
+    if missing_stocks:
+        recovered = _fetch_polygon_closes_per_ticker(missing_stocks, run_date, records)
+        polygon_count += recovered
+        logger.info(
+            "Polygon per-ticker fallback: recovered %d/%d (still missing %d): %s",
+            recovered, len(missing_stocks),
+            len(missing_stocks) - recovered,
+            [t for t in missing_stocks if t.lstrip("^") not in {r["ticker"] for r in records}][:10],
+        )
     return polygon_count
+
+
+def _fetch_polygon_closes_per_ticker(
+    tickers: list[str],
+    run_date: str,
+    records: list[dict],
+) -> int:
+    """Per-ticker polygon single-day fetch — fallback for tickers missing
+    from the grouped-daily response. Same source (polygon), same schema,
+    so no silent-fallback risk per feedback_no_silent_fails.
+
+    Each ticker is one rate-limited polygon call. With the default 5
+    calls/min and ~10-15 misses on a typical bulk-endpoint flake, this
+    adds 2-3 minutes to MorningEnrich runtime — well under the SF's
+    DataPhase1 budget.
+    """
+    from polygon_client import polygon_client
+
+    recovered = 0
+    for ticker in tickers:
+        store_ticker = ticker.lstrip("^")
+        try:
+            bar = polygon_client().get_single_day_bar(store_ticker, run_date)
+        except Exception as exc:
+            logger.warning(
+                "Polygon per-ticker fallback failed for %s @ %s: %s",
+                store_ticker, run_date, exc,
+            )
+            continue
+        if not bar:
+            continue
+        records.append({
+            "ticker": store_ticker,
+            "date": run_date,
+            "Open": round(bar["open"], 4),
+            "High": round(bar["high"], 4),
+            "Low": round(bar["low"], 4),
+            "Close": round(bar["close"], 4),
+            "Adj_Close": round(bar["close"], 4),
+            "Volume": int(bar["volume"]),
+            "VWAP": round(bar["vwap"], 4) if bar.get("vwap") else None,
+        })
+        recovered += 1
+    return recovered
 
 
 def _log_close_discrepancies(
