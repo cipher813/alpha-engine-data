@@ -155,17 +155,9 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
             )
             results["collectors"]["constituents"] = const_result
 
-            # Load the just-written constituents for downstream use
-            if not dry_run:
-                s3 = boto3.client("s3")
-                key = f"{market_prefix}weekly/{run_date}/constituents.json"
-                resp = s3.get_object(Bucket=bucket, Key=key)
-                const_data = json.loads(resp["Body"].read())
-                tickers = const_data.get("tickers", [])
-            else:
-                # In dry-run, fetch tickers directly for counting
-                t, _, _, _, _ = constituents._fetch_constituents()
-                tickers = t
+            # Use the tickers returned by collect() directly — saves the S3
+            # round-trip we previously needed to re-read what we just wrote.
+            tickers = const_result.get("tickers", [])
         except Exception as e:
             logger.error("Constituents collection failed: %s", e)
             results["collectors"]["constituents"] = {"status": "error", "error": str(e)}

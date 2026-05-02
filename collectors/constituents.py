@@ -92,7 +92,11 @@ def collect(
             "[dry-run] constituents: %d tickers (%d S&P500, %d S&P400), %d sector mappings",
             len(tickers), sp500_count, sp400_count, len(sector_etf_map),
         )
-        return {"status": "ok_dry_run", "count": len(tickers)}
+        return {
+            "status": "ok_dry_run",
+            "count": len(tickers),
+            "tickers": tickers,
+        }
 
     # Write to S3
     s3 = boto3.client("s3")
@@ -114,7 +118,17 @@ def collect(
         )
     logger.info("Wrote sector_map.json to data/ and predictor/ paths")
 
-    return {"status": "ok", "count": len(tickers)}
+    # tickers is included in the return so callers don't need an S3 round-trip
+    # to re-read what they just wrote. Pre-MorningEnrich preflight (PR #134)
+    # consumes this directly to feed prune_delisted_tickers' constituents_override
+    # and to populate the daily_closes request list for the same run. Existing
+    # _run_phase1 caller (line 156) just stores the dict — the extra key is
+    # additive, no breakage.
+    return {
+        "status": "ok",
+        "count": len(tickers),
+        "tickers": tickers,
+    }
 
 
 def _fetch_constituents() -> tuple[list[str], dict[str, str], dict[str, str], int, int]:

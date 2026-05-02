@@ -97,3 +97,45 @@ def test_fetch_raises_when_sector_column_missing() -> None:
     # collect() will hard-fail on this state. That's the contract.
     if tickers:
         assert not sector_map or len(sector_map) < len(tickers)
+
+
+def test_collect_returns_tickers_in_dict() -> None:
+    """``collect()``'s return contract MUST include the ``tickers`` list.
+
+    Pre-MorningEnrich preflight (PR #134, weekly_collector._run_morning_enrich)
+    feeds these tickers directly to prune_delisted_tickers' constituents_override
+    and to the daily_closes request list. Without ``tickers`` in the return,
+    the caller silently gets [] and either prunes nothing or asks polygon for
+    nothing. 2026-05-02 SF redrive #5 was this exact regression: collect()
+    returned only ``{"status": "ok", "count": 903}``, the preflight logged
+    'Pre-MorningEnrich constituents refresh: 0 tickers', and MorningEnrich
+    aborted with 'No tickers available for morning enrichment'.
+
+    Locks both happy paths (ok + ok_dry_run).
+    """
+    sp500_html = _fake_html(["AAPL", "MSFT"], ["Information Technology", "Information Technology"])
+    sp400_html = _fake_html(["JHG", "WSO"], ["Financials", "Industrials"])
+
+    def fake_get(url, **kwargs):
+        return _FakeResp(sp500_html if "500" in url else sp400_html)
+
+    # Dry-run path
+    with patch("collectors.constituents.requests.get", side_effect=fake_get):
+        result = constituents.collect(bucket="any", dry_run=True)
+    assert result["status"] == "ok_dry_run"
+    assert "tickers" in result, (
+        "ok_dry_run return MUST include tickers — preflight callers feed "
+        "this directly into prune_delisted_tickers + daily_closes"
+    )
+    assert set(result["tickers"]) == {"AAPL", "MSFT", "JHG", "WSO"}
+
+    # Non-dry-run path (S3 write mocked)
+    with patch("collectors.constituents.requests.get", side_effect=fake_get), \
+         patch("collectors.constituents.boto3"):
+        result = constituents.collect(bucket="any", dry_run=False)
+    assert result["status"] == "ok"
+    assert "tickers" in result, (
+        "ok return MUST include tickers — same contract as ok_dry_run; "
+        "the count is only useful as observability, not as a tickers source"
+    )
+    assert set(result["tickers"]) == {"AAPL", "MSFT", "JHG", "WSO"}
