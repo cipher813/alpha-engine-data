@@ -360,3 +360,205 @@ def test_run_preflight_returns_failure_count():
         n_fail, results = sfp.run_preflight(bucket="test-bucket")
     assert n_fail == 2
     assert len(results) == 3
+
+
+# ── Research-side static checks (PR #77, #78 prevention) ──────────────────────
+
+
+import tempfile
+from pathlib import Path
+
+
+def _make_sibling_repos(tmp_path: Path, *, pricing_yaml: str,
+                        universe_yaml: str | None = None,
+                        research_graph_src: str | None = None,
+                        quant_analyst_src: str | None = None,
+                        qual_analyst_src: str | None = None) -> Path:
+    """Build a tmp sibling-clone directory layout for the static checks
+    to walk. Returns the path that should be passed as the 'parent' dir
+    (i.e. tmp_path / 'siblings' simulates ~/Development).
+
+    Each yaml/source param is optional — pass None to omit the file
+    entirely (e.g. test the missing-file branch)."""
+    siblings = tmp_path / "siblings"
+    config = siblings / "alpha-engine-config"
+    research = siblings / "alpha-engine-research"
+    (config / "cost").mkdir(parents=True)
+    (config / "research").mkdir(parents=True)
+    (research / "agents" / "sector_teams").mkdir(parents=True)
+    (research / "graph").mkdir(parents=True)
+    # alpha-engine-data placeholder so _sibling_repo's parent-resolution
+    # has the right layout (sibling lookup is from this file's parent).
+    (siblings / "alpha-engine-data").mkdir()
+
+    (config / "cost" / "model_pricing.yaml").write_text(pricing_yaml)
+    if universe_yaml is not None:
+        (config / "research" / "universe.yaml").write_text(universe_yaml)
+    if research_graph_src is not None:
+        (research / "graph" / "research_graph.py").write_text(research_graph_src)
+    if quant_analyst_src is not None:
+        (research / "agents" / "sector_teams" / "quant_analyst.py").write_text(quant_analyst_src)
+    if qual_analyst_src is not None:
+        (research / "agents" / "sector_teams" / "qual_analyst.py").write_text(qual_analyst_src)
+
+    return siblings
+
+
+@pytest.fixture
+def patched_sibling(monkeypatch, tmp_path):
+    """Returns a callable that builds a tmp sibling layout + monkeypatches
+    sf_preflight._sibling_repo to resolve into it. Tests build the layout
+    they need then call the check."""
+    def _build(**kwargs) -> Path:
+        siblings = _make_sibling_repos(tmp_path, **kwargs)
+        def _fake_sibling(name: str):
+            candidate = siblings / name
+            return candidate if candidate.is_dir() else None
+        monkeypatch.setattr(sfp, "_sibling_repo", _fake_sibling)
+        return siblings
+    return _build
+
+
+# ── check_price_cards_cover_all_models ─────────────────────────────────────────
+
+
+def test_price_cards_check_passes_when_all_models_have_cards(patched_sibling):
+    """Happy path: every runtime model (after snapshot normalization) has
+    a card. PR #77's normalization is honored."""
+    patched_sibling(
+        pricing_yaml="cards:\n"
+                     "  - {model_name: claude-haiku-4-5, effective_from: 2026-01-01,"
+                     " input_per_1m: 1.0, output_per_1m: 5.0,"
+                     " cache_read_per_1m: 0.1, cache_create_per_1m: 1.25}\n"
+                     "  - {model_name: claude-sonnet-4-6, effective_from: 2026-01-01,"
+                     " input_per_1m: 3.0, output_per_1m: 15.0,"
+                     " cache_read_per_1m: 0.3, cache_create_per_1m: 3.75}\n",
+        universe_yaml="sector_teams:\n"
+                      "  per_stock_model: claude-haiku-4-5-20251001\n"  # snapshot suffix
+                      "  strategic_model: claude-sonnet-4-6\n",
+        research_graph_src='_FALLBACK_AGENT_MODEL_NAMES = {"sector_team": "claude-haiku-4-5"}\n',
+    )
+    result = sfp.check_price_cards_cover_all_models(_ctx())
+    assert result.status == "ok"
+
+
+def test_price_cards_check_fails_when_runtime_model_missing(patched_sibling):
+    """The 2026-05-02 PR #77 scenario exactly: per_stock_model is
+    'claude-haiku-4-5-20251001' (snapshot ID) but no card for the
+    family 'claude-haiku-4-5' exists. SHOULD be caught here."""
+    patched_sibling(
+        pricing_yaml="cards:\n"
+                     "  - {model_name: claude-sonnet-4-6, effective_from: 2026-01-01,"
+                     " input_per_1m: 3.0, output_per_1m: 15.0,"
+                     " cache_read_per_1m: 0.3, cache_create_per_1m: 3.75}\n",
+        universe_yaml="sector_teams:\n"
+                      "  per_stock_model: claude-haiku-4-5-20251001\n",
+        research_graph_src="",  # no fallbacks
+    )
+    result = sfp.check_price_cards_cover_all_models(_ctx())
+    assert result.status == "fail"
+    assert "haiku" in result.message.lower() or "no matching price card" in result.message.lower()
+
+
+def test_price_cards_check_warns_when_sibling_repo_absent(monkeypatch):
+    monkeypatch.setattr(sfp, "_sibling_repo", lambda name: None)
+    result = sfp.check_price_cards_cover_all_models(_ctx())
+    assert result.status == "warn"
+
+
+def test_price_cards_check_handles_fallback_models_in_research_graph(patched_sibling):
+    """Models in _FALLBACK_AGENT_MODEL_NAMES must also be checked — the
+    fallback path runs when track_llm_cost wiring is incomplete and would
+    crash if its model isn't in the price table."""
+    patched_sibling(
+        pricing_yaml="cards: []\n",  # empty cards
+        universe_yaml="",
+        research_graph_src='_FALLBACK_AGENT_MODEL_NAMES = {\n'
+                          '    "sector_team": "claude-haiku-4-5",\n'
+                          '    "ic_cio": "claude-sonnet-4-6",\n'
+                          '}\n',
+    )
+    result = sfp.check_price_cards_cover_all_models(_ctx())
+    assert result.status == "fail"
+    # Both fallback models should be flagged as missing.
+    assert "sector_team" in str(result.details) and "ic_cio" in str(result.details)
+
+
+# ── check_recursion_budget_for_response_format ────────────────────────────────
+
+
+def test_recursion_budget_check_passes_when_buffered(patched_sibling):
+    """Happy path: ReAct site uses response_format AND has +2 buffer in
+    recursion_limit. Mirrors today's PR #78 fix."""
+    patched_sibling(
+        pricing_yaml="cards: []\n",
+        quant_analyst_src=(
+            "from langgraph.prebuilt import create_react_agent\n"
+            "QUANT_MAX_ITERATIONS = 8\n"
+            "_QUANT_RECURSION_LIMIT = QUANT_MAX_ITERATIONS * 2 + 2\n"
+            "agent = create_react_agent(model, tools, response_format=Output)\n"
+            "agent.invoke({}, config={'recursion_limit': _QUANT_RECURSION_LIMIT})\n"
+        ),
+        qual_analyst_src=(
+            "from langgraph.prebuilt import create_react_agent\n"
+            "QUAL_MAX_ITERATIONS = 8\n"
+            "_QUAL_RECURSION_LIMIT = QUAL_MAX_ITERATIONS * 2 + 2\n"
+            "agent = create_react_agent(model, tools, response_format=Output)\n"
+            "agent.invoke({}, config={'recursion_limit': _QUAL_RECURSION_LIMIT})\n"
+        ),
+    )
+    result = sfp.check_recursion_budget_for_response_format(_ctx())
+    assert result.status == "ok"
+
+
+def test_recursion_budget_check_fails_on_bare_x2(patched_sibling):
+    """The 2026-05-02 PR #78 regression: ReAct uses response_format= but
+    recursion_limit is bare ``MAX_ITERATIONS * 2`` (no +N buffer). SF
+    crashes on the structured-extraction call. SHOULD be caught here."""
+    patched_sibling(
+        pricing_yaml="cards: []\n",
+        quant_analyst_src=(
+            "from langgraph.prebuilt import create_react_agent\n"
+            "QUANT_MAX_ITERATIONS = 8\n"
+            "agent = create_react_agent(model, tools, response_format=Output)\n"
+            "agent.invoke({}, config={'recursion_limit': QUANT_MAX_ITERATIONS * 2})\n"
+        ),
+        qual_analyst_src=(
+            "from langgraph.prebuilt import create_react_agent\n"
+            "QUAL_MAX_ITERATIONS = 8\n"
+            "_QUAL_RECURSION_LIMIT = QUAL_MAX_ITERATIONS * 2 + 2\n"
+            "agent = create_react_agent(model, tools, response_format=Output)\n"
+            "agent.invoke({}, config={'recursion_limit': _QUAL_RECURSION_LIMIT})\n"
+        ),
+    )
+    result = sfp.check_recursion_budget_for_response_format(_ctx())
+    assert result.status == "fail"
+    assert "quant_analyst" in str(result.details)
+
+
+def test_recursion_budget_check_skips_files_without_response_format(patched_sibling):
+    """Files that don't use response_format= aren't subject to the +2 rule."""
+    patched_sibling(
+        pricing_yaml="cards: []\n",
+        quant_analyst_src=(
+            "from langgraph.prebuilt import create_react_agent\n"
+            "QUANT_MAX_ITERATIONS = 8\n"
+            "agent = create_react_agent(model, tools)\n"  # no response_format
+            "agent.invoke({}, config={'recursion_limit': QUANT_MAX_ITERATIONS * 2})\n"
+        ),
+        qual_analyst_src=(
+            "from langgraph.prebuilt import create_react_agent\n"
+            "QUAL_MAX_ITERATIONS = 8\n"
+            "agent = create_react_agent(model, tools)\n"  # no response_format
+            "agent.invoke({}, config={'recursion_limit': QUAL_MAX_ITERATIONS * 2})\n"
+        ),
+    )
+    result = sfp.check_recursion_budget_for_response_format(_ctx())
+    assert result.status == "ok"
+    assert all("no response_format" in c for c in result.details["checked"])
+
+
+def test_recursion_budget_check_warns_when_sibling_absent(monkeypatch):
+    monkeypatch.setattr(sfp, "_sibling_repo", lambda name: None)
+    result = sfp.check_recursion_budget_for_response_format(_ctx())
+    assert result.status == "warn"

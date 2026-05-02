@@ -681,6 +681,215 @@ def check_postflight_contracts(ctx: PreflightContext) -> CheckResult:
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 
+# ── Research-side static checks (added 2026-05-02 after the cost-telemetry
+# + recursion-budget incidents) ───────────────────────────────────────────────
+
+
+def _sibling_repo(name: str) -> "Path | None":
+    """Resolve a sibling clone of an alpha-engine-* repo from this file's
+    location. Returns None if the sibling isn't checked out — checks that
+    depend on it then SKIP rather than fail (operator may be running the
+    preflight in an environment without sibling clones)."""
+    from pathlib import Path
+    here = Path(__file__).resolve().parent  # alpha-engine-data
+    candidate = here.parent / name
+    return candidate if candidate.is_dir() else None
+
+
+_ANTHROPIC_SNAPSHOT_RE = __import__("re").compile(r"-\d{8}$")
+
+
+def _normalize_model_for_pricing(model_name: str) -> str:
+    """Strip Anthropic ``-YYYYMMDD`` snapshot suffix. Mirrors the function
+    in ``alpha-engine-research/graph/llm_cost_tracker.py`` (PR #77). Kept
+    here as a static copy so the preflight doesn't need to import the
+    research module (which transitively pulls in heavy deps)."""
+    return _ANTHROPIC_SNAPSHOT_RE.sub("", model_name)
+
+
+def check_price_cards_cover_all_models(ctx: PreflightContext) -> CheckResult:
+    """Catches the 2026-05-02 PR #77 class: cost-telemetry hard-fail when
+    a runtime model name (often a snapshot ID like ``claude-haiku-4-5-
+    20251001``) doesn't normalize to any price card.
+
+    Walks every model name referenced by alpha-engine-research's runtime
+    config + hardcoded fallbacks, normalizes via the same logic the
+    Lambda uses (snapshot-suffix strip), and asserts each maps to a
+    card in alpha-engine-config/cost/model_pricing.yaml.
+
+    Pure file I/O, zero LLM cost. Skips if sibling repos aren't checked
+    out (CI / restricted environments)."""
+    import time
+    import yaml as _yaml
+    from pathlib import Path
+    t0 = time.time()
+
+    config_repo = _sibling_repo("alpha-engine-config")
+    research_repo = _sibling_repo("alpha-engine-research")
+    if config_repo is None or research_repo is None:
+        return CheckResult(
+            name="price_cards_cover_all_models",
+            status="warn",
+            message=(
+                f"Sibling repos not checked out (config={config_repo is not None}, "
+                f"research={research_repo is not None}) — skipped."
+            ),
+            elapsed_seconds=time.time() - t0,
+        )
+
+    pricing_path = config_repo / "cost" / "model_pricing.yaml"
+    if not pricing_path.is_file():
+        return CheckResult(
+            name="price_cards_cover_all_models",
+            status="fail",
+            message=f"Missing {pricing_path}",
+            elapsed_seconds=time.time() - t0,
+        )
+    pricing = _yaml.safe_load(pricing_path.read_text())
+    card_names = {c["model_name"] for c in pricing.get("cards", [])}
+
+    universe_path = config_repo / "research" / "universe.yaml"
+    runtime_models: dict[str, str] = {}
+    if universe_path.is_file():
+        universe = _yaml.safe_load(universe_path.read_text()) or {}
+        sector_cfg = universe.get("sector_teams") or {}
+        for k in ("per_stock_model", "strategic_model"):
+            v = sector_cfg.get(k) or universe.get(k)
+            if v:
+                runtime_models[f"sector_teams.{k}"] = v
+
+    # Also scan research_graph.py's hardcoded fallback dict — these names
+    # are used when track_llm_cost wiring is incomplete.
+    rg_path = research_repo / "graph" / "research_graph.py"
+    if rg_path.is_file():
+        src = rg_path.read_text()
+        # Parse _FALLBACK_AGENT_MODEL_NAMES dict literal — small enough that
+        # a regex is fine (vs full AST). Tolerates whitespace + quote style.
+        import re as _re
+        block = _re.search(
+            r"_FALLBACK_AGENT_MODEL_NAMES[^=]*=\s*\{(.*?)\}",
+            src, _re.DOTALL,
+        )
+        if block:
+            for m in _re.finditer(r'"([^"]+)"\s*:\s*"([^"]+)"', block.group(1)):
+                runtime_models[f"_FALLBACK_AGENT_MODEL_NAMES[{m.group(1)}]"] = m.group(2)
+
+    if not runtime_models:
+        return CheckResult(
+            name="price_cards_cover_all_models",
+            status="warn",
+            message="No runtime model names discovered — schema drift in research config?",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    misses: list[str] = []
+    for source, model_name in runtime_models.items():
+        normalized = _normalize_model_for_pricing(model_name)
+        if normalized not in card_names:
+            misses.append(f"{source}={model_name!r} (normalized={normalized!r})")
+
+    if misses:
+        return CheckResult(
+            name="price_cards_cover_all_models",
+            status="fail",
+            message=(
+                f"{len(misses)} runtime model(s) have no matching price card — "
+                f"recompute_cost would raise PriceCardLookupError on the SF run"
+            ),
+            details={
+                "missing": misses,
+                "available_cards": sorted(card_names),
+            },
+            elapsed_seconds=time.time() - t0,
+        )
+
+    return CheckResult(
+        name="price_cards_cover_all_models",
+        status="ok",
+        message=(
+            f"All {len(runtime_models)} runtime model(s) map to price cards "
+            f"(after snapshot-suffix normalization)"
+        ),
+        details={"runtime_models": runtime_models},
+        elapsed_seconds=time.time() - t0,
+    )
+
+
+def check_recursion_budget_for_response_format(ctx: PreflightContext) -> CheckResult:
+    """Catches the 2026-05-02 PR #78 class: ReAct agents using
+    ``response_format=...`` need ``recursion_limit > MAX_ITERATIONS * 2``
+    because the post-loop structured-extraction call counts against the
+    same budget.
+
+    Static scan of the analyst modules; no imports, no LLM. Asserts that
+    every file using ``response_format=`` in ``create_react_agent`` also
+    sets ``recursion_limit`` with a ``+ 2`` buffer (or higher). The bare
+    ``MAX_ITERATIONS * 2`` formula crashes the SF on the structured-output
+    extraction call."""
+    import time
+    import re as _re
+    from pathlib import Path
+    t0 = time.time()
+
+    research_repo = _sibling_repo("alpha-engine-research")
+    if research_repo is None:
+        return CheckResult(
+            name="recursion_budget_for_response_format",
+            status="warn",
+            message="alpha-engine-research sibling not checked out — skipped.",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    targets = [
+        research_repo / "agents" / "sector_teams" / "quant_analyst.py",
+        research_repo / "agents" / "sector_teams" / "qual_analyst.py",
+    ]
+    issues: list[str] = []
+    checked: list[str] = []
+
+    for path in targets:
+        if not path.is_file():
+            issues.append(f"{path.name} missing")
+            continue
+        src = path.read_text()
+        uses_response_format = "response_format=" in src
+        if not uses_response_format:
+            checked.append(f"{path.name}: no response_format — skipped")
+            continue
+        # Look for any recursion_limit assignment that's NOT bare ``× 2``.
+        # Acceptable shapes: ``MAX_ITERATIONS * 2 + 2``, ``MAX_ITERATIONS * 2 + N``,
+        # explicit numeric ≥ 18, or a named constant we can resolve.
+        bare_x2 = _re.search(
+            r"recursion_limit[\"']?\s*:\s*\w+_MAX_ITERATIONS\s*\*\s*2(?!\s*\+)",
+            src,
+        )
+        if bare_x2:
+            issues.append(
+                f"{path.name}: uses response_format= but recursion_limit is "
+                f"bare MAX_ITERATIONS * 2 (no +N buffer) — SF will halt on "
+                f"the structured-extraction call"
+            )
+            continue
+        checked.append(f"{path.name}: response_format + buffered recursion_limit ✓")
+
+    if issues:
+        return CheckResult(
+            name="recursion_budget_for_response_format",
+            status="fail",
+            message=f"{len(issues)} ReAct site(s) at risk of GraphRecursionError",
+            details={"issues": issues, "checked": checked},
+            elapsed_seconds=time.time() - t0,
+        )
+
+    return CheckResult(
+        name="recursion_budget_for_response_format",
+        status="ok",
+        message=f"All {len(targets)} ReAct site(s) have buffered recursion_limit",
+        details={"checked": checked},
+        elapsed_seconds=time.time() - t0,
+    )
+
+
 # ArcticDB on macOS crashes in ``Aws::S3::S3Client::S3Client`` if boto3 has
 # already initialized the AWS SDK in the process — the arcticdb-bundled
 # AWS SDK conflicts with the system one. Initializing arctic FIRST avoids
@@ -695,6 +904,8 @@ CHECKS = [
     check_predicted_missing_from_closes,
     check_backfill_source_freshness,
     check_postflight_contracts,
+    check_price_cards_cover_all_models,
+    check_recursion_budget_for_response_format,
 ]
 
 
