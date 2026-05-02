@@ -172,6 +172,8 @@ def _run_backfill_with_mocks(**backfill_kwargs):
     )
 
     with patch.object(_bf, "_load_full_cache", return_value=price_data), \
+         patch.object(_bf, "_apply_daily_delta", side_effect=lambda s3, b, d, pd_: (pd_, set())), \
+         patch.object(_bf, "_assert_no_arctic_regression"), \
          patch.object(_bf, "_extract_macro_series", return_value=macro), \
          patch.object(_bf, "_load_sector_map", return_value=sector_map), \
          patch.object(_bf, "_load_cached_fundamentals", return_value=fundamentals), \
@@ -258,6 +260,8 @@ def test_short_history_ticker_gets_feature_columns_written():
         return out
 
     with patch.object(_bf, "_load_full_cache", return_value=price_data), \
+         patch.object(_bf, "_apply_daily_delta", side_effect=lambda s3, b, d, pd_: (pd_, set())), \
+         patch.object(_bf, "_assert_no_arctic_regression"), \
          patch.object(_bf, "_extract_macro_series", return_value=macro), \
          patch.object(_bf, "_load_sector_map", return_value=sector_map), \
          patch.object(_bf, "_load_cached_fundamentals", return_value={}), \
@@ -334,6 +338,8 @@ def test_backfill_writes_vwap_when_input_parquet_lacks_it():
         return out
 
     with patch.object(_bf, "_load_full_cache", return_value=price_data), \
+         patch.object(_bf, "_apply_daily_delta", side_effect=lambda s3, b, d, pd_: (pd_, set())), \
+         patch.object(_bf, "_assert_no_arctic_regression"), \
          patch.object(_bf, "_extract_macro_series", return_value=macro), \
          patch.object(_bf, "_load_sector_map", return_value=sector_map), \
          patch.object(_bf, "_load_cached_fundamentals", return_value={}), \
