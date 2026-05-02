@@ -128,9 +128,13 @@ def test_universe_drift_predicts_prune_outcome():
 
     result = sfp.check_universe_drift(ctx)
 
-    assert result.status == "ok"
+    # Escalated to FAIL when any straggler would be pruned. Operator must
+    # drop them before launching Backtester / recovery SFs (otherwise we
+    # burn a 120-min spot to re-discover them at Backtester preflight).
+    assert result.status == "fail"
     assert result.details["candidates_count"] == 8
     assert result.details["would_prune_count"] == 8
+    assert result.details["remediation"] is not None
 
 
 def test_universe_drift_no_stragglers_passes_quietly():
