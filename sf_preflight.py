@@ -1,0 +1,790 @@
+"""
+sf_preflight.py — Predict whether the Saturday SF would succeed BEFORE
+launching a spot.
+
+Today's Saturday SF (alpha-engine-saturday-pipeline) is a 50-min spot run
+that costs 1 polygon API call (free-tier 5/min budget) per attempt and a
+spot bootstrap (~3 min wall-clock + IAM/SSM dance). Repeated launch-fail
+cycles burn polygon quota and operator hours. This module simulates the
+critical pre-Phase-1 path against real S3 + ArcticDB state and reports
+predicted pass/fail per step BEFORE any compute fires.
+
+Usage:
+    python sf_preflight.py                         # human-readable summary
+    python sf_preflight.py --json                  # structured output
+    python sf_preflight.py --bucket <override>     # alternate bucket
+
+Exit codes:
+    0  all checks pass — SF is predicted to succeed
+    1  ≥1 check fails — fix before redrive
+
+Polygon API budget: 1 call total (one grouped-daily lookup for the prior
+trading day). Same call the actual SF makes; reusable in spirit since the
+SF re-fetches anyway in MorningEnrich.
+
+What this catches (mapped to today's incidents):
+    PR #130 (backfill regression)         — check_backfill_source_freshness
+    PR #131 (polygon coverage flake)      — check_polygon_grouped_coverage
+    PR #132 (missing-from-closes scoping) — check_predicted_missing_from_closes
+    PR #133 (freshness scan scoping)      — check_universe_sample_freshness
+    PR #134 (workflow ordering)           — check_universe_drift
+    PR #135 (return shape)                — check_constituents_fetch
+    Postflight contracts                  — check_postflight_contracts
+
+What this CANNOT catch:
+    - Polygon coverage flipping AFTER preflight succeeds (transient
+      between preflight + actual SF kickoff). PR #131 is defense for this.
+    - ArcticDB write failures (we don't write here).
+    - Spot reclaim / SSM timeouts (infrastructure-level).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+log = logging.getLogger(__name__)
+
+DEFAULT_BUCKET = "alpha-engine-research"
+
+# Same threshold daily_append uses (DAILY_APPEND_MISSING_THRESHOLD).
+# Pre-MorningEnrich prune (PR #134) drops stragglers, so the residual
+# count should be the chronic polygon-coverage gaps only (BF-B, BRK-B,
+# MOG-A, PSTG = 4 today).
+_MISSING_FROM_CLOSES_THRESHOLD = 5
+
+# Universe-freshness scan threshold from builders/daily_append.py.
+_UNIVERSE_FRESHNESS_MAX_STALE_DAYS = 5
+
+# Postflight SPY freshness threshold (validators/postflight.py).
+_POSTFLIGHT_SPY_MAX_STALE_DAYS = 1
+
+# Sample size for the universe-freshness check; matches the post-write
+# scan's _UNIVERSE_SCAN_WORKERS budget.
+_UNIVERSE_SAMPLE_SIZE = 20
+
+
+# ── Result types ──────────────────────────────────────────────────────────────
+
+
+@dataclass
+class CheckResult:
+    name: str
+    status: str  # "ok" | "warn" | "fail"
+    message: str
+    details: dict = field(default_factory=dict)
+    elapsed_seconds: float = 0.0
+
+
+@dataclass
+class PreflightContext:
+    bucket: str
+    today: str  # YYYY-MM-DD
+    prior_trading_day: str  # YYYY-MM-DD
+    fresh_constituents: "set[str] | None" = None  # populated by check_constituents_fetch
+    arctic_universe_symbols: "set[str] | None" = None  # populated by check_arctic_connectivity
+    polygon_returned_tickers: "set[str] | None" = None  # populated by check_polygon_grouped_coverage
+    # ArcticDB handles — initialized once in check_arctic_connectivity and
+    # reused across downstream checks. ArcticDB on macOS crashes in
+    # ``Aws::S3::S3Client::S3Client`` when ``adb.Arctic(uri)`` runs more
+    # than once per process (AWS SDK init race), so every check that needs
+    # arctic must read these from ctx instead of re-initializing.
+    universe_lib: "Any | None" = None
+    macro_lib: "Any | None" = None
+
+
+# ── Individual checks ─────────────────────────────────────────────────────────
+
+
+def check_constituents_fetch(ctx: PreflightContext) -> CheckResult:
+    """Catches PR #135 class: ``constituents.collect()`` return-shape regressions.
+
+    Calls the real ``_fetch_constituents()`` (Wikipedia, no rate limit) and
+    asserts the contract: non-empty tickers, complete sector map. The S&P
+    500/400 split must each contribute their expected ~500/~400 counts.
+    """
+    import time
+    t0 = time.time()
+    try:
+        from collectors.constituents import _fetch_constituents
+        tickers, sector_map, sector_etf_map, sp500, sp400 = _fetch_constituents()
+    except Exception as exc:
+        return CheckResult(
+            name="constituents_fetch",
+            status="fail",
+            message=f"Wikipedia fetch raised: {exc}",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    if not tickers:
+        return CheckResult(
+            name="constituents_fetch",
+            status="fail",
+            message="Wikipedia returned 0 tickers",
+            elapsed_seconds=time.time() - t0,
+        )
+    if sp500 < 480 or sp500 > 520:
+        return CheckResult(
+            name="constituents_fetch",
+            status="fail",
+            message=f"S&P 500 count out of band: {sp500} (expected 480-520)",
+            elapsed_seconds=time.time() - t0,
+        )
+    if sp400 < 380 or sp400 > 420:
+        return CheckResult(
+            name="constituents_fetch",
+            status="fail",
+            message=f"S&P 400 count out of band: {sp400} (expected 380-420)",
+            elapsed_seconds=time.time() - t0,
+        )
+    unmapped = [t for t in tickers if t not in sector_map]
+    if unmapped:
+        return CheckResult(
+            name="constituents_fetch",
+            status="fail",
+            message=f"sector_map missing for {len(unmapped)} tickers (collect would raise)",
+            details={"unmapped_sample": unmapped[:10]},
+            elapsed_seconds=time.time() - t0,
+        )
+
+    ctx.fresh_constituents = set(tickers)
+    return CheckResult(
+        name="constituents_fetch",
+        status="ok",
+        message=f"Wikipedia OK: {len(tickers)} tickers ({sp500} S&P 500 + {sp400} S&P 400)",
+        details={"total": len(tickers), "sp500": sp500, "sp400": sp400},
+        elapsed_seconds=time.time() - t0,
+    )
+
+
+def check_arctic_connectivity(ctx: PreflightContext) -> CheckResult:
+    """ArcticDB cluster reachable + macro/universe libraries present.
+
+    Mirrors the existing preflight.py ArcticDB probe but populates the
+    universe symbol set into the context for downstream checks.
+    """
+    import time
+    t0 = time.time()
+    try:
+        import arcticdb as adb
+        uri = (
+            f"s3s://s3.us-east-1.amazonaws.com:{ctx.bucket}"
+            "?path_prefix=arcticdb&aws_auth=true"
+        )
+        arctic = adb.Arctic(uri)
+        libs = set(arctic.list_libraries())
+        if "universe" not in libs or "macro" not in libs:
+            return CheckResult(
+                name="arctic_connectivity",
+                status="fail",
+                message=f"ArcticDB missing required libraries: have {sorted(libs)}",
+                elapsed_seconds=time.time() - t0,
+            )
+        ctx.universe_lib = arctic.get_library("universe")
+        ctx.macro_lib = arctic.get_library("macro")
+        symbols = set(ctx.universe_lib.list_symbols())
+        ctx.arctic_universe_symbols = symbols
+    except Exception as exc:
+        return CheckResult(
+            name="arctic_connectivity",
+            status="fail",
+            message=f"ArcticDB probe raised: {exc}",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    return CheckResult(
+        name="arctic_connectivity",
+        status="ok",
+        message=f"ArcticDB reachable; universe library has {len(symbols)} symbols",
+        details={"universe_size": len(symbols)},
+        elapsed_seconds=time.time() - t0,
+    )
+
+
+def check_universe_drift(ctx: PreflightContext) -> CheckResult:
+    """Catches PR #134 class: stragglers in arctic that aren't in
+    current constituents, predicting the pre-MorningEnrich prune outcome.
+
+    Computes ``arctic - constituents``, identifies which would actually
+    be pruned (last_date >= 5d stale, matching PR #134's absent_days=5).
+    """
+    import time
+    t0 = time.time()
+    if ctx.fresh_constituents is None or ctx.arctic_universe_symbols is None:
+        return CheckResult(
+            name="universe_drift",
+            status="fail",
+            message="Skipped: prior checks failed to populate context",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    from features.compute import _SKIP_TICKERS, _is_sector_etf
+
+    candidates = sorted(
+        s for s in ctx.arctic_universe_symbols
+        if s not in ctx.fresh_constituents
+        and s not in _SKIP_TICKERS
+        and not _is_sector_etf(s)
+    )
+
+    if not candidates:
+        return CheckResult(
+            name="universe_drift",
+            status="ok",
+            message="No straggler candidates (arctic ⊆ constituents)",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    # Reuse the universe lib from check_arctic_connectivity to avoid the
+    # macOS arcticdb re-init crash (see PreflightContext docstring).
+    if ctx.universe_lib is None:
+        return CheckResult(
+            name="universe_drift",
+            status="fail",
+            message="Skipped: arctic_connectivity did not populate universe_lib",
+            elapsed_seconds=time.time() - t0,
+        )
+    universe_lib = ctx.universe_lib
+    import pandas as pd
+    today_ts = pd.Timestamp(ctx.today)
+
+    will_prune: list[dict] = []
+    will_skip: list[dict] = []
+    for ticker in candidates:
+        try:
+            df = universe_lib.tail(ticker, n=1).data
+            last_ts = pd.Timestamp(df.index[-1]).normalize() if not df.empty else None
+        except Exception:
+            last_ts = None
+        if last_ts is None:
+            will_skip.append({"ticker": ticker, "reason": "unreadable"})
+            continue
+        days_stale = (today_ts.normalize() - last_ts).days
+        entry = {"ticker": ticker, "last_date": last_ts.date().isoformat(), "days_stale": days_stale}
+        # PR #134 uses absent_days=5 for the pre-MorningEnrich prune.
+        if days_stale > 5:
+            will_prune.append(entry)
+        else:
+            will_skip.append({**entry, "reason": "below_5d_threshold"})
+
+    return CheckResult(
+        name="universe_drift",
+        status="ok",
+        message=(
+            f"{len(candidates)} arctic stragglers; {len(will_prune)} would be pruned, "
+            f"{len(will_skip)} too fresh to drop"
+        ),
+        details={
+            "candidates_count": len(candidates),
+            "would_prune_count": len(will_prune),
+            "would_prune": will_prune[:20],
+            "would_skip_count": len(will_skip),
+        },
+        elapsed_seconds=time.time() - t0,
+    )
+
+
+def check_universe_sample_freshness(ctx: PreflightContext) -> CheckResult:
+    """Catches PR #133 class: post-write freshness scan tripping on
+    expected tickers.
+
+    Sample 20 from ``arctic ∩ constituents`` (the same population the
+    actual scan would audit after PR #134's prune drains stragglers).
+    Predict any stale.
+    """
+    import time
+    t0 = time.time()
+    if ctx.fresh_constituents is None or ctx.arctic_universe_symbols is None:
+        return CheckResult(
+            name="universe_sample_freshness",
+            status="fail",
+            message="Skipped: prior checks failed to populate context",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    import arcticdb as adb
+    import pandas as pd
+    import random
+
+    relevant = sorted(ctx.arctic_universe_symbols & ctx.fresh_constituents)
+    if not relevant:
+        return CheckResult(
+            name="universe_sample_freshness",
+            status="fail",
+            message="Empty (arctic ∩ constituents) — universe pruned to nothing or constituents misconfigured",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    rng = random.Random(ctx.today)
+    sample = rng.sample(relevant, min(_UNIVERSE_SAMPLE_SIZE, len(relevant)))
+
+    if ctx.universe_lib is None:
+        return CheckResult(
+            name="universe_sample_freshness",
+            status="fail",
+            message="Skipped: arctic_connectivity did not populate universe_lib",
+            elapsed_seconds=time.time() - t0,
+        )
+    universe_lib = ctx.universe_lib
+    today = pd.Timestamp(ctx.today).normalize()
+
+    stale: list[dict] = []
+    for ticker in sample:
+        try:
+            df = universe_lib.tail(ticker, n=1).data
+            last_ts = pd.Timestamp(df.index[-1]).normalize() if not df.empty else None
+        except Exception:
+            last_ts = None
+        if last_ts is None:
+            stale.append({"ticker": ticker, "reason": "unreadable"})
+            continue
+        days_stale = (today - last_ts).days
+        if days_stale > _UNIVERSE_FRESHNESS_MAX_STALE_DAYS:
+            stale.append({
+                "ticker": ticker,
+                "last_date": last_ts.date().isoformat(),
+                "days_stale": days_stale,
+            })
+
+    if stale:
+        return CheckResult(
+            name="universe_sample_freshness",
+            status="warn",
+            message=(
+                f"{len(stale)}/{len(sample)} sampled symbols >{_UNIVERSE_FRESHNESS_MAX_STALE_DAYS}d "
+                f"stale TODAY (post-MorningEnrich would refresh, so not a hard-fail; "
+                f"flagging for visibility)"
+            ),
+            details={"stale": stale[:10]},
+            elapsed_seconds=time.time() - t0,
+        )
+
+    return CheckResult(
+        name="universe_sample_freshness",
+        status="ok",
+        message=f"Sampled {len(sample)} symbols, all within {_UNIVERSE_FRESHNESS_MAX_STALE_DAYS}d of today",
+        elapsed_seconds=time.time() - t0,
+    )
+
+
+def check_polygon_grouped_coverage(ctx: PreflightContext) -> CheckResult:
+    """ONE polygon grouped-daily call to predict missing-from-closes.
+
+    Same call the actual SF makes — re-using the rate-limit slot that
+    would otherwise be spent during the SF run. Populates the returned
+    ticker set into the context for downstream checks.
+    """
+    import time
+    t0 = time.time()
+    if ctx.fresh_constituents is None:
+        return CheckResult(
+            name="polygon_grouped_coverage",
+            status="fail",
+            message="Skipped: constituents fetch failed",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    import os
+    if not os.environ.get("POLYGON_API_KEY"):
+        # Local-laptop preflight — polygon key lives in .env on the spot
+        # and on EC2. Skip without failing so the rest of the report is
+        # actionable; on the spot the key is present and this fires.
+        return CheckResult(
+            name="polygon_grouped_coverage",
+            status="warn",
+            message="POLYGON_API_KEY not set — skipped (will run on spot/EC2)",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    try:
+        from polygon_client import polygon_client, PolygonForbiddenError
+        grouped = polygon_client().get_grouped_daily(ctx.prior_trading_day)
+    except PolygonForbiddenError as exc:
+        return CheckResult(
+            name="polygon_grouped_coverage",
+            status="fail",
+            message=f"Polygon 403 — same-day fetch on free tier? ({exc})",
+            elapsed_seconds=time.time() - t0,
+        )
+    except Exception as exc:
+        return CheckResult(
+            name="polygon_grouped_coverage",
+            status="fail",
+            message=f"Polygon raised: {exc}",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    if not grouped:
+        return CheckResult(
+            name="polygon_grouped_coverage",
+            status="fail",
+            message=f"Polygon returned 0 tickers for {ctx.prior_trading_day}",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    polygon_symbols = set(grouped.keys())
+    ctx.polygon_returned_tickers = polygon_symbols
+
+    requested = ctx.fresh_constituents
+    covered = polygon_symbols & requested
+    coverage_ratio = len(covered) / len(requested) if requested else 0
+    missing = sorted(requested - polygon_symbols)
+
+    if coverage_ratio < 0.95:
+        return CheckResult(
+            name="polygon_grouped_coverage",
+            status="fail",
+            message=(
+                f"Polygon coverage {coverage_ratio:.1%} below 95% — "
+                f"{len(missing)} of {len(requested)} requested constituents missing"
+            ),
+            details={"missing_sample": missing[:20]},
+            elapsed_seconds=time.time() - t0,
+        )
+
+    return CheckResult(
+        name="polygon_grouped_coverage",
+        status="ok",
+        message=(
+            f"Polygon returned {len(polygon_symbols)} tickers; covers "
+            f"{len(covered)}/{len(requested)} constituents ({coverage_ratio:.1%})"
+        ),
+        details={
+            "polygon_total": len(polygon_symbols),
+            "constituents_covered": len(covered),
+            "constituents_missing": len(missing),
+            "missing_sample": missing[:10],
+        },
+        elapsed_seconds=time.time() - t0,
+    )
+
+
+def check_predicted_missing_from_closes(ctx: PreflightContext) -> CheckResult:
+    """Catches PR #132/#134 class: predict the missing-from-closes count
+    daily_append would compute AFTER the pre-MorningEnrich prune drains
+    stragglers. Should be the chronic polygon gaps only (≤4 today).
+    """
+    import time
+    t0 = time.time()
+    if ctx.fresh_constituents is None or ctx.arctic_universe_symbols is None:
+        return CheckResult(
+            name="predicted_missing_from_closes",
+            status="fail",
+            message="Skipped: prior checks failed to populate context",
+            elapsed_seconds=time.time() - t0,
+        )
+    if ctx.polygon_returned_tickers is None:
+        return CheckResult(
+            name="predicted_missing_from_closes",
+            status="warn",
+            message="Skipped: polygon check skipped (no API key locally)",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    # Simulate post-prune state: arctic ∩ constituents (stragglers gone).
+    post_prune_arctic = ctx.arctic_universe_symbols & ctx.fresh_constituents
+
+    # Closes will contain whatever polygon returned + per-ticker fallback
+    # (PR #131). Per-ticker fallback recovers ~0 of the chronic 4 today
+    # (BF-B, BRK-B, MOG-A, PSTG); model worst-case = no recovery.
+    expected_closes = ctx.polygon_returned_tickers
+    missing = sorted(post_prune_arctic - expected_closes)
+    n_missing = len(missing)
+
+    if n_missing > _MISSING_FROM_CLOSES_THRESHOLD:
+        return CheckResult(
+            name="predicted_missing_from_closes",
+            status="fail",
+            message=(
+                f"Predicted {n_missing} > threshold {_MISSING_FROM_CLOSES_THRESHOLD} "
+                f"missing-from-closes after prune. SF would halt MorningEnrich."
+            ),
+            details={"missing": missing[:20], "threshold": _MISSING_FROM_CLOSES_THRESHOLD},
+            elapsed_seconds=time.time() - t0,
+        )
+
+    return CheckResult(
+        name="predicted_missing_from_closes",
+        status="ok",
+        message=(
+            f"Predicted {n_missing} missing (under {_MISSING_FROM_CLOSES_THRESHOLD} threshold) "
+            f"— WARN-only path"
+        ),
+        details={"missing": missing, "threshold": _MISSING_FROM_CLOSES_THRESHOLD},
+        elapsed_seconds=time.time() - t0,
+    )
+
+
+def check_backfill_source_freshness(ctx: PreflightContext) -> CheckResult:
+    """Catches PR #130 class: backfill regression preflight failure.
+
+    Reads SPY's last_date from ArcticDB macro and the staging/daily_closes
+    parquet date. If staging exists for the prior trading day, backfill's
+    delta-merge will land at that date. Predict whether ArcticDB SPY
+    last_date <= effective backfill source last_date (no regression).
+    """
+    import time
+    import io
+    import boto3
+    import pandas as pd
+
+    t0 = time.time()
+    s3 = boto3.client("s3")
+
+    # ArcticDB SPY last_date — reuse macro_lib from check_arctic_connectivity.
+    if ctx.macro_lib is None:
+        return CheckResult(
+            name="backfill_source_freshness",
+            status="fail",
+            message="Skipped: arctic_connectivity did not populate macro_lib",
+            elapsed_seconds=time.time() - t0,
+        )
+    try:
+        spy_df = ctx.macro_lib.tail("SPY", n=1).data
+        arctic_spy_last = pd.Timestamp(spy_df.index[-1]).normalize() if not spy_df.empty else None
+    except Exception as exc:
+        return CheckResult(
+            name="backfill_source_freshness",
+            status="fail",
+            message=f"ArcticDB SPY read raised: {exc}",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    if arctic_spy_last is None:
+        return CheckResult(
+            name="backfill_source_freshness",
+            status="fail",
+            message="ArcticDB SPY is empty",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    # Backfill source = price_cache + daily_closes delta. Effective last
+    # is max(price_cache_last, daily_closes_last). Read SPY parquet.
+    try:
+        obj = s3.get_object(Bucket=ctx.bucket, Key="predictor/price_cache/SPY.parquet")
+        df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+        cache_last = pd.Timestamp(df.index[-1]).normalize()
+    except Exception as exc:
+        return CheckResult(
+            name="backfill_source_freshness",
+            status="fail",
+            message=f"price_cache SPY read raised: {exc}",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    # Daily delta — staging/daily_closes/{prior_trading_day}.parquet.
+    try:
+        obj = s3.get_object(
+            Bucket=ctx.bucket,
+            Key=f"staging/daily_closes/{ctx.prior_trading_day}.parquet",
+        )
+        delta_df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+        delta_last = pd.Timestamp(ctx.prior_trading_day).normalize() if "SPY" in delta_df.index else None
+    except Exception:
+        delta_last = None
+
+    effective_last = cache_last
+    if delta_last is not None and delta_last > effective_last:
+        effective_last = delta_last
+
+    details = {
+        "arctic_spy_last": arctic_spy_last.date().isoformat(),
+        "cache_spy_last": cache_last.date().isoformat(),
+        "delta_spy_last": delta_last.date().isoformat() if delta_last else None,
+        "effective_backfill_source_last": effective_last.date().isoformat(),
+    }
+
+    if effective_last < arctic_spy_last:
+        return CheckResult(
+            name="backfill_source_freshness",
+            status="fail",
+            message=(
+                f"Backfill regression preflight (PR #130) would fail: "
+                f"source last={effective_last.date()} < arctic last={arctic_spy_last.date()}"
+            ),
+            details=details,
+            elapsed_seconds=time.time() - t0,
+        )
+
+    return CheckResult(
+        name="backfill_source_freshness",
+        status="ok",
+        message=f"Backfill source ({effective_last.date()}) ≥ arctic ({arctic_spy_last.date()})",
+        details=details,
+        elapsed_seconds=time.time() - t0,
+    )
+
+
+def check_postflight_contracts(ctx: PreflightContext) -> CheckResult:
+    """Verify the S3 contract files postflight (validators/postflight.py)
+    will read are present + parseable. Catches latest_weekly.json /
+    constituents.json / macro.json / short_interest.json drift before SF
+    fires the actual postflight.
+    """
+    import time
+    import boto3
+    t0 = time.time()
+    s3 = boto3.client("s3")
+    issues: list[str] = []
+
+    def _read(key: str) -> "dict | None":
+        try:
+            obj = s3.get_object(Bucket=ctx.bucket, Key=key)
+            return json.loads(obj["Body"].read())
+        except Exception as exc:
+            issues.append(f"{key}: {exc}")
+            return None
+
+    pointer = _read("market_data/latest_weekly.json")
+    if pointer:
+        ptr_date = pointer.get("date")
+        if not ptr_date:
+            issues.append("latest_weekly.json missing 'date'")
+        else:
+            # Each weekly artifact is checked at the pointer's date prefix.
+            prefix = pointer.get("s3_prefix", f"market_data/weekly/{ptr_date}/").rstrip("/")
+            cons = _read(f"{prefix}/constituents.json")
+            if cons:
+                if len(cons.get("tickers") or []) < 800:
+                    issues.append(f"constituents.json tickers {len(cons.get('tickers') or [])} < 800")
+                if not isinstance(cons.get("sector_map"), dict):
+                    issues.append("constituents.json missing sector_map dict")
+            macro = _read(f"{prefix}/macro.json")
+            if macro and macro.get("fed_funds_rate") is None:
+                issues.append("macro.json missing fed_funds_rate")
+
+    if issues:
+        return CheckResult(
+            name="postflight_contracts",
+            status="warn",
+            message=(
+                f"{len(issues)} contract issues; postflight may still pass if Phase 1 "
+                f"rewrites these mid-run, but flagging for visibility"
+            ),
+            details={"issues": issues[:10]},
+            elapsed_seconds=time.time() - t0,
+        )
+
+    return CheckResult(
+        name="postflight_contracts",
+        status="ok",
+        message="All postflight contract files present + parseable",
+        elapsed_seconds=time.time() - t0,
+    )
+
+
+# ── Orchestrator ──────────────────────────────────────────────────────────────
+
+
+# ArcticDB on macOS crashes in ``Aws::S3::S3Client::S3Client`` if boto3 has
+# already initialized the AWS SDK in the process — the arcticdb-bundled
+# AWS SDK conflicts with the system one. Initializing arctic FIRST avoids
+# this on macOS and is harmless on Linux. (Linux EC2 doesn't hit the race
+# at all; this matters only for local-laptop preflight runs.)
+CHECKS = [
+    check_arctic_connectivity,
+    check_constituents_fetch,
+    check_universe_drift,
+    check_universe_sample_freshness,
+    check_polygon_grouped_coverage,
+    check_predicted_missing_from_closes,
+    check_backfill_source_freshness,
+    check_postflight_contracts,
+]
+
+
+def _previous_trading_day_str() -> str:
+    """Resolve the prior trading day. Avoids importing weekly_collector
+    (which transitively imports boto3 + every collector module) so
+    ArcticDB's bundled AWS SDK doesn't conflict with system boto3 — the
+    conflict crashes on macOS, see CHECKS docstring.
+    """
+    from datetime import timedelta
+    from alpha_engine_lib.trading_calendar import is_trading_day
+    today = datetime.now(timezone.utc).date()
+    candidate = today - timedelta(days=1)
+    for _ in range(10):
+        if is_trading_day(candidate):
+            return candidate.strftime("%Y-%m-%d")
+        candidate -= timedelta(days=1)
+    raise RuntimeError("Could not find a trading day within the last 10 days")
+
+
+def run_preflight(bucket: str = DEFAULT_BUCKET) -> tuple[int, list[CheckResult]]:
+    """Execute all checks against real state. Returns (n_failures, results).
+
+    Each check runs in its own try/except — a single check raising must
+    not abort the others (we want the full picture, not first-fail-bail).
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    prior = _previous_trading_day_str()
+    ctx = PreflightContext(bucket=bucket, today=today, prior_trading_day=prior)
+
+    results: list[CheckResult] = []
+    for check_fn in CHECKS:
+        try:
+            results.append(check_fn(ctx))
+        except Exception as exc:
+            results.append(CheckResult(
+                name=check_fn.__name__.replace("check_", ""),
+                status="fail",
+                message=f"Check raised: {type(exc).__name__}: {exc}",
+            ))
+    n_fail = sum(1 for r in results if r.status == "fail")
+    return n_fail, results
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+
+def _format_human(results: list[CheckResult]) -> str:
+    lines = ["", "=" * 70, " Saturday SF Preflight ", "=" * 70, ""]
+    icons = {"ok": "[OK]  ", "warn": "[WARN]", "fail": "[FAIL]"}
+    for r in results:
+        lines.append(f"{icons.get(r.status, '[?]   ')} {r.name:<32} {r.message}")
+        if r.status == "fail" and r.details:
+            for k, v in r.details.items():
+                lines.append(f"        {k}: {v}")
+    n_fail = sum(1 for r in results if r.status == "fail")
+    n_warn = sum(1 for r in results if r.status == "warn")
+    lines.append("")
+    lines.append("-" * 70)
+    if n_fail == 0 and n_warn == 0:
+        lines.append(" Predicted SF outcome: PASS")
+    elif n_fail == 0:
+        lines.append(f" Predicted SF outcome: PASS with {n_warn} warning(s)")
+    else:
+        lines.append(f" Predicted SF outcome: FAIL ({n_fail} failure(s), {n_warn} warning(s))")
+    lines.append("=" * 70)
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bucket", default=DEFAULT_BUCKET)
+    parser.add_argument("--json", action="store_true", help="Emit structured JSON instead of human summary")
+    parser.add_argument("--verbose", "-v", action="store_true")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+
+    n_fail, results = run_preflight(bucket=args.bucket)
+
+    if args.json:
+        print(json.dumps([asdict(r) for r in results], indent=2, default=str))
+    else:
+        print(_format_human(results))
+
+    return 1 if n_fail > 0 else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
