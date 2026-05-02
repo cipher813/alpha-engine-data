@@ -39,6 +39,7 @@ from features.feature_engineer import (
 from features.compute import (
     DEFAULT_BUCKET,
     _SKIP_TICKERS,
+    _apply_daily_delta,
     _is_sector_etf,
     _load_parquet_from_s3,
     _load_sector_map,
@@ -162,6 +163,132 @@ def _build_macro_features_df(macro: dict[str, pd.Series]) -> pd.DataFrame:
     return df
 
 
+# Universe sample size for the regression preflight. Matches postflight's
+# _UNIVERSE_SAMPLE_SIZE so the same set of tickers gates both ends of the
+# pipeline. 20 tickers catches any systematic regression with ~certainty
+# (a one-day clobber across the whole universe would land in 100% of
+# samples) while keeping the preflight ArcticDB-read budget tiny.
+_REGRESSION_PREFLIGHT_SAMPLE_SIZE = 20
+
+
+def _planned_last_date(series_or_df) -> "pd.Timestamp | None":
+    """Last index date of a Series or DataFrame, normalized to midnight UTC."""
+    if series_or_df is None:
+        return None
+    idx = series_or_df.index
+    if idx is None or len(idx) == 0:
+        return None
+    last = pd.Timestamp(idx[-1])
+    if last.tzinfo is not None:
+        last = last.tz_convert("UTC").tz_localize(None)
+    return last.normalize()
+
+
+def _existing_last_date(lib, symbol: str) -> "pd.Timestamp | None":
+    """Last existing date in ArcticDB for ``symbol``, or None if not present."""
+    try:
+        df = lib.tail(symbol, n=1).data
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return None
+    last = pd.Timestamp(df.index[-1])
+    if last.tzinfo is not None:
+        last = last.tz_convert("UTC").tz_localize(None)
+    return last.normalize()
+
+
+def _assert_no_arctic_regression(
+    bucket: str,
+    planned_macro: dict[str, "pd.Series"],
+    planned_universe: dict[str, "pd.DataFrame"],
+    run_date: str,
+    sample_size: int = _REGRESSION_PREFLIGHT_SAMPLE_SIZE,
+) -> None:
+    """Refuse to run backfill if its planned data is older than what ArcticDB has.
+
+    Backfill rewrites every macro/sector and (sampled) universe symbol with
+    full-series ``lib.write()`` calls, so any regression at the source
+    instantly knocks every downstream consumer stale. Postflight catches
+    the symptom afterwards but by then the damage is done — this preflight
+    fails BEFORE any feature compute or write so the operator gets a clean
+    actionable error and ArcticDB stays at its current freshness.
+
+    Origin: 2026-05-02 weekly SF. MorningEnrich appended Friday's polygon
+    fill to ArcticDB; price cache passed the mtime "current" check (cache
+    parquets refreshed 4/30) so neither prices nor slim_cache rewrote the
+    cache; backfill loaded that 4/30-ending cache, computed features over
+    it, and ``lib.write()`` regressed every macro/sector/universe symbol
+    from 5/1 → 4/30. Postflight rejected. Pipeline halted at DataPhase1.
+
+    The check is sampled on the universe side (matching
+    ``validators/postflight._UNIVERSE_SAMPLE_SIZE``) because exhaustive
+    ``tail()`` over 900 symbols would dominate backfill runtime on every
+    Saturday. Sample seed is the run_date so reruns hit the same tickers.
+    """
+    import random as _rand
+
+    macro_lib = get_macro_lib(bucket)
+    universe_lib = get_universe_lib(bucket)
+
+    regressions: list[str] = []
+
+    for key, series in planned_macro.items():
+        planned_last = _planned_last_date(series)
+        existing_last = _existing_last_date(macro_lib, key)
+        if planned_last is None or existing_last is None:
+            continue
+        if planned_last < existing_last:
+            regressions.append(
+                f"macro.{key}: planned={planned_last.date()} < existing={existing_last.date()}"
+            )
+
+    try:
+        arctic_syms = set(universe_lib.list_symbols())
+    except Exception as exc:
+        raise RuntimeError(
+            f"Backfill regression preflight: could not list ArcticDB universe symbols: {exc}"
+        ) from exc
+
+    candidates = sorted(
+        t for t in planned_universe
+        if t in arctic_syms and t not in _SKIP_TICKERS and not _is_sector_etf(t)
+    )
+    if len(candidates) > sample_size:
+        rng = _rand.Random(run_date)
+        sample = rng.sample(candidates, sample_size)
+    else:
+        sample = candidates
+
+    for ticker in sample:
+        planned_last = _planned_last_date(planned_universe.get(ticker))
+        existing_last = _existing_last_date(universe_lib, ticker)
+        if planned_last is None or existing_last is None:
+            continue
+        if planned_last < existing_last:
+            regressions.append(
+                f"universe.{ticker}: planned={planned_last.date()} < existing={existing_last.date()}"
+            )
+
+    if regressions:
+        raise RuntimeError(
+            f"Backfill regression preflight failed: {len(regressions)} symbols would regress "
+            f"if backfill proceeded. Source data (predictor/price_cache + daily_closes delta) "
+            f"ends earlier than what ArcticDB already has. Most common cause: the price cache "
+            f"mtime 'current' check skipped the weekly refresh, so the cache lags "
+            f"MorningEnrich/daily_append writes. To recover: run the prices collector with a "
+            f"forced refresh (e.g. delete or touch S3 mtime to invalidate) so the cache "
+            f"includes the prior trading day, then re-invoke backfill. "
+            f"Regressions detected (showing first 10 of {len(regressions)}): {regressions[:10]}"
+        )
+
+    log.info(
+        "Backfill regression preflight: OK — %d macro/sector + %d sampled universe symbols "
+        "all >= existing ArcticDB last_date.",
+        len(planned_macro), len(sample),
+    )
+
+
 def backfill(
     bucket: str = DEFAULT_BUCKET,
     dry_run: bool = False,
@@ -187,19 +314,37 @@ def backfill(
     s3 = boto3.client("s3")
     t0 = time.time()
 
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
     # ── 1. Load data ─────────────────────────────────────────────────────────
     log.info("Loading full 10-year price cache...")
     price_data = _load_full_cache(s3, bucket)
     if not price_data:
         return {"status": "error", "error": "no_price_data"}
 
+    # Apply daily_closes delta on top of the 10y cache so the backfill source
+    # captures rows written between the last cache refresh and today (e.g.
+    # MorningEnrich's polygon-T+1 fill, weekday EOD CaptureSnapshot). Without
+    # this, a price cache that's "current" by S3 mtime can still source data
+    # older than what daily_append already pushed into ArcticDB, and the
+    # full-series ``lib.write()`` calls below regress every symbol. Mirrors
+    # ``features/compute.py::_apply_daily_delta`` so both feature-snapshot and
+    # backfill share the same freshness semantics.
+    if not dry_run:
+        price_data, _split_tickers = _apply_daily_delta(s3, bucket, today_str, price_data)
+
     macro = _extract_macro_series(price_data)
     sector_map = _load_sector_map(s3, bucket)
 
-    # Use today's date for fundamentals/alt data lookup
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     fundamentals = _load_cached_fundamentals(s3, bucket, today_str)
     alt_data = _load_cached_alternative(s3, bucket)
+
+    # Defense-in-depth: refuse to write if planned data is older than what
+    # ArcticDB has. Skipped on per-ticker invocations (those route through
+    # ``skip_macro`` and don't touch the universe sample). Cheap (a handful
+    # of tail() reads) so it runs before the multi-minute feature compute.
+    if not dry_run and ticker_filter is None:
+        _assert_no_arctic_regression(bucket, macro, price_data, today_str)
 
     t_load = time.time() - t0
     log.info(
