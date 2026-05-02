@@ -155,7 +155,8 @@ def test_universe_drift_skipped_if_context_unpopulated():
 # ── check_polygon_grouped_coverage (PR #131 class) ────────────────────────────
 
 
-def test_polygon_grouped_coverage_ok_at_full_coverage():
+def test_polygon_grouped_coverage_ok_at_full_coverage(monkeypatch):
+    monkeypatch.setenv("POLYGON_API_KEY", "stub")
     ctx = _ctx()
     ctx.fresh_constituents = {"AAPL", "MSFT"}
     fake_client = MagicMock()
@@ -166,8 +167,9 @@ def test_polygon_grouped_coverage_ok_at_full_coverage():
     assert ctx.polygon_returned_tickers == {"AAPL", "MSFT", "GOOG"}
 
 
-def test_polygon_grouped_coverage_fails_below_95pct():
+def test_polygon_grouped_coverage_fails_below_95pct(monkeypatch):
     """The exact PR #131 scenario: polygon returns fewer-than-needed tickers."""
+    monkeypatch.setenv("POLYGON_API_KEY", "stub")
     ctx = _ctx()
     ctx.fresh_constituents = {f"T{i}" for i in range(100)}
     # polygon returns only 50/100 — 50% coverage, below 95% threshold.
@@ -179,7 +181,8 @@ def test_polygon_grouped_coverage_fails_below_95pct():
     assert "coverage" in result.message.lower()
 
 
-def test_polygon_grouped_coverage_fails_on_403():
+def test_polygon_grouped_coverage_fails_on_403(monkeypatch):
+    monkeypatch.setenv("POLYGON_API_KEY", "stub")
     from polygon_client import PolygonForbiddenError
     ctx = _ctx()
     ctx.fresh_constituents = {"AAPL"}
@@ -189,6 +192,17 @@ def test_polygon_grouped_coverage_fails_on_403():
         result = sfp.check_polygon_grouped_coverage(ctx)
     assert result.status == "fail"
     assert "403" in result.message
+
+
+def test_polygon_grouped_coverage_skips_when_no_api_key(monkeypatch):
+    """Local-laptop preflight without POLYGON_API_KEY must skip gracefully
+    (WARN, not FAIL) so the rest of the report stays actionable."""
+    monkeypatch.delenv("POLYGON_API_KEY", raising=False)
+    ctx = _ctx()
+    ctx.fresh_constituents = {"AAPL"}
+    result = sfp.check_polygon_grouped_coverage(ctx)
+    assert result.status == "warn"
+    assert "POLYGON_API_KEY" in result.message
 
 
 # ── check_predicted_missing_from_closes (PR #132 class) ───────────────────────
