@@ -1,9 +1,9 @@
-"""RAG library — semantic retrieval over SEC filings, earnings transcripts, and theses."""
+"""RAG namespace package — ingestion side.
 
-# Auto-load .env so RAG_DATABASE_URL and VOYAGE_API_KEY are available
-# whether run from CLI, Lambda (already in env), or imported in tests.
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass  # python-dotenv not installed (e.g. Lambda) — env vars set externally
+The shared retrieval / db / embeddings / schema code now lives in
+``alpha_engine_lib.rag`` (since lib v0.3.0). This folder retains only the
+weekly ingestion ``pipelines/`` subpackage and ``preflight.py``.
+
+The lib's own ``__init__`` auto-loads ``.env`` for ``RAG_DATABASE_URL`` and
+``VOYAGE_API_KEY``, so no duplication is needed here.
+"""
