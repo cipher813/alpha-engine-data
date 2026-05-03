@@ -30,7 +30,7 @@
 # Saturday Step Function):
 #   - AWS CLI with perms to RunInstances / TerminateInstances / DescribeInstances
 #   - SSH key at ~/.ssh/alpha-engine-key.pem
-#   - .env at /home/ec2-user/.alpha-engine.env (for API keys, ALPHA_ENGINE_LIB_TOKEN)
+#   - .env at /home/ec2-user/.alpha-engine.env (for API keys)
 #   - alpha-engine-data checked out at the script's parent dir
 
 set -euo pipefail
@@ -107,8 +107,9 @@ if [ ! -f "$KEY_FILE" ]; then
     echo "ERROR: SSH key not found at $KEY_FILE"
     exit 1
 fi
-# Note: alpha-engine-lib PAT is fetched by the spot itself from SSM
-# (/alpha-engine/lib-token) during the DEPS step — dispatcher never touches it.
+# Note: alpha-engine-lib was flipped public 2026-05-03; spot installs it
+# directly from git+https with no auth required. Earlier versions of this
+# script fetched a PAT from /alpha-engine/lib-token via SSM — no longer needed.
 
 # ── Launch spot ──────────────────────────────────────────────────────────────
 echo "==> Requesting spot instance ($INSTANCE_TYPE)..."
@@ -216,7 +217,7 @@ scp $SSH_OPTS -i "$KEY_FILE" \
 # weekly_collector.py's load_config() searches /home/ec2-user/alpha-engine-config/data/config.yaml
 # first. Private config repo — SCP from the dispatcher's clone (pulled daily by
 # ae-dashboard's boot-pull) rather than cloning it on the spot (which would
-# require broader git-auth setup than the lib-only insteadOf we use here).
+# require broader git-auth setup; the spot only needs read access to public repos).
 CONFIG_SRC="/home/ec2-user/alpha-engine-config/data/config.yaml"
 if [ ! -f "$CONFIG_SRC" ]; then
     CONFIG_SRC="$HOME/Development/alpha-engine-config/data/config.yaml"
@@ -246,14 +247,6 @@ set -a
 # shellcheck disable=SC1091
 source /home/ec2-user/alpha-engine-data/.env
 set +a
-
-LIB_TOKEN=$(aws ssm get-parameter --name /alpha-engine/lib-token --with-decryption --query 'Parameter.Value' --output text --region us-east-1 2>/dev/null || echo "")
-if [ -z "$LIB_TOKEN" ]; then
-    echo "ERROR: could not fetch /alpha-engine/lib-token from SSM — required for alpha-engine-lib pip install"
-    exit 1
-fi
-git config --global url."https://x-access-token:${LIB_TOKEN}@github.com/cipher813/alpha-engine-lib".insteadOf "https://github.com/cipher813/alpha-engine-lib"
-unset LIB_TOKEN
 
 if command -v python3.12 &>/dev/null; then
     PIP="python3.12 -m pip"
@@ -495,7 +488,7 @@ echo "────────────────────────�
 # tail of the value after the shell metachar. SSM stores the value as an
 # opaque string — no shell-parse fragility, no cross-instance sync via
 # push-secrets.sh needed, and the spot's IAM profile already has
-# ssm:GetParameter (pattern already in use above for /alpha-engine/lib-token).
+# ssm:GetParameter for parameters under /alpha-engine/*.
 for name in VOYAGE_API_KEY FINNHUB_API_KEY EDGAR_IDENTITY RAG_DATABASE_URL; do
     val=\$(aws ssm get-parameter --name /alpha-engine/\$name --with-decryption --query 'Parameter.Value' --output text --region "\${AWS_REGION:-us-east-1}" 2>/dev/null || echo "")
     if [ -z "\$val" ]; then
