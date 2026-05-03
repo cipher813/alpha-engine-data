@@ -63,6 +63,28 @@ class TestBacktesterTransition:
 # ── Skip gate ─────────────────────────────────────────────────────────────
 
 
+class TestSkipBacktesterPreservesEvalJudge:
+    """Pins the 2026-05-03 fix: when an operator passes
+    skip_backtester=true (e.g. for SF skip-most validation runs), the
+    skip path must still flow through the eval-judge skip-gate, not
+    leap straight to SaturdayHealthCheck.
+
+    Caught by SF eval-pipeline-validation-5 when Research succeeded
+    + new-format captures landed on S3 but the eval-judge state
+    silently never fired because skip_backtester=true had been
+    short-circuiting past it.
+    """
+
+    def test_skip_backtester_routes_to_eval_skip_gate(self, states):
+        skip = states["CheckSkipBacktester"]
+        choice = skip["Choices"][0]
+        # The skip-true branch must preserve the eval-judge state path.
+        assert choice["Next"] == "CheckSkipEvalJudge"
+        # Critically NOT routed to SaturdayHealthCheck — that was the
+        # silent-bypass bug.
+        assert choice["Next"] != "SaturdayHealthCheck"
+
+
 class TestSkipEvalJudge:
     def test_skip_flag_bypasses_to_health_check(self, states):
         skip = states["CheckSkipEvalJudge"]

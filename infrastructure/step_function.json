@@ -393,14 +393,14 @@
 
     "CheckSkipBacktester": {
       "Type": "Choice",
-      "Comment": "Skip-gate. {\"skip_backtester\": true} bypasses the backtester step (which runs backtest + parity + evaluator as consolidated spot stages post-2026-04-24) and jumps directly to the Saturday health check. The legacy {\"skip_evaluator\": true} and {\"freeze_evaluator\": true} inputs are no longer honored; freeze-evaluator is now a spot CLI flag (--freeze-evaluator) invoked manually outside the SF.",
+      "Comment": "Skip-gate. {\"skip_backtester\": true} bypasses the backtester step (which runs backtest + parity + evaluator as consolidated spot stages post-2026-04-24) and jumps to the eval-judge skip-gate (preserving the eval-pipeline states downstream — the bug fixed 2026-05-03 was that this routed directly to SaturdayHealthCheck, silently bypassing CheckSkipEvalJudge → ComputeEvalCadence → eval-judge → eval-rolling-mean for any operator who passed skip_backtester=true). The legacy {\"skip_evaluator\": true} and {\"freeze_evaluator\": true} inputs are no longer honored; freeze-evaluator is now a spot CLI flag (--freeze-evaluator) invoked manually outside the SF.",
       "Choices": [
         {
           "And": [
             {"Variable": "$.skip_backtester", "IsPresent": true},
             {"Variable": "$.skip_backtester", "BooleanEquals": true}
           ],
-          "Next": "SaturdayHealthCheck"
+          "Next": "CheckSkipEvalJudge"
         }
       ],
       "Default": "Backtester"
