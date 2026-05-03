@@ -19,6 +19,7 @@ Centralized data collection, storage, and distribution. Owns the price universe 
 - Ingests macro indicators from FRED (rates, VIX, commodities) and computes derived signals (yield-curve slope, VIX term slope, market breadth)
 - Pulls per-ticker alternative data (analyst consensus, EPS revisions, options chains, insider filings, 13F holdings, news sentiment) only for tickers promoted by Research — keeps API spend bounded
 - Computes the engineered feature store (~50 features × ~900 tickers) used by the Predictor for both training and inference
+- Runs the RAG ingestion step: SEC 10-K/10-Q/8-K filings, earnings transcripts, and thesis history embedded into the pgvector knowledge base that Research's qual-analyst agents query via tool calls
 - Runs OHLC validation, zero-price detection, extreme-return filtering, and trading-day-gap detection on every refresh; anomalies surface in completion emails
 
 ## Phase 2 measurement contribution
@@ -38,6 +39,13 @@ External APIs
        │    macro                 FRED + commodities + market breadth
        │    universe_returns      polygon.io grouped-daily → research.db
        │    feature_store         ~50 features × ~900 tickers
+       │
+       ├─ RAG ingestion (between Phase 1 and Research, EC2 SSM) ──────
+       │    SEC 10-K/10-Q/8-K     section extraction + chunking
+       │    earnings transcripts  FMP API
+       │    thesis history        self-ingestion from research.db
+       │                          → Voyage voyage-3-lite embeddings (512d)
+       │                          → Neon pgvector (HNSW index)
        │
        ├─ Phase 2 (post-research, weekly Sat — Lambda) ───────────────
        │    alternative_data      analyst · revisions · options · insider · 13F · news
@@ -76,6 +84,7 @@ python weekly_collector.py --phase 1 --dry-run
 | [`collectors/macro.py`](collectors/macro.py) | FRED + commodities + market breadth |
 | [`collectors/universe_returns.py`](collectors/universe_returns.py) | Full-population forward returns via polygon.io grouped-daily |
 | [`feature_store/compute.py`](feature_store/compute.py) | Engineered feature store builder |
+| [`rag/pipelines/`](rag/pipelines/) | RAG ingestion pipelines — SEC filings, earnings transcripts, theses |
 | [`validators/price_validator.py`](validators/price_validator.py) | 6-check data quality gates |
 
 ## How it runs
@@ -83,6 +92,7 @@ python weekly_collector.py --phase 1 --dry-run
 | Pipeline | When | Where | Trigger |
 |---|---|---|---|
 | Phase 1 | Sat 00:00 UTC | EC2 SSM (always-on micro instance) | Saturday Step Function |
+| RAG ingestion | Sat after Phase 1 | EC2 SSM | Saturday Step Function |
 | Phase 2 | Sat after Research | Lambda | Saturday Step Function |
 | Daily EOD | Mon-Fri ~1:05 PM PT | EC2 SSM (ae-trading) | EOD Step Function |
 | Health monitoring | Every 6 hours | Cron on micro instance | SNS alerts on stale data |
@@ -114,6 +124,7 @@ Environment variables:
 | `market_data/weekly/{date}/` | Constituents, macro, alternative data | Weekly |
 | `health/data_phase1.json` | Phase 1 completion marker | Weekly |
 | `research.db` (`universe_returns` table) | Forward returns for all tickers | Weekly |
+| Neon pgvector (`rag.documents`, `rag.chunks`) | RAG corpus — SEC filings, transcripts, theses with HNSW index | Weekly |
 
 ### Reads
 | Path | Content |
