@@ -48,6 +48,7 @@ POLICY='{
       "Resource": [
         "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-research-runner*",
         "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-research-eval-judge*",
+        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-research-eval-rolling-mean*",
         "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-data-collector*",
         "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-predictor-inference*",
         "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-predictor-health-check*"

@@ -565,12 +565,12 @@
         {
           "ErrorEquals": ["States.ALL"],
           "Comment": "Eval is observability — failures must NOT halt the pipeline. The handler already returns OK/PARTIAL/ERROR rather than throwing on per-artifact issues; this Catch covers infra-level failures (Lambda timeout, transient AWS errors).",
-          "Next": "SaturdayHealthCheck",
+          "Next": "EvalRollingMean",
           "ResultPath": "$.eval_judge_error"
         }
       ],
       "ResultPath": "$.eval_judge_result",
-      "Next": "SaturdayHealthCheck"
+      "Next": "EvalRollingMean"
     },
 
     "EvalJudgeWeekly": {
@@ -597,11 +597,42 @@
         {
           "ErrorEquals": ["States.ALL"],
           "Comment": "Eval is observability — failures must NOT halt the pipeline.",
-          "Next": "SaturdayHealthCheck",
+          "Next": "EvalRollingMean",
           "ResultPath": "$.eval_judge_error"
         }
       ],
       "ResultPath": "$.eval_judge_result",
+      "Next": "EvalRollingMean"
+    },
+
+    "EvalRollingMean": {
+      "Type": "Task",
+      "Comment": "Rolling-4-week-mean derived metric Lambda (PR 4b) — runs after both eval-judge branches converge. Reads AlphaEngine/Eval/agent_quality_score for the trailing 28 days, computes the mean per (judged_agent_id, criterion, judge_model) combo, and emits agent_quality_score_4w_mean which a CloudWatch alarm fires against (per ROADMAP §1634). Runs every Saturday — even on weeks where eval-judge had infra failures, the mean across the prior 4 weeks of available data is still the most-current calibration signal.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-research-eval-rolling-mean:live",
+        "Payload": {
+          "end_time_iso.$": "$$.Execution.StartTime"
+        }
+      },
+      "TimeoutSeconds": 300,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "Eval observability layer — failures must NOT halt the pipeline.",
+          "Next": "SaturdayHealthCheck",
+          "ResultPath": "$.eval_rolling_mean_error"
+        }
+      ],
+      "ResultPath": "$.eval_rolling_mean_result",
       "Next": "SaturdayHealthCheck"
     },
 
