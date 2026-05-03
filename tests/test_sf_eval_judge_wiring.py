@@ -43,6 +43,7 @@ class TestStatesPresent:
             "CheckMonthlyCadence",
             "EvalJudgeFirstSaturday",
             "EvalJudgeWeekly",
+            "EvalRollingMean",
         ):
             assert name in states, f"missing SF state: {name}"
 
@@ -174,19 +175,62 @@ class TestEvalJudgeNonBlocking:
         "state_name",
         ["EvalJudgeFirstSaturday", "EvalJudgeWeekly"],
     )
-    def test_success_continues_to_health_check(self, states, state_name):
-        assert states[state_name]["Next"] == "SaturdayHealthCheck"
+    def test_success_continues_to_rolling_mean(self, states, state_name):
+        # Eval-judge branches converge to EvalRollingMean (PR 4c)
+        # rather than SaturdayHealthCheck — ensures the rolling-mean
+        # derived metric runs every week with the freshest raw data.
+        assert states[state_name]["Next"] == "EvalRollingMean"
 
     @pytest.mark.parametrize(
         "state_name",
         ["EvalJudgeFirstSaturday", "EvalJudgeWeekly"],
     )
-    def test_catch_routes_to_health_check_not_failure(self, states, state_name):
+    def test_catch_routes_to_rolling_mean_not_failure(self, states, state_name):
         # Eval is observability per ROADMAP §1635 — failures must NOT
-        # halt the pipeline. Routing to HandleFailure here would be a
-        # regression that shoots the whole Saturday run on a 5xx from
-        # Anthropic on the eval Lambda specifically.
+        # halt the pipeline. Even if eval-judge errors out at the infra
+        # level, rolling-mean still runs against whatever historical
+        # data IS available (the prior 4 weeks are unaffected).
         catch = states[state_name]["Catch"][0]
+        assert catch["ErrorEquals"] == ["States.ALL"]
+        assert catch["Next"] == "EvalRollingMean"
+        assert catch["Next"] != "HandleFailure"
+
+
+# ── EvalRollingMean state (PR 4c) ─────────────────────────────────────────
+
+
+class TestEvalRollingMean:
+    def test_invokes_live_alias(self, states):
+        params = states["EvalRollingMean"]["Parameters"]
+        assert params["FunctionName"] == "alpha-engine-research-eval-rolling-mean:live"
+
+    def test_payload_passes_execution_start_time(self, states):
+        # SF passes its own start time so the rolling-mean window aligns
+        # with the SF execution date — keeps replay/backfill paths
+        # deterministic instead of "whenever the Lambda happened to run."
+        payload = states["EvalRollingMean"]["Parameters"]["Payload"]
+        assert payload["end_time_iso.$"] == "$$.Execution.StartTime"
+
+    def test_timeout_matches_lambda_cap(self, states):
+        # Rolling-mean Lambda is configured with timeout=300s
+        # (alpha-engine-research infrastructure/deploy.sh) — SF state
+        # TimeoutSeconds must equal that ceiling.
+        assert states["EvalRollingMean"]["TimeoutSeconds"] == 300
+
+    def test_success_continues_to_health_check(self, states):
+        assert states["EvalRollingMean"]["Next"] == "SaturdayHealthCheck"
+
+    def test_catch_routes_to_health_check_not_failure(self, states):
+        catch = states["EvalRollingMean"]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
         assert catch["Next"] == "SaturdayHealthCheck"
         assert catch["Next"] != "HandleFailure"
+
+    def test_retries_on_transient_lambda_errors(self, states):
+        # Same retry posture as the eval-judge state — one retry on
+        # AWS-side transient errors (ServiceException / Throttling),
+        # not on application errors.
+        retry = states["EvalRollingMean"]["Retry"][0]
+        assert "Lambda.ServiceException" in retry["ErrorEquals"]
+        assert "Lambda.TooManyRequestsException" in retry["ErrorEquals"]
+        assert retry["MaxAttempts"] == 1
