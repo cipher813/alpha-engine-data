@@ -65,10 +65,10 @@ Centralized data collection — price universe, macro, alternative data, feature
 
 | Mode | Where | Command |
 |---|---|---|
-| Production Phase 1 | EC2 SSM (always-on micro) | Saturday Step Function |
-| Production Phase 2 | Lambda | Saturday Step Function |
+| Production Phase 1 | EC2 SSM (always-on micro) | weekly Step Function |
+| Production Phase 2 | Lambda | weekly Step Function |
 | Production EOD | EC2 SSM (`ae-trading`) | EOD Step Function |
-| Production RAG ingest | EC2 SSM | Saturday Step Function |
+| Production RAG ingest | EC2 SSM | weekly Step Function |
 | Local dry run | venv | `python weekly_collector.py --phase 1 --dry-run` |
 | Single component | venv | `python weekly_collector.py --phase 1 --only macro` |
 

@@ -34,9 +34,9 @@ flowchart LR
     APIs --> P2
     APIs --> EOD
 
-    P1[Phase 1 · Sat<br/>prices · macro · constituents · features]
-    RAG[RAG ingestion · Sat<br/>filings · transcripts · theses]
-    P2[Phase 2 · Sat<br/>alt data — promoted tickers only]
+    P1[Phase 1 · weekly<br/>prices · macro · constituents · features]
+    RAG[RAG ingestion · weekly<br/>filings · transcripts · theses]
+    P2[Phase 2 · weekly<br/>alt data — promoted tickers only]
     EOD[EOD · weekday<br/>daily closes · macro refresh]
 
     P1 --> Arctic[(ArcticDB universe<br/>+ universe_slim)]
