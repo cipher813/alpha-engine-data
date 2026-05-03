@@ -480,7 +480,7 @@
         {
           "Variable": "$.backtester_poll.Status",
           "StringEquals": "Success",
-          "Next": "SaturdayHealthCheck"
+          "Next": "CheckSkipEvalJudge"
         },
         {
           "Variable": "$.backtester_poll.Status",
@@ -500,6 +500,109 @@
       "Type": "Wait",
       "Seconds": 60,
       "Next": "WaitForBacktester"
+    },
+
+    "CheckSkipEvalJudge": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. {\"skip_eval_judge\": true} bypasses the LLM-as-judge eval step (typically used for ad-hoc reruns where eval cost is unwanted).",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_eval_judge", "IsPresent": true},
+            {"Variable": "$.skip_eval_judge", "BooleanEquals": true}
+          ],
+          "Next": "SaturdayHealthCheck"
+        }
+      ],
+      "Default": "ComputeEvalCadence"
+    },
+
+    "ComputeEvalCadence": {
+      "Type": "Pass",
+      "Comment": "Extract day-of-month + ISO date from the SF execution start time so the next Choice state can branch the LLM-as-judge two-tier sampling. day_of_month <= 07 ⇒ first Saturday of the month ⇒ force_sonnet_pass=true (monthly Sonnet sweep per ROADMAP §1626). All other Saturdays run Haiku-only with the per-artifact <3 escalation gate inside the Lambda.",
+      "Parameters": {
+        "day_of_month.$": "States.ArrayGetItem(States.StringSplit(States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0), '-'), 2)",
+        "eval_date.$": "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0)"
+      },
+      "ResultPath": "$.eval_cadence",
+      "Next": "CheckMonthlyCadence"
+    },
+
+    "CheckMonthlyCadence": {
+      "Type": "Choice",
+      "Comment": "First-Saturday-of-the-month detection via lexicographic compare on the zero-padded day-of-month string ('01'..'07' < '08'). Lexicographic ordering is correct here because all values are zero-padded 2-char strings.",
+      "Choices": [
+        {
+          "Variable": "$.eval_cadence.day_of_month",
+          "StringLessThan": "08",
+          "Next": "EvalJudgeFirstSaturday"
+        }
+      ],
+      "Default": "EvalJudgeWeekly"
+    },
+
+    "EvalJudgeFirstSaturday": {
+      "Type": "Task",
+      "Comment": "Monthly Sonnet sweep — force_sonnet_pass=true causes the Lambda to evaluate every captured artifact with both Haiku and Sonnet (regardless of Haiku's per-artifact <3 escalation gate). Calibration insurance: catches the case where Haiku consistently scores 5/5 and would otherwise hide a real regression.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-research-eval-judge:live",
+        "Payload": {
+          "force_sonnet_pass": true,
+          "date.$": "$.eval_cadence.eval_date"
+        }
+      },
+      "TimeoutSeconds": 900,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "Eval is observability — failures must NOT halt the pipeline. The handler already returns OK/PARTIAL/ERROR rather than throwing on per-artifact issues; this Catch covers infra-level failures (Lambda timeout, transient AWS errors).",
+          "Next": "SaturdayHealthCheck",
+          "ResultPath": "$.eval_judge_error"
+        }
+      ],
+      "ResultPath": "$.eval_judge_result",
+      "Next": "SaturdayHealthCheck"
+    },
+
+    "EvalJudgeWeekly": {
+      "Type": "Task",
+      "Comment": "Weekly Haiku-only judge run with per-artifact <3 escalation to Sonnet for borderline outputs. Per-artifact rather than batch-level escalation keeps weekly judging cost bounded while preserving diagnostic depth where it matters.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-research-eval-judge:live",
+        "Payload": {
+          "force_sonnet_pass": false,
+          "date.$": "$.eval_cadence.eval_date"
+        }
+      },
+      "TimeoutSeconds": 900,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "Eval is observability — failures must NOT halt the pipeline.",
+          "Next": "SaturdayHealthCheck",
+          "ResultPath": "$.eval_judge_error"
+        }
+      ],
+      "ResultPath": "$.eval_judge_result",
+      "Next": "SaturdayHealthCheck"
     },
 
     "SaturdayHealthCheck": {
