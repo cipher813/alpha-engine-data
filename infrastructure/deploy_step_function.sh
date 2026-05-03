@@ -7,7 +7,9 @@
 #   2. SSM agent installed on the always-on EC2 instance
 #   3. Research Lambda (alpha-engine-research-runner) deployed
 #   4. Data Phase 2 Lambda (alpha-engine-data-collector) deployed
-#   5. Repos cloned on always-on EC2: alpha-engine-data, alpha-engine-predictor,
+#   5. Eval-judge Lambda (alpha-engine-research-eval-judge) deployed via
+#      `infrastructure/deploy.sh eval_judge` from alpha-engine-research
+#   6. Repos cloned on always-on EC2: alpha-engine-data, alpha-engine-predictor,
 #      alpha-engine-backtester
 #
 # Usage:
@@ -99,6 +101,7 @@ POLICY='{
       "Action": ["lambda:InvokeFunction"],
       "Resource": [
         "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-research-runner*",
+        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-research-eval-judge*",
         "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-data-collector*",
         "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-predictor-inference*"
       ]
