@@ -145,7 +145,11 @@ def test_skip_if_exists_true_skips_when_today_in_hist(monkeypatch):
     spend, just a microsecond ``today_ts in hist.index`` check."""
     from builders.daily_append import daily_append
 
-    today_str = "2026-04-28"
+    # Use real "now" so the daily_append freshness scan (5d threshold
+    # against datetime.now(timezone.utc)) doesn't trip as the calendar
+    # advances. Hardcoded dates rot — the 2026-05-04 CI breakage
+    # surfaced because "2026-04-28" had aged 6d past the threshold.
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     universe = ["AAPL", "MSFT", "GOOGL"]
     _, _, write_calls = _patch_targets(
         monkeypatch,
@@ -176,7 +180,11 @@ def test_skip_if_exists_true_writes_when_today_missing(monkeypatch):
     silent-skip bug for tickers with genuinely-missing today rows."""
     from builders.daily_append import daily_append
 
-    today_str = "2026-04-28"
+    # Use real "now" so the daily_append freshness scan (5d threshold
+    # against datetime.now(timezone.utc)) doesn't trip as the calendar
+    # advances. Hardcoded dates rot — the 2026-05-04 CI breakage
+    # surfaced because "2026-04-28" had aged 6d past the threshold.
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     universe = ["AAPL", "MSFT"]
     _, _, write_calls = _patch_targets(
         monkeypatch,
@@ -202,7 +210,11 @@ def test_skip_if_exists_false_writes_even_when_today_in_hist(monkeypatch):
     that the 2026-04-18 commit introduced for the polygon-label incident."""
     from builders.daily_append import daily_append
 
-    today_str = "2026-04-28"
+    # Use real "now" so the daily_append freshness scan (5d threshold
+    # against datetime.now(timezone.utc)) doesn't trip as the calendar
+    # advances. Hardcoded dates rot — the 2026-05-04 CI breakage
+    # surfaced because "2026-04-28" had aged 6d past the threshold.
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     universe = ["AAPL", "MSFT"]
     _, _, write_calls = _patch_targets(
         monkeypatch,
