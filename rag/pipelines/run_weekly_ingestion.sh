@@ -93,15 +93,24 @@ $PYTHON_BIN -m rag.pipelines.ingest_earnings_finnhub --from-signals --max-per-ti
 
 # ── Step 4: Thesis history (v2 quant/qual from signals.json) ─────────────────
 echo ""
-echo "==> Step 4/5: Thesis history..."
+echo "==> Step 4/6: Thesis history..."
 SINCE=$(date -u -d '14 days ago' '+%Y-%m-%d' 2>/dev/null || date -u -v-14d '+%Y-%m-%d')
 $PYTHON_BIN -m rag.pipelines.ingest_theses --signals --since "$SINCE" $DRY_RUN
 
 # ── Step 5: Filing change detection ──────────────────────────────────────────
 echo ""
-echo "==> Step 5/5: Filing change detection..."
+echo "==> Step 5/6: Filing change detection..."
 if [ -z "$DRY_RUN" ]; then
     $PYTHON_BIN -m rag.pipelines.filing_change_detection --output-s3
+else
+    echo "  SKIPPED in dry-run mode"
+fi
+
+# ── Step 6: Manifest emit (presentation-layer source of truth) ───────────────
+echo ""
+echo "==> Step 6/6: Emit corpus manifest..."
+if [ -z "$DRY_RUN" ]; then
+    $PYTHON_BIN -m rag.pipelines.emit_manifest --output-s3
 else
     echo "  SKIPPED in dry-run mode"
 fi
