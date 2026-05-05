@@ -122,13 +122,32 @@ def _patch_targets(
     write_calls: list[tuple[str, str]] = []
 
     def _spy_write(lib, sym, df, existing_series=None):
-        # Identify which lib the call hit so per-ticker writes are
-        # distinguishable from macro/sector writes.
+        # Macro path still uses _write_row_backfill_safe per-symbol — universe
+        # path was refactored to update_batch in PR #153 (2026-05-05).
         which = "universe" if lib is universe_lib else "macro"
         write_calls.append((which, sym))
         return "append"
 
     monkeypatch.setattr(_da, "_write_row_backfill_safe", _spy_write)
+
+    # Universe path now uses update_batch / write_batch — capture
+    # payload symbols + return one MagicMock VersionedItem per payload
+    # so the aggregation loop's `for payload, result in zip(...)` walks
+    # them and increments n_ok / n_partial correctly.
+    def _spy_update_batch(payloads, **kwargs):
+        for p in payloads:
+            write_calls.append(("universe", p.symbol))
+        return [MagicMock(symbol=p.symbol) for p in payloads]
+
+    def _spy_write_batch(payloads, **kwargs):
+        # Same "universe" label as update_batch — the test's invariant
+        # is "ticker hit the write path", regardless of update vs backfill.
+        for p in payloads:
+            write_calls.append(("universe", p.symbol))
+        return [MagicMock(symbol=p.symbol) for p in payloads]
+
+    universe_lib.update_batch.side_effect = _spy_update_batch
+    universe_lib.write_batch.side_effect = _spy_write_batch
 
     mock_s3 = MagicMock()
     monkeypatch.setattr("builders.daily_append.boto3.client", lambda *a, **k: mock_s3)

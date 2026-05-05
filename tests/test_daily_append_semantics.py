@@ -22,40 +22,40 @@ def _source() -> str:
 
 
 def test_universe_lib_uses_update_not_append():
-    """Per-ticker write must go through _write_row_backfill_safe, which
-    uses lib.update() for the append case (steady-state daily pass) and
-    lib.write() for the backfill case (historical row in middle of series).
-    Direct lib.append() must never appear — it accumulates duplicate
-    same-date rows and caused the 2026-04-15 retrain outage.
+    """Per-ticker writes must use ArcticDB's `update_batch` (idempotent,
+    replaces same-date rows) for the steady-state append-at-head case
+    and `write_batch` for the rare backfill case. Direct `lib.append()`
+    must never appear — it accumulates duplicate same-date rows and
+    caused the 2026-04-15 retrain outage.
 
-    The 2026-04-27 threadpool refactor moved the write call into an inner
-    closure for parallel execution, so this test locks the semantic
-    invariant (write goes through the helper with `universe_lib` as first
-    arg) rather than the literal call shape.
+    History: PR #100 (2026-04-27) wrapped per-ticker `_write_row_backfill_safe`
+    calls in a ThreadPoolExecutor for parallelism. PR #152 (2026-05-05)
+    measured that pool achieving zero parallelism in production
+    (1535s wall ≈ serialized rate). PR replaced it with `update_batch`,
+    which ArcticDB documents as parallel via its native C++ thread pool.
+    `_write_row_backfill_safe` is still the per-symbol helper for
+    macro_lib (small N=7-11) and is the canonical reference for the
+    update-vs-write decision logic.
     """
-    import re
     src = _source()
-    # Match `_write_row_backfill_safe(<whitespace>universe_lib<rest>)` —
-    # tolerates the call being inlined OR moved into a helper closure.
-    assert re.search(
-        r"_write_row_backfill_safe\s*\(\s*universe_lib\b",
-        src,
-    ), (
-        "Per-ticker write must call _write_row_backfill_safe(universe_lib, ...) "
-        "— the helper picks update() for append + write() for backfill. "
-        "Calling universe_lib.update() directly skips the backfill-safe path "
-        "and breaks historical rewrites with 'index must be monotonic' "
-        "(see 2026-04-24 polygon VWAP repair)."
+    assert "universe_lib.update_batch(" in src, (
+        "Per-ticker writes must fan out via universe_lib.update_batch — "
+        "ArcticDB's native C++ thread pool is the only thing that achieves "
+        "actual parallelism (Python ThreadPoolExecutor + lib.update did not, "
+        "per 2026-05-05 MorningEnrich incident)."
     )
-    # Inside the helper, the append branch must use update() (not append()).
+    # Idempotent semantics still required — UpdatePayload + update_batch
+    # use the same update() semantics as the per-symbol path (replaces
+    # same-date rows rather than accumulating duplicates). The ban on
+    # raw lib.append() still holds for both universe and macro paths.
     assert "lib.update(symbol, new_row)" in src, (
-        "_write_row_backfill_safe must call lib.update() in the append "
-        "branch — append() accumulates duplicate same-date rows "
-        "(2026-04-15 retrain outage)."
+        "_write_row_backfill_safe (still used for macro_lib) must call "
+        "lib.update() in the append branch — append() accumulates "
+        "duplicate same-date rows (2026-04-15 retrain outage)."
     )
     assert "universe_lib.append(" not in src, (
-        "Found universe_lib.append() — this is the duplicate-row bug. "
-        "Use _write_row_backfill_safe() (which routes to update() for append)."
+        "Found universe_lib.append() — duplicate-row bug. Use update_batch "
+        "for the bulk path or _write_row_backfill_safe for individual symbols."
     )
 
 
@@ -174,42 +174,47 @@ def test_partial_features_are_loudly_logged():
 
 def test_counters_increment_after_successful_write():
     """n_ok and n_partial must be incremented AFTER the per-ticker write
-    so an exception rolls the iteration back cleanly into n_err.
+    so a failed write rolls the iteration back cleanly into n_err.
 
     Locks the 2026-04-21 rewrite where counters were hoisted post-write
-    to prevent double-counting when the write throws. After the 2026-04-27
-    threadpool refactor, the write call lives inside an inner closure and
-    the counters increment in a post-pool aggregation loop driven by the
-    closure's status string — same semantic guarantee, different shape.
+    to prevent double-counting when the write throws. PR #152 (2026-05-05)
+    replaced the ThreadPoolExecutor + closure pattern with `update_batch`,
+    so the aggregation loop now iterates `update_batch` results and
+    routes each result to n_ok / n_partial / n_err based on whether
+    ArcticDB returned a `DataError` (write-side failure) or a
+    `VersionedItem` (success). Same semantic guarantee, different shape.
     """
     import re
     src = _source()
-    # Find the write call (now inside the _do_write closure).
+    # Find the bulk-write call site (universe_lib.update_batch).
     write_match = re.search(
-        r"_write_row_backfill_safe\s*\(\s*universe_lib\b",
+        r"universe_lib\.update_batch\s*\(",
         src,
     )
     assert write_match is not None, (
-        "_write_row_backfill_safe(universe_lib, ...) call site not found"
+        "universe_lib.update_batch call site not found — required for "
+        "the parallel ArcticDB write path."
     )
     after_write = src[write_match.end():]
-    # The closure must return a status before the aggregation loop touches
-    # n_ok / n_partial — i.e. the increments live AFTER the write site
-    # in source order, not before.
-    assert 'return ("ok"' in after_write, (
-        "Closure must return a success status string from the write path "
-        "so the aggregation loop can route to n_ok / n_partial. Without it "
-        "the threadpool path can't tell ok from err and counters lose the "
-        "exception-rolls-into-n_err invariant."
-    )
+    # Counters must increment AFTER the bulk-write site in source order
+    # (i.e. the post-write aggregation loop drives them, not the payload
+    # build loop). Increments before the write would miscount on failure.
     assert "n_partial += 1" in after_write and "n_ok += 1" in after_write, (
-        "n_ok / n_partial must be incremented AFTER the write call site, "
-        "not before. Increments before write cause miscount on exception."
+        "n_ok / n_partial must be incremented AFTER update_batch, not "
+        "before. Increments in the payload-build loop would miscount on "
+        "ArcticDB-side write failures."
     )
-    # Exception path must still route to n_err — locks the rollback invariant.
     assert "n_err += 1" in after_write, (
-        "Aggregation must increment n_err on closure-status='err' so write "
-        "exceptions don't silently inflate n_ok."
+        "Aggregation must increment n_err when ArcticDB returns DataError "
+        "for a payload — write-side failures must not silently inflate n_ok."
+    )
+    # The DataError type-check is the new "exception path" — ArcticDB
+    # batch APIs return DataError instead of raising, so the type-check
+    # is what routes failures to n_err.
+    assert "isinstance(result, DataError)" in after_write or "DataError" in after_write, (
+        "Aggregation must detect DataError returned by update_batch / "
+        "write_batch (ArcticDB batch APIs return errors per-payload "
+        "rather than raising)."
     )
 
 
