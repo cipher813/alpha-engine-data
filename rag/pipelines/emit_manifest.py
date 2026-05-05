@@ -41,10 +41,11 @@ from alpha_engine_lib.rag.db import execute_query
 
 logger = logging.getLogger(__name__)
 
-# Hardcoded; ``rag.embeddings.embed_*`` defaults to voyage-3-lite (1024d).
+# Hardcoded; ``rag.embeddings.embed_*`` defaults to voyage-3-lite (512d,
+# matches the ``embedding vector(512)`` column in ``rag/schema.sql``).
 # Surfaced in the manifest so consumers don't have to re-derive it.
 _EMBEDDING_MODEL = "voyage-3-lite"
-_EMBEDDING_DIMENSION = 1024
+_EMBEDDING_DIMENSION = 512
 
 
 def _by_source() -> dict[str, dict[str, int]]:
