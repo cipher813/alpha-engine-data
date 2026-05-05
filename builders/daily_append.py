@@ -42,7 +42,7 @@ from features.compute import (
     _load_cached_fundamentals,
     _load_cached_alternative,
 )
-from arcticdb.version_store.library import ReadRequest
+from arcticdb.version_store.library import ReadRequest, UpdatePayload, WritePayload
 from arcticdb_ext.version_store import DataError
 
 from store.arctic_store import get_universe_lib, get_macro_lib
@@ -953,92 +953,90 @@ def daily_append(
             log.warning("Failed to compute %s: %s", ticker, exc)
             n_err += 1
 
-    # ── 4c. Phase 2 — parallel writes via ThreadPoolExecutor ─────────────────
-    # ArcticDB writes against different symbols are independent, and the
-    # underlying S3 round-trip releases the GIL on every network op, so a
-    # thread pool is a clean fit for the per-ticker write fan-out. Worker
-    # count is overridable via env var so prod can tune without a redeploy
-    # if the boto3 connection-pool ceiling changes.
+    # ── 4c. Phase 2 — bulk writes via ArcticDB batch API ─────────────────────
+    # 2026-05-05: replaced ThreadPoolExecutor + per-symbol lib.update() loop
+    # with `update_batch` + `write_batch`. PR #152's per-task timing
+    # instrumentation measured the prior threadpool achieving no parallelism
+    # in practice — wall ≈ 900 × 1.7s/ticker (2026-05-05 MorningEnrich
+    # incident, 1535s for 900 tickers, workers=16, hit the 30-min SSM cap).
+    # Phase 1's `read_batch` runs at 84ms/ticker against the same library,
+    # so the ArcticDB native parallelism is the right primitive — and is
+    # documented as such ("perform an update operation on a list of symbols
+    # in parallel"). Same shift PR #99 made for reads. The #152
+    # instrumentation becomes obsolete with this refactor (no per-task
+    # threadpool to time) and is removed in this PR.
     #
-    # 2026-05-05: instrumented per-task duration + thread-id to diagnose why
-    # the wall time of this loop scales like a serialized run despite
-    # workers=16 (1535s for 900 tickers ≈ 1.7s/ticker × 900, no parallelism
-    # speedup observed). Summary log emits p50/p95/p99 task duration + count
-    # per thread + slowest-N tickers so the next run reveals which hypothesis
-    # holds (boto3 pool ceiling, ArcticDB process-level lock, S3 throttling,
-    # or per-task latency itself). Replacement to `update_batch` tracked
-    # separately.
-    write_workers = int(os.environ.get("DAILY_APPEND_WRITE_WORKERS", "16"))
+    # Path split: append-at-head (target_ts > existing.index.max(), the
+    # common morning-enrich case) → UpdatePayload + update_batch.
+    # Backfill (target_ts in middle of series, rare — historical VWAP
+    # repair etc.) → splice + WritePayload + write_batch. Mirrors
+    # `_write_row_backfill_safe`'s branching for the per-symbol path
+    # (which still serves macro_lib's small N=7-11 sequential writes).
+    update_payloads: list[UpdatePayload] = []
+    write_payloads: list[WritePayload] = []
+    payload_meta: dict[str, tuple[list[str] | None, int]] = {}  # ticker → (nan_features, hist_rows)
 
-    def _do_write(task):
-        _ticker, _today_row, _hist, _nan_features = task
-        import threading
-        _tid = threading.get_ident()
-        _t0 = time.time()
-        try:
-            _write_row_backfill_safe(
-                universe_lib, _ticker, _today_row, existing_series=_hist
-            )
-            _dur = time.time() - _t0
-            return ("ok", _ticker, _nan_features, len(_hist), None, _tid, _dur)
-        except Exception as exc:  # pragma: no cover — covered by err test
-            _dur = time.time() - _t0
-            return ("err", _ticker, None, len(_hist), exc, _tid, _dur)
+    for ticker, today_row, hist, nan_features in write_tasks:
+        target_ts = today_row.index[0]
+        payload_meta[ticker] = (nan_features, len(hist))
+        if hist.empty or target_ts > hist.index.max():
+            # Append at head — fast path. update_batch with upsert=True
+            # also handles the rare "symbol doesn't exist yet" case
+            # (replaces _write_row_backfill_safe's lib.write fallback).
+            update_payloads.append(UpdatePayload(symbol=ticker, data=today_row))
+        else:
+            # Backfill — splice into existing series, full rewrite. Same
+            # logic as _write_row_backfill_safe's backfill branch.
+            combined = pd.concat([hist, today_row])
+            combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+            write_payloads.append(WritePayload(symbol=ticker, data=combined))
 
-    if write_tasks:
+    if update_payloads or write_payloads:
         t_write0 = time.time()
-        with ThreadPoolExecutor(max_workers=write_workers) as pool:
-            write_results = list(pool.map(_do_write, write_tasks))
+        update_results = (
+            universe_lib.update_batch(update_payloads, upsert=True)
+            if update_payloads else []
+        )
+        write_results = (
+            universe_lib.write_batch(write_payloads, prune_previous_versions=True)
+            if write_payloads else []
+        )
         write_wall = time.time() - t_write0
         log.info(
-            "Threadpooled writes: %d tickers in %.1fs (workers=%d)",
-            len(write_tasks), write_wall, write_workers,
+            "Batch writes: %d updates + %d backfills in %.1fs",
+            len(update_payloads), len(write_payloads), write_wall,
         )
 
-        # Per-task timing summary — diagnostic for the 2026-05-05
-        # apparent-no-parallelism observation. Compute on the main thread
-        # using stdlib only (no numpy dep added).
-        _durations = sorted(r[6] for r in write_results)
-        _per_thread = {}
-        for r in write_results:
-            _per_thread[r[5]] = _per_thread.get(r[5], 0) + 1
-        _slowest = sorted(write_results, key=lambda r: r[6], reverse=True)[:5]
+        # Iterate results — ArcticDB returns DataError per failed symbol
+        # rather than raising, so explicit per-symbol error detection is
+        # required. Pair each result with the originating payload's symbol
+        # via positional alignment (ArcticDB guarantees i-th result
+        # corresponds to i-th payload).
+        def _aggregate(payloads, results, label: str):
+            nonlocal n_ok, n_err, n_partial
+            for payload, result in zip(payloads, results):
+                ticker = payload.symbol
+                if isinstance(result, DataError):
+                    log.warning(
+                        "Failed to %s %s: %s (code=%s, category=%s)",
+                        label, ticker, result.exception_string,
+                        result.error_code, result.error_category,
+                    )
+                    n_err += 1
+                    continue
+                nan_features, hist_rows = payload_meta[ticker]
+                if nan_features:
+                    log.warning(
+                        "partial-features ticker=%s rows=%d nan=%d/%d features=%s",
+                        ticker, hist_rows, len(nan_features), len(FEATURES),
+                        nan_features,
+                    )
+                    n_partial += 1
+                else:
+                    n_ok += 1
 
-        def _pct(p):
-            idx = max(0, min(len(_durations) - 1, int(round(p * (len(_durations) - 1)))))
-            return _durations[idx]
-
-        log.info(
-            "Write timing: p50=%.3fs p95=%.3fs p99=%.3fs max=%.3fs sum=%.1fs "
-            "(sum/wall ratio=%.1fx, threads_seen=%d)",
-            _pct(0.5), _pct(0.95), _pct(0.99), _durations[-1],
-            sum(_durations), sum(_durations) / write_wall, len(_per_thread),
-        )
-        log.info(
-            "Write per-thread distribution (tasks per tid): %s",
-            sorted(_per_thread.values(), reverse=True),
-        )
-        log.info(
-            "Write slowest-5: %s",
-            [(r[1], round(r[6], 3)) for r in _slowest],
-        )
-
-        # Aggregation runs on the main thread — counter mutation stays
-        # single-threaded so we don't need locks.
-        for status, ticker, nan_features, hist_rows, exc, _tid, _dur in write_results:
-            if status == "err":
-                log.warning("Failed to append %s: %s", ticker, exc)
-                n_err += 1
-                continue
-            if nan_features:
-                log.warning(
-                    "partial-features ticker=%s rows=%d nan=%d/%d features=%s",
-                    ticker, hist_rows, len(nan_features), len(FEATURES),
-                    nan_features,
-                )
-                n_partial += 1
-            else:
-                n_ok += 1
+        _aggregate(update_payloads, update_results, "update")
+        _aggregate(write_payloads, write_results, "backfill")
 
     t_total = time.time() - t0
 
