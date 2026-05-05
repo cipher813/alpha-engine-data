@@ -426,6 +426,26 @@ set -euo pipefail
 cd /home/ec2-user/alpha-engine-data
 ${ENV_SOURCE}
 
+# ── Spot-side log capture ────────────────────────────────────────────
+# SSM RunCommand truncates StandardOutputContent at 24KB and the spot
+# terminates before the dispatcher can scp logs back, so post-mortem
+# debugging requires the full log to land somewhere durable. Tee
+# everything below into /tmp/data-phase1.log + upload to S3 on ANY exit
+# path (success, hard-fail, signal). Origin: 2026-05-03 SF failure where
+# the postflight error message was past the SSM truncation cutoff and
+# the spot was already gone by the time triage started.
+LOG_FILE=/tmp/data-phase1.log
+exec > >(tee -a "\$LOG_FILE") 2>&1
+
+upload_log() {
+    local exit_code=\$?
+    local s3_key="health/data_phase1_log/\$(date +%Y-%m-%d)/\$(date +%Y%m%dT%H%M%SZ -u)-exit\${exit_code}.log"
+    aws s3 cp "\$LOG_FILE" "s3://${S3_BUCKET}/\$s3_key" --region "\${AWS_REGION:-us-east-1}" 2>/dev/null \\
+        && echo "[log-upload] s3://${S3_BUCKET}/\$s3_key" \\
+        || echo "[log-upload] WARNING: failed to upload \$LOG_FILE to S3"
+}
+trap upload_log EXIT
+
 # ── Morning enrich (Saturday-morning polygon-T+1 fill) ────────────────
 # Polygon's grouped-daily aggregate for date T isn't fully settled
 # until the next calendar day (T+1). The Friday weekday-SF run
