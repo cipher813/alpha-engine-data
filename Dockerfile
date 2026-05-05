@@ -1,5 +1,15 @@
 FROM --platform=linux/amd64 public.ecr.aws/lambda/python:3.12
 
+# Install git — required for ``pip install git+https://...`` of
+# alpha-engine-lib below. The Lambda Python 3.12 base image does not
+# include git; pip's git-cloning command fails with "Cannot find
+# command 'git'" without this. Same fix applied to alpha-engine-research
+# Dockerfile after PR #105's lib-public flip exposed the gap. Caught
+# in alpha-engine-data 2026-05-05 when PR #159's deploy job failed
+# with the same error. ``microdnf`` is the AL2023 minimal package
+# manager; ``-y`` auto-confirms.
+RUN microdnf install -y git && microdnf clean all
+
 # Install dependencies. alpha-engine-lib is installed from public git+https
 # with the [flow_doctor] extra only — the [arcticdb,rag] extras in
 # requirements.txt are intentionally NOT pulled here, since Lambda only
