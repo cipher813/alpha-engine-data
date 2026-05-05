@@ -44,6 +44,8 @@ class TestStatesPresent:
             "EvalJudgeFirstSaturday",
             "EvalJudgeWeekly",
             "EvalRollingMean",
+            "CheckSkipRationaleClustering",
+            "RationaleClustering",
         ):
             assert name in states, f"missing SF state: {name}"
 
@@ -86,7 +88,13 @@ class TestSkipBacktesterPreservesEvalJudge:
 
 
 class TestSkipEvalJudge:
-    def test_skip_flag_bypasses_to_health_check(self, states):
+    def test_skip_flag_bypasses_to_rationale_clustering_gate(self, states):
+        """Skipping the judge must NOT also skip rationale clustering —
+        they are independent observability paths reading different
+        sources (clustering reads decision_artifacts/, judge reads its
+        own _eval/). The skip path lands on CheckSkipRationaleClustering
+        rather than SaturdayHealthCheck so the clustering Lambda still
+        fires unless its own skip flag is set."""
         skip = states["CheckSkipEvalJudge"]
         choice = skip["Choices"][0]
         # Both presence + boolean equality must be checked (matches
@@ -97,7 +105,10 @@ class TestSkipEvalJudge:
             and c.get("BooleanEquals") is True
             for c in and_clauses
         )
-        assert choice["Next"] == "SaturdayHealthCheck"
+        assert choice["Next"] == "CheckSkipRationaleClustering"
+        # Critically NOT routed to SaturdayHealthCheck — that would
+        # bundle-skip both observability paths.
+        assert choice["Next"] != "SaturdayHealthCheck"
 
     def test_default_runs_eval(self, states):
         assert states["CheckSkipEvalJudge"]["Default"] == "ComputeEvalCadence"
@@ -239,13 +250,16 @@ class TestEvalRollingMean:
         # TimeoutSeconds must equal that ceiling.
         assert states["EvalRollingMean"]["TimeoutSeconds"] == 300
 
-    def test_success_continues_to_health_check(self, states):
-        assert states["EvalRollingMean"]["Next"] == "SaturdayHealthCheck"
+    def test_success_continues_to_rationale_clustering_gate(self, states):
+        # Rolling-mean converges to CheckSkipRationaleClustering (the
+        # gate in front of the cross-week clustering Lambda) rather
+        # than directly to SaturdayHealthCheck.
+        assert states["EvalRollingMean"]["Next"] == "CheckSkipRationaleClustering"
 
-    def test_catch_routes_to_health_check_not_failure(self, states):
+    def test_catch_routes_to_rationale_clustering_gate_not_failure(self, states):
         catch = states["EvalRollingMean"]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
-        assert catch["Next"] == "SaturdayHealthCheck"
+        assert catch["Next"] == "CheckSkipRationaleClustering"
         assert catch["Next"] != "HandleFailure"
 
     def test_retries_on_transient_lambda_errors(self, states):
@@ -253,6 +267,61 @@ class TestEvalRollingMean:
         # AWS-side transient errors (ServiceException / Throttling),
         # not on application errors.
         retry = states["EvalRollingMean"]["Retry"][0]
+        assert "Lambda.ServiceException" in retry["ErrorEquals"]
+        assert "Lambda.TooManyRequestsException" in retry["ErrorEquals"]
+        assert retry["MaxAttempts"] == 1
+
+
+# ── Rationale clustering skip-gate + state ───────────────────────────────
+
+
+class TestSkipRationaleClustering:
+    def test_skip_flag_bypasses_to_health_check(self, states):
+        skip = states["CheckSkipRationaleClustering"]
+        choice = skip["Choices"][0]
+        and_clauses = choice["And"]
+        assert any(
+            c.get("Variable") == "$.skip_rationale_clustering"
+            and c.get("BooleanEquals") is True
+            for c in and_clauses
+        )
+        assert choice["Next"] == "SaturdayHealthCheck"
+
+    def test_default_runs_clustering(self, states):
+        assert states["CheckSkipRationaleClustering"]["Default"] == "RationaleClustering"
+
+
+class TestRationaleClustering:
+    def test_invokes_live_alias(self, states):
+        params = states["RationaleClustering"]["Parameters"]
+        assert params["FunctionName"] == "alpha-engine-research-rationale-clustering:live"
+
+    def test_payload_passes_execution_start_time(self, states):
+        # SF passes its own start time so the clustering window aligns
+        # with the SF execution date — same alignment principle as the
+        # rolling-mean state above.
+        payload = states["RationaleClustering"]["Parameters"]["Payload"]
+        assert payload["end_time_iso.$"] == "$$.Execution.StartTime"
+
+    def test_timeout_matches_lambda_cap(self, states):
+        # Clustering Lambda is configured with timeout=600s
+        # (alpha-engine-research infrastructure/deploy.sh) — SF state
+        # TimeoutSeconds must equal that ceiling.
+        assert states["RationaleClustering"]["TimeoutSeconds"] == 600
+
+    def test_success_continues_to_health_check(self, states):
+        assert states["RationaleClustering"]["Next"] == "SaturdayHealthCheck"
+
+    def test_catch_routes_to_health_check_not_failure(self, states):
+        # Eval is observability — clustering failures must NOT halt
+        # the pipeline (matches eval-judge + eval-rolling-mean posture).
+        catch = states["RationaleClustering"]["Catch"][0]
+        assert catch["ErrorEquals"] == ["States.ALL"]
+        assert catch["Next"] == "SaturdayHealthCheck"
+        assert catch["Next"] != "HandleFailure"
+
+    def test_retries_on_transient_lambda_errors(self, states):
+        retry = states["RationaleClustering"]["Retry"][0]
         assert "Lambda.ServiceException" in retry["ErrorEquals"]
         assert "Lambda.TooManyRequestsException" in retry["ErrorEquals"]
         assert retry["MaxAttempts"] == 1

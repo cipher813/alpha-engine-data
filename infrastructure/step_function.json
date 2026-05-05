@@ -504,14 +504,14 @@
 
     "CheckSkipEvalJudge": {
       "Type": "Choice",
-      "Comment": "Skip-gate. {\"skip_eval_judge\": true} bypasses the LLM-as-judge eval step (typically used for ad-hoc reruns where eval cost is unwanted).",
+      "Comment": "Skip-gate. {\"skip_eval_judge\": true} bypasses the LLM-as-judge eval step (typically used for ad-hoc reruns where eval cost is unwanted). Skipping the judge does NOT skip rationale clustering — they're independent observability paths (clustering reads decision_artifacts/, judge reads its own _eval/), so we route to CheckSkipRationaleClustering instead of bypassing both.",
       "Choices": [
         {
           "And": [
             {"Variable": "$.skip_eval_judge", "IsPresent": true},
             {"Variable": "$.skip_eval_judge", "BooleanEquals": true}
           ],
-          "Next": "SaturdayHealthCheck"
+          "Next": "CheckSkipRationaleClustering"
         }
       ],
       "Default": "ComputeEvalCadence"
@@ -628,11 +628,57 @@
         {
           "ErrorEquals": ["States.ALL"],
           "Comment": "Eval observability layer — failures must NOT halt the pipeline.",
-          "Next": "SaturdayHealthCheck",
+          "Next": "CheckSkipRationaleClustering",
           "ResultPath": "$.eval_rolling_mean_error"
         }
       ],
       "ResultPath": "$.eval_rolling_mean_result",
+      "Next": "CheckSkipRationaleClustering"
+    },
+
+    "CheckSkipRationaleClustering": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. {\"skip_rationale_clustering\": true} bypasses the cross-week rationale clustering Lambda (used during ad-hoc reruns where corpus is in a known-bad state, while iterating on extraction logic, or for post-incident reruns where stale outputs shouldn't hit CloudWatch). Standalone invocation of the Lambda is always available regardless of this flag.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_rationale_clustering", "IsPresent": true},
+            {"Variable": "$.skip_rationale_clustering", "BooleanEquals": true}
+          ],
+          "Next": "SaturdayHealthCheck"
+        }
+      ],
+      "Default": "RationaleClustering"
+    },
+
+    "RationaleClustering": {
+      "Type": "Task",
+      "Comment": "Cross-week rationale clustering Lambda (ROADMAP P0, 2026-05-05). Reads decision_artifacts/ for the trailing 8 weeks, clusters rationales per agent_id via TF-IDF char n-grams + greedy single-linkage with digit-normalization, emits CW metric agent_rationale_template_concentration (% of rationales in top-3 clusters; >0.7 indicates template-generation), and persists per-agent analysis JSON to decision_artifacts/_analysis/{agent_id}/{YYYY-WW}.json. Runs every Saturday after EvalRollingMean — same image-share + observability framing.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-research-rationale-clustering:live",
+        "Payload": {
+          "end_time_iso.$": "$$.Execution.StartTime"
+        }
+      },
+      "TimeoutSeconds": 600,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "Eval observability layer — failures must NOT halt the pipeline.",
+          "Next": "SaturdayHealthCheck",
+          "ResultPath": "$.rationale_clustering_error"
+        }
+      ],
+      "ResultPath": "$.rationale_clustering_result",
       "Next": "SaturdayHealthCheck"
     },
 

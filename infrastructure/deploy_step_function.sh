@@ -9,6 +9,8 @@
 #   4. Data Phase 2 Lambda (alpha-engine-data-collector) deployed
 #   5. Eval-judge Lambda (alpha-engine-research-eval-judge) deployed via
 #      `infrastructure/deploy.sh eval_judge` from alpha-engine-research
+#      (rolling-mean + rationale-clustering Lambdas auto-deployed by the
+#      same workflow when the research repo's main branch updates)
 #   6. Repos cloned on always-on EC2: alpha-engine-data, alpha-engine-predictor,
 #      alpha-engine-backtester
 #
@@ -103,6 +105,7 @@ POLICY='{
         "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-research-runner*",
         "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-research-eval-judge*",
         "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-research-eval-rolling-mean*",
+        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-research-rationale-clustering*",
         "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-data-collector*",
         "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-predictor-inference*"
       ]
