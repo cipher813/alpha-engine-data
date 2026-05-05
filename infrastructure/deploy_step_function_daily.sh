@@ -35,73 +35,27 @@ echo "  Micro EC2:       $MICRO_INSTANCE"
 echo "  Trading EC2:     $TRADING_INSTANCE"
 echo ""
 
-# ── Update Step Functions role with EC2 start permission ─────────────────────
-
-echo "Updating IAM role with EC2 start + predictor Lambda permissions..."
-POLICY='{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "LambdaInvoke",
-      "Effect": "Allow",
-      "Action": ["lambda:InvokeFunction"],
-      "Resource": [
-        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-research-runner*",
-        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-research-eval-judge*",
-        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-research-eval-rolling-mean*",
-        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-data-collector*",
-        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-predictor-inference*",
-        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-predictor-health-check*"
-      ]
-    },
-    {
-      "Sid": "SSMSendCommand",
-      "Effect": "Allow",
-      "Action": ["ssm:SendCommand"],
-      "Resource": [
-        "arn:aws:ssm:'"$REGION"'::document/AWS-RunShellScript",
-        "arn:aws:ec2:'"$REGION"':'"$ACCOUNT_ID"':instance/'"$MICRO_INSTANCE"'",
-        "arn:aws:ec2:'"$REGION"':'"$ACCOUNT_ID"':instance/'"$TRADING_INSTANCE"'"
-      ]
-    },
-    {
-      "Sid": "SSMGetCommandInvocation",
-      "Effect": "Allow",
-      "Action": ["ssm:GetCommandInvocation"],
-      "Resource": "*"
-    },
-    {
-      "Sid": "EC2StartStop",
-      "Effect": "Allow",
-      "Action": ["ec2:StartInstances", "ec2:StopInstances"],
-      "Resource": "arn:aws:ec2:'"$REGION"':'"$ACCOUNT_ID"':instance/'"$TRADING_INSTANCE"'"
-    },
-    {
-      "Sid": "SNSPublish",
-      "Effect": "Allow",
-      "Action": ["sns:Publish"],
-      "Resource": "'"$SNS_TOPIC_ARN"'"
-    },
-    {
-      "Sid": "CloudWatchLogs",
-      "Effect": "Allow",
-      "Action": [
-        "logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents",
-        "logs:CreateLogDelivery", "logs:GetLogDelivery", "logs:UpdateLogDelivery",
-        "logs:DeleteLogDelivery", "logs:ListLogDeliveries",
-        "logs:PutResourcePolicy", "logs:DescribeResourcePolicies", "logs:DescribeLogGroups"
-      ],
-      "Resource": "*"
-    }
-  ]
-}'
-
-aws iam put-role-policy \
-  --role-name "$ROLE_NAME" \
-  --policy-name "${ROLE_NAME}-policy" \
-  --policy-document "$POLICY" \
-  --region "$REGION"
-echo "  Role updated"
+# ── Step Functions role IAM ─────────────────────────────────────────────────
+#
+# IAM for `alpha-engine-step-functions-role` is managed in the alpha-engine
+# repo as the codified single source of truth:
+#
+#   alpha-engine/infrastructure/iam/alpha-engine-step-functions-role/alpha-engine-step-functions-role-policy.json
+#
+# Apply via:
+#
+#   cd ~/Development/alpha-engine && \
+#     ./infrastructure/iam/apply.sh --role alpha-engine-step-functions-role
+#
+# This script no longer writes the role's inline policy. Two writers (here +
+# apply.sh) drifted in shape (Sid presence, statement granularity, Lambda
+# resource list) — drift detector flapped each time either ran. Single
+# source of truth (codified IAM + apply.sh) eliminates the pattern.
+#
+# When this deploy script runs, it assumes the role policy is already current.
+# CI's check-drift.py will fail loud if codified ↔ live drifts, so a missed
+# apply.sh run gets caught before the next SF execution depends on the missing
+# permission.
 
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 

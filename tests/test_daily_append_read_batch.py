@@ -131,26 +131,30 @@ def test_batch_request_shape():
     )
 
 
-# ── ThreadPool source-grep checks ───────────────────────────────────────────
+# ── Bulk-write source-grep checks ───────────────────────────────────────────
 
 
-def test_writes_use_threadpool_executor():
-    """The per-ticker write fan-out must run inside a ThreadPoolExecutor —
-    the residual half of the 2026-04-27 12-min budget after read_batch was
-    ~5 min of sequential ~300-400ms ArcticDB writes × 900 tickers.
+def test_writes_use_arcticdb_batch_api():
+    """The per-ticker write fan-out must use ArcticDB's `update_batch` /
+    `write_batch` API rather than a per-symbol Python-thread loop.
+
+    History: PR #100 (2026-04-27) introduced a ThreadPoolExecutor
+    (`workers=16`) around `lib.update()` calls; the 2026-05-05
+    MorningEnrich incident measured that pool achieving no parallelism
+    speedup (1535s wall ≈ 900 × 1.7s/ticker, despite 16 workers).
+    Phase 1's `read_batch` runs at 84ms/ticker against the same library
+    — the ArcticDB native parallelism is the right primitive.
+    Documented as "perform an update operation on a list of symbols in
+    parallel" in the ArcticDB API.
     """
     src = _source()
-    assert "ThreadPoolExecutor" in src, (
-        "Per-ticker writes must fan out through ThreadPoolExecutor so the "
-        "S3 round-trip cost parallelizes (Arctic releases the GIL on every "
-        "network op). Sequential writes were the dominant residual budget "
-        "after PR #99's read_batch optimization."
+    assert "universe_lib.update_batch" in src, (
+        "Per-ticker writes must fan out through `update_batch` so the "
+        "S3 round-trip cost parallelizes via ArcticDB's native C++ thread "
+        "pool. The prior Python ThreadPoolExecutor + lib.update() loop "
+        "achieved no parallelism in production (2026-05-05 MorningEnrich "
+        "incident — 1535s wall for 900 tickers, workers=16)."
     )
-    assert "from concurrent.futures import ThreadPoolExecutor" in src
-    # Worker count must be env-overridable so prod can tune without a
-    # redeploy if the boto3 connection-pool ceiling changes.
-    assert "DAILY_APPEND_WRITE_WORKERS" in src, (
-        "Threadpool worker count must be env-overridable — prod boto3 "
-        "connection-pool ceilings vary and tuning shouldn't require a "
-        "code change + redeploy."
-    )
+    assert "from arcticdb.version_store.library import" in src and "UpdatePayload" in src
+    # Backfill path uses write_batch — kept symmetrical with update_batch.
+    assert "write_batch" in src

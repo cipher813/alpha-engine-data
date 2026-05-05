@@ -324,9 +324,90 @@
 
     "WaitForInstanceReady": {
       "Type": "Wait",
-      "Comment": "Wait for SSM agent to register (~30s typical). IB Gateway authenticates in the background; wait-for-ibgateway.sh handles it before RunMorningPlanner.",
-      "Seconds": 60,
-      "Next": "CheckTradingDay"
+      "Comment": "Initial settle before polling for SSM-agent registration. EC2 stopped→running takes ~15-25s; polling describeInstanceInformation any earlier just burns API calls.",
+      "Seconds": 15,
+      "Next": "InitSSMPollCounter"
+    },
+
+    "InitSSMPollCounter": {
+      "Type": "Pass",
+      "Comment": "Initialize attempts counter for the SSM-readiness poll loop.",
+      "Result": {"attempts": 0},
+      "ResultPath": "$.ssm_poll",
+      "Next": "DescribeInstanceInfo"
+    },
+
+    "DescribeInstanceInfo": {
+      "Type": "Task",
+      "Comment": "Poll SSM-agent registration on the trading instance. Replaces the prior fixed Wait 60s, which was insufficient on cold-boot t3.small (race observed 2026-05-05 morning — Ssm.InvalidInstanceIdException at CheckTradingDay because PingStatus had not yet flipped to Online when the SSM SendCommand fired). SSMReadyChoice routes to CheckTradingDay when PingStatus=Online or HandleFailure when the bounded retry budget (~3 min) is exhausted.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:describeInstanceInformation",
+      "Parameters": {
+        "Filters": [
+          {
+            "Key": "InstanceIds",
+            "Values.$": "$.trading_instance_id"
+          }
+        ]
+      },
+      "TimeoutSeconds": 15,
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.SdkClientException", "States.Timeout"],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.ssm_describe_result",
+      "Next": "SSMReadyChoice"
+    },
+
+    "SSMReadyChoice": {
+      "Type": "Choice",
+      "Comment": "PingStatus=Online → CheckTradingDay. Otherwise wait + retry up to 12 attempts (~3 min total budget). Hard-fail when budget exhausted (per feedback_no_silent_fails — agent not registering after 3 min indicates a real boot problem, not just timing).",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.ssm_describe_result.InstanceInformationList[0].PingStatus",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.ssm_describe_result.InstanceInformationList[0].PingStatus",
+              "StringEquals": "Online"
+            }
+          ],
+          "Next": "CheckTradingDay"
+        },
+        {
+          "Variable": "$.ssm_poll.attempts",
+          "NumericGreaterThanEquals": 12,
+          "Next": "HandleFailure"
+        }
+      ],
+      "Default": "WaitSSMPoll"
+    },
+
+    "WaitSSMPoll": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "IncrementSSMPoll"
+    },
+
+    "IncrementSSMPoll": {
+      "Type": "Pass",
+      "Parameters": {
+        "attempts.$": "States.MathAdd($.ssm_poll.attempts, 1)"
+      },
+      "ResultPath": "$.ssm_poll",
+      "Next": "DescribeInstanceInfo"
     },
 
     "PredictorInference": {
