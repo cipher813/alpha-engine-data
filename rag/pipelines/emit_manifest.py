@@ -16,7 +16,9 @@ What lands in the manifest:
 - ``totals``: documents, chunks, tickers
 - ``embedding``: model name + dimension + chunk vector dimension from the
   ``rag.chunks.embedding`` column
-- ``ingestion``: latest ``ingested_at`` overall + per ``doc_type``
+- ``ingestion``: latest ``ingested_at`` overall + per ``doc_type``, plus
+  per-(date, doc_type) document/chunk counts so the dashboard can render
+  the inventory as a date×doc_type pivot
 
 What is intentionally *not* in the manifest (disclosure boundary):
 per-ticker doc lists, individual document titles, chunk content. Those
@@ -123,6 +125,39 @@ def _totals() -> dict[str, int]:
     }
 
 
+def _by_date_source() -> list[dict[str, Any]]:
+    """Per (ingestion calendar date, doc_type): documents + chunks.
+
+    Powers the dashboard's date×doc_type pivot. Aggregates only — no
+    titles, no per-ticker breakdown — so it stays inside the public-safe
+    disclosure boundary alongside the rest of the manifest.
+    """
+    rows = execute_query(
+        """
+        SELECT
+            DATE(d.ingested_at)         AS ingestion_date,
+            d.doc_type                  AS doc_type,
+            COUNT(DISTINCT d.id)        AS documents,
+            COUNT(c.id)                 AS chunks
+        FROM rag.documents d
+        LEFT JOIN rag.chunks c ON c.document_id = d.id
+        WHERE d.ingested_at IS NOT NULL
+        GROUP BY DATE(d.ingested_at), d.doc_type
+        ORDER BY ingestion_date DESC, doc_type
+        """
+    )
+    out = []
+    for r in rows:
+        d = r["ingestion_date"]
+        out.append({
+            "date": d.isoformat() if hasattr(d, "isoformat") else str(d),
+            "doc_type": r["doc_type"],
+            "documents": int(r["documents"] or 0),
+            "chunks": int(r["chunks"] or 0),
+        })
+    return out
+
+
 def _ingestion() -> dict[str, Any]:
     rows = execute_query(
         """
@@ -137,6 +172,7 @@ def _ingestion() -> dict[str, Any]:
     return {
         "last_run_ts": overall,
         "by_source_last_ts": by_source_last_ts,
+        "by_date_source": _by_date_source(),
     }
 
 
@@ -144,7 +180,7 @@ def build_manifest() -> dict[str, Any]:
     """Assemble the manifest dict by querying pgvector."""
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "schema_version": "1.0.0",
+        "schema_version": "1.1.0",
         "totals": _totals(),
         "by_source": _by_source(),
         "by_ticker_coverage": _by_ticker_coverage(),
