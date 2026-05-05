@@ -86,7 +86,9 @@ def test_coverage_percentiles(manifest):
 
 
 def test_embedding_metadata(manifest):
-    assert manifest["embedding"] == {"model": "voyage-3-lite", "dimension": 1024}
+    # voyage-3-lite is 512d — matches `embedding vector(512)` in the lib's
+    # rag/schema.sql. pgvector enforces dim on INSERT.
+    assert manifest["embedding"] == {"model": "voyage-3-lite", "dimension": 512}
 
 
 def test_ingestion_overall_picks_max(manifest):
