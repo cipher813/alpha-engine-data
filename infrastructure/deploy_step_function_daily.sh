@@ -71,6 +71,12 @@ POLICY='{
       "Resource": "*"
     },
     {
+      "Sid": "SSMDescribeInstanceInformation",
+      "Effect": "Allow",
+      "Action": ["ssm:DescribeInstanceInformation"],
+      "Resource": "*"
+    },
+    {
       "Sid": "EC2StartStop",
       "Effect": "Allow",
       "Action": ["ec2:StartInstances", "ec2:StopInstances"],
