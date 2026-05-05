@@ -360,6 +360,7 @@ def _fetch_polygon_closes(
                 "Adj_Close": round(g["close"], 4),
                 "Volume": int(g["volume"]),
                 "VWAP": round(g["vwap"], 4) if g.get("vwap") else None,
+                "source": "polygon",
             })
             polygon_count += 1
     logger.info("Polygon grouped-daily: %d/%d tickers", polygon_count, len(tickers))
@@ -427,6 +428,7 @@ def _fetch_polygon_closes_per_ticker(
             "Adj_Close": round(bar["close"], 4),
             "Volume": int(bar["volume"]),
             "VWAP": round(bar["vwap"], 4) if bar.get("vwap") else None,
+            "source": "polygon",
         })
         recovered += 1
     return recovered
@@ -528,6 +530,7 @@ def _fetch_fred_closes(
                 # across trades). FRED single-value closes give us no distribution
                 # to VWAP, so None rather than passing Close off as VWAP.
                 "VWAP": None,
+                "source": "fred",
             })
             count += 1
         except Exception as e:
@@ -603,6 +606,7 @@ def _fetch_yfinance_closes(
                         "Adj_Close": round(adj_close, 4),
                         "Volume": int(last["Volume"]) if pd.notna(last.get("Volume")) else 0,
                         "VWAP": None,
+                        "source": "yfinance",
                     })
                     count += 1
                 except Exception as e:
