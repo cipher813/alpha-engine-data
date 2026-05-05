@@ -959,30 +959,73 @@ def daily_append(
     # thread pool is a clean fit for the per-ticker write fan-out. Worker
     # count is overridable via env var so prod can tune without a redeploy
     # if the boto3 connection-pool ceiling changes.
+    #
+    # 2026-05-05: instrumented per-task duration + thread-id to diagnose why
+    # the wall time of this loop scales like a serialized run despite
+    # workers=16 (1535s for 900 tickers ≈ 1.7s/ticker × 900, no parallelism
+    # speedup observed). Summary log emits p50/p95/p99 task duration + count
+    # per thread + slowest-N tickers so the next run reveals which hypothesis
+    # holds (boto3 pool ceiling, ArcticDB process-level lock, S3 throttling,
+    # or per-task latency itself). Replacement to `update_batch` tracked
+    # separately.
     write_workers = int(os.environ.get("DAILY_APPEND_WRITE_WORKERS", "16"))
 
     def _do_write(task):
         _ticker, _today_row, _hist, _nan_features = task
+        import threading
+        _tid = threading.get_ident()
+        _t0 = time.time()
         try:
             _write_row_backfill_safe(
                 universe_lib, _ticker, _today_row, existing_series=_hist
             )
-            return ("ok", _ticker, _nan_features, len(_hist), None)
+            _dur = time.time() - _t0
+            return ("ok", _ticker, _nan_features, len(_hist), None, _tid, _dur)
         except Exception as exc:  # pragma: no cover — covered by err test
-            return ("err", _ticker, None, len(_hist), exc)
+            _dur = time.time() - _t0
+            return ("err", _ticker, None, len(_hist), exc, _tid, _dur)
 
     if write_tasks:
         t_write0 = time.time()
         with ThreadPoolExecutor(max_workers=write_workers) as pool:
             write_results = list(pool.map(_do_write, write_tasks))
+        write_wall = time.time() - t_write0
         log.info(
             "Threadpooled writes: %d tickers in %.1fs (workers=%d)",
-            len(write_tasks), time.time() - t_write0, write_workers,
+            len(write_tasks), write_wall, write_workers,
+        )
+
+        # Per-task timing summary — diagnostic for the 2026-05-05
+        # apparent-no-parallelism observation. Compute on the main thread
+        # using stdlib only (no numpy dep added).
+        _durations = sorted(r[6] for r in write_results)
+        _per_thread = {}
+        for r in write_results:
+            _per_thread[r[5]] = _per_thread.get(r[5], 0) + 1
+        _slowest = sorted(write_results, key=lambda r: r[6], reverse=True)[:5]
+
+        def _pct(p):
+            idx = max(0, min(len(_durations) - 1, int(round(p * (len(_durations) - 1)))))
+            return _durations[idx]
+
+        log.info(
+            "Write timing: p50=%.3fs p95=%.3fs p99=%.3fs max=%.3fs sum=%.1fs "
+            "(sum/wall ratio=%.1fx, threads_seen=%d)",
+            _pct(0.5), _pct(0.95), _pct(0.99), _durations[-1],
+            sum(_durations), sum(_durations) / write_wall, len(_per_thread),
+        )
+        log.info(
+            "Write per-thread distribution (tasks per tid): %s",
+            sorted(_per_thread.values(), reverse=True),
+        )
+        log.info(
+            "Write slowest-5: %s",
+            [(r[1], round(r[6], 3)) for r in _slowest],
         )
 
         # Aggregation runs on the main thread — counter mutation stays
         # single-threaded so we don't need locks.
-        for status, ticker, nan_features, hist_rows, exc in write_results:
+        for status, ticker, nan_features, hist_rows, exc, _tid, _dur in write_results:
             if status == "err":
                 log.warning("Failed to append %s: %s", ticker, exc)
                 n_err += 1
