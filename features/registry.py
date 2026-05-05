@@ -22,7 +22,7 @@ class FeatureEntry:
     group: str          # technical | macro | interaction | alternative | fundamental
     description: str
     dtype: str = "float32"
-    source: str = ""    # yfinance | fmp | computed
+    source: str = ""    # polygon | yfinance | fmp | computed
     refresh: str = ""   # daily | weekly | quarterly
     per_ticker: bool = True  # False for macro features (one row per date)
 
@@ -33,32 +33,32 @@ class FeatureEntry:
 
 CATALOG: list[FeatureEntry] = [
     # ── Technical (29) ────────────────────────────────────────────────────────
-    FeatureEntry("rsi_14", "technical", "RSI(14), range 0-100", source="yfinance", refresh="daily"),
-    FeatureEntry("macd_cross", "technical", "+1 bullish / -1 bearish / 0 no cross (last 3 days)", source="yfinance", refresh="daily"),
-    FeatureEntry("macd_above_zero", "technical", "1 if MACD line > 0, else 0", source="yfinance", refresh="daily"),
-    FeatureEntry("macd_line_last", "technical", "MACD line value (fast EMA - slow EMA)", source="yfinance", refresh="daily"),
-    FeatureEntry("price_vs_ma50", "technical", "Close / SMA(50) ratio", source="yfinance", refresh="daily"),
-    FeatureEntry("price_vs_ma200", "technical", "Close / SMA(200) ratio", source="yfinance", refresh="daily"),
-    FeatureEntry("momentum_20d", "technical", "20-day price return", source="yfinance", refresh="daily"),
-    FeatureEntry("avg_volume_20d", "technical", "20-day avg volume / global mean volume", source="yfinance", refresh="daily"),
-    FeatureEntry("dist_from_52w_high", "technical", "(Close - 52w high) / 52w high", source="yfinance", refresh="daily"),
-    FeatureEntry("momentum_5d", "technical", "5-day price return", source="yfinance", refresh="daily"),
-    FeatureEntry("rel_volume_ratio", "technical", "Today volume / 20-day avg volume", source="yfinance", refresh="daily"),
-    FeatureEntry("return_vs_spy_5d", "technical", "5-day stock return minus SPY return", source="yfinance", refresh="daily"),
-    FeatureEntry("dist_from_52w_low", "technical", "(Close - 52w low) / 52w low", source="yfinance", refresh="daily"),
-    FeatureEntry("vol_ratio_10_60", "technical", "10-day vol / 60-day vol", source="yfinance", refresh="daily"),
-    FeatureEntry("bollinger_pct", "technical", "Position within Bollinger Bands (0-1)", source="yfinance", refresh="daily"),
-    FeatureEntry("sector_vs_spy_5d", "technical", "5-day sector ETF return minus SPY return", source="yfinance", refresh="daily"),
-    FeatureEntry("sector_vs_spy_10d", "technical", "10-day sector ETF return minus SPY return", source="yfinance", refresh="daily"),
-    FeatureEntry("sector_vs_spy_20d", "technical", "20-day sector ETF return minus SPY return", source="yfinance", refresh="daily"),
-    FeatureEntry("price_accel", "technical", "Momentum acceleration (5d mom - 20d mom)", source="yfinance", refresh="daily"),
-    FeatureEntry("ema_cross_8_21", "technical", "EMA(8) / EMA(21) ratio", source="yfinance", refresh="daily"),
-    FeatureEntry("atr_14_pct", "technical", "ATR(14) / Close, normalized volatility", source="yfinance", refresh="daily"),
-    FeatureEntry("realized_vol_20d", "technical", "20-day annualized return std dev", source="yfinance", refresh="daily"),
-    FeatureEntry("volume_trend", "technical", "5-day avg volume / 20-day avg volume", source="yfinance", refresh="daily"),
-    FeatureEntry("obv_slope_10d", "technical", "OBV linear regression slope over 10 days", source="yfinance", refresh="daily"),
-    FeatureEntry("rsi_slope_5d", "technical", "5-day RSI slope", source="yfinance", refresh="daily"),
-    FeatureEntry("volume_price_div", "technical", "sign(volume_trend-1) * sign(momentum_5d)", source="yfinance", refresh="daily"),
+    FeatureEntry("rsi_14", "technical", "RSI(14), range 0-100", source="polygon", refresh="daily"),
+    FeatureEntry("macd_cross", "technical", "+1 bullish / -1 bearish / 0 no cross (last 3 days)", source="polygon", refresh="daily"),
+    FeatureEntry("macd_above_zero", "technical", "1 if MACD line > 0, else 0", source="polygon", refresh="daily"),
+    FeatureEntry("macd_line_last", "technical", "MACD line value (fast EMA - slow EMA)", source="polygon", refresh="daily"),
+    FeatureEntry("price_vs_ma50", "technical", "Close / SMA(50) ratio", source="polygon", refresh="daily"),
+    FeatureEntry("price_vs_ma200", "technical", "Close / SMA(200) ratio", source="polygon", refresh="daily"),
+    FeatureEntry("momentum_20d", "technical", "20-day price return", source="polygon", refresh="daily"),
+    FeatureEntry("avg_volume_20d", "technical", "20-day avg volume / global mean volume", source="polygon", refresh="daily"),
+    FeatureEntry("dist_from_52w_high", "technical", "(Close - 52w high) / 52w high", source="polygon", refresh="daily"),
+    FeatureEntry("momentum_5d", "technical", "5-day price return", source="polygon", refresh="daily"),
+    FeatureEntry("rel_volume_ratio", "technical", "Today volume / 20-day avg volume", source="polygon", refresh="daily"),
+    FeatureEntry("return_vs_spy_5d", "technical", "5-day stock return minus SPY return", source="polygon", refresh="daily"),
+    FeatureEntry("dist_from_52w_low", "technical", "(Close - 52w low) / 52w low", source="polygon", refresh="daily"),
+    FeatureEntry("vol_ratio_10_60", "technical", "10-day vol / 60-day vol", source="polygon", refresh="daily"),
+    FeatureEntry("bollinger_pct", "technical", "Position within Bollinger Bands (0-1)", source="polygon", refresh="daily"),
+    FeatureEntry("sector_vs_spy_5d", "technical", "5-day sector ETF return minus SPY return", source="polygon", refresh="daily"),
+    FeatureEntry("sector_vs_spy_10d", "technical", "10-day sector ETF return minus SPY return", source="polygon", refresh="daily"),
+    FeatureEntry("sector_vs_spy_20d", "technical", "20-day sector ETF return minus SPY return", source="polygon", refresh="daily"),
+    FeatureEntry("price_accel", "technical", "Momentum acceleration (5d mom - 20d mom)", source="polygon", refresh="daily"),
+    FeatureEntry("ema_cross_8_21", "technical", "EMA(8) / EMA(21) ratio", source="polygon", refresh="daily"),
+    FeatureEntry("atr_14_pct", "technical", "ATR(14) / Close, normalized volatility", source="polygon", refresh="daily"),
+    FeatureEntry("realized_vol_20d", "technical", "20-day annualized return std dev", source="polygon", refresh="daily"),
+    FeatureEntry("volume_trend", "technical", "5-day avg volume / 20-day avg volume", source="polygon", refresh="daily"),
+    FeatureEntry("obv_slope_10d", "technical", "OBV linear regression slope over 10 days", source="polygon", refresh="daily"),
+    FeatureEntry("rsi_slope_5d", "technical", "5-day RSI slope", source="polygon", refresh="daily"),
+    FeatureEntry("volume_price_div", "technical", "sign(volume_trend-1) * sign(momentum_5d)", source="polygon", refresh="daily"),
 
     # ── Macro (7) — identical across all tickers on a given day ───────────────
     FeatureEntry("vix_level", "macro", "VIX / 20 (normalized around long-run avg)", source="yfinance", refresh="daily", per_ticker=False),
@@ -86,12 +86,12 @@ CATALOG: list[FeatureEntry] = [
     FeatureEntry("iv_vs_rv", "alternative", "Implied vol / realized vol ratio", source="yfinance", refresh="weekly"),
 
     # ── v3.1 technical additions — horizon + decomposition + reversal-native ──
-    FeatureEntry("return_60d", "technical", "60-day price return (Close_t / Close_{t-60} - 1)", source="yfinance", refresh="daily"),
-    FeatureEntry("return_120d", "technical", "120-day price return (Close_t / Close_{t-120} - 1)", source="yfinance", refresh="daily"),
-    FeatureEntry("overnight_return_5d", "technical", "5d sum of overnight returns (Open_t vs Close_{t-1})", source="yfinance", refresh="daily"),
-    FeatureEntry("intraday_return_5d", "technical", "5d sum of intraday returns (Close_t vs Open_t)", source="yfinance", refresh="daily"),
-    FeatureEntry("dist_from_5d_high", "technical", "(Close - 5d rolling max High) / 5d rolling max High", source="yfinance", refresh="daily"),
-    FeatureEntry("dist_from_20d_high", "technical", "(Close - 20d rolling max High) / 20d rolling max High", source="yfinance", refresh="daily"),
+    FeatureEntry("return_60d", "technical", "60-day price return (Close_t / Close_{t-60} - 1)", source="polygon", refresh="daily"),
+    FeatureEntry("return_120d", "technical", "120-day price return (Close_t / Close_{t-120} - 1)", source="polygon", refresh="daily"),
+    FeatureEntry("overnight_return_5d", "technical", "5d sum of overnight returns (Open_t vs Close_{t-1})", source="polygon", refresh="daily"),
+    FeatureEntry("intraday_return_5d", "technical", "5d sum of intraday returns (Close_t vs Open_t)", source="polygon", refresh="daily"),
+    FeatureEntry("dist_from_5d_high", "technical", "(Close - 5d rolling max High) / 5d rolling max High", source="polygon", refresh="daily"),
+    FeatureEntry("dist_from_20d_high", "technical", "(Close - 20d rolling max High) / 20d rolling max High", source="polygon", refresh="daily"),
 
     # ── Fundamental (8) — quarterly financials ────────────────────────────────
     FeatureEntry("pe_ratio", "fundamental", "Trailing P/E ratio, normalized (PE / 30)", source="fmp", refresh="quarterly"),
