@@ -626,35 +626,54 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     statuses = [r.get("status", "unknown") for r in results["collectors"].values()]
     results["status"] = "ok" if all(s in ("ok", "ok_dry_run") for s in statuses) else "failed"
 
-    # Refresh the `daily_data` health stamp on success. Without this the
-    # executor's 26h staleness gate trips on Monday mornings (post-close stamp
-    # is from Friday ~13h before market close → ~65h on Monday open). Only
-    # write on success — a failed morning_enrich must leave the prior stamp
-    # in place so the gate fires correctly. Post-close DailyData run still
-    # writes the canonical stamp; this is a refresh after the polygon overwrite.
-    if not dry_run and results["status"] == "ok":
+    # Refresh the `daily_data` health stamp on daily_closes success.
+    #
+    # Health gate is decoupled from arcticdb daily_append status — the field
+    # is named `daily_data` and represents the canonical OHLCV write state,
+    # which is what daily_closes produces. ArcticDB append is a downstream
+    # consumer of the same data; its failure mode (slow lib.write rewrites,
+    # universe drift) is separate and surfaces via the arcticdb collector's
+    # own status entry in `results["collectors"]["arcticdb"]`.
+    #
+    # Pre-2026-05-05 the gate required all collectors ok. Symptom: morning
+    # polygon overwrite landed (parquet timestamp 6:21 AM PT, VWAP populated)
+    # but health stayed stale on yesterday's EOD yfinance write because
+    # arcticdb append failed silently in this Lambda invocation. The
+    # `health/daily_data.json` consumer (executor staleness gate, dashboard
+    # ingestion-attribution panel) needs the polygon row counts to reflect
+    # ingestion truth — the arcticdb failure isn't theirs to gate on.
+    #
+    # Without this the executor's 26h staleness gate trips on Monday mornings
+    # (post-close stamp is from Friday ~13h before market close → ~65h on
+    # Monday open). Only write on daily_closes success — a failed
+    # daily_closes must leave the prior stamp in place so the gate fires
+    # correctly. Post-close DailyData run still writes the canonical stamp;
+    # this is a refresh after the polygon overwrite.
+    if not dry_run:
         _dc = results["collectors"].get("daily_closes", {})
-        try:
-            _morning_duration = (
-                datetime.fromisoformat(results["completed_at"])
-                - datetime.fromisoformat(results["started_at"])
-            ).total_seconds()
-        except Exception:
-            _morning_duration = 0.0
-        _write_module_health(
-            bucket,
-            module_name="daily_data",
-            run_date=target_date,
-            status="ok",
-            summary={
-                "tickers_captured": _dc.get("tickers_captured", 0),
-                "polygon": _dc.get("polygon", 0),
-                "fred": _dc.get("fred", 0),
-                "yfinance": _dc.get("yfinance", 0),
-                "morning_enrich": True,
-            },
-            duration_seconds=_morning_duration,
-        )
+        _dc_status = _dc.get("status", "unknown")
+        if _dc_status in ("ok", "ok_dry_run"):
+            try:
+                _morning_duration = (
+                    datetime.fromisoformat(results["completed_at"])
+                    - datetime.fromisoformat(results["started_at"])
+                ).total_seconds()
+            except Exception:
+                _morning_duration = 0.0
+            _write_module_health(
+                bucket,
+                module_name="daily_data",
+                run_date=target_date,
+                status="ok",
+                summary={
+                    "tickers_captured": _dc.get("tickers_captured", 0),
+                    "polygon": _dc.get("polygon", 0),
+                    "fred": _dc.get("fred", 0),
+                    "yfinance": _dc.get("yfinance", 0),
+                    "morning_enrich": True,
+                },
+                duration_seconds=_morning_duration,
+            )
 
     duration = ""
     try:
