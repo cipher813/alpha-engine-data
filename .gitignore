@@ -17,6 +17,9 @@ build/
 # Environment
 .env
 
+# Developer instructions (operational detail, not for public repo)
+CLAUDE.md
+
 # OS
 .DS_Store
 Thumbs.db
