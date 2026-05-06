@@ -46,6 +46,8 @@ class TestStatesPresent:
             "EvalRollingMean",
             "CheckSkipRationaleClustering",
             "RationaleClustering",
+            "CheckSkipReplayConcordance",
+            "ReplayConcordance",
         ):
             assert name in states, f"missing SF state: {name}"
 
@@ -276,7 +278,13 @@ class TestEvalRollingMean:
 
 
 class TestSkipRationaleClustering:
-    def test_skip_flag_bypasses_to_health_check(self, states):
+    def test_skip_flag_bypasses_to_concordance_gate(self, states):
+        """Skipping clustering must NOT also skip concordance — they
+        are independent agent-justification signals (clustering = cross-
+        week templating; concordance = same-input cross-model agreement).
+        The skip path lands on CheckSkipReplayConcordance rather than
+        SaturdayHealthCheck so the concordance Lambda still fires
+        unless its own skip flag is set."""
         skip = states["CheckSkipRationaleClustering"]
         choice = skip["Choices"][0]
         and_clauses = choice["And"]
@@ -285,7 +293,10 @@ class TestSkipRationaleClustering:
             and c.get("BooleanEquals") is True
             for c in and_clauses
         )
-        assert choice["Next"] == "SaturdayHealthCheck"
+        assert choice["Next"] == "CheckSkipReplayConcordance"
+        # Critically NOT routed directly to SaturdayHealthCheck — that
+        # would bundle-skip both observability paths.
+        assert choice["Next"] != "SaturdayHealthCheck"
 
     def test_default_runs_clustering(self, states):
         assert states["CheckSkipRationaleClustering"]["Default"] == "RationaleClustering"
@@ -297,31 +308,88 @@ class TestRationaleClustering:
         assert params["FunctionName"] == "alpha-engine-research-rationale-clustering:live"
 
     def test_payload_passes_execution_start_time(self, states):
-        # SF passes its own start time so the clustering window aligns
-        # with the SF execution date — same alignment principle as the
-        # rolling-mean state above.
         payload = states["RationaleClustering"]["Parameters"]["Payload"]
         assert payload["end_time_iso.$"] == "$$.Execution.StartTime"
 
     def test_timeout_matches_lambda_cap(self, states):
-        # Clustering Lambda is configured with timeout=600s
-        # (alpha-engine-research infrastructure/deploy.sh) — SF state
-        # TimeoutSeconds must equal that ceiling.
         assert states["RationaleClustering"]["TimeoutSeconds"] == 600
 
+    def test_success_continues_to_concordance_gate(self, states):
+        # Clustering converges to CheckSkipReplayConcordance (the gate
+        # in front of the cheap-model concordance Lambda) rather than
+        # directly to SaturdayHealthCheck.
+        assert states["RationaleClustering"]["Next"] == "CheckSkipReplayConcordance"
+
+    def test_catch_routes_to_concordance_gate_not_failure(self, states):
+        catch = states["RationaleClustering"]["Catch"][0]
+        assert catch["ErrorEquals"] == ["States.ALL"]
+        assert catch["Next"] == "CheckSkipReplayConcordance"
+        assert catch["Next"] != "HandleFailure"
+
+    def test_retries_on_transient_lambda_errors(self, states):
+        retry = states["RationaleClustering"]["Retry"][0]
+        assert "Lambda.ServiceException" in retry["ErrorEquals"]
+        assert "Lambda.TooManyRequestsException" in retry["ErrorEquals"]
+        assert retry["MaxAttempts"] == 1
+
+
+# ── Replay concordance skip-gate + state ─────────────────────────────────
+
+
+class TestSkipReplayConcordance:
+    def test_skip_flag_bypasses_to_health_check(self, states):
+        skip = states["CheckSkipReplayConcordance"]
+        choice = skip["Choices"][0]
+        and_clauses = choice["And"]
+        assert any(
+            c.get("Variable") == "$.skip_replay_concordance"
+            and c.get("BooleanEquals") is True
+            for c in and_clauses
+        )
+        assert choice["Next"] == "SaturdayHealthCheck"
+
+    def test_default_runs_concordance(self, states):
+        assert states["CheckSkipReplayConcordance"]["Default"] == "ReplayConcordance"
+
+
+class TestReplayConcordance:
+    def test_invokes_live_alias(self, states):
+        params = states["ReplayConcordance"]["Parameters"]
+        assert params["FunctionName"] == "alpha-engine-replay-concordance:live"
+
+    def test_payload_carries_required_fields(self, states):
+        payload = states["ReplayConcordance"]["Parameters"]["Payload"]
+        # SF execution start time aligns the window with the SF run date.
+        assert payload["end_time_iso.$"] == "$$.Execution.StartTime"
+        # Default target_models pinned at the Saturday SF level so the
+        # production cadence is reproducible — operator overrides via
+        # SF input parameters when running ad-hoc against a different
+        # target model.
+        assert payload["target_models"] == ["claude-haiku-4-5"]
+        assert payload["window_days"] == 56  # 8 weeks
+        # max_artifacts cap fits the 900s Lambda timeout at ~3-5 sec
+        # per replay call (150 × 5 = 750s, comfortable).
+        assert payload["max_artifacts"] == 150
+
+    def test_timeout_matches_lambda_cap(self, states):
+        # Concordance Lambda is configured with timeout=900s
+        # (alpha-engine-backtester infrastructure/deploy_concordance.sh).
+        assert states["ReplayConcordance"]["TimeoutSeconds"] == 900
+
     def test_success_continues_to_health_check(self, states):
-        assert states["RationaleClustering"]["Next"] == "SaturdayHealthCheck"
+        assert states["ReplayConcordance"]["Next"] == "SaturdayHealthCheck"
 
     def test_catch_routes_to_health_check_not_failure(self, states):
-        # Eval is observability — clustering failures must NOT halt
-        # the pipeline (matches eval-judge + eval-rolling-mean posture).
-        catch = states["RationaleClustering"]["Catch"][0]
+        # Eval is observability — concordance failures must NOT halt
+        # the pipeline (matches eval-judge + eval-rolling-mean +
+        # rationale-clustering posture).
+        catch = states["ReplayConcordance"]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
         assert catch["Next"] == "SaturdayHealthCheck"
         assert catch["Next"] != "HandleFailure"
 
     def test_retries_on_transient_lambda_errors(self, states):
-        retry = states["RationaleClustering"]["Retry"][0]
+        retry = states["ReplayConcordance"]["Retry"][0]
         assert "Lambda.ServiceException" in retry["ErrorEquals"]
         assert "Lambda.TooManyRequestsException" in retry["ErrorEquals"]
         assert retry["MaxAttempts"] == 1
