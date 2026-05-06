@@ -1,5 +1,5 @@
 {
-  "Comment": "Alpha Engine Saturday Pipeline — orchestrates weekly data collection, RAG ingestion, research, predictor training, and backtesting sequentially with fail-fast error handling. RAG runs before Research (fresh knowledge base). Backtester runs AFTER predictor training (depends on model weights). Supports partial execution via boolean skip_* flags on input (e.g. {\"skip_data_phase1\": true}); a missing flag is treated as false, so scheduled runs are unaffected.",
+  "Comment": "Alpha Engine Saturday Pipeline — orchestrates weekly data collection, RAG ingestion, research, predictor training, and backtesting sequentially with fail-fast error handling. DataPhase1 and RAGIngestion are independent SF states (split 2026-05-06 after a RAG-side import bug failed under the DataPhase1 label, masking that the data layer was healthy). Each runs on its own spot — accepts +1 bootstrap cycle (~7 min) in exchange for failure isolation, redrive granularity, and per-step health markers. RAG still runs before Research so the knowledge base is fresh. Backtester runs AFTER predictor training (depends on model weights). Supports partial execution via boolean skip_* flags on input (e.g. {\"skip_data_phase1\": true, \"skip_rag_ingestion\": true}); a missing flag is treated as false, so scheduled runs are unaffected.",
   "StartAt": "InitializeInput",
   "States": {
 
@@ -15,14 +15,14 @@
 
     "CheckSkipDataPhase1": {
       "Type": "Choice",
-      "Comment": "Skip-gate. Input like {\"skip_data_phase1\": true} routes past DataPhase1 directly to the next skip-gate. Missing flag = run as normal.",
+      "Comment": "Skip-gate. Input like {\"skip_data_phase1\": true} routes past DataPhase1 directly to the next skip-gate (CheckSkipRAGIngestion). Missing flag = run as normal.",
       "Choices": [
         {
           "And": [
             {"Variable": "$.skip_data_phase1", "IsPresent": true},
             {"Variable": "$.skip_data_phase1", "BooleanEquals": true}
           ],
-          "Next": "CheckSkipResearch"
+          "Next": "CheckSkipRAGIngestion"
         }
       ],
       "Default": "DataPhase1"
@@ -30,7 +30,7 @@
 
     "DataPhase1": {
       "Type": "Task",
-      "Comment": "Bundled weekly data: DataPhase1 + RAGIngestion on a single spot EC2. Micro is the dispatcher (launches spot via bash + AWS CLI; no heavy venv needed). One bootstrap cycle serves both workloads — saves ~7 min vs separate spots.",
+      "Comment": "Weekly data collection (morning-enrich + Phase 1 + universe-prune) on a dedicated spot EC2. RAG ingestion lives in the separate RAGIngestion state — split 2026-05-06 so a RAG failure no longer hides under the DataPhase1 label and so redrive granularity matches actual workloads.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -42,7 +42,7 @@
             "cd /home/ec2-user/alpha-engine-data",
             "export HOME=/home/ec2-user",
             "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
-            "bash infrastructure/spot_data_weekly.sh 2>&1 | tee /var/log/data-weekly.log"
+            "bash infrastructure/spot_data_weekly.sh --data-only 2>&1 | tee /var/log/data-weekly.log"
           ],
           "executionTimeout": ["5400"]
         },
@@ -101,7 +101,7 @@
         {
           "Variable": "$.data_phase1_poll.Status",
           "StringEquals": "Success",
-          "Next": "CheckSkipResearch"
+          "Next": "CheckSkipRAGIngestion"
         },
         {
           "Variable": "$.data_phase1_poll.Status",
@@ -121,6 +121,116 @@
       "Type": "Wait",
       "Seconds": 30,
       "Next": "WaitForDataPhase1"
+    },
+
+    "CheckSkipRAGIngestion": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. Input like {\"skip_rag_ingestion\": true} routes past RAG ingestion directly to CheckSkipResearch. Missing flag = run as normal. Useful when DataPhase1 ran fresh but the RAG corpus is already current.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_rag_ingestion", "IsPresent": true},
+            {"Variable": "$.skip_rag_ingestion", "BooleanEquals": true}
+          ],
+          "Next": "CheckSkipResearch"
+        }
+      ],
+      "Default": "RAGIngestion"
+    },
+
+    "RAGIngestion": {
+      "Type": "Task",
+      "Comment": "Weekly RAG ingestion (SEC filings, 8-Ks, earnings, theses) on its own spot EC2. Same dispatcher (always-on micro) that ran DataPhase1; a fresh spot instance is launched here so this state has its own watchdog budget and per-state health marker. ~7 min extra bootstrap vs the prior bundled design — accepted in exchange for failure isolation. Origin of split: 2026-05-06 SF run where alpha-engine-lib v0.3.0 had bare `from rag.X` imports inside retrieval.py that fired during RRC dedup; failure was labeled DataPhase1 even though the data layer was healthy.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "commands": [
+            "set -eo pipefail",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+            "cd /home/ec2-user/alpha-engine-data",
+            "export HOME=/home/ec2-user",
+            "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
+            "bash infrastructure/spot_data_weekly.sh --rag-only 2>&1 | tee /var/log/rag-ingestion.log"
+          ],
+          "executionTimeout": ["3600"]
+        },
+        "TimeoutSeconds": 3600
+      },
+      "TimeoutSeconds": 3660,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.rag_ingestion_result",
+      "Next": "WaitForRAGIngestion"
+    },
+
+    "WaitForRAGIngestion": {
+      "Type": "Task",
+      "Comment": "Poll SSM command until complete",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.rag_ingestion_result.Command.CommandId",
+        "InstanceId.$": "$.ec2_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.InvocationDoesNotExistException"],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.rag_ingestion_poll",
+      "Next": "CheckRAGIngestionStatus"
+    },
+
+    "CheckRAGIngestionStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.rag_ingestion_poll.Status",
+          "StringEquals": "Success",
+          "Next": "CheckSkipResearch"
+        },
+        {
+          "Variable": "$.rag_ingestion_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "RAGIngestionWait"
+        },
+        {
+          "Variable": "$.rag_ingestion_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "RAGIngestionWait"
+        }
+      ],
+      "Default": "ExtractRAGIngestionError"
+    },
+
+    "RAGIngestionWait": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "WaitForRAGIngestion"
     },
 
     "CheckSkipResearch": {
@@ -918,6 +1028,18 @@
         "phase": "DataPhase1",
         "source": "CheckDataPhase1Status.Default",
         "poll.$": "$.data_phase1_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
+
+    "ExtractRAGIngestionError": {
+      "Type": "Pass",
+      "Comment": "Normalize RAGIngestion SSM non-Success poll into $.error. Mirrors ExtractDataPhase1Error — the soft-failure path from CheckRAGIngestionStatus.Default does not populate $.error, only Task Catch blocks do.",
+      "Parameters": {
+        "phase": "RAGIngestion",
+        "source": "CheckRAGIngestionStatus.Default",
+        "poll.$": "$.rag_ingestion_poll"
       },
       "ResultPath": "$.error",
       "Next": "HandleFailure"
