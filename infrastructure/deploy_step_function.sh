@@ -68,10 +68,21 @@ if [ -z "$EXISTING_SUBS" ]; then
 fi
 
 # ── 2. IAM Role for Step Functions ──────────────────────────────────────────
+#
+# Trust policy + role creation kept here (one-time bootstrap). The inline
+# policy on this role is codified in this repo's infrastructure/iam/
+# directory (alpha-engine-step-functions-role.json) and applied via
+# apply.sh — NOT inline here.
+#
+# This script previously wrote its own inline put-role-policy against
+# this role with a narrower policy than the codified version, which
+# clobbered the codified state every saturday deploy and broke
+# downstream pipelines (4 incidents in 2 months). Codified IAM is now
+# the single writer.
 
-echo "Creating IAM role: $ROLE_NAME..."
+echo "Ensuring IAM role exists: $ROLE_NAME..."
 
-# Trust policy
+# Trust policy (one-time bootstrap; safe to re-run)
 TRUST_POLICY='{
   "Version": "2012-10-17",
   "Statement": [
@@ -88,88 +99,10 @@ aws iam create-role \
   --assume-role-policy-document "$TRUST_POLICY" \
   --region "$REGION" 2>/dev/null || echo "  Role already exists"
 
-# Inline policy: Lambda invoke, SSM, SNS, CloudWatch
-# Trading instance ID for weekday pipeline EC2 start
-TRADING_INSTANCE="${AE_TRADING_INSTANCE_ID:-i-018eb3307a21329bf}"
-
-# Shared policy for BOTH Saturday and Weekday pipelines.
-# Both deploy scripts write to the same role/policy — keep them in sync.
-POLICY='{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "LambdaInvoke",
-      "Effect": "Allow",
-      "Action": ["lambda:InvokeFunction"],
-      "Resource": [
-        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-research-runner*",
-        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-research-eval-judge*",
-        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-research-eval-rolling-mean*",
-        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-research-rationale-clustering*",
-        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-replay-concordance*",
-        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-replay-counterfactual*",
-        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-data-collector*",
-        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-predictor-inference*"
-      ]
-    },
-    {
-      "Sid": "SSMRunCommand",
-      "Effect": "Allow",
-      "Action": [
-        "ssm:SendCommand",
-        "ssm:GetCommandInvocation"
-      ],
-      "Resource": [
-        "arn:aws:ssm:'"$REGION"'::document/AWS-RunShellScript",
-        "arn:aws:ec2:'"$REGION"':'"$ACCOUNT_ID"':instance/'"$EC2_INSTANCE_ID"'",
-        "arn:aws:ssm:'"$REGION"':'"$ACCOUNT_ID"':*"
-      ]
-    },
-    {
-      "Sid": "EC2Start",
-      "Effect": "Allow",
-      "Action": ["ec2:StartInstances"],
-      "Resource": "arn:aws:ec2:'"$REGION"':'"$ACCOUNT_ID"':instance/'"$TRADING_INSTANCE"'"
-    },
-    {
-      "Sid": "SNSPublish",
-      "Effect": "Allow",
-      "Action": ["sns:Publish"],
-      "Resource": "'"$SNS_TOPIC_ARN"'"
-    },
-    {
-      "Sid": "CloudWatchLogs",
-      "Effect": "Allow",
-      "Action": [
-        "logs:CreateLogGroup",
-        "logs:CreateLogStream",
-        "logs:PutLogEvents",
-        "logs:CreateLogDelivery",
-        "logs:GetLogDelivery",
-        "logs:UpdateLogDelivery",
-        "logs:DeleteLogDelivery",
-        "logs:ListLogDeliveries",
-        "logs:PutResourcePolicy",
-        "logs:DescribeResourcePolicies",
-        "logs:DescribeLogGroups"
-      ],
-      "Resource": "*"
-    }
-  ]
-}'
-
-aws iam put-role-policy \
-  --role-name "$ROLE_NAME" \
-  --policy-name "${ROLE_NAME}-policy" \
-  --policy-document "$POLICY" \
-  --region "$REGION"
-
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 echo "  Role ARN: $ROLE_ARN"
-
-# Wait for IAM propagation
-echo "  Waiting for IAM propagation..."
-sleep 10
+echo "  Inline policy is codified in infrastructure/iam/${ROLE_NAME}.json"
+echo "  Apply via: ./infrastructure/iam/apply.sh $ROLE_NAME"
 
 # ── 3. State Machine ───────────────────────────────────────────────────────
 
@@ -228,13 +161,13 @@ aws events put-rule \
   --region "$REGION"
 
 # EventBridge needs a role to start Step Functions executions.
-# Trust policy + role creation kept here (one-time bootstrap); inline IAM
-# policy moved to alpha-engine/infrastructure/iam/ (codified file at
-# alpha-engine-eventbridge-sfn-role/alpha-engine-eventbridge-sfn-role-policy.json).
-# Apply via that repo's `apply.sh`, not here. Prior inline block listed
-# only the saturday SFN ARN — every saturday deploy clobbered the
-# weekday ARN that the daily script had granted, breaking the next
-# weekday auto-fire (recurred 2026-04-21, 2026-05-04, 2026-05-06).
+# Trust policy + role creation kept here (one-time bootstrap); inline
+# policy is codified in this repo's infrastructure/iam/ directory
+# (alpha-engine-eventbridge-sfn-role.json). Apply via apply.sh, not
+# here. Prior inline block listed only the saturday SFN ARN — every
+# saturday deploy clobbered the weekday ARN that the daily script had
+# granted, breaking the next weekday auto-fire (recurred 2026-04-21,
+# 2026-05-04, 2026-05-06).
 EB_ROLE_NAME="alpha-engine-eventbridge-sfn-role"
 EB_TRUST='{
   "Version": "2012-10-17",
