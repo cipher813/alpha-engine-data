@@ -48,6 +48,8 @@ class TestStatesPresent:
             "RationaleClustering",
             "CheckSkipReplayConcordance",
             "ReplayConcordance",
+            "CheckSkipCounterfactual",
+            "Counterfactual",
         ):
             assert name in states, f"missing SF state: {name}"
 
@@ -337,7 +339,14 @@ class TestRationaleClustering:
 
 
 class TestSkipReplayConcordance:
-    def test_skip_flag_bypasses_to_health_check(self, states):
+    def test_skip_flag_bypasses_to_counterfactual_gate(self, states):
+        """Skipping concordance must NOT also skip counterfactual —
+        they are independent agent-justification signals (concordance
+        = same-input cross-model agreement; counterfactual = 3-deep
+        decision-tree match). The skip path lands on
+        CheckSkipCounterfactual rather than SaturdayHealthCheck so the
+        counterfactual Lambda still fires unless its own skip flag is
+        set."""
         skip = states["CheckSkipReplayConcordance"]
         choice = skip["Choices"][0]
         and_clauses = choice["And"]
@@ -346,7 +355,8 @@ class TestSkipReplayConcordance:
             and c.get("BooleanEquals") is True
             for c in and_clauses
         )
-        assert choice["Next"] == "SaturdayHealthCheck"
+        assert choice["Next"] == "CheckSkipCounterfactual"
+        assert choice["Next"] != "SaturdayHealthCheck"
 
     def test_default_runs_concordance(self, states):
         assert states["CheckSkipReplayConcordance"]["Default"] == "ReplayConcordance"
@@ -359,37 +369,85 @@ class TestReplayConcordance:
 
     def test_payload_carries_required_fields(self, states):
         payload = states["ReplayConcordance"]["Parameters"]["Payload"]
-        # SF execution start time aligns the window with the SF run date.
         assert payload["end_time_iso.$"] == "$$.Execution.StartTime"
-        # Default target_models pinned at the Saturday SF level so the
-        # production cadence is reproducible — operator overrides via
-        # SF input parameters when running ad-hoc against a different
-        # target model.
         assert payload["target_models"] == ["claude-haiku-4-5"]
-        assert payload["window_days"] == 56  # 8 weeks
-        # max_artifacts cap fits the 900s Lambda timeout at ~3-5 sec
-        # per replay call (150 × 5 = 750s, comfortable).
+        assert payload["window_days"] == 56
         assert payload["max_artifacts"] == 150
 
     def test_timeout_matches_lambda_cap(self, states):
-        # Concordance Lambda is configured with timeout=900s
-        # (alpha-engine-backtester infrastructure/deploy_concordance.sh).
         assert states["ReplayConcordance"]["TimeoutSeconds"] == 900
 
+    def test_success_continues_to_counterfactual_gate(self, states):
+        # Concordance converges to CheckSkipCounterfactual rather than
+        # directly to SaturdayHealthCheck — counterfactual is the next
+        # leg of the agent-justification triple.
+        assert states["ReplayConcordance"]["Next"] == "CheckSkipCounterfactual"
+
+    def test_catch_routes_to_counterfactual_gate_not_failure(self, states):
+        catch = states["ReplayConcordance"]["Catch"][0]
+        assert catch["ErrorEquals"] == ["States.ALL"]
+        assert catch["Next"] == "CheckSkipCounterfactual"
+        assert catch["Next"] != "HandleFailure"
+
+    def test_retries_on_transient_lambda_errors(self, states):
+        retry = states["ReplayConcordance"]["Retry"][0]
+        assert "Lambda.ServiceException" in retry["ErrorEquals"]
+        assert "Lambda.TooManyRequestsException" in retry["ErrorEquals"]
+        assert retry["MaxAttempts"] == 1
+
+
+# ── Counterfactual rule fit skip-gate + state ────────────────────────────
+
+
+class TestSkipCounterfactual:
+    def test_skip_flag_bypasses_to_health_check(self, states):
+        skip = states["CheckSkipCounterfactual"]
+        choice = skip["Choices"][0]
+        and_clauses = choice["And"]
+        assert any(
+            c.get("Variable") == "$.skip_counterfactual"
+            and c.get("BooleanEquals") is True
+            for c in and_clauses
+        )
+        assert choice["Next"] == "SaturdayHealthCheck"
+
+    def test_default_runs_counterfactual(self, states):
+        assert states["CheckSkipCounterfactual"]["Default"] == "Counterfactual"
+
+
+class TestCounterfactual:
+    def test_invokes_live_alias(self, states):
+        params = states["Counterfactual"]["Parameters"]
+        assert params["FunctionName"] == "alpha-engine-replay-counterfactual:live"
+
+    def test_payload_carries_required_fields(self, states):
+        payload = states["Counterfactual"]["Parameters"]["Payload"]
+        assert payload["end_time_iso.$"] == "$$.Execution.StartTime"
+        # 8-week trailing window — same as concordance + clustering.
+        assert payload["window_days"] == 56
+        # Default tree depth pinned at the SF level so the production
+        # cadence is reproducible.
+        assert payload["max_depth"] == 3
+
+    def test_timeout_matches_lambda_cap(self, states):
+        # Counterfactual Lambda is configured with timeout=600s
+        # (alpha-engine-backtester infrastructure/deploy_counterfactual.sh).
+        # Lighter than concordance (no LLM calls — sklearn fits run
+        # in seconds; 600s is comfortable headroom for S3 listing
+        # across 8 weeks of corpus).
+        assert states["Counterfactual"]["TimeoutSeconds"] == 600
+
     def test_success_continues_to_health_check(self, states):
-        assert states["ReplayConcordance"]["Next"] == "SaturdayHealthCheck"
+        assert states["Counterfactual"]["Next"] == "SaturdayHealthCheck"
 
     def test_catch_routes_to_health_check_not_failure(self, states):
-        # Eval is observability — concordance failures must NOT halt
-        # the pipeline (matches eval-judge + eval-rolling-mean +
-        # rationale-clustering posture).
-        catch = states["ReplayConcordance"]["Catch"][0]
+        catch = states["Counterfactual"]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
         assert catch["Next"] == "SaturdayHealthCheck"
         assert catch["Next"] != "HandleFailure"
 
     def test_retries_on_transient_lambda_errors(self, states):
-        retry = states["ReplayConcordance"]["Retry"][0]
+        retry = states["Counterfactual"]["Retry"][0]
         assert "Lambda.ServiceException" in retry["ErrorEquals"]
         assert "Lambda.TooManyRequestsException" in retry["ErrorEquals"]
         assert retry["MaxAttempts"] == 1

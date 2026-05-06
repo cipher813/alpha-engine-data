@@ -107,6 +107,7 @@ POLICY='{
         "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-research-eval-rolling-mean*",
         "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-research-rationale-clustering*",
         "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-replay-concordance*",
+        "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-replay-counterfactual*",
         "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-data-collector*",
         "arn:aws:lambda:'"$REGION"':'"$ACCOUNT_ID"':function:alpha-engine-predictor-inference*"
       ]
