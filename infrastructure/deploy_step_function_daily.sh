@@ -114,28 +114,14 @@ aws events put-rule \
   --description "Weekday 13:00 UTC (6:00 AM PT) — daily data + predictor + executor start" \
   --region "$REGION"
 
-# Reuse EventBridge role from Saturday pipeline
+# Reuse EventBridge role from Saturday pipeline.
+# IAM policy on this role is codified in alpha-engine/infrastructure/iam/
+# (alpha-engine-eventbridge-sfn-role/) — apply via `apply.sh` from that
+# repo, not inline here. The previous inline block on this script + the
+# saturday script wrote the same role policy with different ARN sets and
+# clobbered each other; the saturday-only write hit prod three times
+# (2026-04-21, 2026-05-04, 2026-05-06) before the role was codified.
 EB_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/alpha-engine-eventbridge-sfn-role"
-
-# Update EventBridge role to also allow starting this state machine
-EB_POLICY='{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": "states:StartExecution",
-      "Resource": [
-        "arn:aws:states:'"$REGION"':'"$ACCOUNT_ID"':stateMachine:alpha-engine-saturday-pipeline",
-        "'"$SM_ARN"'"
-      ]
-    }
-  ]
-}'
-aws iam put-role-policy \
-  --role-name "alpha-engine-eventbridge-sfn-role" \
-  --policy-name "alpha-engine-eventbridge-sfn-role-policy" \
-  --policy-document "$EB_POLICY" \
-  --region "$REGION"
 
 INPUT_JSON=$(cat <<EOF
 {
