@@ -37,8 +37,14 @@ POLICY_DOC=$(cat <<EOF
 EOF
 )
 
-# All IAM roles that need SSM access
-ROLES=("alpha-engine-data-role" "alpha-engine-research-role" "alpha-engine-predictor-role" "alpha-engine-executor-role")
+# All IAM roles that need SSM access.
+#
+# Codified roles handle their own SSM-read inline policy via apply.sh in
+# their home repo's infrastructure/iam/ directory:
+#   - alpha-engine-executor-role  → alpha-engine
+#   - alpha-engine-predictor-role → alpha-engine-predictor
+# This script only writes to roles that don't have codified IAM yet.
+ROLES=("alpha-engine-data-role" "alpha-engine-research-role")
 
 DRY_RUN=false
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=true
