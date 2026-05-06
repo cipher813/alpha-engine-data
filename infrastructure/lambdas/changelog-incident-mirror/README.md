@@ -34,7 +34,7 @@ service-side delete API). They are now hand-managed via this
 directory.
 
 The decision to orphan + reconsideration triggers are documented in
-`alpha-engine-docs/private/ROADMAP.md` under the Observability
+`alpha-engine-config/private-docs/ROADMAP.md` under the Observability
 section.
 
 ## What's here
