@@ -443,59 +443,67 @@ def _previous_trading_day(reference: datetime | None = None) -> str:
     )
 
 
-# Cutoff for the "post-close midweek" skip guard: 1:30pm PT (= 30 min after
-# the 1pm-PT close). Yfinance has same-day close populated by this time, so
-# whatever's already in ArcticDB from the morning enrich Lambda + EOD
-# PostMarketData is "good enough" to feed Phase 1 / training / backtester
-# until the next regular Saturday SF re-fetches via polygon T+1.
-_POST_CLOSE_SKIP_HOUR_PT = 13
-_POST_CLOSE_SKIP_MINUTE_PT = 30
+def _arctic_spy_last_date(bucket: str) -> "date | None":
+    """Return SPY's last-indexed date in ArcticDB macro lib, or None on read failure.
+
+    Best-effort: any exception (lib unavailable, empty symbol, transient S3) is
+    logged and resolved as None so the skip decision falls through to "run
+    polygon". Polygon will surface its own failures loudly downstream.
+    """
+    try:
+        from store.arctic_store import get_macro_lib
+        import pandas as pd
+        macro_lib = get_macro_lib(bucket)
+        df = macro_lib.tail("SPY", n=1).data
+        if df.empty:
+            return None
+        return pd.Timestamp(df.index[-1]).date()
+    except Exception as exc:
+        logger.warning(
+            "ArcticDB SPY last_date read failed (%s) — skip-guard will proceed without staleness check",
+            exc,
+        )
+        return None
 
 
 def _should_skip_morning_enrich(
-    now: datetime | None = None,
+    target_date: str,
+    arctic_last_date: "date | None",
 ) -> tuple[bool, str | None]:
-    """Decide whether to skip MorningEnrich based on wall-clock + trading calendar.
+    """Decide whether to skip MorningEnrich based on data staleness.
 
     Returns ``(skip, reason)``. ``skip=True`` means the caller should bail
     out before invoking polygon. Rationale:
 
     Polygon's free tier 403's same-day grouped-daily, and the next session's
-    T+1 settlement isn't visible until ~04:00–05:00 ET the following morning
-    (the Saturday SF cron — 09:00 UTC = 02:00 AM PT — was chosen on this
-    basis). When MorningEnrich is invoked manually after 1:30 PM PT on a
-    trading day (e.g., a Wed-evening "midweek Saturday SF" rerun),
-    ``_previous_trading_day()`` can resolve to today's date once the UTC
-    clock has rolled past midnight — and the polygon call hard-fails 403.
+    T+1 settlement isn't visible until the following morning (the Saturday SF
+    cron — 09:00 UTC = 02:00 AM PT — was chosen on this basis). On a manual
+    midweek "Saturday SF" rerun after the EOD post-market pass has already
+    landed today's yfinance row, polygon's prior-trading-day overwrite would
+    write *older* data over *newer* data already in ArcticDB.
 
-    Skipping leaves the yfinance row already in ArcticDB (from this morning's
-    weekday-SF MorningEnrich Lambda + this afternoon's EOD PostMarketData)
-    intact. The next regular Saturday SF re-fetches the affected sessions
-    from polygon T+1, restoring authoritative VWAP/OHLCV.
+    The check: if polygon's ``target_date`` is strictly before what's already
+    in ArcticDB, skip. The yfinance row written by this afternoon's EOD
+    PostMarketData stays authoritative for this run; the next regular
+    Saturday SF re-fetches the affected sessions from polygon T+1, restoring
+    authoritative VWAP/OHLCV.
 
-    The scheduled Saturday cron (02:00 AM PT) is well below the cutoff and
-    is unaffected. Explicit ``--date`` is handled by the caller and bypasses
-    the guard.
+    The scheduled Saturday 02:00 PT cron and the weekday-SF 06:15 PT
+    MorningEnrich Lambda both target the prior trading day, which equals
+    ArcticDB's last_date at that hour, so the check returns ``skip=False``
+    and polygon runs as normal.
+
+    Explicit ``--date`` is handled by the caller and bypasses the check.
     """
-    from zoneinfo import ZoneInfo
-    from alpha_engine_lib.trading_calendar import is_trading_day
-
-    pt = ZoneInfo("America/Los_Angeles")
-    now_pt = (now.astimezone(pt) if now else datetime.now(pt))
-    if not is_trading_day(now_pt.date()):
+    if arctic_last_date is None:
         return False, None
-    cutoff = now_pt.replace(
-        hour=_POST_CLOSE_SKIP_HOUR_PT,
-        minute=_POST_CLOSE_SKIP_MINUTE_PT,
-        second=0,
-        microsecond=0,
-    )
-    if now_pt >= cutoff:
+    if target_date < arctic_last_date.isoformat():
         return True, (
-            f"post_close_midweek (now={now_pt.strftime('%Y-%m-%d %H:%M %Z')}, "
-            f"cutoff=13:30 PT) — polygon free-tier 403's today's grouped-daily; "
-            f"yfinance row already in ArcticDB stays authoritative for this run, "
-            f"next Saturday SF re-fetches via polygon T+1"
+            f"stale_overwrite (polygon target={target_date}, "
+            f"ArcticDB SPY last={arctic_last_date.isoformat()}) — polygon's "
+            f"T+1 settled day is older than the yfinance EOD row already in "
+            f"ArcticDB; skipping to avoid overwriting newer with older. "
+            f"Next Saturday SF re-fetches via polygon T+1."
         )
     return False, None
 
@@ -518,13 +526,26 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     bucket = config["bucket"]
     started_at = datetime.now(timezone.utc).isoformat()
 
-    # Skip guard: post-1:30pm-PT manual reruns on a trading day. See
+    # Compute target_date PT-aware so a Wed-evening manual rerun (UTC rolled
+    # past midnight) doesn't resolve "previous trading day" to today PT — that
+    # was the original 403 trap the wall-clock guard worked around.
+    if args.date is None:
+        from zoneinfo import ZoneInfo
+        target_date = _previous_trading_day(
+            reference=datetime.now(ZoneInfo("America/Los_Angeles"))
+        )
+    else:
+        target_date = args.date
+
+    # Skip guard: data-staleness check. If polygon's target_date is older than
+    # what's already in ArcticDB (yfinance EOD already landed today's row),
+    # skip so we don't overwrite newer data with older. See
     # _should_skip_morning_enrich() for full rationale. Explicit --date
     # bypasses the guard so operator-driven backfills still work.
     if args.date is None:
-        skip, reason = _should_skip_morning_enrich()
+        arctic_last_date = _arctic_spy_last_date(bucket)
+        skip, reason = _should_skip_morning_enrich(target_date, arctic_last_date)
         if skip:
-            target_date = _previous_trading_day()
             logger.info(
                 "Skipping MorningEnrich: %s. Would have targeted %s.",
                 reason, target_date,
@@ -538,8 +559,6 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "collectors": {},
             }
-
-    target_date = args.date or _previous_trading_day()
     dry_run = args.dry_run
     daily_cfg = config.get("daily_closes", {})
 
