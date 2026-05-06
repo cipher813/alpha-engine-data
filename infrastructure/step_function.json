@@ -645,7 +645,7 @@
             {"Variable": "$.skip_rationale_clustering", "IsPresent": true},
             {"Variable": "$.skip_rationale_clustering", "BooleanEquals": true}
           ],
-          "Next": "SaturdayHealthCheck"
+          "Next": "CheckSkipReplayConcordance"
         }
       ],
       "Default": "RationaleClustering"
@@ -674,11 +674,60 @@
         {
           "ErrorEquals": ["States.ALL"],
           "Comment": "Eval observability layer — failures must NOT halt the pipeline.",
-          "Next": "SaturdayHealthCheck",
+          "Next": "CheckSkipReplayConcordance",
           "ResultPath": "$.rationale_clustering_error"
         }
       ],
       "ResultPath": "$.rationale_clustering_result",
+      "Next": "CheckSkipReplayConcordance"
+    },
+
+    "CheckSkipReplayConcordance": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. {\"skip_replay_concordance\": true} bypasses the cheap-model concordance Lambda (used for ad-hoc reruns where Anthropic spend is unwanted, or while iterating on the comparison scorers in alpha-engine-backtester replay/comparison.py). Independent of skip_rationale_clustering — the two are different agent-justification signals (clustering = cross-week templating; concordance = same-input cross-model agreement). Standalone invocation of the Lambda is always available regardless of this flag.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_replay_concordance", "IsPresent": true},
+            {"Variable": "$.skip_replay_concordance", "BooleanEquals": true}
+          ],
+          "Next": "SaturdayHealthCheck"
+        }
+      ],
+      "Default": "ReplayConcordance"
+    },
+
+    "ReplayConcordance": {
+      "Type": "Task",
+      "Comment": "Weekly cheap-model concordance Lambda (ROADMAP P0, agent-justification gate signal #3). Replays each captured DecisionArtifact in the trailing 8-week window under the configured target model(s) via langchain_anthropic.with_structured_output against the canonical agent_schemas Pydantic contract; aggregates agreement_score per (agent_id_base, target_model); emits CW metric agent_cheap_model_concordance; persists per-target summary JSON to decision_artifacts/_replay_summary/{YYYY-MM-DD}/{target_model}.json. Default target: claude-haiku-4-5 (Sonnet→Haiku concordance ≈ \"is the larger model earning its cost?\"). Runs every Saturday after RationaleClustering.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-replay-concordance:live",
+        "Payload": {
+          "end_time_iso.$": "$$.Execution.StartTime",
+          "target_models": ["claude-haiku-4-5"],
+          "window_days": 56,
+          "max_artifacts": 150
+        }
+      },
+      "TimeoutSeconds": 900,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "Eval observability layer — concordance failure must NOT halt the pipeline. Same Catch pattern as eval-judge / eval-rolling-mean / rationale-clustering.",
+          "Next": "SaturdayHealthCheck",
+          "ResultPath": "$.replay_concordance_error"
+        }
+      ],
+      "ResultPath": "$.replay_concordance_result",
       "Next": "SaturdayHealthCheck"
     },
 
