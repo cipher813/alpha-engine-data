@@ -14,11 +14,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
 import weekly_collector
 from polygon_client import PolygonForbiddenError
+
+_PT = ZoneInfo("America/Los_Angeles")
 
 
 # ── _previous_trading_day ───────────────────────────────────────────────────
@@ -156,10 +159,15 @@ def test_morning_enrich_default_date_uses_previous_trading_day():
         return {"status": "ok_dry_run", "polygon": 1, "fred": 0, "yfinance": 0,
                 "tickers_captured": 1, "source": "polygon_only"}
 
+    # Pin the skip guard to OFF so this test exercises only the
+    # _previous_trading_day fill-in. Without this the test is wall-clock
+    # dependent (would skip when run after 13:30 PT on a trading day).
     with patch("weekly_collector.constituents", fake_constituents), \
          patch("weekly_collector.daily_closes.collect", side_effect=fake_collect), \
          patch("builders.daily_append.daily_append",
                return_value={"status": "ok"}), \
+         patch("weekly_collector._should_skip_morning_enrich",
+               return_value=(False, None)), \
          patch("weekly_collector._previous_trading_day", return_value="2026-04-23"):
         result = weekly_collector._run_morning_enrich(config, args)
 
@@ -460,6 +468,164 @@ def test_morning_enrich_continues_if_prune_fails():
     )
     assert len(da_called) == 1, "daily_append must still run when prune fails"
     assert result["status"] == "ok"
+
+
+# ── _should_skip_morning_enrich (post-1:30pm-PT skip guard) ────────────────
+
+
+def test_skip_guard_fires_after_1_30pm_pt_on_trading_day():
+    """Wed 14:00 PT (a trading day, after the 13:30 cutoff) → skip=True.
+
+    This is the failure case the guard exists to handle: a manual midweek
+    Saturday-SF rerun after market close. polygon free-tier 403's the
+    same-day grouped-daily, and once UTC has rolled past midnight,
+    _previous_trading_day() resolves to today and the polygon call hard-fails.
+    """
+    # 2026-04-22 is a Wednesday (trading day).
+    now = datetime(2026, 4, 22, 14, 0, 0, tzinfo=_PT)
+    skip, reason = weekly_collector._should_skip_morning_enrich(now=now)
+    assert skip is True
+    assert reason is not None
+    assert "post_close_midweek" in reason
+
+
+def test_skip_guard_does_not_fire_before_1_30pm_pt():
+    """Wed 13:29 PT (one minute before cutoff) → skip=False.
+
+    The pre-13:30 window is the regular weekday-SF MorningEnrich Lambda's
+    operating zone (it runs ~06:15 PT). Polygon T+1 for the prior session
+    is settled by then, so the polygon path is the right one to take.
+    """
+    now = datetime(2026, 4, 22, 13, 29, 0, tzinfo=_PT)
+    skip, reason = weekly_collector._should_skip_morning_enrich(now=now)
+    assert skip is False
+    assert reason is None
+
+
+def test_skip_guard_does_not_fire_on_non_trading_day_after_cutoff():
+    """Sat 14:00 PT → skip=False, even though the wall-clock is past 13:30.
+
+    The Saturday SF cron itself fires at 02:00 PT, well below the cutoff,
+    so this case only applies to manual reruns. On a non-trading day,
+    _previous_trading_day() resolves to a settled prior session (e.g.,
+    Friday) — polygon T+1 is fine, no skip needed.
+    """
+    # 2026-04-25 is a Saturday.
+    now = datetime(2026, 4, 25, 14, 0, 0, tzinfo=_PT)
+    skip, reason = weekly_collector._should_skip_morning_enrich(now=now)
+    assert skip is False
+    assert reason is None
+
+
+def test_skip_guard_does_not_fire_on_saturday_cron_window():
+    """Sat 02:00 PT (the scheduled Saturday SF cron time) → skip=False.
+
+    Defensive: confirms the guard does not interfere with the scheduled
+    Saturday SF path. This is the regression case for "we accidentally
+    broke the Saturday cron path."
+    """
+    # 2026-04-25 is a Saturday.
+    now = datetime(2026, 4, 25, 2, 0, 0, tzinfo=_PT)
+    skip, reason = weekly_collector._should_skip_morning_enrich(now=now)
+    assert skip is False
+    assert reason is None
+
+
+def test_skip_guard_does_not_fire_on_holiday_after_cutoff():
+    """Christmas 14:00 PT → skip=False (NYSE closed).
+
+    Same logic as the Saturday case: on a non-trading day the guard
+    doesn't apply because polygon T+1 for the prior session is already
+    settled.
+    """
+    # 2026-12-25 is Christmas (NYSE closed).
+    now = datetime(2026, 12, 25, 14, 0, 0, tzinfo=_PT)
+    skip, reason = weekly_collector._should_skip_morning_enrich(now=now)
+    assert skip is False
+    assert reason is None
+
+
+def test_skip_guard_accepts_utc_input_via_astimezone():
+    """A UTC-aware datetime that lands past 13:30 PT after conversion fires.
+
+    Real callers pass nothing (helper grabs `datetime.now(PT)` itself), but
+    callers that DO pass a `now` may pass it in any tz — the helper must
+    convert. Wed 22:00 UTC = Wed 15:00 PT (during DST) = past cutoff.
+    """
+    # 2026-04-22 22:00 UTC = 15:00 PT (DST in effect)
+    now_utc = datetime(2026, 4, 22, 22, 0, 0, tzinfo=timezone.utc)
+    skip, reason = weekly_collector._should_skip_morning_enrich(now=now_utc)
+    assert skip is True
+    assert "post_close_midweek" in reason
+
+
+# ── _run_morning_enrich integration with the skip guard ────────────────────
+
+
+def test_morning_enrich_short_circuits_when_skip_guard_fires():
+    """When the guard says skip, _run_morning_enrich must return
+    status='skipped' WITHOUT calling polygon, daily_append, or any
+    side-effecting collector. The yfinance row already in ArcticDB stays
+    authoritative for this run."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date=None, dry_run=False, morning_enrich=True)
+
+    fake_constituents = MagicMock()
+    polygon_calls = []
+    daily_append_calls = []
+    health_calls = []
+
+    with patch(
+        "weekly_collector._should_skip_morning_enrich",
+        return_value=(True, "post_close_midweek (test)"),
+    ), patch("weekly_collector.constituents", fake_constituents), \
+         patch("weekly_collector.daily_closes.collect",
+               side_effect=lambda **k: polygon_calls.append(k) or {"status": "ok"}), \
+         patch("builders.daily_append.daily_append",
+               side_effect=lambda **k: daily_append_calls.append(k) or {"status": "ok"}), \
+         patch("weekly_collector._write_module_health",
+               side_effect=lambda *a, **k: health_calls.append(k)):
+        result = weekly_collector._run_morning_enrich(config, args)
+
+    assert result["status"] == "skipped"
+    assert "post_close_midweek" in result["skip_reason"]
+    assert result["would_have_targeted"]  # _previous_trading_day() filled it in
+    assert polygon_calls == [], "polygon must not be called when guard skips"
+    assert daily_append_calls == [], "daily_append must not be called when guard skips"
+    assert health_calls == [], "health stamp must not refresh when guard skips"
+    fake_constituents.collect.assert_not_called()
+
+
+def test_morning_enrich_explicit_date_overrides_skip_guard():
+    """Explicit --date is operator-driven backfill — must run polygon even
+    after 13:30 PT. Operator knows what they're doing (e.g., backfilling a
+    specific date that polygon T+1 has long since settled)."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    args = SimpleNamespace(date="2026-04-22", dry_run=True, morning_enrich=True)
+
+    fake_constituents = MagicMock()
+    fake_constituents.load_from_s3.return_value = {"tickers": ["AAPL"]}
+
+    polygon_calls = []
+    def fake_collect(**kwargs):
+        polygon_calls.append(kwargs)
+        return {"status": "ok_dry_run", "polygon": 1, "fred": 0, "yfinance": 0,
+                "tickers_captured": 1, "source": "polygon_only"}
+
+    # Force the guard to be willing to fire — verifies that --date bypasses it.
+    with patch(
+        "weekly_collector._should_skip_morning_enrich",
+        return_value=(True, "would-have-skipped"),
+    ), patch("weekly_collector.constituents", fake_constituents), \
+         patch("weekly_collector.daily_closes.collect", side_effect=fake_collect), \
+         patch("builders.daily_append.daily_append", return_value={"status": "ok"}):
+        result = weekly_collector._run_morning_enrich(config, args)
+
+    assert result["status"] == "ok"
+    assert result["date"] == "2026-04-22"
+    assert len(polygon_calls) == 1, (
+        "explicit --date must bypass the skip guard and call polygon"
+    )
 
 
 def test_morning_enrich_dry_run_skips_preflight_writes():

@@ -443,6 +443,63 @@ def _previous_trading_day(reference: datetime | None = None) -> str:
     )
 
 
+# Cutoff for the "post-close midweek" skip guard: 1:30pm PT (= 30 min after
+# the 1pm-PT close). Yfinance has same-day close populated by this time, so
+# whatever's already in ArcticDB from the morning enrich Lambda + EOD
+# PostMarketData is "good enough" to feed Phase 1 / training / backtester
+# until the next regular Saturday SF re-fetches via polygon T+1.
+_POST_CLOSE_SKIP_HOUR_PT = 13
+_POST_CLOSE_SKIP_MINUTE_PT = 30
+
+
+def _should_skip_morning_enrich(
+    now: datetime | None = None,
+) -> tuple[bool, str | None]:
+    """Decide whether to skip MorningEnrich based on wall-clock + trading calendar.
+
+    Returns ``(skip, reason)``. ``skip=True`` means the caller should bail
+    out before invoking polygon. Rationale:
+
+    Polygon's free tier 403's same-day grouped-daily, and the next session's
+    T+1 settlement isn't visible until ~04:00–05:00 ET the following morning
+    (the Saturday SF cron — 09:00 UTC = 02:00 AM PT — was chosen on this
+    basis). When MorningEnrich is invoked manually after 1:30 PM PT on a
+    trading day (e.g., a Wed-evening "midweek Saturday SF" rerun),
+    ``_previous_trading_day()`` can resolve to today's date once the UTC
+    clock has rolled past midnight — and the polygon call hard-fails 403.
+
+    Skipping leaves the yfinance row already in ArcticDB (from this morning's
+    weekday-SF MorningEnrich Lambda + this afternoon's EOD PostMarketData)
+    intact. The next regular Saturday SF re-fetches the affected sessions
+    from polygon T+1, restoring authoritative VWAP/OHLCV.
+
+    The scheduled Saturday cron (02:00 AM PT) is well below the cutoff and
+    is unaffected. Explicit ``--date`` is handled by the caller and bypasses
+    the guard.
+    """
+    from zoneinfo import ZoneInfo
+    from alpha_engine_lib.trading_calendar import is_trading_day
+
+    pt = ZoneInfo("America/Los_Angeles")
+    now_pt = (now.astimezone(pt) if now else datetime.now(pt))
+    if not is_trading_day(now_pt.date()):
+        return False, None
+    cutoff = now_pt.replace(
+        hour=_POST_CLOSE_SKIP_HOUR_PT,
+        minute=_POST_CLOSE_SKIP_MINUTE_PT,
+        second=0,
+        microsecond=0,
+    )
+    if now_pt >= cutoff:
+        return True, (
+            f"post_close_midweek (now={now_pt.strftime('%Y-%m-%d %H:%M %Z')}, "
+            f"cutoff=13:30 PT) — polygon free-tier 403's today's grouped-daily; "
+            f"yfinance row already in ArcticDB stays authoritative for this run, "
+            f"next Saturday SF re-fetches via polygon T+1"
+        )
+    return False, None
+
+
 def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     """Morning polygon enrichment: overwrite the prior trading day's parquet
     + ArcticDB row with polygon's authoritative OHLCV+VWAP.
@@ -459,6 +516,29 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     what downstream consumers actually read.
     """
     bucket = config["bucket"]
+    started_at = datetime.now(timezone.utc).isoformat()
+
+    # Skip guard: post-1:30pm-PT manual reruns on a trading day. See
+    # _should_skip_morning_enrich() for full rationale. Explicit --date
+    # bypasses the guard so operator-driven backfills still work.
+    if args.date is None:
+        skip, reason = _should_skip_morning_enrich()
+        if skip:
+            target_date = _previous_trading_day()
+            logger.info(
+                "Skipping MorningEnrich: %s. Would have targeted %s.",
+                reason, target_date,
+            )
+            return {
+                "mode": "morning_enrich",
+                "status": "skipped",
+                "skip_reason": reason,
+                "would_have_targeted": target_date,
+                "started_at": started_at,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "collectors": {},
+            }
+
     target_date = args.date or _previous_trading_day()
     dry_run = args.dry_run
     daily_cfg = config.get("daily_closes", {})
@@ -466,7 +546,7 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     results: dict = {
         "mode": "morning_enrich",
         "date": target_date,
-        "started_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": started_at,
         "collectors": {},
     }
 
@@ -1136,7 +1216,12 @@ def main() -> None:
     # missing/corrupt data. See feedback_hard_fail_until_stable memory for
     # rationale. Lift this back to == "failed" only after the system is
     # demonstrably stable (multiple clean Saturday runs in a row).
-    if results["status"] != "ok":
+    #
+    # ``skipped`` is the deliberate-no-op status emitted by _run_morning_enrich
+    # when invoked after 1:30pm PT on a trading day (polygon free-tier 403's
+    # today's grouped-daily). Treated as success so spot_data_weekly.sh's
+    # ``if ! ... exit 1`` check does not trip.
+    if results["status"] not in ("ok", "skipped"):
         logger.error(
             "Weekly collection finished with non-ok status=%s — exiting 1 "
             "to halt the pipeline. Per-collector statuses: %s",
