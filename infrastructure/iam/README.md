@@ -98,3 +98,5 @@ scoped to the codified roles only.
 
 If the role is module-specific rather than orchestration-shared, codify
 it in the owning module's repo instead.
+
+<!-- ci-trigger -->
