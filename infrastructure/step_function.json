@@ -829,12 +829,72 @@
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
-          "Comment": "Non-blocking — continue even if polling fails",
-          "Next": "NotifyComplete",
+          "Comment": "Non-blocking — continue to substrate check even if freshness polling fails. SaturdayHealthCheck (artifact freshness) and WeeklySubstrateHealthCheck (row-driven inventory validation) are independent observability paths; both must run.",
+          "Next": "WeeklySubstrateHealthCheck",
           "ResultPath": "$.health_check_error"
         }
       ],
       "ResultPath": "$.health_check_poll",
+      "Next": "WeeklySubstrateHealthCheck"
+    },
+
+    "WeeklySubstrateHealthCheck": {
+      "Type": "Task",
+      "Comment": "Phase 2 → 3 transparency-substrate health check. Validates every row of the transparency inventory (alpha-engine-lib transparency_inventory.yaml) — agent decisions, predictor decisions, trade lineage, risk events, P&L attribution, config changes, data quality, agent quality, pipeline execution. Per-row CloudWatch metrics emit to AlphaEngine/Substrate so individual rows have their own alarms. Non-blocking (alerts on failure but does not halt pipeline) — same pattern as SaturdayHealthCheck. The Sat SF passes --cadence weekly which sweeps weekly + daily rows; the weekday EOD SF will run --cadence daily in a follow-up PR.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "commands": [
+            "set -eo pipefail",
+            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main",
+            "cd /home/ec2-user/alpha-engine-dashboard",
+            "source .venv/bin/activate",
+            "pip install --quiet --upgrade -r requirements.txt",
+            "python -m alpha_engine_lib.transparency --cadence weekly --alert 2>&1 | tee /var/log/substrate-health-check.log"
+          ],
+          "executionTimeout": ["180"]
+        },
+        "TimeoutSeconds": 180
+      },
+      "TimeoutSeconds": 240,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "Substrate check failure is non-blocking — continue to notify. Per-row CloudWatch alarms catch row-level failures; this Catch only fires on infra/SSM failure.",
+          "Next": "NotifyComplete",
+          "ResultPath": "$.substrate_check_error"
+        }
+      ],
+      "ResultPath": "$.substrate_check_result",
+      "Next": "WaitForWeeklySubstrateHealthCheck"
+    },
+
+    "WaitForWeeklySubstrateHealthCheck": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.substrate_check_result.Command.CommandId",
+        "InstanceId.$": "$.ec2_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Ssm.InvocationDoesNotExistException"],
+          "MaxAttempts": 5,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "Non-blocking — continue even if polling fails. Row-level alarms still page on failure regardless of polling outcome.",
+          "Next": "NotifyComplete",
+          "ResultPath": "$.substrate_check_error"
+        }
+      ],
+      "ResultPath": "$.substrate_check_poll",
       "Next": "NotifyComplete"
     },
 
