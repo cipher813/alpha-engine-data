@@ -227,7 +227,14 @@ aws events put-rule \
   --description "Saturday 09:00 UTC (02:00 AM PT Sat) — triggers full Alpha Engine pipeline. Schedule chosen so polygon's Friday daily aggregate has settled (T+1 lag) before MorningEnrich + DataPhase1 fetch it." \
   --region "$REGION"
 
-# EventBridge needs a role to start Step Functions executions
+# EventBridge needs a role to start Step Functions executions.
+# Trust policy + role creation kept here (one-time bootstrap); inline IAM
+# policy moved to alpha-engine/infrastructure/iam/ (codified file at
+# alpha-engine-eventbridge-sfn-role/alpha-engine-eventbridge-sfn-role-policy.json).
+# Apply via that repo's `apply.sh`, not here. Prior inline block listed
+# only the saturday SFN ARN — every saturday deploy clobbered the
+# weekday ARN that the daily script had granted, breaking the next
+# weekday auto-fire (recurred 2026-04-21, 2026-05-04, 2026-05-06).
 EB_ROLE_NAME="alpha-engine-eventbridge-sfn-role"
 EB_TRUST='{
   "Version": "2012-10-17",
@@ -244,23 +251,6 @@ aws iam create-role \
   --role-name "$EB_ROLE_NAME" \
   --assume-role-policy-document "$EB_TRUST" \
   --region "$REGION" 2>/dev/null || true
-
-EB_POLICY='{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": "states:StartExecution",
-      "Resource": "'"$SM_ARN"'"
-    }
-  ]
-}'
-
-aws iam put-role-policy \
-  --role-name "$EB_ROLE_NAME" \
-  --policy-name "${EB_ROLE_NAME}-policy" \
-  --policy-document "$EB_POLICY" \
-  --region "$REGION"
 
 EB_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${EB_ROLE_NAME}"
 
