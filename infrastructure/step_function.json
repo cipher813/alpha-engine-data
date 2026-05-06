@@ -684,14 +684,14 @@
 
     "CheckSkipReplayConcordance": {
       "Type": "Choice",
-      "Comment": "Skip-gate. {\"skip_replay_concordance\": true} bypasses the cheap-model concordance Lambda (used for ad-hoc reruns where Anthropic spend is unwanted, or while iterating on the comparison scorers in alpha-engine-backtester replay/comparison.py). Independent of skip_rationale_clustering — the two are different agent-justification signals (clustering = cross-week templating; concordance = same-input cross-model agreement). Standalone invocation of the Lambda is always available regardless of this flag.",
+      "Comment": "Skip-gate. {\"skip_replay_concordance\": true} bypasses the cheap-model concordance Lambda (used for ad-hoc reruns where Anthropic spend is unwanted, or while iterating on the comparison scorers in alpha-engine-backtester replay/comparison.py). Independent of skip_rationale_clustering and skip_counterfactual — the three are independent agent-justification signals. Standalone invocation of the Lambda is always available regardless of this flag.",
       "Choices": [
         {
           "And": [
             {"Variable": "$.skip_replay_concordance", "IsPresent": true},
             {"Variable": "$.skip_replay_concordance", "BooleanEquals": true}
           ],
-          "Next": "SaturdayHealthCheck"
+          "Next": "CheckSkipCounterfactual"
         }
       ],
       "Default": "ReplayConcordance"
@@ -723,11 +723,59 @@
         {
           "ErrorEquals": ["States.ALL"],
           "Comment": "Eval observability layer — concordance failure must NOT halt the pipeline. Same Catch pattern as eval-judge / eval-rolling-mean / rationale-clustering.",
-          "Next": "SaturdayHealthCheck",
+          "Next": "CheckSkipCounterfactual",
           "ResultPath": "$.replay_concordance_error"
         }
       ],
       "ResultPath": "$.replay_concordance_result",
+      "Next": "CheckSkipCounterfactual"
+    },
+
+    "CheckSkipCounterfactual": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. {\"skip_counterfactual\": true} bypasses the counterfactual rule fit Lambda (used for ad-hoc reruns while iterating on the per-agent feature extractors in alpha-engine-backtester replay/counterfactual.py). Independent of skip_rationale_clustering and skip_replay_concordance — the three are independent agent-justification signals. Standalone invocation of the Lambda is always available regardless of this flag.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.skip_counterfactual", "IsPresent": true},
+            {"Variable": "$.skip_counterfactual", "BooleanEquals": true}
+          ],
+          "Next": "SaturdayHealthCheck"
+        }
+      ],
+      "Default": "Counterfactual"
+    },
+
+    "Counterfactual": {
+      "Type": "Task",
+      "Comment": "Weekly counterfactual rule fit Lambda (ROADMAP P0, agent-justification gate signal #2 — does the agent reduce to a 3-deep decision tree?). Trains DecisionTreeClassifier(max_depth=3) per supported agent on (input → decision) pairs from the trailing 8-week decision_artifacts/ corpus; emits CW metric agent_counterfactual_rule_fit per (judged_agent_id); persists per-agent JSON to decision_artifacts/_counterfactual/{agent_id_base}/{YYYY-WW}.json including tree_text + feature_importances. v1 covers ic_cio + macro_economist; other agents emit UNSUPPORTED markers. $0 ongoing — no LLM calls. Runs every Saturday after ReplayConcordance.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-replay-counterfactual:live",
+        "Payload": {
+          "end_time_iso.$": "$$.Execution.StartTime",
+          "window_days": 56,
+          "max_depth": 3
+        }
+      },
+      "TimeoutSeconds": 600,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "Eval observability layer — counterfactual failure must NOT halt the pipeline. Same Catch pattern as the rest of the agent-justification triple.",
+          "Next": "SaturdayHealthCheck",
+          "ResultPath": "$.counterfactual_error"
+        }
+      ],
+      "ResultPath": "$.counterfactual_result",
       "Next": "SaturdayHealthCheck"
     },
 
