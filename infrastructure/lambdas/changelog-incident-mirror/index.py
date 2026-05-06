@@ -37,7 +37,7 @@ deploy.sh in this directory. The decision to orphan from CF (rather
 than keep it in the alpha-engine-orchestration stack) was made
 2026-05-01 to avoid a perm cascade on the github-actions-lambda-deploy
 OIDC role; trade-off + reconsideration triggers documented in the
-private/ROADMAP.md "Observability" section.
+alpha-engine-config/private-docs/ROADMAP.md "Observability" section.
 """
 
 from __future__ import annotations
