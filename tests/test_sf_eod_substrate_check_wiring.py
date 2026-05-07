@@ -1,0 +1,208 @@
+"""Pins the Phase 2 → 3 substrate-health-check wiring in the EOD SF.
+
+Mirrors ``test_sf_substrate_check_wiring.py`` (the Saturday SF version).
+The new states ``DailySubstrateHealthCheck`` and
+``WaitForDailySubstrateHealthCheck`` chain off the success path of
+``CheckEODStatus`` and run the row-driven
+``alpha_engine_lib.transparency`` checker on the dashboard EC2 with
+``--cadence daily``.
+
+The Saturday SF runs ``--cadence weekly`` which sweeps weekly + daily
+rows. The weekday EOD SF runs ``--cadence daily`` so daily-emitting
+rows (lineage, risk_events, residual_pct) get checked on the day they
+land — without this, a bad emission Mon-Thu wouldn't surface until
+Saturday's run.
+
+Catches regressions like:
+- Someone reroutes ``CheckEODStatus`` Success back to ``StopTradingInstance``
+  and silently drops the substrate check.
+- Someone removes the substrate state thinking the weekly check is
+  enough (it isn't — that's the gap this state closes).
+- Someone flips the substrate Catch into a hard-fail and starts halting
+  EOD shutdown on row-level failure (per-row alarms own paging — the
+  Catch is for SSM/infra failures only). Worse: a hard-fail Catch could
+  prevent ``StopTradingInstance`` from running, leaving the trading EC2
+  up overnight (cost overrun).
+- Someone targets the trading EC2 instead of the dashboard EC2 (the
+  trading EC2 doesn't have the dashboard repo or lib pin installed).
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_eod.json"
+
+
+@pytest.fixture(scope="module")
+def sf() -> dict:
+    return json.loads(_SF_PATH.read_text())
+
+
+@pytest.fixture(scope="module")
+def states(sf) -> dict:
+    return sf["States"]
+
+
+class TestStatePresence:
+    """Both new states must exist and chain after the existing EOD reconcile."""
+
+    def test_daily_substrate_check_state_exists(self, states):
+        assert "DailySubstrateHealthCheck" in states
+
+    def test_wait_for_daily_substrate_check_exists(self, states):
+        assert "WaitForDailySubstrateHealthCheck" in states
+
+
+class TestChainOrdering:
+    """Wiring goes: CheckEODStatus → Substrate → WaitForSubstrate → StopTradingInstance."""
+
+    def test_check_eod_status_success_routes_to_substrate(self, states):
+        choices = states["CheckEODStatus"]["Choices"]
+        success_choice = next(
+            (c for c in choices if c.get("StringEquals") == "Success"), None
+        )
+        assert success_choice is not None, "CheckEODStatus must have a Success branch"
+        assert success_choice["Next"] == "DailySubstrateHealthCheck", (
+            "CheckEODStatus Success must hand off to the substrate check, "
+            "not skip directly to StopTradingInstance."
+        )
+
+    def test_substrate_check_routes_to_wait_state(self, states):
+        assert states["DailySubstrateHealthCheck"]["Next"] == (
+            "WaitForDailySubstrateHealthCheck"
+        )
+
+    def test_wait_for_substrate_routes_to_stop_trading_instance(self, states):
+        assert states["WaitForDailySubstrateHealthCheck"]["Next"] == "StopTradingInstance"
+
+
+class TestCatchSemantics:
+    """Substrate failures must NOT halt EOD shutdown.
+
+    Cost-guard requirement: trading EC2 must always stop, regardless of
+    substrate-check outcome. Per-row CloudWatch alarms own paging on
+    row-level failures; the SF Catch only fires on infra-level failures
+    (SSM unreachable, EC2 down). Either way, the failure path must
+    terminate at StopTradingInstance, not HandleFailure.
+    """
+
+    def test_substrate_check_catch_continues_to_stop(self, states):
+        catches = states["DailySubstrateHealthCheck"]["Catch"]
+        assert len(catches) >= 1
+        for c in catches:
+            assert c["Next"] == "StopTradingInstance", (
+                f"Substrate Catch must continue to StopTradingInstance, not "
+                f"{c['Next']!r} — letting the trading EC2 run overnight on a "
+                f"substrate-check infra failure is a cost regression."
+            )
+
+    def test_substrate_wait_catch_continues_to_stop(self, states):
+        catches = states["WaitForDailySubstrateHealthCheck"]["Catch"]
+        assert len(catches) >= 1
+        for c in catches:
+            assert c["Next"] == "StopTradingInstance"
+
+
+class TestCommandShape:
+    """The SSM command must invoke the lib CLI with --cadence daily --alert.
+
+    Drops here would silently neuter the check (e.g. dropping --alert
+    suppresses SNS without changing exit code; dropping --cadence flips
+    to argparse error; flipping to --cadence weekly would re-check the
+    same rows the Sat SF already covers and miss nothing new).
+    """
+
+    @pytest.fixture
+    def commands(self, states) -> list[str]:
+        return states["DailySubstrateHealthCheck"]["Parameters"]["Parameters"]["commands"]
+
+    def test_invokes_transparency_module(self, commands):
+        assert any(
+            "python -m alpha_engine_lib.transparency" in cmd for cmd in commands
+        )
+
+    def test_passes_cadence_daily(self, commands):
+        joined = " ".join(commands)
+        assert "--cadence daily" in joined, (
+            "Daily SF must run --cadence daily; --cadence weekly would "
+            "duplicate the Sat SF coverage and miss the daily-only rows."
+        )
+
+    def test_passes_alert_flag(self, commands):
+        joined = " ".join(commands)
+        assert "--alert" in joined, (
+            "Without --alert, row-level failures emit metrics but no SNS. "
+            "Removing this flag silently degrades the gate."
+        )
+
+    def test_runs_on_dashboard_ec2(self, commands):
+        # The dispatcher EC2 has the lib installed; confirm we cd there.
+        joined = " ".join(commands)
+        assert "alpha-engine-dashboard" in joined
+
+    def test_pulls_latest_dashboard_main_before_running(self, commands):
+        # Stale repo on the dispatcher would run an outdated lib pin.
+        joined = " ".join(commands)
+        assert "git" in joined and "pull" in joined
+
+
+class TestInstanceTargeting:
+    """The substrate state targets the dashboard EC2 (ec2_instance_id),
+    not the trading EC2 (trading_instance_id).
+
+    The trading EC2 doesn't have alpha-engine-dashboard or the lib pin
+    installed; targeting it would fail at the cd step. The dashboard
+    EC2 is the SF dispatcher with the lib installed (same place the
+    Sat SF runs WeeklySubstrateHealthCheck).
+    """
+
+    def test_substrate_check_targets_dashboard_ec2(self, states):
+        params = states["DailySubstrateHealthCheck"]["Parameters"]
+        assert params["InstanceIds.$"] == "$.ec2_instance_id", (
+            "Substrate check must target $.ec2_instance_id (dashboard EC2), "
+            "not $.trading_instance_id (trading EC2 lacks the dashboard repo)."
+        )
+
+    def test_wait_for_substrate_polls_dashboard_ec2(self, states):
+        params = states["WaitForDailySubstrateHealthCheck"]["Parameters"]
+        assert params["InstanceId.$"] == "$.ec2_instance_id[0]"
+
+
+class TestResultPathIsolation:
+    """The substrate state must not stomp on the EOD reconcile result."""
+
+    def test_distinct_result_paths(self, states):
+        eod_path = states["EODReconcile"]["ResultPath"]
+        sub_path = states["DailySubstrateHealthCheck"]["ResultPath"]
+        assert eod_path != sub_path, (
+            "Both states use ssm:sendCommand and need separate ResultPath "
+            "fields so the wait states can resolve the right CommandId."
+        )
+
+    def test_wait_state_reads_substrate_command_id(self, states):
+        params = states["WaitForDailySubstrateHealthCheck"]["Parameters"]
+        # SF Parameters use ``CommandId.$`` (the dot-dollar suffix marks
+        # the value as a JSONPath reference rather than a literal).
+        cmd_id = params["CommandId.$"]
+        assert "substrate_check_result" in cmd_id, (
+            "WaitForDailySubstrateHealthCheck must poll the substrate "
+            "command, not the EOD reconcile command."
+        )
+
+
+class TestStopTradingInstanceUnchanged:
+    """StopTradingInstance must remain a terminal state — no rewiring
+    that defers it past the substrate check or makes it conditional."""
+
+    def test_stop_trading_instance_is_terminal(self, states):
+        # End=True means this state ends the execution (success path).
+        assert states["StopTradingInstance"].get("End") is True, (
+            "StopTradingInstance must remain a terminal End=true state on "
+            "the success path — anything else is a cost-overrun risk."
+        )
