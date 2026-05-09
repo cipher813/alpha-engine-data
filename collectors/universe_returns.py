@@ -2,8 +2,11 @@
 collectors/universe_returns.py — Full-population forward-return tracking.
 
 Uses polygon.io grouped-daily endpoint to fetch OHLCV for the entire US market
-in a single API call per date. Computes 5d/10d forward returns for every ticker,
-SPY benchmark returns, and sector ETF returns for sector-relative analysis.
+in a single API call per date. Computes 5d/10d/21d/30d forward returns for every
+ticker, SPY benchmark returns, and sector ETF returns for sector-relative
+analysis. 21d arithmetic + log-domain columns added 2026-05-09 to align the
+measurement substrate with the predictor's canonical 21d log-domain training
+target (see docs/private/predictor-21d-migration-260509.md).
 
 This is the denominator for all lift calculations in the backtester evaluation
 framework: scanner filter lift, sector team lift, CIO lift, predictor lift,
@@ -16,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 import tempfile
 from datetime import date, timedelta
@@ -56,19 +60,32 @@ CREATE TABLE IF NOT EXISTS universe_returns (
     close_price REAL,
     return_5d REAL,
     return_10d REAL,
+    return_21d REAL,
     return_30d REAL,
     spy_return_5d REAL,
     spy_return_10d REAL,
+    spy_return_21d REAL,
     spy_return_30d REAL,
     beat_spy_5d INTEGER,
     beat_spy_10d INTEGER,
+    beat_spy_21d INTEGER,
     beat_spy_30d INTEGER,
+    log_return_21d REAL,
+    log_spy_return_21d REAL,
     sector_etf TEXT,
     sector_etf_return_5d REAL,
     beat_sector_5d INTEGER,
     UNIQUE(ticker, eval_date)
 )
 """
+
+_NEW_COLUMNS_21D = [
+    ("return_21d", "REAL"),
+    ("spy_return_21d", "REAL"),
+    ("beat_spy_21d", "INTEGER"),
+    ("log_return_21d", "REAL"),
+    ("log_spy_return_21d", "REAL"),
+]
 
 
 def collect(
@@ -121,9 +138,9 @@ def collect(
     sector_map = _load_sector_map(s3, bucket, sector_map_key)
 
     _ensure_table(db_path)
-    existing = _get_existing_dates(db_path)
-
     today = date.today()
+    existing = _get_existing_dates(db_path, today=today)
+
     dates_to_process = _trading_days_to_process(
         today, max_lookback_trading_days, existing
     )
@@ -249,13 +266,22 @@ def _load_sector_map(s3, bucket: str, key: str) -> dict[str, str] | None:
 # -- DB helpers ---------------------------------------------------------------
 
 def _ensure_table(db_path: str) -> None:
-    """Create universe_returns table if it doesn't exist, and add new columns."""
+    """Create universe_returns table if it doesn't exist, and add new columns.
+
+    Idempotent migrations:
+      - 30d columns (older migration; preserved for back-compat with DBs created
+        before 30d was a first-class horizon)
+      - 21d arithmetic + log-domain columns (added 2026-05-09 to align the
+        measurement substrate with the predictor's canonical 21d log target)
+    """
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(_CREATE_TABLE_SQL)
-        # Add 30d columns if they don't exist (migration for existing DBs)
         cols = {r[1] for r in conn.execute("PRAGMA table_info(universe_returns)").fetchall()}
         for col, col_type in [("return_30d", "REAL"), ("spy_return_30d", "REAL"), ("beat_spy_30d", "INTEGER")]:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE universe_returns ADD COLUMN {col} {col_type}")
+        for col, col_type in _NEW_COLUMNS_21D:
             if col not in cols:
                 conn.execute(f"ALTER TABLE universe_returns ADD COLUMN {col} {col_type}")
         conn.commit()
@@ -263,24 +289,42 @@ def _ensure_table(db_path: str) -> None:
         conn.close()
 
 
-def _get_existing_dates(db_path: str) -> set[str]:
-    """Return set of eval_dates that have return_5d fully populated.
+def _get_existing_dates(db_path: str, today: date | None = None) -> set[str]:
+    """Return set of eval_dates with all already-closed forward windows populated.
 
-    A date is considered "existing" only when at least one row has return_5d
-    set. Dates where rows landed but return_5d stayed NULL (e.g. the 5d
-    forward window hadn't closed when the collector ran, and the date was
-    then frozen out by the prior all-dates-in-DB skip) get reprocessed so
-    the returns can be backfilled.
+    A date is "complete" (and therefore safely skippable) when:
+      - return_5d is non-NULL, AND
+      - return_21d is non-NULL OR the 21d forward window has not yet closed.
+
+    Rows where 21d is stale-NULL (window has closed but column was written
+    before this PR landed, or written before the 21d window closed) get
+    re-enqueued so the new 21d arithmetic + log columns can be backfilled
+    on the next run. INSERT OR REPLACE in `_insert_rows` overwrites the
+    full row idempotently — re-fetching polygon prices for the same eval_date
+    yields the same historical close, so the 5d/10d/30d cells are unchanged.
     """
+    today = today or date.today()
     conn = sqlite3.connect(db_path)
     try:
         rows = conn.execute(
-            "SELECT DISTINCT eval_date FROM universe_returns "
-            "WHERE return_5d IS NOT NULL"
+            "SELECT eval_date, "
+            "MAX(CASE WHEN return_5d IS NOT NULL THEN 1 ELSE 0 END), "
+            "MAX(CASE WHEN return_21d IS NOT NULL THEN 1 ELSE 0 END) "
+            "FROM universe_returns GROUP BY eval_date"
         ).fetchall()
-        return {r[0] for r in rows}
     finally:
         conn.close()
+
+    out: set[str] = set()
+    for eval_date_str, has_5d, has_21d in rows:
+        if not has_5d:
+            continue
+        eval_dt = date.fromisoformat(eval_date_str)
+        fwd_21d_closed = _add_trading_days(eval_dt, 21) < today
+        if fwd_21d_closed and not has_21d:
+            continue
+        out.add(eval_date_str)
+    return out
 
 
 def _insert_rows(db_path: str, rows: list[dict]) -> int:
@@ -298,17 +342,20 @@ def _insert_rows(db_path: str, rows: list[dict]) -> int:
             try:
                 conn.execute(
                     "INSERT OR REPLACE INTO universe_returns "
-                    "(ticker, eval_date, sector, close_price, return_5d, return_10d, return_30d, "
-                    "spy_return_5d, spy_return_10d, spy_return_30d, beat_spy_5d, beat_spy_10d, beat_spy_30d, "
+                    "(ticker, eval_date, sector, close_price, "
+                    "return_5d, return_10d, return_21d, return_30d, "
+                    "spy_return_5d, spy_return_10d, spy_return_21d, spy_return_30d, "
+                    "beat_spy_5d, beat_spy_10d, beat_spy_21d, beat_spy_30d, "
+                    "log_return_21d, log_spy_return_21d, "
                     "sector_etf, sector_etf_return_5d, beat_sector_5d) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
-                        row["ticker"], row["eval_date"], row["sector"],
-                        row["close_price"], row["return_5d"], row["return_10d"], row["return_30d"],
-                        row["spy_return_5d"], row["spy_return_10d"], row["spy_return_30d"],
-                        row["beat_spy_5d"], row["beat_spy_10d"], row["beat_spy_30d"],
-                        row["sector_etf"], row["sector_etf_return_5d"],
-                        row["beat_sector_5d"],
+                        row["ticker"], row["eval_date"], row["sector"], row["close_price"],
+                        row["return_5d"], row["return_10d"], row["return_21d"], row["return_30d"],
+                        row["spy_return_5d"], row["spy_return_10d"], row["spy_return_21d"], row["spy_return_30d"],
+                        row["beat_spy_5d"], row["beat_spy_10d"], row["beat_spy_21d"], row["beat_spy_30d"],
+                        row["log_return_21d"], row["log_spy_return_21d"],
+                        row["sector_etf"], row["sector_etf_return_5d"], row["beat_sector_5d"],
                     ),
                 )
                 inserted += 1
@@ -331,6 +378,7 @@ def _build_rows_for_date(
     eval_dt = date.fromisoformat(eval_date)
     fwd_5d = _add_trading_days(eval_dt, 5)
     fwd_10d = _add_trading_days(eval_dt, 10)
+    fwd_21d = _add_trading_days(eval_dt, 21)
     fwd_30d = _add_trading_days(eval_dt, 30)
 
     # Check that forward dates are in the past (returns can be computed)
@@ -340,12 +388,14 @@ def _build_rows_for_date(
         return []
 
     has_10d = fwd_10d < today
+    has_21d = fwd_21d < today
     has_30d = fwd_30d < today
 
     # Fetch grouped-daily prices for eval_date and forward dates
     prices_t0 = polygon_client.get_grouped_daily(eval_date)
     prices_5d = polygon_client.get_grouped_daily(str(fwd_5d))
     prices_10d = polygon_client.get_grouped_daily(str(fwd_10d)) if has_10d else {}
+    prices_21d = polygon_client.get_grouped_daily(str(fwd_21d)) if has_21d else {}
     prices_30d = polygon_client.get_grouped_daily(str(fwd_30d)) if has_30d else {}
 
     if not prices_t0:
@@ -360,11 +410,14 @@ def _build_rows_for_date(
     spy_t0 = prices_t0.get("SPY", {}).get("close")
     spy_5d = prices_5d.get("SPY", {}).get("close")
     spy_10d = prices_10d.get("SPY", {}).get("close") if has_10d else None
+    spy_21d = prices_21d.get("SPY", {}).get("close") if has_21d else None
     spy_30d = prices_30d.get("SPY", {}).get("close") if has_30d else None
 
     spy_ret_5d = _pct_return(spy_t0, spy_5d)
     spy_ret_10d = _pct_return(spy_t0, spy_10d) if has_10d else None
+    spy_ret_21d = _pct_return(spy_t0, spy_21d) if has_21d else None
     spy_ret_30d = _pct_return(spy_t0, spy_30d) if has_30d else None
+    log_spy_ret_21d = _log_return(spy_t0, spy_21d) if has_21d else None
 
     # Sector ETF returns
     sector_etf_returns_5d: dict[str, float | None] = {}
@@ -385,11 +438,14 @@ def _build_rows_for_date(
 
         close_5d = prices_5d.get(ticker, {}).get("close")
         close_10d = prices_10d.get(ticker, {}).get("close") if has_10d else None
+        close_21d = prices_21d.get(ticker, {}).get("close") if has_21d else None
         close_30d = prices_30d.get(ticker, {}).get("close") if has_30d else None
 
         ret_5d = _pct_return(close_t0, close_5d)
         ret_10d = _pct_return(close_t0, close_10d) if has_10d else None
+        ret_21d = _pct_return(close_t0, close_21d) if has_21d else None
         ret_30d = _pct_return(close_t0, close_30d) if has_30d else None
+        log_ret_21d = _log_return(close_t0, close_21d) if has_21d else None
 
         # Sector classification
         sector_etf = sector_map.get(ticker) if sector_map else None
@@ -403,13 +459,18 @@ def _build_rows_for_date(
             "close_price": round(close_t0, 2),
             "return_5d": round(ret_5d, 4) if ret_5d is not None else None,
             "return_10d": round(ret_10d, 4) if ret_10d is not None else None,
+            "return_21d": round(ret_21d, 4) if ret_21d is not None else None,
             "return_30d": round(ret_30d, 4) if ret_30d is not None else None,
             "spy_return_5d": round(spy_ret_5d, 4) if spy_ret_5d is not None else None,
             "spy_return_10d": round(spy_ret_10d, 4) if spy_ret_10d is not None else None,
+            "spy_return_21d": round(spy_ret_21d, 4) if spy_ret_21d is not None else None,
             "spy_return_30d": round(spy_ret_30d, 4) if spy_ret_30d is not None else None,
             "beat_spy_5d": int(ret_5d > spy_ret_5d) if ret_5d is not None and spy_ret_5d is not None else None,
             "beat_spy_10d": int(ret_10d > spy_ret_10d) if ret_10d is not None and spy_ret_10d is not None else None,
+            "beat_spy_21d": int(ret_21d > spy_ret_21d) if ret_21d is not None and spy_ret_21d is not None else None,
             "beat_spy_30d": int(ret_30d > spy_ret_30d) if ret_30d is not None and spy_ret_30d is not None else None,
+            "log_return_21d": round(log_ret_21d, 6) if log_ret_21d is not None else None,
+            "log_spy_return_21d": round(log_spy_ret_21d, 6) if log_spy_ret_21d is not None else None,
             "sector_etf": sector_etf,
             "sector_etf_return_5d": round(etf_ret_5d, 4) if etf_ret_5d is not None else None,
             "beat_sector_5d": int(ret_5d > etf_ret_5d) if ret_5d is not None and etf_ret_5d is not None else None,
@@ -425,3 +486,10 @@ def _pct_return(price_start: float | None, price_end: float | None) -> float | N
     if price_start is None or price_end is None or price_start <= 0:
         return None
     return (price_end / price_start) - 1.0
+
+
+def _log_return(price_start: float | None, price_end: float | None) -> float | None:
+    """Compute log return ln(price_end / price_start). Decimal log-units."""
+    if price_start is None or price_end is None or price_start <= 0 or price_end <= 0:
+        return None
+    return math.log(price_end / price_start)
