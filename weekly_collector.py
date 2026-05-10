@@ -957,6 +957,14 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     logger.info("=" * 60)
     logger.info("MORNING ENRICH: polygon overwrite for %s (prior trading day)", target_date)
     logger.info("=" * 60)
+    # Windowed-reconciliation knobs from config — default window_days=1
+    # preserves legacy single-date overwrite. When set to N > 1, polygon
+    # makes one grouped-daily call per BDay in the window (N total —
+    # bounded by free-tier rate limit). Polygon ignores skip_if_canonical
+    # per option (a): re-overwrites within the window to absorb
+    # corporate-action backfills.
+    window_days = int(daily_cfg.get("window_days", 1))
+    skip_if_canonical = bool(daily_cfg.get("skip_if_canonical", False))
     try:
         dc_result = daily_closes.collect(
             bucket=bucket,
@@ -965,6 +973,8 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
             s3_prefix=daily_cfg.get("s3_prefix", "staging/daily_closes/"),
             dry_run=dry_run,
             source="polygon_only",
+            window_days=window_days,
+            skip_if_canonical=skip_if_canonical,
         )
         results["collectors"]["daily_closes"] = dc_result
     except Exception as e:
@@ -1187,6 +1197,14 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
     logger.info("COLLECTING: daily closes")
     logger.info("=" * 60)
     dc_started_at = datetime.now(timezone.utc)
+    # Windowed-reconciliation knobs from config — default window_days=1
+    # preserves single-date legacy behavior. When N > 1, the EOD yfinance
+    # pass scans the last N BDays, filling NaN cells per the source-
+    # precedence ladder. With skip_if_canonical=true, tickers that
+    # already have an authoritative source skip the yfinance fetch
+    # entirely so the batch cost stays near zero in steady state.
+    window_days = int(daily_cfg.get("window_days", 1))
+    skip_if_canonical = bool(daily_cfg.get("skip_if_canonical", False))
     try:
         # EOD pass uses yfinance_only — polygon free-tier 403's same-day, and
         # silently substituting yfinance was the 2026-04-17 → 2026-04-23 VWAP
@@ -1200,6 +1218,8 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
             s3_prefix=daily_cfg.get("s3_prefix", "staging/daily_closes/"),
             dry_run=dry_run,
             source="yfinance_only",
+            window_days=window_days,
+            skip_if_canonical=skip_if_canonical,
         )
         results["collectors"]["daily_closes"] = dc_result
     except Exception as e:
