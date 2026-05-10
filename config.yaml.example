@@ -36,6 +36,30 @@ signal_returns:
 # 7-day S3 lifecycle expiration; canonical home is ArcticDB universe library)
 daily_closes:
   s3_prefix: staging/daily_closes/
+  # Windowed-data-reconciliation arc (plan doc:
+  # alpha-engine-docs/private/windowed-data-reconciliation-260510.md).
+  # When window_days > 1, both the EOD yfinance pass and the morning
+  # polygon pass scan the last N business days, applying the source-
+  # precedence ladder (NaN < yfinance < polygon) to converge every cell
+  # to its highest-authority source within ≤24h.
+  #
+  # Polygon's free-tier rate limit is honored by-design: one
+  # `grouped-daily` call per date in the window — total `window_days`
+  # polygon calls per morning pass — bounded regardless of universe size.
+  #
+  # `window_days: 1` preserves single-date legacy behavior. Recommended
+  # production default is 14 (two-week recovery horizon for transient
+  # outages); staged rollout flips this AFTER one clean Sat SF + 5 clean
+  # weekday SFs at 14.
+  window_days: 1
+  # Source-precedence-ladder skip optimization. When true, yfinance pass
+  # skips tickers that already have an authoritative source in the
+  # existing parquet (keeps batch cost near zero in steady state).
+  # Polygon pass ignores this flag — always overwrites within the window
+  # so corporate-action backfills are absorbed (option (a) per
+  # 2026-05-10 design discussion). Recommended production: true once
+  # window_days > 1 takes effect.
+  skip_if_canonical: false
 
 # Chronic polygon coverage gaps — tickers polygon does not reliably serve.
 # MorningEnrich's `_self_heal_chronic_polygon_gaps` step yfinance-backfills
