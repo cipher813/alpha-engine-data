@@ -14,6 +14,10 @@ pgvector>=0.2
 voyageai>=0.3
 jsonschema>=4.20
 arcticdb>=6.11
+# Regime substrate (features/regime/) — HMM via hmmlearn, BOCPD uses
+# scipy.stats.t closed-form predictive distribution.
+hmmlearn>=0.3
+scipy>=1.11
 # flow-doctor is pulled in transitively via alpha-engine-lib[flow_doctor].
 # [rag] (added in lib v0.3.0) consolidates psycopg2-binary + pgvector + numpy
 # previously listed above as direct deps; kept those direct lines for now to
