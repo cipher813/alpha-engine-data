@@ -57,7 +57,154 @@ import boto3
 from alpha_engine_lib.secrets import get_secret
 import requests
 
+from validators.price_validator import (
+    ALL_FEATURE_ANOMALY_TYPES,
+    DEFAULT_FEATURE_BLOCK_ANOMALY_TYPES,
+    validate_feature_record,
+)
+
 logger = logging.getLogger(__name__)
+
+
+# ── Write-time value-range gate (ROADMAP L1243, extends #215) ──────────────
+# alternative.collect writes one feature-source JSON per ticker to S3 that
+# bypasses builders/daily_append.py's validate_today_row gate entirely. A
+# corrupt numeric sub-field (a NaN put/call ratio from a 0/0 open-interest
+# divide, a negative analyst price target from a malformed yfinance .info,
+# a negative fund-increasing count) silently degrades the research qual
+# sub-score with no pipeline failure. The per-source ok_ratio gate above
+# only checks *presence* of data, not whether the present values are
+# sane — this gate closes the value-range half.
+#
+# Specs are declared per (source, field). Only numeric, semantically
+# value-constrained fields are listed; free-form / categorical fields
+# (rating string, news article lists) are out of scope for value-range
+# validation. lo/hi bands are deliberately generous — the goal is to
+# catch gross corruption, not to second-guess a legitimately extreme but
+# real metric (gross_outlier warns, never blocks by default).
+_ALT_FIELD_SPECS: dict[str, dict[str, dict]] = {
+    "analyst_consensus": {
+        "target_price": {"nonneg": True, "lo": 0.0, "hi": 1_000_000.0},
+        "num_analysts": {"nonneg": True, "lo": 0.0, "hi": 200.0},
+    },
+    "eps_revision": {
+        # EPS can legitimately be negative (loss-making firms); only flag
+        # absurd magnitudes as a gross outlier.
+        "current_estimate": {"lo": -10_000.0, "hi": 10_000.0},
+        "revision_4w": {"lo": -100_000.0, "hi": 100_000.0},
+    },
+    "options_flow": {
+        "put_call_ratio": {"nonneg": True, "lo": 0.0, "hi": 1_000.0},
+        "iv_rank": {"nonneg": True, "lo": 0.0, "hi": 100.0},
+        "expected_move_pct": {"nonneg": True, "lo": 0.0, "hi": 1_000.0},
+    },
+    "insider_activity": {
+        "net_shares_30d": {"lo": -1e12, "hi": 1e12},
+    },
+    "institutional": {
+        "funds_increasing": {"nonneg": True, "lo": 0.0, "hi": 100_000.0},
+        "funds_decreasing": {"nonneg": True, "lo": 0.0, "hi": 100_000.0},
+    },
+}
+
+
+def _load_alt_block_anomaly_types() -> frozenset[str]:
+    """Read ``ALT_BLOCK_ANOMALY_TYPES`` env var or fall back to defaults.
+
+    Format + validation mirror ``fundamentals._load_fundamentals_block_anomaly_types``
+    and ``daily_append._load_block_anomaly_types``: a JSON list of
+    feature-anomaly type strings; unknown types raise (NoSilentFails).
+    """
+    raw = os.environ.get("ALT_BLOCK_ANOMALY_TYPES", "").strip()
+    if not raw:
+        return DEFAULT_FEATURE_BLOCK_ANOMALY_TYPES
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"ALT_BLOCK_ANOMALY_TYPES is not valid JSON: {exc}. "
+            f"Expected a JSON list of feature-anomaly type strings."
+        ) from exc
+    if not isinstance(parsed, list) or not all(isinstance(x, str) for x in parsed):
+        raise RuntimeError(
+            f"ALT_BLOCK_ANOMALY_TYPES must be a JSON list of strings, "
+            f"got {parsed!r}"
+        )
+    unknown = set(parsed) - ALL_FEATURE_ANOMALY_TYPES
+    if unknown:
+        raise RuntimeError(
+            f"ALT_BLOCK_ANOMALY_TYPES contains unknown anomaly types: "
+            f"{sorted(unknown)}. Known types: "
+            f"{sorted(ALL_FEATURE_ANOMALY_TYPES)}"
+        )
+    return frozenset(parsed)
+
+
+def _validate_alt_payload(
+    payload: dict, ticker: str, block_anomaly_types: frozenset[str]
+) -> tuple[list[dict], list[dict]]:
+    """Run validate_feature_record over each spec'd sub-section of an
+    alternative-data payload.
+
+    Returns ``(blocking, warning)`` anomaly lists (each anomaly dict gains
+    a ``source`` key so the caller can log which sub-section failed).
+    """
+    blocking: list[dict] = []
+    warning: list[dict] = []
+    for source, specs in _ALT_FIELD_SPECS.items():
+        section = payload.get(source)
+        if not isinstance(section, dict):
+            continue
+        qg = validate_feature_record(section, specs, ticker)
+        for a in qg["anomalies"]:
+            a = {**a, "source": source}
+            if a["type"] in block_anomaly_types:
+                blocking.append(a)
+            else:
+                warning.append(a)
+    return blocking, warning
+
+
+def _emit_quality_gate_metrics(
+    counts_by_type: dict[str, int], n_blocked: int, n_warned: int
+) -> None:
+    """Emit ``AlphaEngine/Data/alternative_quality_*`` gauges.
+
+    Best-effort: CloudWatch errors WARN but don't fail the collector.
+    Mirrors ``builders.daily_append._emit_quality_gate_metrics`` and
+    ``fundamentals._emit_quality_gate_metrics``.
+    """
+    if not counts_by_type and n_blocked == 0 and n_warned == 0:
+        return
+    try:
+        cw = boto3.client("cloudwatch")
+        metric_data: list[dict] = [
+            {
+                "MetricName": "alternative_quality_blocked_count",
+                "Value": float(n_blocked),
+                "Unit": "Count",
+            },
+            {
+                "MetricName": "alternative_quality_warned_count",
+                "Value": float(n_warned),
+                "Unit": "Count",
+            },
+        ]
+        for atype, count in counts_by_type.items():
+            metric_data.append({
+                "MetricName": "alternative_quality_anomaly_count",
+                "Dimensions": [{"Name": "anomaly_type", "Value": atype}],
+                "Value": float(count),
+                "Unit": "Count",
+            })
+        cw.put_metric_data(Namespace="AlphaEngine/Data", MetricData=metric_data)
+    except Exception as exc:
+        logger.warning(
+            "CloudWatch alternative_quality_* metric failed: %s. Not "
+            "blocking — the per-anomaly logger.error calls are the "
+            "load-bearing Flow Doctor surface.",
+            exc,
+        )
 
 
 # ── Per-source populated-ratio gate ──────────────────────────────────────────
@@ -295,9 +442,18 @@ def collect(
             "ticker_list": tickers[:10],
         }
 
+    # Read ALT_BLOCK_ANOMALY_TYPES once per run (raises on malformed env —
+    # fail fast before fetching).
+    block_anomaly_types = _load_alt_block_anomaly_types()
+
     succeeded = 0
     failed = 0
     errors = []
+    # Write-time value-range gate accounting (parallels daily_append +
+    # fundamentals).
+    n_quality_blocked = 0
+    n_quality_warned = 0
+    quality_counts_by_type: dict[str, int] = {}
     # Per-source populated counts. Increment only when the source for
     # this ticker carried real (non-default) data — see _HAS_DATA_PREDICATES
     # commentary above for the silent-fail surface this protects against.
@@ -311,6 +467,49 @@ def collect(
     for ticker in tickers:
         try:
             data = _fetch_all_alternative(ticker, run_date, bucket)
+            # ── Write-time value-range gate ─────────────────────────────
+            # Runs on the assembled per-ticker payload before the S3
+            # write. A block-severity anomaly (NaN/inf or
+            # negative-where-impossible in a numeric feature sub-field)
+            # refuses the whole ticker write — a corrupt sub-section would
+            # otherwise silently degrade the research qual sub-score. The
+            # ticker is then accounted exactly like a fetch failure so the
+            # existing failed/errors + ok_ratio machinery surfaces it.
+            blocking, warning = _validate_alt_payload(
+                data, ticker, block_anomaly_types
+            )
+            if blocking:
+                for a in blocking:
+                    # logger.error so FlowDoctorHandler picks it up.
+                    logger.error(
+                        "Alternative quality gate BLOCK %s.%s.%s: %s",
+                        ticker, a["source"], a["type"], a["detail"],
+                    )
+                    quality_counts_by_type[a["type"]] = (
+                        quality_counts_by_type.get(a["type"], 0) + 1
+                    )
+                n_quality_blocked += 1
+                failed += 1
+                errors.append({
+                    "ticker": ticker,
+                    "error": (
+                        "value-range gate blocked: "
+                        + "; ".join(
+                            f"{a['source']}.{a['type']}" for a in blocking
+                        )
+                    ),
+                })
+                continue
+            if warning:
+                for a in warning:
+                    logger.warning(
+                        "Alternative quality gate WARN %s.%s.%s: %s",
+                        ticker, a["source"], a["type"], a["detail"],
+                    )
+                    quality_counts_by_type[a["type"]] = (
+                        quality_counts_by_type.get(a["type"], 0) + 1
+                    )
+                n_quality_warned += 1
             key = f"{s3_prefix}weekly/{run_date}/alternative/{ticker}.json"
             s3.put_object(
                 Bucket=bucket,
@@ -328,6 +527,21 @@ def collect(
             failed += 1
             errors.append({"ticker": ticker, "error": str(e)})
             logger.warning("Alternative data failed for %s: %s", ticker, e)
+
+    if n_quality_blocked or n_quality_warned:
+        logger.info(
+            "Alternative quality gate: %d blocked, %d warned, counts=%s",
+            n_quality_blocked, n_quality_warned, quality_counts_by_type,
+        )
+    _emit_quality_gate_metrics(
+        quality_counts_by_type, n_quality_blocked, n_quality_warned
+    )
+    _quality_fields = {
+        "tickers_quality_blocked": n_quality_blocked,
+        "tickers_quality_warned": n_quality_warned,
+        "quality_anomaly_counts": quality_counts_by_type,
+        "quality_block_anomaly_types": sorted(block_anomaly_types),
+    }
 
     # ── Per-source ok_ratio gate ────────────────────────────────────────────
     # Mirrors `fundamentals.py::_MIN_OK_RATIO` and
@@ -385,6 +599,7 @@ def collect(
         "source_ok_ratios": {k: round(v, 4) for k, v in source_ratios.items()},
         "source_min_ok_ratios": min_ok_ratios,
         "errors": errors[:20],
+        **_quality_fields,
     }
     manifest_key = f"{s3_prefix}weekly/{run_date}/alternative/manifest.json"
     s3.put_object(
@@ -420,6 +635,7 @@ def collect(
             "source_min_ok_ratios": min_ok_ratios,
             "breached_sources": [src for src, _, _ in breached],
             "errors": errors[:20],
+            **_quality_fields,
         }
 
     status = "ok" if failed == 0 else "partial"
@@ -436,6 +652,7 @@ def collect(
         "source_ok_ratios": {k: round(v, 4) for k, v in source_ratios.items()},
         "source_min_ok_ratios": min_ok_ratios,
         "errors": errors[:20],
+        **_quality_fields,
     }
 
 
