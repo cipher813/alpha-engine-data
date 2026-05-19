@@ -74,6 +74,9 @@ setup_logging(
 )
 
 from collectors import constituents, prices, slim_cache, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest
+from builders._price_cache_writeboth import (
+    price_cache_write_prefixes as _price_cache_write_prefixes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -645,7 +648,9 @@ def _self_heal_chronic_polygon_gaps(
          after the first heal lands).
       3. Else yfinance-fetch ``[last_date+1, target_date]`` OHLCV.
       4. Append the new rows to ``predictor/price_cache/{ticker}.parquet``
-         (dedupe by date keep="last" so repeated heals are idempotent).
+         (dedupe by date keep="last" so repeated heals are idempotent). Wave 3
+         PR1 mirrors the put to ``reference/price_cache/{ticker}.parquet`` via
+         the ``_price_cache_write_prefixes`` helper.
       5. Invoke ``builders.backfill(ticker_filter=ticker)`` — reuses the
          per-ticker compute_features + ArcticDB write path so the new
          rows get the same feature schema as every other ticker.
@@ -733,6 +738,10 @@ def _self_heal_chronic_polygon_gaps(
             ohlcv_cols = ["Open", "High", "Low", "Close", "Volume"]
             new_rows = yf_df[[c for c in ohlcv_cols if c in yf_df.columns]].copy()
 
+            # Wave 3 PR1: read from legacy (single source of truth during the
+            # write-both soak — readers haven't migrated yet); write to both
+            # legacy + new prefix on the put back (see
+            # builders/_price_cache_writeboth.py for soak contract)
             pcache_key = f"predictor/price_cache/{ticker}.parquet"
             try:
                 obj = s3.get_object(Bucket=bucket, Key=pcache_key)
@@ -748,8 +757,11 @@ def _self_heal_chronic_polygon_gaps(
             if not dry_run:
                 buf = _io.BytesIO()
                 combined_pcache.to_parquet(buf, engine="pyarrow", compression="snappy")
-                buf.seek(0)
-                s3.put_object(Bucket=bucket, Key=pcache_key, Body=buf.getvalue())
+                body = buf.getvalue()
+                for _prefix in _price_cache_write_prefixes():
+                    s3.put_object(
+                        Bucket=bucket, Key=f"{_prefix}{ticker}.parquet", Body=body
+                    )
 
                 from builders.backfill import backfill as _backfill
                 _backfill(bucket=bucket, ticker_filter=ticker, dry_run=False)

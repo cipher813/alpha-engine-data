@@ -28,6 +28,8 @@ import boto3
 import pandas as pd
 import yfinance as yf
 
+from builders._price_cache_writeboth import price_cache_write_prefixes
+
 logger = logging.getLogger(__name__)
 
 # Tickers that require a leading caret in yfinance (not available on polygon)
@@ -218,10 +220,13 @@ def _refresh_stale(
                     new_df.index = idx
                     new_df = new_df.sort_index()
 
-                    # Write locally and upload
+                    # Write locally and upload (Wave 3 PR1: write-both to legacy
+                    # ``predictor/price_cache/`` + new ``reference/price_cache/``;
+                    # see builders/_price_cache_writeboth.py for soak contract)
                     parquet_path = local_dir / f"{ticker}.parquet"
                     new_df.to_parquet(parquet_path, engine="pyarrow", compression="snappy")
-                    s3.upload_file(str(parquet_path), bucket, f"{s3_prefix}{ticker}.parquet")
+                    for prefix in price_cache_write_prefixes(s3_prefix):
+                        s3.upload_file(str(parquet_path), bucket, f"{prefix}{ticker}.parquet")
                     refreshed += 1
 
                 except Exception as e:
