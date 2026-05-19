@@ -273,6 +273,9 @@ class TestBackfillToS3:
         assert result["per_ticker"]["HYOAS"]["status"] == "ok"
 
     def test_uploads_to_s3_when_not_dry_run(self):
+        """Wave 3 PR1: each FRED-sourced ticker writes to BOTH legacy
+        (``predictor/price_cache/``) and new (``reference/price_cache/``)
+        prefixes. PR4 cutover will flip this back to a single key."""
         with self._patch_fetch_returning(), \
              patch("collectors.fred_history.boto3.client") as mock_boto:
             mock_s3 = MagicMock()
@@ -283,8 +286,17 @@ class TestBackfillToS3:
                 dry_run=False,
             )
         assert result["dry_run"] is False
-        # upload_file called with (local_path, bucket, key)
-        assert mock_s3.upload_file.called
-        call = mock_s3.upload_file.call_args
-        assert call[0][1] == "test-bucket"
-        assert call[0][2] == "predictor/price_cache/TWO.parquet"
+        # upload_file called twice — once per write-both prefix
+        assert mock_s3.upload_file.call_count == 2
+        keys = sorted(
+            call.args[2] for call in mock_s3.upload_file.call_args_list
+        )
+        assert keys == [
+            "predictor/price_cache/TWO.parquet",
+            "reference/price_cache/TWO.parquet",
+        ]
+        # Both writes hit the same bucket + same local file
+        buckets = {call.args[1] for call in mock_s3.upload_file.call_args_list}
+        assert buckets == {"test-bucket"}
+        local_paths = {call.args[0] for call in mock_s3.upload_file.call_args_list}
+        assert len(local_paths) == 1  # same local parquet body for both uploads

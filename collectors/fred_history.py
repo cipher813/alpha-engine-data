@@ -34,6 +34,8 @@ import boto3
 import pandas as pd
 import requests
 
+from builders._price_cache_writeboth import price_cache_write_prefixes
+
 logger = logging.getLogger(__name__)
 
 _FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
@@ -247,16 +249,20 @@ def backfill_to_s3(
                     "last_date": ohlcv.index.max().date().isoformat(),
                 }
                 if not dry_run:
-                    s3.upload_file(
-                        str(parquet_path),
-                        bucket,
-                        f"{s3_prefix}{ticker}.parquet",
-                    )
-                    logger.info(
-                        "Uploaded s3://%s/%s%s.parquet (%d rows, %s → %s)",
-                        bucket, s3_prefix, ticker, len(ohlcv),
-                        results[ticker]["first_date"], results[ticker]["last_date"],
-                    )
+                    # Wave 3 PR1: write-both to legacy ``predictor/price_cache/``
+                    # + new ``reference/price_cache/`` (see
+                    # builders/_price_cache_writeboth.py for soak contract)
+                    for prefix in price_cache_write_prefixes(s3_prefix):
+                        s3.upload_file(
+                            str(parquet_path),
+                            bucket,
+                            f"{prefix}{ticker}.parquet",
+                        )
+                        logger.info(
+                            "Uploaded s3://%s/%s%s.parquet (%d rows, %s → %s)",
+                            bucket, prefix, ticker, len(ohlcv),
+                            results[ticker]["first_date"], results[ticker]["last_date"],
+                        )
             except Exception as e:
                 logger.error("Backfill failed for %s (%s): %s", ticker, series_id, e)
                 results[ticker] = {"status": "error", "error": str(e)}

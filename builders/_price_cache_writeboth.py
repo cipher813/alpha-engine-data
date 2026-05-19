@@ -1,0 +1,69 @@
+"""Wave 3 PR1 — additive write-both helper for the price_cache prefix migration.
+
+ROADMAP P1 "`predictor/` S3 namespace rationalization Wave 3": migrate the 10y
+``predictor/price_cache/*.parquet`` tree to ``reference/price_cache/`` so the
+``predictor/`` namespace ends up owning ONLY predictor-module outputs
+(``weights/``, ``predictions/``, ``metrics/``) and ``reference/`` collects
+long-lived data-module references. Mirrors the Wave 1 ``predictor/daily_closes/``
+→ ``staging/daily_closes/`` arc but uses write-both + soak (instead of Wave 1's
+hard cutover) because this writer rewrites only STALE tickers — a hard cut
+would leave fresh tickers in legacy and the new prefix incomplete for an
+entire yfinance refresh cycle. CLAUDE.md S3 Contract Safety mandates the
+write-both for any path change.
+
+Soak contract:
+    Wave 3 PR1 (this PR) → both prefixes written, every reader stays on legacy.
+    ≥1 week soak after PR1's first Saturday SF lands writes to both prefixes.
+    Wave 3 PR3+ → reader migrations with legacy fallback in 4 repos.
+    Wave 3 PR4 (cutover) → swap primary to ``reference/``, drop legacy from this
+        helper's return list, retire fallbacks, ``aws s3 rm`` legacy prefix.
+
+The helper is the single chokepoint for write-both — three writers call into
+it (``collectors/prices.py`` yfinance refresh, ``collectors/fred_history.py``
+FRED backfill, ``weekly_collector.py`` chronic-gap self-heal patch). Adding
+a future writer requires no per-call-site discipline beyond wrapping the
+upload in ``for prefix in price_cache_write_prefixes(s3_prefix): ...``.
+"""
+
+from __future__ import annotations
+
+# Wave 3 PR1 — legacy primary, new mirror. The cutover PR (Wave 3 PR4) flips
+# ``PRICE_CACHE_NEW_PREFIX`` to first position and removes the legacy entry
+# from ``price_cache_write_prefixes`` (one-line edit at that time).
+PRICE_CACHE_LEGACY_PREFIX = "predictor/price_cache/"
+PRICE_CACHE_NEW_PREFIX = "reference/price_cache/"
+
+
+def price_cache_write_prefixes(primary: str = PRICE_CACHE_LEGACY_PREFIX) -> list[str]:
+    """Return the active write prefixes for ticker parquet uploads.
+
+    During the Wave 3 write-both soak (this PR through Wave 3 PR4 cutover):
+
+      * ``primary == "predictor/price_cache/"`` (the production default) →
+        ``["predictor/price_cache/", "reference/price_cache/"]`` — every
+        ticker-parquet write hits both prefixes byte-for-byte.
+      * ``primary`` is any other string (custom prefix from a test or a
+        config override) → ``[primary]`` — single-write fallback. Tests
+        that need to assert a single-prefix write pass an explicit custom
+        prefix; production paths use the default and get write-both.
+
+    Callers wrap their upload in::
+
+        for prefix in price_cache_write_prefixes(s3_prefix):
+            s3.upload_file(local_path, bucket, f"{prefix}{ticker}.parquet")
+
+    The order is deterministic (legacy first, new second) so a fail-fast
+    upload error on the legacy prefix preserves the existing pre-Wave-3
+    failure semantics — the new prefix never silently masks a legacy
+    write failure.
+    """
+    if primary == PRICE_CACHE_LEGACY_PREFIX:
+        return [PRICE_CACHE_LEGACY_PREFIX, PRICE_CACHE_NEW_PREFIX]
+    return [primary]
+
+
+__all__ = [
+    "PRICE_CACHE_LEGACY_PREFIX",
+    "PRICE_CACHE_NEW_PREFIX",
+    "price_cache_write_prefixes",
+]
