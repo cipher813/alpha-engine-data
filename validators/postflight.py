@@ -59,11 +59,18 @@ _UNIVERSE_SAMPLE_SIZE = 20
 # >2d tolerates weekend-adjacent partial writes but catches genuine staleness.
 _UNIVERSE_MAX_STALE_VS_SPY_DAYS = 2
 
-# Minimum SPY freshness: last row must be ≥ run_date - 1 calendar day.
-# DataPhase1 for run_date=<Saturday> expects SPY to have <Friday>'s close,
-# which is run_date - 1 calendar day. Tighter than the preflight check that
-# tolerates weekend runs (Saturday 00:00 UTC ≈ Friday 5-8 PM PT).
-_MACRO_SPY_MAX_STALE_DAYS = 1
+# Minimum SPY freshness: last row must be ≥ the last closed trading day for
+# run_date. The check is in *trading days*, not calendar days — the predicate
+# being verified is "does SPY carry the most recent close that exists?", which
+# is independent of which day of the week the SF runs.
+#
+# Previously this was calendar-day arithmetic with a 1-day tolerance, tuned
+# specifically for the Saturday 09:00 UTC cadence (Friday close + 1 calendar
+# day = Saturday). That formulation passed on Saturday but tripped on every
+# post-Saturday redrive (Sunday → Friday is +2 calendar days, still 0 trading
+# days). The 2026-05-24 recovery attempt blocked here despite ArcticDB
+# carrying the correct close — see ROADMAP/postflight-trading-day-aware-260524.
+_MACRO_SPY_MAX_STALE_TRADING_DAYS = 0
 
 # Minimum constituent count for a valid constituents.json payload.
 # Matches research's ``fetch_sp500_sp400_with_sectors`` contract
@@ -135,9 +142,17 @@ class DataPostflight:
     def _check_macro_spy_fresh(self) -> None:
         """Consumer: predictor ``_verify_arctic_fresh``.
 
-        SPY lives in the ArcticDB macro library. For a Saturday run_date, SPY's
-        last row must be ≥ run_date - 1 (= the prior Friday's close).
+        SPY lives in the ArcticDB macro library. Its last row must carry the
+        most recent NYSE close that exists as of ``run_date``. We resolve that
+        reference via ``alpha_engine_lib.dates.last_closed_trading_day`` —
+        Friday on Saturday/Sunday/holiday-Monday, the day's own date once that
+        day's close has settled. The check is binary in *trading days*, not
+        calendar days: a redrive on Sunday 5/24 against macro.SPY last_date=
+        Friday 5/22 is 2 calendar days but 0 trading days stale, and must pass.
         """
+        from datetime import datetime, time, timezone
+        from alpha_engine_lib.dates import last_closed_trading_day
+
         _, macro_lib = self._open_arctic_libs()
         try:
             df = macro_lib.read("SPY", columns=["Close"]).data
@@ -155,19 +170,33 @@ class DataPostflight:
         last_ts = pd.Timestamp(df.index[-1])
         if last_ts.tzinfo is not None:
             last_ts = last_ts.tz_convert("UTC").tz_localize(None)
-        last_date = last_ts.normalize()
-        expected = pd.Timestamp(self.run_date).normalize()
-        stale_days = (expected - last_date).days
-        if stale_days > _MACRO_SPY_MAX_STALE_DAYS:
+        last_date = last_ts.normalize().date()
+
+        # Reference = the last NYSE close that exists as of run_date. Anchor at
+        # 23:00 UTC of the run_date so the resolver sees that day's close as
+        # settled if run_date is itself a trading day. Holiday-aware via the
+        # NYSE calendar baked into alpha_engine_lib.dates.
+        run_date_obj = datetime.strptime(self.run_date, "%Y-%m-%d").date()
+        run_date_anchor = datetime.combine(
+            run_date_obj, time(23, 0), tzinfo=timezone.utc,
+        )
+        expected_last_close = last_closed_trading_day(run_date_anchor)
+
+        if last_date < expected_last_close:
+            calendar_days = (expected_last_close - last_date).days
             raise PostflightError(
-                f"ArcticDB macro.SPY last_date={last_date.date()} is "
-                f"{stale_days}d stale for run_date={expected.date()} "
-                f"(>{_MACRO_SPY_MAX_STALE_DAYS}d threshold). Predictor's "
-                f"_verify_arctic_fresh will reject this."
+                f"ArcticDB macro.SPY last_date={last_date} is behind the "
+                f"expected last close {expected_last_close} for "
+                f"run_date={run_date_obj} ({calendar_days} calendar-day(s) "
+                f"behind, ≥1 trading-day; threshold is "
+                f"{_MACRO_SPY_MAX_STALE_TRADING_DAYS} trading-day(s)). "
+                f"Predictor's _verify_arctic_fresh will reject this."
             )
         log.info(
-            "postflight: ArcticDB macro.SPY last_date=%s (%dd ≤ %dd)",
-            last_date.date(), stale_days, _MACRO_SPY_MAX_STALE_DAYS,
+            "postflight: ArcticDB macro.SPY last_date=%s ≥ expected last close %s "
+            "(0 trading-day(s) stale ≤ %d threshold)",
+            last_date, expected_last_close,
+            _MACRO_SPY_MAX_STALE_TRADING_DAYS,
         )
 
     def _check_universe_sample_fresh(self) -> None:
