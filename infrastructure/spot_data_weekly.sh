@@ -306,6 +306,15 @@ done
 # substrate weakness) is handled inside the lib — first ~60s after
 # SendCommand maps to "Pending" status; later occurrences are terminal
 # failure.
+#
+# L394 cascade: --diagnostics-bucket + --diagnostics-prefix activate the
+# lib v0.39.0 chokepoint that writes a JSON failure record (status +
+# command_id + 4KB stdout/stderr tails + instance_id) to
+# s3://${S3_BUCKET}/_spot_diagnostics/ae-data/{YYYY-MM-DD}.json on
+# terminal non-Success (Failed / TimedOut / Cancelled / Cancelling /
+# TerminalError). Best-effort write inside the lib — S3 failure is
+# swallowed; the inner SSM exit code is preserved. No-op on Success
+# (substrate is failure-only).
 run_ssm() {
     local description="$1" timeout_s="${2:-3600}"
     "$LIB_PYTHON" -m alpha_engine_lib.ssm_dispatcher run \
@@ -315,6 +324,8 @@ run_ssm() {
         --output-bucket "$S3_BUCKET" \
         --output-key-prefix "${S3_STAGING_PREFIX}/ssm-output" \
         --region "$AWS_REGION" \
+        --diagnostics-bucket "$S3_BUCKET" \
+        --diagnostics-prefix "_spot_diagnostics/ae-data" \
         --script-stdin
 }
 

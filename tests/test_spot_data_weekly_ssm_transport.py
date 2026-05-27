@@ -154,6 +154,39 @@ def test_uses_lib_ssm_dispatcher_chokepoint():
     )
 
 
+def test_run_ssm_passes_diagnostics_flags():
+    """L394 cascade — ``run_ssm`` MUST pass both ``--diagnostics-bucket``
+    and ``--diagnostics-prefix`` so terminal non-Success in any spot
+    SSM step writes a JSON failure record to
+    ``s3://${S3_BUCKET}/_spot_diagnostics/ae-data/{date}.json`` per the
+    lib v0.39.0 contract. Both flags must be present — lib's partial-
+    config guard makes a missing flag a silent no-op (the worst
+    failure mode: future grep for "did diagnostics fire?" returns
+    empty even though the cron hit a real failure)."""
+    body = _SCRIPT.read_text()
+    assert "--diagnostics-bucket" in body, (
+        "spot_data_weekly.sh does not pass --diagnostics-bucket to the "
+        "lib CLI. L394 cascade requires both --diagnostics-bucket and "
+        "--diagnostics-prefix together; without --diagnostics-bucket "
+        "the lib's partial-config guard makes the diagnostics-write a "
+        "silent no-op even on terminal non-Success."
+    )
+    assert "--diagnostics-prefix" in body, (
+        "spot_data_weekly.sh does not pass --diagnostics-prefix to the "
+        "lib CLI."
+    )
+    # Prefix MUST scope to ae-data so cascade B (ae-backtester) and
+    # cascade C (ae-predictor) write to non-overlapping S3 namespaces —
+    # multi-failure-per-day per-prefix would otherwise clobber.
+    assert "_spot_diagnostics/ae-data" in body, (
+        "spot_data_weekly.sh --diagnostics-prefix must scope to "
+        "_spot_diagnostics/ae-data so ae-backtester / ae-predictor "
+        "cascade siblings write to disjoint S3 namespaces. The current "
+        "{date}.json key shape overwrites within a prefix; the per-repo "
+        "subprefix is the multi-cascade discriminator."
+    )
+
+
 def test_no_inline_aws_ssm_send_command():
     """The script MUST NOT call ``aws ssm send-command`` directly — that
     bypasses the lib chokepoint and reverts to the pre-lift
