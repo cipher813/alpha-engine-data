@@ -99,6 +99,7 @@ DEMAND_GATE_ENABLED = os.environ.get("GROOM_DEMAND_GATE_ENABLED", "true").lower(
 BACKLOG_REPOS = (
     "nousergon/alpha-engine-config", "nousergon/metron-ops",
     "nousergon/vires-ops", "nousergon/telos-ops",
+    "nousergon/nousergon-security",
 )
 _RESEARCH_BUCKET = "alpha-engine-research"
 
