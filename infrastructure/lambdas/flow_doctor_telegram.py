@@ -151,22 +151,26 @@ def notify_via_flow_doctor(
     flow_name: str,
     topics: Sequence[Any],
     db_basename: str,
+    source: Optional[str] = None,
     context: Optional[Dict[str, Any]] = None,
     silent_topic: Any | None = None,
-    source: Optional[str] = None,
 ) -> bool:
     """Route ``text`` through flow-doctor forum topics; fallback to ``send_message``.
-
-    :param source: Overseer intake bus attribution for the resulting alert
-        event's ``detail.source`` — should match whatever this Lambda's other
-        notification path (e.g. an ``alerts.publish(source=...)`` bus call) or
-        its registered ``playbooks.yaml`` ``alert_classes`` row already uses.
-        ``None`` (default) preserves the pre-fix behavior: attribution falls
-        back to ``KREPIS_EVENT_SOURCE`` env or the Lambda's runtime
-        ``AWS_LAMBDA_FUNCTION_NAME`` identity, which is exactly the
-        config-I3513 drift — every in-repo caller should pass this
-        explicitly; the default exists only for backward compat with any
-        caller not yet migrated.
+    Args:
+        text: Notification body text.
+        silent: If True, send with notifications suppressed (Telegram silent).
+        severity: One of ``critical``, ``error``, ``warning``, ``info``.
+        dedup_key: Stable dedup key for cross-invocation cooldown.
+        flow_name: Flow doctor flow name.
+        topics: Telegram topic routing.
+        db_basename: Flow doctor store basename.
+        source: Explicit event source override. When set, ``KREPIS_EVENT_SOURCE``
+            is temporarily scoped so ``emit_alert_event``'s ``_resolve_source``
+            picks it up instead of falling through to ``AWS_LAMBDA_FUNCTION_NAME``.
+            If omitted, the caller's Lambda function name is used (the default
+            krepis behavior).
+        context: Arbitrary key-value metadata.
+        silent_topic: Optional topic for silent notifications when ``silent`` is True.
     """
     owner_repo = (context or {}).get("owner_repo")
     if owner_repo in TEST_NAMESPACE_OWNER_REPOS:
