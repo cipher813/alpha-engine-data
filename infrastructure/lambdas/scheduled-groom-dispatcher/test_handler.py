@@ -436,14 +436,14 @@ def test_gated_reverify_schedule_forwards_filter(monkeypatch):
 
 
 def test_missing_model_and_issue_filter_default_to_mid_queue(monkeypatch):
-    # Schedules with no model/issue_filter must default to Sonnet / mid-only.
+    # Schedules with no model/issue_filter must default to DeepSeek / mid-only.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
     g = out["groom"]
-    assert g["model"] == "claude-sonnet-5"
+    assert g["model"] == "deepseek-v4-pro"
     assert g["issue_filter"] == "mid-only"
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
-    assert "export GROOM_MODEL=claude-sonnet-5" in cmd
+    assert "export GROOM_MODEL=deepseek-v4-pro" in cmd
     assert "export GROOM_ISSUE_FILTER=mid-only" in cmd
 
 
@@ -473,10 +473,10 @@ def test_malformed_model_falls_back_to_default(monkeypatch):
     # than embedded into the SSM command (defense-in-depth allowlist).
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler({"run_mode": "full", "model": "claude; rm -rf /"}, None)
-    assert out["groom"]["model"] == "claude-sonnet-5"
+    assert out["groom"]["model"] == "deepseek-v4-pro"
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
     assert "claude; rm -rf /" not in cmd
-    assert "export GROOM_MODEL=claude-sonnet-5" in cmd
+    assert "export GROOM_MODEL=deepseek-v4-pro" in cmd
 
 
 def test_soft_limit_min_override_forwarded_for_bounded_test(monkeypatch):
