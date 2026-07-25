@@ -387,7 +387,7 @@
         "Payload": {
           "run_mode": "sweep",
           "launch_decided": true,
-          "model": "claude-haiku-4-5",
+          "model": "deepseek-v4-flash",
           "issue_filter": "mid-only",
           "schedule": "end-of-sf-sweep"
         }
