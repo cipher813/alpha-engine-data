@@ -86,20 +86,32 @@ BACKSTOP_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:${BACKSTOP_TOPIC_NAME}"
 # alerts topic (Phase B "watch-the-watchers", config#1273) — that alarm stays;
 # it does not satisfy the independent-backstop-topic argument this script
 # exists for (see header), so both alarms are intentional, not duplicative.
+# arctic-migration-dispatcher added alpha-engine-config-I3242 (merge-triggered
+# in-region ArcticDB migration runner) — onboarded in the SAME PR that ships
+# it, per this file's own header convention. (Comment kept OUT of the array
+# literal below so the tests/test_watch_plane_alarms_script.py block-parser
+# isn't confused by a stray `)` inside the block.)
+# ci-watch-liveness-probe / alert-drain-liveness-probe added config#3173
+# (mid-run spot-reclaim checkers for the ci-watch and alert-drain families,
+# mirroring sf-watch-liveness-probe's config#2270 mechanism) — onboarded in
+# the SAME PR that ships them, per this file's own header convention.
 declare -A WATCH_PLANE_FUNCTIONS=(
   ["saturday-sf-watch-dispatcher"]="alpha-engine-saturday-sf-watch-dispatcher"
   ["sf-watch-spot-dispatcher"]="alpha-engine-sf-watch-spot-dispatcher"
   ["ci-watch-dispatcher"]="alpha-engine-ci-watch-dispatcher"
+  ["ci-watch-liveness-probe"]="alpha-engine-ci-watch-liveness-probe"
   ["sf-watch-liveness-probe"]="alpha-engine-sf-watch-liveness-probe"
   ["overseer-liveness-probe"]="alpha-engine-overseer-liveness-probe"
   ["overseer-dispatcher"]="alpha-engine-overseer-dispatcher"
   ["alert-drain-dispatcher"]="alpha-engine-alert-drain-dispatcher"
+  ["alert-drain-liveness-probe"]="alpha-engine-alert-drain-liveness-probe"
   ["substrate-health-gate"]="alpha-engine-substrate-health-gate"
   ["pipeline-watchdog"]="alpha-engine-pipeline-watchdog"
   ["canary-replay-liveness-probe"]="alpha-engine-canary-replay-liveness-probe"
   ["saturday-integrity-sentinel"]="alpha-engine-saturday-integrity-sentinel"
   ["freshness-monitor"]="alpha-engine-freshness-monitor"
   ["sweep-artifact-monitor"]="alpha-engine-sweep-artifact-monitor"
+  ["arctic-migration-dispatcher"]="alpha-engine-arctic-migration-dispatcher"
 )
 
 echo "Configuring watch-plane Lambda alarms"

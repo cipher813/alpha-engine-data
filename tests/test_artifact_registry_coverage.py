@@ -104,6 +104,16 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # here only to force operator review of the new PUT site.
     "builders/migrate_universe_crsp_basis.py": 1,
     "builders/migrate_universe_feature_order.py": 1,
+    # overseer/_control/completed/arctic-migration-<head>.json — the migration
+    # runner's per-run completion marker (alpha-engine-config-I3242). Like the
+    # alert-drain/sf-watch completion markers it mirrors (also unregistered),
+    # this is an EVENT-DRIVEN dispatch-control artifact (written once per
+    # merge-triggered migration run), NOT a periodic freshness-SLA artifact —
+    # ARTIFACT_REGISTRY.yaml carries only cadence/SLA rows, so like the
+    # migrate_universe_* audit PUTs above it is grandfathered out of the
+    # registry and pinned here only to force operator review of any new PUT
+    # site in the runner.
+    "scripts/run_arctic_migrations.py": 1,
     "builders/migrate_universe_vwap.py": 1,
     "builders/prune_delisted_tickers.py": 1,
     # builders/backfill_delisted_audit/{date}-{HHMMSSZ}.json — per-run audit record for
@@ -127,7 +137,15 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # a consumer exists, so grandfathered out of ARTIFACT_REGISTRY.yaml (see
     # alpha-engine-config private-docs/ARTIFACT_REGISTRY.yaml grandfathered_paths)
     # rather than registered with a speculative cadence/SLA.
-    "collectors/constituents.py": 3,
+    #
+    # 4th PUT site (config#934): data/sub_sector_etf_map.json +
+    # reference/price_cache/sub_sector_etf_map.json — ticker → sub-sector
+    # benchmark ETF (defaulting to the sector ETF), consumed by
+    # feature_engineer's sub_sector_vs_benchmark_* features. Same dual-path
+    # loop as the two maps above (1 new put_object call site, textually). The
+    # two new S3 paths still need an ARTIFACT_REGISTRY.yaml grandfather —
+    # companion config PR, same as config#2020 did for sub_industry_map.
+    "collectors/constituents.py": 4,
     # crypto/holdings.json — Metron crypto-page wallet balances (metron-ops#111). The
     # ARTIFACT_REGISTRY freshness row is DEFERRED until the producer is live (IAM + timer
     # installed) per "never register a freshness entry ahead of its producer" — registering
