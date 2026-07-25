@@ -196,7 +196,8 @@ class TestDiffRow:
     MW = index._month_window(NOW)
     BUDGETS = {"providers": {"openrouter": {"monthly_budget_usd": 4.0}}}
 
-    def test_no_baseline_establishes(self):
+    def test_no_baseline_establishes(self, monkeypatch):
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
         row = index._diff_row(index._row("openrouter", "OpenRouter"), self.MW,
                               self.BUDGETS, "openrouter", 42.5, {}, "openrouter_total_usage")
         assert row["mtd_cost_usd"] == 0.0
@@ -213,7 +214,8 @@ class TestDiffRow:
         # 2.5 over ~53% of month → ~4.7 projected > 4.0 budget
         assert row["pace"] == "over"
 
-    def test_negative_diff_clamped(self):
+    def test_negative_diff_clamped(self, monkeypatch):
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
         baseline = {"counters": {"deepseek_neg_balance": -10.0},
                     "as_of": {"deepseek_neg_balance": "2026-07-01T00:10:00+00:00"}}
         row = index._diff_row(index._row("deepseek", "DeepSeek"), self.MW, {},
