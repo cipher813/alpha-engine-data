@@ -72,7 +72,7 @@ def test_sweep_payload_is_the_launch_decided_sweep_contract(states):
     assert payload == {
         "run_mode": "sweep",
         "launch_decided": True,
-        "model": "claude-haiku-4-5",
+        "model": "deepseek-v4-flash",
         "issue_filter": "mid-only",
         "schedule": "end-of-sf-sweep",
     }
