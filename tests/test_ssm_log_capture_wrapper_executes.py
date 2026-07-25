@@ -91,6 +91,7 @@ def test_wrapper_module_executes_inner_command(module, tmp_path):
         capture_output=True,
         text=True,
         timeout=120,
+        env={**__import__("os").environ, "RUN_TOKEN": "test-1646-execute"},
     )
     assert sentinel in proc.stdout, (
         f"`python -m {module} run -- <cmd>` did NOT execute the inner "
@@ -126,6 +127,7 @@ def test_wrapper_module_propagates_inner_exit_code(module, tmp_path):
         capture_output=True,
         text=True,
         timeout=120,
+        env={**__import__("os").environ, "RUN_TOKEN": "test-1646-exit-code"},
     )
     assert proc.returncode == 7, (
         f"inner exit code not propagated (got {proc.returncode}) — a "
