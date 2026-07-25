@@ -213,7 +213,7 @@ _DEFAULT_RUN_MODE = "full"
 # structurally closed.
 _VALID_ISSUE_FILTERS = set(ge.VALID_ISSUE_FILTERS)
 _DEFAULT_ISSUE_FILTER = "mid-only"
-_DEFAULT_MODEL = "claude-sonnet-5"
+_DEFAULT_MODEL = "deepseek-v4-pro"
 # Defense-in-depth allowlist for the model id (embedded verbatim into the SSM
 # shell command below) — model ids are Lambda-config-controlled, not raw user
 # input, but this is cheap and rules out shell-metacharacter injection outright.
@@ -1489,9 +1489,9 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """EventBridge Scheduler handler — launches the groom spot box on cadence.
 
     `event` is the schedule's JSON input, e.g. {"run_mode": "full", "model":
-    "claude-sonnet-5", "issue_filter": "high-only", "schedule": "0 1 * * *"}.
-    `model`/`issue_filter` default to the Sonnet mid-tier queue when absent
-    (the two pre-existing Sonnet schedules don't set them). `soft_limit_min` is
+    "deepseek-v4-pro", "issue_filter": "high-only", "schedule": "0 1 * * *"}.
+    `model`/`issue_filter` default to the DeepSeek mid-tier queue when absent
+    (the pre-existing schedules don't set them). `soft_limit_min` is
     a manual-invoke-ONLY bounded-test override — no live schedule sets it.
     `pr_budget` is set only on the dedicated high-only schedule (config#1769).
     `force_on_demand` (config#1645) is set only by the dispatch Step Function's
