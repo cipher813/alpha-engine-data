@@ -196,7 +196,8 @@ class TestDiffRow:
     MW = index._month_window(NOW)
     BUDGETS = {"providers": {"openrouter": {"monthly_budget_usd": 4.0}}}
 
-    def test_no_baseline_establishes(self):
+    def test_no_baseline_establishes(self, monkeypatch):
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
         row = index._diff_row(index._row("openrouter", "OpenRouter"), self.MW,
                               self.BUDGETS, "openrouter", 42.5, {}, "openrouter_total_usage")
         assert row["mtd_cost_usd"] == 0.0
