@@ -74,7 +74,7 @@ arcticdb>=6.18.7
 # `from nousergon_lib.series_contract import (...)` (alpha-engine-
 # config#2456) — the base requirements.txt's own extras list is missing
 # this too (pre-existing gap, out of scope here; noted for the record).
-nousergon-lib[arcticdb,flow-doctor,series-contract] @ git+https://github.com/nousergon/nousergon-lib@v0.124.6
+nousergon-lib[arcticdb,flow-doctor,series-contract] @ git+https://github.com/nousergon/nousergon-lib@v0.124.9
 # krepis: not imported directly by any file in this closure, but
 # nousergon_lib.locks/.trading_calendar/.dates/.secrets/.yfinance_quiet/
 # .http_retry/.logging (all imported somewhere in the traced closure) are
