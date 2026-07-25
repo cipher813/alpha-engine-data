@@ -24,12 +24,14 @@
 # Usage:
 #   bash infrastructure/lambdas/eod-backstop/deploy.sh             # update code only
 #   bash infrastructure/lambdas/eod-backstop/deploy.sh --bootstrap # first-time create (rule DISABLED)
+#   bash infrastructure/lambdas/eod-backstop/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
 #   bash infrastructure/lambdas/eod-backstop/deploy.sh --dry-run   # show actions, do not apply
 #   bash infrastructure/lambdas/eod-backstop/deploy.sh --smoke     # invoke once (no-op unless box up + no EOD today)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 FUNCTION_NAME="alpha-engine-eod-backstop"
 ROLE_NAME="alpha-engine-eod-backstop-role"
 POLICY_NAME="alpha-engine-eod-backstop-policy"
@@ -37,13 +39,23 @@ RULE_NAME="alpha-engine-eod-backstop-daily"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 
-DRY_RUN=false
+# DRY_RUN honors an ambient env var (true/1/yes) as well as the --dry-run
+# flag below, so DRY_RUN=1/true from a caller's shell actually no-ops
+# instead of silently running the real deploy path (alpha-engine-config-
+# I2752 incident, 2026-07-16: an operator assumed DRY_RUN=<env var> worked
+# here, matching other tools' convention, and triggered a real deploy).
+case "${DRY_RUN:-false}" in
+  true|1|yes|TRUE|YES) DRY_RUN=true ;;
+  *) DRY_RUN=false ;;
+esac
 BOOTSTRAP=false
+APPLY_IAM=false
 SMOKE=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
     --bootstrap) BOOTSTRAP=true ;;
+    --apply-iam) APPLY_IAM=true ;;
     --smoke) SMOKE=true ;;
     -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
   esac
@@ -66,10 +78,11 @@ ast.parse(src)
 print('index.py syntax OK')
 "
 
-if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  echo "Running handler unit tests..."
-  python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
-fi
+# ----- Preflight handler unit tests (shared gate — config#2381) -------------
+# Delegates to the one _shared/run_handler_tests.sh so this gate can never
+# re-drift into the naive no-install `python3 -m pytest` form (config#2295).
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+run_handler_tests "${SCRIPT_DIR}" boto3 -r "${SCRIPT_DIR}/requirements.txt"
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
 
@@ -89,6 +102,14 @@ ZIP="${PKG}/function.zip"
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
 
 # ----- 2. Bootstrap (first-time only) ---------------------------------------
+
+# ----- Apply IAM only (config#2825, no bootstrap side effects) -------------
+if $APPLY_IAM; then
+  echo "Applying IAM (role=${ROLE_NAME}, policy=${POLICY_NAME})..."
+  TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
+  echo "  ✓ IAM applied."
+fi
 
 if $BOOTSTRAP; then
   echo "Bootstrapping ${FUNCTION_NAME}..."

@@ -23,22 +23,15 @@
 # Lambda) + ssm:GetCommandInvocation (to poll) + sns:Publish (to alert on
 # failure) — it never touches secrets or launches anything itself.
 #
-# Cadence (UTC). Reduced 3->2/day on 2026-06-29 (the 15:00 UTC / 8am-PT run was
-# dropped per usage pacing); a 3rd schedule was re-added 2026-07-01 (config#1495
-# follow-up) at the SAME 15:00 UTC slot, now running a DIFFERENT tier — Opus,
-# complexity:high ONLY — not a reinstatement of the old Sonnet drain-phase run.
-# UNIFORM 3x/day, all 7 days, since 2026-07-02: the Sat-skip on the 07:00 slot
-# (originally "avoid colliding with the 09:00 UTC Saturday pipeline") was never
-# evidence-based — investigated and confirmed the groom and the weekly SF share
-# NEITHER the Claude Max quota (groom = Max-plan OAuth token; weekly SF Research/
-# Predictor = separate pay-as-you-go ANTHROPIC_API_KEY) NOR EC2 spot capacity
-# (disjoint instance families: groom t3/t3a/t2.medium vs weekly-SF c5/m5/c6i/c5a/
-# r5/r5a/r6i.large). No exceptions kept — the weekly SF can also now land on any
-# day (e.g. Friday, per the holiday-aware weekly-schedule-adjuster, #578) without
-# the groom cadence needing to track it.
-#   07:00 daily     cron(0 7 * * ? *)         FULL   Sonnet, default queue  # 12am PT, every day
-#   23:00 daily     cron(0 23 * * ? *)        FULL   Sonnet, default queue  # 4pm PT, every day
-#   15:00 daily     cron(0 15 * * ? *)        FULL   Opus,   high-only      # 8am PT, every day
+# Cadence (UTC). MAINTENANCE CADENCE as of 2026-07-25 (config#1311): the
+# backlog is drained (30 open issues on alpha-engine-config, ~70 across all
+# 4 backlog repos), so the drain-phase 3x/day tier-split cadence is reverted
+# to a single daily full groom + the weekly Sunday gated-reverify lane. The
+# end-of-SF sweep (DispatchEndOfSfSweep in step_function_groom.json) continues
+# to run unconditionally after every trigger cycle — it covers the PR set
+# regardless of how many groom boxes launch.
+#   12:00 daily     cron(0 12 * * ? *)        FULL   all 3 tiers + sweep    # 5am PT, every day
+#   Sun 09:00       cron(0 9 ? * SUN *)       FULL   Haiku,  gated-reverify # weekly stale-gate lane (config#1891)
 #
 # SCHED_NAMES is the source of truth: any live scheduler rule under the
 # alpha-engine-scheduled-groom- prefix that is NOT in SCHED_NAMES is PRUNED
@@ -67,12 +60,14 @@
 # Usage:
 #   bash .../scheduled-groom-dispatcher/deploy.sh             # update code only (also the CI auto-deploy path)
 #   bash .../scheduled-groom-dispatcher/deploy.sh --bootstrap # operator-only: create/update IAM roles + wire EventBridge Scheduler
+#   bash .../scheduled-groom-dispatcher/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
 #   bash .../scheduled-groom-dispatcher/deploy.sh --dry-run   # show actions, do not apply
 #   bash .../scheduled-groom-dispatcher/deploy.sh --smoke     # invoke once with a synthetic schedule event (⚠ fires a REAL groom)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 FUNCTION_NAME="alpha-engine-scheduled-groom-dispatcher"
 ROLE_NAME="alpha-engine-scheduled-groom-dispatcher-role"
 POLICY_NAME="alpha-engine-scheduled-groom-dispatcher-policy"
@@ -100,30 +95,37 @@ SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 # schedule label, plus model/issue_filter per tier — config#1760 tier-split).
 # deploy.sh prune drops orphaned rule names when cadence changes.
 SCHED_NAMES=(
-  "alpha-engine-scheduled-groom-0700-daily-low"
-  "alpha-engine-scheduled-groom-1500-daily-opus-high"
-  "alpha-engine-scheduled-groom-2300-daily-mid"
+  "alpha-engine-scheduled-groom-1200-daily"
+  "alpha-engine-scheduled-groom-sun0900-weekly-gated-reverify"
 )
 SCHED_CRONS=(
-  "cron(0 7 * * ? *)"
-  "cron(0 15 * * ? *)"
-  "cron(0 23 * * ? *)"
+  "cron(0 12 * * ? *)"
+  "cron(0 9 ? * SUN *)"
 )
 SCHED_INPUTS=(
-  '{"run_mode":"full","model":"claude-haiku-4-5","issue_filter":"low-only","schedule":"0 7 * * *"}'
-  '{"run_mode":"full","model":"claude-opus-4-8","issue_filter":"high-only","pr_budget":100,"schedule":"0 15 * * *"}'
-  '{"run_mode":"full","model":"claude-sonnet-5","issue_filter":"mid-only","schedule":"0 23 * * *"}'
+  '{"run_mode":"full","trigger":"demand-all","pr_budget":50,"schedule":"0 12 * * *"}'
+  '{"run_mode":"full","model":"deepseek-v4-flash","issue_filter":"gated-reverify","schedule":"0 9 * * 0"}'
 )
 # Prefix used to discover live rules for prune reconciliation (see step 2f).
 SCHED_PREFIX="alpha-engine-scheduled-groom-"
 
-DRY_RUN=false
+# DRY_RUN honors an ambient env var (true/1/yes) as well as the --dry-run
+# flag below, so DRY_RUN=1/true from a caller's shell actually no-ops
+# instead of silently running the real deploy path (alpha-engine-config-
+# I2752 incident, 2026-07-16: an operator assumed DRY_RUN=<env var> worked
+# here, matching other tools' convention, and triggered a real deploy).
+case "${DRY_RUN:-false}" in
+  true|1|yes|TRUE|YES) DRY_RUN=true ;;
+  *) DRY_RUN=false ;;
+esac
 BOOTSTRAP=false
+APPLY_IAM=false
 SMOKE=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
     --bootstrap) BOOTSTRAP=true ;;
+    --apply-iam) APPLY_IAM=true ;;
     --smoke) SMOKE=true ;;
     -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
   esac
@@ -137,14 +139,12 @@ run() {
   fi
 }
 
-# ----- 0. Scratch dirs + validate handler syntax -----------------------------
-# PKG and TEST_DEPS are both created up front (mirrors freshness-monitor/
-# deploy.sh) so ONE trap covers both — a pytest-install failure below still
-# cleans up.
+# ----- 0. Scratch dir + validate handler syntax -----------------------------
+# PKG (the Lambda-zip staging dir) is created up front; the shared handler-
+# test gate (0b) provisions its OWN scratch dir for pytest + deps (config#2381).
 
 PKG=$(mktemp -d)
-TEST_DEPS=$(mktemp -d)
-trap "rm -rf '$PKG' '$TEST_DEPS'" EXIT
+trap "rm -rf '$PKG'" EXIT
 
 python3 -c "
 import ast
@@ -157,18 +157,13 @@ print('index.py syntax OK')
 # Hermetic for AWS: boto3 + nousergon_lib.ec2_spot are stubbed in sys.modules
 # before `import index` (see test_handler.py). nousergon_lib.flow_doctor_fleet
 # is pure stdlib — install the REAL pinned enum from requirements.txt so the
-# hand-maintained FleetTelegramTopic fake cannot drift (config#1772). krepis
-# (pre-boot pace gate math) is also installed for real. Both land in a scratch
-# TEST_DEPS dir — NOT the caller's global site-packages, not bundled into the
-# Lambda zip.
-if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
-  KREPIS_REQ=$(grep -E '^krepis' "${SCRIPT_DIR}/requirements.txt" | head -1)
-  echo "Installing pytest + krepis + pinned nousergon-lib into ${TEST_DEPS}..."
-  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest "${KREPIS_REQ}" "${NOUSERGON_LIB_REQ}"
-  echo "Running handler unit tests..."
-  PYTHONPATH="${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
-fi
+# hand-maintained FleetTelegramTopic fake cannot drift (config#1772). It is
+# passed to the shared gate, which lands it in its own scratch dir — NOT the
+# caller's global site-packages, not bundled into the Lambda zip. (krepis was
+# removed 2026-07-14 with the pace gate — usage pacing dismantled.)
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
+run_handler_tests "${SCRIPT_DIR}" "${NOUSERGON_LIB_REQ}"
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
 
@@ -184,6 +179,14 @@ ZIP="${PKG}/function.zip"
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
 
 # ----- 2. Bootstrap (first-time only) ---------------------------------------
+
+# ----- Apply IAM only (config#2825, no bootstrap side effects) -------------
+if $APPLY_IAM; then
+  echo "Applying IAM (role=${ROLE_NAME}, policy=${POLICY_NAME})..."
+  TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
+  echo "  ✓ IAM applied."
+fi
 
 if $BOOTSTRAP; then
   echo "Bootstrapping ${FUNCTION_NAME}..."
@@ -212,6 +215,11 @@ if $BOOTSTRAP; then
   fi
 
   # --- 2b. Lambda function ---
+  # GROOM_MAX_DISPATCHES_DAILY (config#3173, generalizing config#2269's
+  # sf-watch pattern): pinned here (not left to index.py's own default) so a
+  # live env tweak never silently survives a redeploy — same rationale as
+  # sf-watch's SF_WATCH_MAX_DISPATCHES_* (config#1818 lesson). Change via a
+  # PR editing this value, not a console edit.
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
   if ! aws lambda get-function --function-name "${FUNCTION_NAME}" --query 'Configuration.FunctionName' --output text >/dev/null 2>&1; then
     echo "  Creating Lambda: ${FUNCTION_NAME}"
@@ -223,7 +231,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 300 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+      --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid,high"}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -384,7 +392,7 @@ echo "✓ Code deployed."
 echo "Updating Lambda environment (flow-doctor SSM hydration)..."
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
-  --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+  --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid,high"}' \
   --region "${REGION}" \
   --query 'LastUpdateStatus' --output text
 if ! $DRY_RUN; then

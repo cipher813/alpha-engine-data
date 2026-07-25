@@ -6,6 +6,15 @@
 # scripts. Hourly scan terminates any alpha-engine-* tagged spot instance
 # whose age exceeds its per-tag-prefix budget + 30-min grace.
 #
+# ci-watch-dispatcher migration (new dependency): index.py now imports
+# nousergon_lib.telegram (re-exports krepis.telegram.send_message) for the
+# CI-watch incomplete-reap alert. nousergon-lib pulls in pydantic (pydantic-
+# core ships a compiled, platform-specific wheel — verified: a bare macOS
+# `pip install --target` produces a darwin/arm64 .so that is NOT Lambda-safe),
+# so packaging now goes through lambda_pip_install.sh (Docker linux/amd64),
+# mirroring scheduled-groom-dispatcher/deploy.sh exactly, instead of the old
+# single-file `zip index.py`.
+#
 # Managed outside CloudFormation — same rationale as the
 # changelog-cloudwatch-mirror Lambda (keeps the github-actions-lambda-deploy
 # OIDC role's blast radius narrow; this Lambda has destructive ec2:Terminate
@@ -14,12 +23,14 @@
 # Usage:
 #   bash infrastructure/lambdas/spot-orphan-reaper/deploy.sh             # update code only
 #   bash infrastructure/lambdas/spot-orphan-reaper/deploy.sh --bootstrap # first-time create + wire EventBridge
+#   bash infrastructure/lambdas/spot-orphan-reaper/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
 #   bash infrastructure/lambdas/spot-orphan-reaper/deploy.sh --dry-run   # show actions, do not apply
 #   bash infrastructure/lambdas/spot-orphan-reaper/deploy.sh --smoke     # invoke once with DRY_RUN=true and print scan output
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 FUNCTION_NAME="alpha-engine-spot-orphan-reaper"
 ROLE_NAME="alpha-engine-spot-orphan-reaper-role"
 POLICY_NAME="alpha-engine-spot-orphan-reaper-policy"
@@ -33,13 +44,23 @@ ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 PROD_ENV='Variables={MAX_SPOT_BUDGET_SECONDS=21600,GRACE_SECONDS=1800,DRY_RUN=false}'
 SMOKE_ENV='Variables={MAX_SPOT_BUDGET_SECONDS=21600,GRACE_SECONDS=1800,DRY_RUN=true}'
 
-DRY_RUN=false
+# DRY_RUN honors an ambient env var (true/1/yes) as well as the --dry-run
+# flag below, so DRY_RUN=1/true from a caller's shell actually no-ops
+# instead of silently running the real deploy path (alpha-engine-config-
+# I2752 incident, 2026-07-16: an operator assumed DRY_RUN=<env var> worked
+# here, matching other tools' convention, and triggered a real deploy).
+case "${DRY_RUN:-false}" in
+  true|1|yes|TRUE|YES) DRY_RUN=true ;;
+  *) DRY_RUN=false ;;
+esac
 BOOTSTRAP=false
+APPLY_IAM=false
 SMOKE=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
     --bootstrap) BOOTSTRAP=true ;;
+    --apply-iam) APPLY_IAM=true ;;
     --smoke) SMOKE=true ;;
     -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
   esac
@@ -53,7 +74,12 @@ run() {
   fi
 }
 
-# ----- 0. Validate handler ---------------------------------------------------
+# ----- 0. Scratch dir + validate handler syntax -----------------------------
+# PKG (the Lambda-zip staging dir) is created up front; the shared handler-
+# test gate (0b) provisions its OWN scratch dir for pytest + deps (config#2381).
+
+PKG=$(mktemp -d)
+trap "rm -rf '$PKG'" EXIT
 
 python3 -c "
 import ast, sys
@@ -62,12 +88,25 @@ ast.parse(src)
 print('index.py syntax OK')
 "
 
-if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  echo "Running handler unit tests..."
-  python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
-fi
+# ----- 0b. Preflight handler unit tests --------------------------------------
+# Hermetic for AWS: boto3 + nousergon_lib.telegram are stubbed in sys.modules
+# before `import index` (see test_handler.py). The pinned nousergon-lib is
+# installed for real by the shared gate into its own scratch dir (config#1746 hermetic-
+# import-guard pattern) — NOT the caller's global site-packages, not bundled
+# into the Lambda zip.
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
+run_handler_tests "${SCRIPT_DIR}" "${NOUSERGON_LIB_REQ}"
 
 # ----- 1. Bootstrap (first-time only) ---------------------------------------
+
+# ----- Apply IAM only (config#2825, no bootstrap side effects) -------------
+if $APPLY_IAM; then
+  echo "Applying IAM (role=${ROLE_NAME}, policy=${POLICY_NAME})..."
+  TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
+  echo "  ✓ IAM applied."
+fi
 
 if $BOOTSTRAP; then
   echo "Bootstrapping ${FUNCTION_NAME}..."
@@ -94,11 +133,12 @@ if $BOOTSTRAP; then
     sleep 10
   fi
 
-  PKG=$(mktemp -d)
-  trap "rm -rf '$PKG'" EXIT
+  LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+  echo "  Installing deps into ${PKG} (Lambda-safe Docker pip)..."
+  bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
   cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
   ZIP="${PKG}/function.zip"
-  (cd "${PKG}" && zip -q "function.zip" index.py)
+  (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
   echo "  Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
 
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
@@ -145,11 +185,12 @@ fi
 # ----- 2. Update function code (always) -------------------------------------
 
 if ! $BOOTSTRAP; then
-  PKG=$(mktemp -d)
-  trap "rm -rf '$PKG'" EXIT
+  LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+  echo "Installing deps into ${PKG} (Lambda-safe Docker pip)..."
+  bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
   cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
   ZIP="${PKG}/function.zip"
-  (cd "${PKG}" && zip -q "function.zip" index.py)
+  (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
   echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
 
   echo "Updating Lambda function code: ${FUNCTION_NAME}"

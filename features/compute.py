@@ -41,6 +41,7 @@ from dataclasses import dataclass
 import corporate_actions as ca
 from features.cross_sectional import apply_factor_zscores
 from features.feature_engineer import FEATURES, FEATURE_CFG, MIN_ROWS_FOR_FEATURES, compute_features
+from features.metron_supplemental import compute_metron_supplemental_features, write_metron_supplemental_snapshot
 from features.private_pack import apply_private_features
 from features.registry import upload_registry
 from features.writer import write_feature_snapshot
@@ -108,10 +109,20 @@ def make_source_series(values: list[str] | pd.Series, index: pd.Index | None = N
 # and lets each ticker's DataFrame be freed incrementally via pop().
 _FEATURE_WARMUP_ROWS = 280
 
+# Sub-sector benchmark ETFs (config#934) — SMH/IGV/XBI/PPH/XOP/KRE/ITA/GDX,
+# the distinct non-XL* symbols in constituents.GICS_SUBINDUSTRY_TO_ETF. Like
+# the XL* sector ETFs (excluded via _is_sector_etf) these are benchmark
+# series, NOT stocks: they must NOT get full-universe feature computation and
+# must NOT be flagged as constituents-churn stragglers by the coverage diff.
+# The XL* prefix test can't catch them (SMH/IGV/… don't start with "XL"), so
+# they are enumerated into _SKIP_TICKERS explicitly.
+_SUB_SECTOR_ETFS = frozenset({"SMH", "IGV", "XBI", "PPH", "XOP", "KRE", "ITA", "GDX"})
+
 # Tickers that are macro/index series, not stocks
 _SKIP_TICKERS = {
     "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
     "^VIX", "^VIX3M", "^TNX", "^IRX",
+    *_SUB_SECTOR_ETFS,
 }
 
 # Macro/index symbols ALSO promoted to full `universe` members (full OHLCV +
@@ -144,6 +155,22 @@ def _load_sector_map(s3, bucket: str) -> dict[str, str]:
         return json.loads(obj["Body"].read())
     except Exception as exc:
         log.warning("Failed to load sector_map.json: %s", exc)
+        return {}
+
+
+def _load_sub_sector_etf_map(s3, bucket: str) -> dict[str, str]:
+    """Load ticker -> sub-sector benchmark ETF mapping from S3 (config#934).
+
+    Best-effort/non-blocking, mirroring _load_sector_map: a missing file
+    (e.g. before the weekly collector has written it, or on an S3 read
+    failure) returns an empty map, which degrades every ticker's
+    sub_sector_vs_benchmark_* to its neutral default rather than raising.
+    """
+    try:
+        obj = s3.get_object(Bucket=bucket, Key="data/sub_sector_etf_map.json")
+        return json.loads(obj["Body"].read())
+    except Exception as exc:
+        log.warning("Failed to load sub_sector_etf_map.json: %s", exc)
         return {}
 
 
@@ -551,6 +578,7 @@ _MACRO_SLIM_KEYS = {
     "IRX": "IRX",
     "GLD": "GLD",
     "USO": "USO",
+    "HYOAS": "HYOAS", # config#939 — credit spreads; FRED-only index ticker
 }
 
 
@@ -818,6 +846,7 @@ def compute_and_write(
     gld_series = macro.get("GLD")
     uso_series = macro.get("USO")
     vix3m_series = macro.get("VIX3M")
+    hyoas_series = macro.get("HYOAS")
 
     for ticker in universe_tickers:
         try:
@@ -842,6 +871,7 @@ def compute_and_write(
                 gld_series=gld_series,
                 uso_series=uso_series,
                 vix3m_series=vix3m_series,
+                hyoas_series=hyoas_series,
                 earnings_data=earnings_data,
                 revision_data=revision_data,
                 options_data=options_data,
@@ -947,6 +977,27 @@ def compute_and_write(
             "Feature snapshot + registry written to s3://%s/%s%s/ (schema=%s)",
             bucket, FEATURE_STORE_PREFIX, date_str, _schema_hash,
         )
+
+        # Metron-held/watchlisted tickers outside the S&P500+400 universe above
+        # (metron-ops#177) — a SEPARATE, additive snapshot crucible-research's
+        # factor_scoring.py optionally reads for Attractiveness coverage. Runs
+        # strictly AFTER the core snapshot write above, and is swallowed
+        # (logged WARNING, not raised): (a) failure mode swallowed is a fetch/
+        # compute error for this display-only supplemental ticker set; (b) the
+        # primary deliverable — the ML training/risk-model feature snapshot
+        # Predictor and Executor depend on — is already durably written by this
+        # point and must not be taken down by a Metron-coverage nice-to-have;
+        # (c) recording surface is this log.warning, which the weekly SF's log
+        # aggregation surfaces same as any other WARNING.
+        try:
+            supp_features_df, supp_sector_map = compute_metron_supplemental_features(
+                bucket, s3, set(features_df["ticker"]), macro,
+            )
+            write_metron_supplemental_snapshot(
+                date_str, supp_features_df, supp_sector_map, bucket, s3_client=s3,
+            )
+        except Exception as supp_exc:
+            log.warning("Metron supplemental factor-scoring compute failed (non-fatal): %s", supp_exc)
 
     t_total = time.time() - t0
 

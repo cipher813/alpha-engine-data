@@ -66,6 +66,10 @@ FX_PREFIX = "market_data/fx/"
 # History artifacts (per-symbol / per-currency) — power Metron's Performance NAV
 # reconstruction (close series) + as-of-date realized/dividend FX conversion.
 CLOSE_HISTORY_PREFIX = "market_data/close_history/"
+# Consolidated close-history artifact containing all symbols' close series + currency map
+# (one file instead of N per-ticker files — metron-ops#233). Written alongside per-ticker
+# files during the transition period; the consumer prefers this when present.
+CONSOLIDATED_CLOSE_HISTORY_KEY = f"{CLOSE_HISTORY_PREFIX}consolidated.json"
 FX_HISTORY_PREFIX = "market_data/fx_history/"
 # Factor/sector ETFs whose close-history Metron's RISK (factor model) + ATTRIBUTION
 # (Brinson sector) need. These are NOT in any held universe, so unless their history is
@@ -111,6 +115,11 @@ FUNDAMENTALS_PREFIX = "market_data/fundamentals/"
 # v3 (metron Holdings balance-sheet band): added the absolute balance-sheet fields
 # (totalDebt / totalCash / ebitda / freeCashflow) the Holdings "Balance Sheet" columns
 # need — cash balance, debt balance, net debt, and net-debt/EBITDA leverage.
+# v4 (metron-ops#163): added trailingEps/forwardEps so the Holdings Valuation band can
+# show raw EPS alongside P/E, not just the ratio.
+# v5 (metron-ops#178): added bookValue/revenuePerShare/enterpriseValue — every Valuation
+# multiple now has its raw input(s) in the same band (P/B -> book value/share, P/S ->
+# revenue/share, EV/EBITDA -> enterprise value).
 FUNDAMENTALS_INFO_KEYS = [
     "trailingPE", "forwardPE", "trailingPegRatio", "enterpriseToEbitda",
     "priceToBook", "priceToSalesTrailing12Months",
@@ -118,6 +127,8 @@ FUNDAMENTALS_INFO_KEYS = [
     "returnOnEquity", "returnOnAssets", "grossMargins", "operatingMargins",
     "totalDebt", "totalCash", "ebitda", "freeCashflow",
     "beta", "dividendYield", "marketCap", "sector", "industry",
+    "trailingEps", "forwardEps",
+    "bookValue", "revenuePerShare", "enterpriseValue",
 ]
 # Technicals — per-held-symbol indicators computed from the close_history this module
 # already publishes daily (zero new fetches). Slow-moving (RSI14 / 50d-200d MA / 52w
@@ -167,11 +178,17 @@ INDEX_PROXY_SYMBOLS = ["SPY", "ONEQ", "QQQ", "IWM"]
 CLOSES_SCHEMA_VERSION = 1
 FX_SCHEMA_VERSION = 1
 CLOSE_HISTORY_SCHEMA_VERSION = 1
+# Additive per-artifact provenance field (config#1865) documenting close_history's price
+# basis now that it's primarily sourced from the dividend-adjusted price_cache rather than
+# an independent split-only-adjusted yfinance fetch — see _price_cache_close_history's
+# docstring for the full basis-change rationale. Old consumers pinned only on
+# schema_version/yf_symbol/currency/closes ignore the extra key (no shape break).
+CLOSE_HISTORY_ADJUSTMENT_BASIS = "dividend_adjusted"
 FX_HISTORY_SCHEMA_VERSION = 1
 SECTORS_SCHEMA_VERSION = 2  # v2: additive `countries` map (yf_symbol → country of domicile)
 EARNINGS_SCHEMA_VERSION = 1
 MACRO_SCHEMA_VERSION = 2  # v2: added next_release (per series) + release_events (metron-ops#49)
-FUNDAMENTALS_SCHEMA_VERSION = 3  # v3: + totalDebt/totalCash/ebitda/freeCashflow (balance sheet)
+FUNDAMENTALS_SCHEMA_VERSION = 5  # v5: + bookValue/revenuePerShare/enterpriseValue (metron-ops#178)
 INTRADAY_SCHEMA_VERSION = 3  # v3: additive `fund_proxies` map (mutual-fund tracking-proxy ETF quotes)
 TECHNICALS_SCHEMA_VERSION = 2  # v2: + pct_from_52wk_high (tearsheet parity with Holdings)
 SECURITY_PERFORMANCE_SCHEMA_VERSION = 1
@@ -434,10 +451,17 @@ def _yfinance_fx(currencies: list[str], base: str = BASE_CURRENCY) -> dict[str, 
 
 
 @_yf_quiet
-def _yf_history(symbols: list[str], period: str, *, is_fx: bool = False, base: str = BASE_CURRENCY) -> dict[str, list[tuple[str, float]]]:
+def _yf_history(
+    symbols: list[str], period: str, *, is_fx: bool = False, base: str = BASE_CURRENCY,
+    auto_adjust: bool = False,
+) -> dict[str, list[tuple[str, float]]]:
     """Daily close series per symbol via yfinance over ``period`` →
     ``{key: [(bar_date, close), …]}`` ascending. ``is_fx`` maps a currency to the
-    ``{CCY}{BASE}=X`` pair and keys the result by the bare currency. Empty series omitted."""
+    ``{CCY}{BASE}=X`` pair and keys the result by the bare currency. Empty series omitted.
+    ``auto_adjust`` selects the basis (config#1865): ``False`` (default) is split-adjusted-
+    only; ``True`` is dividend-adjusted, matching the price_cache basis (see
+    ``_yfinance_close_history_dividend_adjusted``, the gap-fill fallback used by
+    ``_price_cache_close_history``)."""
     try:
         import pandas as pd
         import yfinance as yf
@@ -456,7 +480,7 @@ def _yf_history(symbols: list[str], period: str, *, is_fx: bool = False, base: s
             time.sleep(_YFINANCE_BATCH_DELAY)
         try:
             raw = yf.download(tickers=batch[0] if len(batch) == 1 else batch, period=period,
-                              interval="1d", auto_adjust=False, progress=False, group_by="ticker", threads=True)
+                              interval="1d", auto_adjust=auto_adjust, progress=False, group_by="ticker", threads=True)
             is_multi = isinstance(raw.columns, pd.MultiIndex)
             for key in batch:
                 try:
@@ -476,7 +500,175 @@ def _yf_history(symbols: list[str], period: str, *, is_fx: bool = False, base: s
 
 
 def _yfinance_close_history(yf_symbols: list[str], period: str = DEFAULT_HISTORY_PERIOD) -> dict[str, list[tuple[str, float]]]:
+    """Legacy split-only-adjusted (``auto_adjust=False``) yfinance fetch. No longer
+    ``collect_history``'s default source (config#1865: superseded by
+    ``_price_cache_close_history``, which reads the dividend-adjusted price_cache and
+    gap-fills via ``_yfinance_close_history_dividend_adjusted``) — kept for direct callers/
+    tests that want the pre-#1865 split-only basis explicitly."""
     return _yf_history(yf_symbols, period, is_fx=False)
+
+
+def _yfinance_close_history_dividend_adjusted(
+    yf_symbols: list[str], period: str = DEFAULT_HISTORY_PERIOD,
+) -> dict[str, list[tuple[str, float]]]:
+    """Dividend-adjusted (``auto_adjust=True``) yfinance fetch — same basis as
+    ``reference/price_cache/`` (see ``collectors/prices.py``). Used by
+    ``_price_cache_close_history`` to gap-fill symbols price_cache doesn't cover, so a
+    published close_history series is never a split-only/dividend-adjusted chimera
+    (config#1865)."""
+    return _yf_history(yf_symbols, period, is_fx=False, auto_adjust=True)
+
+
+def _period_to_timedelta(period: str) -> Any:
+    """Best-effort ``"10y"``/``"5d"``/``"6mo"``-style yfinance period string → ``pd.Timedelta``.
+    Unrecognized shapes fall back to the ``DEFAULT_HISTORY_PERIOD`` (10y) window rather than
+    raising — a period-string typo should degrade to "trim less aggressively", never abort
+    the price_cache read."""
+    import pandas as pd
+
+    try:
+        if period.endswith("mo"):
+            return pd.Timedelta(days=30 * int(period[:-2]))
+        if period.endswith("y"):
+            return pd.Timedelta(days=365 * int(period[:-1]))
+        if period.endswith("d"):
+            return pd.Timedelta(days=int(period[:-1]))
+    except (ValueError, AttributeError):
+        pass
+    return pd.Timedelta(days=365 * 10)
+
+
+# config#1865-followup (Brian ruling, 2026-07-15 triage): reference/price_cache/ only
+# refreshes weekly (collectors/prices.py), so "the parquet exists" is NOT the same claim
+# as "the parquet is current" — a covered symbol's cached bar can be several trading days
+# stale relative to the daily-fresh yfinance fetch it replaced. Concrete regression this
+# guards against: CRWD's cached snapshot was 4 trading days stale and missed a +12.58%
+# earnings move, producing a -19.9pp security_performance diff with nothing to do with the
+# dividend-adjustment basis change. A symbol whose latest cached bar is stale beyond this
+# many trading days is treated as NOT covered by price_cache for this run and routed
+# through the SAME yfinance gap-fill path as a genuine no-coverage symbol, rather than
+# silently publishing a week-old price. Start conservative at 1 (tolerate the ordinary T+0/
+# T+1 refresh-timing lag, nothing more); revisit only with an explicit written rationale.
+PRICE_CACHE_MAX_STALE_TRADING_DAYS = 1
+
+
+def _price_cache_close_series(
+    s3_client: Any, bucket: str, yf_symbol: str, period: str, *, reference_day: date | None = None,
+) -> list[tuple[str, float]] | None:
+    """Read one symbol's dividend-adjusted close series from the price_cache parquet
+    (``reference/price_cache/{ticker}.parquet`` — ``builders/_price_cache_writeboth.py``
+    owns the read-prefix fallback chain), trimmed to ``period`` lookback. Returns ``None``
+    when the parquet is absent in every active read prefix (genuine no-coverage — e.g. a
+    foreign/OTC/fund symbol outside price_cache's SP1500-overlap universe), unreadable/
+    malformed, OR when the cached snapshot's latest bar is more than
+    ``PRICE_CACHE_MAX_STALE_TRADING_DAYS`` NYSE trading sessions behind ``reference_day``
+    (config#1865-followup — see the constant's docstring for the CRWD regression this
+    closes). All three cases route the caller to the yfinance gap-fill fallback rather than
+    aborting the run or silently publishing a stale price (module posture: best-effort, one
+    symbol's irregularity never blocks the rest). ``reference_day`` defaults to
+    ``nousergon_lib.dates.last_closed_trading_day()`` — injectable for tests/determinism."""
+    from botocore.exceptions import ClientError
+
+    from builders._price_cache_writeboth import PRICE_CACHE_LEGACY_PREFIX, price_cache_read_prefixes
+    from nousergon_lib.dates import is_fresh_in_trading_days, last_closed_trading_day, trading_days_stale
+    from store.parquet_loader import load_parquet_from_s3
+
+    df = None
+    for prefix in price_cache_read_prefixes(PRICE_CACHE_LEGACY_PREFIX):
+        key = f"{prefix}{yf_symbol}.parquet"
+        try:
+            df = load_parquet_from_s3(s3_client, bucket, key)
+            break
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("NoSuchKey", "404"):
+                continue
+            logger.warning("[metron_market_data] price_cache read failed for %s (%s): %s", yf_symbol, key, exc)
+            return None
+        except Exception as e:
+            logger.warning("[metron_market_data] price_cache parse failed for %s (%s): %s", yf_symbol, key, e)
+            return None
+
+    if df is None or df.empty or "Close" not in df.columns:
+        return None
+
+    import pandas as pd
+
+    cutoff = pd.Timestamp.now(tz="UTC").tz_localize(None) - _period_to_timedelta(period)
+    trimmed = df.loc[df.index >= cutoff, "Close"].dropna()
+    if trimmed.empty:
+        return None
+
+    latest_date = trimmed.index.max().date()
+    ref_day = reference_day or last_closed_trading_day()
+    if not is_fresh_in_trading_days(latest_date, ref_day, max_stale=PRICE_CACHE_MAX_STALE_TRADING_DAYS):
+        logger.info(
+            "[metron_market_data] price_cache stale for %s: latest cached bar %s is %d "
+            "trading day(s) behind %s (max=%d) — routing to yfinance gap-fill instead of "
+            "publishing a stale snapshot",
+            yf_symbol, latest_date.isoformat(), trading_days_stale(latest_date, ref_day),
+            ref_day.isoformat(), PRICE_CACHE_MAX_STALE_TRADING_DAYS,
+        )
+        return None
+
+    return [(d.date().isoformat(), round(float(c), 6)) for d, c in trimmed.items()]
+
+
+def _price_cache_close_history(
+    s3_client: Any, bucket: str, period: str = DEFAULT_HISTORY_PERIOD, *, reference_day: date | None = None,
+) -> "CloseHistorySource":
+    """Build ``collect_history``'s default ``close_history_source`` (config#1865): prefer
+    the already-refreshed ``reference/price_cache/`` parquet (``collectors/prices.py``'s
+    weekly ~903-symbol SP1500-overlap refresh) over an independent yfinance fetch, cutting
+    the duplicate yfinance fan-out ``collect_history`` used to make for every symbol
+    price_cache already covers. yfinance is only called for the gap: symbols price_cache
+    doesn't carry at all, AND (config#1865-followup) symbols price_cache carries but whose
+    cached bar has gone stale (see ``PRICE_CACHE_MAX_STALE_TRADING_DAYS``) — both are
+    "not usably covered this run" and share one fallback path.
+
+    Basis change (Operator decision 2026-07-08, config#1865, resolving the ask in
+    https://github.com/nousergon/alpha-engine-config/issues/1865#issuecomment-4912376677):
+    price_cache is fetched ``auto_adjust=True`` (dividend-adjusted Close). Pre-#1865,
+    close_history was independently fetched ``auto_adjust=False`` (split-adjusted only,
+    NOT dividend-adjusted — see the now-superseded ``_yfinance_close_history``). Sourcing
+    from price_cache means close_history is now dividend-adjusted — a deliberate,
+    documented basis change, not a silent one: downstream consumers (security_performance /
+    risk / attribution) will see return/YTD/volatility/drawdown figures shift on
+    dividend-paying names. The gap-fill fallback uses
+    ``_yfinance_close_history_dividend_adjusted`` (``auto_adjust=True``) — the SAME basis —
+    so a published close_history series is never a split-only/dividend-adjusted chimera.
+
+    Staleness fallback (config#1865-followup, Brian ruling 2026-07-15): price_cache's
+    weekly refresh means a "covered" symbol can silently carry up to a week-old close —
+    unlike the daily-fresh yfinance fetch it replaced. Every symbol's cached bar is checked
+    against ``reference_day`` (defaults to ``nousergon_lib.dates.last_closed_trading_day()``,
+    computed once per call so every symbol in the run is judged against the same session —
+    injectable for tests) and routed to the yfinance gap-fill fallback when stale beyond
+    ``PRICE_CACHE_MAX_STALE_TRADING_DAYS`` trading days, rather than accepting a stale
+    price_cache value with no signal that it happened."""
+    from nousergon_lib.dates import last_closed_trading_day
+
+    ref_day = reference_day or last_closed_trading_day()
+
+    def _source(yf_symbols: list[str]) -> dict[str, list[tuple[str, float]]]:
+        from_cache: dict[str, list[tuple[str, float]]] = {}
+        gaps: list[str] = []
+        for sym in yf_symbols:
+            series = _price_cache_close_series(s3_client, bucket, sym, period, reference_day=ref_day)
+            if series:
+                from_cache[sym] = series
+            else:
+                gaps.append(sym)
+        gap_filled = _yfinance_close_history_dividend_adjusted(gaps, period) if gaps else {}
+        logger.info(
+            "[metron_market_data] close_history: %d/%d symbols from price_cache, "
+            "%d yfinance gap-fill (dividend-adjusted basis, config#1865; includes "
+            "staleness-triggered fallback beyond %d trading day(s), config#1865-followup)",
+            len(from_cache), len(yf_symbols), len(gap_filled), PRICE_CACHE_MAX_STALE_TRADING_DAYS,
+        )
+        return {**from_cache, **gap_filled}
+
+    return _source
 
 
 def _yfinance_fx_history(currencies: list[str], period: str = DEFAULT_HISTORY_PERIOD) -> dict[str, list[tuple[str, float]]]:
@@ -847,8 +1039,23 @@ def collect_history(
     """Write per-symbol close-history + per-currency FX-history artifacts for Metron's
     held universe (Performance NAV reconstruction + as-of-date realized/dividend FX):
 
-        market_data/close_history/{yf_symbol}.json  {schema_version, yf_symbol, currency, closes: [[date, close], …]}
+        market_data/close_history/{yf_symbol}.json  {schema_version, yf_symbol, currency,
+            adjustment_basis, closes: [[date, close], …]}
         market_data/fx_history/{CCY}.json           {schema_version, currency, base, rates: [[date, rate], …]}
+
+    close_history basis (config#1865): sourced primarily from ``reference/price_cache/``
+    (dividend-adjusted — ``auto_adjust=True``), gap-filled via yfinance for symbols
+    price_cache doesn't cover, OR whose cached bar has gone stale beyond
+    ``PRICE_CACHE_MAX_STALE_TRADING_DAYS`` trading days (config#1865-followup — price_cache
+    only refreshes weekly, so "covered" alone is not "current"; a stale symbol is routed to
+    the same gap-fill path as a genuinely uncovered one rather than silently publishing a
+    week-old close). Both use the same dividend-adjusted basis, so the series is never a
+    split-only/dividend-adjusted chimera. This dedups the independent yfinance fetch
+    ``collect_history`` used to make for every symbol against the SP1500-overlap universe
+    ``collectors/prices.py`` already refreshes weekly. Pre-#1865 this was an independent
+    yfinance fetch at ``auto_adjust=False`` (split-only) — see
+    ``_price_cache_close_history``'s docstring for the full basis-change and
+    staleness-fallback rationale (Operator decision 2026-07-08 + Brian ruling 2026-07-15).
 
     Idempotent (full-series overwrite each run). Injectable sources/S3 for tests."""
     if s3_client is None:
@@ -866,7 +1073,7 @@ def collect_history(
     hist_symbols = sorted(
         set(ccy_by_yf) | set(RISK_FACTOR_ETFS) | set(INDEX_PROXY_SYMBOLS) | set(FUND_PROXY_ETFS)
     )
-    closes = (close_history_source or _yfinance_close_history)(hist_symbols)
+    closes = (close_history_source or _price_cache_close_history(s3_client, bucket, period))(hist_symbols)
     fx = (fx_history_source or _yfinance_fx_history)(currencies)
     if dry_run:
         logger.info("[metron_market_data] DRY-RUN history: %d close series, %d fx series", len(closes), len(fx))
@@ -875,11 +1082,22 @@ def collect_history(
         for yf_sym, series in sorted(closes.items()):
             _write_json(s3_client, bucket, f"{CLOSE_HISTORY_PREFIX}{yf_sym}.json", {
                 "schema_version": CLOSE_HISTORY_SCHEMA_VERSION, "yf_symbol": yf_sym,
-                "currency": ccy_by_yf.get(yf_sym, "USD"), "closes": [list(p) for p in series]})
+                "currency": ccy_by_yf.get(yf_sym, "USD"),
+                "adjustment_basis": CLOSE_HISTORY_ADJUSTMENT_BASIS,
+                "closes": [list(p) for p in series]})
         for ccy, series in sorted(fx.items()):
             _write_json(s3_client, bucket, f"{FX_HISTORY_PREFIX}{ccy}.json", {
                 "schema_version": FX_HISTORY_SCHEMA_VERSION, "currency": ccy,
                 "base": BASE_CURRENCY, "rates": [list(p) for p in series]})
+        # Consolidated artifact (metron-ops#233): a single file with all symbols' close
+        # series + currency map, so the consumer reads one S3 get_object instead of N.
+        # Written alongside per-ticker files during the transition period.
+        _write_json(s3_client, bucket, CONSOLIDATED_CLOSE_HISTORY_KEY, {
+            "schema_version": CLOSE_HISTORY_SCHEMA_VERSION,
+            "adjustment_basis": CLOSE_HISTORY_ADJUSTMENT_BASIS,
+            "series": {sym: [list(p) for p in series] for sym, series in closes.items()},
+            "currency": {sym: ccy_by_yf.get(sym, "USD") for sym in closes},
+        })
     except Exception as e:  # fail loud to the phase registry
         logger.error("[metron_market_data] history write failed: %s", e)
         return {"status": "error", "error": str(e)}
@@ -1459,13 +1677,21 @@ def _compute_security_performance(
     if len(rets) >= _MIN_RISK_BARS:
         span_days = (series[-1][0] - series[0][0]).days or 1
         ppy = len(rets) / (span_days / 365.25)
-        out["volatility"] = round(volatility(rets, periods_per_year=ppy), 6)
-        out["sharpe"] = round(sharpe_ratio(rets, periods_per_year=ppy), 4)
-        out["sortino"] = round(sortino_ratio(rets, periods_per_year=ppy), 4)
+        vol = volatility(rets, periods_per_year=ppy)
+        if vol is not None:
+            out["volatility"] = round(vol, 6)
+        sharpe = sharpe_ratio(rets, periods_per_year=ppy)
+        if sharpe is not None:
+            out["sharpe"] = round(sharpe, 4)
+        sortino = sortino_ratio(rets, periods_per_year=ppy)
+        if sortino is not None:
+            out["sortino"] = round(sortino, 4)
         index = [1.0]
         for r in rets:
             index.append(index[-1] * (1.0 + r))
-        out["max_drawdown"] = round(max_drawdown(index), 6)
+        mdd = max_drawdown(index)
+        if mdd is not None:
+            out["max_drawdown"] = round(mdd, 6)
         beta, vs_window = _sp_beta_and_vs_spy(series, spy_series)
         out["beta_vs_spy"] = beta
         out["vs_spy_window"] = vs_window
@@ -1542,6 +1768,90 @@ def collect_security_performance(
 
 # ── Valuation medians (SP1500-broad sector & country peer benchmark) ──────────
 
+# Country-specific iShares MSCI ETFs whose yfinance ``top_holdings`` serve as a
+# proxy universe for ex-US large-cap stocks in the country-valuation-medians
+# benchmark (metron-ops#222 / Option A — extend yfinance collection). Each ETF's
+# top 10 holdings are unioned into the medians universe so a non-US holding
+# benchmarks against its actual country peers rather than the SP1500-only
+# (US-domiciled) default that leaves non-US country buckets thin or empty.
+#
+# Selected symbols cover the majority of MSCI EAFE developed-market weight by
+# market cap. Fail-soft per ETF: a ticker that yfinance can't resolve makes no
+# contribution; a country whose ETF is temporarily unreachable falls back to
+# whatever the held universe provides that country.
+_EAFE_COUNTRY_ETFS: dict[str, str] = {
+    "EWJ": "Japan",
+    "EWU": "United Kingdom",
+    "EWG": "Germany",
+    "EWQ": "France",
+    "EWL": "Switzerland",
+    "EWA": "Australia",
+    "EWC": "Canada",
+    "EWH": "Hong Kong",
+    "EIS": "Israel",
+}
+
+
+def _eafe_tickers() -> set[str]:
+    """Derive an ex-US large-cap proxy ticker set from country-ETF top holdings.
+
+    Reads the top 10 holdings of each country-specific iShares MSCI ETF in
+    ``_EAFE_COUNTRY_ETFS`` via yfinance ``funds_data.top_holdings`` — ~9 ETFs →
+    ~90 stock tickers across the major developed-market countries the MSCI EAFE
+    index represents. These supplement the SP1500-broad medians universe so a
+    non-US holding's country-median benchmark draws from a meaningful set of
+    country peers rather than falling through to the US-domiciled-only default.
+
+    Fail-soft per ETF: a transient yfinance miss on one country degrades to
+    whatever subset was successfully fetched; all failures return ``set()`` (no
+    ex-US contribution, logged). Never raises.
+
+    yfinance alone is the entire data path (Option A mandate — no new provider,
+    no paid feed). The top-holdings data is the same source the existing
+    ``yf.Ticker(sym).info`` fetcher reads; the ~9 light-weight fund_data calls
+    (~2 s each, sequential rate-limited) add negligible latency to the weekly
+    valuation-medians pass compared to the per-ticker ~900-name info fan-out.
+    """
+    import yfinance as yf
+
+    result: set[str] = set()
+    n_success = 0
+    for etf, country in sorted(_EAFE_COUNTRY_ETFS.items()):
+        try:
+            t = yf.Ticker(etf)
+            th = t.funds_data.top_holdings
+            if th is not None and len(th) > 0:
+                symbols = {str(s).strip() for s in th.index if s and str(s).strip()}
+                result.update(symbols)
+                n_success += 1
+                logger.info(
+                    "[metron_market_data] eafe_tickers: %d tickers from %s (%s)",
+                    len(symbols), etf, country,
+                )
+            else:
+                logger.warning(
+                    "[metron_market_data] eafe_tickers: empty holdings for %s (%s)",
+                    etf, country,
+                )
+        except Exception as e:  # noqa: BLE001 — fail-soft per ETF; one country's miss degrades to the rest
+            logger.warning(
+                "[metron_market_data] eafe_tickers: failed to fetch %s (%s): %s",
+                etf, country, e,
+            )
+
+    if result:
+        logger.info(
+            "[metron_market_data] eafe_tickers: %d total tickers from %d/%d country ETFs",
+            len(result), n_success, len(_EAFE_COUNTRY_ETFS),
+        )
+    else:
+        logger.warning(
+            "[metron_market_data] eafe_tickers: no tickers fetched — ex-US country "
+            "medians will fall back to the current SP1500-only benchmark",
+        )
+    return result
+
+
 # camelCase yfinance .info key → snake_case median output field (the consumer maps these
 # 1:1 to the per-holding multiple, so band and row are directly comparable).
 _MEDIAN_OUT_NAME = {
@@ -1588,9 +1898,22 @@ def _yfinance_valuation(yf_symbols: list[str]) -> dict[str, dict]:
 
 
 def _default_medians_universe(bucket: str, s3_client: Any) -> list[str]:
-    """The broad benchmark universe = SP1500 ∪ Metron held/watchlist (``load_price_derived_universe``)."""
+    """The broad benchmark universe = SP1500 ∪ Metron held/watchlist ∪ EAFE proxy.
+
+    SP1500 and the Metron universe are loaded from S3 via ``load_price_derived_universe``
+    (fail-soft to empty). The EAFE proxy tickers are derived live from country-ETF top
+    holdings (``_eafe_tickers``, fail-soft to empty) — a yfinance-only extension that
+    fills the ex-US large-cap gap in ``by_country`` medians (metron-ops#222)."""
     holdings, _ = load_price_derived_universe(bucket, s3_client)
-    return [h["yf_symbol"] for h in holdings]
+    sp1500_symbols = {h["yf_symbol"] for h in holdings}
+    eafe = _eafe_tickers()
+    all_symbols = sorted(sp1500_symbols | eafe)
+    if eafe:
+        logger.info(
+            "[metron_market_data] medians universe: %d SP1500 ∪ %d EAFE proxy = %d total",
+            len(sp1500_symbols), len(eafe), len(all_symbols),
+        )
+    return all_symbols
 
 
 def _grouped_medians(rows: list[dict], group_key: str) -> dict[str, dict]:
@@ -1774,6 +2097,45 @@ def _flag_suspect_quotes(quotes: dict[str, dict]) -> int:
     return n_suspect
 
 
+# Cross-source scale-coherence bounds (metron-ops#159 — MARUY intraday quote landed at
+# 30.17 against a settled EOD close of 308.40, a 10.2:1 ADR-ratio-scale divergence). The
+# >40% move guard above compares a quote only to ITS OWN prior tick from the SAME
+# yfinance intraday pull — so when yfinance's live quote and its own recent-session bars
+# both silently shift onto a new scale together (an ADR ratio change the live feed picked
+# up that the settled-close run, fetched at a different time, hasn't), `last` and
+# `prev_close` agree with EACH OTHER and the move guard sees nothing wrong. Mirrors
+# metron's consumer-side guard (api/services/intraday.py `_COHERENCE_RATIO_BOUNDS`) but
+# runs at the SOURCE against THIS producer's own settled ``eod_closes`` artifact, so a
+# wrong-scale quote is flagged for every consumer of the spine, not just Metron.
+_SCALE_COHERENCE_RATIO_BOUNDS = (0.5, 2.0)
+
+
+def _flag_scale_incoherent_quotes(quotes: dict[str, dict], eod_closes: dict[str, dict]) -> int:
+    """Flag (never drop) any quote whose implied move vs THIS producer's own settled EOD
+    close (``eod_closes``, the ``market_data/eod_closes/latest.json`` artifact this module
+    also publishes) falls outside ``_SCALE_COHERENCE_RATIO_BOUNDS`` — a real single-session
+    move that large is rare enough that it's overwhelmingly a wrong-scale quote (ADR ratio
+    change, pence-vs-pounds, symbol collision). Symbols with no settled close on file are
+    skipped (nothing to cross-check against). Marks ``suspect: true`` in place and returns
+    the count newly flagged (a quote already suspect from the move guard isn't double
+    counted)."""
+    n_suspect = 0
+    lo, hi = _SCALE_COHERENCE_RATIO_BOUNDS
+    for sym, q in quotes.items():
+        eod = eod_closes.get(sym)
+        settled = (eod or {}).get("close")
+        last = q.get("last")
+        if not settled or last is None:
+            continue
+        ratio = last / settled
+        if not (lo <= ratio <= hi):
+            already = q.get("suspect", False)
+            q["suspect"] = True
+            if not already:
+                n_suspect += 1
+    return n_suspect
+
+
 def collect_intraday(
     *, bucket: str = DEFAULT_BUCKET, dry_run: bool = False, s3_client: Any = None,
     intraday_source: IntradaySource | None = None, force: bool = False,
@@ -1799,8 +2161,11 @@ def collect_intraday(
     for manual runs). The major-index ETF proxies (``INDEX_PROXY_SYMBOLS``) are market
     context — fetched every run regardless of the held universe, so a brand-new account
     still gets the markets strip. A quote moving >40% vs prior close carries
-    ``suspect: true`` (flagged, never dropped). Single ``latest.json`` key — consumers see
-    staleness via ``as_of_utc``. Injectable source/S3 for tests."""
+    ``suspect: true`` (flagged, never dropped); a held quote whose scale disagrees with
+    this producer's own settled EOD close (metron-ops#159) is flagged the same way, even
+    when the move guard alone would miss it (see ``_flag_scale_incoherent_quotes``).
+    Single ``latest.json`` key — consumers see staleness via ``as_of_utc``. Injectable
+    source/S3 for tests."""
     if not force and not in_us_market_window(now):
         return {"status": "skipped", "reason": "outside US market window"}
     if s3_client is None:
@@ -1833,6 +2198,17 @@ def collect_intraday(
     n_suspect = _flag_suspect_quotes(quotes) + _flag_suspect_quotes(indices) + _flag_suspect_quotes(fund_proxies)
     if n_suspect:
         logger.warning("[metron_market_data] %d intraday quote(s) flagged suspect (>40%% vs prev close)", n_suspect)
+
+    # Cross-source scale-coherence check (metron-ops#159): compare each held quote against
+    # THIS producer's own settled EOD close (already published, so no extra fetch). Fail-soft
+    # — a missing/unreadable eod_closes artifact just skips the check (nothing to flag yet).
+    eod_closes = (_read_json(s3_client, bucket, f"{CLOSES_PREFIX}latest.json") or {}).get("closes", {})
+    n_scale_suspect = _flag_scale_incoherent_quotes(quotes, eod_closes)
+    if n_scale_suspect:
+        logger.warning(
+            "[metron_market_data] %d intraday quote(s) flagged suspect (scale-incoherent vs settled close)",
+            n_scale_suspect,
+        )
     artifact = {
         "schema_version": INTRADAY_SCHEMA_VERSION,
         "as_of_utc": (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ"),

@@ -58,15 +58,32 @@ def _data_repo_entrypoints() -> dict[str, list[str]]:
 def test_known_data_entrypoints_in_scope():
     # RunDailyNews removed (alpha-engine-config#1089) — the standalone 04:00
     # daily-news chain now produces the artifact, so it is no longer a weekday-SF
-    # data-repo entrypoint. MorningEnrich + MorningArcticAppend + ChronicGapSelfHeal
-    # remain (they pull alpha-engine-data and run from its venv).
+    # data-repo entrypoint.
+    #
+    # config#1767 (Phase 2): MorningEnrich + MorningArcticAppend were relocated OFF
+    # the on-trading SSM path onto the ephemeral data spot (the spot bootstrap in
+    # infrastructure/lambdas/data-spot-dispatcher/index.py clones + venvs the data
+    # repo there). They are therefore no longer on-trading ssm:sendCommand
+    # entrypoints in this SF.
+    #
+    # alpha-engine-config-I2717 (2026-07-16): ChronicGapSelfHeal — the last
+    # remaining on-trading data-repo entrypoint this test used to pin — was
+    # ALSO removed (moved to the standalone --daily-heal job, on its own
+    # ephemeral spot box that clones fresh rather than pulling a persistent
+    # checkout, so it is out of scope for this detector by construction, same
+    # as the data-spot-dispatcher's other workloads). The weekday SF now has
+    # ZERO on-trading data-repo entrypoints in this detector's scope — this is
+    # the expected end state of config#1767 + I2717's cumulative decoupling,
+    # not a detection regression.
     eps = set(_data_repo_entrypoints())
-    # config#1807: MorningEnrich / MorningArcticAppend / ChronicGapSelfHeal
-    # moved to the daily data spot (fresh clone + fresh deps per bootstrap
-    # — no pull->stale-venv window remains), so NO daily-SF state is a
-    # data-venv entrypoint today. The detector + parametrized heal test
-    # stay armed for any future re-addition.
-    assert eps == set(), sorted(eps)
+    assert eps == set(), (
+        f"expected NO on-trading data-repo entrypoints left in the weekday SF "
+        f"(all moved to spot boxes), found: {sorted(eps)}"
+    )
+    # Guard the relocation: the moved states must NOT be on-trading entrypoints.
+    assert "MorningEnrich" not in eps
+    assert "MorningArcticAppend" not in eps
+    assert "ChronicGapSelfHeal" not in eps
 
 
 @pytest.mark.parametrize("name", sorted(_data_repo_entrypoints()))

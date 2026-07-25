@@ -140,6 +140,13 @@ FEATURES = [
     "sector_vs_spy_5d",
     "sector_vs_spy_10d",
     "sector_vs_spy_20d",
+    # config#934 — sub-sector benchmark-relative momentum. Same shape/math as
+    # sector_vs_spy_* one GICS level finer: the sub-sector ETF's (SMH/IGV/
+    # XBI/…) excess return over SPY, falling back to the sector ETF (so ==
+    # sector_vs_spy_*) for sub-industries with no liquid proxy.
+    "sub_sector_vs_benchmark_5d",
+    "sub_sector_vs_benchmark_10d",
+    "sub_sector_vs_benchmark_20d",
     # v1.3 additions — macro regime features
     "yield_10y",
     "yield_curve_slope",
@@ -251,6 +258,25 @@ FEATURES = [
     # emitted by apply_factor_zscores (log pre-transform registered in
     # cross_sectional.FACTOR_LOADING_TRANSFORMS). Barra SIZE loading.
     "size_zscore",
+    # config#939 — feature gaps: VWAP divergence, buying/selling pressure,
+    # credit spreads. NaN-safe optional-input features (like beta_60d /
+    # hy_oas_credit_spread_pct below): propagate NaN rather than crash when
+    # the upstream input is unavailable (VWAP is NaN for yfinance-fallback
+    # rows and during the documented 2026-04-17→23 Polygon outage).
+    "vwap_divergence_pct",
+    # Chaikin Money Flow (20d) — buying/selling pressure. Bounded ~[-1, 1]
+    # dimensionless ratio of volume-weighted close-location-value sums.
+    "cmf_20_ratio",
+    # hy_oas_credit_spread_pct: ICE BofA US HY Index OAS (FRED
+    # BAMLH0A0HYM2), percent. Per-ticker/date credit-spread level feature
+    # (identical across tickers on a given day — macro group). Deliberately
+    # named DISTINCT from crucible-predictor's regime_predictor.py
+    # ``hy_oas_level`` / ``hy_oas_change_21d`` (a SEPARATE market-wide
+    # regime-substrate feature family sourced from its own HYOAS.parquet
+    # cache, consumed only via cfg.MACRO_NORM_FEATURES) — same underlying
+    # FRED series, different namespace/consumer/compute path, so the names
+    # must not collide.
+    "hy_oas_credit_spread_pct",
 ]
 
 MIN_ROWS_FOR_FEATURES = 265  # 252 warmup + buffer
@@ -302,6 +328,7 @@ def compute_features(
     spy_series: pd.Series | None = None,
     vix_series: pd.Series | None = None,
     sector_etf_series: pd.Series | None = None,
+    sub_sector_etf_series: pd.Series | None = None,
     tnx_series: pd.Series | None = None,
     irx_series: pd.Series | None = None,
     gld_series: pd.Series | None = None,
@@ -312,6 +339,7 @@ def compute_features(
     fundamental_data: dict | None = None,
     vix3m_series: pd.Series | None = None,
     xsect_dispersion: pd.Series | None = None,
+    hyoas_series: pd.Series | None = None,
     close_col: str = "Close",
 ) -> pd.DataFrame:
     """
@@ -334,6 +362,11 @@ def compute_features(
     spy_series : SPY Close prices (DatetimeIndex).
     vix_series : VIX Close prices (DatetimeIndex).
     sector_etf_series : Sector ETF Close prices (DatetimeIndex).
+    sub_sector_etf_series : Sub-sector benchmark ETF Close prices
+        (DatetimeIndex), e.g. SMH for a Semiconductors ticker (config#934).
+        Resolved by the caller from ``sub_sector_etf_map`` — falls back to
+        the ticker's sector ETF for sub-industries with no liquid proxy, in
+        which case ``sub_sector_vs_benchmark_*`` equals ``sector_vs_spy_*``.
     tnx_series : 10Y Treasury yield in percent (DatetimeIndex).
     irx_series : 3M T-bill yield in percent (DatetimeIndex).
     gld_series : GLD Close prices (DatetimeIndex).
@@ -344,6 +377,10 @@ def compute_features(
     fundamental_data : dict with keys: pe_ratio, pb_ratio, etc.
     vix3m_series : VIX3M Close prices (DatetimeIndex).
     xsect_dispersion : Cross-sectional dispersion Series (DatetimeIndex).
+    hyoas_series : ICE BofA US HY Index OAS, FRED series BAMLH0A0HYM2, in
+        percent (DatetimeIndex). License-gated to 2023+ on FRED — rows
+        before the series' first observation fall back to the neutral
+        default like the other optional macro inputs (see hy_oas_credit_spread_pct).
 
     Returns
     -------
@@ -558,6 +595,34 @@ def compute_features(
         df["sector_vs_spy_10d"] = 0.0
         df["sector_vs_spy_20d"] = 0.0
 
+    # Sub-sector benchmark ETF vs SPY (5d/10d/20d) — config#934. Mirrors the
+    # sector_vs_spy block above EXACTLY (same horizons, same math): the
+    # sub-sector benchmark ETF's excess return over SPY. The caller resolves
+    # the ETF from sub_sector_etf_map, which falls back to the ticker's
+    # sector ETF when the GICS sub-industry has no liquid proxy — so in the
+    # fallback case sub_sector_etf_series IS sector_etf_series and these
+    # columns equal sector_vs_spy_*, one level finer otherwise (e.g. SMH for
+    # a Semiconductors name vs. the whole-Tech XLK).
+    if sub_sector_etf_series is not None:
+        subsec_aligned = sub_sector_etf_series.reindex(df.index)
+        subsec_mom_5d = (subsec_aligned / subsec_aligned.shift(_mom_short)) - 1.0
+        subsec_mom_10d = (subsec_aligned / subsec_aligned.shift(10)) - 1.0
+        subsec_mom_20d = (subsec_aligned / subsec_aligned.shift(_mom_long)) - 1.0
+        if spy_mom_5d is not None:
+            spy_mom_10d = (spy_aligned / spy_aligned.shift(10)) - 1.0
+            spy_mom_20d = (spy_aligned / spy_aligned.shift(_mom_long)) - 1.0
+            df["sub_sector_vs_benchmark_5d"] = subsec_mom_5d - spy_mom_5d
+            df["sub_sector_vs_benchmark_10d"] = subsec_mom_10d - spy_mom_10d
+            df["sub_sector_vs_benchmark_20d"] = subsec_mom_20d - spy_mom_20d
+        else:
+            df["sub_sector_vs_benchmark_5d"] = subsec_mom_5d
+            df["sub_sector_vs_benchmark_10d"] = subsec_mom_10d
+            df["sub_sector_vs_benchmark_20d"] = subsec_mom_20d
+    else:
+        df["sub_sector_vs_benchmark_5d"] = 0.0
+        df["sub_sector_vs_benchmark_10d"] = 0.0
+        df["sub_sector_vs_benchmark_20d"] = 0.0
+
     # ── v1.3 features — macro regime ──────────────────────────────────────────
 
     # yield_10y
@@ -592,6 +657,18 @@ def compute_features(
         df["oil_mom_5d"] = df["oil_mom_5d"].fillna(0.0)
     else:
         df["oil_mom_5d"] = 0.0
+
+    # hy_oas_credit_spread_pct (config#939) — ICE BofA US HY Index OAS,
+    # FRED BAMLH0A0HYM2, percent. License-gated to 2023+ on FRED, so
+    # pre-2023 rows (and any date before hyoas_series' first observation)
+    # naturally ffill to NaN via reindex — fillna(0.0) below applies the
+    # same neutral-default-fallback pattern already used for gold_mom_5d /
+    # oil_mom_5d rather than hard-failing on missing history.
+    if hyoas_series is not None:
+        hyoas_aligned = hyoas_series.reindex(df.index, method="ffill")
+        df["hy_oas_credit_spread_pct"] = hyoas_aligned.fillna(0.0)
+    else:
+        df["hy_oas_credit_spread_pct"] = 0.0
 
     # ── v1.6 features — investigation upgrades (A2) ─────────────────────────
 
@@ -640,6 +717,20 @@ def compute_features(
     # a vol-term-structure signal (steep upward slope = vol expansion;
     # flat / inverted = mean-revert regime).
     df["realized_vol_63d"] = daily_returns.rolling(63).std() * np.sqrt(_52w)
+
+    # vwap_divergence_pct (config#939) — (Close - VWAP) / VWAP. VWAP is a
+    # first-class OHLCV column (store/arctic_store.py OHLCV_COLS) sourced
+    # from Polygon's `vw` field; it is NaN for yfinance-fallback rows and
+    # during the documented 2026-04-17→23 Polygon outage. No column at all
+    # is also possible (pre-VWAP-migration frames) — mirror the
+    # High/Low-optional guard above rather than crash. Division by a
+    # (rare) zero VWAP is guarded the same way volume_trend/obv_slope_10d
+    # guard a zero divisor; both paths propagate NaN, never raise.
+    if "VWAP" in df.columns:
+        vwap = df["VWAP"].astype(float)
+        df["vwap_divergence_pct"] = (close - vwap) / vwap.replace(0, float("nan"))
+    else:
+        df["vwap_divergence_pct"] = float("nan")
 
     # ── v3.2: Per-ticker risk features (Stage 2 regime-conditioning rebuild) ──
     # Four institutional risk dimensions that capture cross-sectional
@@ -759,6 +850,25 @@ def compute_features(
 
     # volume_price_div
     df["volume_price_div"] = np.sign(df["volume_trend"] - 1.0) * np.sign(df["momentum_5d"])
+
+    # cmf_20_ratio (config#939) — Chaikin Money Flow, buying/selling
+    # pressure. MFM (money flow multiplier) is the close's position within
+    # the day's H-L range, signed: +1 at the high, -1 at the low. Guard
+    # High==Low (e.g. halted / illiquid sessions) the same way
+    # volume_trend / obv_slope_10d guard a zero divisor — .replace(0, nan)
+    # so a degenerate day contributes NaN to the sum rather than a
+    # division blow-up. CMF_20 = rolling_SUM(MFM*Volume, 20) /
+    # rolling_SUM(Volume, 20) — bounded ~[-1, 1] by construction. NOTE:
+    # this is a rolling SUM denominator, not the rolling MEAN `vol_20`
+    # used by volume_trend/obv_slope_10d above — reusing that mean here
+    # would inflate CMF by ~20x and break the bounded range.
+    mfm = ((close - low) - (high - close)) / (high - low).replace(0, float("nan"))
+    mfv = mfm * volume
+    vol_sum_20 = volume.rolling(_vol_slow, min_periods=_vol_slow).sum()
+    df["cmf_20_ratio"] = (
+        mfv.rolling(_vol_slow, min_periods=_vol_slow).sum()
+        / vol_sum_20.replace(0, float("nan"))
+    )
 
     # ── v1.5 features — regime interaction terms ───────────────────────────────
 

@@ -14,6 +14,15 @@ logger = logging.getLogger(__name__)
 _FLOW_DOCTOR_BY_NAME: dict[str, Any | None] = {}
 _INIT_ATTEMPTED: set[str] = set()
 
+# Deterministic backstop (config#2208): callers that thread `owner_repo`
+# through `context` (e.g. freshness-monitor) get this chokepoint refused
+# regardless of test-suite stubbing state, so fixture data can never page a
+# real Telegram channel even if a test forgets to mock this module. This is
+# a belt on top of — not a substitute for — hermetic test stubbing: it only
+# fires for the `owner_repo` values test fixtures actually use, and only
+# when a caller passes `owner_repo` in `context` at all.
+TEST_NAMESPACE_OWNER_REPOS = frozenset({"ae-test", "alpha-engine-test"})
+
 
 def reset_flow_doctor_cache() -> None:
     """Test hook — clear lazy-init state between handler invocations."""
@@ -35,7 +44,15 @@ def build_flow_doctor_config(
         "repo": repo,
         "owner": "@brianmcmahon",
         "notify": fleet_telegram_notifier_dicts(topics),
-        "store": {"type": "sqlite", "path": f"/tmp/{db_basename}.db"},
+        # DynamoDB, not local SQLite — dedup cooldowns must survive across
+        # separate Lambda invocations (a fresh cold start gets an empty /tmp
+        # every time, so SQLite there can never dedup cross-invocation;
+        # config#2418, mirrors the data-collector flow-doctor.yaml fix in
+        # #790/I2417). Table provisioned out-of-band (PAY_PER_REQUEST);
+        # runtime role only needs CRUD, not CreateTable — see
+        # infrastructure/iam/alpha-engine-data-role.json and each fleet
+        # Lambda's own iam-policy.json FlowDoctorDedupStore statement.
+        "store": {"type": "dynamodb", "table_name": "flow-doctor-store", "region": "us-east-1"},
         "dedup_cooldown_minutes": 1,
         "rate_limits": {"max_alerts_per_day": 100},
     }
@@ -95,10 +112,36 @@ def notify_via_flow_doctor(
     flow_name: str,
     topics: Sequence[Any],
     db_basename: str,
+    source: Optional[str] = None,
     context: Optional[Dict[str, Any]] = None,
     silent_topic: Any | None = None,
 ) -> bool:
-    """Route ``text`` through flow-doctor forum topics; fallback to ``send_message``."""
+    """Route ``text`` through flow-doctor forum topics; fallback to ``send_message``.
+
+    Args:
+        text: Notification body text.
+        silent: If True, send with notifications suppressed (Telegram silent).
+        severity: One of ``critical``, ``error``, ``warning``, ``info``.
+        dedup_key: Stable dedup key for cross-invocation cooldown.
+        flow_name: Flow doctor flow name.
+        topics: Telegram topic routing.
+        db_basename: Flow doctor store basename.
+        source: Explicit event source override. When set, ``KREPIS_EVENT_SOURCE``
+            is temporarily scoped so ``emit_alert_event``'s ``_resolve_source``
+            picks it up instead of falling through to ``AWS_LAMBDA_FUNCTION_NAME``.
+            If omitted, the caller's Lambda function name is used (the default
+            krepis behavior).
+        context: Arbitrary key-value metadata.
+        silent_topic: Optional topic for silent notifications when ``silent`` is True.
+    """
+    owner_repo = (context or {}).get("owner_repo")
+    if owner_repo in TEST_NAMESPACE_OWNER_REPOS:
+        logger.warning(
+            "notify_via_flow_doctor: refusing to dispatch — owner_repo=%r is a "
+            "test-fixture namespace (config#2208 deterministic backstop)",
+            owner_repo,
+        )
+        return False
     fd = get_flow_doctor(flow_name, topics, db_basename=db_basename)
     if fd is None:
         return send_message(text, disable_notification=silent)
@@ -110,11 +153,22 @@ def notify_via_flow_doctor(
         if notifier is not None:
             return notifier.send_raw(text, disable_notification=True) is not None
 
-    report_id = fd.notify_event(
-        subject,
-        body=None,
-        severity=severity,
-        context=context or {},
-        dedup_key=dedup_key,
-    )
+    # Scope the event source so krepis's _resolve_source picks up the
+    # explicit override instead of falling through to AWS_LAMBDA_FUNCTION_NAME.
+    old_source = os.environ.pop("KREPIS_EVENT_SOURCE", None)
+    if source is not None:
+        os.environ["KREPIS_EVENT_SOURCE"] = source
+    try:
+        report_id = fd.notify_event(
+            subject,
+            body=None,
+            severity=severity,
+            context=context or {},
+            dedup_key=dedup_key,
+        )
+    finally:
+        if old_source is not None:
+            os.environ["KREPIS_EVENT_SOURCE"] = old_source
+        elif source is not None:
+            os.environ.pop("KREPIS_EVENT_SOURCE", None)
     return report_id is not None

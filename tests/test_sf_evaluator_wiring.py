@@ -129,6 +129,19 @@ class TestEvaluatorTask:
         cmds = extract_commands(states["Evaluator"])
         spot_cmd = next(c for c in cmds if "spot_backtest.sh" in c)
         assert "--skip-stages=backtest,parity" in spot_cmd
+        # 2026-07-20: pit_parity was the ONE stage no SF state's flags
+        # excluded here — the three backtest states pass --no-pit-parity and
+        # Parity owns it via --pit-parity-enabled=1, but the Evaluator was
+        # forgotten, so the config#2871 pit-parity sweep (which does not
+        # marker-skip) re-ran a 2h predictor-sim walkforward inside the
+        # Evaluator's budget and SIGKILLed it twice
+        # (watch-rerun-2026-07-18-10/-11). Single-producer decomposition:
+        # alpha-engine-config-I3112.
+        assert "--no-pit-parity" in spot_cmd, (
+            "Evaluator must pass --no-pit-parity (Parity owns pit_parity); "
+            "without it the pit-parity sweep free-rides in the Evaluator's "
+            "timeout budget"
+        )
 
     def test_writes_to_evaluator_log(self, states):
         # Tee output into /var/log/evaluator.log so it's distinguishable
@@ -138,30 +151,46 @@ class TestEvaluatorTask:
         spot_cmd = next(c for c in cmds if "spot_backtest.sh" in c)
         assert "/var/log/evaluator.log" in spot_cmd
 
-    def test_timeout_is_60_min(self, states):
-        # Evaluator runtime is ~30 min for full mode (per evaluate.py
-        # historical runs). 3600s ceiling gives 2x headroom + bootstrap.
-        assert states["Evaluator"]["Parameters"]["TimeoutSeconds"] == 3600
+    def test_timeout_is_120_min_sibling_parity(self, states):
+        # 2026-07-20: the 3600s ceiling SIGKILLed (rc=137, exactly
+        # PT1H0.029S) a legitimately-working evaluator run — the eval body
+        # outgrew its hour once config#3031's deps fix let it actually run
+        # (bigger deps install + refreshed champion-feed parquet). Bumped to
+        # 7200s = parity with every sibling backtest-family stage
+        # (Backtester/PredictorBacktest/PortfolioOptimizerBacktest/Parity).
+        # Structural follow-up (universe-size-derived per-stage budgets):
+        # config#3095.
+        assert states["Evaluator"]["Parameters"]["Parameters"]["executionTimeout"] == ["7200"]
+        assert states["Evaluator"]["Parameters"]["TimeoutSeconds"] == 7200
         # SF state TimeoutSeconds wraps with +60s safety buffer (matches
         # Backtester's 7200/7260 ratio).
-        assert states["Evaluator"]["TimeoutSeconds"] == 3660
+        assert states["Evaluator"]["TimeoutSeconds"] == 7260
 
     def test_retry_mirrors_backtester_posture(self, states):
-        # Spot interruption handling: 2 attempts, 180s initial backoff,
-        # 2.0x multiplier — matches Backtester for symmetry.
+        # config#2279: both Evaluator and Backtester now carry the declared
+        # spot-stage gold ladder (4+2 jittered) — symmetry preserved; the
+        # exact ladder shape is pinned centrally in
+        # test_sf_retry_ladder_convention.py.
+        def _sig(state):
+            return [
+                {k: v for k, v in rule.items() if k != "Comment"}
+                for rule in state["Retry"]
+            ]
+        assert _sig(states["Evaluator"]) == _sig(states["Backtester"])
         retry = states["Evaluator"]["Retry"][0]
-        assert retry["MaxAttempts"] == 2
-        assert retry["IntervalSeconds"] == 180
-        assert retry["BackoffRate"] == 2.0
+        assert retry["MaxAttempts"] == 4
+        assert retry["JitterStrategy"] == "FULL"
 
     def test_catch_routes_to_handle_failure(self, states):
         # Evaluator failure halts the pipeline (unlike eval-judge which
         # is observability-only). The optimizer auto-apply contract
         # means a silent evaluator failure could leave stale configs in
-        # production — fail loud.
+        # production — fail loud. config#1819: routes through
+        # NormalizeFailureContext (the single chokepoint in front of
+        # HandleFailure) rather than HandleFailure directly.
         catch = states["Evaluator"]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
-        assert catch["Next"] == "HandleFailure"
+        assert catch["Next"] == "NormalizeFailureContext"
 
 
 # ── Poll loop ─────────────────────────────────────────────────────────────
@@ -218,4 +247,6 @@ class TestExtractEvaluatorError:
         assert params["poll.$"] == "$.evaluator_poll"
 
     def test_routes_to_handle_failure(self, states):
-        assert states["ExtractEvaluatorError"]["Next"] == "HandleFailure"
+        # config#1819: routes through NormalizeFailureContext, not HandleFailure
+        # directly (was HandleFailure pre-fix).
+        assert states["ExtractEvaluatorError"]["Next"] == "NormalizeFailureContext"

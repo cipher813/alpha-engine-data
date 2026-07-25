@@ -29,10 +29,36 @@
       "Resource": "arn:aws:s3:::alpha-engine-research/_freshness_monitor/check_results.json"
     },
     {
+      "Sid": "ListFreshnessMonitorPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["_freshness_monitor/*"]
+        }
+      }
+    },
+    {
       "Sid": "WriteIntegrityMarker",
       "Effect": "Allow",
       "Action": ["s3:PutObject"],
       "Resource": "arn:aws:s3:::alpha-engine-research/consolidated/saturday_integrity/*"
+    },
+    {
+      "Sid": "FlowDoctorDedupStore",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PutItem",
+        "dynamodb:GetItem",
+        "dynamodb:Query",
+        "dynamodb:Scan",
+        "dynamodb:DescribeTable"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:us-east-1:711398986525:table/flow-doctor-store",
+        "arn:aws:dynamodb:us-east-1:711398986525:table/flow-doctor-store/index/*"
+      ]
     }
   ]
 }

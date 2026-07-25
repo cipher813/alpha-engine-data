@@ -120,7 +120,11 @@ class TestChainOrdering:
     CheckSkipEvaluator (existing downstream unchanged)."""
 
     def test_skip_backtester_default_runs_backtester(self, states):
-        assert states["CheckSkipBacktester"]["Default"] == "Backtester"
+        # config#2362 Option A: CheckSkipBacktester's Default now falls
+        # through the additive CheckSkipBacktesterStageOnly gate before
+        # Backtester (still runs Backtester on a scheduled/normal run).
+        assert states["CheckSkipBacktester"]["Default"] == "CheckSkipBacktesterStageOnly"
+        assert states["CheckSkipBacktesterStageOnly"]["Default"] == "Backtester"
 
     def test_skip_backtester_whole_pair_routes_to_evaluator_skipgate(self, states):
         """{"skip_backtester": true} keeps its original whole-pair
@@ -236,6 +240,7 @@ class TestChainOrdering:
             return (
                 name is None
                 or name.startswith("Extract")
+                or name.startswith("NormalizeFailureContext")
                 or name.endswith("Wait")
                 or name.endswith("RetryGate")
                 or name.endswith("Reissue")
@@ -376,9 +381,10 @@ class TestBudgetParity:
 
 
 class TestCatchSemantics:
-    """Both new Task states must Catch States.ALL → HandleFailure with
-    ResultPath $.error, exactly like the Backtester quartet (the SF halts
-    on infra failure of these states)."""
+    """Both new Task states must Catch States.ALL → NormalizeFailureContext
+    (config#1819: the single chokepoint in front of HandleFailure, was
+    HandleFailure directly pre-fix) with ResultPath $.error, exactly like the
+    Backtester quartet (the SF halts on infra failure of these states)."""
 
     @pytest.mark.parametrize("name", ["Parity", "WaitForParity"])
     def test_catch_routes_to_handle_failure(self, states, name):
@@ -386,16 +392,16 @@ class TestCatchSemantics:
         assert len(catches) >= 1
         for c in catches:
             assert c["ErrorEquals"] == ["States.ALL"]
-            assert c["Next"] == "HandleFailure"
+            assert c["Next"] == "NormalizeFailureContext"
             assert c["ResultPath"] == "$.error"
 
     def test_backtester_still_catches_handle_failure(self, states):
         """Regression guard — the kept Backtester state must keep its
-        HandleFailure Catch through this split."""
+        NormalizeFailureContext Catch through this split."""
         catches = states["Backtester"]["Catch"]
         assert any(
             c["ErrorEquals"] == ["States.ALL"]
-            and c["Next"] == "HandleFailure"
+            and c["Next"] == "NormalizeFailureContext"
             and c["ResultPath"] == "$.error"
             for c in catches
         )
@@ -404,7 +410,7 @@ class TestCatchSemantics:
         st = states["ExtractParityError"]
         assert st["Type"] == "Pass"
         assert st["ResultPath"] == "$.error"
-        assert st["Next"] == "HandleFailure"
+        assert st["Next"] == "NormalizeFailureContext"
         assert st["Parameters"]["phase"] == "Parity"
 
 
@@ -514,10 +520,12 @@ class TestL4472PhaseSplit:
         ["PredictorBacktest", "PortfolioOptimizerBacktest"],
     )
     def test_new_task_catches_handle_failure(self, states, name):
+        # config#1819: routes through NormalizeFailureContext, not
+        # HandleFailure directly (was HandleFailure pre-fix).
         catches = states[name]["Catch"]
         assert any(
             c["ErrorEquals"] == ["States.ALL"]
-            and c["Next"] == "HandleFailure"
+            and c["Next"] == "NormalizeFailureContext"
             and c["ResultPath"] == "$.error"
             for c in catches
         )

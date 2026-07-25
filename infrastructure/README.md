@@ -50,3 +50,97 @@ input contracts are pinned by `tests/test_run_weekly_offcycle.py`.
 
 Holiday-week recipe (e.g. Juneteenth Fri): `shell` first → wait for
 SUCCEEDED → `full` (they share the t3.small box, so run sequentially).
+
+## Non-redrivable by design — `ne-weekly-freshness-pipeline` <a name="non-redrivable"></a>
+
+**AWS `redrive-execution` is a deterministic no-op on this state machine.**
+Do not attempt it as an incident-response step; it will not retry the
+failing stage (config#2156, decided 2026-07-11: "Operator decision
+2026-07-11: Option A" — accepted, not a bug to be re-architected away).
+
+**Why.** Every spot-bearing Task in `step_function.json` carries a
+`Catch: States.ALL` that routes through `Extract*Error` →
+`NormalizeFailureContext(Repin)` → `HandleFailure` (the per-stage SNS
+failure alert) → `FailExecution`, a single shared terminal `Fail` state.
+AWS's `redrive-execution` resumes from the execution's recorded failure
+point — but a *caught* error counts as "handled", so the only
+unsuccessful state left on the execution is `FailExecution` itself. A
+`Fail` state has no logic to re-run; redriving it just re-enters
+`FailExecution` and re-fails immediately (same stale input, no
+intervening Task execution). Confirmed live 2026-07-10 against execution
+`offcycle-shell-20260710-211603`: `ExecutionRedriven` → `ExecutionFailed`
+landed 39ms apart with zero intervening state transitions.
+
+**The real recovery mechanism: fresh execution + `skip_*` flags.** The
+pipeline's `Execution.Input` accepts one boolean `skip_*` flag per
+spot-bearing stage. Start a new execution with `skip_*: true` for every
+stage that already completed successfully before the failure, so the
+retry only re-runs the stage that actually failed (and everything after
+it). This is the operational equivalent of a targeted redrive:
+
+```
+skip_weekly_run_day_gate, skip_morning_enrich, skip_data_phase1, skip_data_phase2,
+skip_lib_pin_drift_check, skip_scanner, skip_signals_envelope, skip_challenger_shadow,
+skip_regime_substrate, skip_research, skip_rag_ingestion, skip_thinktank_coverage,
+skip_rationale_clustering, skip_eval_judge, skip_evaluator, skip_post_eval,
+skip_regime_retrospective_eval, skip_predictor_training, skip_predictor_backtest,
+skip_portfolio_optimizer_backtest, skip_backtester, skip_backtester_stage_only,
+skip_parity, skip_replay_concordance, skip_counterfactual, skip_aggregate_costs
+```
+
+**`skip_backtester_stage_only` (config#2362 Option A, operator-ruled
+2026-07-21)**: additive, distinct from `skip_backtester`'s legacy whole-pair
+jump above. `skip_backtester` bypasses BOTH the Backtester task AND the
+PredictorBacktest/PortfolioOptimizerBacktest/Parity gates after it — so it
+cannot be used for a mid-tail recovery rerun where Backtester already
+completed this `run_date` but one of those later stages failed (using
+`skip_backtester` there would ALSO skip the failed stage's own gate, the
+forbidden swallow). `skip_backtester_stage_only=true` instead skips ONLY the
+Backtester SSM task (reusing its already-written `backtest/{run_date}/`
+artifacts) while still routing through the tail gates, so the failed stage
+reruns without an unnecessary Backtester re-burn.
+`scripts/weekly_sf_rerun.py` derives this automatically: when Backtester
+completed but a `predictor_backtest` / `portfolio_optimizer_backtest` /
+`parity` failure is detected, it emits `skip_backtester_stage_only` in place
+of `skip_backtester`.
+
+**Lane-A flags (config#3134)**: `skip_scanner`, `skip_signals_envelope`,
+`skip_challenger_shadow`, `skip_thinktank_coverage` extend this charter to
+the Scanner/SignalsEnvelope/ChallengerShadow/ThinkTankCoverage research
+states inside `ResearchPredictorParallel`'s branch A — previously NONE of
+the four had a skip gate, so every partial rerun (e.g. `mode=backtest-eval`,
+see below) unconditionally re-scanned `candidates.json`, re-called the
+ChallengerShadow producer, and re-attempted ThinkTankCoverage's `gap_fill`
+thesis generation (real challenger-corpus writes + OpenRouter token burn)
+regardless of what was actually being rerun. **`skip_signals_envelope` is
+the one exception to "safe to set true for a completed stage": its gate
+defaults FALSE** because SignalsEnvelope is LOAD-BEARING for a real weekly
+run (I2880 staleness guard — the executor hard-fails Monday without a
+fresh `signals.json`). It is only safe to skip on a genuine partial rerun
+(e.g. `mode=backtest-eval`, where the whole run never reaches the
+executor) or when the failed execution's history proves SignalsEnvelope
+already ran this `run_date` — never hand-set it true on an operator rerun
+that is expected to produce a live Monday signal.
+
+e.g. an execution that failed at `MorningEnrich` retries with
+`skip_weekly_run_day_gate=true` (already passed) and every other `skip_*`
+left `false`/absent so the pipeline re-runs from `MorningEnrich` forward.
+
+Caution: this is safe for the idempotent/additive `shell` (Friday
+rehearsal) path. For a `full` Saturday run, stages are **not** all
+additive (see `run_weekly_offcycle.sh`'s "Why `full` touches the cron"
+above) — do not blanket-skip stages you have not actually confirmed
+completed, and do not let a manual retry race a still-pending scheduled
+Saturday fire (double spot spend / model-zoo rotation / artifact
+clobber).
+
+**Both operator-facing failure messages point back here:** the
+`HandleFailure` SNS alert's `Message` and the `FailExecution` state's
+`Cause` field both explain the no-op and name this doc as the recovery
+reference. If you're tempted to "fix" this by wiring per-Task `Catch`
+targets to distinct `Fail` states, or by making `HandleFailure` a Task
+terminal node instead of a Pass-through to `Fail` — don't: neither
+restores real redrive-to-the-failing-Task without dropping the in-ASL
+catch-all entirely and moving failure notification to an
+execution-level EventBridge rule (a substantial re-architecture, Option
+B in config#2156, not pursued per the 2026-07-11 ruling).

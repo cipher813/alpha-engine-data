@@ -1,0 +1,215 @@
+"""CodeFreshnessGate must serialize its git ops behind boot-pull.service.
+
+2026-07-08 preopen-trading failure: the weekday SF's ``CodeFreshnessGate``
+(config#1811) and the trading box's ``boot-pull.service`` (a systemd oneshot
+that runs the SAME ``git fetch / checkout -f main / reset --hard origin/main``
+on the same three repos at every daily boot) are two concurrent git writers.
+The gate fires the instant SSM reports the instance ``Online`` — which can be
+WHILE boot-pull's ``git reset --hard`` still holds
+``alpha-engine-data/.git/index.lock``. The gate's ``checkout -f main`` /
+``reset --hard`` then died with::
+
+    fatal: Unable to create '.../.git/index.lock': File exists.
+    Another git process seems to be running in this repository...
+    exit status 128
+
+which routed COMMAND_FAILED -> HandleFailure -> FailExecution: no orders placed.
+
+The fix wraps the gate's mutating git ops (fetch + self-heal checkout/reset) in
+a ``git_retry`` helper that retries ONLY on git's lock-contention signature,
+bounded to ~150s (> boot-pull's 120s ``TimeoutStartSec``), and FAILS LOUD on any
+other error or if the lock persists past the budget. This pins that contract so
+a future edit cannot silently drop back to bare, race-prone git calls.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_daily.json"
+
+# git's stable, version-independent message for ANY *.lock contention
+# (index.lock, packed-refs.lock, shallow.lock, HEAD.lock). Retrying on this
+# exact phrase is what serializes the gate behind boot-pull.
+_LOCK_SIGNATURE = "Another git process seems to be running"
+
+
+def _gate_commands() -> list[str]:
+    doc = json.loads(_SF_PATH.read_text())
+    gate = doc["States"]["CodeFreshnessGate"]
+    return gate["Parameters"]["Parameters"]["commands"]
+
+
+def test_gate_defines_git_retry_helper() -> None:
+    cmds = _gate_commands()
+    joined = "\n".join(cmds)
+    assert "git_retry()" in joined, (
+        "CodeFreshnessGate must define a git_retry() helper that serializes its "
+        "git ops behind boot-pull.service (2026-07-08 index.lock race)."
+    )
+
+
+def test_git_retry_matches_only_lock_contention() -> None:
+    """The retry must key on git's lock signature, not blanket-retry."""
+    helper = next((c for c in _gate_commands() if "git_retry()" in c), None)
+    assert helper is not None
+    assert _LOCK_SIGNATURE in helper, (
+        "git_retry must retry ONLY on git's lock-contention signature "
+        f"({_LOCK_SIGNATURE!r}) — a blanket retry would mask real git errors."
+    )
+
+
+def test_git_retry_fails_loud_and_is_bounded() -> None:
+    """A bounded retry that returns non-zero past budget = fail-loud.
+
+    Under the block's `set -eo pipefail`, a non-zero git_retry return aborts the
+    command -> COMMAND_FAILED -> HandleFailure. The helper must (a) have a finite
+    attempt ceiling and (b) return non-zero on both the non-lock and
+    budget-exhausted paths. We pin the fail-loud markers rather than swallow.
+    """
+    helper = next((c for c in _gate_commands() if "git_retry()" in c), None)
+    assert helper is not None
+    # bounded: an explicit attempt ceiling is present.
+    assert "-ge 30" in helper, "git_retry must be bounded (attempt ceiling)."
+    # fail-loud: emits the real error to stderr and returns non-zero.
+    assert ">&2" in helper and "return 1" in helper, (
+        "git_retry must surface the real error (>&2) and return non-zero "
+        "(fail-loud) when it gives up — never swallow."
+    )
+
+
+def test_self_heal_git_mutations_go_through_git_retry() -> None:
+    """The checkout/reset that took the lock must not be bare git calls."""
+    cmds = _gate_commands()
+    self_heal = next((c for c in cmds if "SELF-HEAL" in c), None)
+    assert self_heal is not None, "CodeFreshnessGate self-heal line missing."
+    assert "git_retry -C $d checkout -f main" in self_heal, (
+        "self-heal `checkout -f main` must go through git_retry (race-safe)."
+    )
+    assert "git_retry -C $d reset --hard origin/main" in self_heal, (
+        "self-heal `reset --hard` must go through git_retry (race-safe)."
+    )
+    # The race-prone bare forms must be gone from the self-heal.
+    assert "sudo -u ec2-user git -C $d checkout" not in self_heal
+    assert "sudo -u ec2-user git -C $d reset" not in self_heal
+
+
+def test_self_heal_reclaim_is_detect_guarded_and_nonfatal() -> None:
+    """The ownership-reclaim chown must not be a bare, fatal `chown -R`.
+
+    2026-07-20 preopen FailExecution (recurrence of the 2026-07-08 concurrent-
+    writer class, on the one self-heal op left outside the flock protocol): the
+    self-heal's ``chown -R ec2-user:ec2-user $d`` recursed into ``$d/.venv`` and
+    raced boot-pull.service's concurrent ``pip install`` — which runs OUTSIDE the
+    shared git flock, so the flock cannot serialize it. chown -R hit a
+    ``.dist-info`` directory pip had just removed mid-upgrade
+    (``chown: cannot access '.../nousergon_lib-0.116.0.dist-info': No such file
+    or directory``), returned rc=1, and under ``set -eo pipefail`` that aborted
+    the whole gate: COMMAND_FAILED -> HandleFailure -> FailExecution, no orders.
+
+    boot-pull.sh (crucible-executor infrastructure/) already solved this exact
+    race and the gate must mirror it: (a) DETECT foreign ownership first
+    (``find $d -not -user ec2-user -print -quit``) so the clean path chowns
+    nothing and never touches the churning .venv, and (b) chown NON-FATALLY
+    (``|| ...``) so a transient pip-churn ENOENT cannot fail the gate. This is
+    NOT a fail-loud regression: a genuinely unreclaimable root-owned tree still
+    fails LOUD one line later at ``git_retry -C $d reset --hard`` (under
+    pipefail), which is the real gate the 2026-07-06 root-owned-checkout
+    incident exists to catch.
+    """
+    cmds = _gate_commands()
+    self_heal = next((c for c in cmds if "SELF-HEAL" in c), None)
+    assert self_heal is not None, "CodeFreshnessGate self-heal line missing."
+
+    # (a) DETECT-first: the reclaim is guarded by a foreign-ownership scan that
+    # short-circuits the clean path (mirrors boot-pull.sh's reclaim guard).
+    assert "find $d -not -user ec2-user -print -quit" in self_heal, (
+        "self-heal ownership reclaim must DETECT foreign ownership first "
+        "(`find $d -not -user ec2-user -print -quit`) so the common clean path "
+        "never runs chown -R over the concurrently pip-churned $d/.venv "
+        "(2026-07-20 .dist-info ENOENT race with boot-pull.service)."
+    )
+
+    # (b) NON-FATAL: the chown must have a `||` fallback so a transient ENOENT
+    # from boot-pull's concurrent .venv pip churn cannot abort the gate under
+    # `set -eo pipefail`. The bare, fatal `chown -R ...; ` form must be gone.
+    assert "chown -R ec2-user:ec2-user $d ||" in self_heal, (
+        "the ownership-reclaim chown must be NON-FATAL (`chown -R ... $d || ...`) "
+        "so a transient pip-churn ENOENT under $d/.venv can't fail the gate; the "
+        "git_retry reset below stays the fail-loud gate for a genuinely "
+        "unreclaimable root-owned tree."
+    )
+    assert "chown -R ec2-user:ec2-user $d; " not in self_heal, (
+        "the bare, FATAL `chown -R ec2-user:ec2-user $d;` form (fatal under "
+        "`set -eo pipefail`) must not return — it is exactly the 2026-07-20 "
+        "FailExecution root cause."
+    )
+
+
+def test_fetch_loop_goes_through_git_retry() -> None:
+    cmds = _gate_commands()
+    fetch = next((c for c in cmds if "fetch --quiet origin main" in c), None)
+    assert fetch is not None
+    assert "git_retry -C /home/ec2-user/$r fetch --quiet origin main" in fetch, (
+        "the fetch loop must go through git_retry so a concurrent boot-pull "
+        "fetch can't fail the gate on a ref/pack lock."
+    )
+
+
+# ── config#1944: shared flock chokepoint across trading-box git writers ──────
+# The lock-signature retry above defends the transition window; the durable
+# class fix is a shared advisory flock that all trading-box git writers
+# (boot-pull.service, CodeFreshnessGate) acquire on the SAME inode, so no two
+# index-mutating git ops ever run concurrently.
+#
+# alpha-engine-config-I2717 (2026-07-16): ChronicGapSelfHeal — formerly the
+# third trading-box git writer this comment used to name — was REMOVED from
+# this SF entirely. Its replacement, the standalone --daily-heal workload, was
+# NOT a candidate for this shared flock in the first place: it runs on its own
+# ephemeral, self-terminating data-spot box (via the existing data-spot-
+# dispatcher bootstrap, which does a fresh shallow CLONE per run, not a `pull`
+# against a persistent checkout) — there is no shared inode to contend over.
+
+# Must match crucible-executor infrastructure/boot-pull.sh's GIT_SYNC_LOCK
+# default. A guard test in each repo pins it.
+_SHARED_GIT_LOCK = "/home/ec2-user/.ae-git-sync.lock"
+
+
+def test_git_retry_acquires_shared_flock() -> None:
+    """git_retry must run its git op under the shared advisory flock so the
+    gate serializes against boot-pull.service window-free (config#1944), not
+    only via the lock-signature backoff."""
+    helper = next((c for c in _gate_commands() if "git_retry()" in c), None)
+    assert helper is not None
+    assert f"flock -w 150 {_SHARED_GIT_LOCK} git" in helper, (
+        "git_retry must acquire `flock -w 150 /home/ec2-user/.ae-git-sync.lock` "
+        "around each git op — the shared trading-box git-sync mutex."
+    )
+    # Fail-loud + transition fallback both survive: the lock-signature retry is
+    # retained (an older on-disk boot-pull may not yet be flock-aware).
+    assert "Another git process seems to be running" in helper
+
+
+def test_chronic_gap_self_heal_removed_not_a_shared_flock_participant() -> None:
+    """alpha-engine-config-I2717 (2026-07-16): ChronicGapSelfHeal — previously
+    pinned here as the third trading-box git writer under the shared flock —
+    is now REMOVED from this SF entirely (moved to the standalone
+    --daily-heal job, on its own ephemeral spot box, which clones fresh rather
+    than pulling a persistent checkout — see the module-level comment above
+    _SHARED_GIT_LOCK). Regression guard: it must not reappear here."""
+    doc = json.loads(_SF_PATH.read_text())
+    assert "ChronicGapSelfHeal" not in doc["States"]
+
+
+def test_shared_git_lock_lives_in_home_not_var_lock() -> None:
+    """The lock MUST be in ec2-user's HOME, never /var/lock: /var/lock ->
+    /run/lock is root:root 0755, so boot-pull (runs as ec2-user) cannot create
+    a lock file there. Every actor flocks this path as ec2-user."""
+    helper = next((c for c in _gate_commands() if "git_retry()" in c), None)
+    assert "/var/lock/" not in helper, (
+        "do not put the git-sync lock in /var/lock (root-only-writable); "
+        "boot-pull runs as ec2-user and could not create it."
+    )
+    assert _SHARED_GIT_LOCK.startswith("/home/ec2-user/")

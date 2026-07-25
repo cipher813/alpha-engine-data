@@ -1,28 +1,38 @@
-"""Pins the ChronicGapSelfHeal fail-soft split in the WEEKDAY SF.
+"""Pins the REMOVAL of ChronicGapSelfHeal (+ its liveness-poll quintet and
+skip-gate) from the WEEKDAY SF, and the rewiring left behind.
 
-Origin: 2026-06-11 — the weekday pipeline FAILED. The chronic-polygon-gap
-self-heal ran INLINE at the tail of MorningEnrich (``weekly_collector.py
---morning-enrich``). It is best-effort by design, but inline it could not
-honour that: an unbounded ``yf.download`` hang ran out MorningEnrich's SSM
-``executionTimeout`` and SIGKILLed (137) the whole command — AFTER the
-load-bearing ``daily_append`` had already completed (~20 min of work). The
-SF saw MorningEnrich ``Failed`` → ``HandleFailure`` → the weekday pipeline
-failed with no predictions / planner / daemon that day.
+Origin: alpha-engine-config-I2717 (Brian ruling 2026-07-16, option 1 —
+standalone daily heal) + the preopen half of alpha-engine-config-I2722. The
+2026-07-16 incident (a heal firing inline ate the preopen's poll budget) led
+to the decision to move the universe-gap self-heal AND the chronic-polygon-gap
+heal (this state's logic) entirely OFF ``ne-preopen-trading-pipeline`` into a
+single standalone EventBridge-triggered daily-heal spot job (~09:00 UTC,
+weekly_collector.py ``--daily-heal``, see ``weekly_collector._run_daily_heal``
+and the ``daily-heal`` workload in
+``infrastructure/lambdas/data-spot-dispatcher/index.py``).
 
-The fix (per the standing rule — a best-effort downstream step must never
-force re-running a completed upstream task; the same rule that split
-MorningEnrich out of DataPhase1) moves the heal into its OWN fail-soft SF
-state, ``ChronicGapSelfHeal``, that runs AFTER MorningEnrich and routes to
-PredictorInference on EVERY terminal outcome (success, failure, timeout).
+This file previously pinned ChronicGapSelfHeal's presence + fail-soft wiring
+(see git history for that version, superseded here) — that state, its
+liveness-poll quintet (``InitChronicGapPoll``/``WaitForChronicGap``/
+``CheckChronicGapStatus``/``ChronicGapWait``/``StampChronicGapUnresponsive``),
+and its skip-gate (``CheckSkipChronicGapHeal``) are now DELETED from
+``step_function_daily.json`` — 7 states removed in total. The 5 states that
+used to route into ``CheckSkipChronicGapHeal`` now route directly to
+``CheckSkipPredictorInference`` instead: ``CheckSkipMorningEnrich``,
+``CheckMorningEnrichSpotLaunched``, ``CheckMorningArcticAppendSpotLaunched``,
+``CheckMorningArcticAppendSpotStatus`` (its "Success" choice), and
+``PublishDataSpotFailureImmediate`` (both its plain ``Next`` and its Catch's
+``Next``).
 
 This test catches regressions like:
-- Someone reroutes CheckMorningEnrichStatus(Success) straight back to
-  PredictorInference, dropping the ChronicGapSelfHeal state.
-- Someone makes ChronicGapSelfHeal (or its poll) fatal by routing a
-  failure to HandleFailure instead of PredictorInference.
-- Someone drops ``--skip-chronic-heal`` from the weekday MorningEnrich
-  command, re-introducing the inline (un-isolated) heal.
-- Someone points the heal state at the wrong entrypoint.
+- Someone re-adds ChronicGapSelfHeal (or any state in its quintet/skip-gate)
+  to this SF instead of the standalone daily-heal job — reopening the exact
+  preopen poll-budget risk I2717 exists to close.
+- Someone leaves a dangling reference to one of the removed state names.
+- The 5 rewired predecessors drifting off ``CheckSkipPredictorInference``.
+- ``ForceStopUnresponsiveInstance`` (SHARED with the code-freshness-gate and
+  morning-planner liveness loops) getting accidentally deleted along with the
+  chronic-gap quintet it used to also serve.
 """
 
 from __future__ import annotations
@@ -32,15 +42,18 @@ from pathlib import Path
 
 import pytest
 
-from tests.sf_command_utils import extract_commands
-
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_daily.json"
 
-_HEAL = "ChronicGapSelfHeal"
-_POLL = "WaitForChronicGap"
-_CHECK = "CheckChronicGapStatus"
-_WAIT = "ChronicGapWait"
+_REMOVED_STATES = [
+    "CheckSkipChronicGapHeal",
+    "ChronicGapSelfHeal",
+    "InitChronicGapPoll",
+    "WaitForChronicGap",
+    "CheckChronicGapStatus",
+    "ChronicGapWait",
+    "StampChronicGapUnresponsive",
+]
 
 
 @pytest.fixture(scope="module")
@@ -53,139 +66,28 @@ def states(sf) -> dict:
     return sf["States"]
 
 
-class TestStatePresence:
-    @pytest.mark.parametrize("name", [_HEAL, _POLL, _CHECK, _WAIT])
-    def test_state_exists(self, states, name):
-        assert name in states, f"{name} missing from weekday SF States"
-
-
-class TestChainOrdering:
-    """CheckMorningEnrichStatus(Success) → ChronicGapSelfHeal →
-    WaitForChronicGap → CheckChronicGapStatus(terminal) → PredictorInference."""
-
-    def test_heal_runs_after_morning_enrich_and_append(self, states):
-        # Since L4608 the load-bearing daily_append (CheckSkipMorningArcticAppend
-        # → MorningArcticAppend) sits between MorningEnrich and the heal. The
-        # heal still runs (behind its skip-gate) AFTER both, before predictions.
-        success = [
-            c["Next"]
-            for c in states["CheckMorningEnrichStatus"]["Choices"]
-            if c.get("StringEquals") == "SUCCESS"
-        ]
-        assert success == ["CheckSkipMorningArcticAppend"], (
-            "MorningEnrich success must hand off to the arctic-append gate"
-        )
-        # Append success → the chronic-gap skip-gate → (no flag) the heal.
-        append_success = [
-            c["Next"]
-            for c in states["CheckMorningArcticAppendStatus"]["Choices"]
-            if c.get("StringEquals") == "SUCCESS"
-        ]
-        assert append_success == ["CheckSkipChronicGapHeal"]
-        assert states["CheckSkipChronicGapHeal"]["Default"] == _HEAL
-
-    def test_heal_routes_to_poll(self, states):
-        # config#1811: an Init pass seeds the liveness-poll counters first.
-        assert states[_HEAL]["Next"] == "InitChronicGapPoll"
-        assert states["InitChronicGapPoll"]["Next"] == _POLL
-
-    def test_poll_routes_to_status_check(self, states):
-        assert states[_POLL]["Next"] == _CHECK
-
-    def test_status_inprogress_and_pending_loop_via_wait(self, states):
-        # config#1811: the poller folds Pending/Delayed/registering into a
-        # single IN_PROGRESS verdict; only that verdict keeps polling.
-        nexts = {
-            c["StringEquals"]: c["Next"]
-            for c in states[_CHECK]["Choices"]
-        }
-        assert nexts["IN_PROGRESS"] == _WAIT
-        assert states[_WAIT]["Next"] == _POLL
-
-    def test_unresponsive_host_is_not_fail_soft(self, states):
-        """config#1811 carve-out: INSTANCE_UNRESPONSIVE is a HOST failure,
-        not a heal failure — the same wedged box every later step (planner,
-        daemon) needs. Proceeding fail-soft would just fail at
-        RunMorningPlanner after burning PredictorInference. It must route
-        to the stamp → force-stop → HandleFailure chain instead."""
-        nexts = {
-            c["StringEquals"]: c["Next"]
-            for c in states[_CHECK]["Choices"]
-        }
-        assert nexts["INSTANCE_UNRESPONSIVE"] == "StampChronicGapUnresponsive"
-        assert (
-            # config#1807: the heal runs on the daily data spot — an
-            # unresponsive host terminates the SPOT, not the trading box.
-            states["StampChronicGapUnresponsive"]["Next"]
-            == "ForceTerminateUnresponsiveDataSpot"
+class TestChronicGapHealQuintetRemoved:
+    @pytest.mark.parametrize("name", _REMOVED_STATES)
+    def test_state_absent(self, states, name):
+        assert name not in states, (
+            f"{name} must NOT be in the weekday SF — the chronic-gap heal "
+            "moved to the standalone --daily-heal job (alpha-engine-"
+            "config-I2717/I2722)."
         )
 
-    def test_heal_precedes_predictor_inference(self, sf, states):
-        """Walk the happy path from MorningEnrich success and assert
-        ChronicGapSelfHeal is visited strictly before PredictorInference."""
-        order: list[str] = []
-        seen: set[str] = set()
-        cur = _HEAL
-        while cur and cur in states and cur not in seen:
-            seen.add(cur)
-            order.append(cur)
-            st = states[cur]
-            if st.get("Type") == "Choice":
-                # Status check: only InProgress/Pending loop; the terminal
-                # path is the Default (= proceed to PredictorInference).
-                cur = st.get("Default")
-            else:
-                cur = st.get("Next")
-            if cur == "PredictorInference":
-                order.append(cur)
-                break
-        assert _HEAL in order, order
-        assert "PredictorInference" in order, order
-        assert order.index(_HEAL) < order.index("PredictorInference"), order
-
-
-class TestFailSoft:
-    """A heal failure / hang / timeout must NEVER fail the pipeline — every
-    terminal edge routes to PredictorInference, never HandleFailure."""
-
-    # Since L4606 the forward target is the CheckSkipPredictorInference rerun
-    # gate (whose Default runs PredictorInference) rather than PredictorInference
-    # directly — still fail-soft: it proceeds toward predictions, never to
-    # HandleFailure.
-    _FWD = "CheckSkipPredictorInference"
-    # config#1807: data-phase exits route through the spot-terminate hook
-    # first; its Default (and TerminateDailyDataSpot both ways) proceed to
-    # _FWD, so the fail-soft guarantee is unchanged.
-    _HOOK = "CheckDataSpotToTerminate"
-
-    def test_check_default_proceeds_toward_predictions_not_handlefailure(self, states):
-        # Inverse of CheckMorningEnrichStatus, whose Default is HandleFailure.
-        assert states[_CHECK]["Default"] == self._HOOK, (
-            "Chronic-gap heal is best-effort: any terminal status (incl. "
-            "failure) must proceed toward PredictorInference, not HandleFailure."
+    def test_shared_force_stop_state_survives(self, states):
+        # ForceStopUnresponsiveInstance is SHARED with the code-freshness-gate
+        # and morning-planner liveness loops — it must NOT be deleted along
+        # with the chronic-gap quintet.
+        assert "ForceStopUnresponsiveInstance" in states
+        assert states["ForceStopUnresponsiveInstance"]["Resource"] == (
+            "arn:aws:states:::aws-sdk:ec2:stopInstances"
         )
-        assert states[self._HOOK]["Default"] == self._FWD
-        # And the gate it hands to must actually run PredictorInference.
-        assert states[self._FWD]["Default"] == "PredictorInference"
 
-    def test_heal_catch_proceeds_toward_predictions(self, states):
-        catches = states[_HEAL].get("Catch", [])
-        assert catches, f"{_HEAL} must have a fail-soft Catch"
-        for c in catches:
-            assert c["Next"] == self._HOOK, (
-                f"{_HEAL} Catch must proceed toward PredictorInference via "
-                f"{self._HOOK} (fail-soft through the spot-terminate hook), got {c['Next']}"
-            )
-
-    def test_poll_catch_proceeds_toward_predictions(self, states):
-        catches = states[_POLL].get("Catch", [])
-        assert catches, f"{_POLL} must have a fail-soft Catch"
-        for c in catches:
-            assert c["Next"] == self._HOOK
-
-    def test_no_heal_state_routes_to_handlefailure(self, states):
-        """No Next/Default/Catch target across the heal quartet may be
-        HandleFailure (checks routing edges, not comment text)."""
+    def test_no_dangling_reference_to_removed_states(self, states):
+        """No Next/Default/Catch edge anywhere in the SF may point at a
+        removed state name — a dangling reference would be a hard ASL
+        validation failure at deploy time."""
         def _targets(o):
             out = []
             if isinstance(o, dict):
@@ -199,44 +101,56 @@ class TestFailSoft:
                     out.extend(_targets(x))
             return out
 
-        for name in (_HEAL, _POLL, _CHECK, _WAIT):
-            targets = _targets(states[name])
-            assert "HandleFailure" not in targets, (
-                f"{name} routes to HandleFailure {targets} — the heal is fail-soft."
-            )
+        for name, st in states.items():
+            for t in _targets(st):
+                assert t not in _REMOVED_STATES, (
+                    f"{name} references removed state {t!r}"
+                )
 
 
-class TestSsmCommandShape:
-    def test_heal_invokes_chronic_gap_heal_entrypoint(self, states):
-        cmds = extract_commands(states[_HEAL])
-        joined = "\n".join(cmds)
-        assert "weekly_collector.py --chronic-gap-heal" in joined, (
-            "ChronicGapSelfHeal must invoke the standalone --chronic-gap-heal "
-            f"entrypoint. Commands:\n{joined}"
+class TestRewiredPredecessorsRouteToPredictorInferenceGate:
+    """The 5 states that used to enter CheckSkipChronicGapHeal now enter
+    CheckSkipPredictorInference directly."""
+
+    def test_check_skip_morning_enrich_skip_edge(self, states):
+        choices = states["CheckSkipMorningEnrich"]["Choices"]
+        assert len(choices) == 1
+        assert choices[0]["Next"] == "CheckSkipPredictorInference"
+
+    def test_morning_enrich_spot_launched_default(self, states):
+        assert states["CheckMorningEnrichSpotLaunched"]["Default"] == (
+            "CheckSkipPredictorInference"
         )
 
-    def test_heal_has_pipefail_and_deployed_exports(self, states):
-        cmds = extract_commands(states[_HEAL])
-        assert cmds[0] == "set -eo pipefail"
-        joined = "\n".join(cmds)
-        assert "export FLOW_DOCTOR_ENABLED=1" in joined
-        assert "export ALPHA_ENGINE_DEPLOYED=1" in joined
-
-    def test_heal_has_bounded_execution_timeout(self, states):
-        et = states[_HEAL]["Parameters"]["Parameters"]["executionTimeout"]
-        # SSM executionTimeout is a single-element string list.
-        secs = int(et[0]) if isinstance(et, list) else int(et)
-        assert 0 < secs <= 600, (
-            "The heal state must carry a short, bounded SSM executionTimeout so "
-            "a hang is capped in its OWN state (not MorningEnrich's). "
-            f"got {secs}s"
+    def test_arctic_append_spot_launched_default(self, states):
+        assert states["CheckMorningArcticAppendSpotLaunched"]["Default"] == (
+            "CheckSkipPredictorInference"
         )
 
-    def test_weekday_morning_enrich_skips_inline_heal(self, states):
-        cmds = extract_commands(states["MorningEnrich"])
-        joined = "\n".join(cmds)
-        assert "--morning-enrich --skip-chronic-heal" in joined, (
-            "The weekday MorningEnrich must pass --skip-chronic-heal so the "
-            "inline heal is not double-run alongside the ChronicGapSelfHeal "
-            "state (and MorningEnrich stays fully isolated from the heal)."
-        )
+    def test_arctic_append_spot_status_success_edge(self, states):
+        success = [
+            c["Next"]
+            for c in states["CheckMorningArcticAppendSpotStatus"]["Choices"]
+            if c.get("StringEquals") == "Success"
+        ]
+        assert success == ["CheckSkipPredictorInference"]
+
+    def test_publish_data_spot_failure_immediate_routes_forward(self, states):
+        st = states["PublishDataSpotFailureImmediate"]
+        assert st["Next"] == "CheckSkipPredictorInference"
+        assert st["Catch"][0]["Next"] == "CheckSkipPredictorInference"
+
+
+class TestPredictorInferenceGateUnchanged:
+    """CheckSkipPredictorInference itself is untouched by this refactor —
+    still the same skip-gate shape, still defaulting to PredictorInference."""
+
+    def test_gate_shape(self, states):
+        gate = states["CheckSkipPredictorInference"]
+        assert gate["Type"] == "Choice"
+        assert gate["Default"] == "PredictorInference"
+        choices = gate["Choices"]
+        assert len(choices) == 1
+        variables = {c["Variable"] for c in choices[0]["And"]}
+        assert variables == {"$.skip_predictor_inference"}
+        assert choices[0]["Next"] == "CheckSkipMorningPlanner"

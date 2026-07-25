@@ -70,28 +70,35 @@ class TestTradingDayGateChoice:
         false_branch = [
             c["Next"]
             for c in states["TradingDayGateChoice"]["Choices"]
-            if c.get("BooleanEquals") is False
+            # config-I2767: unwrap the And[IsPresent, BooleanEquals] guard.
+            if any(op.get("BooleanEquals") is False for op in c.get("And", [c]))
         ]
         assert false_branch == ["NotifyHolidaySkip"]
 
     def test_default_proceeds_to_start_box(self, states):
-        # config#1807: trading day confirmed -> dispatch the data-spot launch
-        # first (fire-and-forget), then boot the box.
-        assert states["TradingDayGateChoice"]["Default"] == "CheckSkipDataSpot"
-        assert states["CheckSkipDataSpot"]["Default"] == "LaunchDailyDataSpot"
-        assert states["LaunchDailyDataSpot"]["Next"] == "StartExecutorEC2"
+        # config#1767 (Phase 2): the Phase-1 pre-launch-before-boot data-spot
+        # hop (CheckSkipDataSpot -> LaunchDailyDataSpot) was retired — each
+        # Phase-2 spot now launches lazily, later, from its own
+        # CheckSkipMorningEnrich gate — so trading day confirmed proceeds
+        # straight to booting the box.
+        assert states["TradingDayGateChoice"]["Default"] == "StartExecutorEC2"
 
     def test_choice_reads_is_trading_day_off_gate_payload(self, states):
-        var = states["TradingDayGateChoice"]["Choices"][0]["Variable"]
-        assert var == "$.trading_day_gate.Payload.is_trading_day"
+        # config-I2767: the comparison is IsPresent-guarded inside an And;
+        # both operands read the same gate-payload path.
+        rule = states["TradingDayGateChoice"]["Choices"][0]
+        variables = {op["Variable"] for op in rule["And"]}
+        assert variables == {"$.trading_day_gate.Payload.is_trading_day"}
+        assert any(op.get("IsPresent") is True for op in rule["And"])
 
 
 class TestTradingDayGateFailed:
     def test_failed_proceeds_to_start_box(self, states):
         failed = states["TradingDayGateFailed"]
         assert failed["Resource"] == "arn:aws:states:::sns:publish"
-        # config#1807: fail-open path also routes through the spot-launch gate.
-        assert failed["Next"] == "CheckSkipDataSpot"
+        # config#1767 (Phase 2): fail-open path also proceeds straight to
+        # booting the box — no pre-launch data-spot hop anymore.
+        assert failed["Next"] == "StartExecutorEC2"
 
 
 class TestDeadStatesRemoved:

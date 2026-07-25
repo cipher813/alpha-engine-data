@@ -11,8 +11,15 @@ Usage:
     df = universe.read("AAPL").data
 
 Libraries:
-    universe — per-ticker time series (OHLCV + 53 computed features)
-    macro    — market-wide time series (VIX, yields, commodities, macro features)
+    universe          — per-ticker time series (OHLCV + 53 computed features)
+    macro             — market-wide time series (VIX, yields, commodities, macro features)
+    delisted_history  — survivorship-free retention store: full OHLCV history of
+                        tickers pruned from ``universe`` on delisting, so a
+                        point-in-time (as-of-membership) backtest universe can be
+                        reconstructed. NEVER read by live-trading code paths — they
+                        want only currently-tradable names and are unaffected by this
+                        library's existence. See ``get_delisted_history_lib`` for the
+                        record schema/contract (config#1943, Leg 3).
 """
 
 from __future__ import annotations
@@ -29,6 +36,16 @@ log = logging.getLogger(__name__)
 
 DEFAULT_BUCKET = "alpha-engine-research"
 ARCTIC_PREFIX = "arcticdb"
+
+# Survivorship-free retention store (config#1943, Leg 3). Delisted tickers are
+# MOVED here (full OHLCV + delisting metadata) rather than hard-deleted from
+# ``universe``, so a point-in-time backtest universe can be reconstructed
+# without survivorship bias (~1-4%/yr overstatement otherwise). Deliberately
+# a SEPARATE library — not an in-``universe`` flag — so live-trading code
+# paths (which want only tradable names) require no change and never see the
+# retained-for-backtest-only rows. See ``get_delisted_history_lib`` for the
+# per-symbol record schema/contract.
+DELISTED_HISTORY_LIB = "delisted_history"
 
 # Canonical universe-library schema. Persisted layout is
 # ``OHLCV_COLS + [PROVENANCE_COL] + FEATURES`` — any write that lays
@@ -60,7 +77,7 @@ TOTAL_RETURN_COL: str = "total_return_close"
 # (e.g. ``universe_crsp``); ``get_scratch_universe_lib`` refuses these
 # names structurally so a misconfigured ``--scratch-lib`` can't clobber
 # the live universe / macro libraries the live pipeline reads.
-_LIVE_LIB_NAMES: frozenset[str] = frozenset({"universe", "macro"})
+_LIVE_LIB_NAMES: frozenset[str] = frozenset({"universe", "macro", "delisted_history"})
 
 _arctic_instance: adb.Arctic | None = None
 
@@ -107,6 +124,28 @@ def get_macro_lib(bucket: str | None = None) -> adb.library.Library:
     return open_macro_lib(bucket, create_if_missing=True)
 
 
+#: Dedicated library holding the ``universe`` data-plane schema-version stamp
+#: (alpha-engine-config-I3241). Kept OUT of the ``universe`` library so it never
+#: pollutes the fleet-wide ticker roster ``get_universe_symbols()`` returns
+#: (``list_symbols()`` is unfiltered) — see ``store/schema_version.py``.
+SCHEMA_META_LIB = "universe_schema_meta"
+
+
+def get_schema_meta_lib(bucket: str | None = None) -> adb.library.Library:
+    """Get the ``universe_schema_meta`` library that carries the universe data
+    plane's schema-version stamp (alpha-engine-config-I3241).
+
+    Routed through the same ``_get_arctic`` connection singleton + canonical URI
+    as every other library. ``create_if_missing=True`` so a fresh bucket
+    bootstraps cleanly (an unstamped/absent stamp is read as baseline v0 — see
+    ``store.schema_version.assert_schema_version``). This is the single
+    mockable open-seam producers use, mirroring ``get_universe_lib`` /
+    ``get_macro_lib``.
+    """
+    arctic = _get_arctic(bucket)
+    return arctic.get_library(SCHEMA_META_LIB, create_if_missing=True)
+
+
 def get_scratch_universe_lib(name: str, bucket: str | None = None) -> adb.library.Library:
     """Get a SCRATCH universe-shaped library for an offline migration build.
 
@@ -130,6 +169,68 @@ def get_scratch_universe_lib(name: str, bucket: str | None = None) -> adb.librar
         )
     arctic = _get_arctic(bucket)
     return arctic.get_library(name, create_if_missing=True)
+
+
+def get_delisted_history_lib(bucket: str | None = None) -> adb.library.Library:
+    """Get the ``delisted_history`` library — the survivorship-free retention
+    store for tickers pruned from ``universe`` on delisting (config#1943, Leg 3).
+
+    Design decision (separate library, NOT an in-``universe`` flag):
+        Delisted names are physically segregated into their own ArcticDB
+        library so that every live-trading consumer of the ``universe`` lib
+        (executor, daily_append, features/compute, the morning pipeline)
+        keeps seeing ONLY currently-tradable names with zero code change —
+        no consumer has to learn a "delisted" flag or filter it out. The
+        retained-for-backtest-only data lives out-of-band and is read solely
+        by the (follow-on) backtester universe-construction path.
+
+    Record schema / S3 contract (one ArcticDB symbol per delisted ticker,
+    keyed by the ticker string, e.g. ``"HOLX"``):
+
+        data (pd.DataFrame)
+            The ticker's FULL stored OHLCV history AS READ from the universe
+            library at prune time — re-keyed verbatim, NOT re-projected (same
+            identity-preserving discipline as ``corporate_actions.migrate_
+            symbol``). Whatever columns the universe symbol carried (canonical
+            ``OHLCV_COLS [+ total_return_close] + source + FEATURES``) are
+            preserved, so a reconstructed backtest sees the same frame the live
+            universe held on the ticker's last active day.
+
+        metadata (dict) — the as-of-membership provenance:
+            ``schema_version``      int, currently 1 (forward-compat guard).
+            ``symbol``              str, the ticker (redundant with the key,
+                                    carried in-band for standalone records).
+            ``delisted_detected_on`` str ``YYYY-MM-DD`` — the prune run's
+                                    ``today`` (the date this pruner CONFIRMED the
+                                    delisting; NOT necessarily the true ex-date).
+            ``last_active_date``    str ``YYYY-MM-DD`` — last index date present
+                                    in ``data`` (the ArcticDB ``last_date`` the
+                                    staleness gate keyed on). Together with the
+                                    first index date this is the last-known
+                                    membership window.
+            ``first_active_date``   str ``YYYY-MM-DD`` — first index date in
+                                    ``data`` (start of the retained window).
+            ``rows``                int, len(data) — cheap integrity check.
+            ``constituents_date``   str — the weekly constituents partition the
+                                    absence was judged against (provenance for
+                                    "which membership snapshot dropped it").
+            ``retained_at``         str ISO-8601 UTC timestamp of the write.
+            ``source``              str, ``"prune_delisted_tickers"`` — the
+                                    producer that retained the record.
+
+    Idempotency: retention writes overwrite the same symbol key with
+    ``prune_previous_versions=True``, so re-running the pruner over an
+    already-retained (but not-yet-deleted-from-universe) ticker refreshes the
+    record in place rather than duplicating or corrupting it.
+
+    ``create_if_missing=True``: this is the sole PRODUCER site and must
+    bootstrap the library on a fresh bucket (cold start), mirroring
+    ``get_universe_lib`` / ``get_macro_lib``. Routed through the shared
+    ``_get_arctic`` connection singleton + canonical ``arctic_uri`` so the
+    S3 endpoint/path_prefix conventions match every other library exactly.
+    """
+    arctic = _get_arctic(bucket)
+    return arctic.get_library(DELISTED_HISTORY_LIB, create_if_missing=True)
 
 
 def reset_connection():
@@ -246,3 +347,35 @@ def to_arctic_canonical(
         df = df[canonical]
 
     return to_arctic_safe(df)
+
+
+def canonical_universe_columns(
+    *,
+    features: Sequence[str] | None = None,
+) -> list[str]:
+    """Return the LIVE ``universe`` library's canonical column list, derived
+    deterministically from code with no DataFrame required.
+
+    This is the single derivation of the persisted universe descriptor's
+    column set — the schema SSoT that both the schema-migration chokepoint
+    (``tests/test_schema_migration_chokepoint.py``) and the baseline
+    migration (``migrations/0000_baseline_universe_schema.py``) anchor
+    against. It is the column-only counterpart of ``to_arctic_canonical``:
+    same ordering rule, but expressed without a sample frame so a CI gate
+    can diff it against a migration's declared ``columns_after``.
+
+    The live universe symbols carry ``OHLCV_COLS + [source] + FEATURES``.
+    ``total_return_close`` (spliced after ``Close`` by ``to_arctic_canonical``
+    *when present*) is DELIBERATELY EXCLUDED: it exists only on the offline
+    CRSP-basis scratch library (``builders/migrate_universe_crsp_basis.py``),
+    never on the live ``universe`` symbols the daily/weekly producers write
+    and every downstream consumer reads. Including it would make the anchor
+    disagree with the real persisted descriptor.
+
+    Pass an explicit ``features`` only in tests that pin a synthetic schema;
+    production callers use the default (``feature_engineer.FEATURES``).
+    """
+    if features is None:
+        from features.feature_engineer import FEATURES as _FEATURES
+        features = _FEATURES
+    return list(OHLCV_COLS) + [PROVENANCE_COL] + list(features)

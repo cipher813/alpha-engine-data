@@ -1,10 +1,27 @@
 #!/usr/bin/env bash
-# infrastructure/spot_data_weekly.sh — Run weekly data workloads on a spot EC2.
+# infrastructure/spot_data_weekly.sh — Launch a weekly data workload on its
+# own fresh spot EC2 (c5.large-class), run it, emit a heartbeat on success,
+# and self-terminate.
 #
-# Bundles DataPhase1 + RAGIngestion on a single spot: launches c5.large,
-# clones alpha-engine-data, runs `python weekly_collector.py --phase 1`
-# followed by `bash rag/pipelines/run_weekly_ingestion.sh`, emits a
-# heartbeat on success, and self-terminates.
+# ONE SPOT PER WORKLOAD (preflight-task-split, 2026-05-16): the weekly SF
+# (ne-weekly-freshness-pipeline) SSM-invokes this script on the launching
+# host once per data state, and each invocation launches its OWN spot for
+# exactly one workload:
+#
+#   SF state MorningEnrich → --morning-enrich-only
+#       (Saturday-morning polygon T+1 fill: weekly_collector.py --morning-enrich)
+#   SF state DataPhase1    → --phase1-only
+#       (full price-cache refresh: weekly_collector.py --phase 1)
+#   SF state RAGIngestion  → --rag-only
+#       (rag/pipelines/run_weekly_ingestion.sh)
+#
+# Each SF state polls its own spot's completion independently (Wait /
+# CheckStatus / RetryGate / Reissue loop in step_function.json), so a
+# phase1 failure no longer re-pays the ~28-min morning-enrich, and a RAG
+# failure doesn't invalidate the price data. The pre-split single-spot
+# bundle survives only as MANUAL rerun modes: --data-only (morning-enrich
+# + phase1) and the no-flag default "full" (morning-enrich + phase1 + RAG
+# on one spot) — the SF never uses them.
 #
 # Origin: moved off ae-dashboard (t3.micro, 1 GB RAM) after the 2026-04-16
 # OOM incident (features/compute.py in the DAILY code path exhausted micro
@@ -13,12 +30,6 @@
 # fragile-by-design. This spot pattern mirrors the Backtester +
 # PredictorTraining launchers so all heavy weekly compute lives on
 # fresh, self-terminating instances instead of the always-on micro.
-#
-# Bundling rationale: Phase 1 and RAG ingestion are sequential SF steps
-# that share the same repo + venv. One spot per bundle saves ~7 min of
-# bootstrap overhead and one spot request. Trade-off: any failure fails
-# both — acceptable since partial Saturday failures typically require a
-# full-pipeline rerun anyway.
 #
 # **2026-05-27 — SSH/SCP → SSM transport migration (ROADMAP L342 PR 2).**
 # Communication with the spot is now via `aws ssm send-command`
@@ -35,7 +46,11 @@
 # audit.
 #
 # Usage:
-#   ./infrastructure/spot_data_weekly.sh                   # phase1 + rag
+#   ./infrastructure/spot_data_weekly.sh --morning-enrich-only  # one spot: morning enrich (SF: MorningEnrich)
+#   ./infrastructure/spot_data_weekly.sh --phase1-only          # one spot: DataPhase1 (SF: DataPhase1)
+#   ./infrastructure/spot_data_weekly.sh --rag-only             # one spot: RAG ingestion (SF: RAGIngestion)
+#   ./infrastructure/spot_data_weekly.sh --data-only            # manual rerun: morning-enrich + phase1
+#   ./infrastructure/spot_data_weekly.sh                        # manual full bundle: enrich + phase1 + rag
 #   ./infrastructure/spot_data_weekly.sh --smoke-only      # quick validation, then terminate
 #   ./infrastructure/spot_data_weekly.sh --preflight-only  # boot + DataPhase1/MorningEnrich preflight, exit 0 (NO fetch/write)
 #   ./infrastructure/spot_data_weekly.sh --rag-only --preflight-only  # boot + RAG-path preflight, exit 0 (NO fetch/write)
@@ -99,6 +114,12 @@ AMI_ID="ami-0c421724a94bba6d6"      # Amazon Linux 2023 x86_64
 # plus pip install + preflight. If the workload legitimately needs longer,
 # bump this — don't silently rely on the orphan reaper.
 MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-5400}"
+# Set to 1 only by the --max-runtime-seconds flag: the rag-only 4h-cap
+# override below must not clobber an explicit operator value. MUST be
+# default-initialized here — this script runs under `set -u`, and the flag
+# path is the only assignment (2026-07-18: the missing default killed every
+# SF-driven rag-only dispatch with "MAX_RUNTIME_EXPLICIT: unbound variable").
+MAX_RUNTIME_EXPLICIT="${MAX_RUNTIME_EXPLICIT:-0}"
 # ── Spot-interruption resilience (2026-05-30 incident) ──────────────────────
 # The Saturday SF DataPhase1 failed when this run's nested spot
 # (i-02e498e018441751f, c5.large/us-east-1a) was reclaimed by AWS *mid-
@@ -214,13 +235,35 @@ while [[ $# -gt 0 ]]; do
         --phase1-only) RUN_MODE="phase1-only"; shift ;;
         --launch-only) RUN_MODE="launch-only"; shift ;;
         --id-artifact-key) ID_ARTIFACT_KEY="$2"; shift 2 ;;
-        --max-runtime-seconds) MAX_RUNTIME_SECONDS="$2"; shift 2 ;;
+        --max-runtime-seconds) MAX_RUNTIME_SECONDS="$2"; MAX_RUNTIME_EXPLICIT=1; shift 2 ;;
         --preflight-only) PREFLIGHT_ONLY=1; shift ;;
         --instance-type) INSTANCE_TYPE="$2"; shift 2 ;;  # legacy: collapses INSTANCE_TYPES to single value
         --branch) BRANCH="$2"; shift 2 ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
 done
+
+# ── config#2938: rag-only full-universe news-sweep budget ────────────────────
+# RAGIngestion's Step 5/9 is the multi-source news sweep whose Polygon leg
+# (5 req/min, account-wide) now covers the FULL ~944-ticker universe (~3.15h)
+# per config#2938 ruling 1. The DataPhase1-sized defaults (5400s watchdog,
+# 3600s inner workload) SIGKILLed it twice on 2026-07-18. rag-only therefore
+# gets the config#2938 hard cap (6h since 2026-07-18 — measured filings phase
+# >=1h precedes the ~3.15h Polygon sweep) on BOTH the spot-side watchdog and the inner
+# workload SSM call. These MUST stay in lockstep with the RAGIngestion
+# executionTimeout in step_function.json (14400s) and the
+# WEEKLY_RAG_EXECUTION_TIMEOUT_SECONDS constant in
+# collectors/news_sources/fetch_budget.py — guarded by
+# tests/test_rag_ingestion_news_budget_wiring.py. Other modes (DataPhase1,
+# workloads) keep the 5400s default; an explicit --max-runtime-seconds still
+# wins so an operator can override.
+RAG_ONLY_EXECUTION_TIMEOUT_SECONDS=21600          # = SF RAGIngestion executionTimeout
+RAG_ONLY_WORKLOAD_TIMEOUT_SECONDS="$RAG_ONLY_EXECUTION_TIMEOUT_SECONDS"
+if [ "$RUN_MODE" = "rag-only" ] && [ "$MAX_RUNTIME_EXPLICIT" != "1" ]; then
+    # +300s so the box's own shutdown watchdog is a BACKSTOP that fires after
+    # the outer SF executionTimeout/cleanup, never before the sweep completes.
+    MAX_RUNTIME_SECONDS=21900
+fi
 
 # launch-only contract: the id artifact is how the weekday SF finds the
 # spot — launching without it would orphan the instance until the
@@ -587,9 +630,12 @@ DEPS
 
 # ── Launch-only: hand the bootstrapped spot to the weekday SF ────────────────
 # config#1807: the weekday pre-open data phase (MorningEnrich +
-# MorningArcticAppend + ChronicGapSelfHeal) runs on this spot instead of
-# the trading box, whose 2026-07-06 swap-thrash starved its own SSM agent
-# and blocked RunDaemon at market open. This mode ends at the exact point
+# MorningArcticAppend) runs on this spot instead of the trading box, whose
+# 2026-07-06 swap-thrash starved its own SSM agent and blocked RunDaemon at
+# market open. (ChronicGapSelfHeal, formerly also on-trading, was removed
+# entirely per alpha-engine-config-I2717 2026-07-16 — it now runs as part of
+# the standalone --daily-heal workload, off both the trading box and this
+# per-workload spot lifecycle.) This mode ends at the exact point
 # the per-state workload dispatch would begin: the SF owns the workloads
 # (per-state granularity + liveness polling + skip flags preserved) and
 # the termination; the bootstrap watchdog above (MAX_RUNTIME_SECONDS,
@@ -757,7 +803,7 @@ RAG_ONLY_PREFLIGHT
     echo "═══════════════════════════════════════════════════════════════"
     echo "  RAG-ONLY RUN (skipping DataPhase1)"
     echo "═══════════════════════════════════════════════════════════════"
-    run_ssm "rag-only" 3600 <<RAG_ONLY
+    run_ssm "rag-only" "$RAG_ONLY_WORKLOAD_TIMEOUT_SECONDS" <<RAG_ONLY
 set -eo pipefail
 ${ENV_SOURCE}
 cd /home/ec2-user/alpha-engine-data

@@ -32,8 +32,11 @@ The SF is a STRICT SUPERSET of the pre-spine Saturday SF:
   spot_drift_detection.sh, converting it from a literal `commands` array to
   the same `commands.$`/`States.Format($.preflight_args)` Option-C
   mechanism); the LAMBDA states run dry via their handler's no-write dry
-  flag: Research/DataPhase2/RegimeSubstrate/RegimeRetrospectiveEval from
-  the keystone, PLUS the eval-judge chain
+  flag: DataPhase2/RegimeSubstrate/RegimeRetrospectiveEval from
+  the keystone (the multi-agent Research state was also dry from the
+  keystone but was removed entirely by alpha-engine-config-I2515 Phase B;
+  its replacements SignalsEnvelope/ChallengerShadow carry no dry-run
+  signal, mirroring ThinkTankCoverage's own convention), PLUS the eval-judge chain
   (EvalJudgeSubmit{FirstSaturday,Weekly}/Poll/Process), RationaleClustering
   (research #202), ReplayConcordance + Counterfactual (backtester #225) —
   all reusing the canonical `$.research_dry` shell-run-dry signal via
@@ -87,10 +90,23 @@ _EXPECTED_SKIPS = {
     "skip_lib_pin_drift_check",
     "skip_morning_enrich",
     "skip_data_phase1",
+    # config#3134: Scanner, SignalsEnvelope, ChallengerShadow, and
+    # ThinkTankCoverage each got their own CheckSkip* gate — previously
+    # NONE of the four had one, so every partial rerun unconditionally
+    # re-ran all four regardless of flags. skip_signals_envelope's gate
+    # DEFAULTS FALSE (SignalsEnvelope is LOAD-BEARING — I2880 staleness
+    # guard — unlike the other three, which are safe defaults-false too
+    # but carry no comparable live-run hazard).
+    "skip_scanner",
+    "skip_signals_envelope",
+    "skip_challenger_shadow",
     "skip_rag_ingestion",
+    "skip_thinktank_coverage",
     "skip_regime_substrate",
     "skip_regime_retrospective_eval",
-    "skip_research",
+    # skip_research retired: alpha-engine-config-I2515 Phase B removed the
+    # multi-agent Research state (and its CheckSkipResearch gate) entirely
+    # — there is no longer a Lambda invocation to skip.
     "skip_data_phase2",
     "skip_eval_judge",
     "skip_rationale_clustering",
@@ -105,6 +121,10 @@ _EXPECTED_SKIPS = {
     # (and its CheckSkipDriftDetection gate) were collapsed when drift was
     # bundled onto the PredictorTraining spot, so there is no gate to skip.
     "skip_backtester",
+    # config#2362 Option A (operator-ruled 2026-07-21): additive gate that
+    # skips only the Backtester SSM task, distinct from skip_backtester's
+    # legacy whole-pair jump above.
+    "skip_backtester_stage_only",
     # Added config#830 — give the weekly SF a Backtester→Evaluator-only mid-week
     # path (mode=backtest-eval) without a separate state machine. PredictorBacktest
     # and PortfolioOptimizerBacktest (L4472 split) previously had no skip gate, and
@@ -160,7 +180,7 @@ _SPOT_STATES = {
         "/var/log/parity.log",
     ),
     "Evaluator": (
-        "bash infrastructure/spot_backtest.sh --skip-stages=backtest,parity",
+        "bash infrastructure/spot_backtest.sh --no-pit-parity --skip-stages=backtest,parity",
         "/var/log/evaluator.log",
     ),
     # config#902: DriftDetection was collapsed — drift is now bundled onto the
@@ -172,16 +192,24 @@ _SPOT_STATES = {
 
 # KEYSTONE + skip-exception rewire: the LAMBDA states routed dry (NOT
 # skipped) via an input-var ref so the absent path is behaviourally
-# identical. Research/DataPhase2/Regime* were dry from the keystone; the
+# identical. DataPhase2/Regime* were dry from the keystone; the
 # skip-exception rewire ADDED the eval-judge chain + rationale-clustering
 # (research #202 added dry_run_llm) + replay-concordance + counterfactual
 # (backtester #225 added dry_run_llm) — all reusing the canonical
 # $.research_dry shell-run-dry signal (already true under shell_run / false
 # on the real run). DriftDetection is NOT here — it is a SPOT state (see
 # _SPOT_STATES) routed dry via --preflight-only, not a Lambda dry flag.
+# alpha-engine-config-I2515 Phase B removed the multi-agent Research state
+# entirely — its "Research" entry here is retired along with it.
+# ChallengerShadow still threads no dry-run signal (mirroring ThinkTankCoverage's
+# no-dry-flag convention). SignalsEnvelope, however, threads a preflight signal
+# (config-I2916) — NOT via this _DRY_LAMBDA_STATES map, because it is NOT a
+# full dry short-circuit: preflight.$=$.research_dry keeps the read/build/write
+# path LIVE and only downgrades the I2880 board-staleness guard to a WARN on the
+# Friday dry-Scanner preflight. That distinct wiring is pinned by
+# test_signals_envelope_preflight_signal below, not by the dry-flag map.
 # state name → (Payload key carrying the dry flag, input var it references).
 _DRY_LAMBDA_STATES = {
-    "Research": ("dry_run_llm.$", "$.research_dry"),
     "DataPhase2": ("dry_run.$", "$.data_phase2_dry"),
     "RegimeSubstrate": ("action.$", "$.regime_action"),
     "RegimeRetrospectiveEval": ("action.$", "$.regime_action"),
@@ -348,6 +376,20 @@ def orig_spot_cmds() -> dict:
       reporting SUCCESS. `krepis.ssm_log_capture` is the canonical
       executable path; `test_ssm_log_capture_wrapper_executes.py` now
       proves executability (not just importability) in CI.
+    - **Regenerated 2026-07-10** as part of the weekly-SF `.env` deprecation
+      (alpha-engine-config#890 item 1, mirroring nousergon-data#485's
+      daily/eod migration): the 6 `_SPOT_STATES` entries that formerly did
+      `set -a && source /home/ec2-user/.alpha-engine.env && set +a`
+      (Backtester, Evaluator, Parity, PortfolioOptimizerBacktest,
+      PredictorBacktest, PredictorTraining) now inline-export
+      `AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1` instead — same
+      idiom as the merged daily/eod PR. Secrets still resolve via
+      `get_secret()`/SSM at runtime, unaffected by `.env` removal.
+      `DriftDetection` is left untouched (stale key, no longer a live SF
+      state per config#902 — outside `_SPOT_STATES` and outside this PR's
+      scope). `MorningEnrich`/`DataPhase1`/`RAGIngestion` are unchanged
+      (they invoke `spot_data_weekly.sh`, which self-exports the region via
+      its own `ENV_SOURCE` heredoc and never sourced `.env` directly).
 
     Regenerate ONLY on a deliberate, reviewed change to a spot state's
     absent-path (`preflight_args=""`) command, by re-extracting the
@@ -472,7 +514,10 @@ class TestStrictSuperset:
         assert nc["End"] is True
 
     def test_success_notify_gate_default_is_notify_complete(self, states):
-        assert states["CheckShellRunNotify"]["Default"] == "NotifyComplete"
+        # config#2278: the real-run success edge now passes through the
+        # gate-degraded completion Choice before NotifyComplete.
+        assert states["CheckShellRunNotify"]["Default"] == "CheckGateDegradedNotify"
+        assert states["CheckGateDegradedNotify"]["Default"] == "NotifyComplete"
 
 
 class TestApplyShellRunDefaults:
@@ -706,26 +751,72 @@ class TestByteIdenticalAbsentPath:
             f"follows the control var); got {payload.get(payload_key)!r}"
         )
 
+    def test_signals_envelope_preflight_signal(self, sf):
+        """config-I2916: SignalsEnvelope threads preflight.$=$.research_dry so the
+        Friday-PM dry-Scanner preflight downgrades the signals-envelope Lambda's
+        I2880 universe-board fallback-staleness guard from a hard raise to a WARN
+        (the dated board is intentionally absent on the dry preflight, so the
+        ~5-trading-day-stale prior-Saturday fallback is EXPECTED there).
+
+        This is DISTINCT from a full dry short-circuit: the key is `preflight`,
+        NOT `dry_run_llm` (which is_dry() would use to return before any S3
+        access). SignalsEnvelope's read/build/write path stays LIVE on the
+        preflight (bootstrap/transport smoke is the preflight's whole point);
+        only the one expected-stale-fallback condition is relaxed. On the real
+        Saturday run research_dry=false → preflight=false → the guard is fully
+        in force.
+        """
+        payload = self._state(sf, "SignalsEnvelope")["Parameters"]["Payload"]
+        assert payload.get("preflight.$") == "$.research_dry", (
+            "SignalsEnvelope.Payload must thread preflight.$=$.research_dry so the "
+            "Friday preflight relaxes the I2880 board-staleness guard to a WARN; "
+            f"got {payload.get('preflight.$')!r}"
+        )
+        # It must NOT reuse dry_run_llm — that would short-circuit the read path
+        # entirely (is_dry), defeating the transport smoke this state exists for.
+        assert "dry_run_llm.$" not in payload, (
+            "SignalsEnvelope must NOT thread dry_run_llm (full S3 short-circuit); "
+            "the config-I2916 fix keeps the read path live via a distinct "
+            "`preflight` signal."
+        )
+        # run_date must still flow so the (live) read keys off the same date.
+        assert payload.get("run_date.$") == "$.run_date"
+
 
 class TestConsolidatedNotify:
     def test_substrate_check_routes_to_notify_gate(self, states):
         # The substrate check flows into two non-fatal advisory states (evaluator
         # Report Card v2, then the Director) before the notify gate. ReportCard's
-        # SUCCESS Next feeds the Director; its Catch skips straight to
-        # CheckShellRunNotify. The Director's own Next AND Catch both land on
-        # CheckShellRunNotify, so the path to the notify gate is preserved whether
-        # grading/advisory succeed or fail. On the Friday preflight the states
-        # still RUN (dry, see test_advisory_tail_runs_dry_on_preflight) — they are
-        # not skipped — so the success edge is identical on real + preflight runs.
+        # SUCCESS Next feeds the Director; its Catch routes to
+        # PublishReportCardDegraded (config#2302: a WARNING page — advisory grading
+        # failed silently for 9 days pre-fix) which then continues to
+        # CheckShellRunNotify. The Director's own Next lands on CheckShellRunNotify;
+        # its Catch routes to PublishDirectorDegraded (same config#2302 shape) which
+        # then continues to CheckShellRunNotify. The path to the notify gate is
+        # preserved whether grading/advisory succeed or fail. On the Friday preflight
+        # the states still RUN (dry, see test_advisory_tail_runs_dry_on_preflight) —
+        # they are not skipped — so the success edge is identical on real + preflight
+        # runs.
+        # config#2276: the substrate poll resolves to a terminal status
+        # first; its Success edge is what feeds ReportCard.
         assert (
-            states["WaitForWeeklySubstrateHealthCheck"]["Next"] == "ReportCard"
+            states["WaitForWeeklySubstrateHealthCheck"]["Next"]
+            == "CheckSubstrateHealthCheckStatus"
         )
+        substrate_success = next(
+            r
+            for r in states["CheckSubstrateHealthCheckStatus"]["Choices"]
+            if r.get("StringEquals") == "Success"
+        )
+        assert substrate_success["Next"] == "ReportCard"
         report_card = states["ReportCard"]
         assert report_card["Next"] == "Director"
-        assert all(c["Next"] == "CheckShellRunNotify" for c in report_card["Catch"])
+        assert all(c["Next"] == "PublishReportCardDegraded" for c in report_card["Catch"])
+        assert states["PublishReportCardDegraded"]["Next"] == "CheckShellRunNotify"
         director = states["Director"]
         assert director["Next"] == "CheckShellRunNotify"
-        assert all(c["Next"] == "CheckShellRunNotify" for c in director["Catch"])
+        assert all(c["Next"] == "PublishDirectorDegraded" for c in director["Catch"])
+        assert states["PublishDirectorDegraded"]["Next"] == "CheckShellRunNotify"
 
     def test_advisory_tail_runs_dry_on_preflight(self, states):
         """ROADMAP L4504: ReportCard + Director were added after the shell-run
@@ -901,8 +992,9 @@ class TestHappyPathTraversal:
                         for cc in conds
                         if "StringEquals" in cc
                     }
-                    if eqs & {"Success", "OK", "SKIPPED"}:
-                        # success-continuation edge
+                    if eqs & {"Success", "OK", "SKIPPED", "HEALTHY"}:
+                        # success-continuation edge (HEALTHY: config#2249
+                        # SubstrateHealthGate verdict on a green trace)
                         success_edge = success_edge or c["Next"]
                     if eqs & {"FAILED", "ERROR"}:
                         # a FAILED-guard Choice (CheckBranchOutcomes shape):
@@ -998,7 +1090,11 @@ class TestHappyPathTraversal:
         # composed directly after LibPinDriftGate's pass-through (no drift ->
         # PipelineContractCheck -> PipelineContractGate -> CheckMutexRole on no
         # violation) — two extra states in the visited order.
-        assert order[: order.index("CheckSkipMorningEnrich") + 2] == [
+        # config#2249: CheckSkipMorningEnrich.Default now routes through the
+        # SubstrateHealthGate -> CheckSubstrateHealthGate pre-check before
+        # MorningEnrich (fast fail on a dead dispatch box) — two extra states
+        # in the visited order on the no-skip path.
+        assert order[: order.index("CheckSkipMorningEnrich") + 4] == [
             "InitializeInput",
             "CheckWeeklyRunDayGate",
             "CheckRunMode",
@@ -1010,6 +1106,8 @@ class TestHappyPathTraversal:
             "CheckMutexRole",
             "CheckShellRun",
             "CheckSkipMorningEnrich",
+            "SubstrateHealthGate",
+            "CheckSubstrateHealthGate",
             "MorningEnrich",
         ]
 
