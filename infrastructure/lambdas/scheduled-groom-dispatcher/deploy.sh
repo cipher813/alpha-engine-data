@@ -121,7 +121,7 @@ SCHED_INPUTS=(
   '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 4 * * *"}'
   '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 12 * * *"}'
   '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 20 * * *"}'
-  '{"run_mode":"full","model":"claude-haiku-4-5","issue_filter":"gated-reverify","schedule":"0 9 * * 0"}'
+  '{"run_mode":"full","model":"deepseek-v4-flash","issue_filter":"gated-reverify","schedule":"0 9 * * 0"}'
 )
 # Prefix used to discover live rules for prune reconciliation (see step 2f).
 SCHED_PREFIX="alpha-engine-scheduled-groom-"
