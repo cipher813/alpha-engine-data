@@ -63,7 +63,7 @@
       "Resource": "arn:aws:s3:::alpha-engine-research",
       "Condition": {
         "StringLike": {
-          "s3:prefix": ["expenses/*", "decision_artifacts/_cost_raw/*"]
+          "s3:prefix": ["expenses/*", "decision_artifacts/_cost_raw/*", "config/expense_budgets.json"]
         }
       }
     },
