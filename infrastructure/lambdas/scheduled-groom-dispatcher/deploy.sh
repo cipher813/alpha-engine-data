@@ -23,27 +23,14 @@
 # Lambda) + ssm:GetCommandInvocation (to poll) + sns:Publish (to alert on
 # failure) — it never touches secrets or launches anything itself.
 #
-# Cadence (UTC). Reduced 3->2/day on 2026-06-29 (the 15:00 UTC / 8am-PT run was
-# dropped per usage pacing); a 3rd schedule was re-added 2026-07-01 (config#1495
-# follow-up) at the SAME 15:00 UTC slot, now running a DIFFERENT tier — Opus,
-# complexity:high ONLY — not a reinstatement of the old Sonnet drain-phase run.
-# UNIFORM 3x/day, all 7 days, since 2026-07-02: the Sat-skip on the 07:00 slot
-# (originally "avoid colliding with the 09:00 UTC Saturday pipeline") was never
-# evidence-based — investigated and confirmed the groom and the weekly SF share
-# NEITHER the Claude Max quota (groom = Max-plan OAuth token; weekly SF Research/
-# Predictor = separate pay-as-you-go ANTHROPIC_API_KEY) NOR EC2 spot capacity
-# (disjoint instance families: groom t3/t3a/t2.medium vs weekly-SF c5/m5/c6i/c5a/
-# r5/r5a/r6i.large). No exceptions kept — the weekly SF can also now land on any
-# day (e.g. Friday, per the holiday-aware weekly-schedule-adjuster, #578) without
-# the groom cadence needing to track it.
-# Off-peak tier-split cadence (2026-07-07): avoid Anthropic Max weekday peak
-# (5–11am PT / 12:00–18:00 UTC PDT) and Brian's interactive hours where possible.
-# config#2409 (2026-07-13): the 01:00 high-only slot moved off Opus onto Sonnet
-# — dedicated queue/budget/off-peak schedule, no longer a distinct model tier.
-#   04:00 daily     cron(0 4 * * ? *)         FULL   all 3 tiers + sweep    # 9pm PT, every day
+# Cadence (UTC). MAINTENANCE CADENCE as of 2026-07-25 (config#1311): the
+# backlog is drained (30 open issues on alpha-engine-config, ~70 across all
+# 4 backlog repos), so the drain-phase 3x/day tier-split cadence is reverted
+# to a single daily full groom + the weekly Sunday gated-reverify lane. The
+# end-of-SF sweep (DispatchEndOfSfSweep in step_function_groom.json) continues
+# to run unconditionally after every trigger cycle — it covers the PR set
+# regardless of how many groom boxes launch.
 #   12:00 daily     cron(0 12 * * ? *)        FULL   all 3 tiers + sweep    # 5am PT, every day
-#   20:00 daily     cron(0 20 * * ? *)        FULL   all 3 tiers + sweep    # 1pm PT, every day
-#   Models: low=deepseek-v4-flash, mid=deepseek-v4-flash, high=deepseek-v4-pro, sweep=deepseek-v4-flash
 #   Sun 09:00       cron(0 9 ? * SUN *)       FULL   Haiku,  gated-reverify # weekly stale-gate lane (config#1891)
 #
 # SCHED_NAMES is the source of truth: any live scheduler rule under the
@@ -108,21 +95,15 @@ SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 # schedule label, plus model/issue_filter per tier — config#1760 tier-split).
 # deploy.sh prune drops orphaned rule names when cadence changes.
 SCHED_NAMES=(
-  "alpha-engine-scheduled-groom-0400-daily-high"
-  "alpha-engine-scheduled-groom-1200-daily-mid"
-  "alpha-engine-scheduled-groom-2000-daily-low"
+  "alpha-engine-scheduled-groom-1200-daily"
   "alpha-engine-scheduled-groom-sun0900-weekly-gated-reverify"
 )
 SCHED_CRONS=(
-  "cron(0 4 * * ? *)"
   "cron(0 12 * * ? *)"
-  "cron(0 20 * * ? *)"
   "cron(0 9 ? * SUN *)"
 )
 SCHED_INPUTS=(
-  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 4 * * *"}'
-  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 12 * * *"}'
-  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 20 * * *"}'
+  '{"run_mode":"full","trigger":"demand-all","pr_budget":50,"schedule":"0 12 * * *"}'
   '{"run_mode":"full","model":"deepseek-v4-flash","issue_filter":"gated-reverify","schedule":"0 9 * * 0"}'
 )
 # Prefix used to discover live rules for prune reconciliation (see step 2f).
