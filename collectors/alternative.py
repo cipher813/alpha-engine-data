@@ -208,89 +208,6 @@ def _emit_quality_gate_metrics(
         )
 
 
-# ── EDGAR local data dir → /tmp (Lambda read-only $HOME) ───────────────────
-#
-# edgartools (the ``edgar`` package, used by _fetch_institutional for 13F
-# data) writes its local data + HTTP response cache under a root directory
-# that defaults to ``~/.edgar`` (and ``~/.edgar/_tcache`` for the httpx
-# cache). In the DataPhase2 Lambda sandbox ``$HOME`` (``/home/sbx_user1051``)
-# is a read-only filesystem — only ``/tmp`` is writable — so every edgar
-# call raised ``[Errno 30] Read-only file system`` on 2026-05-17, leaving
-# the institutional source 0/33 populated and breaching the per-source
-# populated-ratio gate (``institutional`` threshold 0.20) → DataPhase2
-# returned ``{"status": "ERROR"}``.
-#
-# edgartools resolves ``EDGAR_LOCAL_DATA_DIR`` at *call time* (verified
-# against installed edgartools 5.28.2: edgar.paths.get_data_directory ->
-# os.getenv(ENV_EDGAR_DATA_DIR); edgar.httpclient.get_cache_directory ->
-# get_edgar_data_directory()/"_tcache"). Setting it before any
-# ``from edgar import ...`` / ``Company(...)`` runs is therefore effective,
-# and the env var alone redirects both the data dir and the _tcache HTTP
-# cache (the path that failed) — no ``$HOME`` override is required. We only
-# set it if unset so an operator-provided value still wins.
-def _holdings_to_value_dict(holdings) -> dict:
-    """Map an edgartools `ThirteenF.holdings` (or `previous.holdings`) result
-    to ``{cusip: value}`` regardless of whether the underlying API returns
-    a `pd.DataFrame` (edgartools 5.x — current) or a list-of-objects
-    (legacy edgartools 4.x — pre-2026-04-25).
-
-    Closes 5/23-SF P0 sweep L1308 (edgartools API drift). The drift happens
-    silently because edgartools changes the `holdings` return-shape across
-    minor versions without a breaking-change banner. Wrapping in a helper
-    + supporting both forms keeps the institutional data layer resilient
-    to future drift in the same direction.
-
-    Returns an empty dict if ``holdings`` is None or empty. Per-row
-    failures (missing Cusip / non-numeric Value) are logged at DEBUG and
-    skipped — single-row corruption shouldn't blank the whole report.
-    """
-    if holdings is None:
-        return {}
-    # Try DataFrame path first (edgartools 5.x). Column names per the
-    # holdings() docstring: Cusip (PascalCase), Value.
-    try:
-        import pandas as pd
-        if isinstance(holdings, pd.DataFrame):
-            if holdings.empty:
-                return {}
-            # Tolerate column-case variations (Cusip / cusip / CUSIP).
-            cusip_col = next(
-                (c for c in ("Cusip", "cusip", "CUSIP") if c in holdings.columns),
-                None,
-            )
-            value_col = next(
-                (c for c in ("Value", "value", "VALUE") if c in holdings.columns),
-                None,
-            )
-            if cusip_col is None or value_col is None:
-                logger.warning(
-                    "13F holdings DataFrame missing Cusip/Value columns "
-                    "(got %s) — empty result",
-                    list(holdings.columns),
-                )
-                return {}
-            return dict(zip(holdings[cusip_col], holdings[value_col]))
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("13F DataFrame path failed: %s", exc)
-    # Legacy list-of-objects fallback (edgartools 4.x).
-    try:
-        return {h.cusip: h.value for h in holdings}
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "13F holdings legacy iteration failed: %s — empty result", exc,
-        )
-        return {}
-
-
-_EDGAR_TMP_DATA_DIR = "/tmp/edgar"
-if not os.environ.get("EDGAR_LOCAL_DATA_DIR"):
-    try:
-        os.makedirs(_EDGAR_TMP_DATA_DIR, exist_ok=True)
-        os.environ["EDGAR_LOCAL_DATA_DIR"] = _EDGAR_TMP_DATA_DIR
-    except OSError as _e:  # pragma: no cover - /tmp is writable on Lambda
-        logger.warning("Could not prepare EDGAR_LOCAL_DATA_DIR: %s", _e)
-
-
 # ── Generic URL-credential scrubber ────────────────────────────────────────
 #
 # requests.exceptions.HTTPError embeds the full request URL — including any
@@ -359,7 +276,7 @@ _DEFAULT_MIN_OK_RATIOS: dict[str, float] = {
     "eps_revision":      0.50,
     "options_flow":      0.30,
     "insider_activity":  0.10,
-    "institutional":     0.20,
+    "institutional":     0.0,   # permanently dead; replaced by inst_ownership derived table (2026-07-25)
     "news":              0.50,
 }
 
@@ -885,8 +802,18 @@ def _fetch_all_alternative(ticker: str, run_date: str, bucket: str) -> dict:
     # 4. Insider activity (SEC EDGAR)
     result["insider_activity"] = _fetch_insider(ticker, run_date)
 
-    # 5. Institutional 13F (edgartools)
-    result["institutional"] = _fetch_institutional(ticker)
+    # 5. Institutional 13F — DEPRECATED 2026-07-13, function removed 2026-07-25.
+    #    _fetch_institutional was killed by OOM (Runtime.OutOfMemory) on every
+    #    weekly-SF run since at least May 2026 — CIK-mismatch bug meant it
+    #    always returned empty, but the edgar library's Company(ticker) +
+    #    get_filings("13F-HR") per-ticker call accumulated memory across 903
+    #    universe tickers until the Lambda hit its 512 MB ceiling.
+    #    Replaced by data/derived/inst_ownership.py (SEC quarterly bulk).
+    result["institutional"] = {
+        "accumulation": False,
+        "funds_increasing": 0,
+        "funds_decreasing": 0,
+    }
 
     # 6. News (Yahoo RSS + EDGAR 8-K)
     result["news"] = _fetch_news(ticker)
@@ -1403,88 +1330,13 @@ def _fetch_insider(ticker: str, run_date: str) -> dict:
     return result
 
 
-# ---- 5. Institutional 13F ----
-
-def _fetch_institutional(ticker: str) -> dict:
-    """DEPRECATED 2026-07-13 — ``inst_ownership`` derived table replaces this.
-
-    ``Company(ticker)`` resolves to the stock's CIK, but 13F-HR is filed
-    by the fund manager's CIK — this always returns empty for operating
-    companies. See ``alpha-engine-data/data/derived/inst_ownership.py``
-    (SEC quarterly bulk data, CUSIP→ticker resolved via yfinance).
-    """
-    logger.warning(
-        "DEPRECATED _fetch_institutional: use data.derived.inst_ownership "
-        "(SEC quarterly bulk) instead. CIK-mismatch bug renders this "
-        "always-empty for operating companies."
-    )
-    result = {
-        "accumulation": False,
-        "funds_increasing": 0,
-        "funds_decreasing": 0,
-    }
-
-    identity = get_secret("EDGAR_IDENTITY", required=False, default="")
-    if not identity:
-        return result
-
-    try:
-        from edgar import set_identity, Company
-        set_identity(identity)
-
-        company = Company(ticker)
-        filings = company.get_filings(form="13F-HR").latest(5)
-        if not filings or len(filings) == 0:
-            return result
-
-        n_accumulating = 0
-        n_decreasing = 0
-
-        try:
-            latest_filing = filings[0]
-            thirteen_f = latest_filing.obj()
-
-            if hasattr(thirteen_f, 'previous_holding_report'):
-                prev = thirteen_f.previous_holding_report()
-                if prev is not None:
-                    # edgartools API drift fix (L1308 / 5/23-SF P0 sweep):
-                    # `thirteen_f.holdings` now returns a `pd.DataFrame`
-                    # (aggregated holdings by security, columns include
-                    # `Cusip` + `Value` per the edgartools 5.x docstring).
-                    # The pre-fix code iterated the frame, yielding column
-                    # name strings, hence the `'str' object has no
-                    # attribute 'cusip'` AttributeError that silenced
-                    # institutional data for 29 days (2026-04-25 →
-                    # 2026-05-24 audit). Use `.itertuples()` to materialize
-                    # row records; column names are PascalCase post-drift.
-                    current_holdings = _holdings_to_value_dict(
-                        getattr(thirteen_f, 'holdings', None)
-                    )
-                    prev_holdings = _holdings_to_value_dict(
-                        getattr(prev, 'holdings', None)
-                    )
-
-                    for cusip, current_value in current_holdings.items():
-                        prev_value = prev_holdings.get(cusip, 0)
-                        if current_value and prev_value:
-                            if current_value > prev_value:
-                                n_accumulating += 1
-                            elif current_value < prev_value:
-                                n_decreasing += 1
-        except Exception as e:
-            logger.warning("13F comparison failed for %s: %s", ticker, _scrub_url_creds(e))
-
-        result["funds_increasing"] = n_accumulating
-        result["funds_decreasing"] = n_decreasing
-        result["accumulation"] = n_accumulating >= 3
-
-    except ImportError:
-        logger.debug("edgartools not available for 13F data")
-    except Exception as e:
-        logger.warning("Institutional fetch failed for %s: %s", ticker, _scrub_url_creds(e))
-
-    return result
-
+# ---- 5. Institutional 13F (REMOVED 2026-07-25) ----
+# _fetch_institutional was killed — CIK-mismatch bug meant it always returned
+# empty for operating companies, but the edgar library's Company(ticker) +
+# get_filings("13F-HR") per-ticker call accumulated memory across 903 universe
+# tickers until the Lambda OOM'd at 512 MB. Replaced by the derived inst_ownership
+# table (data/derived/inst_ownership.py, SEC quarterly bulk data).
+# The static default result is returned inline in _fetch_all_alternative.
 
 # ---- 6. News ----
 
