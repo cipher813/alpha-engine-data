@@ -327,12 +327,11 @@ def test_deploy_schedule_high_only_carries_pr_budget():
         line for line in sched_inputs_lines
         if "pr_budget" in line
     ]
-    # config#1311 maintenance cadence: 1 daily SCHED_INPUT has pr_budget
-    # (the single daily slot launches all tiers including high).
-    # The weekly gated-reverify SCHED_INPUTS does not.
-    assert len(pr_budget_lines) == 1, (
-        f"expected 1 daily SCHED_INPUT entry with pr_budget (maintenance "
-        f"cadence, config#1311), got {len(pr_budget_lines)}: {pr_budget_lines}"
+    # config#1311: 3 daily + 1 Sunday = 4 demand-all slots, all carry pr_budget
+    # (every slot launches all 3 tiers including high when the queue clears).
+    assert len(pr_budget_lines) == 4, (
+        f"expected 4 SCHED_INPUT entries with pr_budget (3 daily + Sunday, "
+        f"demand-all cadence), got {len(pr_budget_lines)}: {pr_budget_lines}"
     )
 
 
