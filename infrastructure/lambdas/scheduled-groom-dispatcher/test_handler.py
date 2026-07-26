@@ -1661,7 +1661,10 @@ def test_demand_all_launches_from_ruling_pending_prs_alone_at_floor(monkeypatch)
     assert idx._test_ssm.sent, "a real spot box must have been dispatched"
 
 
-def test_demand_all_ruling_pending_prs_below_floor_fresh_no_launch(monkeypatch):
+def test_demand_all_ruling_pending_prs_launch_when_any_present(monkeypatch):
+    # groom-primary-deepseek (v0.124.15): unconditional per-tier launch —
+    # a single ruling:pending-exec PR with complexity:mid, zero issues,
+    # still launches (1 > 0).
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     monkeypatch.setattr(idx, "_github_token", lambda: "tok")
     monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_empty_issue_pages)
@@ -1670,15 +1673,16 @@ def test_demand_all_ruling_pending_prs_below_floor_fresh_no_launch(monkeypatch):
     pr["repo"] = "nousergon/nousergon-data"
     monkeypatch.setattr(idx, "_enumerate_ruling_pending_prs", lambda token: [pr])
     out = idx.handler(_demand_event(), None)
-    assert out["groom"]["launches"] == []
-    assert not idx._test_ssm.sent
+    launches = out["groom"]["launches"]
+    assert len(launches) == 1
+    assert launches[0]["issue_filter"] == "mid-only"
+    assert idx._test_ssm.sent
 
 
-def test_demand_all_stale_ruling_pending_pr_fires_escape_valve(monkeypatch):
-    # A single ruled PR, zero issues, well below the floor — but its
-    # updated_at is far past DEFAULT_MAX_WAIT_HOURS (72h), so it must fire
-    # the anti-starvation escape valve exactly like an overdue actionable
-    # issue would (config-I3227 acceptance criteria).
+def test_demand_all_ruling_pending_pr_launches_unconditionally(monkeypatch):
+    # groom-primary-deepseek (v0.124.15): unconditional per-tier launch —
+    # escape valves and staleness thresholds are retired; any positive
+    # count launches regardless of age or floor.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     monkeypatch.setattr(idx, "_github_token", lambda: "tok")
     monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_empty_issue_pages)
