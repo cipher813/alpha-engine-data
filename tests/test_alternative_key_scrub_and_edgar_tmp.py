@@ -1,30 +1,15 @@
-"""Regression tests for two production fixes in ``collectors/alternative.py``.
+"""Regression tests for API-key leak in alt-data exception logs.
 
-1. EDGAR local data dir → /tmp (Lambda read-only $HOME)
-   --------------------------------------------------------
-   edgartools (``edgar`` package, used by ``_fetch_institutional`` for 13F
-   data) writes its local data + httpx response cache under ``~/.edgar`` /
-   ``~/.edgar/_tcache``. In the DataPhase2 Lambda sandbox ``$HOME`` is a
-   read-only filesystem (only ``/tmp`` is writable), so on 2026-05-17 every
-   edgar call raised ``[Errno 30] Read-only file system`` → institutional
-   source 0/33 populated → per-source populated-ratio gate (``institutional``
-   floor 0.20) breached → DataPhase2 returned ``{"status": "ERROR"}``.
+FMP-backed warnings ("EPS estimate failed for AFL: 402 ... ?apikey=<KEY>")
+and Finnhub-backed warnings (``token=<KEY>``) embed the live credential in
+the request URL inside ``HTTPError.str()``. ``_scrub_url_creds`` masks
+``apikey=``/``api_key=``/``token=`` querystring secrets before logging.
 
-   The module sets ``EDGAR_LOCAL_DATA_DIR`` to a writable ``/tmp`` path at
-   import time *only if unset* (an operator-provided value must win).
-
-2. API-key leak in alt-data exception logs
-   ----------------------------------------
-   FMP-backed warnings ("EPS estimate failed for AFL: 402 ... ?apikey=<KEY>")
-   and Finnhub-backed warnings (``token=<KEY>``) embed the live credential in
-   the request URL inside ``HTTPError.str()``. ``_scrub_url_creds`` masks
-   ``apikey=``/``api_key=``/``token=`` querystring secrets before logging.
+(EDGAR data-dir redirect tests were removed 2026-07-25 along with the
+_fetch_institutional function — the edgar package is no longer imported.)
 """
 
 from __future__ import annotations
-
-import importlib
-import os
 
 import pytest
 
@@ -113,57 +98,3 @@ def test_scrub_case_insensitive():
     scrubbed = alternative._scrub_url_creds(msg)
     assert "MIXEDCASE" not in scrubbed
     assert "APIKEY=***" in scrubbed
-
-
-# ── EDGAR_LOCAL_DATA_DIR redirect ──────────────────────────────────────────
-
-
-def test_edgar_local_data_dir_set_to_tmp_when_unset(monkeypatch):
-    """Simulate the Lambda env (no preset var): after the institutional
-    module is (re)imported, ``EDGAR_LOCAL_DATA_DIR`` points at a writable
-    ``/tmp`` path and the directory exists."""
-    monkeypatch.delenv("EDGAR_LOCAL_DATA_DIR", raising=False)
-
-    from collectors import alternative
-
-    importlib.reload(alternative)
-
-    val = os.environ.get("EDGAR_LOCAL_DATA_DIR")
-    assert val is not None
-    assert val.startswith("/tmp/"), f"expected /tmp path, got {val!r}"
-    assert os.path.isdir(val)
-
-
-def test_edgar_local_data_dir_respects_operator_preset(monkeypatch, tmp_path):
-    """An operator-provided ``EDGAR_LOCAL_DATA_DIR`` must NOT be overridden
-    (e.g. a future EFS mount or a tuned /tmp subdir)."""
-    preset = str(tmp_path / "operator-edgar")
-    monkeypatch.setenv("EDGAR_LOCAL_DATA_DIR", preset)
-
-    from collectors import alternative
-
-    importlib.reload(alternative)
-
-    assert os.environ.get("EDGAR_LOCAL_DATA_DIR") == preset
-
-
-def test_edgar_redirect_is_effective_for_installed_edgartools():
-    """End-to-end: with the env var set by the module, the installed
-    edgartools resolves BOTH its data dir and its httpx ``_tcache`` cache
-    (the path that raised the read-only-FS error) under the redirected
-    root — proving the env var alone is sufficient (no $HOME override)."""
-    edgar = pytest.importorskip("edgar")
-
-    from collectors import alternative  # noqa: F401  (sets the env var)
-
-    root = os.environ["EDGAR_LOCAL_DATA_DIR"]
-    resolved_root = os.path.realpath(root)
-
-    from edgar.core import get_edgar_data_directory
-    from edgar.httpclient import get_cache_directory
-
-    data_dir = os.path.realpath(str(get_edgar_data_directory()))
-    http_cache = os.path.realpath(str(get_cache_directory()))
-
-    assert data_dir.startswith(resolved_root), (data_dir, resolved_root)
-    assert http_cache.startswith(resolved_root), (http_cache, resolved_root)
