@@ -1626,14 +1626,13 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                               "queue_manifests": manifest_keys,
                               "launches": results}}
 
-    # alpha-engine-config-I3479 (PRIMARY-mode DeepSeek): default "" (unchanged
-    # Claude path) — only the single-tier demand-gate branch below ever sets
-    # this to a non-empty value. Every bypass of that branch (manifest-key
-    # drain, force_on_demand relaunch, gated-reverify/non-slot filters, demand
-    # gate disabled) deliberately stays on Claude — PRIMARY selection is
-    # scoped to the three enumerate-then-decide entry points named in the
-    # module docstring, not every legacy launch shape.
-    backend = ""
+    # alpha-engine-config-I3479 (PRIMARY-mode DeepSeek): when
+    # GROOM_PRIMARY_DEEPSEEK_TIERS is armed, ALL launch paths use DeepSeek —
+    # including gated-reverify, manifest drains, and force_on_demand relaunches.
+    # The per-tier scoping in _primary_backend_for (via the demand-gate branch
+    # below) still applies to the demand-all path for mixed-bundle scenarios,
+    # but with all three tiers armed today (low,mid,high) the distinction is moot.
+    backend = GROOM_BACKEND_DEEPSEEK if GROOM_PRIMARY_DEEPSEEK_TIERS else ""
     if run_mode == "full" and not force_on_demand and not queue_manifest_key:
         decided = _demand_decision(issue_filter, schedule_label)
         if decided is not None:
