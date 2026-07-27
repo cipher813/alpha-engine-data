@@ -24,6 +24,13 @@ from pathlib import Path
 
 import pytest
 
+# groom-sweep-policy §2.3: `nousergon_lib.groom_eligibility.TIER_MODELS` is the
+# SINGLE OWNER of the tier->model assignment. Derive expectations from it rather
+# than restating the model names here — a second hardcoded copy is exactly how
+# this Lambda came to dispatch claude-sonnet-5 for the high tier for days after
+# v0.124.16 moved it to deepseek-v4-pro (alpha-engine-config-I4796).
+from nousergon_lib.groom_eligibility import TIER_MODELS
+
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -770,11 +777,11 @@ def test_symmetric_trigger_brians_8_9_10_launches_three_boxes(monkeypatch):
     g = out["groom"]
     assert g["trigger"] == "demand-all"
     launched = {(l["issue_filter"], l["model"]) for l in g["launches"]}
-    # groom-primary-deepseek (v0.124.15): every tier launches independently at
-    # its tier's model — low=deepseek-v4-flash, mid=deepseek-v4-flash, high=claude-sonnet-5
-    assert launched == {("high-only", "claude-sonnet-5"),
-                        ("mid-only", "deepseek-v4-flash"),
-                        ("low-only", "deepseek-v4-flash")}
+    # Every tier launches independently at its OWN tier's model, read from the
+    # lib that owns the assignment (groom-sweep-policy §5 tier table).
+    assert launched == {("high-only", TIER_MODELS["high"]),
+                        ("mid-only", TIER_MODELS["mid"]),
+                        ("low-only", TIER_MODELS["low"])}
     cmds = [c["Parameters"]["commands"][0] for c in idx._test_ssm.sent]
     assert len(cmds) == 3
     # config#2201: groom boxes are pure issue-coverage workers — the
@@ -797,7 +804,7 @@ def test_symmetric_trigger_all_tiers_launch_when_any_issues(monkeypatch):
     issue_filters = {l["issue_filter"] for l in launches}
     assert issue_filters == {"low-only", "mid-only", "high-only"}
     models = {l["model"] for l in launches}
-    assert models == {"deepseek-v4-flash", "claude-sonnet-5"}
+    assert models == {TIER_MODELS["low"], TIER_MODELS["mid"], TIER_MODELS["high"]}
     assert len(idx._test_ssm.sent) == 3
 
 
