@@ -582,6 +582,9 @@ def _notify_concurrent_skip(tier_tag: str, existing_ids: list[str], schedule_lab
             context={"schedule": schedule_label, "tier_tag": tier_tag,
                      "existing_instance_ids": existing_ids},
             silent_topic=FleetTelegramTopic.GROOM,
+            # Matches playbooks.yaml's registered `groom_dispatch_telegram_only`
+            # class source exactly (config-I3513).
+            source="flow-doctor:scheduled-groom-dispatcher",
         )
     except Exception as exc:  # noqa: BLE001 — secondary observability
         logger.warning("concurrent-lane skip Telegram failed (non-fatal): %s", exc)
@@ -655,6 +658,9 @@ def _notify_dispatch_ceiling_exhausted(prior: int, ceiling: int, tier_tag: str,
             db_basename=_DB_BASENAME,
             context={"schedule": schedule_label, "tier_tag": tier_tag,
                      "prior_dispatch_count": prior, "dispatch_ceiling": ceiling},
+            # Matches playbooks.yaml's registered `groom_dispatch_telegram_only`
+            # class source exactly (config-I3513).
+            source="flow-doctor:scheduled-groom-dispatcher",
         )
     except Exception as exc:  # noqa: BLE001 — secondary observability
         logger.warning("dispatch-ceiling-exhausted Telegram failed (non-fatal): %s", exc)
@@ -1038,6 +1044,9 @@ def _notify_demand_trigger_failed(exc: Exception, schedule_label: str) -> None:
             flow_name=_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
             db_basename=_DB_BASENAME,
             context={"schedule": schedule_label, "error": str(exc)},
+            # Matches playbooks.yaml's registered `groom_dispatch_telegram_only`
+            # class source exactly (config-I3513).
+            source="flow-doctor:scheduled-groom-dispatcher",
         )
     except Exception as notify_exc:  # noqa: BLE001 — secondary observability
         logger.warning("trigger-failed Telegram failed (non-fatal): %s", notify_exc)
@@ -1058,6 +1067,9 @@ def _notify_demand_skip(decision, counts: dict, schedule_label: str) -> None:
             db_basename=_DB_BASENAME,
             context={"schedule": schedule_label, **decision.as_record()},
             silent_topic=FleetTelegramTopic.GROOM,
+            # Matches playbooks.yaml's registered `groom_dispatch_telegram_only`
+            # class source exactly (config-I3513).
+            source="flow-doctor:scheduled-groom-dispatcher",
         )
     except Exception as exc:  # noqa: BLE001 — secondary observability
         logger.warning("demand-skip Telegram failed (non-fatal): %s", exc)
@@ -1626,14 +1638,13 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                               "queue_manifests": manifest_keys,
                               "launches": results}}
 
-    # alpha-engine-config-I3479 (PRIMARY-mode DeepSeek): default "" (unchanged
-    # Claude path) — only the single-tier demand-gate branch below ever sets
-    # this to a non-empty value. Every bypass of that branch (manifest-key
-    # drain, force_on_demand relaunch, gated-reverify/non-slot filters, demand
-    # gate disabled) deliberately stays on Claude — PRIMARY selection is
-    # scoped to the three enumerate-then-decide entry points named in the
-    # module docstring, not every legacy launch shape.
-    backend = ""
+    # alpha-engine-config-I3479 (PRIMARY-mode DeepSeek): when
+    # GROOM_PRIMARY_DEEPSEEK_TIERS is armed, ALL launch paths use DeepSeek —
+    # including gated-reverify, manifest drains, and force_on_demand relaunches.
+    # The per-tier scoping in _primary_backend_for (via the demand-gate branch
+    # below) still applies to the demand-all path for mixed-bundle scenarios,
+    # but with all three tiers armed today (low,mid,high) the distinction is moot.
+    backend = GROOM_BACKEND_DEEPSEEK if GROOM_PRIMARY_DEEPSEEK_TIERS else ""
     if run_mode == "full" and not force_on_demand and not queue_manifest_key:
         decided = _demand_decision(issue_filter, schedule_label)
         if decided is not None:
