@@ -1,0 +1,107 @@
+name: IAM Policy Change Guard
+
+# Structural enforcement (config#4472): a PR that changes a Lambda's
+# `iam-policy.json` must also touch that Lambda's `deploy.sh` (which has
+# `--apply-iam` to push it live) OR carry a `gate:operator` label naming
+# the tracked operator issue — otherwise the policy change is SILENTLY
+# inert until an operator happens to re-run --apply-iam, the exact failure
+# mode that caused a 4-day silent drain outage in 2026-07.
+#
+# The GHA auto-deploy path code-only deploy (flagless `deploy.sh`) runs
+# through an OIDC role that intentionally lacks iam:PutRolePolicy (fleet
+# single-writer rule after 4 IAM-clobber incidents). So the deploy itself
+# cannot apply the policy — the guard ensures the PR author has either
+# touched the deploy script (operator will run --apply-iam) or explicitly
+# gated the change on a tracked operator issue. See infrastructure/iam/
+# README.md "Single-writer rule" and _shared/apply_iam_policy.sh.
+#
+# Usage: required status check on main branch protection.
+
+on:
+  pull_request:
+    paths:
+      - 'infrastructure/lambdas/*/iam-policy.json'
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  # Job id is the branch-protection CONTEXT. Deliberately specific rather
+  # than a generic `check`: a required context must be unambiguous, and a
+  # future workflow adding its own `check` job would otherwise collide with
+  # a REQUIRED status (nousergon-data-I1078).
+  iam-policy-change-guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Check iam-policy.json changes have deploy.sh or gate:operator
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          # Get all changed iam-policy.json files in this PR
+          CHANGED_POLICIES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" \
+            -- 'infrastructure/lambdas/*/iam-policy.json' || true)
+
+          if [ -z "$CHANGED_POLICIES" ]; then
+            echo "✓ No iam-policy.json changes detected (path trigger may have fired on other changes)."
+            exit 0
+          fi
+
+          echo "Changed iam-policy.json files:"
+          echo "$CHANGED_POLICIES"
+
+          # Extract the lambda directory for each changed policy
+          FAILED=""
+          for POLICY in $CHANGED_POLICIES; do
+            LAMBDA_DIR=$(dirname "$POLICY")
+            LAMBDA_NAME=$(basename "$LAMBDA_DIR")
+            DEPLOY_SCRIPT="${LAMBDA_DIR}/deploy.sh"
+
+            # Check if the corresponding deploy.sh was also changed
+            if echo "$CHANGED_POLICIES" | grep -q "${DEPLOY_SCRIPT}" \
+              || git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -q "^${DEPLOY_SCRIPT}$"; then
+              echo "✓ ${POLICY}: deploy.sh also changed (--apply-iam can be run)"
+              continue
+            fi
+
+            # Check for gate:operator label on the PR
+            HAS_GATE_OPERATOR=false
+            if [ -n "$PR_NUMBER" ]; then
+              LABELS=$(gh pr view "$PR_NUMBER" --json labels --jq '.labels[].name' 2>/dev/null || echo "")
+              if echo "$LABELS" | grep -q "^gate:operator$"; then
+                HAS_GATE_OPERATOR=true
+              fi
+            fi
+
+            if [ "$HAS_GATE_OPERATOR" = true ]; then
+              echo "✓ ${POLICY}: PR carries gate:operator label (blocked on tracked operator issue)"
+              continue
+            fi
+
+            echo "FAIL: ${POLICY} changed but ${DEPLOY_SCRIPT} was not touched"
+            echo "      and no gate:operator label is set on this PR."
+            echo ""
+            echo "      A changed iam-policy.json has NO LIVE EFFECT until an operator"
+            echo "      runs 'deploy.sh --apply-iam' or 'deploy.sh --bootstrap'. Either:"
+            echo "        1) Also modify ${DEPLOY_SCRIPT} (so the operator knows to apply IAM)"
+            echo "        2) Add the 'gate:operator' label with a tracked operator issue"
+            FAILED="true"
+          done
+
+          if [ "$FAILED" = "true" ]; then
+            exit 1
+          fi

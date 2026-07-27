@@ -205,6 +205,69 @@ def _fetch_s3_definition(key: str) -> dict | None:
     return json.loads(out)
 
 
+def _git(*args: str) -> str | None:
+    """``git`` output, or ``None`` if git is unavailable / the command fails
+    (not a git checkout, no remote-tracking ref, shallow clone). Never raises:
+    the staleness note is an aid, and its absence must never break a real
+    drift check."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), *args],
+            capture_output=True, text=True, check=False,
+        )
+    except (OSError, ValueError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def stale_definition_files(entries) -> list[str]:
+    """Definition files whose WORKING-TREE bytes differ from ``origin/HEAD``'s.
+
+    This script's entire premise is "the repo file is the intended truth" — so
+    when the working tree does not match the pushed branch, every finding it
+    produces is suspect: the difference may be local staleness rather than live
+    drift. On 2026-07-27 a checkout 9 commits behind origin produced four
+    confident findings (an alleged 18-state divergence in the weekly trading
+    pipeline) that were entirely the local delta; live, S3 and origin/main all
+    agreed. A tool whose job is comparing repo bytes to live must not report
+    drift from bytes it cannot vouch for.
+
+    Deliberately does NOT fetch — a checker must not mutate git state, and a
+    stale remote-tracking ref still catches the common case (a checkout that
+    was never pulled). Deliberately does NOT fail: comparing an in-flight
+    branch's definitions against live before merging is a legitimate use, and
+    that case would trip this every time. It annotates instead.
+
+    Returns repo-relative paths, sorted. Empty when git is unavailable — an
+    unknown answer is reported as "no note", never as a false reassurance,
+    because ``main()`` prints the note only when this is non-empty."""
+    if _git("rev-parse", "--is-inside-work-tree") != "true":
+        return []
+    # Resolve the tracked remote branch rather than assuming "origin/main".
+    upstream = (_git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+                or "origin/main")
+    stale: list[str] = []
+    for entry in SF_DEFINITIONS:
+        rel = (INFRA_DIR / entry["definition_file"]).relative_to(REPO_ROOT)
+        local = _git("hash-object", str(rel))
+        remote = _git("rev-parse", f"{upstream}:{rel}")
+        if local and remote and local != remote:
+            stale.append(str(rel))
+    return sorted(set(stale))
+
+
+def stale_checkout_note(stale: list[str], upstream: str = "origin/main") -> str:
+    """The operator-facing warning. Pure / testable."""
+    files = ", ".join(stale)
+    return (
+        f"⚠️  LOCAL CHECKOUT MAY BE STALE — {len(stale)} definition file(s) "
+        f"differ from {upstream}: {files}\n"
+        f"    Findings below compare LOCAL bytes against live/S3, so a "
+        f"'drift' here may be your checkout, not the deployment.\n"
+        f"    Run `git pull` and re-check before acting on anything below."
+    )
+
+
 def _check_sf(entry: dict) -> list[str]:
     sf_name = entry["sf_name"]
     definition_path = INFRA_DIR / entry["definition_file"]
@@ -329,6 +392,12 @@ def main() -> int:
         total_findings.extend(_check_sf(entry))
 
     if total_findings:
+        # Printed BEFORE the findings, so it cannot be missed by someone who
+        # reads the first line and starts acting (which is exactly what
+        # happened on 2026-07-27).
+        stale = stale_definition_files(entries)
+        if stale:
+            print(stale_checkout_note(stale))
         print(f"SF definition drift detected ({len(total_findings)} finding(s)):")
         for f in total_findings:
             print(f"  - {f}")
