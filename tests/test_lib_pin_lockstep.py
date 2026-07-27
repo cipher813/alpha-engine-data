@@ -85,7 +85,7 @@ _LAMBDA_PIN_EXEMPTIONS = {
     "alert-drain-liveness-probe": (
         "v0.83.0",
         "flow-doctor forum-topic routing (config#1742) — mirrors "
-        "sf-watch-liveness-probe's reclaim-checker exactly (config#3173)",
+        "sf-watch-reclaim-sweep-handler's reclaim-checker exactly (config#3173)",
     ),
     "ci-watch-dispatcher": (
         "v0.124.5",
@@ -96,7 +96,7 @@ _LAMBDA_PIN_EXEMPTIONS = {
     "ci-watch-liveness-probe": (
         "v0.83.0",
         "flow-doctor forum-topic routing (config#1742) — mirrors "
-        "sf-watch-liveness-probe's reclaim-checker exactly (config#3173)",
+        "sf-watch-reclaim-sweep-handler's reclaim-checker exactly (config#3173)",
     ),
     "data-spot-dispatcher": (
         "v0.124.5",
@@ -118,7 +118,7 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "v0.83.0",
         "flow-doctor forum-topic routing (config#1742); OPS_HEALTH-only "
         "single-topic consumer, same exemption group as "
-        "saturday-integrity-sentinel/sf-watch-liveness-probe/pipeline-watchdog "
+        "saturday-integrity-sentinel/sf-watch-reclaim-sweep-handler/pipeline-watchdog "
         "(alpha-engine-config#2843)",
     ),
     "freshness-monitor": (
@@ -149,7 +149,7 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "flow-doctor forum-topic routing (config#1742)",
     ),
     "scheduled-groom-dispatcher": (
-        "v0.124.10",
+        "v0.124.15",
         "spot_dispatch + SlotDecision + label-exclude parity (config#2146/2106/2129); "
         "bumped for TIER_MODELS[\"high\"] Opus->Sonnet (config#2409); "
         "v0.124.0 for nousergon_lib.github_app — _github_token() mints the "
@@ -157,13 +157,15 @@ _LAMBDA_PIN_EXEMPTIONS = {
         "nousergon-lib#220, incident config-I2784); bumped to v0.124.5 for config#2698 "
         "SpotQuotaExceededError on-demand fallback, first available at v0.124.1; "
         "bumped to v0.124.10 for ge.RULING_PENDING_LABEL — org-wide "
-        "ruling:pending-exec PR demand counting (config-I3227, nousergon-lib#232)",
+        "ruling:pending-exec PR demand counting (config-I3227, nousergon-lib#232); "
+        "bumped to v0.124.15 for nousergon-lib#241 (unconditional decide_trigger "
+        "— no floor gates, no thin-tier bundling) — replaces the v0.124.13 pin",
     ),
     "sf-telegram-notifier": (
         "v0.83.0",
         "flow-doctor forum-topic routing (config#1742)",
     ),
-    "sf-watch-liveness-probe": (
+    "sf-watch-reclaim-sweep-handler": (
         "v0.83.0",
         "flow-doctor forum-topic routing (config#1742)",
     ),

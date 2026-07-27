@@ -95,7 +95,7 @@ import logging
 import os
 import re
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import boto3
@@ -213,7 +213,7 @@ _DEFAULT_RUN_MODE = "full"
 # structurally closed.
 _VALID_ISSUE_FILTERS = set(ge.VALID_ISSUE_FILTERS)
 _DEFAULT_ISSUE_FILTER = "mid-only"
-_DEFAULT_MODEL = "claude-sonnet-5"
+_DEFAULT_MODEL = "deepseek-v4-pro"
 # Defense-in-depth allowlist for the model id (embedded verbatim into the SSM
 # shell command below) — model ids are Lambda-config-controlled, not raw user
 # input, but this is cheap and rules out shell-metacharacter injection outright.
@@ -1110,52 +1110,13 @@ def _demand_decision(issue_filter: str, schedule_label: str):
         return None
 
 
-def _load_recent_engagements() -> dict:
-    """(repo, number) -> engagement horizon epoch from the last
-    ``ge.ENGAGEMENT_LOOKBACK_DAYS`` days' S3 run artifacts (same schema the
-    driver's config#1893 fresh-skip reads).
-
-    RAISES on any read failure (config#2142). This was previously fail-safe
-    ``{}`` ("skip nothing — counting a few extra issues"), which masked a
-    total AccessDenied on the ``groom/{date}/`` engagement scan for every
-    trigger from ship (2026-07-08) to 2026-07-10: fresh-skip enumeration ran
-    with an empty map on 8 consecutive triggers with zero pipeline signal,
-    inflating every advertised per-tier count. The trigger handler's own
-    catch is the recording surface: it skips the trigger (fail-closed, no
-    launch on over-counted queues) AND pages ops-health.
-
-    config#2038: the lookback (was a hardcoded ``range(3)``) and the engaged-
-    disposition set (was a hardcoded tuple literal) had silently drifted from
-    groom_driver.py's own constants (4-day lookback, same 4 dispositions) —
-    this module already imports ``nousergon_lib.groom_eligibility`` as the
-    declared single source of truth for exactly this class of drift; the two
-    values just weren't pulled from it yet. Read them from ``ge`` so they
-    can't re-drift.
-    """
-    out: dict = {}
-    s3 = boto3.client("s3", region_name=REGION)
-    now = datetime.now(ZoneInfo("UTC"))
-    for d in range(ge.ENGAGEMENT_LOOKBACK_DAYS):
-        date = (now - timedelta(days=d)).strftime("%Y-%m-%d")
-        resp = s3.list_objects_v2(Bucket=_RESEARCH_BUCKET, Prefix=f"groom/{date}/")
-        for obj in resp.get("Contents", []) or []:
-            if not obj["Key"].endswith(".json"):
-                continue
-            art = json.loads(s3.get_object(Bucket=_RESEARCH_BUCKET, Key=obj["Key"])["Body"].read())
-            run_start = art.get("run_start", "")
-            if not run_start:
-                continue
-            horizon = (datetime.fromisoformat(run_start.replace("Z", "+00:00")).timestamp()
-                       + int(art.get("elapsed_min", 0)) * 60 + ge.FRESH_SKIP_SLACK_SEC)
-            for rec in art.get("issues", []):
-                if rec.get("disposition") in ge.ENGAGED_DISPOSITIONS:
-                    k = (rec.get("repo", ""), rec.get("number"))
-                    out[k] = max(out.get(k, 0.0), horizon)
-    return out
-
-
 def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list, dict]:
-    """Tier stats with config#1893 fresh-skip applied (P0 exempt).
+    """Tier stats (config#2146: the 72h fresh-skip cooldown this function
+    used to apply is retired — eligibility is disposition-structural now,
+    ``ge.is_actionable`` alone decides membership; see groom_eligibility's
+    module docstring for the Brian ruling. ``_load_recent_engagements`` (the
+    engagement-horizon S3 scan fresh-skip used to consume) is removed with
+    it — it had no other caller).
 
     Returns (counts, oldest_wait_hours, p0_tiers, tier_issues) —
     the first three for ge.decide_trigger(); ``tier_issues`` maps tier →
@@ -1173,16 +1134,10 @@ def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list, dict]:
     starvation escape valve exactly like an issue-only one would; the
     escape valve is generic over ANY tier's oldest wait, so a ruled PR that
     has sat past ``max_wait_hours`` fires it the same way an actionable P0
-    issue does — no separate carve-out needed). Fresh-skip applies to ruled
-    PRs identically to issues: a PR groom_driver.py's ``ruling_exec_pr_pool``
-    already worked and left an engagement disposition for (via the same
-    (repo, number) key) is debounced the same 72h window; a PR with no
-    matching engagement record is simply never skipped. PR titles are
-    prefixed ``[PR] `` in ``tier_issues``, mirroring the disambiguation
-    convention ``groom_driver.py``'s ``gated_reverify_pr_pool``/
-    ``ruling_exec_pr_pool`` already use for the identical PR-vs-issue
-    ambiguity."""
-    engagements = _load_recent_engagements()
+    issue does — no separate carve-out needed). PR titles are prefixed
+    ``[PR] `` in ``tier_issues``, mirroring the disambiguation convention
+    ``groom_driver.py``'s ``gated_reverify_pr_pool``/``ruling_exec_pr_pool``
+    already use for the identical PR-vs-issue ambiguity."""
     counts: dict[str, int] = {t: 0 for t in ge.TIERS}
     oldest: dict[str, float] = {t: 0.0 for t in ge.TIERS}
     tier_issues: dict[str, list[dict]] = {t: [] for t in ge.TIERS}
@@ -1211,9 +1166,6 @@ def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list, dict]:
                 is_p0 = "P0" in labels
                 updated_epoch = datetime.fromisoformat(
                     str(it.get("updated_at", "")).replace("Z", "+00:00")).timestamp()
-                engaged = engagements.get((repo, it["number"]))
-                if engaged and not is_p0 and ge.fresh_skip_active(engaged, updated_epoch, now_epoch):
-                    continue
                 counts[tier] += 1
                 tier_issues[tier].append({
                     "repo": repo, "number": it["number"],
@@ -1235,9 +1187,6 @@ def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list, dict]:
         pr_repo = pr.get("repo", "")
         updated_epoch = datetime.fromisoformat(
             str(pr.get("updated_at", "")).replace("Z", "+00:00")).timestamp()
-        engaged = engagements.get((pr_repo, pr.get("number")))
-        if engaged and not is_p0 and ge.fresh_skip_active(engaged, updated_epoch, now_epoch):
-            continue
         counts[tier] += 1
         tier_issues[tier].append({
             "repo": pr_repo, "number": pr.get("number"),
@@ -1501,9 +1450,9 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """EventBridge Scheduler handler — launches the groom spot box on cadence.
 
     `event` is the schedule's JSON input, e.g. {"run_mode": "full", "model":
-    "claude-sonnet-5", "issue_filter": "high-only", "schedule": "0 1 * * *"}.
-    `model`/`issue_filter` default to the Sonnet mid-tier queue when absent
-    (the two pre-existing Sonnet schedules don't set them). `soft_limit_min` is
+    "deepseek-v4-pro", "issue_filter": "high-only", "schedule": "0 1 * * *"}.
+    `model`/`issue_filter` default to the DeepSeek mid-tier queue when absent
+    (the pre-existing schedules don't set them). `soft_limit_min` is
     a manual-invoke-ONLY bounded-test override — no live schedule sets it.
     `pr_budget` is set only on the dedicated high-only schedule (config#1769).
     `force_on_demand` (config#1645) is set only by the dispatch Step Function's
@@ -1620,8 +1569,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         try:
             counts, oldest, p0_tiers, tier_issues = _enumerate_tier_stats_fresh(_github_token())
             launches = ge.decide_trigger(counts, oldest, p0_tiers)
-        except Exception as exc:  # noqa: BLE001 — fail-closed: skip this trigger rather than launching with stale (no-fresh-skip) legacy counts; recorded via ops-health page (config#2142)
-            logger.warning("demand trigger unavailable (%s) — skipping trigger (legacy fallthrough retired, fresh-skip-less enumeration over-counts the queue)", exc)
+        except Exception as exc:  # noqa: BLE001 — fail-closed: skip this trigger rather than launching on a partial/failed GitHub enumeration sweep; recorded via ops-health page (config#2142)
+            logger.warning("demand trigger unavailable (%s) — skipping trigger (legacy fallthrough retired, config#2146: a failed enumeration sweep must never launch on an incomplete count)", exc)
             _notify_demand_trigger_failed(exc, schedule_label)
             # config-I2540: an enumeration failure must still leave a decision
             # record — a missing groom/decisions/{date}/trigger-*.json file
@@ -1689,14 +1638,13 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                               "queue_manifests": manifest_keys,
                               "launches": results}}
 
-    # alpha-engine-config-I3479 (PRIMARY-mode DeepSeek): default "" (unchanged
-    # Claude path) — only the single-tier demand-gate branch below ever sets
-    # this to a non-empty value. Every bypass of that branch (manifest-key
-    # drain, force_on_demand relaunch, gated-reverify/non-slot filters, demand
-    # gate disabled) deliberately stays on Claude — PRIMARY selection is
-    # scoped to the three enumerate-then-decide entry points named in the
-    # module docstring, not every legacy launch shape.
-    backend = ""
+    # alpha-engine-config-I3479 (PRIMARY-mode DeepSeek): when
+    # GROOM_PRIMARY_DEEPSEEK_TIERS is armed, ALL launch paths use DeepSeek —
+    # including gated-reverify, manifest drains, and force_on_demand relaunches.
+    # The per-tier scoping in _primary_backend_for (via the demand-gate branch
+    # below) still applies to the demand-all path for mixed-bundle scenarios,
+    # but with all three tiers armed today (low,mid,high) the distinction is moot.
+    backend = GROOM_BACKEND_DEEPSEEK if GROOM_PRIMARY_DEEPSEEK_TIERS else ""
     if run_mode == "full" and not force_on_demand and not queue_manifest_key:
         decided = _demand_decision(issue_filter, schedule_label)
         if decided is not None:

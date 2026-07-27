@@ -960,8 +960,13 @@ def test_arctic_append_reads_constituents_by_run_date_not_pointer():
     import dates
 
     assert seen["run_date"] == dates.default_run_date()
-    # The fresh universe is what flows into expected_tickers.
-    assert captured and set(captured[0]["expected_tickers"]) == {"AAPL", "MSFT", "NVDA"}
+    # The fresh universe is what flows into expected_tickers, augmented with
+    # _MACRO_DAILY_TICKERS (config#2898: the morning arctic-append path now
+    # routes through _augment_with_macro_daily_tickers so SPY and the other
+    # macro tickers can't silently drop out of one path while staying in another).
+    assert captured and set(captured[0]["expected_tickers"]) == {"AAPL", "MSFT", "NVDA"} | set(
+        weekly_collector._MACRO_DAILY_TICKERS
+    )
 
 
 # ── EOD daily_append split: PostMarketData + PostMarketArcticAppend (2026-06-16) ──

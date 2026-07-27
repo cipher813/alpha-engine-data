@@ -188,6 +188,7 @@ def _month_window(now: datetime) -> dict:
         "start": start,
         "total_seconds": total_s,
         "elapsed_frac": min(max((now - start).total_seconds() / total_s, 0.0), 1.0),
+        "now": now,
     }
 
 
@@ -541,7 +542,7 @@ def _diff_row(row: dict, mw: dict, budgets: dict, key: str, counter_now: float,
     observed = mw["elapsed_frac"]
     if base_ts:
         base_dt = datetime.fromisoformat(base_ts)
-        observed = max((_now_utc() - base_dt).total_seconds() / mw["total_seconds"], 0.0)
+        observed = max((mw.get("now", _now_utc()) - base_dt).total_seconds() / mw["total_seconds"], 0.0)
         if (base_dt - mw["start"]).total_seconds() > 3600:
             row["note"] = f"measured since {base_dt:%Y-%m-%d} baseline (mid-month start)"
     row.update(mtd_cost_usd=mtd)

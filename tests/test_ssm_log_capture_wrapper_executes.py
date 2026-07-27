@@ -74,7 +74,7 @@ def test_wrapper_module_executes_inner_command(module, tmp_path):
     """
     log = tmp_path / "wrapper.log"
     sentinel = "SENTINEL_WRAPPER_EXECUTED_1646"
-    env = {**os.environ, "RUN_TOKEN": "test-exec-1646"}
+    test_env = {**os.environ, "RUN_TOKEN": "test-run-token-1646"}
     proc = subprocess.run(
         [
             sys.executable,
@@ -85,6 +85,8 @@ def test_wrapper_module_executes_inner_command(module, tmp_path):
             "wrapper-execute-test",
             "--log",
             str(log),
+            "--correlation-id",
+            "wrapper-execute-test-1646",
             "--",
             sys.executable,
             "-c",
@@ -93,7 +95,7 @@ def test_wrapper_module_executes_inner_command(module, tmp_path):
         capture_output=True,
         text=True,
         timeout=120,
-        env=env,
+        env=test_env,
     )
     assert sentinel in proc.stdout, (
         f"`python -m {module} run -- <cmd>` did NOT execute the inner "
@@ -111,7 +113,7 @@ def test_wrapper_module_executes_inner_command(module, tmp_path):
 @pytest.mark.parametrize("module", sorted(_wrapper_modules()))
 def test_wrapper_module_propagates_inner_exit_code(module, tmp_path):
     """A failing workload must fail the SSM command — rc must propagate."""
-    env = {**os.environ, "RUN_TOKEN": "test-exec-1646"}
+    test_env = {**os.environ, "RUN_TOKEN": "test-run-token-1646"}
     proc = subprocess.run(
         [
             sys.executable,
@@ -122,6 +124,8 @@ def test_wrapper_module_propagates_inner_exit_code(module, tmp_path):
             "wrapper-execute-test",
             "--log",
             str(tmp_path / "wrapper.log"),
+            "--correlation-id",
+            "wrapper-propagate-test-1646",
             "--",
             sys.executable,
             "-c",
@@ -130,7 +134,7 @@ def test_wrapper_module_propagates_inner_exit_code(module, tmp_path):
         capture_output=True,
         text=True,
         timeout=120,
-        env=env,
+        env=test_env,
     )
     assert proc.returncode == 7, (
         f"inner exit code not propagated (got {proc.returncode}) — a "
