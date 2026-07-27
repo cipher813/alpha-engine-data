@@ -176,6 +176,36 @@ playbooks:
         - type: lambda_active
           function: alpha-engine-alert-drain-dispatcher
           report_kill_switch: ALERT_DRAIN_DISPATCH_ENABLED
+        # Run-window accounting (config#4474): the drain ledger at
+        # overseer/drain_ledger/ is only written by a charter that ran to
+        # completion — the completion marker (_control/completed/) is written
+        # even on crash, so the ledger (not the marker) is the liveness signal.
+        # MAX_RUNTIME_SECONDS=10800 (180m) + boot/report margin = 210m ceiling;
+        # margin beyond the ceiling is 30m. The 4x-daily schedule mirrors the
+        # four EventBridge Scheduler names in watch_plane_liveness.
+        - type: run_window
+          label: alert-drain
+          artifact_prefix: overseer/drain_ledger/
+          ceiling_min: 210
+          margin_min: 30
+          lookback_hours: 30
+          schedule:
+            - hour: 4
+              minute: 0
+              dows: [0, 1, 2, 3, 4, 5, 6]
+              label: "04:00 UTC daily"
+            - hour: 10
+              minute: 0
+              dows: [0, 1, 2, 3, 4, 5, 6]
+              label: "10:00 UTC daily"
+            - hour: 16
+              minute: 0
+              dows: [0, 1, 2, 3, 4, 5, 6]
+              label: "16:00 UTC daily"
+            - hour: 22
+              minute: 0
+              dows: [0, 1, 2, 3, 4, 5, 6]
+              label: "22:00 UTC daily"
 
   groom:
     description: >-
