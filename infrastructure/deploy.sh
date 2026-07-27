@@ -4,8 +4,25 @@
 # Container image deployment (ECR) — same pattern as research + predictor.
 # Function: alpha-engine-data-collector
 #   - Timeout: 600s (10 min, ~30 tickers of alternative data)
-#   - Memory: 512 MB
+#   - Memory: 1024 MB (see LAMBDA_MEMORY_MB below)
 #   - Triggered by Step Functions (Saturday pipeline)
+#
+# Memory/timeout are applied on EVERY deploy, not just on create (2026-07-27).
+# Previously they were passed only to `create-function`, so on an existing
+# function the values were whatever someone last set by hand — un-versioned
+# live state that silently drifts from this file.
+#
+# That drift caused the 2026-07-25 DataPhase2 failure. Memory had been raised
+# to 1024 MB on $LATEST, but `publish-version` snapshots configuration at
+# publish time and the `live` alias still pointed at version 269 — published
+# at 512 MB. The Saturday SF invokes `alpha-engine-data-collector:live`, so it
+# kept running at 512 MB and hit Runtime.OutOfMemory twice (REPORT lines show
+# maxMemoryUsed == memorySize == 512 on two ~460s invocations). The raise was
+# real, and completely invisible to the pipeline.
+#
+# Hence the ordering below: update code -> wait -> update CONFIG -> wait ->
+# publish-version -> repoint alias. Configuration must land on $LATEST before
+# the version is cut, or the alias serves a version that never saw it.
 #
 # Prerequisites:
 #   1. AWS CLI configured with appropriate credentials
@@ -24,6 +41,18 @@ set -euo pipefail
 FUNCTION_NAME="alpha-engine-data-collector"
 REGION="${AWS_REGION:-us-east-1}"
 BUCKET="alpha-engine-research"
+
+# Declared runtime envelope — the single source of truth for this function's
+# memory/timeout. Overridable for one-off experiments, but the committed
+# default is what every deploy converges the live function to.
+#
+# 1024 MB: phase-2 invocations OOM'd at 512 MB (2026-07-25). Non-phase-2 runs
+# sit at 236-341 MB observed, so 512 was adequate for them and masked the
+# phase-2 requirement. Sized at 2x the OOM ceiling rather than a hair above it
+# because the OOM'd invocations were also running ~460s of a 600s timeout, and
+# Lambda scales CPU with memory — the headroom buys margin on both axes.
+LAMBDA_MEMORY_MB="${LAMBDA_MEMORY_MB:-1024}"
+LAMBDA_TIMEOUT="${LAMBDA_TIMEOUT:-600}"
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region "$REGION" 2>/dev/null || echo "ACCOUNT_ID")
 ROLE_ARN="${LAMBDA_ROLE_ARN:-arn:aws:iam::${ACCOUNT_ID}:role/alpha-engine-data-role}"
@@ -63,6 +92,18 @@ if aws lambda get-function --function-name "$FUNCTION_NAME" --region "$REGION" &
       --function-name "$FUNCTION_NAME" \
       --image-uri "$IMAGE_URI" \
       --region "$REGION" > /dev/null
+
+    # Converge configuration to the declared envelope on every deploy. Must
+    # complete BEFORE publish-version below, which snapshots $LATEST's config
+    # into the version the `live` alias will serve.
+    aws lambda wait function-updated \
+      --function-name "$FUNCTION_NAME" --region "$REGION" 2>/dev/null || sleep 5
+    echo "  Applying declared config: ${LAMBDA_MEMORY_MB}MB / ${LAMBDA_TIMEOUT}s..."
+    aws lambda update-function-configuration \
+      --function-name "$FUNCTION_NAME" \
+      --timeout "$LAMBDA_TIMEOUT" \
+      --memory-size "$LAMBDA_MEMORY_MB" \
+      --region "$REGION" > /dev/null
   else
     echo "  Migrating from zip to container image..."
     aws lambda delete-function --function-name "$FUNCTION_NAME" --region "$REGION"
@@ -72,8 +113,8 @@ if aws lambda get-function --function-name "$FUNCTION_NAME" --region "$REGION" &
       --package-type Image \
       --code "ImageUri=$IMAGE_URI" \
       --role "$ROLE_ARN" \
-      --timeout 600 \
-      --memory-size 512 \
+      --timeout "$LAMBDA_TIMEOUT" \
+      --memory-size "$LAMBDA_MEMORY_MB" \
       --region "$REGION" > /dev/null
   fi
 else
@@ -82,8 +123,8 @@ else
     --package-type Image \
     --code "ImageUri=$IMAGE_URI" \
     --role "$ROLE_ARN" \
-    --timeout 600 \
-    --memory-size 512 \
+    --timeout "$LAMBDA_TIMEOUT" \
+    --memory-size "$LAMBDA_MEMORY_MB" \
     --region "$REGION" > /dev/null
 fi
 echo "  $FUNCTION_NAME deployed."
