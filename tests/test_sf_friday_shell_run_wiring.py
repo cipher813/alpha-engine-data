@@ -301,12 +301,24 @@ def _eval_intrinsic_args(s: str) -> list[str]:
     return args
 
 
+# Context-object values the spot commands reference via `$$.`. Bound to a
+# stable sentinel so byte-identity comparisons stay deterministic; the real
+# value is the SF execution name, which krepis uses as the correlation id
+# (see tests/test_sf_krepis_correlation_id.py).
+_CONTEXT_OBJECT = {"Execution.Name": "test-execution-name"}
+
+
 def _eval_expr(e: str, ctx: dict):
     """Resolve the subset of ASL intrinsics the spot commands.$ use:
-    string literals, $.var refs, States.Array(...), States.Format(...)."""
+    string literals, $.var refs, $$.context refs, States.Array(...),
+    States.Format(...)."""
     e = e.strip()
     if e.startswith("'") and e.endswith("'"):
         return e[1:-1].replace("\\'", "'")
+    if e.startswith("$$."):
+        key = e[3:]
+        assert key in _CONTEXT_OBJECT, f"unbound context-object ref: {e}"
+        return _CONTEXT_OBJECT[key]
     if e.startswith("$."):
         return ctx[e[2:]]
     if e.startswith("States.Array("):
@@ -390,6 +402,16 @@ def orig_spot_cmds() -> dict:
       scope). `MorningEnrich`/`DataPhase1`/`RAGIngestion` are unchanged
       (they invoke `spot_data_weekly.sh`, which self-exports the region via
       its own `ENV_SOURCE` heredoc and never sourced `.env` directly).
+
+    - **Regenerated 2026-07-27** as part of the krepis `--correlation-id`
+      fix. krepis 0.18.8 made the correlation id mandatory (`run` exits 2
+      without `--correlation-id` or `$RUN_TOKEN`), which failed all 11
+      weekly SSM workload states on 2026-07-25. Every krepis call now
+      passes `--correlation-id {}` bound to `$$.Execution.Name`, so the
+      resolved command gains that argument immediately after `run`.
+      `_eval_expr` learned the `$$.` context-object form; the baseline
+      resolves it via `_CONTEXT_OBJECT` so byte-identity stays
+      deterministic. See `tests/test_sf_krepis_correlation_id.py`.
 
     Regenerate ONLY on a deliberate, reviewed change to a spot state's
     absent-path (`preflight_args=""`) command, by re-extracting the
@@ -727,6 +749,7 @@ class TestByteIdenticalAbsentPath:
         expected = (
             "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python "
             "-m krepis.ssm_log_capture run "
+            f"--correlation-id {_CONTEXT_OBJECT['Execution.Name']} "
             f"--slug {slug} --log {log} -- "
             f"{token} --preflight-only"
         )
