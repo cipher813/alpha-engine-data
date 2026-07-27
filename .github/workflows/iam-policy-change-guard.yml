@@ -28,7 +28,11 @@ permissions:
   pull-requests: read
 
 jobs:
-  check:
+  # Job id is the branch-protection CONTEXT. Deliberately specific rather
+  # than a generic `check`: a required context must be unambiguous, and a
+  # future workflow adding its own `check` job would otherwise collide with
+  # a REQUIRED status (nousergon-data-I1078).
+  iam-policy-change-guard:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
