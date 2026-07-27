@@ -100,3 +100,64 @@ class TestReadInstOwnershipParquet:
         )
         df = read_inst_ownership_parquet(s3_client=s3)
         assert len(df) == 0
+
+
+# ── main() CLI guard (§119 rule 1) ────────────────────────────────────
+
+class TestMainCLIGuard:
+    """Tests for inst_ownership.main() CLI entry point guards.
+
+    Covers three exit paths: (1) boto3 import failure, (2) missing
+    ``--tickers-file`` argument, (3) success path with valid file and
+    mocked compute.
+    """
+
+    def test_missing_boto3_exits_with_code_1(self, monkeypatch):
+        """Simulate absent boto3 — verifies SystemExit(1) from the import guard."""
+        import builtins
+        import pytest
+        from data.derived.inst_ownership import main
+
+        real_import = builtins.__import__
+
+        def _mock_import(name, *args, **kwargs):
+            if name == "boto3":
+                raise ImportError(f"No module named '{name}'")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _mock_import)
+        monkeypatch.setattr("sys.argv", ["inst_ownership"])
+
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 1
+
+    def test_missing_tickers_file_exits_with_code_1(self, monkeypatch):
+        """Omit --tickers-file — verifies SystemExit(1) from the arg guard."""
+        import pytest
+        from data.derived.inst_ownership import main
+
+        monkeypatch.setattr("sys.argv", ["inst_ownership"])
+
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 1
+
+    def test_success_path_returns_normally(self, monkeypatch, tmp_path):
+        """Valid tickers file with mocked S3 and compute — guard passes."""
+        from data.derived.inst_ownership import main
+
+        tickers_file = tmp_path / "tickers.txt"
+        tickers_file.write_text("AAPL\nMSFT\nGOOG\n")
+
+        monkeypatch.setattr(
+            "sys.argv",
+            ["inst_ownership", "--tickers-file", str(tickers_file)],
+        )
+        monkeypatch.setattr("boto3.client", lambda *a, **k: None)
+        monkeypatch.setattr(
+            "data.derived.inst_ownership.compute_and_write_inst_ownership",
+            lambda *a, **k: [_make_row()],
+        )
+
+        main()  # must not raise

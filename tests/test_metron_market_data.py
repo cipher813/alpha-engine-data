@@ -198,7 +198,8 @@ class TestHistory:
         assert result["status"] == "ok" and result["close_series"] == 2 and result["fx_series"] == 1
         puts = _puts(s3)
         assert set(puts) == {"market_data/close_history/AAPL.json", "market_data/close_history/1299.HK.json",
-                             "market_data/fx_history/HKD.json"}
+                             "market_data/fx_history/HKD.json",
+                             mmd.CONSOLIDATED_CLOSE_HISTORY_KEY}
         aapl = puts["market_data/close_history/AAPL.json"]
         assert aapl["yf_symbol"] == "AAPL" and aapl["currency"] == "USD"
         assert aapl["closes"] == [["2026-06-10", 200.0], ["2026-06-11", 201.5]]
@@ -246,6 +247,26 @@ class TestHistory:
         mmd.collect_history(bucket="b", s3_client=s3, close_history_source=close_hist, fx_history_source=lambda c: {})
         aapl = _puts(s3)["market_data/close_history/AAPL.json"]
         assert aapl["adjustment_basis"] == mmd.CLOSE_HISTORY_ADJUSTMENT_BASIS == "dividend_adjusted"
+
+    def test_writes_consolidated_close_history_artifact(self):
+        # metron-ops#233: collect_history writes a single consolidated file containing all
+        # symbols' close series and currency map alongside the per-ticker files.
+        s3 = _universe_s3(_UNIVERSE)
+        close_hist = lambda syms: {"AAPL": [("2026-06-10", 200.0), ("2026-06-11", 201.5)], "1299.HK": [("2026-06-11", 64.2)]}
+        fx_hist = lambda ccys: {"HKD": [("2026-06-10", 0.128), ("2026-06-11", 0.1282)]}
+        result = mmd.collect_history(bucket="b", s3_client=s3, close_history_source=close_hist, fx_history_source=fx_hist)
+        assert result["status"] == "ok"
+        puts = _puts(s3)
+        # Consolidated artifact must exist alongside per-ticker files.
+        assert mmd.CONSOLIDATED_CLOSE_HISTORY_KEY in puts
+        cons = puts[mmd.CONSOLIDATED_CLOSE_HISTORY_KEY]
+        assert cons["schema_version"] == mmd.CLOSE_HISTORY_SCHEMA_VERSION
+        assert cons["adjustment_basis"] == mmd.CLOSE_HISTORY_ADJUSTMENT_BASIS
+        assert "AAPL" in cons["series"] and "1299.HK" in cons["series"]
+        assert cons["series"]["AAPL"] == [["2026-06-10", 200.0], ["2026-06-11", 201.5]]
+        assert cons["series"]["1299.HK"] == [["2026-06-11", 64.2]]
+        assert cons["currency"]["AAPL"] == "USD"
+        assert cons["currency"]["1299.HK"] == "HKD"
 
 
 class TestCloseHistoryPriceCacheSource:
@@ -944,3 +965,133 @@ class TestIntraday:
         )
         assert result["status"] == "ok_dry_run" and result["quotes"] == 2 and result["indices"] == 4
         assert not s3.put_object.called
+
+
+class TestEafeUniverse:
+    """metron-ops#222: EAFE proxy ticker set derived from country-ETF top holdings."""
+
+    @staticmethod
+    def _mock_top_holdings(symbols: list[str]) -> "pd.DataFrame":
+        import pandas as pd
+        return pd.DataFrame(
+            {"Name": [f"Fake_{s}" for s in symbols], "Holding Percent": [round(1.0 / len(symbols), 4) for _ in symbols]},
+            index=pd.Index(symbols, name="Symbol"),
+        )
+
+    @staticmethod
+    def _per_etf_syms() -> dict[str, list[str]]:
+        return {
+            "EWJ": ["8035.T", "8306.T"], "EWU": ["HSBA.L", "AZN.L"],
+            "EWG": ["SIE.DE", "ALV.DE"], "EWQ": ["SU.PA", "MC.PA"],
+            "EWL": ["NESN.SW", "NOVN.SW"], "EWA": ["BHP.AX", "CBA.AX"],
+            "EWC": ["RY", "TD"], "EWH": ["1299.HK", "0388.HK"],
+            "EIS": ["TEVA", "LUMI.TA"],
+        }
+
+    def test_returns_country_etf_tickers(self, monkeypatch):
+        """_eafe_tickers() reads country-ETF top_holdings and unions the symbols."""
+        per_etf = self._per_etf_syms()
+        mock_fn = self._mock_top_holdings
+
+        class MockTicker:
+            def __init__(self, symbol):
+                self._sym = symbol
+
+            @property
+            def funds_data(self):
+                syms = per_etf.get(self._sym)
+                if not syms:
+                    raise Exception("NoSuchKey")
+                fd = type("FD", (), {})()
+                fd.top_holdings = mock_fn(syms)
+                return fd
+
+        import yfinance as yf
+        monkeypatch.setattr(yf, "Ticker", MockTicker)
+
+        tickers = mmd._eafe_tickers()
+        assert "8035.T" in tickers
+        assert "HSBA.L" in tickers
+        assert "SIE.DE" in tickers
+        assert "1299.HK" in tickers
+        assert len(tickers) >= 4
+
+    def test_empty_when_all_etfs_fail(self, monkeypatch):
+        """_eafe_tickers() returns empty set when every ETF's holdings fetch fails."""
+
+        class FailingTicker:
+            def __init__(self, symbol):
+                pass
+
+            @property
+            def funds_data(self):
+                raise Exception("yfinance unavailable")
+
+        import yfinance as yf
+        monkeypatch.setattr(yf, "Ticker", FailingTicker)
+
+        tickers = mmd._eafe_tickers()
+        assert tickers == set()
+
+    def test_empty_when_top_holdings_none(self, monkeypatch):
+        """_eafe_tickers() returns empty set when top_holdings is None for all ETFs."""
+
+        class NullHoldingsTicker:
+            def __init__(self, symbol):
+                pass
+
+            @property
+            def funds_data(self):
+                fd = type("FD", (), {})()
+                fd.top_holdings = None
+                return fd
+
+        import yfinance as yf
+        monkeypatch.setattr(yf, "Ticker", NullHoldingsTicker)
+
+        tickers = mmd._eafe_tickers()
+        assert tickers == set()
+
+    def test_eafe_tickers_are_added_to_default_medians_universe(self, monkeypatch):
+        """_default_medians_universe union includes EAFE proxy tickers."""
+        s3 = _universe_s3(_UNIVERSE)  # AAPL, 1299.HK
+
+        def mock_eafe():
+            return {"8035.T", "HSBA.L"}
+
+        monkeypatch.setattr(mmd, "_eafe_tickers", mock_eafe)
+
+        universe = mmd._default_medians_universe("b", s3)
+        assert "AAPL" in universe
+        assert "1299.HK" in universe
+        assert "8035.T" in universe  # from EAFE proxy
+        assert "HSBA.L" in universe  # from EAFE proxy
+
+    def test_valuation_accepts_eafe_ticker(self, monkeypatch):
+        """EAFE proxy tickers resolve through _yfinance_valuation."""
+        import yfinance as yf
+
+        class MockInfoTicker:
+            def __init__(self, sym):
+                pass
+
+            @property
+            def info(self):
+                return {
+                    "trailingPE": 15.2, "forwardPE": 14.8,
+                    "priceToBook": 2.1, "priceToSalesTrailing12Months": 1.5,
+                    "enterpriseToEbitda": 10.3, "dividendYield": 0.025,
+                    "sector": "Technology", "country": "Japan",
+                }
+
+            @property
+            def funds_data(self):
+                return None
+
+        monkeypatch.setattr(yf, "Ticker", MockInfoTicker)
+
+        result = mmd._yfinance_valuation(["8035.T"])
+        assert "8035.T" in result
+        assert result["8035.T"]["sector"] == "Technology"
+        assert result["8035.T"]["country"] == "Japan"
+        assert result["8035.T"]["trailingPE"] == 15.2
