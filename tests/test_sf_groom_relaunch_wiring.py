@@ -205,3 +205,30 @@ def test_top_level_tasks_declare_timeouts():
         if st.get("Type") == "Task" and "TimeoutSeconds" not in st
     ]
     assert not missing, f"top-level Task states with no declared timeout: {missing}"
+
+
+def test_task_token_travels_inside_the_lambda_payload(states):
+    """`TaskToken` is not a field of the Lambda Invoke API.
+
+    Step Functions rejects it as a sibling of `Payload` at RUNTIME, not at
+    definition-validation time — `validate-state-machine-definition` returned
+    OK on the broken form, and the 2026-07-27 20:00 UTC scheduled run failed
+    11 seconds in with:
+
+        The field "TaskToken" is not supported by Step Functions
+
+    For `lambda:invoke.waitForTaskToken` the token must be carried inside the
+    Payload, where the Lambda reads it off the event.
+    """
+    params = states["LaunchGroomSpot"]["Parameters"]
+    assert "TaskToken" not in params and "TaskToken.$" not in params, (
+        "TaskToken must not be a sibling of Payload — Step Functions rejects it"
+    )
+    assert "$$.Task" in params["Payload.$"], (
+        "the task token must be merged into the Lambda Payload"
+    )
+
+
+def test_wait_for_task_token_resource_still_declared(states):
+    """The token plumbing above is only meaningful with the callback integration."""
+    assert states["LaunchGroomSpot"]["Resource"].endswith(".waitForTaskToken")

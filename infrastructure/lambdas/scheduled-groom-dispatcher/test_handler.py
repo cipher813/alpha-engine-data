@@ -2103,3 +2103,27 @@ def test_deploy_sh_arms_primary_deepseek_tiers_low_mid_high():
     assert len(armed_lines) == 2
     for line in armed_lines:
         assert 'GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid,high"' in line
+
+
+def test_task_token_is_read_from_the_event_not_the_context(monkeypatch):
+    """config-I4333: the token arrives in the Lambda Payload.
+
+    `getattr(getattr(context, "task", None), "token", "")` returned "" on every
+    invocation — a Python Lambda context has no `task` attribute — so the
+    callback was never sent and the SF fell through to its timeout path.
+    """
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+
+    assert idx._task_token({"Token": "AQCEAAAAKgAAAAMAAAAA"}) == "AQCEAAAAKgAAAAMAAAAA"
+    assert idx._task_token({"Token": "  padded  "}) == "padded"
+    # Absent is legitimate (manual invoke, sweep dispatch) — "" not an error.
+    assert idx._task_token({}) == ""
+    assert idx._task_token({"Token": None}) == ""
+    assert idx._task_token({"Token": ""}) == ""
+
+    # A Lambda context object never carries the token; reading it must not
+    # reintroduce the silent-"" regression.
+    class _Ctx:
+        pass
+
+    assert not hasattr(_Ctx(), "task")
