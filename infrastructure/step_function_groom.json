@@ -152,7 +152,7 @@
               {
                 "Variable": "$.retry_count",
                 "NumericGreaterThan": 0,
-                "Next": "CheckLaunchedCallback"
+                "Next": "NotifyRelaunch"
               }
             ],
             "Default": "CheckLaunchedCallback"
