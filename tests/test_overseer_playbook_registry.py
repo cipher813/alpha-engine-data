@@ -436,3 +436,39 @@ def test_registry_model_passes_its_executor_validator():
         )
         checked += 1
     assert checked >= 3, f"expected >=3 routed playbooks with models, checked {checked}"
+
+
+# Fleet ROUTING-TIER suffixes. These are LiteLLM/registry group aliases
+# (LLM_MODEL_REGISTRY ids like `deepseek-v4-pro-max`, whose own `model:` field
+# resolves to the real provider name `deepseek-v4-pro`). They are NOT provider
+# API model names.
+_ROUTING_ALIAS_SUFFIXES = ("-max", "-low", "-mid", "-high")
+
+
+@pytest.mark.parametrize(
+    "name",
+    sorted(k for k, v in REGISTRY["playbooks"].items() if v.get("routed") and v.get("model")),
+)
+def test_registry_model_is_a_provider_name_not_a_routing_alias(name):
+    """A routed playbook's `model` is passed STRAIGHT to `claude -p --model` on
+    the spot box, which talks directly to the provider through the local egress
+    proxy — there is no LiteLLM hop to resolve a fleet routing alias.
+
+    alpha-engine-config-I4471: alert-drain shipped `deepseek-v4-pro-max` (a
+    registry TIER id, not an API model) and every run died on
+
+        400 The supported API model names are deepseek-v4-pro or
+        deepseek-v4-flash, but you passed deepseek-v4-pro-max.
+
+    The alias resolves to `deepseek-v4-pro` in LLM_MODEL_REGISTRY, but nothing
+    performed that resolution on this path.
+    """
+    model = REGISTRY["playbooks"][name]["model"]
+    bad = [s for s in _ROUTING_ALIAS_SUFFIXES if model.endswith(s)]
+    assert not bad, (
+        f"routed playbook {name!r} declares model {model!r}, which ends in the "
+        f"routing-tier suffix {bad[0]!r} — that is a fleet registry ALIAS, not a "
+        f"provider API model name. The spot box passes this value directly to "
+        f"the provider and the call will 400. Use the resolved provider model "
+        f"(e.g. 'deepseek-v4-pro')."
+    )
