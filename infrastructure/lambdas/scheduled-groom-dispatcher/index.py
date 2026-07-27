@@ -1553,7 +1553,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             force_on_demand,
             queue_manifest_key=queue_manifest_key,
             backend=_resolve_launch_decided_backend(event),
-            task_token=event.get("taskToken", ""),
+            task_token=getattr(getattr(context, 'task', None), 'token', ''),
         )
         # demand-all path did (_write_trigger_record/_write_skip_record),
         # leaving sweep-mode (and any other launch_decided) dispatches with
@@ -1562,7 +1562,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         # launched (concurrent skip, kill-switch), call send-task-success with
         # launched:false so the SF doesn't wait 6h for a callback that will never
         # come. The box handles the launched:true callback itself in its finish() trap.
-        task_token = event.get("taskToken", "")
+        task_token = getattr(getattr(context, 'task', None), 'token', '')
         if task_token and not result.get("launched"):
             try:
                 boto3.client("stepfunctions", region_name=REGION).send_task_success(
