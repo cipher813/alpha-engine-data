@@ -413,6 +413,7 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                     staleness_threshold_days=price_cfg.get("staleness_threshold_days", 3),
                     batch_size=price_cfg.get("refresh_batch_size", 50),
                     dry_run=dry_run,
+                    reference_date=run_date,
                 ),
                 supports_auto_skip=False,
             )
@@ -1539,7 +1540,12 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     # drift class (one copy gets updated, the other silently doesn't).
     # Both call sites now derive from the single module-level
     # _MACRO_DAILY_TICKERS constant so SPY (and any future addition) can't
-    # drift out of one path while staying in the other.
+    # drift out of one path while staying in the other. NOTE: kept as the
+    # direct constant reference (not routed through the newer
+    # _augment_with_macro_daily_tickers helper added for config#2898) — this
+    # exact literal is pinned by
+    # test_morning_enrich_and_daily_arctic_append_share_one_macro_ticker_list's
+    # `"_MACRO_DAILY_TICKERS" in inspect.getsource(...)` source-text guard.
     tickers = list(dict.fromkeys(tickers + _MACRO_DAILY_TICKERS))
 
     logger.info("=" * 60)
@@ -2352,6 +2358,15 @@ def _run_morning_arctic_append(config: dict, args: argparse.Namespace) -> dict:
         results["completed_at"] = datetime.now(timezone.utc).isoformat()
         return results
 
+    # config#2898: union with _MACRO_DAILY_TICKERS here — the evening twin
+    # (_run_daily_arctic_append, via _load_daily_universe_tickers) already
+    # did this, but this morning path never did, so SPY (and the other macro
+    # tickers) were silently absent from expected_tickers on every morning
+    # run regardless of which of the three branches above populated
+    # `tickers`. Applied post-branch so it covers the direct-read,
+    # pointer-fallback, AND Wikipedia-fallback paths uniformly.
+    tickers = _augment_with_macro_daily_tickers(tickers)
+
     logger.info("=" * 60)
     logger.info("APPENDING: ArcticDB universe (arctic-append state, %s)", target_date)
     logger.info("=" * 60)
@@ -2566,8 +2581,28 @@ _MACRO_DAILY_TICKERS = [
     "SPY", "GLD", "USO",
     "XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
     "XLP", "XLRE", "XLU", "XLV", "XLY",
+    # config#934 — sub-sector benchmark ETFs (SMH/IGV/XBI/PPH/XOP/KRE/ITA/GDX),
+    # the distinct non-XL* symbols in constituents.GICS_SUBINDUSTRY_TO_ETF.
+    # Their daily closes must land in staging/daily_closes so daily_append can
+    # write their bars to ArcticDB macro for the sub_sector_vs_benchmark_*
+    # features. Additive: unlike the XL* set, a missing bar here is non-fatal
+    # in daily_append (the feature neutral-defaults) — see daily_append.
+    "SMH", "IGV", "XBI", "PPH", "XOP", "KRE", "ITA", "GDX",
     "^VIX", "^VIX3M", "^TNX", "^IRX",
 ]
+
+
+def _augment_with_macro_daily_tickers(tickers: list[str]) -> list[str]:
+    """Union ``tickers`` with :data:`_MACRO_DAILY_TICKERS`, de-duplicated.
+
+    config#2898: every constructor of a ``daily_append``/``expected_tickers``
+    input must route through this ONE function, not re-inline the union —
+    two independent inline copies is exactly how the morning-arctic-append
+    caller silently diverged from the evening one and dropped SPY out of its
+    expected-ticker scope while the evening path kept it. Routing all callers
+    through here guarantees the macro tickers (SPY included) reach
+    ``expected_tickers`` regardless of which entrypoint constructed the list."""
+    return list(dict.fromkeys(tickers + _MACRO_DAILY_TICKERS))
 
 
 def _load_daily_universe_tickers(config: dict) -> list[str]:
@@ -2594,15 +2629,19 @@ def _load_daily_universe_tickers(config: dict) -> list[str]:
             logger.error("Wikipedia constituents fallback failed: %s", exc)
     if not tickers:
         return []
-    return list(dict.fromkeys(tickers + _MACRO_DAILY_TICKERS))
+    return _augment_with_macro_daily_tickers(tickers)
 
 
 def _run_daily(config: dict, args: argparse.Namespace) -> dict:
-    """Daily mode: capture today's OHLCV closes for all tracked tickers."""
+    """Daily mode: capture today's OHLCV closes for all tracked tickers, plus
+    (config#2756) refresh reference/price_cache/*.parquet for any ticker that
+    missed a trading session — keeps the cache daily-fresh instead of the
+    prior Saturday-only cadence."""
     bucket = config["bucket"]
     run_date = args.date or default_run_date()
     dry_run = args.dry_run
     daily_cfg = config.get("daily_closes", {})
+    price_cfg = config.get("price_cache", {})
     reg = _build_registry(config, args, run_date)
 
     results: dict = {
@@ -2658,6 +2697,44 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         verify_artifact_exists=True,
         bucket=bucket,
     )
+
+    # ── Price cache refresh (config#2756 — daily cadence) ───────────────────
+    # reference/price_cache/*.parquet previously only refreshed on the
+    # Saturday DataPhase1 run, so metron_market_data.collect_history's
+    # 1-trading-day price_cache staleness gate (data#693) only cleared on
+    # Monday; Tue-Fri the whole universe fell back to an independent
+    # yfinance fetch. Running the same collector here (Mon-Fri EOD) keeps
+    # the cache within `daily_staleness_threshold_days` trading sessions on
+    # every weekday. _find_stale_fast is trading-day-exact (config#2756), so
+    # in steady state only tickers that actually missed a session (new
+    # listings, corporate actions, a prior-day miss) pay the full 10y
+    # yfinance rewrite — most weekdays this list is empty.
+    if bool(price_cfg.get("daily_enabled", True)):
+        logger.info("=" * 60)
+        logger.info("COLLECTING: price cache (daily)")
+        logger.info("=" * 60)
+        results["collectors"]["prices"] = _phase_collect(
+            reg, "prices",
+            lambda: prices.collect(
+                bucket=bucket,
+                tickers=tickers,
+                s3_prefix=price_cfg.get("s3_prefix", "predictor/price_cache/"),
+                fetch_period=price_cfg.get("fetch_period", "10y"),
+                staleness_threshold_days=price_cfg.get("daily_staleness_threshold_days", 1),
+                batch_size=price_cfg.get("refresh_batch_size", 50),
+                dry_run=dry_run,
+                reference_date=run_date,
+            ),
+            supports_auto_skip=False,
+        )
+        # Same unconditional sentinel the Saturday run writes (config#2350) —
+        # now also written on a successful weekday refresh so the freshness
+        # monitor sees the true (now-daily) cadence.
+        if not dry_run and results["collectors"]["prices"].get("status") == "ok":
+            _write_price_cache_freshness_sentinel(
+                boto3.client("s3"), bucket,
+                writer="nousergon-data:weekly_collector.py:daily",
+            )
 
     # Metron market-data producer — EOD closes + FX for Metron's held-ticker universe.
     # `alpha-engine-data` is the single market-data ground truth for the NE system;

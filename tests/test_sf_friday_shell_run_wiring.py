@@ -90,15 +90,23 @@ _EXPECTED_SKIPS = {
     "skip_lib_pin_drift_check",
     "skip_morning_enrich",
     "skip_data_phase1",
+    # config#3134: Scanner, SignalsEnvelope, ChallengerShadow, and
+    # ThinkTankCoverage each got their own CheckSkip* gate — previously
+    # NONE of the four had one, so every partial rerun unconditionally
+    # re-ran all four regardless of flags. skip_signals_envelope's gate
+    # DEFAULTS FALSE (SignalsEnvelope is LOAD-BEARING — I2880 staleness
+    # guard — unlike the other three, which are safe defaults-false too
+    # but carry no comparable live-run hazard).
+    "skip_scanner",
+    "skip_signals_envelope",
+    "skip_challenger_shadow",
     "skip_rag_ingestion",
+    "skip_thinktank_coverage",
     "skip_regime_substrate",
     "skip_regime_retrospective_eval",
     # skip_research retired: alpha-engine-config-I2515 Phase B removed the
     # multi-agent Research state (and its CheckSkipResearch gate) entirely
-    # — there is no longer a Lambda invocation to skip. SignalsEnvelope,
-    # its load-bearing replacement, has no skip gate (mirrors Scanner's
-    # own unconditional posture — it is now a same-day-freshness producer,
-    # not an ad-hoc-rerun-optional step).
+    # — there is no longer a Lambda invocation to skip.
     "skip_data_phase2",
     "skip_eval_judge",
     "skip_rationale_clustering",
@@ -113,6 +121,10 @@ _EXPECTED_SKIPS = {
     # (and its CheckSkipDriftDetection gate) were collapsed when drift was
     # bundled onto the PredictorTraining spot, so there is no gate to skip.
     "skip_backtester",
+    # config#2362 Option A (operator-ruled 2026-07-21): additive gate that
+    # skips only the Backtester SSM task, distinct from skip_backtester's
+    # legacy whole-pair jump above.
+    "skip_backtester_stage_only",
     # Added config#830 — give the weekly SF a Backtester→Evaluator-only mid-week
     # path (mode=backtest-eval) without a separate state machine. PredictorBacktest
     # and PortfolioOptimizerBacktest (L4472 split) previously had no skip gate, and
@@ -364,6 +376,20 @@ def orig_spot_cmds() -> dict:
       reporting SUCCESS. `krepis.ssm_log_capture` is the canonical
       executable path; `test_ssm_log_capture_wrapper_executes.py` now
       proves executability (not just importability) in CI.
+    - **Regenerated 2026-07-10** as part of the weekly-SF `.env` deprecation
+      (alpha-engine-config#890 item 1, mirroring nousergon-data#485's
+      daily/eod migration): the 6 `_SPOT_STATES` entries that formerly did
+      `set -a && source /home/ec2-user/.alpha-engine.env && set +a`
+      (Backtester, Evaluator, Parity, PortfolioOptimizerBacktest,
+      PredictorBacktest, PredictorTraining) now inline-export
+      `AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1` instead — same
+      idiom as the merged daily/eod PR. Secrets still resolve via
+      `get_secret()`/SSM at runtime, unaffected by `.env` removal.
+      `DriftDetection` is left untouched (stale key, no longer a live SF
+      state per config#902 — outside `_SPOT_STATES` and outside this PR's
+      scope). `MorningEnrich`/`DataPhase1`/`RAGIngestion` are unchanged
+      (they invoke `spot_data_weekly.sh`, which self-exports the region via
+      its own `ENV_SOURCE` heredoc and never sourced `.env` directly).
 
     Regenerate ONLY on a deliberate, reviewed change to a spot state's
     absent-path (`preflight_args=""`) command, by re-extracting the

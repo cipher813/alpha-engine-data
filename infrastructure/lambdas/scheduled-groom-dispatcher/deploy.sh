@@ -23,27 +23,17 @@
 # Lambda) + ssm:GetCommandInvocation (to poll) + sns:Publish (to alert on
 # failure) — it never touches secrets or launches anything itself.
 #
-# Cadence (UTC). Reduced 3->2/day on 2026-06-29 (the 15:00 UTC / 8am-PT run was
-# dropped per usage pacing); a 3rd schedule was re-added 2026-07-01 (config#1495
-# follow-up) at the SAME 15:00 UTC slot, now running a DIFFERENT tier — Opus,
-# complexity:high ONLY — not a reinstatement of the old Sonnet drain-phase run.
-# UNIFORM 3x/day, all 7 days, since 2026-07-02: the Sat-skip on the 07:00 slot
-# (originally "avoid colliding with the 09:00 UTC Saturday pipeline") was never
-# evidence-based — investigated and confirmed the groom and the weekly SF share
-# NEITHER the Claude Max quota (groom = Max-plan OAuth token; weekly SF Research/
-# Predictor = separate pay-as-you-go ANTHROPIC_API_KEY) NOR EC2 spot capacity
-# (disjoint instance families: groom t3/t3a/t2.medium vs weekly-SF c5/m5/c6i/c5a/
-# r5/r5a/r6i.large). No exceptions kept — the weekly SF can also now land on any
-# day (e.g. Friday, per the holiday-aware weekly-schedule-adjuster, #578) without
-# the groom cadence needing to track it.
-# Off-peak tier-split cadence (2026-07-07): avoid Anthropic Max weekday peak
-# (5–11am PT / 12:00–18:00 UTC PDT) and Brian's interactive hours where possible.
-# config#2409 (2026-07-13): the 01:00 high-only slot moved off Opus onto Sonnet
-# — dedicated queue/budget/off-peak schedule, no longer a distinct model tier.
-#   01:00 daily     cron(0 1 * * ? *)         FULL   Sonnet, high-only      # 6pm PT, every day
-#   07:00 daily     cron(0 7 * * ? *)         FULL   Sonnet, mid-only       # 12am PT, every day
-#   19:00 daily     cron(0 19 * * ? *)        FULL   Haiku,  low-only       # 12pm PT, every day
-#   Sun 09:00       cron(0 9 ? * SUN *)       FULL   Haiku,  gated-reverify # weekly stale-gate lane (config#1891)
+# Cadence (UTC). Three symmetric demand-all triggers per day + Sunday extra slot.
+# Each trigger evaluates the FULL backlog and launches 0..3 tier boxes via
+# decide_trigger / _primary_backend_for. All tiers route through DeepSeek primary.
+# The end-of-SF sweep (DispatchEndOfSfSweep in step_function_groom.json) continues
+# to run unconditionally after every trigger cycle — it covers the PR set
+# regardless of how many groom boxes launch.
+#  04:00 daily     cron(0 4 * * ? *)         FULL   demand-all  # 9pm PT
+#  12:00 daily     cron(0 12 * * ? *)        FULL   demand-all  # 5am PT
+#  20:00 daily     cron(0 20 * * ? *)        FULL   demand-all  # 1pm PT
+#  Sun 09:00       cron(0 9 ? * SUN *)       FULL   demand-all  # weekly extra slot
+#  Models: krepis.router selects per GROOM_ROUTER_CLASS — zero Anthropic
 #
 # SCHED_NAMES is the source of truth: any live scheduler rule under the
 # alpha-engine-scheduled-groom- prefix that is NOT in SCHED_NAMES is PRUNED
@@ -72,12 +62,14 @@
 # Usage:
 #   bash .../scheduled-groom-dispatcher/deploy.sh             # update code only (also the CI auto-deploy path)
 #   bash .../scheduled-groom-dispatcher/deploy.sh --bootstrap # operator-only: create/update IAM roles + wire EventBridge Scheduler
+#   bash .../scheduled-groom-dispatcher/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
 #   bash .../scheduled-groom-dispatcher/deploy.sh --dry-run   # show actions, do not apply
 #   bash .../scheduled-groom-dispatcher/deploy.sh --smoke     # invoke once with a synthetic schedule event (⚠ fires a REAL groom)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 FUNCTION_NAME="alpha-engine-scheduled-groom-dispatcher"
 ROLE_NAME="alpha-engine-scheduled-groom-dispatcher-role"
 POLICY_NAME="alpha-engine-scheduled-groom-dispatcher-policy"
@@ -105,22 +97,22 @@ SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 # schedule label, plus model/issue_filter per tier — config#1760 tier-split).
 # deploy.sh prune drops orphaned rule names when cadence changes.
 SCHED_NAMES=(
-  "alpha-engine-scheduled-groom-0100-daily-opus-high"
-  "alpha-engine-scheduled-groom-0700-daily-mid"
-  "alpha-engine-scheduled-groom-1900-daily-low"
-  "alpha-engine-scheduled-groom-sun0900-weekly-gated-reverify"
+  "alpha-engine-scheduled-groom-0400-daily"
+  "alpha-engine-scheduled-groom-1200-daily"
+  "alpha-engine-scheduled-groom-2000-daily"
+  "alpha-engine-scheduled-groom-sun0900-weekly"
 )
 SCHED_CRONS=(
-  "cron(0 1 * * ? *)"
-  "cron(0 7 * * ? *)"
-  "cron(0 19 * * ? *)"
+  "cron(0 4 * * ? *)"
+  "cron(0 12 * * ? *)"
+  "cron(0 20 * * ? *)"
   "cron(0 9 ? * SUN *)"
 )
 SCHED_INPUTS=(
-  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 1 * * *"}'
-  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 7 * * *"}'
-  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 19 * * *"}'
-  '{"run_mode":"full","model":"claude-haiku-4-5","issue_filter":"gated-reverify","schedule":"0 9 * * 0"}'
+  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 4 * * *"}'
+  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 12 * * *"}'
+  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 20 * * *"}'
+  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 9 * * 0"}'
 )
 # Prefix used to discover live rules for prune reconciliation (see step 2f).
 SCHED_PREFIX="alpha-engine-scheduled-groom-"
@@ -135,11 +127,13 @@ case "${DRY_RUN:-false}" in
   *) DRY_RUN=false ;;
 esac
 BOOTSTRAP=false
+APPLY_IAM=false
 SMOKE=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
     --bootstrap) BOOTSTRAP=true ;;
+    --apply-iam) APPLY_IAM=true ;;
     --smoke) SMOKE=true ;;
     -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
   esac
@@ -194,6 +188,14 @@ echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
 
 # ----- 2. Bootstrap (first-time only) ---------------------------------------
 
+# ----- Apply IAM only (config#2825, no bootstrap side effects) -------------
+if $APPLY_IAM; then
+  echo "Applying IAM (role=${ROLE_NAME}, policy=${POLICY_NAME})..."
+  TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
+  echo "  ✓ IAM applied."
+fi
+
 if $BOOTSTRAP; then
   echo "Bootstrapping ${FUNCTION_NAME}..."
 
@@ -221,6 +223,11 @@ if $BOOTSTRAP; then
   fi
 
   # --- 2b. Lambda function ---
+  # GROOM_MAX_DISPATCHES_DAILY (config#3173, generalizing config#2269's
+  # sf-watch pattern): pinned here (not left to index.py's own default) so a
+  # live env tweak never silently survives a redeploy — same rationale as
+  # sf-watch's SF_WATCH_MAX_DISPATCHES_* (config#1818 lesson). Change via a
+  # PR editing this value, not a console edit.
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
   if ! aws lambda get-function --function-name "${FUNCTION_NAME}" --query 'Configuration.FunctionName' --output text >/dev/null 2>&1; then
     echo "  Creating Lambda: ${FUNCTION_NAME}"
@@ -232,7 +239,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 300 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+      --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid,high"}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -393,7 +400,7 @@ echo "✓ Code deployed."
 echo "Updating Lambda environment (flow-doctor SSM hydration)..."
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
-  --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+  --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid,high"}' \
   --region "${REGION}" \
   --query 'LastUpdateStatus' --output text
 if ! $DRY_RUN; then

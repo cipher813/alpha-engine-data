@@ -1,7 +1,7 @@
 """alpha-engine-overseer-liveness-probe — registry-driven wiring + run-window
 liveness check for the whole fleet watch plane (alpha-engine-config-I2831).
 
-Consolidates the two per-probe enumerations — sf-watch-liveness-probe's config
+Consolidates the two per-probe enumerations — sf-watch-reclaim-sweep-handler's config
 -drift WIRING checks and groom-liveness-probe's RUN-WINDOW accounting — into ONE
 probe that iterates ``infrastructure/overseer/playbooks.yaml``. Each playbook
 declares an OPTIONAL ``liveness.checks`` list; a top-level
@@ -11,7 +11,7 @@ the surface is no longer enumerated in per-probe Python constants.
 
 **Read-only.** The sf-watch reclaim-checker (config#2270) and disabled-window
 sweep (config#2257) are ACTION paths with their own EC2-event trigger topology
-and 45 pinned tests; they STAY in the (now slimmed) sf-watch-liveness-probe. A
+and 45 pinned tests; they STAY in the (now slimmed) sf-watch-reclaim-sweep-handler. A
 follow-up tracks their eventual migration. This probe never mutates fleet state
 — it checks wiring + run windows, dedups by problem-set CONTENT, and alerts.
 
@@ -27,6 +27,15 @@ Check types (discriminated union on ``type`` — contract in playbooks.schema.js
                                 dispatcher decision log), an S3 run artifact's
                                 run_start landed in [T, T+ceiling+margin].
   * ``sqs_queue_exists``      — queue (and optional DLQ) exists.
+  * ``scheduler_schedule_exists`` — EventBridge Scheduler schedule (a distinct
+                                resource type from ``eventbridge_rule``) exists
+                                and is ENABLED (alpha-engine-config-I2906).
+  * ``sf_watch_invocation_success`` — per mature real terminal-failure
+                                execution of a watched pipeline (read from the
+                                SFs' own execution history), the day's
+                                watch-log doc has a matching event — catches a
+                                dispatcher that is wired correctly but crashes
+                                on invocation (alpha-engine-config-I2901).
 
 Conventions preserved from both source probes:
   * silent-unless-broken: a clean pass logs + returns, no Telegram noise.
@@ -133,6 +142,10 @@ def _sqs_client():
     return boto3.client("sqs", region_name=REGION)
 
 
+def _scheduler_client():
+    return boto3.client("scheduler", region_name=REGION)
+
+
 def _on_bus(bus: str | None) -> str:
     return f" on bus '{bus}'" if bus else ""
 
@@ -142,7 +155,7 @@ def _on_bus(bus: str | None) -> str:
 
 def _check_eventbridge_rule(spec: dict, now: datetime) -> tuple[list[str], dict]:
     """Rule existence/state/target (+ optional stateMachineArn registration).
-    Generalizes sf-watch-liveness-probe._check_rule: the target may be a Lambda
+    Generalizes sf-watch-reclaim-sweep-handler._check_rule: the target may be a Lambda
     (``expect_target_function``) or an SQS queue (``expect_target_queue``, the
     intake rules), and the rule may live on a custom bus (``event_bus_name``).
     Fail-loud on any error code OTHER than the "does not exist" one checked for."""
@@ -208,7 +221,7 @@ def _check_eventbridge_rule(spec: dict, now: datetime) -> tuple[list[str], dict]
 def _check_state_machines_exist(spec: dict, now: datetime) -> tuple[list[str], dict]:
     """Each named pipeline's Step Function must actually exist — the exact
     2026-06-29 dead-ARN bug class, caught directly (ported from
-    sf-watch-liveness-probe._check_state_machines_exist)."""
+    sf-watch-reclaim-sweep-handler._check_state_machines_exist)."""
     problems: list[str] = []
     sfn = _sfn_client()
     for name in spec["state_machines"]:
@@ -228,7 +241,7 @@ def _check_state_machines_exist(spec: dict, now: datetime) -> tuple[list[str], d
 
 def _check_launch_config(fn_name: str, lc: dict, env: dict[str, str]) -> list[str]:
     """The deregistered-AMI silent-break guard (ported from
-    sf-watch-liveness-probe._check_launch_config): assert the AMI/SG/subnets the
+    sf-watch-reclaim-sweep-handler._check_launch_config): assert the AMI/SG/subnets the
     DEPLOYED Lambda would launch with still exist, reading their ids from its
     LIVE env (no duplicated constants). Uses Filters (not Ids) so a missing
     resource is an EMPTY set, not an error code — unexpected API errors RAISE."""
@@ -288,7 +301,7 @@ def _check_lambda_active(spec: dict, now: datetime) -> tuple[list[str], dict]:
     """Function Active + LastUpdateStatus Successful. Optionally REPORTS a
     kill-switch env value (never alerted — a deliberate operator disable is
     state) and verifies launch-config resources. Ported from
-    sf-watch-liveness-probe._check_lambda_healthy + _check_spot_dispatch_leg."""
+    sf-watch-reclaim-sweep-handler._check_lambda_healthy + _check_spot_dispatch_leg."""
     fn_name = spec["function"]
     switch_key = spec.get("report_kill_switch")
     problems: list[str] = []
@@ -341,6 +354,36 @@ def _queues_to_check(spec: dict) -> list[tuple[str, str]]:
     if spec.get("expect_dlq"):
         out.append((spec["expect_dlq"], "intake DLQ"))
     return out
+
+
+# ── Check: scheduler_schedule_exists ─────────────────────────────────────────
+
+
+def _check_scheduler_schedule_exists(spec: dict, now: datetime) -> tuple[list[str], dict]:
+    """EventBridge Scheduler schedule exists + (by default) ENABLED. A
+    DIFFERENT AWS resource from the classic `events` rules the
+    ``eventbridge_rule`` check covers — a deleted/disabled Scheduler schedule
+    is otherwise invisible (alpha-engine-config-I2906). Deliberately NAME +
+    STATE only, never target ARN: a concurrent migration
+    (alpha-engine-config-I2832) re-points some of these schedules' targets
+    between executor Lambdas and the overseer-dispatcher router, and this
+    check must stay valid across that repoint. GetSchedule raises
+    ``ResourceNotFoundException`` for a truly-absent schedule (a FINDING); any
+    other error RAISES (fail-loud)."""
+    name = spec["schedule_name"]
+    problems: list[str] = []
+    scheduler = _scheduler_client()
+    try:
+        sched = scheduler.get_schedule(Name=name)
+    except Exception as exc:  # noqa: BLE001 — inspect code below; re-raise if unexpected
+        if _error_code(exc) == "ResourceNotFoundException":
+            return [f"EventBridge Scheduler schedule '{name}' does NOT EXIST"], {}
+        raise
+    if spec.get("expect_enabled", True) and sched.get("State") != "ENABLED":
+        problems.append(
+            f"EventBridge Scheduler schedule '{name}' is {sched.get('State')}, not ENABLED"
+        )
+    return problems, {}
 
 
 # ── Check: run_window (ported from groom-liveness-probe) ──────────────────────
@@ -540,6 +583,138 @@ def _check_run_window(spec: dict, now: datetime) -> tuple[list[str], dict]:
     return problems, {}
 
 
+# ── Check: sf_watch_invocation_success ───────────────────────────────────────
+# The exact "wiring vs function" gap (alpha-engine-config-I2901): every check
+# above only asserts the sf-watch dispatcher is deployed + correctly WIRED — a
+# dispatcher that is Active, correctly targeted, AND crashes on every real
+# invocation (2026-07-17 ListBucket/403 while loading/writing the watch-log)
+# is invisible to them. This check is the invocation-SUCCESS signal the issue
+# asks for: for each mature terminal-failure execution of a watched pipeline —
+# read from the state machines' OWN execution history, an INDEPENDENT signal
+# from the watch-log the dispatcher writes, so a broken writer can't hide its
+# own breakage — the day's watch-log doc must carry a matching event record.
+
+_SF_FAILURE_STATUSES = ("FAILED", "TIMED_OUT", "ABORTED")
+
+
+def _list_recent_sf_failures(sfn, state_machine_arn: str, horizon: datetime) -> list[dict]:
+    """Every FAILED/TIMED_OUT/ABORTED execution of this state machine with
+    stopDate >= horizon. ListExecutions returns executions newest-first within
+    each status filter, so paging stops as soon as one is older than horizon.
+    PRIMARY input — RAISES on any API error (fail-loud)."""
+    out: list[dict] = []
+    for status in _SF_FAILURE_STATUSES:
+        token = None
+        while True:
+            kwargs: dict = {
+                "stateMachineArn": state_machine_arn,
+                "statusFilter": status,
+                "maxResults": 100,
+            }
+            if token:
+                kwargs["nextToken"] = token
+            resp = sfn.list_executions(**kwargs)
+            older_than_horizon = False
+            for execu in resp.get("executions", []):
+                stop = execu.get("stopDate")
+                if stop is not None and stop < horizon:
+                    older_than_horizon = True
+                    break
+                out.append(execu)
+            token = resp.get("nextToken")
+            if older_than_horizon or not token:
+                break
+    return out
+
+
+def _sf_watch_run_date_for_execution(sfn, execu: dict, now: datetime) -> str:
+    """Mirror saturday-sf-watch-dispatcher._run_date verbatim: prefer the
+    execution input's ``run_date``, else the execution ``startDate``, else
+    ``now`` — so this check reads the EXACT S3 key the dispatcher itself would
+    have written to. DescribeExecution is a PRIMARY input here (needed for
+    correctness, not a convenience) — RAISES on an unexpected error (fail-loud,
+    an ExecutionDoesNotExist is treated as "no input to read", not swallowed
+    silently past that); only malformed input JSON degrades to the startDate
+    fallback, mirroring the producer's own tolerant behavior for that one
+    narrow case."""
+    resp = None
+    try:
+        resp = sfn.describe_execution(executionArn=execu["executionArn"])
+    except Exception as exc:  # noqa: BLE001 — inspect code below; re-raise if unexpected
+        if _error_code(exc) != "ExecutionDoesNotExist":
+            raise
+    if resp is not None:
+        try:
+            payload = json.loads(resp.get("input") or "{}")
+            rd = payload.get("run_date")
+            if isinstance(rd, str) and rd:
+                return rd
+        except (ValueError, TypeError):
+            pass
+    start = execu.get("startDate")
+    if isinstance(start, datetime):
+        return start.date().isoformat()
+    return now.date().isoformat()
+
+
+def _watch_log_events(s3, key: str) -> list[dict] | None:
+    """Read + parse the day's watch-log doc, or None if it genuinely does not
+    exist yet (the common no-failure-today case). Any OTHER read error — 403
+    above all, the exact 2026-07-17 incident class — RAISES (fail-loud): a
+    check that treated an AccessDenied as "no events yet" would hide the very
+    crash it exists to catch."""
+    try:
+        obj = s3.get_object(Bucket=WATCH_BUCKET, Key=key)
+    except Exception as exc:  # noqa: BLE001 — inspect code below; re-raise if unexpected
+        if _error_code(exc) in {"NoSuchKey", "404"}:
+            return None
+        raise
+    try:
+        doc = json.loads(obj["Body"].read())
+    except (ValueError, TypeError):
+        return []
+    events = doc.get("events") if isinstance(doc, dict) else None
+    return events if isinstance(events, list) else []
+
+
+def _check_sf_watch_invocation_success(spec: dict, now: datetime) -> tuple[list[str], dict]:
+    """Per registered pipeline, every MATURE (older than
+    ``response_window_min``) terminal-failure execution within
+    ``lookback_hours`` must have produced a matching watch-log event. A miss
+    means the dispatcher was invoked (EventBridge fired — wiring is fine) but
+    never completed its PRIMARY fail-loud watch-log write, i.e. it crashed on
+    invocation."""
+    problems: list[str] = []
+    sfn = _sfn_client()
+    s3 = _s3_client()
+    horizon = now - timedelta(hours=spec["lookback_hours"])
+    mature_before = now - timedelta(minutes=spec["response_window_min"])
+    for entry in spec["pipelines"]:
+        sm_name = entry["state_machine"]
+        watch_prefix = entry["watch_prefix"]
+        arn = f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:{sm_name}"
+        failures = _list_recent_sf_failures(sfn, arn, horizon)
+        for execu in failures:
+            stop = execu.get("stopDate")
+            if stop is None or stop > mature_before:
+                continue  # not mature yet — give the dispatcher time to write
+            run_date = _sf_watch_run_date_for_execution(sfn, execu, now)
+            key = f"{watch_prefix}/{run_date}.json"
+            events = _watch_log_events(s3, key)
+            recorded = events is not None and any(
+                e.get("execution_arn") == execu.get("executionArn") for e in events
+            )
+            if not recorded:
+                problems.append(
+                    f"sf-watch: {sm_name} execution '{execu.get('name')}' terminal-failed "
+                    f"({execu.get('status')}) @ {stop.strftime('%Y-%m-%d %H:%M')}Z with NO "
+                    f"matching watch-log event under '{key}' {spec['response_window_min']}+ min "
+                    "later — the dispatcher was invoked but crashed before its fail-loud "
+                    "watch-log write (wiring OK, function broken)"
+                )
+    return problems, {}
+
+
 # ── Check dispatch table + aggregation ───────────────────────────────────────
 
 CHECKERS = {
@@ -548,6 +723,8 @@ CHECKERS = {
     "lambda_active": _check_lambda_active,
     "sqs_queue_exists": _check_sqs_queue_exists,
     "run_window": _check_run_window,
+    "scheduler_schedule_exists": _check_scheduler_schedule_exists,
+    "sf_watch_invocation_success": _check_sf_watch_invocation_success,
 }
 
 
@@ -583,7 +760,7 @@ def _run_checks(now: datetime) -> tuple[list[str], dict[str, str]]:
     return problems, kill_switches
 
 
-# ── Dedup + alert (content-fingerprint, ported from sf-watch-liveness-probe) ──
+# ── Dedup + alert (content-fingerprint, ported from sf-watch-reclaim-sweep-handler) ──
 
 
 def _problem_fingerprint(problems: list[str]) -> str:
@@ -641,6 +818,14 @@ def _alert(problems: list[str], kill_switches: dict[str, str] | None = None) -> 
             topics=_OPS_TOPICS,
             db_basename=_DB_BASENAME,
             context={"problems": len(problems), "kill_switches": kill_switches or {}},
+            # No playbooks.yaml alert_classes row exists yet for this Lambda's
+            # own identity (config-I3513 audit finding) — note this is
+            # DISTINCT from the registered `overseer_dispatch_escalation`
+            # class (source "overseer-dispatcher"), which belongs to the
+            # separate overseer-dispatcher Lambda. Using _FLOW_NAME is still
+            # strictly correct (this Lambda's own naming convention);
+            # follow-up filed to add a row.
+            source=_FLOW_NAME,
         )
     except Exception as exc:  # noqa: BLE001 — delivery surface; finding still returned
         logger.warning("overseer liveness alert Telegram send failed (non-fatal): %s", exc)

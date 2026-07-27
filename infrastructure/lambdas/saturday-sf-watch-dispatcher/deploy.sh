@@ -22,12 +22,14 @@
 # Usage:
 #   bash infrastructure/lambdas/saturday-sf-watch-dispatcher/deploy.sh             # update code only
 #   bash infrastructure/lambdas/saturday-sf-watch-dispatcher/deploy.sh --bootstrap # first-time create + wire EventBridge
+#   bash infrastructure/lambdas/saturday-sf-watch-dispatcher/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
 #   bash infrastructure/lambdas/saturday-sf-watch-dispatcher/deploy.sh --dry-run   # show actions, do not apply
 #   bash infrastructure/lambdas/saturday-sf-watch-dispatcher/deploy.sh --smoke     # invoke once with a synthetic FAILED event
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 FUNCTION_NAME="alpha-engine-saturday-sf-watch-dispatcher"
 ROLE_NAME="alpha-engine-saturday-sf-watch-dispatcher-role"
 POLICY_NAME="alpha-engine-saturday-sf-watch-dispatcher-policy"
@@ -48,11 +50,13 @@ case "${DRY_RUN:-false}" in
   *) DRY_RUN=false ;;
 esac
 BOOTSTRAP=false
+APPLY_IAM=false
 SMOKE=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
     --bootstrap) BOOTSTRAP=true ;;
+    --apply-iam) APPLY_IAM=true ;;
     --smoke) SMOKE=true ;;
     -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
   esac
@@ -111,6 +115,14 @@ echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
 
 # ----- 2. Bootstrap (first-time only) ---------------------------------------
 
+# ----- Apply IAM only (config#2825, no bootstrap side effects) -------------
+if $APPLY_IAM; then
+  echo "Applying IAM (role=${ROLE_NAME}, policy=${POLICY_NAME})..."
+  TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
+  echo "  ✓ IAM applied."
+fi
+
 if $BOOTSTRAP; then
   echo "Bootstrapping ${FUNCTION_NAME}..."
 
@@ -155,13 +167,14 @@ if $BOOTSTRAP; then
   fi
 
   # EventBridge rule: terminal-failure statuses of ANY registered fleet SF.
-  # One rule, one target — keep the ARN list in lockstep with
-  # index.PIPELINES. (The transitional alpha-engine-eod-pipeline alias was
-  # retired 2026-07-11 — config#2272; old SF deleted live.) Widened
-  # 2026-07-14 (alpha-engine-config-I2544/I2545) to also cover the two new
-  # child SFs split out of the weekly pipeline — both registered in
-  # index.PIPELINES with has_listener:False (watch-log + Telegram fire;
-  # autonomous-agent dispatch deferred until their own charter exists).
+  # One rule, one target. The ARN list is in ENFORCED lockstep with
+  # index.PIPELINES — tests/test_sf_watch_rule_pattern_lockstep.py statically
+  # extracts this heredoc's pipeline names and fails CI on drift. (Added
+  # 2026-07-21, alpha-engine-config-I3187: the I2890 re-inline retired
+  # ne-weekly-advisory-pipeline / ne-modelzoo-sunday-pipeline from
+  # index.PIPELINES, but this heredoc kept both ARNs because the old
+  # "keep in lockstep" comment was prose, not a contract — the live rule
+  # then re-acquired the stale ARNs on bootstrap.)
   echo "  Creating EventBridge rule: ${RULE_NAME}"
   EVENT_PATTERN=$(cat <<EOF
 {
@@ -171,9 +184,7 @@ if $BOOTSTRAP; then
     "stateMachineArn": [
       "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-weekly-freshness-pipeline",
       "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-preopen-trading-pipeline",
-      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline",
-      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-weekly-advisory-pipeline",
-      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-modelzoo-sunday-pipeline"
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline"
     ],
     "status": ["FAILED", "TIMED_OUT", "ABORTED"]
   }
