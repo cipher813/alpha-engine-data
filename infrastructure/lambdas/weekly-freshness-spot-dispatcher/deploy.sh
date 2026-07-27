@@ -117,10 +117,14 @@ if $BOOTSTRAP; then
   TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
   if ! aws iam get-role --role-name "${ROLE_NAME}" --query 'Role.RoleName' --output text >/dev/null 2>&1; then
     echo "  Creating IAM role: ${ROLE_NAME}"
+    # --description must be ASCII-only: IAM constrains it to
+    # [\u0009\u000A\u000D\u0020-\u007E\u00A1-\u00FF]. An em-dash (U+2014) is
+    # outside that range and CreateRole fails with ValidationError. Caught on
+    # the live 2026-07-27 bootstrap; use a plain hyphen, as siblings do.
     run aws iam create-role \
       --role-name "${ROLE_NAME}" \
       --assume-role-policy-document "${TRUST_POLICY}" \
-      --description "Execution role for ${FUNCTION_NAME} — launch the weekly-freshness launcher spot + fire async SSM bootstrap (config#2248)" \
+      --description "Execution role for ${FUNCTION_NAME} - launch the weekly-freshness launcher spot + fire async SSM bootstrap (config#2248)" \
       --query 'Role.RoleName' --output text
   else
     echo "  IAM role exists: ${ROLE_NAME}"
