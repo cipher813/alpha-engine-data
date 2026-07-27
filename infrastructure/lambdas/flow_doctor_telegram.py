@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Iterator, Optional, Sequence
 
 from nousergon_lib.telegram import send_message
 
@@ -103,6 +104,44 @@ def topic_telegram_notifier(fd: Any, topic: Any) -> Any | None:
     return None
 
 
+@contextlib.contextmanager
+def _event_source_override(source: Optional[str]) -> Iterator[None]:
+    """Attribute the Overseer intake bus event this call produces to ``source``.
+
+    Every Telegram delivery path this function can take — ``fd.notify_event``
+    (via ``flow_doctor.notify.telegram.TelegramNotifier.send``),
+    ``notifier.send_raw`` (the ``silent_topic`` branch), and the bare
+    ``send_message`` fallback — funnels through ``krepis.telegram.send_message``
+    at the bottom, which has no ``source`` parameter at all: it always calls
+    ``krepis.fleet_events.emit_alert_event`` with no explicit source, so
+    attribution resolves via ``krepis.fleet_events._resolve_source`` — explicit
+    arg (never supplied on this path) > ``KREPIS_EVENT_SOURCE`` env > the
+    Lambda's own runtime ``AWS_LAMBDA_FUNCTION_NAME`` identity.
+
+    ``KREPIS_EVENT_SOURCE`` is krepis's own documented override for exactly
+    this case, so this sets it for the duration of the call rather than
+    reaching into krepis/flow-doctor (separate repos) to thread a ``source``
+    kwarg through every intermediate layer. Restores the prior value
+    (including "unset") afterward so a warm Lambda container never leaks one
+    invocation's source into the next. config-I3513 — before this fix, every
+    caller here silently fell back to Lambda runtime identity, which matches
+    NO row in ``playbooks.yaml``'s ``alert_classes`` for most callers
+    (confirmed live: 7 of 10 freshness-monitor intake events unclassified).
+    """
+    if source is None:
+        yield
+        return
+    prior = os.environ.get("KREPIS_EVENT_SOURCE")
+    os.environ["KREPIS_EVENT_SOURCE"] = source
+    try:
+        yield
+    finally:
+        if prior is None:
+            os.environ.pop("KREPIS_EVENT_SOURCE", None)
+        else:
+            os.environ["KREPIS_EVENT_SOURCE"] = prior
+
+
 def notify_via_flow_doctor(
     text: str,
     *,
@@ -117,7 +156,6 @@ def notify_via_flow_doctor(
     silent_topic: Any | None = None,
 ) -> bool:
     """Route ``text`` through flow-doctor forum topics; fallback to ``send_message``.
-
     Args:
         text: Notification body text.
         silent: If True, send with notifications suppressed (Telegram silent).
@@ -142,23 +180,18 @@ def notify_via_flow_doctor(
             owner_repo,
         )
         return False
-    fd = get_flow_doctor(flow_name, topics, db_basename=db_basename)
-    if fd is None:
-        return send_message(text, disable_notification=silent)
+    with _event_source_override(source):
+        fd = get_flow_doctor(flow_name, topics, db_basename=db_basename)
+        if fd is None:
+            return send_message(text, disable_notification=silent)
 
-    subject = text.replace("*", "").strip()
+        subject = text.replace("*", "").strip()
 
-    if silent and silent_topic is not None:
-        notifier = topic_telegram_notifier(fd, silent_topic)
-        if notifier is not None:
-            return notifier.send_raw(text, disable_notification=True) is not None
+        if silent and silent_topic is not None:
+            notifier = topic_telegram_notifier(fd, silent_topic)
+            if notifier is not None:
+                return notifier.send_raw(text, disable_notification=True) is not None
 
-    # Scope the event source so krepis's _resolve_source picks up the
-    # explicit override instead of falling through to AWS_LAMBDA_FUNCTION_NAME.
-    old_source = os.environ.pop("KREPIS_EVENT_SOURCE", None)
-    if source is not None:
-        os.environ["KREPIS_EVENT_SOURCE"] = source
-    try:
         report_id = fd.notify_event(
             subject,
             body=None,
@@ -166,9 +199,4 @@ def notify_via_flow_doctor(
             context=context or {},
             dedup_key=dedup_key,
         )
-    finally:
-        if old_source is not None:
-            os.environ["KREPIS_EVENT_SOURCE"] = old_source
-        elif source is not None:
-            os.environ.pop("KREPIS_EVENT_SOURCE", None)
-    return report_id is not None
+        return report_id is not None
