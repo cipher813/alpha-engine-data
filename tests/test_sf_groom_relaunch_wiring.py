@@ -48,11 +48,12 @@ def iam_policy() -> dict:
     return json.loads(_IAM_PATH.read_text())
 
 
-def test_completion_marker_check_uses_head_object(states):
-    st = states["CheckCompletionMarker"]
-    assert st["Resource"] == "arn:aws:states:::aws-sdk:s3:headObject"
-    assert st["Parameters"]["Bucket"] == "alpha-engine-research"
-    assert "groom/_control/completed/" in st["Parameters"]["Key.$"]
+def test_completion_marker_task_token_timeout_routes_to_retry(states):
+    """config-I4333: when the task token times out, CheckCompletionMarkerTaskToken
+    invokes the Lambda and routes to CheckRetryBudget for the relaunch decision."""
+    st = states["CheckCompletionMarkerTaskToken"]
+    assert st["Resource"] == "arn:aws:states:::lambda:invoke"
+    assert st["Next"] == "CheckRetryBudget"
 
 
 def test_sf_role_grants_head_object_on_completion_marker(iam_policy):
@@ -91,11 +92,11 @@ def test_relaunch_critical_path_launch_before_notify(states):
     assert states["CheckForceOnDemand"]["Default"] == "LaunchGroomSpot"
     assert states["SetForceOnDemand"]["Next"] == "LaunchGroomSpot"
     assert states["LaunchGroomSpot"]["Next"] == "RelaunchNotifyGate"
-    assert states["RelaunchNotifyGate"]["Default"] == "CheckLaunched"
+    assert states["RelaunchNotifyGate"]["Default"] == "CheckLaunchedCallback"
     relaunch_choices = states["RelaunchNotifyGate"]["Choices"]
     assert relaunch_choices[0]["Next"] == "NotifyRelaunch"
-    assert states["NotifyRelaunch"]["Next"] == "CheckLaunched"
-    assert states["NotifyRelaunch"]["Catch"][0]["Next"] == "CheckLaunched"
+    assert states["NotifyRelaunch"]["Next"] == "CheckLaunchedCallback"
+    assert states["NotifyRelaunch"]["Catch"][0]["Next"] == "CheckLaunchedCallback"
 
 
 def test_notify_relaunch_message_uses_preserved_groom_poll_status(states):

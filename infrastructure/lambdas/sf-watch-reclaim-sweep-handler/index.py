@@ -1,6 +1,6 @@
-"""alpha-engine-sf-watch-liveness-probe — the ACTION half of the Fleet-SF Watch
-watchdog: the mid-run spot-reclaim checker + the disabled-window dropped-failure
-sweep.
+"""alpha-engine-sf-watch-reclaim-sweep-handler — the ACTION half of the
+Fleet-SF Watch watchdog: the mid-run spot-reclaim checker + the disabled-window
+dropped-failure sweep.
 
 SLIMMED (alpha-engine-config-I2831): the read-only WIRING-INTEGRITY checks that
 used to live here (EventBridge rule / registered-SF-ARN / dead-state-machine /
@@ -9,10 +9,9 @@ alpha-engine-overseer-liveness-probe, which iterates
 infrastructure/overseer/playbooks.yaml so the watch-plane surface is enumerated
 in ONE place instead of per-probe constants. This Lambda retains ONLY the two
 ACTION paths below — they have their own EC2-event trigger topology + 45 pinned
-behavioral tests, so they were deliberately NOT migrated in that pass (a
-follow-up tracks their eventual move). The Lambda name / EC2 reclaim rules /
-scheduler cron are unchanged (renaming would re-point live EventBridge targets
-for zero gain).
+behavioral tests. Renamed to reflect it is action-only (alpha-engine-config-I2868)
+— no longer carries "liveness" in its name; the read-only liveness checks live in
+overseer-liveness-probe.
 
 **Mid-run spot-reclaim checker (config#2270).** This Lambda is ALSO the
 EventBridge target for `EC2 Spot Instance Interruption Warning` and
@@ -102,8 +101,8 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 ACCOUNT_ID = os.environ.get("ACCOUNT_ID", "711398986525")
-_FLOW_NAME = "sf-watch-liveness-probe"
-_DB_BASENAME = "flow_doctor_sf_watch_liveness_probe"
+_FLOW_NAME = "sf-watch-reclaim-sweep-handler"
+_DB_BASENAME = "flow_doctor_sf_watch_reclaim_sweep_handler"
 _OPS_TOPICS = (
     FleetTelegramTopic.CRITICAL,
     FleetTelegramTopic.OPS_HEALTH,
@@ -289,6 +288,13 @@ def _reclaim_escalate(text: str, dedup_key: str, context_info: dict) -> bool:
             topics=_OPS_TOPICS,
             db_basename=_DB_BASENAME,
             context=context_info,
+            # No playbooks.yaml alert_classes row exists yet for this
+            # Lambda's own identity (config-I3513 audit finding, distinct
+            # from the `canary_replay_liveness` class which belongs to the
+            # separate canary-replay-liveness-probe Lambda). Using
+            # _FLOW_NAME is still strictly correct; follow-up filed to add
+            # a row.
+            source=_FLOW_NAME,
         )
     except Exception as exc:  # noqa: BLE001 — delivery surface; finding still logged + returned
         logger.warning("reclaim escalation Telegram send failed (non-fatal): %s", exc)
@@ -309,6 +315,11 @@ def _reclaim_note(text: str, dedup_key: str, context_info: dict) -> bool:
             db_basename=_DB_BASENAME,
             context=context_info,
             silent_topic=FleetTelegramTopic.OPS_HEALTH,
+            # No playbooks.yaml alert_classes row exists yet for this
+            # Lambda's own identity (config-I3513 audit finding). Using
+            # _FLOW_NAME is still strictly correct; follow-up filed to add
+            # a row.
+            source=_FLOW_NAME,
         )
     except Exception as exc:  # noqa: BLE001 — delivery surface; relaunch already fired + recorded
         logger.warning("reclaim relaunch Telegram note failed (non-fatal): %s", exc)

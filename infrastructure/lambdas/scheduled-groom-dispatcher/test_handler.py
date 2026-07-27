@@ -327,11 +327,11 @@ def test_deploy_schedule_high_only_carries_pr_budget():
         line for line in sched_inputs_lines
         if "pr_budget" in line
     ]
-    # All 3 daily SCHED_INPUTS have pr_budget (every slot launches high tier).
-    # The weekly gated-reverify SCHED_INPUTS does not.
-    assert len(pr_budget_lines) == 3, (
-        f"expected 3 daily SCHED_INPUTS entries with pr_budget (one per slot), "
-        f"got {len(pr_budget_lines)}: {pr_budget_lines}"
+    # config#1311: 3 daily + 1 Sunday = 4 demand-all slots, all carry pr_budget
+    # (every slot launches all 3 tiers including high when the queue clears).
+    assert len(pr_budget_lines) == 4, (
+        f"expected 4 SCHED_INPUT entries with pr_budget (3 daily + Sunday, "
+        f"demand-all cadence), got {len(pr_budget_lines)}: {pr_budget_lines}"
     )
 
 
@@ -424,41 +424,41 @@ def test_gated_reverify_schedule_forwards_filter(monkeypatch):
     # the weekly lane would have silently run as mid-only.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler(
-        {"run_mode": "full", "model": "claude-haiku-4-5",
+        {"run_mode": "full", "model": "deepseek-v4-flash",
          "issue_filter": "gated-reverify", "schedule": "0 9 * * 0"},
         None,
     )
     g = out["groom"]
     assert g["issue_filter"] == "gated-reverify"
-    assert g["model"] == "claude-haiku-4-5"
+    assert g["model"] == "deepseek-v4-flash"
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
     assert "export GROOM_ISSUE_FILTER=gated-reverify" in cmd
 
 
 def test_missing_model_and_issue_filter_default_to_mid_queue(monkeypatch):
-    # Schedules with no model/issue_filter must default to Sonnet / mid-only.
+    # Schedules with no model/issue_filter must default to DeepSeek / mid-only.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler({"run_mode": "full", "schedule": "0 23 * * *"}, None)
     g = out["groom"]
-    assert g["model"] == "claude-sonnet-5"
+    assert g["model"] == "deepseek-v4-pro"
     assert g["issue_filter"] == "mid-only"
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
-    assert "export GROOM_MODEL=claude-sonnet-5" in cmd
+    assert "export GROOM_MODEL=deepseek-v4-pro" in cmd
     assert "export GROOM_ISSUE_FILTER=mid-only" in cmd
 
 
 def test_low_only_schedule_forwards_haiku_model_and_filter(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler(
-        {"run_mode": "full", "model": "claude-haiku-4-5", "issue_filter": "low-only",
+        {"run_mode": "full", "model": "deepseek-v4-flash", "issue_filter": "low-only",
          "schedule": "0 19 * * *"},
         None,
     )
     g = out["groom"]
-    assert g["model"] == "claude-haiku-4-5"
+    assert g["model"] == "deepseek-v4-flash"
     assert g["issue_filter"] == "low-only"
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
-    assert "export GROOM_MODEL=claude-haiku-4-5" in cmd
+    assert "export GROOM_MODEL=deepseek-v4-flash" in cmd
     assert "export GROOM_ISSUE_FILTER=low-only" in cmd
 
 
@@ -473,10 +473,10 @@ def test_malformed_model_falls_back_to_default(monkeypatch):
     # than embedded into the SSM command (defense-in-depth allowlist).
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler({"run_mode": "full", "model": "claude; rm -rf /"}, None)
-    assert out["groom"]["model"] == "claude-sonnet-5"
+    assert out["groom"]["model"] == "deepseek-v4-pro"
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
     assert "claude; rm -rf /" not in cmd
-    assert "export GROOM_MODEL=claude-sonnet-5" in cmd
+    assert "export GROOM_MODEL=deepseek-v4-pro" in cmd
 
 
 def test_soft_limit_min_override_forwarded_for_bounded_test(monkeypatch):
@@ -668,7 +668,7 @@ def _stub_stats(monkeypatch, idx, counts, oldest=None, has_p0=False):
 def test_demand_gate_skips_light_queue_with_zero_launch(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     _stub_stats(monkeypatch, idx, {"low": 3, "mid": 40, "high": 2})
-    out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
+    out = idx.handler({"run_mode": "full", "model": "deepseek-v4-flash",
                        "issue_filter": "low-only", "schedule": "0 19 * * *"}, None)
     assert out["groom"]["launched"] is False
     assert out["groom"]["reason"] == "demand_gate_skip"
@@ -676,17 +676,19 @@ def test_demand_gate_skips_light_queue_with_zero_launch(monkeypatch):
 
 
 def test_demand_gate_bundles_and_downgrades_model(monkeypatch):
-    # high slot, no high issues, starving low+mid -> ONE Sonnet run.
+    # high slot, no high issues, starving low+mid -> ONE box at the highest
+    # present tier's model (mid=deepseek-v4-flash in v0.124.15). decide_slot
+    # bundling logic unchanged; only TIER_MODELS changed.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     _stub_stats(monkeypatch, idx, {"low": 5, "mid": 6, "high": 0})
     out = idx.handler({"run_mode": "full", "model": "claude-sonnet-5",
                        "issue_filter": "high-only", "schedule": "0 1 * * *"}, None)
     g = out["groom"]
     assert g["launched"] and g["issue_filter"] == "mid+low"
-    assert g["model"] == "claude-sonnet-5"
+    assert g["model"] == "deepseek-v4-flash"
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
     assert "export GROOM_ISSUE_FILTER=mid+low" in cmd
-    assert "export GROOM_MODEL=claude-sonnet-5" in cmd
+    assert "export GROOM_MODEL=deepseek-v4-flash" in cmd
 
 
 def test_demand_gate_full_queues_run_own_tier(monkeypatch):
@@ -704,7 +706,7 @@ def test_demand_gate_bypassed_for_reverify_force_and_sweep(monkeypatch):
     monkeypatch.setattr(idx, "_enumerate_tier_stats",
                         lambda token: called.append(1) or ({}, {}, False))
     # gated-reverify: no tier queue -> gate bypassed, launch proceeds
-    out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
+    out = idx.handler({"run_mode": "full", "model": "deepseek-v4-flash",
                        "issue_filter": "gated-reverify"}, None)
     assert out["groom"]["launched"]
     # force_on_demand (relaunch SF final retry): must never be blocked
@@ -723,7 +725,7 @@ def test_demand_gate_fail_safe_launches_legacy_on_enumeration_error(monkeypatch)
         raise RuntimeError("github down")
     monkeypatch.setattr(idx, "_github_token", lambda: "tok")
     monkeypatch.setattr(idx, "_enumerate_tier_stats", boom)
-    out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
+    out = idx.handler({"run_mode": "full", "model": "deepseek-v4-flash",
                        "issue_filter": "low-only"}, None)
     assert out["groom"]["launched"] and out["groom"]["issue_filter"] == "low-only"
 
@@ -768,9 +770,11 @@ def test_symmetric_trigger_brians_8_9_10_launches_three_boxes(monkeypatch):
     g = out["groom"]
     assert g["trigger"] == "demand-all"
     launched = {(l["issue_filter"], l["model"]) for l in g["launches"]}
+    # groom-primary-deepseek (v0.124.15): every tier launches independently at
+    # its tier's model — low=deepseek-v4-flash, mid=deepseek-v4-flash, high=claude-sonnet-5
     assert launched == {("high-only", "claude-sonnet-5"),
-                        ("mid-only", "claude-sonnet-5"),
-                        ("low-only", "claude-haiku-4-5")}
+                        ("mid-only", "deepseek-v4-flash"),
+                        ("low-only", "deepseek-v4-flash")}
     cmds = [c["Parameters"]["commands"][0] for c in idx._test_ssm.sent]
     assert len(cmds) == 3
     # config#2201: groom boxes are pure issue-coverage workers — the
@@ -781,22 +785,35 @@ def test_symmetric_trigger_brians_8_9_10_launches_three_boxes(monkeypatch):
         assert "GROOM_SWEEP_PARTITION" not in c
 
 
-def test_symmetric_trigger_light_backlog_zero_boxes(monkeypatch):
+def test_symmetric_trigger_all_tiers_launch_when_any_issues(monkeypatch):
+    # groom-primary-deepseek (v0.124.15): unconditional per-tier launch —
+    # every tier with >0 actionable issues launches its own box regardless
+    # of floor=8. low=2, mid=3, high=1 → 3 boxes.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     _stub_fresh_stats(monkeypatch, idx, {"low": 2, "mid": 3, "high": 1})
     out = idx.handler(_demand_event("0 7 * * *"), None)
-    assert out["groom"]["launches"] == []
-    assert not idx._test_ssm.sent
+    launches = out["groom"]["launches"]
+    assert len(launches) == 3
+    issue_filters = {l["issue_filter"] for l in launches}
+    assert issue_filters == {"low-only", "mid-only", "high-only"}
+    models = {l["model"] for l in launches}
+    assert models == {"deepseek-v4-flash", "claude-sonnet-5"}
+    assert len(idx._test_ssm.sent) == 3
 
 
-def test_symmetric_trigger_thin_pool_downgrades_model(monkeypatch):
-    # 5 low + 6 mid + 0 high pooled -> ONE Sonnet box regardless of trigger time.
+def test_symmetric_trigger_separate_boxes_no_bundling(monkeypatch):
+    # groom-primary-deepseek (v0.124.15): no thin-tier bundling — low=5
+    # launches its own low-only box (deepseek-v4-flash), mid=6 launches its
+    # own mid-only box (deepseek-v4-flash). high=0 is skipped.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     _stub_fresh_stats(monkeypatch, idx, {"low": 5, "mid": 6, "high": 0})
     out = idx.handler(_demand_event(), None)
     ls = out["groom"]["launches"]
-    assert len(ls) == 1 and ls[0]["issue_filter"] == "mid+low"
-    assert ls[0]["model"] == "claude-sonnet-5"
+    assert len(ls) == 2
+    issue_filters = {l["issue_filter"] for l in ls}
+    assert issue_filters == {"low-only", "mid-only"}
+    for l in ls:
+        assert l["model"] == "deepseek-v4-flash"
 
 
 def test_symmetric_trigger_skips_on_enumeration_error(monkeypatch):
@@ -820,18 +837,13 @@ def test_symmetric_trigger_skips_on_enumeration_error(monkeypatch):
     assert kw["severity"] == "warning" and kw["silent"] is False
 
 
-def test_load_recent_engagements_raises_on_s3_access_denied(monkeypatch):
-    """config#2142: an engagement-scan read failure must RAISE, never degrade
-    to an empty map. The old fail-safe ``{}`` ("skip nothing") silently
-    disabled fresh-skip on every trigger from ship (2026-07-08) to 2026-07-10
-    when the role lacked ListBucket on groom/{date}/ — the dispatcher
-    advertised pre-skip counts (e.g. high=26) that deflated on-box (10)."""
+def test_load_recent_engagements_no_longer_exists(monkeypatch):
+    """config#2146: the 72h fresh-skip cooldown this engagement-horizon scan
+    fed is retired — eligibility is disposition-structural now
+    (ge.is_actionable alone). The function had no other caller, so it's
+    removed with the cooldown rather than left as dead S3-scanning weight."""
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
-    def denied(Bucket, Prefix):  # noqa: N803 — boto3 kwarg names
-        raise RuntimeError("AccessDenied: s3:ListBucket")
-    monkeypatch.setattr(idx._test_s3, "list_objects_v2", denied)
-    with pytest.raises(RuntimeError, match="AccessDenied"):
-        idx._load_recent_engagements()
+    assert not hasattr(idx, "_load_recent_engagements")
 
 
 def test_non_demand_events_keep_legacy_behavior(monkeypatch):
@@ -840,7 +852,7 @@ def test_non_demand_events_keep_legacy_behavior(monkeypatch):
     monkeypatch.setattr(idx, "_enumerate_tier_stats_fresh",
                         lambda token: called.append(1) or ({}, {}, []))
     monkeypatch.setattr(idx, "_demand_decision", lambda f, s: None)
-    out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
+    out = idx.handler({"run_mode": "full", "model": "deepseek-v4-flash",
                        "issue_filter": "gated-reverify"}, None)
     assert out["groom"]["launched"] and not called
 
@@ -879,15 +891,15 @@ def test_decide_only_single_tier_returns_one_launch(monkeypatch):
                        "issue_filter": "mid-only", "schedule": "0 7 * * *",
                        "decide_only": True}, None)
     d = out["decide"]
-    assert d["launches"] == [{"model": "claude-sonnet-5", "issue_filter": "mid-only"}]
+    assert d["launches"] == [{"model": "deepseek-v4-flash", "issue_filter": "mid-only"}]
     assert idx._test_ssm.sent == []
 
 
 def test_decide_only_ungated_direct_dispatch(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
-    out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
+    out = idx.handler({"run_mode": "full", "model": "deepseek-v4-flash",
                        "issue_filter": "gated-reverify", "decide_only": True}, None)
-    assert out["decide"]["launches"] == [{"model": "claude-haiku-4-5",
+    assert out["decide"]["launches"] == [{"model": "deepseek-v4-flash",
                                           "issue_filter": "gated-reverify"}]
     assert idx._test_ssm.sent == []
 
@@ -895,7 +907,7 @@ def test_decide_only_ungated_direct_dispatch(monkeypatch):
 def test_decide_only_demand_gate_skip_shape(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     _stub_stats(monkeypatch, idx, {"low": 3, "mid": 40, "high": 2})
-    out = idx.handler({"run_mode": "full", "model": "claude-haiku-4-5",
+    out = idx.handler({"run_mode": "full", "model": "deepseek-v4-flash",
                        "issue_filter": "low-only", "schedule": "0 19 * * *",
                        "decide_only": True}, None)
     d = out["decide"]
@@ -923,15 +935,15 @@ def test_launch_decided_launches_exactly_the_given_decision(monkeypatch):
                         lambda token: (_ for _ in ()).throw(
                             AssertionError("launch_decided must not re-enumerate")))
     out = idx.handler({
-        "run_mode": "full", "schedule": "0 1 * * *", "model": "claude-haiku-4-5",
+        "run_mode": "full", "schedule": "0 1 * * *", "model": "deepseek-v4-flash",
         "issue_filter": "low-only",
         "launch_decided": True,
     }, None)
     g = out["groom"]
     assert g["launched"] is True
-    assert g["model"] == "claude-haiku-4-5" and g["issue_filter"] == "low-only"
+    assert g["model"] == "deepseek-v4-flash" and g["issue_filter"] == "low-only"
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
-    assert "export GROOM_MODEL=claude-haiku-4-5" in cmd
+    assert "export GROOM_MODEL=deepseek-v4-flash" in cmd
     assert "export GROOM_ISSUE_FILTER=low-only" in cmd
 
 
@@ -956,7 +968,7 @@ def test_launch_decided_launches_regardless_of_recorded_usage(monkeypatch):
 
 
 _SWEEP_SF_EVENT = {
-    "run_mode": "sweep", "launch_decided": True, "model": "claude-haiku-4-5",
+    "run_mode": "sweep", "launch_decided": True, "model": "deepseek-v4-flash",
     "issue_filter": "mid-only", "schedule": "end-of-sf-sweep",
 }
 
@@ -971,10 +983,10 @@ def test_sweep_launch_decided_launches_haiku_sweep_box(monkeypatch):
     g = out["groom"]
     assert g["launched"] is True
     assert g["run_mode"] == "sweep"
-    assert g["model"] == "claude-haiku-4-5"
+    assert g["model"] == "deepseek-v4-flash"
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
     assert "groom_spot_bootstrap.sh --mode sweep" in cmd
-    assert "export GROOM_MODEL=claude-haiku-4-5" in cmd
+    assert "export GROOM_MODEL=deepseek-v4-flash" in cmd
 
 
 def test_sweep_box_tagged_with_distinct_sweep_lane(monkeypatch):
@@ -1063,7 +1075,7 @@ def test_sweep_launch_writes_decision_record(monkeypatch):
     assert doc["run_mode"] == "sweep"
     assert doc["trigger"] == "launch_decided"
     assert doc["decisions"] == [{
-        "launch": True, "issue_filter": "mid-only", "model": "claude-haiku-4-5",
+        "launch": True, "issue_filter": "mid-only", "model": "deepseek-v4-flash",
         "reason": "launch_decided", "tier_tag": "sweep",
     }]
     assert "decided_at" in doc
@@ -1135,52 +1147,43 @@ def test_launch_decided_never_exports_partition_envs(monkeypatch):
     assert "GROOM_NO_SWEEP" not in cmd
 
 
-# ── config#2038: engagement lookback + disposition set must come from the lib ──
+# ── config#2146: fresh-skip retirement — ge.is_actionable alone gates entry ──
 
 
-def test_load_recent_engagements_uses_lib_lookback_window(monkeypatch):
-    """A run artifact just inside ge.ENGAGEMENT_LOOKBACK_DAYS ago must be
-    picked up — this would be dropped by the old hardcoded range(3) whenever
-    the lib's lookback is > 3 (config#2038's actual drift: 4 vs 3)."""
-    from datetime import datetime, timedelta
-    from zoneinfo import ZoneInfo
-
-    import nousergon_lib.groom_eligibility as ge
-
-    now = datetime.now(ZoneInfo("UTC"))
-    farthest = now - timedelta(days=ge.ENGAGEMENT_LOOKBACK_DAYS - 1)
+def test_enumerate_tier_stats_fresh_no_longer_engagement_gated(monkeypatch):
+    """config#2146: a recently-touched issue is no longer excluded/deflated —
+    the 72h fresh-skip cooldown ge.fresh_skip_active used to apply here is
+    retired, and disposition-structural eligibility (ge.is_actionable) is
+    the ONLY gate left. A same-day S3 run artifact records a ``commented``
+    engagement on an issue that is ALSO still open with a mid-tier label; it
+    must still be counted (there is no engagement-horizon lookup left at
+    all — ``_load_recent_engagements`` no longer exists)."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    now = datetime.now(timezone.utc)
     art = json.dumps({
-        "run_start": farthest.isoformat().replace("+00:00", "Z"),
-        "elapsed_min": 5,
+        "run_start": now.isoformat().replace("+00:00", "Z"), "elapsed_min": 5,
         "issues": [{"repo": "nousergon/alpha-engine-config", "number": 999,
                     "disposition": "commented"}],
     }).encode()
-    key = f"groom/{farthest.strftime('%Y-%m-%d')}/run1.json"
-    idx = _load(monkeypatch, s3_objects={key: art})
-    engagements = idx._load_recent_engagements()
-    assert ("nousergon/alpha-engine-config", 999) in engagements
-
-
-def test_load_recent_engagements_uses_lib_engaged_dispositions(monkeypatch):
-    """A "labeled" disposition (config#1928/#1890 — label-only edits are the
-    NORM for blocked dispositions) must count as engaged — this comes from
-    ge.ENGAGED_DISPOSITIONS, not a local hardcoded tuple that could drift."""
-    from datetime import datetime, timezone
-
-    import nousergon_lib.groom_eligibility as ge
-
-    assert "labeled" in ge.ENGAGED_DISPOSITIONS
-    now = datetime.now(timezone.utc)
-    art = json.dumps({
-        "run_start": now.isoformat().replace("+00:00", "Z"),
-        "elapsed_min": 5,
-        "issues": [{"repo": "nousergon/alpha-engine-config", "number": 998,
-                    "disposition": "labeled"}],
-    }).encode()
     key = f"groom/{now.strftime('%Y-%m-%d')}/run1.json"
-    idx = _load(monkeypatch, s3_objects={key: art})
-    engagements = idx._load_recent_engagements()
-    assert ("nousergon/alpha-engine-config", 998) in engagements
+    idx._test_s3._objects[key] = art
+    recently_updated = now.isoformat().replace("+00:00", "Z")
+
+    def fake_urlopen(req, timeout=30):
+        url = req.full_url
+        if ("/repos/nousergon/alpha-engine-config/issues?state=open&per_page="
+                in url and "page=1" in url):
+            return _FakeHTTPResponse(json.dumps([
+                {"number": 999, "labels": [{"name": "complexity:mid"}],
+                 "updated_at": recently_updated},
+            ]).encode())
+        return _FakeHTTPResponse(b"[]")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(idx, "_enumerate_ruling_pending_prs", lambda token: [])
+    counts, _oldest, _p0, tier_issues = idx._enumerate_tier_stats_fresh("tok")
+    assert counts["mid"] == 1
+    assert tier_issues["mid"][0]["number"] == 999
 
 
 # ── config#2152: queue manifests (observer phase) ───────────────────────────────
@@ -1238,7 +1241,7 @@ def test_skipped_tier_gets_no_manifest(monkeypatch):
 def test_manifest_key_reaches_bootstrap_env(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler({"run_mode": "full", "schedule": "manual",
-                       "model": "claude-haiku-4-5", "issue_filter": "low-only",
+                       "model": "deepseek-v4-flash", "issue_filter": "low-only",
                        "queue_manifest_key": "groom/queues/drain/2026-07-10-low.json"}, None)
     assert out["groom"]["launched"]
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
@@ -1248,7 +1251,7 @@ def test_manifest_key_reaches_bootstrap_env(monkeypatch):
 def test_no_manifest_key_no_export(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     out = idx.handler({"run_mode": "full", "schedule": "manual", "force_on_demand": True,
-                       "model": "claude-haiku-4-5", "issue_filter": "low-only"}, None)
+                       "model": "deepseek-v4-flash", "issue_filter": "low-only"}, None)
     assert out["groom"]["launched"]
     assert "GROOM_QUEUE_MANIFEST_KEY" not in idx._test_ssm.sent[0]["Parameters"]["commands"][0]
 
@@ -1258,7 +1261,7 @@ def test_malformed_manifest_key_fails_loud(monkeypatch):
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     with pytest.raises(ValueError, match="invalid queue_manifest_key"):
         idx.handler({"run_mode": "full", "schedule": "manual",
-                     "model": "claude-haiku-4-5", "issue_filter": "low-only",
+                     "model": "deepseek-v4-flash", "issue_filter": "low-only",
                      "queue_manifest_key": "groom/x; rm -rf /"}, None)
 
 
@@ -1281,7 +1284,7 @@ def test_manifest_key_skips_single_tier_demand_gate_and_launches_spot(monkeypatc
     monkeypatch.setattr(idx, "_enumerate_tier_stats",
                         lambda token: enumerated.append(1) or ({}, {}, False))
     out = idx.handler({"run_mode": "full", "schedule": "manual",
-                       "model": "claude-haiku-4-5", "issue_filter": "low-only",
+                       "model": "deepseek-v4-flash", "issue_filter": "low-only",
                        "queue_manifest_key": "groom/queues/drain/2026-07-10-low.json"}, None)
     g = out["groom"]
     assert g["launched"] is True
@@ -1323,7 +1326,7 @@ def test_manifest_key_launches_regardless_of_recorded_usage(monkeypatch):
                 s3_objects={"claude_code_usage/groom/2026-07-13.json":
                             _wet_doc(0.5 * 1_140_000_000)})
     out = idx.handler({"run_mode": "full", "schedule": "manual",
-                       "model": "claude-haiku-4-5", "issue_filter": "low-only",
+                       "model": "deepseek-v4-flash", "issue_filter": "low-only",
                        "queue_manifest_key": "groom/queues/drain/2026-07-10-low.json"}, None)
     assert out["groom"]["launched"] is True
     assert len(idx._test_ssm.sent) == 1
@@ -1657,7 +1660,10 @@ def test_demand_all_launches_from_ruling_pending_prs_alone_at_floor(monkeypatch)
     assert idx._test_ssm.sent, "a real spot box must have been dispatched"
 
 
-def test_demand_all_ruling_pending_prs_below_floor_fresh_no_launch(monkeypatch):
+def test_demand_all_ruling_pending_prs_launch_when_any_present(monkeypatch):
+    # groom-primary-deepseek (v0.124.15): unconditional per-tier launch —
+    # a single ruling:pending-exec PR with complexity:mid, zero issues,
+    # still launches (1 > 0).
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     monkeypatch.setattr(idx, "_github_token", lambda: "tok")
     monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_empty_issue_pages)
@@ -1666,15 +1672,16 @@ def test_demand_all_ruling_pending_prs_below_floor_fresh_no_launch(monkeypatch):
     pr["repo"] = "nousergon/nousergon-data"
     monkeypatch.setattr(idx, "_enumerate_ruling_pending_prs", lambda token: [pr])
     out = idx.handler(_demand_event(), None)
-    assert out["groom"]["launches"] == []
-    assert not idx._test_ssm.sent
+    launches = out["groom"]["launches"]
+    assert len(launches) == 1
+    assert launches[0]["issue_filter"] == "mid-only"
+    assert idx._test_ssm.sent
 
 
-def test_demand_all_stale_ruling_pending_pr_fires_escape_valve(monkeypatch):
-    # A single ruled PR, zero issues, well below the floor — but its
-    # updated_at is far past DEFAULT_MAX_WAIT_HOURS (72h), so it must fire
-    # the anti-starvation escape valve exactly like an overdue actionable
-    # issue would (config-I3227 acceptance criteria).
+def test_demand_all_ruling_pending_pr_launches_unconditionally(monkeypatch):
+    # groom-primary-deepseek (v0.124.15): unconditional per-tier launch —
+    # escape valves and staleness thresholds are retired; any positive
+    # count launches regardless of age or floor.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     monkeypatch.setattr(idx, "_github_token", lambda: "tok")
     monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_empty_issue_pages)
@@ -1899,19 +1906,22 @@ def test_primary_backend_armed_pure_mid_bundle_routes_deepseek(monkeypatch):
     assert mid_entry["backend"] == "deepseek"
 
 
-def test_primary_backend_armed_low_plus_mid_bundle_routes_deepseek(monkeypatch):
-    # Thin-pool bundling (no standalone high): 5 low + 6 mid + 0 high -> ONE
-    # "mid+low" bundle. Every tier in the bundle qualifies -> deepseek.
+def test_primary_backend_armed_low_and_mid_separate_boxes_deepseek(monkeypatch):
+    # groom-primary-deepseek (v0.124.15): no bundling — low=5 → low-only box,
+    # mid=6 → mid-only box, both on DeepSeek since both tiers are armed.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true",
                                   "GROOM_PRIMARY_DEEPSEEK_TIERS": "low,mid"})
     _stub_fresh_stats(monkeypatch, idx, {"low": 5, "mid": 6, "high": 0})
     out = idx.handler(_demand_event(), None)
     ls = out["groom"]["launches"]
-    assert len(ls) == 1 and ls[0]["issue_filter"] == "mid+low"
-    assert ls[0]["backend"] == "deepseek"
-    assert out["groom"]["decisions"][0]["backend"] == "deepseek"
-    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
-    assert "export GROOM_BACKEND=deepseek" in cmd
+    assert len(ls) == 2
+    issue_filters = {l["issue_filter"] for l in ls}
+    assert issue_filters == {"low-only", "mid-only"}
+    for l in ls:
+        assert l["backend"] == "deepseek"
+    assert {d["issue_filter"] for d in out["groom"]["decisions"]} == {"low-only", "mid-only"}
+    for cmd in (s["Parameters"]["commands"][0] for s in idx._test_ssm.sent):
+        assert "export GROOM_BACKEND=deepseek" in cmd
 
 
 def test_primary_backend_armed_high_only_bundle_stays_claude(monkeypatch):
@@ -1930,20 +1940,19 @@ def test_primary_backend_armed_high_only_bundle_stays_claude(monkeypatch):
     assert "GROOM_BACKEND" not in high_cmd
 
 
-def test_primary_backend_armed_high_plus_mid_bundle_stays_claude(monkeypatch):
-    # config#2409 attach-upward: mid (thin) rides UP into high's standalone
-    # run when there's no standalone mid run of its own -> tiers=(mid, high).
-    # mid alone WOULD qualify for DeepSeek, but any-high blocks the whole
-    # bundle — one box, one provider, high stays on the Max plan by ruling.
+def test_primary_backend_armed_high_stays_claude_mid_goes_deepseek(monkeypatch):
+    # groom-primary-deepseek (v0.124.15): every tier launches independently.
+    # mid=3 → its own DeepSeek box (mid in GROOM_PRIMARY_DEEPSEEK_TIERS).
+    # high=10 → its own Claude box (high NOT in GROOM_PRIMARY_DEEPSEEK_TIERS).
+    # No attach-upward bundling — each tier is a separate launch.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true",
                                   "GROOM_PRIMARY_DEEPSEEK_TIERS": "low,mid"})
     _stub_fresh_stats(monkeypatch, idx, {"low": 8, "mid": 3, "high": 10})
     out = idx.handler(_demand_event(), None)
-    bundle = next(e for e in out["groom"]["launches"] if e["issue_filter"] == "high+mid")
-    assert "backend" not in bundle
-    bundle_decision = next(d for d in out["groom"]["decisions"] if d["issue_filter"] == "high+mid")
-    assert "backend" not in bundle_decision
-    # The separate low-only standalone run in the SAME trigger DOES qualify.
+    high_entry = next(e for e in out["groom"]["launches"] if e["issue_filter"] == "high-only")
+    assert "backend" not in high_entry
+    mid_entry = next(e for e in out["groom"]["launches"] if e["issue_filter"] == "mid-only")
+    assert mid_entry["backend"] == "deepseek"
     low_entry = next(e for e in out["groom"]["launches"] if e["issue_filter"] == "low-only")
     assert low_entry["backend"] == "deepseek"
 
@@ -1972,7 +1981,7 @@ def test_decide_only_single_tier_includes_backend_when_armed(monkeypatch):
                        "issue_filter": "mid-only", "schedule": "0 7 * * *",
                        "decide_only": True}, None)
     assert out["decide"]["launches"] == [
-        {"model": "claude-sonnet-5", "issue_filter": "mid-only", "backend": "deepseek"}
+        {"model": "deepseek-v4-flash", "issue_filter": "mid-only", "backend": "deepseek"}
     ]
     assert idx._test_ssm.sent == []
 
