@@ -2054,7 +2054,7 @@
               "Resource": "arn:aws:states:::sns:publish",
               "Parameters": {
                 "TopicArn.$": "$.sns_topic_arn",
-                "Subject.$": "States.Format('Alpha Engine Saturday{} Pipeline — Branch A FAILED (early signal — SF will fail at join)', $.pipeline_label)",
+                "Subject.$": "States.Format('Alpha Engine Saturday{} Pipeline — Branch A FAILED (early signal)', $.pipeline_label)",
                 "Message.$": "States.Format('Branch A (RAGIngestion or SignalsEnvelope) hard-failed inside ResearchPredictorParallel. The sibling PredictorTraining branch is still running and will complete its own work; the SF will fail at the parallel-join aggregation via CheckBranchOutcomes once both branches terminate. This is an EARLY-SIGNAL alert so you do not have to wait for the join. Error: {}', States.JsonToString($.error))"
               },
               "ResultPath": null,
@@ -2351,7 +2351,7 @@
               "Resource": "arn:aws:states:::sns:publish",
               "Parameters": {
                 "TopicArn.$": "$.sns_topic_arn",
-                "Subject.$": "States.Format('Alpha Engine Saturday{} Pipeline — PredictorTraining FAILED (early signal — SF will fail at join)', $.pipeline_label)",
+                "Subject.$": "States.Format('Alpha Engine Saturday{} Pipeline — PredictorTraining FAILED (early signal)', $.pipeline_label)",
                 "Message.$": "States.Format('PredictorTraining branch failed inside ResearchPredictorParallel. The sibling Research branch is still running and will complete its eval-judge / RollingMean / Counterfactual work independently; the SF will fail at the parallel-join aggregation via CheckBranchOutcomes once both branches terminate. This is an EARLY-SIGNAL alert so you do not have to wait for the join. Error: {}', States.JsonToString($.error))"
               },
               "ResultPath": null,
@@ -2834,7 +2834,7 @@
               "Resource": "arn:aws:states:::sns:publish",
               "Parameters": {
                 "TopicArn.$": "$.sns_topic_arn",
-                "Subject.$": "States.Format('Alpha Engine Saturday{} Pipeline — ModelZooRotation FAILED (zoo digest email may be missing)', $.pipeline_label)",
+                "Subject.$": "States.Format('Alpha Engine Saturday{} Pipeline — ModelZooRotation FAILED (zoo digest may be missing)', $.pipeline_label)",
                 "Message.$": "States.Format('The model-zoo rotation failed or timed out. The base champion-arch retrain already trained+promoted and DEFERRED its training email to the zoo digest (PREDICTOR_DEFER_TRAINING_EMAIL=1), so the consolidated digest email may NOT have been sent for this run — review predictor-model-zoo.log on the spot and predictor/model_zoo/leaderboard/. The branch will still complete (the champion is live); the rotation is best-effort. Error: {}', States.JsonToString($.model_zoo_error))"
               },
               "ResultPath": null,
