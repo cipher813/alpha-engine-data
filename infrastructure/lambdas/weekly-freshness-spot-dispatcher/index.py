@@ -264,6 +264,18 @@ git clone --depth 1 --branch {DASHBOARD_BRANCH} \\
 chown -R ec2-user:ec2-user /home/ec2-user/alpha-engine-data /home/ec2-user/alpha-engine-config \\
   /home/ec2-user/alpha-engine-backtester /home/ec2-user/alpha-engine-dashboard \\
   /home/ec2-user/alpha-engine-predictor || fail "chown failed"
+# crucible-backtester's config.yaml is gitignored (the .example pattern), and
+# spot_backtest.sh hard-exits without it: "ERROR: config.yaml not found".
+# The canonical provisioning is a symlink into alpha-engine-config's TRACKED
+# backtester/config.yaml -- the same shape the long-lived dashboard box has
+# carried by hand since 2026-04-11, and the shape spot_backtest.sh's own
+# pre-launch check expects (it warns when the target is NOT inside a git repo,
+# because operator flags outside version control have no audit trail).
+# Without this, every backtest-family stage dies on a freshly-built box.
+echo "[weekly-freshness-spot-bootstrap] linking backtester config.yaml..."
+ln -sfn /home/ec2-user/alpha-engine-config/backtester/config.yaml \\
+  /home/ec2-user/alpha-engine-backtester/config.yaml || fail "config.yaml symlink failed"
+chown -h ec2-user:ec2-user /home/ec2-user/alpha-engine-backtester/config.yaml || fail "config.yaml chown failed"
 echo "[weekly-freshness-spot-bootstrap] building alpha-engine-dashboard venv..."
 cd /home/ec2-user/alpha-engine-dashboard
 "$PYTHON_BIN" -m venv .venv || fail "venv create failed"
