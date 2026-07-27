@@ -353,6 +353,38 @@ def _resolve_soft_limit_min(event: dict) -> int | None:
     return n
 
 
+def _task_token(event: dict) -> str:
+    """The SF task token for this ``launch_decided`` invocation, or "".
+
+    config-I4333: the token arrives INSIDE the Lambda ``Payload``, under the key
+    ``Token``. The SF merges the context object's ``$$.Task`` — literally
+    ``{"Token": "..."}`` — into the payload's existing wholesale
+    ``States.JsonMerge``, so the key name is the context object's own, and no
+    string-building or escaping is involved. Three earlier attempts got this
+    wrong and none could ever have worked:
+
+      * a top-level ``TaskToken`` sibling of ``Payload`` in the SF
+        ``Parameters`` — rejected by Step Functions at RUNTIME (not by
+        ``validate-state-machine-definition``, which returned OK), since
+        ``TaskToken`` is not a field of the Lambda Invoke API:
+        "The field \"TaskToken\" is not supported by Step Functions".
+      * ``getattr(getattr(context, "task", None), "token", "")`` — a Python
+        Lambda ``context`` has no ``task`` attribute, so this silently
+        returned "" on every invocation and the ""-is-legitimate fallback
+        masked it.
+      * building the key with ``States.Format('{{"task_token":"{}"}}', ...)``
+        — ``States.Format`` cannot emit a literal brace by doubling OR by
+        backslash-escaping; both forms fail with "matching '}' not found".
+        Verified against the live TestState API, not assumed.
+
+    An absent token is legitimate (manual invoke, sweep dispatch), so "" is a
+    valid result — but it means no callback will be sent, and the SF then
+    depends on its timeout path.
+    """
+    raw = event.get("Token")
+    return str(raw).strip() if raw else ""
+
+
 def _resolve_launch_decided_backend(event: dict) -> str:
     """Validate the ``backend`` threaded through a ``launch_decided`` SF
     invocation (PRIMARY-mode DeepSeek selection, alpha-engine-config-I3479)
@@ -1553,7 +1585,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             force_on_demand,
             queue_manifest_key=queue_manifest_key,
             backend=_resolve_launch_decided_backend(event),
-            task_token=event.get("taskToken", ""),
+            task_token=_task_token(event),
         )
         # demand-all path did (_write_trigger_record/_write_skip_record),
         # leaving sweep-mode (and any other launch_decided) dispatches with
@@ -1562,7 +1594,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         # launched (concurrent skip, kill-switch), call send-task-success with
         # launched:false so the SF doesn't wait 6h for a callback that will never
         # come. The box handles the launched:true callback itself in its finish() trap.
-        task_token = event.get("taskToken", "")
+        task_token = _task_token(event)
         if task_token and not result.get("launched"):
             try:
                 boto3.client("stepfunctions", region_name=REGION).send_task_success(

@@ -40,8 +40,8 @@
           "kill_switch_env": { "type": "string", "pattern": "^[A-Z0-9_]+$" },
           "model": {
             "type": "string",
-            "pattern": "^claude-[a-z0-9.-]+$",
-            "description": "config-I3293 — the Claude model this playbook's agent runs. LIVE config, not documentation: the overseer-dispatcher injects it into the executor payload as `model`; executors thread it to the run script. The run script's inline default is the fallback only for non-router invocation paths. Required (via registry test, not schema) on every routed playbook whose executor launches a claude-CLI agent."
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+            "description": "config-I3293 — the model this playbook's agent runs (provider-agnostic since alpha-engine-config-I4478; was claude-only, which could not express the fleet's DeepSeek-primary policy). LIVE config, not documentation: the overseer-dispatcher injects it into the executor payload as `model`; executors thread it to the run script. The run script's inline default is the fallback only for non-router invocation paths. Required (via registry test, not schema) on every routed playbook whose executor launches a claude-CLI agent."
           },
           "wake": {
             "type": "array",
