@@ -289,10 +289,20 @@ def test_every_routed_playbook_declares_model_wake_cadence():
     for name, spec in REGISTRY["playbooks"].items():
         if not spec.get("routed"):
             continue
-        assert spec.get("model", "").startswith("claude-"), (
+        assert spec.get("model"), (
             f"routed playbook {name!r} missing a registry-declared model "
             f"(config-I3293) — the run script's inline default would silently "
             f"become undeclared live config"
+        )
+        # alpha-engine-config-I4478: was `.startswith("claude-")`. That, the
+        # schema pattern, and each executor's `_MODEL_RE` all independently
+        # hardcoded Anthropic — four layers making it structurally impossible
+        # for the registry (the declared SSoT for "what model runs this agent")
+        # to express the fleet's own 2026-07-24 zero-Anthropic-model ruling.
+        assert not spec["model"].startswith(("claude-", "anthropic")), (
+            f"routed playbook {name!r} declares Anthropic model "
+            f"{spec['model']!r} — forbidden fleet-wide by the 2026-07-24 ruling "
+            f"(nous-ergon-ops/policies/llm-provider-model-policy.md)"
         )
         assert spec.get("wake"), f"routed playbook {name!r} missing wake declaration"
         assert spec.get("cadence"), f"routed playbook {name!r} missing cadence declaration"
@@ -397,3 +407,32 @@ def test_known_bus_sources_have_rows():
                   "alpha-engine-backtester/optimizer/live_key_reconciliation.py",
                   "cloudwatch-alarm:*"):
         assert known in sources, f"known emitter {known!r} has no alert-class row"
+
+
+def test_registry_model_passes_its_executor_validator():
+    """LOCKSTEP: every routed playbook's declared `model` must actually be
+    accepted by the executor Lambda that receives it.
+
+    alpha-engine-config-I4478/I4516: the registry declared `claude-*` models
+    while the run scripts had migrated to DeepSeek, and each executor's
+    `_MODEL_RE` accepted ONLY `claude-*`. Nothing tied the three together, so
+    the drift was invisible until an agent died on a spot box at 04:00 UTC.
+    This test makes that class of drift a CI failure instead.
+    """
+    checked = 0
+    for name, spec in REGISTRY["playbooks"].items():
+        if not spec.get("routed") or not spec.get("model"):
+            continue
+        exec_dir = spec.get("executor_lambda_dir")
+        assert exec_dir, f"routed playbook {name!r} has no executor_lambda_dir"
+        src = (LAMBDAS_DIR / exec_dir / "index.py").read_text(encoding="utf-8")
+        m = re.search(r'_MODEL_RE\s*=\s*re\.compile\(r"([^"]+)"\)', src)
+        assert m, f"{exec_dir}/index.py has no _MODEL_RE to validate against"
+        assert re.compile(m.group(1)).match(spec["model"]), (
+            f"registry declares model {spec['model']!r} for playbook {name!r}, "
+            f"but {exec_dir}'s _MODEL_RE ({m.group(1)!r}) REJECTS it — the "
+            f"router would inject a value the executor refuses, and the agent "
+            f"never launches"
+        )
+        checked += 1
+    assert checked >= 3, f"expected >=3 routed playbooks with models, checked {checked}"

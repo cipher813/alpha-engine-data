@@ -38,7 +38,7 @@ playbooks:
     # overseer-dispatcher injects it into the executor payload and the
     # executor threads it to the run script's `--model`; the run script's
     # inline default is the fallback ONLY for non-router invocation paths.
-    model: claude-opus-4-8
+    model: deepseek-v4-pro
     wake:
       - "eventbridge:alpha-engine-saturday-sf-watch-failed (fleet SF terminal failure -> triage Lambda -> router, M2)"
       - "eventbridge:alpha-engine-sf-watch-spot-interruption + alpha-engine-sf-watch-instance-terminated (reclaim/relaunch)"
@@ -118,7 +118,7 @@ playbooks:
     tier: T2
     routed: true
     enabled: true
-    model: claude-opus-4-8   # config-I3293 — registry-declared, router-injected
+    model: deepseek-v4-pro   # config-I3293 — registry-declared, router-injected
     wake:
       - "gha:nousergon-lib notify-ci-failure.yml -> repository_dispatch -> sf-watch.yml ci-watch-dispatch job -> this router (main-branch CI failure)"
     cadence: "event-driven only — no scheduled wake (deprecation to drain intake tracked: config-I2845)"
@@ -154,7 +154,7 @@ playbooks:
     tier: T2
     routed: true
     enabled: true
-    model: claude-sonnet-5   # config-I3293 — registry-declared, router-injected; charter may spawn complexity-matched sub-agents (Brian ruling 2026-07-22)
+    model: deepseek-v4-pro-max   # config-I3293 — registry-declared, router-injected; charter may spawn complexity-matched sub-agents (Brian ruling 2026-07-22)
     wake:
       - "scheduler:alpha-engine-alert-drain-0400utc/1000utc/1600utc/2200utc (4x-daily non-urgent queue drain, Brian ruling 2026-07-22)"
       - "event-time: freshness-monitor CRITICAL page -> router (trigger=freshness-critical, config-I3282)"
