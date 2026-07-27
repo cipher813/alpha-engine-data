@@ -276,6 +276,49 @@ def test_watch_plane_covers_all_four_router_scheduler_schedules():
     }
 
 
+# ── Cadence-based liveness coverage (alpha-engine-config#4474) ──────────────
+
+
+_EVENT_DRIVEN_PATTERNS = ("event-driven only", "no scheduled wake")
+
+
+def test_every_cadenced_playbook_has_run_window_or_invocation_success():
+    """alpha-engine-config#4474: Every playbook with a scheduled (non-event-
+    driven) cadence MUST declare either a ``run_window`` liveness check or
+    an ``sf_watch_invocation_success`` check. A cadenced trigger with no
+    artifact-accounting check means a silent death is invisible — exactly
+    the wiring-vs-invocation gap this queue already fixed for sf-watch
+    (I2901) and groom (config#2414/#2667) and is now generalizing.
+
+    ``cadence`` strings matching ``_EVENT_DRIVEN_PATTERNS`` are exempt: they
+    have no scheduled wake to miss. ``trigger_type: github_actions_cron``
+    entries are also exempt: they have no Lambda (the run_window check is
+    only meaningful for Lambda-backed entries)."""
+    for name, spec in REGISTRY["playbooks"].items():
+        cadence = spec.get("cadence", "")
+        if any(p in cadence for p in _EVENT_DRIVEN_PATTERNS):
+            continue  # event-driven only — no scheduled wake to miss
+        if spec.get("trigger_type") == "github_actions_cron":
+            continue  # GHA cron — no Lambda, no run_window/invocation check
+
+        liveness = spec.get("liveness")
+        assert liveness and liveness.get("checks"), (
+            f"playbook {name!r}: cadence {cadence!r} indicates a scheduled "
+            f"trigger but has no liveness block — add a run_window or "
+            f"sf_watch_invocation_success check so the probe can detect "
+            f"silent deaths"
+        )
+        check_types = {c["type"] for c in liveness["checks"]}
+        has_window = "run_window" in check_types
+        has_invocation = "sf_watch_invocation_success" in check_types
+        assert has_window or has_invocation, (
+            f"playbook {name!r}: cadence {cadence!r} requires either a "
+            f"run_window or sf_watch_invocation_success check in its "
+            f"liveness block — lambda_active alone cannot distinguish 'alive "
+            f"dispatcher' from 'working agent'"
+        )
+
+
 # ── model/wake/cadence declaration (config-I3293) ────────────────────────────
 
 

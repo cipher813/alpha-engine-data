@@ -1,0 +1,110 @@
+name: IAM Policy Change Guard
+
+# alpha-engine-config#4472: A PR touching any
+# infrastructure/lambdas/<name>/iam-policy.json must ALSO touch that
+# Lambda's deploy.sh, OR carry a `gate:operator` label naming a tracked
+# operator-apply issue. Without this guard, an iam-policy.json edit merges
+# silently with no live effect — the component is silently disarmed.
+#
+# Merging such a change without applying it is the exact failure class
+# that caused the 2026-07-23 alpha-engine-config-I3508
+# (nousergon-data#1014) 4-day silent drain outage: the iam-policy.json
+# added a needed grant; no one ran `deploy.sh --apply-iam`; the component
+# 100% failed for 4 days with no report.
+
+on:
+  pull_request:
+    types: [opened, synchronize, labeled, unlabeled]
+    paths:
+      - 'infrastructure/lambdas/*/iam-policy.json'
+      - '.github/workflows/iam-policy-change-guard.yml'
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  guard:
+    name: Check IAM policy change has deploy path or gate label
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout merge commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0  # full history for the diff
+
+      - name: Check iam-policy.json changes have deploy.sh counterpart or gate:operator label
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Gather changed iam-policy.json files vs main
+          CHANGED_IAM=$(
+            git diff --name-only origin/main...HEAD \
+              | grep -E '^infrastructure/lambdas/[^/]+/iam-policy\.json$' \
+              || true
+          )
+
+          if [ -z "$CHANGED_IAM" ]; then
+            echo "✓ No iam-policy.json files changed — skipping."
+            exit 0
+          fi
+
+          echo "Changed iam-policy.json files:"
+          echo "$CHANGED_IAM"
+
+          # Gather changed deploy.sh files
+          CHANGED_DEPLOY=$(
+            git diff --name-only origin/main...HEAD \
+              | grep -E '^infrastructure/lambdas/[^/]+/deploy\.sh$' \
+              || true
+          )
+
+          # Check for gate:operator label (via gh CLI — works on all PR event types)
+          HAS_GATE_OPERATOR=false
+          PR_LABELS=$(gh pr view "${{ github.event.number }}" --repo "${{ github.repository }}" \
+            --json labels --jq '.labels[].name' 2>/dev/null || true)
+          if echo "$PR_LABELS" | grep -qxF 'gate:operator'; then
+            HAS_GATE_OPERATOR=true
+          fi
+
+          FAILED=""
+          ORIGIN_PREFIX="infrastructure/lambdas/"
+
+          for iam_file in $CHANGED_IAM; do
+            LAMBDA_DIR="${iam_file#${ORIGIN_PREFIX}}"
+            LAMBDA_DIR="${LAMBDA_DIR%%/*}"
+            EXPECTED_DEPLOY="${ORIGIN_PREFIX}${LAMBDA_DIR}/deploy.sh"
+
+            if echo "$CHANGED_DEPLOY" | grep -qxF "$EXPECTED_DEPLOY"; then
+              echo "✓ ${LAMBDA_DIR}: iam-policy.json change paired with deploy.sh change"
+              continue
+            fi
+
+            if [ "$HAS_GATE_OPERATOR" = "true" ]; then
+              echo "✓ ${LAMBDA_DIR}: iam-policy.json change carries gate:operator label"
+              continue
+            fi
+
+            echo "❌ ${LAMBDA_DIR}: iam-policy.json changed but deploy.sh NOT changed and no gate:operator label"
+            FAILED="$FAILED ${LAMBDA_DIR}"
+          done
+
+          if [ -n "$FAILED" ]; then
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "VIOLATION: iam-policy.json changed without deploy.sh change or gate:operator label"
+            echo "Affected lambdas:${FAILED}"
+            echo ""
+            echo "Fix: also update the corresponding deploy.sh to handle the IAM change,"
+            echo "or add a 'gate:operator' label with a named tracked issue for operator apply."
+            echo "See alpha-engine-config#4472 for the policy rationale."
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            exit 1
+          fi
+
+          echo ""
+          echo "✓ All iam-policy.json changes have deploy.sh counterpart or gate:operator label."

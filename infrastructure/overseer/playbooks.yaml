@@ -171,11 +171,34 @@ playbooks:
     # The alert-drain executor's own liveness. Its intake queue + the two
     # intake EventBridge rules are cross-cutting infra, checked under the
     # top-level watch_plane_liveness block below.
+    #
+    # alpha-engine-config#4474: run-window accounting. `lambda_active` above
+    # passes while every single drain run crashes — the dispatcher IS active
+    # and correctly wired; the agent it launches dies. This check asserts
+    # the drain LEDGER (overseer/drain_ledger/) was written within the
+    # MAX_RUNTIME window of each cadenced trigger — the ledger only exists
+    # if a charter actually ran, distinguishing "alive dispatcher" from
+    # "working drain." The completion marker (overseer/_control/completed/)
+    # is NOT used here: the drain writes it even on rc=1 (the finish() trap),
+    # so a crashing drain looks alive if keyed on the marker.
+    # The `ceiling_min` matches alert_drain_spot_bootstrap.sh
+    # MAX_RUNTIME_SECONDS (10800) divided by 60, plus boot overhead.
     liveness:
       checks:
         - type: lambda_active
           function: alpha-engine-alert-drain-dispatcher
           report_kill_switch: ALERT_DRAIN_DISPATCH_ENABLED
+        - type: run_window
+          label: alert-drain
+          artifact_prefix: overseer/drain_ledger/
+          ceiling_min: 180
+          margin_min: 30
+          lookback_hours: 18
+          schedule:
+            - {hour: 4, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "04:00 UTC"}
+            - {hour: 10, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "10:00 UTC"}
+            - {hour: 16, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "16:00 UTC"}
+            - {hour: 22, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "22:00 UTC"}
 
   groom:
     description: >-
@@ -276,6 +299,25 @@ playbooks:
     routed: false
     enabled: true
     executor_function: alpha-engine-canary-replay-dispatcher
+    # alpha-engine-config#4474: run-window liveness accounting. The dedicated
+    # canary-replay-liveness-probe sibling Lambda ticks every 15min and provides
+    # per-invocation health; this registry-level run_window is an additional
+    # backstop asserting that a completion marker exists for each scheduled
+    # trigger (Wednesday drills + Thursday weekly canary). The marker prefix
+    # is tmp/canary/ (written by canary_replay_spot_bootstrap.sh even on probe
+    # failure, so only missing markers = completely skipped launch = problem).
+    liveness:
+      checks:
+        - type: run_window
+          label: canary-replay
+          artifact_prefix: tmp/canary/
+          ceiling_min: 120
+          margin_min: 60
+          lookback_hours: 240
+          schedule:
+            - {hour: 15, minute: 0, dows: [3], label: "Wednesday sf-watch canary drill"}
+            - {hour: 15, minute: 30, dows: [3], label: "Wednesday ci-watch canary drill"}
+            - {hour: 9, minute: 0, dows: [4], label: "Thursday weekly canary replay"}
     wake:
       - "scheduler:alpha-engine-ci-watch-canary-drill-weekly + alpha-engine-sf-watch-canary-drill-weekly (Wednesday drills; router re-point tracked config-I2832)"
     cadence: "weekly Wednesday drills; liveness tick every 15min (eventbridge:alpha-engine-canary-replay-liveness-probe-tick)"
