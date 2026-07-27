@@ -316,6 +316,51 @@ def test_drain_wake_names_all_four_schedules():
         )
 
 
+# ── Cadence → liveness coverage (config#4474) ─────────────────────────────────
+# Every playbook with a non-event-driven cadence (scheduled wake, not strictly
+# event-driven) MUST declare a run_window check, an sf_watch_invocation_success
+# check, or a sibling_probe_function (a dedicated sibling Lambda that covers
+# the same freshness surface independently). This prevents the next playbook
+# from shipping with a silent-death failure mode like alert-drain had.
+
+
+def _cadence_is_event_driven(cadence: str) -> bool:
+    """Heuristic: a cadence starting with 'event-driven' is purely event-
+    driven (no scheduled wake) and needs no scheduled-run liveness check."""
+    return cadence.lower().startswith("event-driven")
+
+
+def test_every_cadenced_playbook_has_liveness_or_sibling_probe():
+    """config#4474: every playbook whose cadence mentions a scheduled wake
+    (not purely event-driven) must have either a run_window check, an
+    sf_watch_invocation_success check, or a sibling_probe_function that
+    documents alternative coverage — a scheduled playbook with no such check
+    is silent-death-prone by construction."""
+    for name, spec in REGISTRY["playbooks"].items():
+        cadence = spec.get("cadence", "")
+        if not cadence or _cadence_is_event_driven(cadence):
+            continue
+
+        # Check sibling probe exemption first.
+        if spec.get("sibling_probe_function"):
+            continue
+
+        liveness_checks = spec.get("liveness", {}).get("checks", [])
+        has_run_window = any(c.get("type") == "run_window" for c in liveness_checks)
+        has_invocation_success = any(
+            c.get("type") == "sf_watch_invocation_success" for c in liveness_checks
+        )
+
+        assert has_run_window or has_invocation_success, (
+            f"playbook {name!r} has a non-event-driven cadence "
+            f"({cadence!r}) but no run_window / sf_watch_invocation_success "
+            f"check in its liveness.checks, and no sibling_probe_function "
+            f"documenting alternative coverage — a scheduled playbook with "
+            f"no run-window or invocation-success check is silent-death-prone "
+            f"by construction (config#4474)"
+        )
+
+
 # ── alert-class registry (config-I3211) ──────────────────────────────────────
 
 
