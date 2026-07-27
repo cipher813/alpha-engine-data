@@ -76,8 +76,20 @@ def _make_clients(*, describe=None, history=None, existing=None, put=None):
     if put is not None:
         s3.put_object.side_effect = put
 
-    def factory(name, region_name=None):
-        return sf if name == "stepfunctions" else s3
+    # I4510: with M2_DISPATCH_TARGET defaulting to `overseer`, the dispatch path
+    # now calls boto3.client("lambda", region_name=..., config=...) and invokes
+    # the router. Accept **kwargs (the `config=` the real call passes) and hand
+    # back a lambda mock whose invoke reports a normal async 202 — otherwise
+    # every test silently took a TypeError down the error branch.
+    lam = MagicMock()
+    lam.invoke.return_value = {"StatusCode": 202}
+
+    def factory(name, region_name=None, **_kwargs):
+        if name == "stepfunctions":
+            return sf
+        if name == "lambda":
+            return lam
+        return s3
 
     return factory, sf, s3
 
