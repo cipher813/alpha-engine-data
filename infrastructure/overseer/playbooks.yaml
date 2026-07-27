@@ -171,6 +171,13 @@ playbooks:
     # The alert-drain executor's own liveness. Its intake queue + the two
     # intake EventBridge rules are cross-cutting infra, checked under the
     # top-level watch_plane_liveness block below.
+    #
+    # Run-window accounting (config#4474): for each MATURE expected trigger
+    # (the 4x-daily scheduler cadence below), assert an S3 drain-ledger
+    # artifact's run_start landed in [T, T+ceiling+margin]. Key on the LEDGER
+    # (overseer/drain_ledger/) rather than the completion marker
+    # (_control/completed/) — the marker is written even on rc=1 (a crashing
+    # drain looks alive), the ledger only by a charter that ran.
     liveness:
       checks:
         - type: lambda_active
@@ -317,6 +324,12 @@ playbooks:
       at-most-one-live-marker idempotency per ISO week / PR+sha).
     supports_drill: false
     kill_switch_env: CANARY_REPLAY_DISPATCH_ENABLED
+    # Liveness is covered by the dedicated canary-replay-liveness-probe sibling
+    # Lambda (its own wiring + schedule + tick cadence), NOT by the overseer's
+    # registry-driven liveness probe — this entry is inventory-only, so the
+    # run-window contract test below (config#4474) accepts this field as proof
+    # of alternative coverage instead of requiring a run_window check here.
+    sibling_probe_function: alpha-engine-canary-replay-liveness-probe
 
   arctic-migration:
     description: >-
