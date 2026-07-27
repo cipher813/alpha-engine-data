@@ -243,7 +243,13 @@ class TestModelInjection:
         sent = json.loads(lam.invoke.call_args.kwargs["Payload"])
         reg_model = index._registry()["playbooks"]["sf-watch"]["model"]
         assert sent["model"] == reg_model
-        assert reg_model.startswith("claude-")
+        # alpha-engine-config-I4478: was `startswith("claude-")`. The fleet runs
+        # NO Anthropic models and NO Claude Plan in the system (Brian ruling
+        # 2026-07-24, reaffirmed 2026-07-27) — assert the injected model is a
+        # real declared value and is not Anthropic, rather than pinning it to
+        # the vendor this arc is removing.
+        assert reg_model
+        assert not reg_model.startswith(("claude-", "anthropic"))
 
     def test_caller_model_override_wins(self, index_mod):
         index, fake_boto3 = index_mod

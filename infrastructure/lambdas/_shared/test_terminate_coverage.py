@@ -30,6 +30,11 @@ _EXPECTED_LAUNCHERS = frozenset(
         "canary-replay-dispatcher",
         "alert-drain-dispatcher",
         "arctic-migration-dispatcher",
+        # nousergon-data#975 — per-execution ephemeral dispatch box for the
+        # weekly SF, retiring the always-on dashboard-box target. Carries
+        # terminate-on-failure coverage plus a 13h InstanceInitiatedShutdown
+        # watchdog sized past the SF's own 12h TimeoutSeconds.
+        "weekly-freshness-spot-dispatcher",
     }
 )
 

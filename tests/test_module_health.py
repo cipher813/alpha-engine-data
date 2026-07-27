@@ -43,14 +43,19 @@ class TestWriteModuleHealth:
         assert payload["warnings"] == []
         assert payload["error"] is None
         assert payload["last_success"] is not None
-        assert payload["deliverables"] == [
-            {
-                "name": "daily_data",
-                "required": True,
-                "produced": True,
-                "detail": "",
-            }
-        ]
+        # Asserted field-by-field rather than as one exact-dict comparison:
+        # deliverable records come from nousergon_lib, whose schema grows by
+        # ADDING fields (the fleet's S3 schema rule — add, never rename or
+        # remove). v0.124.19 added `artifact_key`, which broke the previous
+        # exact-equality assertion on a change that is backwards-compatible by
+        # construction. Pinning the fields this repo actually depends on keeps
+        # the guard meaningful without re-breaking on the next additive bump.
+        assert len(payload["deliverables"]) == 1
+        deliverable = payload["deliverables"][0]
+        assert deliverable["name"] == "daily_data"
+        assert deliverable["required"] is True
+        assert deliverable["produced"] is True
+        assert deliverable["detail"] == ""
         datetime.fromisoformat(payload["last_success"])
 
     @patch("weekly_collector.boto3")
