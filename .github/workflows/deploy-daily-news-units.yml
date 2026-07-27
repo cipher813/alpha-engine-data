@@ -20,7 +20,7 @@ name: Deploy daily-news systemd units
 #
 # IAM: no new grant needed. github-actions-lambda-deploy already carries
 # ssm:SendCommand scoped to this exact instance (Sid DashboardDeployViaSSM,
-# infrastructure/iam/github-actions-lambda-deploy.json) — added for the
+# nous-ergon-ops/infrastructure/iam/github-actions-lambda-deploy/) — added for the
 # dashboard code-deploy path and reused here since the resource scope
 # (i-09b539c844515d549) and action (AWS-RunShellScript) are identical.
 
