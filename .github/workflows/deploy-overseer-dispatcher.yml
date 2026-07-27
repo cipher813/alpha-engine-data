@@ -28,6 +28,14 @@ on:
     branches: [main]
     paths:
       - 'infrastructure/lambdas/overseer-dispatcher/**'
+      # The router BUNDLES the registry into its zip at deploy time (deploy.sh
+      # copies infrastructure/overseer/playbooks.yaml), so a registry-only
+      # change must redeploy it — otherwise the live router keeps routing on a
+      # stale copy. Omitting this is how the alert-drain model fix (#1064)
+      # redeployed the liveness probe (whose filter DID list the registry) but
+      # not the router, leaving the router injecting the old broken model.
+      # Pinned by tests/test_overseer_playbook_registry.py.
+      - 'infrastructure/overseer/playbooks.yaml'
       - '.github/workflows/deploy-overseer-dispatcher.yml'
   workflow_dispatch:
 
