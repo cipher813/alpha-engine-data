@@ -23,15 +23,17 @@
 # Lambda) + ssm:GetCommandInvocation (to poll) + sns:Publish (to alert on
 # failure) — it never touches secrets or launches anything itself.
 #
-# Cadence (UTC). MAINTENANCE CADENCE as of 2026-07-25 (config#1311): the
-# backlog is drained (30 open issues on alpha-engine-config, ~70 across all
-# 4 backlog repos), so the drain-phase 3x/day tier-split cadence is reverted
-# to a single daily full groom + the weekly Sunday gated-reverify lane. The
-# end-of-SF sweep (DispatchEndOfSfSweep in step_function_groom.json) continues
+# Cadence (UTC). Three symmetric demand-all triggers per day + Sunday extra slot.
+# Each trigger evaluates the FULL backlog and launches 0..3 tier boxes via
+# decide_trigger / _primary_backend_for. All tiers route through DeepSeek primary.
+# The end-of-SF sweep (DispatchEndOfSfSweep in step_function_groom.json) continues
 # to run unconditionally after every trigger cycle — it covers the PR set
 # regardless of how many groom boxes launch.
-#   12:00 daily     cron(0 12 * * ? *)        FULL   all 3 tiers + sweep    # 5am PT, every day
-#   Sun 09:00       cron(0 9 ? * SUN *)       FULL   Haiku,  gated-reverify # weekly stale-gate lane (config#1891)
+#  04:00 daily     cron(0 4 * * ? *)         FULL   demand-all  # 9pm PT
+#  12:00 daily     cron(0 12 * * ? *)        FULL   demand-all  # 5am PT
+#  20:00 daily     cron(0 20 * * ? *)        FULL   demand-all  # 1pm PT
+#  Sun 09:00       cron(0 9 ? * SUN *)       FULL   demand-all  # weekly extra slot
+#  Models: krepis.router selects per GROOM_ROUTER_CLASS — zero Anthropic
 #
 # SCHED_NAMES is the source of truth: any live scheduler rule under the
 # alpha-engine-scheduled-groom- prefix that is NOT in SCHED_NAMES is PRUNED
@@ -95,16 +97,22 @@ SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 # schedule label, plus model/issue_filter per tier — config#1760 tier-split).
 # deploy.sh prune drops orphaned rule names when cadence changes.
 SCHED_NAMES=(
+  "alpha-engine-scheduled-groom-0400-daily"
   "alpha-engine-scheduled-groom-1200-daily"
-  "alpha-engine-scheduled-groom-sun0900-weekly-gated-reverify"
+  "alpha-engine-scheduled-groom-2000-daily"
+  "alpha-engine-scheduled-groom-sun0900-weekly"
 )
 SCHED_CRONS=(
+  "cron(0 4 * * ? *)"
   "cron(0 12 * * ? *)"
+  "cron(0 20 * * ? *)"
   "cron(0 9 ? * SUN *)"
 )
 SCHED_INPUTS=(
-  '{"run_mode":"full","trigger":"demand-all","pr_budget":50,"schedule":"0 12 * * *"}'
-  '{"run_mode":"full","model":"deepseek-v4-flash","issue_filter":"gated-reverify","schedule":"0 9 * * 0"}'
+  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 4 * * *"}'
+  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 12 * * *"}'
+  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 20 * * *"}'
+  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 9 * * 0"}'
 )
 # Prefix used to discover live rules for prune reconciliation (see step 2f).
 SCHED_PREFIX="alpha-engine-scheduled-groom-"
