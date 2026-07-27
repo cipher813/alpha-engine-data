@@ -717,10 +717,98 @@ def test_run_checks_aggregates_problems_and_kill_switches():
     sqs.get_queue_url.side_effect = FakeClientError("QueueDoesNotExist")
     with patch("index._registry", return_value=reg), \
          patch("index.boto3.client", side_effect=_client_factory(**{"lambda": lam, "sqs": sqs})):
-        problems, ks = index._run_checks(NOW)
+        problems, ks, run, failed = index._run_checks(NOW)
     assert any("not Active" in p for p in problems)
     assert any("does NOT EXIST" in p for p in problems)
     assert ks == {"SF_WATCH_DISPATCH_ENABLED": "true"}
+    assert (run, failed) == (2, 0)
+
+
+# ── I4473: per-check isolation ───────────────────────────────────────────────
+
+
+def _isolation_registry():
+    """One check that will blow up (scheduler) + two that will report normally."""
+    return {
+        "playbooks": {
+            "sf-watch": {"liveness": {"checks": [
+                {"type": "lambda_active", "function": "alpha-engine-spot",
+                 "report_kill_switch": "SF_WATCH_DISPATCH_ENABLED"},
+            ]}},
+        },
+        "watch_plane_liveness": {"checks": [
+            {"type": "scheduler_schedule_exists",
+             "schedule_name": "alpha-engine-alert-drain-0400utc"},
+            {"type": "sqs_queue_exists", "queue_name": "nousergon-overseer-intake"},
+        ]},
+    }
+
+
+def test_run_checks_isolates_a_raising_check_and_still_runs_the_others():
+    """The 2026-07-23 regression: an AccessDenied on ONE check aborted the whole
+    handler, erasing ~25 checks' coverage for four days."""
+    lam = MagicMock()
+    lam.get_function_configuration.return_value = _lambda_cfg(
+        state="Pending", env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    sched = MagicMock()
+    sched.get_schedule.side_effect = FakeClientError("AccessDeniedException")
+    sqs = MagicMock()
+    sqs.get_queue_url.side_effect = FakeClientError("QueueDoesNotExist")
+    with patch("index._registry", return_value=_isolation_registry()), \
+         patch("index.boto3.client", side_effect=_client_factory(
+             **{"lambda": lam, "scheduler": sched, "sqs": sqs})):
+        problems, ks, run, failed = index._run_checks(NOW)
+
+    # the raising check became its own problem line...
+    assert any("FAILED TO RUN" in p and "scheduler_schedule_exists" in p for p in problems)
+    # ...and BOTH other checks still reported their real findings
+    assert any("not Active" in p for p in problems)
+    assert any("does NOT EXIST" in p for p in problems)
+    assert ks == {"SF_WATCH_DISPATCH_ENABLED": "true"}
+    assert (run, failed) == (3, 1)
+    assert not any("PROBE BLIND" in p for p in problems)
+
+
+def test_run_checks_unknown_type_still_raises_not_isolated():
+    """An unknown check type is a packaging bug that invalidates the whole
+    registry — it must stay fail-loud, NOT be isolated like a runtime error."""
+    reg = {"playbooks": {"x": {"liveness": {"checks": [{"type": "bogus_check"}]}}}}
+    with patch("index._registry", return_value=reg):
+        with pytest.raises(index._RegistryError):
+            index._run_checks(NOW)
+
+
+def test_run_checks_all_failing_reports_probe_blind_first():
+    reg = {"watch_plane_liveness": {"checks": [
+        {"type": "scheduler_schedule_exists", "schedule_name": "s-one"},
+        {"type": "scheduler_schedule_exists", "schedule_name": "s-two"},
+    ]}}
+    sched = MagicMock()
+    sched.get_schedule.side_effect = FakeClientError("AccessDeniedException")
+    with patch("index._registry", return_value=reg), \
+         patch("index.boto3.client", side_effect=_client_factory(scheduler=sched)):
+        problems, _ks, run, failed = index._run_checks(NOW)
+    assert run == failed == 2
+    assert problems[0].startswith("PROBE BLIND")
+    assert "all 2 liveness checks failed to run" in problems[0]
+
+
+def test_run_checks_partial_failure_is_not_probe_blind():
+    reg = {"watch_plane_liveness": {"checks": [
+        {"type": "scheduler_schedule_exists", "schedule_name": "s-one"},
+        {"type": "sqs_queue_exists", "queue_name": "nousergon-overseer-intake"},
+    ]}}
+    sched = MagicMock()
+    sched.get_schedule.side_effect = FakeClientError("AccessDeniedException")
+    sqs = MagicMock()
+    sqs.get_queue_url.return_value = {"QueueUrl": "https://q"}
+    sqs.get_queue_attributes.return_value = {"Attributes": {"RedrivePolicy": json.dumps(
+        {"deadLetterTargetArn": "arn:aws:sqs:us-east-1:711398986525:nousergon-overseer-intake-dlq"})}}
+    with patch("index._registry", return_value=reg), \
+         patch("index.boto3.client", side_effect=_client_factory(scheduler=sched, sqs=sqs)):
+        problems, _ks, run, failed = index._run_checks(NOW)
+    assert (run, failed) == (2, 1)
+    assert not any("PROBE BLIND" in p for p in problems)
 
 
 def test_registry_malformed_raises():
@@ -731,7 +819,8 @@ def test_registry_malformed_raises():
     index._REGISTRY_CACHE = None
 
 
-def _handler_with(problems, kill_switches=None, state_fingerprint=None):
+def _handler_with(problems, kill_switches=None, state_fingerprint=None,
+                  checks_run=None, checks_failed=0):
     """Drive handler with _run_checks + S3 dedup state stubbed."""
     s3 = MagicMock()
     if state_fingerprint is None:
@@ -739,11 +828,36 @@ def _handler_with(problems, kill_switches=None, state_fingerprint=None):
     else:
         s3.get_object.return_value = {"Body": _Body(json.dumps({"fingerprint": state_fingerprint}).encode())}
     notify = MagicMock(return_value=True)
-    with patch("index._run_checks", return_value=(problems, kill_switches or {})), \
+    if checks_run is None:
+        checks_run = max(len(problems), 1)
+    with patch("index._run_checks",
+               return_value=(problems, kill_switches or {}, checks_run, checks_failed)), \
          patch("index._s3_client", return_value=s3), \
          patch("index.notify_via_flow_doctor", notify):
         result = index.handler({}, None)
     return result, s3, notify
+
+
+def test_handler_reports_check_coverage_counts():
+    result, _s3, _notify = _handler_with([], checks_run=25, checks_failed=0)
+    assert result["checks_run"] == 25 and result["checks_failed"] == 0
+
+
+def test_handler_alert_names_incomplete_coverage():
+    result, _s3, notify = _handler_with(
+        ["watch_plane: liveness check 'scheduler_schedule_exists' FAILED TO RUN (X: y)"],
+        checks_run=25, checks_failed=1,
+    )
+    assert result["checks_failed"] == 1
+    text = notify.call_args[0][0]
+    assert "Coverage incomplete" in text and "1 of 25" in text
+    assert "UNVERIFIED, not confirmed healthy" in text
+
+
+def test_handler_clean_run_alert_omits_coverage_caveat():
+    _result, _s3, notify = _handler_with(["some unrelated finding"],
+                                         checks_run=25, checks_failed=0)
+    assert "Coverage incomplete" not in notify.call_args[0][0]
 
 
 def test_handler_clean_no_alert():
