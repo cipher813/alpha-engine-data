@@ -353,6 +353,38 @@ def _resolve_soft_limit_min(event: dict) -> int | None:
     return n
 
 
+def _task_token(event: dict) -> str:
+    """The SF task token for this ``launch_decided`` invocation, or "".
+
+    config-I4333: the token arrives INSIDE the Lambda ``Payload``, under the key
+    ``Token``. The SF merges the context object's ``$$.Task`` — literally
+    ``{"Token": "..."}`` — into the payload's existing wholesale
+    ``States.JsonMerge``, so the key name is the context object's own, and no
+    string-building or escaping is involved. Three earlier attempts got this
+    wrong and none could ever have worked:
+
+      * a top-level ``TaskToken`` sibling of ``Payload`` in the SF
+        ``Parameters`` — rejected by Step Functions at RUNTIME (not by
+        ``validate-state-machine-definition``, which returned OK), since
+        ``TaskToken`` is not a field of the Lambda Invoke API:
+        "The field \"TaskToken\" is not supported by Step Functions".
+      * ``getattr(getattr(context, "task", None), "token", "")`` — a Python
+        Lambda ``context`` has no ``task`` attribute, so this silently
+        returned "" on every invocation and the ""-is-legitimate fallback
+        masked it.
+      * building the key with ``States.Format('{{"task_token":"{}"}}', ...)``
+        — ``States.Format`` cannot emit a literal brace by doubling OR by
+        backslash-escaping; both forms fail with "matching '}' not found".
+        Verified against the live TestState API, not assumed.
+
+    An absent token is legitimate (manual invoke, sweep dispatch), so "" is a
+    valid result — but it means no callback will be sent, and the SF then
+    depends on its timeout path.
+    """
+    raw = event.get("Token")
+    return str(raw).strip() if raw else ""
+
+
 def _resolve_launch_decided_backend(event: dict) -> str:
     """Validate the ``backend`` threaded through a ``launch_decided`` SF
     invocation (PRIMARY-mode DeepSeek selection, alpha-engine-config-I3479)
@@ -401,7 +433,8 @@ def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: st
                        run_token: str, soft_limit_min: int | None = None,
                        pr_budget: int | None = None,
                        queue_manifest_key: str = "",
-                       backend: str = "") -> str:
+                       backend: str = "",
+                       task_token: str = "") -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec bootstrap.
 
     Runs as root on the box. The heavy, version-controlled logic lives in the
@@ -440,6 +473,7 @@ def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: st
     # runs never trigger Claude quota signatures, so the flag is harmless
     # there but critical for high-tier Claude runs (I3483 companion).
     fallback_enabled_export = "export GROOM_DEEPSEEK_FALLBACK_ENABLED=true\n"
+    task_token_export = f"export GROOM_SF_TASK_TOKEN={task_token}\n" if task_token else ""
     return f"""set -uo pipefail
 export AWS_DEFAULT_REGION={REGION}
 # SSM RunShellScript runs as root with NO $HOME set; git config/clone need it.
@@ -462,7 +496,7 @@ cd /home/ec2-user/alpha-engine-config
 export GROOM_MODEL={model}
 export GROOM_ISSUE_FILTER={issue_filter}
 export GROOM_RUN_TOKEN={run_token}
-{pr_budget_export}{manifest_export}{fallback_enabled_export}{backend_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
+{pr_budget_export}{manifest_export}{fallback_enabled_export}{backend_export}{task_token_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
 """
 
 
@@ -494,13 +528,13 @@ def _wait_ssm_online(instance_id: str) -> None:
 def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, issue_filter: str,
                     run_token: str, soft_limit_min: int | None = None,
                     pr_budget: int | None = None, queue_manifest_key: str = "",
-                    backend: str = "") -> str:
+                    backend: str = "", task_token: str = "") -> str:
     """Fire the async, detached SSM command that runs the groom + self-terminates."""
     return spot_dispatch.send_async_command(
         instance_id,
         _bootstrap_command(
             run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
-            queue_manifest_key, backend,
+            queue_manifest_key, backend, task_token,
         ),
         comment=(f"backlog groom ({run_mode}, {model}, {issue_filter}"
                  f"{f', {backend}' if backend else ''}) — config#1432/#1495/#1645"),
@@ -679,7 +713,8 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
                        soft_limit_min: int | None = None, pr_budget: int | None = None,
                        force_on_demand: bool = False,
                        queue_manifest_key: str = "",
-                       backend: str = "") -> dict:
+                       backend: str = "",
+                       task_token: str = "") -> dict:
     """Launch + bootstrap the groom box. Fail-loud — any error RAISES.
 
     ``backend`` (quota-fallback 3-repo feature, default ``""`` = unchanged
@@ -767,7 +802,7 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
         )
         command_id = _send_bootstrap(
             instance_id, run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
-            queue_manifest_key, backend,
+            queue_manifest_key, backend, task_token,
         )
     except Exception:
         _terminate_instance(instance_id)
@@ -1550,11 +1585,33 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             force_on_demand,
             queue_manifest_key=queue_manifest_key,
             backend=_resolve_launch_decided_backend(event),
+            task_token=_task_token(event),
         )
-        # config#2667: record this decision too — previously only the
         # demand-all path did (_write_trigger_record/_write_skip_record),
         # leaving sweep-mode (and any other launch_decided) dispatches with
         # no entry in the dispatch-decision log at all.
+        # config-I4333: when invoked with .waitForTaskToken and the box was NOT
+        # launched (concurrent skip, kill-switch), call send-task-success with
+        # launched:false so the SF doesn't wait 6h for a callback that will never
+        # come. The box handles the launched:true callback itself in its finish() trap.
+        task_token = _task_token(event)
+        if task_token and not result.get("launched"):
+            try:
+                boto3.client("stepfunctions", region_name=REGION).send_task_success(
+                    taskToken=task_token,
+                    output=json.dumps({
+                        "groomLaunch": {
+                            "Payload": {
+                                "groom": {
+                                    "launched": False,
+                                    "reason": result.get("reason", "not_launched")
+                                }
+                            }
+                        }
+                    })
+                )
+            except Exception as exc:
+                logger.warning("send-task-success for launched:false failed (non-fatal — SF timeout catcher covers this): %s", exc)
         _write_sweep_decision_record(schedule_label, run_mode, result)
         return {"groom": result}
 
