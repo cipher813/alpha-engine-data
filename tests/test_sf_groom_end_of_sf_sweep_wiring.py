@@ -133,8 +133,8 @@ def test_sweep_is_fire_and_forget_no_polling_loop(states):
     poll/relaunch machinery (that lives inside MapLaunches's ItemProcessor for
     groom boxes only)."""
     assert states["DispatchEndOfSfSweep"]["Next"] not in (
-        "PollGroomCommand", "CheckLaunched", "RelaunchNotifyGate")
-    # And no top-level SSM polling state exists for the sweep.
+        "CheckLaunchedCallback", "RelaunchNotifyGate")
+    # config-I4333: no SSM polling state exists — replaced by .waitForTaskToken
     top_level_ssm_polls = [
         n for n, s in states.items()
         if s.get("Resource") == "arn:aws:states:::aws-sdk:ssm:getCommandInvocation"
@@ -150,22 +150,29 @@ def test_no_groom_box_partition_fields_remain_in_sf(doc):
     assert "partition_count" not in raw
 
 
-def test_poll_groom_command_retries_transient_ssm_sdk_errors(states):
-    """config#2311: a single Ssm.SdkClientException (bare network blip) must
-    not kill a lane outright — this loop fires every ~15s across a run that
-    can span hours, so a transient blip somewhere in that window is a
-    near-certainty, not an edge case (this is what actually happened live on
-    2026-07-11, 2h43m into an otherwise-healthy run)."""
-    poll = states["MapLaunches"]["ItemProcessor"]["States"]["PollGroomCommand"]
-    retries = poll["Retry"]
-    error_sets = [set(r["ErrorEquals"]) for r in retries]
-    assert {"Ssm.InvocationDoesNotExistException", "Ssm.InvocationDoesNotExist"} in error_sets
-    sdk_retry = next(
-        (r for r in retries if "Ssm.SdkClientException" in r["ErrorEquals"]), None
-    )
-    assert sdk_retry is not None, "no Retry entry covers Ssm.SdkClientException"
-    assert "States.Timeout" in sdk_retry["ErrorEquals"]
-    assert sdk_retry["MaxAttempts"] >= 1
+def test_launch_groom_spot_uses_wait_for_task_token(states):
+    """config-I4333: LaunchGroomSpot uses .waitForTaskToken so the SF pauses
+    until the box calls send-task-success instead of polling SSM every 15s.
+
+    2026-07-27: this asserted `"TaskToken.$" in lg["Parameters"]` — pinning the
+    exact shape Step Functions rejects at runtime, since `TaskToken` is not a
+    field of the Lambda Invoke API. The 20:00 UTC run died 11s in on it while
+    this test was green. Third instance today of a guard outliving (or, here,
+    never matching) the design it claims to protect; see groom-sweep-policy §9.
+    The token must be carried INSIDE Payload — via the context object's
+    $$.Task — which is what is asserted now.
+    """
+    lg = states["MapLaunches"]["ItemProcessor"]["States"]["LaunchGroomSpot"]
+    assert lg["Resource"] == "arn:aws:states:::lambda:invoke.waitForTaskToken"
+    assert lg["TimeoutSeconds"] == 21600
+    assert "TaskToken.$" not in lg["Parameters"]
+    assert "TaskToken" not in lg["Parameters"]
+    assert "$$.Task" in lg["Parameters"]["Payload.$"]
+    # Timeout → CheckCompletionMarkerTaskToken
+    timeout_catchers = [c for c in lg["Catch"] if "States.Timeout" in c["ErrorEquals"]]
+    assert len(timeout_catchers) == 1
+    assert timeout_catchers[0]["Next"] == "CheckCompletionMarkerTaskToken"
+
 
 
 def test_map_launch_failure_still_reaches_sweep(states):
