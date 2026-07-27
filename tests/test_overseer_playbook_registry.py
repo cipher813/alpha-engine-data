@@ -326,6 +326,38 @@ def test_drain_wake_names_all_four_schedules():
         )
 
 
+# ── cadence liveness coverage (config#4474) ───────────────────────────────────
+
+
+def test_every_cadenced_playbook_has_run_window_or_invocation_success():
+    """Every Lambda-backed playbook with a non-event-driven cadence string
+    MUST declare either a ``run_window`` or ``sf_watch_invocation_success``
+    liveness check — a mature trigger with no covering check is a silent
+    outage. Entries with ``trigger_type: github_actions_cron`` have no
+    Lambda/run-artifact surface. Entries whose cadence explicitly documents
+    a sibling probe (``liveness tick``/``probe`` in the cadence string) are
+    exempt — the sibling is their coverage. (config#4474, overseer
+    conformance audit 2026-07-27.)"""
+    for name, spec in REGISTRY["playbooks"].items():
+        if spec.get("trigger_type") == "github_actions_cron":
+            continue
+        cadence = spec.get("cadence")
+        if not cadence or "event-driven" in cadence:
+            continue
+        # Exempt: cadence documents a sibling liveness probe (not a
+        # run_window but independently covered, e.g. canary-replay).
+        if "liveness tick" in cadence or "probe" in cadence:
+            continue
+        checks = spec.get("liveness", {}).get("checks", [])
+        check_types = [c["type"] for c in checks]
+        assert "run_window" in check_types or "sf_watch_invocation_success" in check_types, (
+            f"playbook {name!r} has a non-event-driven cadence "
+            f"({cadence!r}) but no run_window or invocation_success "
+            f"liveness check — add one or annotate the cadence with "
+            f"the coverage mechanism"
+        )
+
+
 # ── alert-class registry (config-I3211) ──────────────────────────────────────
 
 
