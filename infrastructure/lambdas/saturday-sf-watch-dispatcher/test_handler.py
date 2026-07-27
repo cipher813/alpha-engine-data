@@ -1569,28 +1569,20 @@ def test_m2_overseer_invoke_failure_is_nonfatal(monkeypatch):
 
 
 @pytest.mark.listener_semantics
-def test_m2_default_target_is_overseer(monkeypatch):
-    """alpha-engine-config-I2830, applied 2026-07-27. Was pinned to
-    `repository_dispatch` as a safe-rollout default. That default outlived its
-    purpose and became the bug: the flag was flipped live, a redeploy raced
-    preserve_env_flag and wrote its stale map back, and routing silently
-    reverted — the next EOD failure recorded action=observe."""
-    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
-    assert index.M2_DISPATCH_TARGET == "overseer"
-    factory, sf, s3, lam, lambda_configs = _make_clients_with_lambda()
-    monkeypatch.setattr(index, "_get_github_pat", MagicMock(return_value="pat"))
-    resp_cm = MagicMock()
-    resp_cm.__enter__ = MagicMock(return_value=MagicMock(status=204))
-    resp_cm.__exit__ = MagicMock(return_value=False)
-    with patch("index.boto3.client", side_effect=factory), patch(
-        "index.urllib.request.urlopen", return_value=resp_cm
-    ) as urlopen:
-        result = index.handler(_event("FAILED"), None)
+def test_m2_default_target_is_overseer():
+    """alpha-engine-config-I2830, applied 2026-07-27.
 
-    assert result["agent_dispatch"]["dispatched"] is True
-    assert result["agent_dispatch"].get("target") != "overseer"
-    urlopen.assert_called_once()
-    lam.invoke.assert_not_called()
+    Was `test_m2_default_target_still_uses_repository_dispatch`, which asserted
+    the constant AND that the default produced a GitHub POST. That composite
+    intent no longer holds, and the routing half is already covered by
+    `test_dispatch_enabled_fires_repository_dispatch` (which pins the mode
+    explicitly). This asserts only the constant.
+
+    The old default outlived its purpose and became the bug: the flag was
+    flipped live, a redeploy raced preserve_env_flag and wrote its stale map
+    back, and routing silently reverted — the very next EOD failure recorded
+    action=observe."""
+    assert index.M2_DISPATCH_TARGET == "overseer"
 
 
 # ── I4510: mode-aware listener semantics ─────────────────────────────────────
