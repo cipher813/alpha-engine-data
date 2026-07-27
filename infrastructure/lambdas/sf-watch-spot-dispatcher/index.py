@@ -235,7 +235,14 @@ _FAILED_STATE_RE = re.compile(r"^[A-Za-z0-9 _.:()/-]{0,200}$")
 _WATCH_LOG_KEY_RE = re.compile(r"^[A-Za-z0-9_./-]{0,300}$")
 _BOOL_RE = re.compile(r"^(true|false)$")
 # config-I3293 — registry-declared agent model (router-injected); optional.
-_MODEL_RE = re.compile(r"^claude-[a-z0-9.-]{1,60}$")
+# alpha-engine-config-I4478/I4516: provider-agnostic, mirroring
+# scheduled-groom-dispatcher's long-standing pattern. Was `^claude-...$`, which
+# structurally could NOT carry the DeepSeek model IDs the fleet actually runs
+# (2026-07-24 zero-Anthropic-model ruling) — so the registry, which is the
+# declared SSoT for each playbook's model, could not express the live policy.
+# Still a strict anchored allow-list of shell-safe characters: the value is
+# interpolated into the bootstrap command, so the injection guard is the point.
+_MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 
 class _InvalidEvent(ValueError):

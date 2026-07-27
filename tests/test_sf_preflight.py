@@ -567,3 +567,81 @@ def test_recursion_budget_check_warns_when_sibling_absent(monkeypatch):
     monkeypatch.setattr(sfp, "_sibling_repo", lambda name: None)
     result = sfp.check_recursion_budget_for_response_format(_ctx())
     assert result.status == "warn"
+
+
+# ── check_sf_iam_reachability (alpha-engine-config-I4494) ─────────────────────
+#
+# Bug class: an identity the weekly SF depends on cannot reach what it targets,
+# and nothing notices until a stage fails mid-run. Three live instances on
+# 2026-07-27: the evaluator role's unapplied s3 grant, the SF role's missing
+# invoke on the new dispatcher, and substrate-health-gate's instance-scoped
+# SendCommand against a per-execution box.
+
+
+@pytest.mark.parametrize(
+    "function_name,expected",
+    [
+        ("alpha-engine-scanner", "alpha-engine-scanner"),
+        ("alpha-engine-scanner:live", "alpha-engine-scanner"),
+        (
+            "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-substrate-health-gate",
+            "alpha-engine-substrate-health-gate",
+        ),
+        (
+            "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-evaluator:live",
+            "alpha-engine-evaluator",
+        ),
+    ],
+)
+def test_lambda_base_name_handles_bare_names_and_arns(function_name, expected):
+    """Regression: the ARN form must not collapse to "arn".
+
+    Caught while validating the check against live AWS — the first run reported
+    a false denial for a role that held the grant, because splitting the ARN on
+    ":" yielded "arn" and simulated a function that does not exist. A preflight
+    that cries wolf gets ignored, so this is a correctness requirement, not a
+    cosmetic one.
+    """
+    assert sfp._lambda_base_name(function_name) == expected
+
+
+def test_walk_invoked_lambdas_finds_nested_states():
+    """FunctionName is collected from Parallel branches and Map iterators too."""
+    definition = {
+        "States": {
+            "Top": {"Parameters": {"FunctionName": "fn-top"}},
+            "Par": {
+                "Type": "Parallel",
+                "Branches": [{"States": {"B": {"Parameters": {"FunctionName": "fn-branch"}}}}],
+            },
+            "Map": {
+                "Type": "Map",
+                "ItemProcessor": {
+                    "States": {"M": {"Parameters": {"FunctionName": "fn-map"}}}
+                },
+            },
+        }
+    }
+    assert sfp._walk_invoked_lambdas(definition) == {"fn-top", "fn-branch", "fn-map"}
+
+
+def test_simulate_treats_an_error_as_not_allowed():
+    """"Could not check" must never read as "allowed".
+
+    Conflating the two is the silent-degradation pattern the weekly-SF policy
+    forbids: a gate that cannot evaluate has not passed.
+    """
+    iam = MagicMock()
+    iam.simulate_principal_policy.side_effect = RuntimeError("throttled")
+    assert sfp._simulate(iam, "arn:role", "lambda:InvokeFunction", "arn:fn") is False
+
+
+def test_simulate_requires_every_result_allowed():
+    iam = MagicMock()
+    iam.simulate_principal_policy.return_value = {
+        "EvaluationResults": [
+            {"EvalDecision": "allowed"},
+            {"EvalDecision": "implicitDeny"},
+        ]
+    }
+    assert sfp._simulate(iam, "arn:role", "ssm:SendCommand", "arn:inst") is False
