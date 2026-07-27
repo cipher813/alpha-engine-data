@@ -472,3 +472,49 @@ def test_registry_model_is_a_provider_name_not_a_routing_alias(name):
         f"the provider and the call will 400. Use the resolved provider model "
         f"(e.g. 'deepseek-v4-pro')."
     )
+
+
+def test_every_registry_bundling_lambda_redeploys_on_registry_change():
+    """LOCKSTEP: if a Lambda's deploy.sh BUNDLES playbooks.yaml into its zip,
+    that Lambda's deploy workflow must be path-triggered on the registry too.
+
+    Otherwise a registry-only edit deploys nothing and the live Lambda keeps
+    running on a stale copy — silently. That is exactly what happened on
+    2026-07-27: #1064 fixed alert-drain's model in the registry; the liveness
+    probe redeployed (its filter listed the registry) but the ROUTER did not
+    (its filter listed only its own lambda dir), so the router kept injecting
+    the broken model and the drain stayed down.
+
+    The two existing `*_bundles_this_registry` tests pin the copy step; this
+    pins the trigger that makes the copy actually reach production.
+    """
+    workflows = REPO_ROOT / ".github" / "workflows"
+    checked = 0
+    for lambda_dir in sorted(LAMBDAS_DIR.iterdir()):
+        deploy_sh = lambda_dir / "deploy.sh"
+        if not deploy_sh.is_file():
+            continue
+        if "overseer/playbooks.yaml" not in deploy_sh.read_text(encoding="utf-8"):
+            continue
+        wf = workflows / f"deploy-{lambda_dir.name}.yml"
+        assert wf.is_file(), (
+            f"{lambda_dir.name}/deploy.sh bundles the registry but there is no "
+            f"{wf.name} to trigger a redeploy"
+        )
+        # Parse the YAML and read the ACTUAL push-paths list. A raw substring
+        # check would match an explanatory comment mentioning the path and pass
+        # even with the trigger missing (verified while writing this test).
+        wf_doc = yaml.safe_load(wf.read_text(encoding="utf-8"))
+        # PyYAML parses the bare key `on:` as the boolean True (YAML 1.1).
+        triggers = wf_doc.get("on", wf_doc.get(True)) or {}
+        paths = ((triggers.get("push") or {}).get("paths")) or []
+        assert "infrastructure/overseer/playbooks.yaml" in paths, (
+            f"{wf.name} push paths {paths} do not include "
+            f"'infrastructure/overseer/playbooks.yaml', but {lambda_dir.name}/deploy.sh "
+            f"BUNDLES that file — a registry-only change would leave this Lambda "
+            f"running a stale registry"
+        )
+        checked += 1
+    assert checked >= 2, (
+        f"expected >=2 registry-bundling lambdas (router + liveness probe), found {checked}"
+    )

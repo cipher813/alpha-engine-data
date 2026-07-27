@@ -352,7 +352,14 @@ def test_dispatch_enabled_fires_repository_dispatch(monkeypatch):
 
 
 def test_dispatch_routes_weekday_event_type(monkeypatch):
-    """A weekday failure dispatches the weekday-sf-failure event type + payload."""
+    """A weekday failure dispatches the weekday-sf-failure event type + payload.
+
+    alpha-engine-config-I4510: weekday now carries has_listener=False on the
+    repository_dispatch path (sf-watch.yml gates its job to Saturday only), so
+    this test must force the legacy flag on to exercise the routing itself.
+    The listener SEMANTICS are covered separately below.
+    """
+    monkeypatch.setitem(index.PIPELINES["ne-preopen-trading-pipeline"], "has_listener", True)
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
     monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
     sent = {}
@@ -433,8 +440,8 @@ def test_no_listener_pipeline_never_dispatches_even_when_globally_enabled(monkey
 
 
 def test_saturday_still_dispatches_when_enabled(monkeypatch):
-    """Non-regression: the has_listener plumbing must not change behavior for
-    the 3 trading pipelines, which all default has_listener=True."""
+    """Non-regression: Saturday — the one pipeline with a live GHA listener —
+    still dispatches unchanged after I4510 made has_listener mode-aware."""
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
     monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
     monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
@@ -1531,3 +1538,63 @@ def test_m2_default_target_still_uses_repository_dispatch(monkeypatch):
     assert result["agent_dispatch"].get("target") != "overseer"
     urlopen.assert_called_once()
     lam.invoke.assert_not_called()
+
+
+# ── I4510: mode-aware listener semantics ─────────────────────────────────────
+
+
+def test_weekday_does_not_dispatch_on_repository_dispatch_path(monkeypatch):
+    """The defect this closes: a weekday failure POSTed a repository_dispatch
+    that GitHub accepted (204) and no job consumed, while Telegram claimed
+    "autonomous fix ACTIVE". sf-watch.yml gates its dispatch job to
+    saturday-sf-failure only (config#2004), so weekday has no listener here."""
+    monkeypatch.setattr(index, "M2_DISPATCH_TARGET", "repository_dispatch")
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    called = []
+    monkeypatch.setattr(index, "_get_github_pat", lambda: called.append("pat") or "ghp_fake")
+    factory, _, _ = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+    assert result["agent_dispatch"] == {"dispatched": False, "reason": "no_listener"}
+    assert not called, "must not even mint a PAT for a dispatch nothing consumes"
+
+
+def test_weekday_DOES_dispatch_in_overseer_mode(monkeypatch):
+    """Flipping M2_DISPATCH_TARGET to `overseer` is the single action that
+    enables weekday/EOD coverage: the router dispatches by PLAYBOOK, not by
+    event type, so it is a live listener for every pipeline — no GHA gate
+    edit, per the standing direction to cede sf-watch dispatch to the
+    Overseer."""
+    monkeypatch.setattr(index, "M2_DISPATCH_TARGET", "overseer")
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    factory, _, _ = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+    assert result["agent_dispatch"]["dispatched"] is True
+    assert result["agent_dispatch"]["target"] == "overseer"
+
+
+def test_watch_log_records_the_real_listener_state(monkeypatch):
+    """The watch-log record itself was false on 2026-07-27: has_listener:true
+    and action:"dispatch" for a weekday failure nothing could consume. The
+    audit trail must not assert a dispatch that cannot happen."""
+    monkeypatch.setattr(index, "M2_DISPATCH_TARGET", "repository_dispatch")
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    factory, s3, _ = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+    body = json.loads(s3.put_object.call_args.kwargs["Body"])
+    ev = body["events"][-1]
+    assert ev["has_listener"] is False
+    assert ev["action"] == "observe"
+
+
+def test_has_listener_helper_modes():
+    saturday = index.PIPELINES["ne-weekly-freshness-pipeline"]
+    weekday = index.PIPELINES["ne-preopen-trading-pipeline"]
+    with patch.object(index, "M2_DISPATCH_TARGET", "repository_dispatch"):
+        assert index._has_listener(saturday) is True
+        assert index._has_listener(weekday) is False
+    with patch.object(index, "M2_DISPATCH_TARGET", "overseer"):
+        assert index._has_listener(saturday) is True
+        assert index._has_listener(weekday) is True
