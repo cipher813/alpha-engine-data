@@ -152,11 +152,22 @@ def test_no_groom_box_partition_fields_remain_in_sf(doc):
 
 def test_launch_groom_spot_uses_wait_for_task_token(states):
     """config-I4333: LaunchGroomSpot uses .waitForTaskToken so the SF pauses
-    until the box calls send-task-success instead of polling SSM every 15s."""
+    until the box calls send-task-success instead of polling SSM every 15s.
+
+    2026-07-27: this asserted `"TaskToken.$" in lg["Parameters"]` — pinning the
+    exact shape Step Functions rejects at runtime, since `TaskToken` is not a
+    field of the Lambda Invoke API. The 20:00 UTC run died 11s in on it while
+    this test was green. Third instance today of a guard outliving (or, here,
+    never matching) the design it claims to protect; see groom-sweep-policy §9.
+    The token must be carried INSIDE Payload — via the context object's
+    $$.Task — which is what is asserted now.
+    """
     lg = states["MapLaunches"]["ItemProcessor"]["States"]["LaunchGroomSpot"]
     assert lg["Resource"] == "arn:aws:states:::lambda:invoke.waitForTaskToken"
     assert lg["TimeoutSeconds"] == 21600
-    assert "TaskToken.$" in lg["Parameters"]
+    assert "TaskToken.$" not in lg["Parameters"]
+    assert "TaskToken" not in lg["Parameters"]
+    assert "$$.Task" in lg["Parameters"]["Payload.$"]
     # Timeout → CheckCompletionMarkerTaskToken
     timeout_catchers = [c for c in lg["Catch"] if "States.Timeout" in c["ErrorEquals"]]
     assert len(timeout_catchers) == 1
