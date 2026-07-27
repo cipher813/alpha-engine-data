@@ -104,28 +104,28 @@ def reset_notify(monkeypatch):
 def pytest_configure(config):  # noqa: D401 — pytest hook
     config.addinivalue_line(
         "markers",
-        "legacy_routing: run with M2_DISPATCH_TARGET=repository_dispatch (the "
-        "pre-2026-07-27 GitHub round-trip) instead of the live `overseer` default",
+        "listener_semantics: exercise the I4510 mode-aware has_listener rules "
+        "instead of the pre-I4510 always-True weekday/EOD behaviour",
     )
 
 
 @pytest.fixture(autouse=True)
-def _default_routing_mode(request, monkeypatch):
-    """Default every test to the LIVE production routing mode.
+def _legacy_weekday_listener(request, monkeypatch):
+    """Preserve pre-I4510 behaviour for the many tests that use the weekday/EOD
+    ARN merely as a VEHICLE for some other behaviour — fast-path fallback,
+    preflight context, over-suppression, the 2026-07-18 shepherd ruling.
 
-    alpha-engine-config-I4510 made `has_listener` mode-aware, and
-    M2_DISPATCH_TARGET was flipped to `overseer` in production on 2026-07-27.
-    Under `overseer` the router is a listener for EVERY pipeline, so the many
-    tests that merely USE the weekday ARN as a vehicle for some other behaviour
-    (fast-path fallback, preflight, over-suppression, the shepherd ruling) keep
-    exercising what they were written to exercise.
-
-    Tests that specifically assert the legacy GitHub round-trip, or the code's
-    own default, opt out with @pytest.mark.legacy_routing.
+    I4510 made weekday/EOD honestly `has_listener: False` on the
+    repository_dispatch path, which would otherwise turn all of those into
+    `no_listener` declines and stop testing what they were written to test.
+    Pinning the flag here keeps their intent intact and confines the semantic
+    change to the tests that actually assert it, which opt in with
+    @pytest.mark.listener_semantics.
     """
-    if request.node.get_closest_marker("legacy_routing"):
+    if request.node.get_closest_marker("listener_semantics"):
         return
-    monkeypatch.setattr(index, "M2_DISPATCH_TARGET", "overseer", raising=False)
+    for pipeline in ("ne-preopen-trading-pipeline", "ne-postclose-trading-pipeline"):
+        monkeypatch.setitem(index.PIPELINES[pipeline], "has_listener", True)
 
 
 def test_failed_writes_watch_log_and_returns_state():
@@ -358,7 +358,6 @@ def test_dispatch_disabled_by_default():
     assert result["action"] == "observe"
 
 
-@pytest.mark.legacy_routing
 def test_dispatch_enabled_fires_repository_dispatch(monkeypatch):
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
     monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
@@ -391,7 +390,6 @@ def test_dispatch_enabled_fires_repository_dispatch(monkeypatch):
     s3.put_object.assert_called_once()
 
 
-@pytest.mark.legacy_routing
 def test_dispatch_routes_weekday_event_type(monkeypatch):
     """A weekday failure dispatches the weekday-sf-failure event type + payload.
 
@@ -1562,7 +1560,6 @@ def test_m2_overseer_invoke_failure_is_nonfatal(monkeypatch):
     assert "router down" in result["agent_dispatch"]["error"]
 
 
-@pytest.mark.legacy_routing
 def test_m2_default_target_still_uses_repository_dispatch(monkeypatch):
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
     assert index.M2_DISPATCH_TARGET == "repository_dispatch"
@@ -1585,6 +1582,7 @@ def test_m2_default_target_still_uses_repository_dispatch(monkeypatch):
 # ── I4510: mode-aware listener semantics ─────────────────────────────────────
 
 
+@pytest.mark.listener_semantics
 def test_weekday_does_not_dispatch_on_repository_dispatch_path(monkeypatch):
     """The defect this closes: a weekday failure POSTed a repository_dispatch
     that GitHub accepted (204) and no job consumed, while Telegram claimed
@@ -1601,6 +1599,7 @@ def test_weekday_does_not_dispatch_on_repository_dispatch_path(monkeypatch):
     assert not called, "must not even mint a PAT for a dispatch nothing consumes"
 
 
+@pytest.mark.listener_semantics
 def test_weekday_DOES_dispatch_in_overseer_mode(monkeypatch):
     """Flipping M2_DISPATCH_TARGET to `overseer` is the single action that
     enables weekday/EOD coverage: the router dispatches by PLAYBOOK, not by
@@ -1616,13 +1615,14 @@ def test_weekday_DOES_dispatch_in_overseer_mode(monkeypatch):
     assert result["agent_dispatch"]["target"] == "overseer"
 
 
+@pytest.mark.listener_semantics
 def test_watch_log_records_the_real_listener_state(monkeypatch):
     """The watch-log record itself was false on 2026-07-27: has_listener:true
     and action:"dispatch" for a weekday failure nothing could consume. The
     audit trail must not assert a dispatch that cannot happen."""
     monkeypatch.setattr(index, "M2_DISPATCH_TARGET", "repository_dispatch")
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
-    factory, s3, _ = _make_clients()
+    factory, _sf, s3 = _make_clients()
     with patch("index.boto3.client", side_effect=factory):
         index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
     body = json.loads(s3.put_object.call_args.kwargs["Body"])
@@ -1631,6 +1631,7 @@ def test_watch_log_records_the_real_listener_state(monkeypatch):
     assert ev["action"] == "observe"
 
 
+@pytest.mark.listener_semantics
 def test_has_listener_helper_modes():
     saturday = index.PIPELINES["ne-weekly-freshness-pipeline"]
     weekday = index.PIPELINES["ne-preopen-trading-pipeline"]
