@@ -288,6 +288,13 @@ def _reclaim_escalate(text: str, dedup_key: str, context_info: dict) -> bool:
             topics=_OPS_TOPICS,
             db_basename=_DB_BASENAME,
             context=context_info,
+            # No playbooks.yaml alert_classes row exists yet for this
+            # Lambda's own identity (config-I3513 audit finding, distinct
+            # from the `canary_replay_liveness` class which belongs to the
+            # separate canary-replay-liveness-probe Lambda). Using
+            # _FLOW_NAME is still strictly correct; follow-up filed to add
+            # a row.
+            source=_FLOW_NAME,
         )
     except Exception as exc:  # noqa: BLE001 — delivery surface; finding still logged + returned
         logger.warning("reclaim escalation Telegram send failed (non-fatal): %s", exc)
@@ -308,6 +315,11 @@ def _reclaim_note(text: str, dedup_key: str, context_info: dict) -> bool:
             db_basename=_DB_BASENAME,
             context=context_info,
             silent_topic=FleetTelegramTopic.OPS_HEALTH,
+            # No playbooks.yaml alert_classes row exists yet for this
+            # Lambda's own identity (config-I3513 audit finding). Using
+            # _FLOW_NAME is still strictly correct; follow-up filed to add
+            # a row.
+            source=_FLOW_NAME,
         )
     except Exception as exc:  # noqa: BLE001 — delivery surface; relaunch already fired + recorded
         logger.warning("reclaim relaunch Telegram note failed (non-fatal): %s", exc)
