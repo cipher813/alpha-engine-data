@@ -159,7 +159,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 60 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=false,M2_DISPATCH_TARGET=repository_dispatch,FAST_PATH_ENABLED=false,SF_WATCH_DISPATCH_AFTER_ESCALATION=true,EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=true,SF_WATCH_MAX_DISPATCHES_SATURDAY=8,SF_WATCH_MAX_DISPATCHES_WEEKDAY=2,SF_WATCH_MAX_DISPATCHES_EOD=2,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+      --environment 'Variables={LOG_LEVEL=INFO,AGENT_DISPATCH_ENABLED=false,M2_DISPATCH_TARGET=overseer,FAST_PATH_ENABLED=false,SF_WATCH_DISPATCH_AFTER_ESCALATION=true,EOD_SF_WATCH_DISPATCH_AFTER_ESCALATION=true,SF_WATCH_MAX_DISPATCHES_SATURDAY=8,SF_WATCH_MAX_DISPATCHES_WEEKDAY=2,SF_WATCH_MAX_DISPATCHES_EOD=2,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -241,9 +241,25 @@ echo "Updating Lambda environment (flow-doctor SSM hydration)..."
 # was open. Bootstrap (create-function above) still defaults false — safe
 # rollout posture for a NEW deployment only.
 CURRENT_DISPATCH=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" AGENT_DISPATCH_ENABLED false)
-# M2_DISPATCH_TARGET (alpha-engine-config-I2823) — operator-owned routing flag:
+# M2_DISPATCH_TARGET (alpha-engine-config-I2823) — routing flag:
 # repository_dispatch (legacy GitHub round-trip) vs overseer (direct router).
-CURRENT_M2_TARGET=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" M2_DISPATCH_TARGET repository_dispatch)
+#
+# DEFAULT FLIPPED repository_dispatch -> overseer (alpha-engine-config-I2830,
+# actually applied 2026-07-27). I2830 was closed 2026-07-21 but the live flag
+# still read repository_dispatch six days later, because it was operator-owned:
+# set by hand, never codified. Flipping it live on 2026-07-27 was then CLOBBERED
+# within minutes by a redeploy — preserve_env_flag read the env before the
+# manual change and wrote its stale map after (LastModified 18:42Z). The very
+# next EOD failure recorded action=observe.
+#
+# So the fallback here is the DURABLE state, not a safe-rollout placeholder: it
+# is what a redeploy lands on whenever the live read races or returns empty.
+# Codifying `overseer` is what makes the routing survive its own deploy.
+#
+# Routing consequence: the router dispatches by PLAYBOOK, not by event type, so
+# it is a live listener for all three pipelines — this default is what enables
+# weekday/EOD SF coverage, with no .github/workflows/sf-watch.yml gate edit.
+CURRENT_M2_TARGET=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" M2_DISPATCH_TARGET overseer)
 # FAST_PATH_ENABLED (config#1900) is operator-owned exactly like
 # AGENT_DISPATCH_ENABLED — preserve the live value across redeploys.
 CURRENT_FAST_PATH=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" FAST_PATH_ENABLED false)

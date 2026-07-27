@@ -80,10 +80,6 @@
         "fod": {
           "force_on_demand": false,
           "launch_decided": true
-        },
-        "retryState": {
-          "retry_count.$": "$.retry_count",
-          "max_retries.$": "$.max_retries"
         }
       },
       "Catch": [
@@ -104,12 +100,11 @@
         "States": {
           "LaunchGroomSpot": {
             "Type": "Task",
-            "Comment": "config#2129 + alpha-engine-config-I4333 (task-token callback): invoke the Lambda's launch_decided operation with .waitForTaskToken so the SF pauses here until the box calls send-task-success (sub-second) instead of polling SSM every 15s for hours. The Lambda launches the box, embeds the task token in the SSM command, and returns immediately \u2014 the SF ignores the return value; the callback payload IS the state output. Timeout (6h, matching the box's watchdog) routes to the existing CheckCompletionMarker / relaunch loop.",
+            "Comment": "config#2129 + alpha-engine-config-I4333 (task-token callback): invoke the Lambda's launch_decided operation with .waitForTaskToken so the SF pauses here until the box calls send-task-success (sub-second) instead of polling SSM every 15s for hours. The token is carried INSIDE the Payload by merging the context object's $$.Task ({Token: ...}) into the same wholesale merge \u2014 `TaskToken` is NOT a field of the Lambda Invoke API, and declaring it as a sibling of Payload is rejected at RUNTIME (not by validate-state-machine-definition), which is how the 2026-07-27 20:00 UTC run died 11s in. String-building the key with States.Format does not work either: Format cannot emit a literal brace. The Lambda reads event['Token']. The Lambda launches the box, embeds the token in the SSM command, and returns immediately \u2014 the SF ignores the return value; the callback payload IS the state output. TimeoutSeconds (6h, matching the box's own watchdog) is the SOLE authoritative bound on a lane \u2014 groom-sweep-policy \u00a72.1. A HeartbeatSeconds was declared here until 2026-07-27 with NO SendTaskHeartbeat emitter on the box, which silently made 3600s the real lane timeout and killed every run longer than an hour; do not re-add a liveness interval without a proven emitter and its states:SendTaskHeartbeat grant. Timeout routes to CheckCompletionMarkerTaskToken / the bounded relaunch loop.",
             "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
             "Parameters": {
               "FunctionName": "alpha-engine-scheduled-groom-dispatcher",
-              "Payload.$": "States.JsonMerge(States.JsonMerge($.schedInput, $.launchDecision, false), $.fod, false)",
-              "TaskToken.$": "$$.Task.Token"
+              "Payload.$": "States.JsonMerge(States.JsonMerge(States.JsonMerge($.schedInput, $.launchDecision, false), $.fod, false), $$.Task, false)"
             },
             "TimeoutSeconds": 21600,
             "Retry": [
@@ -142,8 +137,7 @@
               }
             ],
             "ResultPath": "$.callbackOutput",
-            "Next": "RelaunchNotifyGate",
-            "HeartbeatSeconds": 3600
+            "Next": "RelaunchNotifyGate"
           },
           "RelaunchNotifyGate": {
             "Type": "Choice",
@@ -179,7 +173,7 @@
                   "Variable": "$.callbackOutput.groomLaunch.Payload.groom.launched",
                   "IsPresent": true
                 },
-                "Next": "GroomRetriesExhausted"
+                "Next": "GroomLaunchStateUnknown"
               }
             ],
             "Default": "GroomSkipped"
@@ -208,7 +202,8 @@
                 "Next": "CheckRetryBudget",
                 "ResultPath": "$.markerCheckError"
               }
-            ]
+            ],
+            "TimeoutSeconds": 360
           },
           "CheckRetryBudget": {
             "Type": "Choice",
@@ -224,15 +219,13 @@
           },
           "PrepRelaunch": {
             "Type": "Pass",
-            "Comment": "config#1645: bump the counter for the next attempt (each relaunch calls the Lambda fresh, which mints its own new run_token \u2014 the old attempt's absent marker is never confused with the new attempt's). MUST preserve groomPoll/groomLaunch/launchDecision through the relaunch path \u2014 NotifyRelaunch (best-effort) and audit trails reference groomPoll/groomLaunch; LaunchGroomSpot's Payload merge references launchDecision on every attempt, not just the first.",
+            "Comment": "config#1645: bump the counter for the next attempt (each relaunch calls the Lambda fresh, which mints its own new run_token \u2014 the old attempt's absent marker is never confused with the new attempt's). Emits EXACTLY the shape LaunchGroomSpot needs (schedInput/launchDecision/fod for its Payload merge, retry_count for RelaunchNotifyGate, max_retries for CheckRetryBudget) and nothing else. Until 2026-07-27 this also carried groomPoll/groomLaunch, retired with the SSM poll loop by I4333 \u2014 the dangling reference raised an UNCATCHABLE States.Runtime here and killed the entire bounded-relaunch loop (groom-sweep-policy \u00a72.2). Every field referenced below must be produced by a predecessor on the path that reaches this state.",
             "Parameters": {
               "schedInput.$": "$.schedInput",
               "launchDecision.$": "$.launchDecision",
-              "retry_count.$": "States.MathAdd($.retry_count, 1)",
               "max_retries.$": "$.max_retries",
-              "fod.$": "$.fod",
-              "groomPoll.$": "$.groomPoll",
-              "groomLaunch.$": "$.groomLaunch"
+              "retry_count.$": "States.MathAdd($.retry_count, 1)",
+              "fod.$": "$.fod"
             },
             "Next": "CheckForceOnDemand"
           },
@@ -250,29 +243,27 @@
           },
           "SetForceOnDemand": {
             "Type": "Pass",
-            "Comment": "Final relaunch attempt \u2014 escalate to on-demand. Preserves groomPoll/groomLaunch/launchDecision for downstream visibility and the next LaunchGroomSpot's Payload merge.",
+            "Comment": "Final relaunch attempt \u2014 escalate to on-demand so a bad spot-capacity window still guarantees completion. Same field discipline as PrepRelaunch: emits only what LaunchGroomSpot and its downstream Choices actually read.",
             "Parameters": {
               "schedInput.$": "$.schedInput",
               "launchDecision.$": "$.launchDecision",
-              "retry_count.$": "$.retry_count",
               "max_retries.$": "$.max_retries",
+              "retry_count.$": "$.retry_count",
               "fod": {
                 "force_on_demand": true,
                 "launch_decided": true
-              },
-              "groomPoll.$": "$.groomPoll",
-              "groomLaunch.$": "$.groomLaunch"
+              }
             },
             "Next": "LaunchGroomSpot"
           },
           "NotifyRelaunch": {
             "Type": "Task",
-            "Comment": "config#1645: best-effort WARNING-level ping AFTER the relaunch box is already launching (LaunchGroomSpot -> RelaunchNotifyGate -> here). A States.Format intrinsic error in Parameters is NOT catchable (States.Runtime) \u2014 groomPoll is preserved through PrepRelaunch/SetForceOnDemand for this message. SNS publish failures ARE catchable and route to CheckLaunched so a notify hiccup never blocks polling the new run.",
+            "Comment": "config#1645: best-effort WARNING-level ping AFTER the relaunch box is already launching (LaunchGroomSpot -> RelaunchNotifyGate -> here). A States.Format intrinsic error in Parameters is NOT catchable (States.Runtime), so this message may reference ONLY fields PrepRelaunch/SetForceOnDemand emit \u2014 it referenced the retired $.groomPoll.Status until 2026-07-27. SNS publish failures ARE catchable and route to CheckLaunchedCallback so a notify hiccup never blocks the new run.",
             "Resource": "arn:aws:states:::sns:publish",
             "Parameters": {
               "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
               "Subject": "Alpha Engine Backlog Groom \u2014 spot interrupted, auto-relaunching",
-              "Message.$": "States.Format('Backlog groom box died mid-run (SSM status={}, no completion marker). Relaunched automatically: attempt {} of {} (force_on_demand={}).', $.groomPoll.Status, $.retry_count, $.max_retries, States.JsonToString($.fod.force_on_demand))"
+              "Message.$": "States.Format('Backlog groom box died mid-run (task token never fired; no completion marker). Tier: {}. Relaunched automatically: attempt {} of {} (force_on_demand={}).', $.launchDecision.issue_filter, $.retry_count, $.max_retries, States.JsonToString($.fod.force_on_demand))"
             },
             "ResultPath": "$.relaunch_notify",
             "Catch": [
@@ -284,7 +275,8 @@
                 "ResultPath": "$.relaunch_notify_error"
               }
             ],
-            "Next": "CheckLaunchedCallback"
+            "Next": "CheckLaunchedCallback",
+            "TimeoutSeconds": 60
           },
           "GroomSucceeded": {
             "Type": "Succeed"
@@ -300,16 +292,14 @@
           },
           "GroomRetriesExhausted": {
             "Type": "Pass",
-            "Comment": "config#1645: the completion marker was absent on every attempt (box died mid-run each time) and the bounded relaunch budget (including the forced-on-demand final attempt) is spent \u2014 a genuine escalation, not a routine spot hiccup.",
+            "Comment": "config#1645: the task token never fired on any attempt (box died mid-run each time) and the bounded relaunch budget \u2014 including the forced-on-demand final attempt \u2014 is spent. A genuine escalation, not a routine spot hiccup. Reached ONLY from CheckRetryBudget, so $.timeoutError is always present; the CheckLaunchedCallback path has its own terminal (GroomLaunchStateUnknown) because its input shape is disjoint from this one.",
             "Parameters": {
               "source": "groom_status",
               "reason": "spot_interruption_retries_exhausted",
-              "status.$": "$.groomPoll.Status",
-              "status_details.$": "$.groomPoll.StatusDetails",
+              "issue_filter.$": "$.launchDecision.issue_filter",
               "retry_count.$": "$.retry_count",
               "max_retries.$": "$.max_retries",
-              "command_id.$": "$.groomLaunch.Payload.groom.command_id",
-              "instance_id.$": "$.groomLaunch.Payload.groom.instance_id"
+              "last_error.$": "$.timeoutError"
             },
             "ResultPath": "$.error",
             "Next": "HandleFailure"
@@ -334,7 +324,21 @@
                 "ResultPath": "$.failure_notify_error"
               }
             ],
-            "Next": "FailExecution"
+            "Next": "FailExecution",
+            "TimeoutSeconds": 60
+          },
+          "GroomLaunchStateUnknown": {
+            "Type": "Pass",
+            "Comment": "config-I4333: the task-token callback returned but its payload carries no groom.launched flag \u2014 the box called send-task-success with an unrecognised shape. Distinct from the retries-exhausted path above: this one has $.callbackOutput and no $.timeoutError, so it needs its own terminal rather than sharing one whose Parameters cannot resolve here (groom-sweep-policy \u00a72.2).",
+            "Parameters": {
+              "source": "groom_status",
+              "reason": "callback_payload_missing_launch_flag",
+              "issue_filter.$": "$.launchDecision.issue_filter",
+              "retry_count.$": "$.retry_count",
+              "callback.$": "$.callbackOutput"
+            },
+            "ResultPath": "$.error",
+            "Next": "HandleFailure"
           }
         }
       },
@@ -421,7 +425,8 @@
           "ResultPath": "$.sweep_notify_error"
         }
       ],
-      "Next": "CheckMapLaunchOutcome"
+      "Next": "CheckMapLaunchOutcome",
+      "TimeoutSeconds": 60
     },
     "CheckMapLaunchOutcome": {
       "Type": "Choice",
@@ -464,12 +469,14 @@
           "ResultPath": "$.failure_notify_error"
         }
       ],
-      "Next": "DecideFailExecution"
+      "Next": "DecideFailExecution",
+      "TimeoutSeconds": 60
     },
     "DecideFailExecution": {
       "Type": "Fail",
       "Error": "GroomDispatchFailure",
       "Cause": "Backlog groom dispatch failed during the decide phase \u2014 see the SNS alert / Lambda logs for detail."
     }
-  }
+  },
+  "TimeoutSeconds": 72000
 }

@@ -76,8 +76,20 @@ def _make_clients(*, describe=None, history=None, existing=None, put=None):
     if put is not None:
         s3.put_object.side_effect = put
 
-    def factory(name, region_name=None):
-        return sf if name == "stepfunctions" else s3
+    # I4510: with M2_DISPATCH_TARGET defaulting to `overseer`, the dispatch path
+    # now calls boto3.client("lambda", region_name=..., config=...) and invokes
+    # the router. Accept **kwargs (the `config=` the real call passes) and hand
+    # back a lambda mock whose invoke reports a normal async 202 — otherwise
+    # every test silently took a TypeError down the error branch.
+    lam = MagicMock()
+    lam.invoke.return_value = {"StatusCode": 202}
+
+    def factory(name, region_name=None, **_kwargs):
+        if name == "stepfunctions":
+            return sf
+        if name == "lambda":
+            return lam
+        return s3
 
     return factory, sf, s3
 
@@ -87,6 +99,41 @@ def reset_notify(monkeypatch):
     mock = MagicMock(return_value=True)
     monkeypatch.setattr(index, "notify_via_flow_doctor", mock)
     yield mock
+
+
+def pytest_configure(config):  # noqa: D401 — pytest hook
+    config.addinivalue_line(
+        "markers",
+        "listener_semantics: exercise the I4510 mode-aware has_listener rules "
+        "instead of the pre-I4510 always-True weekday/EOD behaviour",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _legacy_weekday_listener(request, monkeypatch):
+    """Preserve pre-I4510 behaviour for the many tests that use the weekday/EOD
+    ARN merely as a VEHICLE for some other behaviour — fast-path fallback,
+    preflight context, over-suppression, the 2026-07-18 shepherd ruling.
+
+    I4510 made weekday/EOD honestly `has_listener: False` on the
+    repository_dispatch path, which would otherwise turn all of those into
+    `no_listener` declines and stop testing what they were written to test.
+    Pinning the flag here keeps their intent intact and confines the semantic
+    change to the tests that actually assert it, which opt in with
+    @pytest.mark.listener_semantics.
+    """
+    if request.node.get_closest_marker("listener_semantics"):
+        return
+    # Routing mode: the CODE default is now `overseer` (I2830, applied
+    # 2026-07-27), but the great majority of this suite was written against the
+    # legacy repository_dispatch path — it asserts the urlopen POST, the
+    # `no_listener` decline, the weekday event_type, and so on. Pin the legacy
+    # mode by default so those keep testing what they were written to test;
+    # tests that assert the NEW default or the overseer path opt out with
+    # @pytest.mark.listener_semantics (or set the mode explicitly themselves).
+    monkeypatch.setattr(index, "M2_DISPATCH_TARGET", "repository_dispatch", raising=False)
+    for pipeline in ("ne-preopen-trading-pipeline", "ne-postclose-trading-pipeline"):
+        monkeypatch.setitem(index.PIPELINES[pipeline], "has_listener", True)
 
 
 def test_failed_writes_watch_log_and_returns_state():
@@ -352,7 +399,14 @@ def test_dispatch_enabled_fires_repository_dispatch(monkeypatch):
 
 
 def test_dispatch_routes_weekday_event_type(monkeypatch):
-    """A weekday failure dispatches the weekday-sf-failure event type + payload."""
+    """A weekday failure dispatches the weekday-sf-failure event type + payload.
+
+    alpha-engine-config-I4510: weekday now carries has_listener=False on the
+    repository_dispatch path (sf-watch.yml gates its job to Saturday only), so
+    this test must force the legacy flag on to exercise the routing itself.
+    The listener SEMANTICS are covered separately below.
+    """
+    monkeypatch.setitem(index.PIPELINES["ne-preopen-trading-pipeline"], "has_listener", True)
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
     monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
     sent = {}
@@ -433,8 +487,8 @@ def test_no_listener_pipeline_never_dispatches_even_when_globally_enabled(monkey
 
 
 def test_saturday_still_dispatches_when_enabled(monkeypatch):
-    """Non-regression: the has_listener plumbing must not change behavior for
-    the 3 trading pipelines, which all default has_listener=True."""
+    """Non-regression: Saturday — the one pipeline with a live GHA listener —
+    still dispatches unchanged after I4510 made has_listener mode-aware."""
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
     monkeypatch.setattr(index, "_get_github_pat", lambda: "ghp_fake")
     monkeypatch.setattr(index.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp())
@@ -1514,20 +1568,110 @@ def test_m2_overseer_invoke_failure_is_nonfatal(monkeypatch):
     assert "router down" in result["agent_dispatch"]["error"]
 
 
-def test_m2_default_target_still_uses_repository_dispatch(monkeypatch):
-    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
-    assert index.M2_DISPATCH_TARGET == "repository_dispatch"
-    factory, sf, s3, lam, lambda_configs = _make_clients_with_lambda()
-    monkeypatch.setattr(index, "_get_github_pat", MagicMock(return_value="pat"))
-    resp_cm = MagicMock()
-    resp_cm.__enter__ = MagicMock(return_value=MagicMock(status=204))
-    resp_cm.__exit__ = MagicMock(return_value=False)
-    with patch("index.boto3.client", side_effect=factory), patch(
-        "index.urllib.request.urlopen", return_value=resp_cm
-    ) as urlopen:
-        result = index.handler(_event("FAILED"), None)
+@pytest.mark.listener_semantics
+def test_m2_default_target_is_overseer():
+    """alpha-engine-config-I2830, applied 2026-07-27.
 
+    Was `test_m2_default_target_still_uses_repository_dispatch`, which asserted
+    the constant AND that the default produced a GitHub POST. That composite
+    intent no longer holds, and the routing half is already covered by
+    `test_dispatch_enabled_fires_repository_dispatch` (which pins the mode
+    explicitly). This asserts only the constant.
+
+    The old default outlived its purpose and became the bug: the flag was
+    flipped live, a redeploy raced preserve_env_flag and wrote its stale map
+    back, and routing silently reverted — the very next EOD failure recorded
+    action=observe."""
+    assert index.M2_DISPATCH_TARGET == "overseer"
+
+
+# ── I4510: mode-aware listener semantics ─────────────────────────────────────
+
+
+@pytest.mark.listener_semantics
+def test_weekday_does_not_dispatch_on_repository_dispatch_path(monkeypatch):
+    """The defect this closes: a weekday failure POSTed a repository_dispatch
+    that GitHub accepted (204) and no job consumed, while Telegram claimed
+    "autonomous fix ACTIVE". sf-watch.yml gates its dispatch job to
+    saturday-sf-failure only (config#2004), so weekday has no listener here."""
+    monkeypatch.setattr(index, "M2_DISPATCH_TARGET", "repository_dispatch")
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    called = []
+    monkeypatch.setattr(index, "_get_github_pat", lambda: called.append("pat") or "ghp_fake")
+    factory, _, _ = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+    assert result["agent_dispatch"] == {"dispatched": False, "reason": "no_listener"}
+    assert not called, "must not even mint a PAT for a dispatch nothing consumes"
+
+
+@pytest.mark.listener_semantics
+def test_weekday_DOES_dispatch_in_overseer_mode(monkeypatch):
+    """Flipping M2_DISPATCH_TARGET to `overseer` is the single action that
+    enables weekday/EOD coverage: the router dispatches by PLAYBOOK, not by
+    event type, so it is a live listener for every pipeline — no GHA gate
+    edit, per the standing direction to cede sf-watch dispatch to the
+    Overseer."""
+    monkeypatch.setattr(index, "M2_DISPATCH_TARGET", "overseer")
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    factory, _, _ = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
     assert result["agent_dispatch"]["dispatched"] is True
-    assert result["agent_dispatch"].get("target") != "overseer"
-    urlopen.assert_called_once()
-    lam.invoke.assert_not_called()
+    assert result["agent_dispatch"]["target"] == "overseer"
+
+
+@pytest.mark.listener_semantics
+def test_watch_log_records_the_real_listener_state(monkeypatch):
+    """The watch-log record itself was false on 2026-07-27: has_listener:true
+    and action:"dispatch" for a weekday failure nothing could consume. The
+    audit trail must not assert a dispatch that cannot happen."""
+    monkeypatch.setattr(index, "M2_DISPATCH_TARGET", "repository_dispatch")
+    monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
+    factory, _sf, s3 = _make_clients()
+    with patch("index.boto3.client", side_effect=factory):
+        index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+    body = json.loads(s3.put_object.call_args.kwargs["Body"])
+    ev = body["events"][-1]
+    assert ev["has_listener"] is False
+    assert ev["action"] == "observe"
+
+
+@pytest.mark.listener_semantics
+def test_has_listener_helper_modes():
+    saturday = index.PIPELINES["ne-weekly-freshness-pipeline"]
+    weekday = index.PIPELINES["ne-preopen-trading-pipeline"]
+    with patch.object(index, "M2_DISPATCH_TARGET", "repository_dispatch"):
+        assert index._has_listener(saturday) is True
+        assert index._has_listener(weekday) is False
+    with patch.object(index, "M2_DISPATCH_TARGET", "overseer"):
+        assert index._has_listener(saturday) is True
+        assert index._has_listener(weekday) is True
+
+
+def test_m2_default_is_overseer_in_code_and_deploy():
+    """LOCKSTEP: index.py's fallback and BOTH deploy.sh defaults (create-function
+    and preserve_env_flag) must agree.
+
+    Three independent places encode this routing mode. The 2026-07-27 incident
+    was exactly a disagreement between them — the live env said `overseer`,
+    deploy.sh's preserve fallback said `repository_dispatch`, and the deploy
+    won. Pinning all three together is what makes the routing survive its own
+    deploy."""
+    import re
+    from pathlib import Path
+
+    here = Path(__file__).resolve().parent
+    src = (here / "index.py").read_text(encoding="utf-8")
+    m = re.search(r'M2_DISPATCH_TARGET = os\.environ\.get\(\s*"M2_DISPATCH_TARGET",\s*"([a-z_]+)"', src)
+    assert m and m.group(1) == "overseer", "index.py fallback must default to overseer"
+
+    deploy = (here / "deploy.sh").read_text(encoding="utf-8")
+    assert "M2_DISPATCH_TARGET=overseer," in deploy, (
+        "deploy.sh create-function default must be overseer"
+    )
+    assert re.search(r'preserve_env_flag[^\n]*M2_DISPATCH_TARGET overseer', deploy), (
+        "deploy.sh preserve_env_flag fallback must be overseer — this is the value "
+        "a redeploy lands on when the live read races or returns empty, i.e. the "
+        "one that actually clobbered the manual flip"
+    )

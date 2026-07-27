@@ -165,6 +165,8 @@ BACKTESTER_REPO = os.environ.get("WEEKLY_SPOT_BACKTESTER_REPO", "nousergon/cruci
 BACKTESTER_BRANCH = os.environ.get("WEEKLY_SPOT_BACKTESTER_BRANCH", "main")
 DASHBOARD_REPO = os.environ.get("WEEKLY_SPOT_DASHBOARD_REPO", "nousergon/crucible-dashboard")
 DASHBOARD_BRANCH = os.environ.get("WEEKLY_SPOT_DASHBOARD_BRANCH", "main")
+PREDICTOR_REPO = os.environ.get("WEEKLY_SPOT_PREDICTOR_REPO", "nousergon/crucible-predictor")
+PREDICTOR_BRANCH = os.environ.get("WEEKLY_SPOT_PREDICTOR_BRANCH", "main")
 
 # alpha-engine-config is private; the box reads the fleet PAT from SSM via its
 # instance profile — same pattern data-spot-dispatcher/scheduled-groom-
@@ -249,13 +251,31 @@ rm -rf /home/ec2-user/alpha-engine-backtester
 git clone --depth 1 --branch {BACKTESTER_BRANCH} \\
   "https://x-access-token:${{PAT}}@github.com/{BACKTESTER_REPO}.git" \\
   /home/ec2-user/alpha-engine-backtester || fail "alpha-engine-backtester clone failed"
+echo "[weekly-freshness-spot-bootstrap] cloning alpha-engine-predictor..."
+rm -rf /home/ec2-user/alpha-engine-predictor
+git clone --depth 1 --branch {PREDICTOR_BRANCH} \\
+  "https://x-access-token:${{PAT}}@github.com/{PREDICTOR_REPO}.git" \\
+  /home/ec2-user/alpha-engine-predictor || fail "alpha-engine-predictor clone failed"
 echo "[weekly-freshness-spot-bootstrap] cloning alpha-engine-dashboard..."
 rm -rf /home/ec2-user/alpha-engine-dashboard
 git clone --depth 1 --branch {DASHBOARD_BRANCH} \\
   "https://x-access-token:${{PAT}}@github.com/{DASHBOARD_REPO}.git" \\
   /home/ec2-user/alpha-engine-dashboard || fail "alpha-engine-dashboard clone failed"
 chown -R ec2-user:ec2-user /home/ec2-user/alpha-engine-data /home/ec2-user/alpha-engine-config \\
-  /home/ec2-user/alpha-engine-backtester /home/ec2-user/alpha-engine-dashboard || fail "chown failed"
+  /home/ec2-user/alpha-engine-backtester /home/ec2-user/alpha-engine-dashboard \\
+  /home/ec2-user/alpha-engine-predictor || fail "chown failed"
+# crucible-backtester's config.yaml is gitignored (the .example pattern), and
+# spot_backtest.sh hard-exits without it: "ERROR: config.yaml not found".
+# The canonical provisioning is a symlink into alpha-engine-config's TRACKED
+# backtester/config.yaml -- the same shape the long-lived dashboard box has
+# carried by hand since 2026-04-11, and the shape spot_backtest.sh's own
+# pre-launch check expects (it warns when the target is NOT inside a git repo,
+# because operator flags outside version control have no audit trail).
+# Without this, every backtest-family stage dies on a freshly-built box.
+echo "[weekly-freshness-spot-bootstrap] linking backtester config.yaml..."
+ln -sfn /home/ec2-user/alpha-engine-config/backtester/config.yaml \\
+  /home/ec2-user/alpha-engine-backtester/config.yaml || fail "config.yaml symlink failed"
+chown -h ec2-user:ec2-user /home/ec2-user/alpha-engine-backtester/config.yaml || fail "config.yaml chown failed"
 echo "[weekly-freshness-spot-bootstrap] building alpha-engine-dashboard venv..."
 cd /home/ec2-user/alpha-engine-dashboard
 "$PYTHON_BIN" -m venv .venv || fail "venv create failed"

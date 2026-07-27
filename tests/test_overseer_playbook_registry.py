@@ -276,49 +276,6 @@ def test_watch_plane_covers_all_four_router_scheduler_schedules():
     }
 
 
-# ── Cadence-based liveness coverage (alpha-engine-config#4474) ──────────────
-
-
-_EVENT_DRIVEN_PATTERNS = ("event-driven only", "no scheduled wake")
-
-
-def test_every_cadenced_playbook_has_run_window_or_invocation_success():
-    """alpha-engine-config#4474: Every playbook with a scheduled (non-event-
-    driven) cadence MUST declare either a ``run_window`` liveness check or
-    an ``sf_watch_invocation_success`` check. A cadenced trigger with no
-    artifact-accounting check means a silent death is invisible — exactly
-    the wiring-vs-invocation gap this queue already fixed for sf-watch
-    (I2901) and groom (config#2414/#2667) and is now generalizing.
-
-    ``cadence`` strings matching ``_EVENT_DRIVEN_PATTERNS`` are exempt: they
-    have no scheduled wake to miss. ``trigger_type: github_actions_cron``
-    entries are also exempt: they have no Lambda (the run_window check is
-    only meaningful for Lambda-backed entries)."""
-    for name, spec in REGISTRY["playbooks"].items():
-        cadence = spec.get("cadence", "")
-        if any(p in cadence for p in _EVENT_DRIVEN_PATTERNS):
-            continue  # event-driven only — no scheduled wake to miss
-        if spec.get("trigger_type") == "github_actions_cron":
-            continue  # GHA cron — no Lambda, no run_window/invocation check
-
-        liveness = spec.get("liveness")
-        assert liveness and liveness.get("checks"), (
-            f"playbook {name!r}: cadence {cadence!r} indicates a scheduled "
-            f"trigger but has no liveness block — add a run_window or "
-            f"sf_watch_invocation_success check so the probe can detect "
-            f"silent deaths"
-        )
-        check_types = {c["type"] for c in liveness["checks"]}
-        has_window = "run_window" in check_types
-        has_invocation = "sf_watch_invocation_success" in check_types
-        assert has_window or has_invocation, (
-            f"playbook {name!r}: cadence {cadence!r} requires either a "
-            f"run_window or sf_watch_invocation_success check in its "
-            f"liveness block — lambda_active alone cannot distinguish 'alive "
-            f"dispatcher' from 'working agent'"
-        )
-
-
 # ── model/wake/cadence declaration (config-I3293) ────────────────────────────
 
 
@@ -366,6 +323,38 @@ def test_drain_wake_names_all_four_schedules():
         hour_token = sched.rsplit("-", 1)[-1]  # e.g. '0400utc'
         assert hour_token in wake_text, (
             f"drain schedule {sched} not reflected in the wake declaration"
+        )
+
+
+# ── cadence liveness coverage (config#4474) ───────────────────────────────────
+
+
+def test_every_cadenced_playbook_has_run_window_or_invocation_success():
+    """Every Lambda-backed playbook with a non-event-driven cadence string
+    MUST declare either a ``run_window`` or ``sf_watch_invocation_success``
+    liveness check — a mature trigger with no covering check is a silent
+    outage. Entries with ``trigger_type: github_actions_cron`` have no
+    Lambda/run-artifact surface. Entries whose cadence explicitly documents
+    a sibling probe (``liveness tick``/``probe`` in the cadence string) are
+    exempt — the sibling is their coverage. (config#4474, overseer
+    conformance audit 2026-07-27.)"""
+    for name, spec in REGISTRY["playbooks"].items():
+        if spec.get("trigger_type") == "github_actions_cron":
+            continue
+        cadence = spec.get("cadence")
+        if not cadence or "event-driven" in cadence:
+            continue
+        # Exempt: cadence documents a sibling liveness probe (not a
+        # run_window but independently covered, e.g. canary-replay).
+        if "liveness tick" in cadence or "probe" in cadence:
+            continue
+        checks = spec.get("liveness", {}).get("checks", [])
+        check_types = [c["type"] for c in checks]
+        assert "run_window" in check_types or "sf_watch_invocation_success" in check_types, (
+            f"playbook {name!r} has a non-event-driven cadence "
+            f"({cadence!r}) but no run_window or invocation_success "
+            f"liveness check — add one or annotate the cadence with "
+            f"the coverage mechanism"
         )
 
 
@@ -447,3 +436,85 @@ def test_registry_model_passes_its_executor_validator():
         )
         checked += 1
     assert checked >= 3, f"expected >=3 routed playbooks with models, checked {checked}"
+
+
+# Fleet ROUTING-TIER suffixes. These are LiteLLM/registry group aliases
+# (LLM_MODEL_REGISTRY ids like `deepseek-v4-pro-max`, whose own `model:` field
+# resolves to the real provider name `deepseek-v4-pro`). They are NOT provider
+# API model names.
+_ROUTING_ALIAS_SUFFIXES = ("-max", "-low", "-mid", "-high")
+
+
+@pytest.mark.parametrize(
+    "name",
+    sorted(k for k, v in REGISTRY["playbooks"].items() if v.get("routed") and v.get("model")),
+)
+def test_registry_model_is_a_provider_name_not_a_routing_alias(name):
+    """A routed playbook's `model` is passed STRAIGHT to `claude -p --model` on
+    the spot box, which talks directly to the provider through the local egress
+    proxy — there is no LiteLLM hop to resolve a fleet routing alias.
+
+    alpha-engine-config-I4471: alert-drain shipped `deepseek-v4-pro-max` (a
+    registry TIER id, not an API model) and every run died on
+
+        400 The supported API model names are deepseek-v4-pro or
+        deepseek-v4-flash, but you passed deepseek-v4-pro-max.
+
+    The alias resolves to `deepseek-v4-pro` in LLM_MODEL_REGISTRY, but nothing
+    performed that resolution on this path.
+    """
+    model = REGISTRY["playbooks"][name]["model"]
+    bad = [s for s in _ROUTING_ALIAS_SUFFIXES if model.endswith(s)]
+    assert not bad, (
+        f"routed playbook {name!r} declares model {model!r}, which ends in the "
+        f"routing-tier suffix {bad[0]!r} — that is a fleet registry ALIAS, not a "
+        f"provider API model name. The spot box passes this value directly to "
+        f"the provider and the call will 400. Use the resolved provider model "
+        f"(e.g. 'deepseek-v4-pro')."
+    )
+
+
+def test_every_registry_bundling_lambda_redeploys_on_registry_change():
+    """LOCKSTEP: if a Lambda's deploy.sh BUNDLES playbooks.yaml into its zip,
+    that Lambda's deploy workflow must be path-triggered on the registry too.
+
+    Otherwise a registry-only edit deploys nothing and the live Lambda keeps
+    running on a stale copy — silently. That is exactly what happened on
+    2026-07-27: #1064 fixed alert-drain's model in the registry; the liveness
+    probe redeployed (its filter listed the registry) but the ROUTER did not
+    (its filter listed only its own lambda dir), so the router kept injecting
+    the broken model and the drain stayed down.
+
+    The two existing `*_bundles_this_registry` tests pin the copy step; this
+    pins the trigger that makes the copy actually reach production.
+    """
+    workflows = REPO_ROOT / ".github" / "workflows"
+    checked = 0
+    for lambda_dir in sorted(LAMBDAS_DIR.iterdir()):
+        deploy_sh = lambda_dir / "deploy.sh"
+        if not deploy_sh.is_file():
+            continue
+        if "overseer/playbooks.yaml" not in deploy_sh.read_text(encoding="utf-8"):
+            continue
+        wf = workflows / f"deploy-{lambda_dir.name}.yml"
+        assert wf.is_file(), (
+            f"{lambda_dir.name}/deploy.sh bundles the registry but there is no "
+            f"{wf.name} to trigger a redeploy"
+        )
+        # Parse the YAML and read the ACTUAL push-paths list. A raw substring
+        # check would match an explanatory comment mentioning the path and pass
+        # even with the trigger missing (verified while writing this test).
+        wf_doc = yaml.safe_load(wf.read_text(encoding="utf-8"))
+        # PyYAML parses the bare key `on:` as the boolean True (YAML 1.1).
+        triggers = wf_doc.get("on", wf_doc.get(True)) or {}
+        paths = ((triggers.get("push") or {}).get("paths")) or []
+        assert "infrastructure/overseer/playbooks.yaml" in paths, (
+            f"{wf.name} push paths {paths} do not include "
+            f"'infrastructure/overseer/playbooks.yaml', but {lambda_dir.name}/deploy.sh "
+            f"BUNDLES that file — a registry-only change would leave this Lambda "
+            f"running a stale registry"
+        )
+        checked += 1
+    assert checked >= 2, (
+        f"expected >=2 registry-bundling lambdas (router + liveness probe), found {checked}"
+    )
