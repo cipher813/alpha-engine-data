@@ -16,6 +16,19 @@
       ]
     },
     {
+      "Sid": "SsmDiskProbeWeeklyFreshnessSpot",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:SendCommand"
+      ],
+      "Resource": "arn:aws:ec2:us-east-1:711398986525:instance/*",
+      "Condition": {
+        "StringLike": {
+          "ssm:resourceTag/Name": "alpha-engine-weekly-freshness-spot"
+        }
+      }
+    },
+    {
       "Sid": "Logs",
       "Effect": "Allow",
       "Action": [
