@@ -185,7 +185,7 @@ def _sibling_dispatcher_pipeline_names() -> set[str]:
 
 
 def test_sf_watch_liveness_pipelines_lockstep_with_dispatcher():
-    """REGRESSION GUARD (moved from sf-watch-liveness-probe's own test): the
+    """REGRESSION GUARD (moved from sf-watch-reclaim-sweep-handler's own test): the
     sf-watch playbook's liveness pipeline list (the eventbridge_rule
     ``expect_state_machines`` + ``state_machines_exist`` list — ONE YAML anchor)
     must exactly match saturday-sf-watch-dispatcher's PIPELINES registry. Drift
@@ -289,10 +289,20 @@ def test_every_routed_playbook_declares_model_wake_cadence():
     for name, spec in REGISTRY["playbooks"].items():
         if not spec.get("routed"):
             continue
-        assert spec.get("model", "").startswith("claude-"), (
+        assert spec.get("model"), (
             f"routed playbook {name!r} missing a registry-declared model "
             f"(config-I3293) — the run script's inline default would silently "
             f"become undeclared live config"
+        )
+        # alpha-engine-config-I4478: was `.startswith("claude-")`. That, the
+        # schema pattern, and each executor's `_MODEL_RE` all independently
+        # hardcoded Anthropic — four layers making it structurally impossible
+        # for the registry (the declared SSoT for "what model runs this agent")
+        # to express the fleet's own 2026-07-24 zero-Anthropic-model ruling.
+        assert not spec["model"].startswith(("claude-", "anthropic")), (
+            f"routed playbook {name!r} declares Anthropic model "
+            f"{spec['model']!r} — forbidden fleet-wide by the 2026-07-24 ruling "
+            f"(nous-ergon-ops/policies/llm-provider-model-policy.md)"
         )
         assert spec.get("wake"), f"routed playbook {name!r} missing wake declaration"
         assert spec.get("cadence"), f"routed playbook {name!r} missing cadence declaration"
@@ -313,6 +323,38 @@ def test_drain_wake_names_all_four_schedules():
         hour_token = sched.rsplit("-", 1)[-1]  # e.g. '0400utc'
         assert hour_token in wake_text, (
             f"drain schedule {sched} not reflected in the wake declaration"
+        )
+
+
+# ── cadence liveness coverage (config#4474) ───────────────────────────────────
+
+
+def test_every_cadenced_playbook_has_run_window_or_invocation_success():
+    """Every Lambda-backed playbook with a non-event-driven cadence string
+    MUST declare either a ``run_window`` or ``sf_watch_invocation_success``
+    liveness check — a mature trigger with no covering check is a silent
+    outage. Entries with ``trigger_type: github_actions_cron`` have no
+    Lambda/run-artifact surface. Entries whose cadence explicitly documents
+    a sibling probe (``liveness tick``/``probe`` in the cadence string) are
+    exempt — the sibling is their coverage. (config#4474, overseer
+    conformance audit 2026-07-27.)"""
+    for name, spec in REGISTRY["playbooks"].items():
+        if spec.get("trigger_type") == "github_actions_cron":
+            continue
+        cadence = spec.get("cadence")
+        if not cadence or "event-driven" in cadence:
+            continue
+        # Exempt: cadence documents a sibling liveness probe (not a
+        # run_window but independently covered, e.g. canary-replay).
+        if "liveness tick" in cadence or "probe" in cadence:
+            continue
+        checks = spec.get("liveness", {}).get("checks", [])
+        check_types = [c["type"] for c in checks]
+        assert "run_window" in check_types or "sf_watch_invocation_success" in check_types, (
+            f"playbook {name!r} has a non-event-driven cadence "
+            f"({cadence!r}) but no run_window or invocation_success "
+            f"liveness check — add one or annotate the cadence with "
+            f"the coverage mechanism"
         )
 
 
@@ -365,3 +407,114 @@ def test_known_bus_sources_have_rows():
                   "alpha-engine-backtester/optimizer/live_key_reconciliation.py",
                   "cloudwatch-alarm:*"):
         assert known in sources, f"known emitter {known!r} has no alert-class row"
+
+
+def test_registry_model_passes_its_executor_validator():
+    """LOCKSTEP: every routed playbook's declared `model` must actually be
+    accepted by the executor Lambda that receives it.
+
+    alpha-engine-config-I4478/I4516: the registry declared `claude-*` models
+    while the run scripts had migrated to DeepSeek, and each executor's
+    `_MODEL_RE` accepted ONLY `claude-*`. Nothing tied the three together, so
+    the drift was invisible until an agent died on a spot box at 04:00 UTC.
+    This test makes that class of drift a CI failure instead.
+    """
+    checked = 0
+    for name, spec in REGISTRY["playbooks"].items():
+        if not spec.get("routed") or not spec.get("model"):
+            continue
+        exec_dir = spec.get("executor_lambda_dir")
+        assert exec_dir, f"routed playbook {name!r} has no executor_lambda_dir"
+        src = (LAMBDAS_DIR / exec_dir / "index.py").read_text(encoding="utf-8")
+        m = re.search(r'_MODEL_RE\s*=\s*re\.compile\(r"([^"]+)"\)', src)
+        assert m, f"{exec_dir}/index.py has no _MODEL_RE to validate against"
+        assert re.compile(m.group(1)).match(spec["model"]), (
+            f"registry declares model {spec['model']!r} for playbook {name!r}, "
+            f"but {exec_dir}'s _MODEL_RE ({m.group(1)!r}) REJECTS it — the "
+            f"router would inject a value the executor refuses, and the agent "
+            f"never launches"
+        )
+        checked += 1
+    assert checked >= 3, f"expected >=3 routed playbooks with models, checked {checked}"
+
+
+# Fleet ROUTING-TIER suffixes. These are LiteLLM/registry group aliases
+# (LLM_MODEL_REGISTRY ids like `deepseek-v4-pro-max`, whose own `model:` field
+# resolves to the real provider name `deepseek-v4-pro`). They are NOT provider
+# API model names.
+_ROUTING_ALIAS_SUFFIXES = ("-max", "-low", "-mid", "-high")
+
+
+@pytest.mark.parametrize(
+    "name",
+    sorted(k for k, v in REGISTRY["playbooks"].items() if v.get("routed") and v.get("model")),
+)
+def test_registry_model_is_a_provider_name_not_a_routing_alias(name):
+    """A routed playbook's `model` is passed STRAIGHT to `claude -p --model` on
+    the spot box, which talks directly to the provider through the local egress
+    proxy — there is no LiteLLM hop to resolve a fleet routing alias.
+
+    alpha-engine-config-I4471: alert-drain shipped `deepseek-v4-pro-max` (a
+    registry TIER id, not an API model) and every run died on
+
+        400 The supported API model names are deepseek-v4-pro or
+        deepseek-v4-flash, but you passed deepseek-v4-pro-max.
+
+    The alias resolves to `deepseek-v4-pro` in LLM_MODEL_REGISTRY, but nothing
+    performed that resolution on this path.
+    """
+    model = REGISTRY["playbooks"][name]["model"]
+    bad = [s for s in _ROUTING_ALIAS_SUFFIXES if model.endswith(s)]
+    assert not bad, (
+        f"routed playbook {name!r} declares model {model!r}, which ends in the "
+        f"routing-tier suffix {bad[0]!r} — that is a fleet registry ALIAS, not a "
+        f"provider API model name. The spot box passes this value directly to "
+        f"the provider and the call will 400. Use the resolved provider model "
+        f"(e.g. 'deepseek-v4-pro')."
+    )
+
+
+def test_every_registry_bundling_lambda_redeploys_on_registry_change():
+    """LOCKSTEP: if a Lambda's deploy.sh BUNDLES playbooks.yaml into its zip,
+    that Lambda's deploy workflow must be path-triggered on the registry too.
+
+    Otherwise a registry-only edit deploys nothing and the live Lambda keeps
+    running on a stale copy — silently. That is exactly what happened on
+    2026-07-27: #1064 fixed alert-drain's model in the registry; the liveness
+    probe redeployed (its filter listed the registry) but the ROUTER did not
+    (its filter listed only its own lambda dir), so the router kept injecting
+    the broken model and the drain stayed down.
+
+    The two existing `*_bundles_this_registry` tests pin the copy step; this
+    pins the trigger that makes the copy actually reach production.
+    """
+    workflows = REPO_ROOT / ".github" / "workflows"
+    checked = 0
+    for lambda_dir in sorted(LAMBDAS_DIR.iterdir()):
+        deploy_sh = lambda_dir / "deploy.sh"
+        if not deploy_sh.is_file():
+            continue
+        if "overseer/playbooks.yaml" not in deploy_sh.read_text(encoding="utf-8"):
+            continue
+        wf = workflows / f"deploy-{lambda_dir.name}.yml"
+        assert wf.is_file(), (
+            f"{lambda_dir.name}/deploy.sh bundles the registry but there is no "
+            f"{wf.name} to trigger a redeploy"
+        )
+        # Parse the YAML and read the ACTUAL push-paths list. A raw substring
+        # check would match an explanatory comment mentioning the path and pass
+        # even with the trigger missing (verified while writing this test).
+        wf_doc = yaml.safe_load(wf.read_text(encoding="utf-8"))
+        # PyYAML parses the bare key `on:` as the boolean True (YAML 1.1).
+        triggers = wf_doc.get("on", wf_doc.get(True)) or {}
+        paths = ((triggers.get("push") or {}).get("paths")) or []
+        assert "infrastructure/overseer/playbooks.yaml" in paths, (
+            f"{wf.name} push paths {paths} do not include "
+            f"'infrastructure/overseer/playbooks.yaml', but {lambda_dir.name}/deploy.sh "
+            f"BUNDLES that file — a registry-only change would leave this Lambda "
+            f"running a stale registry"
+        )
+        checked += 1
+    assert checked >= 2, (
+        f"expected >=2 registry-bundling lambdas (router + liveness probe), found {checked}"
+    )
