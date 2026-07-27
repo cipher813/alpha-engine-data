@@ -465,3 +465,79 @@ def test_main_no_alert_flag_suppresses_alert_even_on_drift(cd, monkeypatch, fake
     monkeypatch.setattr("sys.argv", ["check-definition-drift.py", "--no-alert"])
     assert cd.main() == 1
     assert fake_nousergon_lib_alerts == []
+
+
+# ── stale-checkout guard (2026-07-27) ───────────────────────────────────────
+#
+# A checkout 9 commits behind origin produced four confident findings — an
+# alleged 18-state divergence in the weekly trading pipeline — that were
+# entirely the local delta. Live, S3 and origin/main all agreed. This script
+# compares REPO bytes to live, so stale repo bytes yield confident false drift.
+
+
+def test_stale_note_names_every_stale_file_and_the_fix(cd):
+    note = cd.stale_checkout_note(
+        ["infrastructure/step_function.json",
+         "infrastructure/step_function_eod.json"])
+    assert "STALE" in note
+    assert "infrastructure/step_function.json" in note
+    assert "infrastructure/step_function_eod.json" in note
+    assert "git pull" in note
+    # Must say the finding may be the CHECKOUT, not the deployment — that is
+    # the whole point of the note.
+    assert "may be your checkout" in note
+
+
+def test_stale_note_respects_a_non_default_upstream(cd):
+    note = cd.stale_checkout_note(["a.json"], upstream="origin/release")
+    assert "origin/release" in note
+
+
+def test_no_stale_files_when_working_tree_matches_upstream(cd, monkeypatch):
+    def fake_git(*args):
+        if args[0] == "rev-parse" and "--is-inside-work-tree" in args:
+            return "true"
+        if args[0] == "hash-object":
+            return "deadbeef"
+        if args[0] == "rev-parse":
+            return "deadbeef"          # upstream blob == working tree blob
+        return None
+    monkeypatch.setattr(cd, "_git", fake_git)
+    assert cd.stale_definition_files(cd.SF_DEFINITIONS) == []
+
+
+def test_stale_files_detected_when_blobs_differ(cd, monkeypatch):
+    def fake_git(*args):
+        if args[0] == "rev-parse" and "--is-inside-work-tree" in args:
+            return "true"
+        if args[0] == "rev-parse" and "--abbrev-ref" in args:
+            return "origin/main"
+        if args[0] == "hash-object":
+            return "local-sha"
+        if args[0] == "rev-parse":
+            return "remote-sha"
+        return None
+    monkeypatch.setattr(cd, "_git", fake_git)
+    stale = cd.stale_definition_files(cd.SF_DEFINITIONS)
+    assert stale, "differing blobs must be reported as stale"
+    assert stale == sorted(set(stale)), "output must be sorted + deduped"
+
+
+def test_no_note_outside_a_git_checkout(cd, monkeypatch):
+    """CI images and vendored copies are not always git checkouts — an
+    unknown answer must degrade to 'no note', never to a crash."""
+    monkeypatch.setattr(cd, "_git", lambda *a: None)
+    assert cd.stale_definition_files(cd.SF_DEFINITIONS) == []
+
+
+def test_git_helper_never_raises_when_git_is_missing(cd, monkeypatch):
+    def boom(*a, **k):
+        raise OSError("git not found")
+    monkeypatch.setattr(cd.subprocess, "run", boom)
+    assert cd._git("rev-parse", "HEAD") is None
+
+
+def test_git_helper_returns_none_on_nonzero_exit(cd, monkeypatch):
+    monkeypatch.setattr(cd.subprocess, "run",
+                        lambda *a, **k: MagicMock(returncode=1, stdout="x"))
+    assert cd._git("rev-parse", "nope") is None
