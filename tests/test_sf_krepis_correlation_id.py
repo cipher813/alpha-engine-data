@@ -44,7 +44,11 @@ _SF_DEFINITIONS = [
 ]
 
 _KREPIS_CALL = "ssm_log_capture run"
-_STATES_FORMAT = re.compile(r"States\.Format\('((?:[^'\\]|\\.)*)'((?:,\s*[^,()]+)*)\)")
+# NOTE: no `\s*` after the comma — `[^,()]+` already matches spaces, and having
+# both makes the argument-list group ambiguous, which CodeQL correctly flags as
+# exponential backtracking (py/redos). Leading whitespace on each argument is
+# stripped in code instead.
+_STATES_FORMAT = re.compile(r"States\.Format\('((?:[^'\\]|\\.)*)'((?:,[^,()]+)*)\)")
 
 
 def _iter_command_sites(node, definition: str, path: str = ""):
