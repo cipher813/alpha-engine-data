@@ -1,0 +1,108 @@
+"""The weekly spot bootstrap must clone every repo the SF actually uses.
+
+Bug class this guards (found by the 2026-07-27 post-#975 rehearsal): the
+per-execution launcher box's bootstrap cloned four repos —
+``alpha-engine-{data,config,backtester,dashboard}`` — while the weekly SF's
+command strings ``cd`` into **five**. ``alpha-engine-predictor`` was never
+cloned, so `PredictorTraining` died at launch:
+
+    fatal: cannot change to '/home/ec2-user/alpha-engine-predictor':
+    No such file or directory
+    failed to run commands: exit status 128
+
+That took out the whole predictor arm — `PredictorTraining`, `ResolveZooSpecs`,
+`TrainSpecDispatch`, `ModelZooSelect`, and therefore the live-champion
+promotion.
+
+It was invisible before #975 because the long-lived dashboard box had all five
+repos provisioned by hand years of runs ago. Only a box built from scratch
+exposes the gap — which is exactly why the rehearsal exists, and why pinning
+the invariant in CI matters more than fixing the one missing clone.
+
+The assertion is derived from BOTH sides — the SF definition's own command
+strings and the dispatcher's bootstrap script — so adding a stage that uses a
+sixth repo fails here rather than at 02:00 on a Saturday.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SF_JSON = _REPO_ROOT / "infrastructure" / "step_function.json"
+_DISPATCHER = (
+    _REPO_ROOT
+    / "infrastructure"
+    / "lambdas"
+    / "weekly-freshness-spot-dispatcher"
+    / "index.py"
+)
+
+# Checkout paths under /home/ec2-user that the bootstrap creates.
+_CHECKOUT_RE = re.compile(r"/home/ec2-user/(alpha-engine-[a-z-]+)")
+
+
+def _repos_the_sf_uses() -> set[str]:
+    """Every alpha-engine-* checkout path referenced by an SF command string."""
+    doc = json.loads(_SF_JSON.read_text(encoding="utf-8"))
+    found: set[str] = set()
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            for key, val in node.items():
+                if key == "commands.$" and isinstance(val, str):
+                    found.update(_CHECKOUT_RE.findall(val))
+                else:
+                    walk(val)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(doc)
+    return found
+
+
+def _repos_the_bootstrap_clones() -> set[str]:
+    """Every checkout path the dispatcher's bootstrap script git-clones."""
+    src = _DISPATCHER.read_text(encoding="utf-8")
+    # Each clone ends with the destination path on its own continuation line.
+    return set(re.findall(r"/home/ec2-user/(alpha-engine-[a-z-]+) \|\| fail", src))
+
+
+def test_sf_references_at_least_one_repo():
+    """Guard the guard — a broken walker must not silently pass."""
+    assert _repos_the_sf_uses(), "no alpha-engine-* checkout paths found in the SF"
+
+
+def test_bootstrap_clones_every_repo_the_sf_uses():
+    used = _repos_the_sf_uses()
+    cloned = _repos_the_bootstrap_clones()
+    missing = used - cloned
+    assert not missing, (
+        f"the weekly SF cds into {sorted(missing)} but the launcher-box bootstrap "
+        f"never clones {'it' if len(missing) == 1 else 'them'}. Every stage using "
+        f"{'that repo' if len(missing) == 1 else 'those repos'} will die with "
+        f"\"cannot change to ...: No such file or directory\" (exit 128) on a "
+        f"freshly-launched box. Add the clone (and the chown) in "
+        f"infrastructure/lambdas/weekly-freshness-spot-dispatcher/index.py. "
+        f"SF uses {sorted(used)}; bootstrap clones {sorted(cloned)}."
+    )
+
+
+def test_every_cloned_repo_is_chowned_to_ec2_user():
+    """A clone the box cannot write to is as broken as a missing one.
+
+    The bootstrap runs as root; every stage runs as ec2-user and does a
+    ``git pull``, which needs write access to the checkout.
+    """
+    src = _DISPATCHER.read_text(encoding="utf-8")
+    chown_block = re.search(r"chown -R ec2-user:ec2-user(.*?)\|\| fail", src, re.S)
+    assert chown_block, "bootstrap has no chown block"
+    chowned = set(_CHECKOUT_RE.findall(chown_block.group(1)))
+    missing = _repos_the_bootstrap_clones() - chowned
+    assert not missing, (
+        f"{sorted(missing)} cloned but never chowned to ec2-user — stages run as "
+        f"ec2-user and `git pull` needs write access"
+    )
