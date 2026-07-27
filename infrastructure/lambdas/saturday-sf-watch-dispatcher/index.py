@@ -174,7 +174,12 @@ DISPATCH_REPO = os.environ.get("DISPATCH_REPO", "nousergon/alpha-engine-config")
 # OPERATOR-OWNED runtime flag like AGENT_DISPATCH_ENABLED (deploy.sh preserves
 # it across redeploys). Flip gated on the reshaped weekly SF's first live run
 # (gate:weekly-sf) — see alpha-engine-config-I2823.
-M2_DISPATCH_TARGET = os.environ.get("M2_DISPATCH_TARGET", "repository_dispatch")
+# alpha-engine-config-I2830 (applied 2026-07-27): default is `overseer`.
+# The router dispatches by PLAYBOOK rather than event type, so it listens for
+# all three pipelines — this default is what gives weekday/EOD SF coverage,
+# with no sf-watch.yml gate edit. Kept in lockstep with deploy.sh's two
+# defaults (pinned by test_m2_default_is_overseer_in_code_and_deploy).
+M2_DISPATCH_TARGET = os.environ.get("M2_DISPATCH_TARGET", "overseer")
 OVERSEER_FUNCTION = os.environ.get("OVERSEER_FUNCTION", "alpha-engine-overseer-dispatcher")
 # Dedicated fine-grained PAT (SecureString) scoped to the SF-path repos, shared
 # across pipelines. Read at dispatch time only — never logged.

@@ -1560,9 +1560,14 @@ def test_m2_overseer_invoke_failure_is_nonfatal(monkeypatch):
     assert "router down" in result["agent_dispatch"]["error"]
 
 
-def test_m2_default_target_still_uses_repository_dispatch(monkeypatch):
+def test_m2_default_target_is_overseer(monkeypatch):
+    """alpha-engine-config-I2830, applied 2026-07-27. Was pinned to
+    `repository_dispatch` as a safe-rollout default. That default outlived its
+    purpose and became the bug: the flag was flipped live, a redeploy raced
+    preserve_env_flag and wrote its stale map back, and routing silently
+    reverted — the next EOD failure recorded action=observe."""
     monkeypatch.setattr(index, "AGENT_DISPATCH_ENABLED", True)
-    assert index.M2_DISPATCH_TARGET == "repository_dispatch"
+    assert index.M2_DISPATCH_TARGET == "overseer"
     factory, sf, s3, lam, lambda_configs = _make_clients_with_lambda()
     monkeypatch.setattr(index, "_get_github_pat", MagicMock(return_value="pat"))
     resp_cm = MagicMock()
@@ -1641,3 +1646,31 @@ def test_has_listener_helper_modes():
     with patch.object(index, "M2_DISPATCH_TARGET", "overseer"):
         assert index._has_listener(saturday) is True
         assert index._has_listener(weekday) is True
+
+
+def test_m2_default_is_overseer_in_code_and_deploy():
+    """LOCKSTEP: index.py's fallback and BOTH deploy.sh defaults (create-function
+    and preserve_env_flag) must agree.
+
+    Three independent places encode this routing mode. The 2026-07-27 incident
+    was exactly a disagreement between them — the live env said `overseer`,
+    deploy.sh's preserve fallback said `repository_dispatch`, and the deploy
+    won. Pinning all three together is what makes the routing survive its own
+    deploy."""
+    import re
+    from pathlib import Path
+
+    here = Path(__file__).resolve().parent
+    src = (here / "index.py").read_text(encoding="utf-8")
+    m = re.search(r'M2_DISPATCH_TARGET = os\.environ\.get\(\s*"M2_DISPATCH_TARGET",\s*"([a-z_]+)"', src)
+    assert m and m.group(1) == "overseer", "index.py fallback must default to overseer"
+
+    deploy = (here / "deploy.sh").read_text(encoding="utf-8")
+    assert "M2_DISPATCH_TARGET=overseer," in deploy, (
+        "deploy.sh create-function default must be overseer"
+    )
+    assert re.search(r'preserve_env_flag[^\n]*M2_DISPATCH_TARGET overseer', deploy), (
+        "deploy.sh preserve_env_flag fallback must be overseer — this is the value "
+        "a redeploy lands on when the live read races or returns empty, i.e. the "
+        "one that actually clobbered the manual flip"
+    )
