@@ -47,6 +47,42 @@ demand-all path always did (`_write_trigger_record`); an enumeration FAILURE
 now writes one too (config-I2540), so a missing record unambiguously means
 the scheduler never invoked this Lambda.
 
+DeepSeek quota-fallback direct invoke (3-repo feature): the on-box quota
+classifier above can now, on wind-down, invoke THIS SAME Lambda directly via
+`lambda:InvokeFunction` (never EventBridge) with
+`{"mode": "fallback", "tier": "<low|mid|high>"}` to launch exactly one
+replacement box for that tier running the DeepSeek backend
+(`GROOM_BACKEND=deepseek`) instead of retrying Claude — see
+`_handle_fallback_dispatch`. Reuses `_launch_groom_spot` verbatim (same
+concurrency guard, daily ceiling, spot/on-demand + SSM mechanics); the
+DeepSeek tier->model mapping (`nousergon_lib.groom_eligibility.
+FALLBACK_TIER_MODELS`) is consumed on-box, not by this Lambda.
+
+DeepSeek PRIMARY-mode backend selection (alpha-engine-config-I3479, Brian
+ruling 2026-07-22): distinct from the quota-FALLBACK leg above — that one is
+a rescue for an already-in-flight Claude run hitting mid-run quota
+exhaustion; THIS is a pre-planned routing decision made at scheduled-dispatch
+time, before any Claude attempt, for the low/mid tiers moving off the Claude
+Max plan onto direct DeepSeek. Governed by `GROOM_PRIMARY_DEEPSEEK_TIERS`
+(env, comma-separated tier names, unset/empty = feature fully OFF — ships
+this way): `_primary_backend_for()` returns `GROOM_BACKEND_DEEPSEEK` iff the
+env set is non-empty AND every tier in a launch's bundle is a member of it,
+so a bundle containing "high" (e.g. a high+mid attach-upward bundle) always
+stays on Claude — high remains on the Max plan by ruling. Applied at the
+three scheduled-dispatch entry points that decide a bundle's tiers: the
+demand-all per-launch loop, the single-tier demand-gate path, and threaded
+through the decide_only -> launch_decided SF round-trip (the Map state's
+`States.JsonMerge` passes each decide-time entry dict — including an
+additive `backend` key when present — through to the launch_decided
+invocation WHOLESALE, so no ASL change was needed). Sweep-mode and the
+quota-fallback `mode=fallback` leg are UNCHANGED by this feature. Reuses the
+SAME `GROOM_BACKEND=deepseek` on-box contract the fallback leg already
+established: alpha-engine-config-PR3487's bootstrap OVERRIDES `GROOM_MODEL`
+from its own `FALLBACK_TIER_MODELS` mirror (deepest tier of the bundle) when
+`GROOM_BACKEND=deepseek` — this Lambda's `model`/`GROOM_MODEL` stays a
+Claude-side default/pass-through in the PRIMARY case too, never a DeepSeek
+model id this Lambda selects itself.
+
 Managed OUTSIDE CloudFormation (same as before): operator-deployed via
 `deploy.sh --bootstrap`. Merging the PR has ZERO live effect until the new code +
 IAM are deployed AND the GHA `schedule:` crons are disabled (the gated cutover).
@@ -59,7 +95,7 @@ import logging
 import os
 import re
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import boto3
@@ -177,13 +213,82 @@ _DEFAULT_RUN_MODE = "full"
 # structurally closed.
 _VALID_ISSUE_FILTERS = set(ge.VALID_ISSUE_FILTERS)
 _DEFAULT_ISSUE_FILTER = "mid-only"
-_DEFAULT_MODEL = "claude-sonnet-5"
+_DEFAULT_MODEL = "deepseek-v4-pro"
 # Defense-in-depth allowlist for the model id (embedded verbatim into the SSM
 # shell command below) — model ids are Lambda-config-controlled, not raw user
 # input, but this is cheap and rules out shell-metacharacter injection outright.
 _MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
+# ── Quota-fallback direct-invoke dispatch (3-repo feature, this is the
+# Lambda-side leg) ────────────────────────────────────────────────────────
+# When an on-box groom run hits mid-run Claude-quota exhaustion, it winds down
+# cleanly (existing config#1803 behavior, UNCHANGED) and then invokes THIS
+# Lambda directly via `lambda:InvokeFunction` — bypassing EventBridge Scheduler
+# entirely — with a payload shaped `{"mode": "fallback", "tier": "<low|mid|
+# high>"}`. `mode` is not a key any of the 3 live SCHED_INPUTS (deploy.sh) or
+# any other invocation shape in this handler (decide_only/launch_decided/
+# demand-all/legacy) ever sets, so this is a purely additive discriminator —
+# it can never intercept a real cron/SF-driven invocation.
+# `GROOM_BACKEND=deepseek` is threaded through the SAME `_launch_groom_spot`
+# call every other path uses (no duplicated launch/SSM code) so the box runs
+# the DeepSeek fallback provider. The tier -> DeepSeek-model mapping
+# (`nousergon_lib.groom_eligibility.FALLBACK_TIER_MODELS`, a sibling PR) is
+# consumed on-box by alpha-engine-config's groom_spot_bootstrap.sh /
+# groom_driver.py — this Lambda does not import or reference that dict.
+_VALID_FALLBACK_TIERS = set(ge.TIERS)  # {"low", "mid", "high"}
+GROOM_BACKEND_DEEPSEEK = "deepseek"
 
+# ── PRIMARY-mode DeepSeek selection for SCHEDULED dispatch (alpha-engine-
+# config-I3479, Brian ruling 2026-07-22) ────────────────────────────────────
+# Comma-separated tier names (e.g. "low,mid"). Unset/empty (the SHIPPED
+# default) means this feature is fully OFF — every scheduled-dispatch path
+# below computes `backend=None` for every bundle and behaves byte-identically
+# to pre-PRIMARY-mode code. Armed by setting this on the Lambda (see deploy.sh
+# for why the value must be pinned there, not just set live via console/CLI).
+GROOM_PRIMARY_DEEPSEEK_TIERS = {
+    t.strip()
+    for t in os.environ.get("GROOM_PRIMARY_DEEPSEEK_TIERS", "").split(",")
+    if t.strip()
+}
+_unknown_primary_tiers = GROOM_PRIMARY_DEEPSEEK_TIERS - set(ge.TIERS)
+if _unknown_primary_tiers:
+    logger.warning(
+        "GROOM_PRIMARY_DEEPSEEK_TIERS contains unrecognized tier name(s) %s "
+        "(valid: %s) — these can never match a launch bundle and are "
+        "effectively inert; check for a typo",
+        sorted(_unknown_primary_tiers), sorted(ge.TIERS),
+    )
+
+
+def _primary_backend_for(tiers) -> str | None:
+    """PRIMARY-mode DeepSeek selection (alpha-engine-config-I3479): returns
+    ``GROOM_BACKEND_DEEPSEEK`` iff ``GROOM_PRIMARY_DEEPSEEK_TIERS`` is armed
+    (non-empty) AND every tier in this launch's bundle is a member of it —
+    else ``None`` (the unchanged Claude path). A bundle containing a tier
+    NOT in the armed set therefore stays on Claude: the env var controls
+    exactly which tiers use DeepSeek primary, and "any-foreign-tier-blocks-
+    the-whole-bundle" means a mixed bundle can never split backends mid-box
+    (one box, one provider). As of 2026-07-24 all three tiers (low, mid,
+    high) are armed for DeepSeek primary.
+
+    Distinct from (and orthogonal to) ``GROOM_BACKEND_DEEPSEEK``'s existing
+    quota-FALLBACK use in ``_handle_fallback_dispatch`` — that path is a
+    rescue for an already-in-flight Claude run hitting mid-run quota
+    exhaustion and ALWAYS threads the DeepSeek backend regardless of this
+    env var; this helper only ever governs the PRIMARY (pre-planned,
+    no-Claude-attempt-first) scheduled dispatch paths.
+
+    Ships UNARMED: ``GROOM_PRIMARY_DEEPSEEK_TIERS`` unset/empty means this
+    always returns ``None`` — today's Claude-only dispatch behavior is
+    byte-identical until an operator arms the env var.
+    """
+    if not GROOM_PRIMARY_DEEPSEEK_TIERS:
+        return None
+    if not tiers:
+        return None
+    if not all(t in GROOM_PRIMARY_DEEPSEEK_TIERS for t in tiers):
+        return None
+    return GROOM_BACKEND_DEEPSEEK
 
 
 
@@ -248,6 +353,60 @@ def _resolve_soft_limit_min(event: dict) -> int | None:
     return n
 
 
+def _task_token(event: dict) -> str:
+    """The SF task token for this ``launch_decided`` invocation, or "".
+
+    config-I4333: the token arrives INSIDE the Lambda ``Payload``, under the key
+    ``Token``. The SF merges the context object's ``$$.Task`` — literally
+    ``{"Token": "..."}`` — into the payload's existing wholesale
+    ``States.JsonMerge``, so the key name is the context object's own, and no
+    string-building or escaping is involved. Three earlier attempts got this
+    wrong and none could ever have worked:
+
+      * a top-level ``TaskToken`` sibling of ``Payload`` in the SF
+        ``Parameters`` — rejected by Step Functions at RUNTIME (not by
+        ``validate-state-machine-definition``, which returned OK), since
+        ``TaskToken`` is not a field of the Lambda Invoke API:
+        "The field \"TaskToken\" is not supported by Step Functions".
+      * ``getattr(getattr(context, "task", None), "token", "")`` — a Python
+        Lambda ``context`` has no ``task`` attribute, so this silently
+        returned "" on every invocation and the ""-is-legitimate fallback
+        masked it.
+      * building the key with ``States.Format('{{"task_token":"{}"}}', ...)``
+        — ``States.Format`` cannot emit a literal brace by doubling OR by
+        backslash-escaping; both forms fail with "matching '}' not found".
+        Verified against the live TestState API, not assumed.
+
+    An absent token is legitimate (manual invoke, sweep dispatch), so "" is a
+    valid result — but it means no callback will be sent, and the SF then
+    depends on its timeout path.
+    """
+    raw = event.get("Token")
+    return str(raw).strip() if raw else ""
+
+
+def _resolve_launch_decided_backend(event: dict) -> str:
+    """Validate the ``backend`` threaded through a ``launch_decided`` SF
+    invocation (PRIMARY-mode DeepSeek selection, alpha-engine-config-I3479)
+    against the fixed vocabulary — only ``GROOM_BACKEND_DEEPSEEK``
+    ("deepseek") or absent/empty is valid. Fails LOUD (raises) on anything
+    else rather than silently dropping an unrecognized value onto the
+    default Claude path (no-silent-swallows) — a malformed ``backend`` in
+    the decide -> launch round-trip means the SF's item merge or a caller
+    drifted, and that must surface immediately, not quietly run the wrong
+    provider (or the right provider under a typo'd/unexpected value)."""
+    raw = event.get("backend")
+    if raw is None or raw == "":
+        return ""
+    backend = str(raw).strip().lower()
+    if backend != GROOM_BACKEND_DEEPSEEK:
+        raise ValueError(
+            f"invalid backend in launch_decided event: {raw!r} — must be "
+            f"{GROOM_BACKEND_DEEPSEEK!r} or absent/empty"
+        )
+    return backend
+
+
 def _resolve_pr_budget(event: dict) -> int | None:
     """Optional per-schedule PR budget override (config#1769).
 
@@ -273,7 +432,9 @@ def _resolve_pr_budget(event: dict) -> int | None:
 def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: str,
                        run_token: str, soft_limit_min: int | None = None,
                        pr_budget: int | None = None,
-                       queue_manifest_key: str = "") -> str:
+                       queue_manifest_key: str = "",
+                       backend: str = "",
+                       task_token: str = "") -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec bootstrap.
 
     Runs as root on the box. The heavy, version-controlled logic lives in the
@@ -285,6 +446,12 @@ def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: st
     retired — groom boxes are pure issue-coverage workers now; PR merge-
     readiness sweeping moved to the single end-of-SF run_mode=sweep box the
     dispatch SF launches after every Map wind-down.
+
+    ``backend`` (quota-fallback 3-repo feature): a Lambda-code literal
+    (``GROOM_BACKEND_DEEPSEEK`` — never event-sourced text), so unlike
+    ``model``/``issue_filter`` it needs no shell-metacharacter allowlist
+    before embedding. Empty by default — every existing caller's command
+    shape is byte-for-byte unchanged.
     """
     soft_limit_flag = f" --soft-limit-min {soft_limit_min}" if soft_limit_min else ""
     pr_budget_export = f"export GROOM_PR_BUDGET={pr_budget}\n" if pr_budget else ""
@@ -294,6 +461,19 @@ def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: st
     # root-shell command line.
     manifest_export = (f"export GROOM_QUEUE_MANIFEST_KEY={queue_manifest_key}\n"
                        if queue_manifest_key else "")
+    # Quota-fallback (3-repo feature): GROOM_BACKEND is consumed on-box by
+    # alpha-engine-config's groom_spot_bootstrap.sh/groom_driver.py to route
+    # the run through DeepSeek instead of Claude — this Lambda passes the flag
+    # through verbatim, it does not select the DeepSeek model itself.
+    backend_export = f"export GROOM_BACKEND={backend}\n" if backend else ""
+    # Arming the DeepSeek fallback dispatch: when a Claude-backed groom run
+    # hits quota exhaustion, the on-box groom_run.sh checks this flag and —
+    # if enabled — invokes this Lambda again with mode=fallback to launch a
+    # DeepSeek rescue box. Safe to enable unconditionally: DeepSeek-backed
+    # runs never trigger Claude quota signatures, so the flag is harmless
+    # there but critical for high-tier Claude runs (I3483 companion).
+    fallback_enabled_export = "export GROOM_DEEPSEEK_FALLBACK_ENABLED=true\n"
+    task_token_export = f"export GROOM_SF_TASK_TOKEN={task_token}\n" if task_token else ""
     return f"""set -uo pipefail
 export AWS_DEFAULT_REGION={REGION}
 # SSM RunShellScript runs as root with NO $HOME set; git config/clone need it.
@@ -316,7 +496,7 @@ cd /home/ec2-user/alpha-engine-config
 export GROOM_MODEL={model}
 export GROOM_ISSUE_FILTER={issue_filter}
 export GROOM_RUN_TOKEN={run_token}
-{pr_budget_export}{manifest_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
+{pr_budget_export}{manifest_export}{fallback_enabled_export}{backend_export}{task_token_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
 """
 
 
@@ -347,15 +527,17 @@ def _wait_ssm_online(instance_id: str) -> None:
 
 def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, issue_filter: str,
                     run_token: str, soft_limit_min: int | None = None,
-                    pr_budget: int | None = None, queue_manifest_key: str = "") -> str:
+                    pr_budget: int | None = None, queue_manifest_key: str = "",
+                    backend: str = "", task_token: str = "") -> str:
     """Fire the async, detached SSM command that runs the groom + self-terminates."""
     return spot_dispatch.send_async_command(
         instance_id,
         _bootstrap_command(
             run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
-            queue_manifest_key,
+            queue_manifest_key, backend, task_token,
         ),
-        comment=f"backlog groom ({run_mode}, {model}, {issue_filter}) — config#1432/#1495/#1645",
+        comment=(f"backlog groom ({run_mode}, {model}, {issue_filter}"
+                 f"{f', {backend}' if backend else ''}) — config#1432/#1495/#1645"),
         region=REGION,
         cw_log_group=CW_LOG_GROUP,
         # Execution timeout (NOT the start timeout) — without this SSM kills the
@@ -434,6 +616,9 @@ def _notify_concurrent_skip(tier_tag: str, existing_ids: list[str], schedule_lab
             context={"schedule": schedule_label, "tier_tag": tier_tag,
                      "existing_instance_ids": existing_ids},
             silent_topic=FleetTelegramTopic.GROOM,
+            # Matches playbooks.yaml's registered `groom_dispatch_telegram_only`
+            # class source exactly (config-I3513).
+            source="flow-doctor:scheduled-groom-dispatcher",
         )
     except Exception as exc:  # noqa: BLE001 — secondary observability
         logger.warning("concurrent-lane skip Telegram failed (non-fatal): %s", exc)
@@ -507,6 +692,9 @@ def _notify_dispatch_ceiling_exhausted(prior: int, ceiling: int, tier_tag: str,
             db_basename=_DB_BASENAME,
             context={"schedule": schedule_label, "tier_tag": tier_tag,
                      "prior_dispatch_count": prior, "dispatch_ceiling": ceiling},
+            # Matches playbooks.yaml's registered `groom_dispatch_telegram_only`
+            # class source exactly (config-I3513).
+            source="flow-doctor:scheduled-groom-dispatcher",
         )
     except Exception as exc:  # noqa: BLE001 — secondary observability
         logger.warning("dispatch-ceiling-exhausted Telegram failed (non-fatal): %s", exc)
@@ -524,8 +712,19 @@ def _terminate_instance(instance_id: str) -> None:
 def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_filter: str,
                        soft_limit_min: int | None = None, pr_budget: int | None = None,
                        force_on_demand: bool = False,
-                       queue_manifest_key: str = "") -> dict:
-    """Launch + bootstrap the groom box. Fail-loud — any error RAISES."""
+                       queue_manifest_key: str = "",
+                       backend: str = "",
+                       task_token: str = "") -> dict:
+    """Launch + bootstrap the groom box. Fail-loud — any error RAISES.
+
+    ``backend`` (quota-fallback 3-repo feature, default ``""`` = unchanged
+    Claude path): threaded through to ``_send_bootstrap``/``_bootstrap_command``
+    as ``GROOM_BACKEND``. This is the ONE launch chokepoint every dispatch
+    path in this file already shares — the quota-fallback direct-invoke path
+    (``_handle_fallback_dispatch``) reuses it verbatim rather than
+    duplicating the concurrency guard (config#1979), the daily dispatch
+    ceiling (config#3173), or the spot/on-demand + SSM-send-command mechanics.
+    """
     if not DISPATCH_ENABLED:
         logger.warning("GROOM_DISPATCH_ENABLED=false — groom spot NOT launched")
         return {"launched": False, "reason": "disabled"}
@@ -603,14 +802,14 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
         )
         command_id = _send_bootstrap(
             instance_id, run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
-            queue_manifest_key,
+            queue_manifest_key, backend, task_token,
         )
     except Exception:
         _terminate_instance(instance_id)
         raise
     logger.info(
         "groom dispatched: instance=%s market=%s command=%s run_mode=%s model=%s issue_filter=%s "
-        "schedule=%s run_token=%s",
+        "schedule=%s run_token=%s backend=%s",
         instance_id,
         market,
         command_id,
@@ -619,6 +818,7 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
         issue_filter,
         schedule_label,
         run_token,
+        backend or "claude",
     )
     return {
         "launched": True,
@@ -631,6 +831,7 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
         "tier_tag": tier_tag,
         "run_token": run_token,
         **({"pr_budget": pr_budget} if pr_budget is not None else {}),
+        **({"backend": backend} if backend else {}),
     }
 
 
@@ -831,14 +1032,20 @@ def _enumerate_tier_stats(token: str) -> tuple[dict, dict, bool]:
 
 
 def _write_decision_record(slot_tier: str, decision, counts: dict,
-                           schedule_label: str) -> None:
+                           schedule_label: str, backend: str = "") -> None:
     """groom/decisions/{date}/{slot}.json — a skipped slot must be
-    distinguishable from a broken scheduler (no-silent-caps). Best-effort."""
+    distinguishable from a broken scheduler (no-silent-caps). Best-effort.
+
+    ``backend`` (PRIMARY-mode DeepSeek selection, alpha-engine-config-I3479):
+    additive — present only when this slot's bundle was routed to DeepSeek,
+    omitted entirely on the (today, default-unarmed) Claude path, so the
+    record shape stays byte-identical until the feature is armed."""
     date = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
     key = f"groom/decisions/{date}/{slot_tier}.json"
     body = json.dumps({
         "schema_version": 1, "slot_tier": slot_tier, "schedule": schedule_label,
         "counts": counts, **decision.as_record(),
+        **({"backend": backend} if backend else {}),
         "decided_at": datetime.now(ZoneInfo("UTC")).isoformat(),
     })
     try:
@@ -872,6 +1079,9 @@ def _notify_demand_trigger_failed(exc: Exception, schedule_label: str) -> None:
             flow_name=_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
             db_basename=_DB_BASENAME,
             context={"schedule": schedule_label, "error": str(exc)},
+            # Matches playbooks.yaml's registered `groom_dispatch_telegram_only`
+            # class source exactly (config-I3513).
+            source="flow-doctor:scheduled-groom-dispatcher",
         )
     except Exception as notify_exc:  # noqa: BLE001 — secondary observability
         logger.warning("trigger-failed Telegram failed (non-fatal): %s", notify_exc)
@@ -892,17 +1102,29 @@ def _notify_demand_skip(decision, counts: dict, schedule_label: str) -> None:
             db_basename=_DB_BASENAME,
             context={"schedule": schedule_label, **decision.as_record()},
             silent_topic=FleetTelegramTopic.GROOM,
+            # Matches playbooks.yaml's registered `groom_dispatch_telegram_only`
+            # class source exactly (config-I3513).
+            source="flow-doctor:scheduled-groom-dispatcher",
         )
     except Exception as exc:  # noqa: BLE001 — secondary observability
         logger.warning("demand-skip Telegram failed (non-fatal): %s", exc)
 
 
 def _demand_decision(issue_filter: str, schedule_label: str):
-    """config#1933 enumerate-then-decide. Returns a SlotDecision, or None to
-    proceed with the legacy unconditional launch (gate off / non-slot run /
-    enumeration failure — the gate is an optimization, NEVER a correctness
-    gate, so any error here fail-safes to launching). Counts are passed to
-    the record writer via the decision closure below."""
+    """config#1933 enumerate-then-decide. Returns ``(decision, counts,
+    backend)``, or None to proceed with the legacy unconditional launch
+    (gate off / non-slot run / enumeration failure — the gate is an
+    optimization, NEVER a correctness gate, so any error here fail-safes to
+    launching). Counts are passed to the record writer via the decision
+    closure below.
+
+    ``backend`` (PRIMARY-mode DeepSeek selection, alpha-engine-config-I3479):
+    computed once here from the decided bundle's ``.tiers`` via
+    ``_primary_backend_for`` — "" (unchanged Claude path) unless
+    ``GROOM_PRIMARY_DEEPSEEK_TIERS`` is armed and every tier in the bundle
+    qualifies. Written into the SAME decision record the caller already
+    writes, so the demand-gate log distinguishes DeepSeek-primary launches
+    without a second enumeration/decision pass."""
     if not DEMAND_GATE_ENABLED:
         return None
     try:
@@ -914,60 +1136,22 @@ def _demand_decision(issue_filter: str, schedule_label: str):
     try:
         counts, oldest, has_p0 = _enumerate_tier_stats(_github_token())
         decision = ge.decide_slot(slot_tiers[0], counts, oldest, has_p0)
-        _write_decision_record(slot_tiers[0], decision, counts, schedule_label)
-        return decision, counts
+        backend = _primary_backend_for(decision.tiers) or ""
+        _write_decision_record(slot_tiers[0], decision, counts, schedule_label, backend)
+        return decision, counts, backend
     except Exception as exc:  # noqa: BLE001 — fail-safe to legacy launch
         logger.warning("demand gate unavailable (%s) — legacy unconditional "
                        "launch", exc)
         return None
 
 
-def _load_recent_engagements() -> dict:
-    """(repo, number) -> engagement horizon epoch from the last
-    ``ge.ENGAGEMENT_LOOKBACK_DAYS`` days' S3 run artifacts (same schema the
-    driver's config#1893 fresh-skip reads).
-
-    RAISES on any read failure (config#2142). This was previously fail-safe
-    ``{}`` ("skip nothing — counting a few extra issues"), which masked a
-    total AccessDenied on the ``groom/{date}/`` engagement scan for every
-    trigger from ship (2026-07-08) to 2026-07-10: fresh-skip enumeration ran
-    with an empty map on 8 consecutive triggers with zero pipeline signal,
-    inflating every advertised per-tier count. The trigger handler's own
-    catch is the recording surface: it skips the trigger (fail-closed, no
-    launch on over-counted queues) AND pages ops-health.
-
-    config#2038: the lookback (was a hardcoded ``range(3)``) and the engaged-
-    disposition set (was a hardcoded tuple literal) had silently drifted from
-    groom_driver.py's own constants (4-day lookback, same 4 dispositions) —
-    this module already imports ``nousergon_lib.groom_eligibility`` as the
-    declared single source of truth for exactly this class of drift; the two
-    values just weren't pulled from it yet. Read them from ``ge`` so they
-    can't re-drift.
-    """
-    out: dict = {}
-    s3 = boto3.client("s3", region_name=REGION)
-    now = datetime.now(ZoneInfo("UTC"))
-    for d in range(ge.ENGAGEMENT_LOOKBACK_DAYS):
-        date = (now - timedelta(days=d)).strftime("%Y-%m-%d")
-        resp = s3.list_objects_v2(Bucket=_RESEARCH_BUCKET, Prefix=f"groom/{date}/")
-        for obj in resp.get("Contents", []) or []:
-            if not obj["Key"].endswith(".json"):
-                continue
-            art = json.loads(s3.get_object(Bucket=_RESEARCH_BUCKET, Key=obj["Key"])["Body"].read())
-            run_start = art.get("run_start", "")
-            if not run_start:
-                continue
-            horizon = (datetime.fromisoformat(run_start.replace("Z", "+00:00")).timestamp()
-                       + int(art.get("elapsed_min", 0)) * 60 + ge.FRESH_SKIP_SLACK_SEC)
-            for rec in art.get("issues", []):
-                if rec.get("disposition") in ge.ENGAGED_DISPOSITIONS:
-                    k = (rec.get("repo", ""), rec.get("number"))
-                    out[k] = max(out.get(k, 0.0), horizon)
-    return out
-
-
 def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list, dict]:
-    """Tier stats with config#1893 fresh-skip applied (P0 exempt).
+    """Tier stats (config#2146: the 72h fresh-skip cooldown this function
+    used to apply is retired — eligibility is disposition-structural now,
+    ``ge.is_actionable`` alone decides membership; see groom_eligibility's
+    module docstring for the Brian ruling. ``_load_recent_engagements`` (the
+    engagement-horizon S3 scan fresh-skip used to consume) is removed with
+    it — it had no other caller).
 
     Returns (counts, oldest_wait_hours, p0_tiers, tier_issues) —
     the first three for ge.decide_trigger(); ``tier_issues`` maps tier →
@@ -985,16 +1169,10 @@ def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list, dict]:
     starvation escape valve exactly like an issue-only one would; the
     escape valve is generic over ANY tier's oldest wait, so a ruled PR that
     has sat past ``max_wait_hours`` fires it the same way an actionable P0
-    issue does — no separate carve-out needed). Fresh-skip applies to ruled
-    PRs identically to issues: a PR groom_driver.py's ``ruling_exec_pr_pool``
-    already worked and left an engagement disposition for (via the same
-    (repo, number) key) is debounced the same 72h window; a PR with no
-    matching engagement record is simply never skipped. PR titles are
-    prefixed ``[PR] `` in ``tier_issues``, mirroring the disambiguation
-    convention ``groom_driver.py``'s ``gated_reverify_pr_pool``/
-    ``ruling_exec_pr_pool`` already use for the identical PR-vs-issue
-    ambiguity."""
-    engagements = _load_recent_engagements()
+    issue does — no separate carve-out needed). PR titles are prefixed
+    ``[PR] `` in ``tier_issues``, mirroring the disambiguation convention
+    ``groom_driver.py``'s ``gated_reverify_pr_pool``/``ruling_exec_pr_pool``
+    already use for the identical PR-vs-issue ambiguity."""
     counts: dict[str, int] = {t: 0 for t in ge.TIERS}
     oldest: dict[str, float] = {t: 0.0 for t in ge.TIERS}
     tier_issues: dict[str, list[dict]] = {t: [] for t in ge.TIERS}
@@ -1023,9 +1201,6 @@ def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list, dict]:
                 is_p0 = "P0" in labels
                 updated_epoch = datetime.fromisoformat(
                     str(it.get("updated_at", "")).replace("Z", "+00:00")).timestamp()
-                engaged = engagements.get((repo, it["number"]))
-                if engaged and not is_p0 and ge.fresh_skip_active(engaged, updated_epoch, now_epoch):
-                    continue
                 counts[tier] += 1
                 tier_issues[tier].append({
                     "repo": repo, "number": it["number"],
@@ -1047,9 +1222,6 @@ def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list, dict]:
         pr_repo = pr.get("repo", "")
         updated_epoch = datetime.fromisoformat(
             str(pr.get("updated_at", "")).replace("Z", "+00:00")).timestamp()
-        engaged = engagements.get((pr_repo, pr.get("number")))
-        if engaged and not is_p0 and ge.fresh_skip_active(engaged, updated_epoch, now_epoch):
-            continue
         counts[tier] += 1
         tier_issues[tier].append({
             "repo": pr_repo, "number": pr.get("number"),
@@ -1127,13 +1299,20 @@ def _write_skip_record(schedule_label: str, skip_reason: str, **extra) -> None:
         logger.warning("skip record write failed (non-fatal): %s", exc)
 
 
-def _write_trigger_record(schedule_label: str, launches: list, counts: dict) -> None:
-    """One record per trigger evaluation — groom/decisions/{date}/{HHMM}.json."""
+def _write_trigger_record(schedule_label: str, decisions_record: list, counts: dict) -> None:
+    """One record per trigger evaluation — groom/decisions/{date}/{HHMM}.json.
+
+    ``decisions_record`` is the list of per-decision dicts the demand-all
+    handler loop has already built (each a ``SlotDecision.as_record()``,
+    optionally carrying an additive ``backend`` key — PRIMARY-mode DeepSeek
+    selection, alpha-engine-config-I3479) — NOT raw ``SlotDecision`` objects,
+    so the backend augmentation happens exactly once, at the same place the
+    launch entries themselves are built, rather than being recomputed here."""
     now = datetime.now(ZoneInfo("UTC"))
     key = f"groom/decisions/{now:%Y-%m-%d}/trigger-{now:%H%M}.json"
     body = json.dumps({
         "schema_version": 2, "trigger": "demand-all", "schedule": schedule_label,
-        "counts": counts, "decisions": [d.as_record() for d in launches],
+        "counts": counts, "decisions": decisions_record,
         "decided_at": now.isoformat(),
     })
     try:
@@ -1164,7 +1343,16 @@ def _write_sweep_decision_record(schedule_label: str, run_mode: str, launched: d
     version 2, a ``decisions`` list of ``{launch, ...}`` dicts) so the probe's
     reader treats both trigger kinds identically. Best-effort non-fatal,
     mirroring the demand-all writers: a record-write failure must never block
-    or crash the (fire-and-forget) sweep dispatch itself."""
+    or crash the (fire-and-forget) sweep dispatch itself.
+
+    ``launched.get("backend")`` (PRIMARY-mode DeepSeek selection,
+    alpha-engine-config-I3479): additive — present in the per-decision
+    record only when ``_launch_groom_spot`` actually threaded a backend
+    (itself only truthy when a launch_decided caller resolved one via
+    ``_resolve_launch_decided_backend``), omitted entirely for every other
+    (Claude, or unarmed) launch_decided dispatch — sweep boxes included, so
+    this record stays byte-identical to its pre-PRIMARY-mode shape by
+    default."""
     now = datetime.now(ZoneInfo("UTC"))
     key = f"groom/decisions/{now:%Y-%m-%d}/sweep-{now:%H%M%S}.json"
     launch_ok = bool(launched.get("launched"))
@@ -1177,6 +1365,7 @@ def _write_sweep_decision_record(schedule_label: str, run_mode: str, launched: d
             "model": launched.get("model", ""),
             "reason": launched.get("reason", "launch_decided"),
             "tier_tag": launched.get("tier_tag", ""),
+            **({"backend": launched["backend"]} if launched.get("backend") else {}),
         }],
         "decided_at": now.isoformat(),
     })
@@ -1188,13 +1377,117 @@ def _write_sweep_decision_record(schedule_label: str, run_mode: str, launched: d
         logger.warning("sweep decision record write failed (non-fatal): %s", exc)
 
 
+def _write_fallback_decision_record(schedule_label: str, tier: str, backend: str,
+                                    launched: dict) -> None:
+    """groom/decisions/{date}/fallback-{HHMMSS}.json — records a quota-fallback
+    direct-invoke dispatch (``{"mode": "fallback", "tier": ...}`` — see
+    ``_handle_fallback_dispatch``). Own key prefix (``fallback-{HHMMSS}``, not
+    ``trigger-``/``sweep-``) so a same-minute demand-all evaluation or
+    end-of-SF sweep never collides with this on S3.
+
+    Same schema_version 2 shape (a ``decisions`` list of ``{launch, ...}``
+    dicts) every other dispatch path in this file already writes, so the
+    overseer-liveness-probe's ``run_window`` reader (config#2667) treats a
+    quota-fallback dispatch identically to a demand-all/sweep one — a
+    fallback box that dies silently must leave the same trace a scheduled one
+    would, closing the exact blind-spot class config-I2540/config#2667
+    already fixed for the other two dispatch shapes rather than reopening it
+    for this new third one. Best-effort non-fatal, mirroring every other
+    decision-record writer here: a record-write failure must never block or
+    crash the (fire-and-forget) fallback dispatch itself."""
+    now = datetime.now(ZoneInfo("UTC"))
+    key = f"groom/decisions/{now:%Y-%m-%d}/fallback-{now:%H%M%S}.json"
+    launch_ok = bool(launched.get("launched"))
+    body = json.dumps({
+        "schema_version": 2, "trigger": "quota_fallback", "tier": tier,
+        "backend": backend, "schedule": schedule_label,
+        "decisions": [{
+            "launch": launch_ok,
+            "issue_filter": launched.get("issue_filter", ""),
+            "model": launched.get("model", ""),
+            "reason": launched.get("reason", "quota_fallback"),
+            "tier_tag": launched.get("tier_tag", ""),
+        }],
+        "decided_at": now.isoformat(),
+    })
+    try:
+        boto3.client("s3", region_name=REGION).put_object(
+            Bucket=_RESEARCH_BUCKET, Key=key, Body=body.encode(),
+            ContentType="application/json")
+    except Exception as exc:  # noqa: BLE001 — mirrors _write_sweep_decision_record: observability only, never blocks the launch it's recording
+        logger.warning("fallback decision record write failed (non-fatal): %s", exc)
+
+
+def _handle_fallback_dispatch(event: dict) -> dict:
+    """Direct ``lambda:InvokeFunction`` quota-fallback path (3-repo feature;
+    this Lambda is one leg — see ``nousergon_lib``'s new
+    ``FALLBACK_TIER_MODELS`` dict and ``alpha-engine-config``'s
+    ``groom_driver.py`` quota classifier for the other two).
+
+    A groom box that hits mid-run Claude-quota exhaustion winds down cleanly
+    (existing config#1803 behavior, UNCHANGED by this change) and then
+    invokes THIS Lambda directly, bypassing EventBridge Scheduler entirely,
+    with ``{"mode": "fallback", "tier": "<low|mid|high>"}``. ``mode`` is not a
+    key any of the 3 live SCHED_INPUTS (deploy.sh) or any other invocation
+    shape this handler reads (``decide_only``/``launch_decided``/``demand-
+    all``/legacy) ever sets — this is a purely additive discriminator that
+    can never intercept a real cron/SF-driven invocation.
+
+    Deliberately SKIPS ``ge.decide_trigger()``'s demand-eligibility gate
+    (config#1933) entirely — a quota-fallback dispatch is a rescue for
+    already-decided, already-in-flight work the exhausted run didn't finish,
+    not a fresh demand re-evaluation — and launches EXACTLY ONE box for the
+    named tier via the SAME ``_launch_groom_spot`` chokepoint every other
+    dispatch path in this file uses (no duplicated launch/SSM code): it gets
+    the config#1979 concurrency guard, the config#3173 daily ceiling, and the
+    spot/on-demand + SSM-send-command mechanics for free, with
+    ``GROOM_BACKEND_DEEPSEEK`` threaded through so the box runs the DeepSeek
+    fallback provider. The tier -> DeepSeek-model mapping itself
+    (``FALLBACK_TIER_MODELS``) is consumed on-box by alpha-engine-config's
+    groom_spot_bootstrap.sh/groom_driver.py — this Lambda does not import or
+    reference that dict; ``GROOM_MODEL`` here is only the (inert-for-
+    deepseek) Claude-side default so the bootstrap command shape stays
+    unchanged for the field.
+
+    Fails LOUD (raises ``ValueError``) on a missing/invalid tier rather than
+    silently falling through to an unrelated demand-all launch — a malformed
+    fallback payload must never masquerade as a normal scheduled trigger.
+
+    Known, deliberately out-of-scope gotcha: the invoking box may still carry
+    the ``groom-issue-filter=<tier>-only`` tag while mid-terminate when this
+    fires, which COULD trip ``_launch_groom_spot``'s concurrent-tier-skip
+    guard and suppress the very fallback launch this path exists for.
+    Termination-before-invoke sequencing is an alpha-engine-config
+    ``groom_driver.py`` wind-down concern, not this Lambda's.
+    """
+    tier = str(event.get("tier") or "").strip().lower()
+    if tier not in _VALID_FALLBACK_TIERS:
+        raise ValueError(
+            f"invalid quota-fallback tier: {event.get('tier')!r} — must be "
+            f"one of {sorted(_VALID_FALLBACK_TIERS)}"
+        )
+    issue_filter = f"{tier}-only"
+    model = _resolve_model(event)
+    schedule_label = str(event.get("schedule") or "quota-fallback")
+    logger.info(
+        "quota-fallback dispatch: tier=%s issue_filter=%s model=%s backend=%s schedule=%s",
+        tier, issue_filter, model, GROOM_BACKEND_DEEPSEEK, schedule_label,
+    )
+    result = _launch_groom_spot(
+        "full", schedule_label, model, issue_filter,
+        backend=GROOM_BACKEND_DEEPSEEK,
+    )
+    _write_fallback_decision_record(schedule_label, tier, GROOM_BACKEND_DEEPSEEK, result)
+    return {"groom": result}
+
+
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """EventBridge Scheduler handler — launches the groom spot box on cadence.
 
     `event` is the schedule's JSON input, e.g. {"run_mode": "full", "model":
-    "claude-sonnet-5", "issue_filter": "high-only", "schedule": "0 1 * * *"}.
-    `model`/`issue_filter` default to the Sonnet mid-tier queue when absent
-    (the two pre-existing Sonnet schedules don't set them). `soft_limit_min` is
+    "deepseek-v4-pro", "issue_filter": "high-only", "schedule": "0 1 * * *"}.
+    `model`/`issue_filter` default to the DeepSeek mid-tier queue when absent
+    (the pre-existing schedules don't set them). `soft_limit_min` is
     a manual-invoke-ONLY bounded-test override — no live schedule sets it.
     `pr_budget` is set only on the dedicated high-only schedule (config#1769).
     `force_on_demand` (config#1645) is set only by the dispatch Step Function's
@@ -1219,8 +1512,27 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     per-box states unchanged. Legacy direct invokes (no `decide_only` /
     `launch_decided` key) behave EXACTLY as before — decide AND launch in one
     call, same response shapes — for any caller not yet on the new SF flow.
+
+    Quota-fallback direct invoke (3-repo feature, ``mode: "fallback"``): a
+    THIRD invocation shape, checked first and returned early —
+    ``{"mode": "fallback", "tier": "<low|mid|high>"}`` fired by
+    ``lambda:InvokeFunction`` (never EventBridge) when an on-box groom run
+    winds down on mid-run Claude-quota exhaustion. See
+    ``_handle_fallback_dispatch`` for the full contract; no live schedule or
+    other caller ever sets a top-level ``mode`` key, so this cannot collide
+    with any invocation shape above.
+
+    PRIMARY-mode DeepSeek backend (alpha-engine-config-I3479): NOT a new
+    invocation shape — an additive ``backend`` field that rides the existing
+    demand-all / single-tier-demand-gate / decide_only / launch_decided
+    paths above. See ``_primary_backend_for`` and the module docstring for
+    the full contract; default (``GROOM_PRIMARY_DEEPSEEK_TIERS`` unset) is
+    every launch resolving ``backend=""``, byte-identical to pre-I3479
+    behavior.
     """
     event = event or {}
+    if event.get("mode") == "fallback":
+        return _handle_fallback_dispatch(event)
     run_mode = _resolve_run_mode(event)
     model = _resolve_model(event)
     issue_filter = _resolve_issue_filter(event)
@@ -1263,15 +1575,43 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         # unconditional by design, so bypassing the demand gates is
         # exactly right; the config#1979 concurrent guard (on the distinct
         # 'sweep' lane tag) is the only pre-launch check that applies.
+        # alpha-engine-config-I3479 (PRIMARY-mode DeepSeek): a decide_only
+        # entry that carried a "backend" key round-trips here verbatim via
+        # the SF Map's wholesale States.JsonMerge (see module docstring) —
+        # validated against the fixed vocabulary before use, fail-loud on
+        # anything unrecognized.
         result = _launch_groom_spot(
             run_mode, schedule_label, model, issue_filter, soft_limit_min, pr_budget,
             force_on_demand,
             queue_manifest_key=queue_manifest_key,
+            backend=_resolve_launch_decided_backend(event),
+            task_token=_task_token(event),
         )
-        # config#2667: record this decision too — previously only the
         # demand-all path did (_write_trigger_record/_write_skip_record),
         # leaving sweep-mode (and any other launch_decided) dispatches with
         # no entry in the dispatch-decision log at all.
+        # config-I4333: when invoked with .waitForTaskToken and the box was NOT
+        # launched (concurrent skip, kill-switch), call send-task-success with
+        # launched:false so the SF doesn't wait 6h for a callback that will never
+        # come. The box handles the launched:true callback itself in its finish() trap.
+        task_token = _task_token(event)
+        if task_token and not result.get("launched"):
+            try:
+                boto3.client("stepfunctions", region_name=REGION).send_task_success(
+                    taskToken=task_token,
+                    output=json.dumps({
+                        "groomLaunch": {
+                            "Payload": {
+                                "groom": {
+                                    "launched": False,
+                                    "reason": result.get("reason", "not_launched")
+                                }
+                            }
+                        }
+                    })
+                )
+            except Exception as exc:
+                logger.warning("send-task-success for launched:false failed (non-fatal — SF timeout catcher covers this): %s", exc)
         _write_sweep_decision_record(schedule_label, run_mode, result)
         return {"groom": result}
 
@@ -1286,8 +1626,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         try:
             counts, oldest, p0_tiers, tier_issues = _enumerate_tier_stats_fresh(_github_token())
             launches = ge.decide_trigger(counts, oldest, p0_tiers)
-        except Exception as exc:  # noqa: BLE001 — fail-closed: skip this trigger rather than launching with stale (no-fresh-skip) legacy counts; recorded via ops-health page (config#2142)
-            logger.warning("demand trigger unavailable (%s) — skipping trigger (legacy fallthrough retired, fresh-skip-less enumeration over-counts the queue)", exc)
+        except Exception as exc:  # noqa: BLE001 — fail-closed: skip this trigger rather than launching on a partial/failed GitHub enumeration sweep; recorded via ops-health page (config#2142)
+            logger.warning("demand trigger unavailable (%s) — skipping trigger (legacy fallthrough retired, config#2146: a failed enumeration sweep must never launch on an incomplete count)", exc)
             _notify_demand_trigger_failed(exc, schedule_label)
             # config-I2540: an enumeration failure must still leave a decision
             # record — a missing groom/decisions/{date}/trigger-*.json file
@@ -1301,15 +1641,24 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             return {"groom": err}
         if launches is not None:
             manifest_keys = _write_queue_manifests(schedule_label, launches, tier_issues)
-            _write_trigger_record(schedule_label, launches, counts)
             entries = []
+            decisions_record = []
             for d in launches:
+                # alpha-engine-config-I3479 (PRIMARY-mode DeepSeek): computed
+                # once per bundle from its own .tiers, folded into BOTH the
+                # decision record (below) and the launch entry (further
+                # below) — additive in each, "" is inert/omitted.
+                backend = _primary_backend_for(d.tiers) or ""
+                record = dict(d.as_record())
+                if backend:
+                    record["backend"] = backend
+                decisions_record.append(record)
                 if not d.launch:
                     logger.info("demand trigger: %s", d.reason)
                     _notify_demand_skip(d, counts, schedule_label)
                     continue
-                logger.info("demand trigger LAUNCH — %s (filter=%s model=%s)",
-                            d.reason, d.issue_filter, d.model)
+                logger.info("demand trigger LAUNCH — %s (filter=%s model=%s backend=%s)",
+                            d.reason, d.issue_filter, d.model, backend or "claude")
                 # config#2201: SlotDecision no longer carries partition_index/
                 # partition_count at all — those fields were fully removed
                 # from nousergon-lib's SlotDecision (confirmed on the lib's
@@ -1318,12 +1667,17 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 entry = {"model": d.model, "issue_filter": d.issue_filter}
                 if pr_budget is not None and "high" in d.tiers:
                     entry["pr_budget"] = pr_budget
+                if backend:
+                    entry["backend"] = backend
                 entries.append(entry)
-            decisions_record = [d.as_record() for d in launches]
+            _write_trigger_record(schedule_label, decisions_record, counts)
             if event.get("decide_only"):
                 # config#2152: manifests are written at DECIDE time (above) —
                 # the enumerate-once product of the same walk as the counts —
-                # so the two-phase SF path records them here too.
+                # so the two-phase SF path records them here too. Each entry's
+                # optional "backend" key (I3479) rides the SF Map's wholesale
+                # per-item merge straight into the matching launch_decided
+                # invocation — see the module docstring.
                 return {"decide": {"trigger": "demand-all", "counts": counts,
                                    "decisions": decisions_record,
                                    "queue_manifests": manifest_keys,
@@ -1332,6 +1686,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 _launch_groom_spot(
                     run_mode, schedule_label, e["model"], e["issue_filter"], soft_limit_min,
                     e.get("pr_budget"), force_on_demand,
+                    backend=e.get("backend", ""),
                 )
                 for e in entries
             ]
@@ -1340,10 +1695,17 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                               "queue_manifests": manifest_keys,
                               "launches": results}}
 
+    # alpha-engine-config-I3479 (PRIMARY-mode DeepSeek): when
+    # GROOM_PRIMARY_DEEPSEEK_TIERS is armed, ALL launch paths use DeepSeek —
+    # including gated-reverify, manifest drains, and force_on_demand relaunches.
+    # The per-tier scoping in _primary_backend_for (via the demand-gate branch
+    # below) still applies to the demand-all path for mixed-bundle scenarios,
+    # but with all three tiers armed today (low,mid,high) the distinction is moot.
+    backend = GROOM_BACKEND_DEEPSEEK if GROOM_PRIMARY_DEEPSEEK_TIERS else ""
     if run_mode == "full" and not force_on_demand and not queue_manifest_key:
         decided = _demand_decision(issue_filter, schedule_label)
         if decided is not None:
-            decision, counts = decided
+            decision, counts, decided_backend = decided
             if not decision.launch:
                 logger.info("demand gate SKIP — %s", decision.reason)
                 _notify_demand_skip(decision, counts, schedule_label)
@@ -1357,17 +1719,21 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             # below its own tier's model, and a bundle without high never pays for it.
             issue_filter = decision.issue_filter
             model = decision.model
-            logger.info("demand gate LAUNCH — %s (filter=%s model=%s)",
-                        decision.reason, issue_filter, model)
+            backend = decided_backend
+            logger.info("demand gate LAUNCH — %s (filter=%s model=%s backend=%s)",
+                        decision.reason, issue_filter, model, backend or "claude")
 
     if event.get("decide_only"):
         entry = {"model": model, "issue_filter": issue_filter}
         if pr_budget is not None:
             entry["pr_budget"] = pr_budget
+        if backend:
+            entry["backend"] = backend
         return {"decide": {"launches": [entry]}}
 
     result = _launch_groom_spot(
         run_mode, schedule_label, model, issue_filter, soft_limit_min, pr_budget, force_on_demand,
         queue_manifest_key=queue_manifest_key,
+        backend=backend,
     )
     return {"groom": result}

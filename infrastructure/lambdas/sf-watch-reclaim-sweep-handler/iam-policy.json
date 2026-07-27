@@ -9,7 +9,7 @@
         "logs:CreateLogStream",
         "logs:PutLogEvents"
       ],
-      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-sf-watch-liveness-probe:*"
+      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-sf-watch-reclaim-sweep-handler:*"
     },
     {
       "Sid": "TelegramSecretsSSM",
@@ -73,7 +73,18 @@
       "Sid": "LivenessDedupState",
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject"],
-      "Resource": "arn:aws:s3:::alpha-engine-research/consolidated/sf_watch_liveness/*"
+      "Resource": "arn:aws:s3:::alpha-engine-research/consolidated/sf_watch_reclaim_sweep/*"
+    },
+    {
+      "Sid": "ListSfWatchReclaimSweepPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["consolidated/sf_watch_reclaim_sweep/*"]
+        }
+      }
     },
     {
       "Sid": "ReclaimCheckerCompletionMarkers",
@@ -82,10 +93,32 @@
       "Resource": "arn:aws:s3:::alpha-engine-research/sf_watch/_control/completed/*"
     },
     {
+      "Sid": "ListSfWatchControlPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["sf_watch/_control/completed/*"]
+        }
+      }
+    },
+    {
       "Sid": "ReclaimCheckerWatchLogRW",
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject"],
       "Resource": "arn:aws:s3:::alpha-engine-research/consolidated/*_sf_watch/*"
+    },
+    {
+      "Sid": "ListConsolidatedSfWatchPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["consolidated/*_sf_watch/*"]
+        }
+      }
     },
     {
       "Sid": "ReclaimCheckerInvokeSpotDispatcher",

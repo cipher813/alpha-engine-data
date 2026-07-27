@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import socket
 import sys
 from pathlib import Path
 
@@ -128,26 +129,62 @@ def main() -> int:
     if findings:
         print(f"DRIFT: {len(findings)} unit(s) diverged from repo.", file=sys.stderr)
         if args.report:
-            _flow_doctor_report(findings)
+            _report_drift(findings)
     else:
         print("Systemd unit drift check PASSED (installed units match repo).")
 
     return exit_code
 
 
-def _flow_doctor_report(findings: list[str]) -> None:
-    try:
-        sys.path.insert(0, str(REPO_ROOT))
-        import flow_doctor
+def _report_drift(findings: list[str]) -> None:
+    """Alert on detected systemd unit drift.
 
-        fd = flow_doctor.init(config_path=str(REPO_ROOT / "flow-doctor.yaml"))
-        fd.report(
-            RuntimeError(f"systemd unit drift: {'; '.join(findings)}"),
+    This used to construct flow-doctor by hand and had been BROKEN for an
+    unknown length of time (alpha-engine-config-I4509). Two independent faults,
+    either one fatal:
+
+      1. `flow_doctor.init()` does not exist. flow-doctor 0.8.7 exports
+         FlowDoctor / FlowDoctorBuilder and no `init`, so the call raised
+         AttributeError every time.
+      2. The env hydration was incomplete anyway -- flow-doctor.yaml references
+         more ${VAR}s than were being set, so even with (1) fixed, construction
+         raises ConfigError.
+
+    Neither was noticed because this function only runs when drift is FOUND,
+    and the daily check normally passes -- the same reason boot-pull's copy of
+    this bug survived. A reporting path that is only exercised on failure needs
+    a test that exercises failure; see the accompanying test module.
+
+    `krepis.alerts` is the canonical alert CLI (config#1649). It resolves its
+    own secrets, so there is no hydration list here to drift out of sync with
+    flow-doctor.yaml.
+    """
+    message = (
+        f"systemd unit drift on {socket.gethostname()}: "
+        f"installed units no longer match the repo -- {'; '.join(findings)}"
+    )
+    try:
+        from krepis.alerts import publish
+
+        publish(
+            message=message,
             severity="error",
-            context={"site": "check-systemd-unit-drift", "findings": findings},
+            source="check-systemd-unit-drift",
+            # Dedup on the FINDINGS, not the message: the same drift persisting
+            # alerts once a day, while a new finding changes the key and pages.
+            dedup_key="unit-drift-" + hashlib.sha256(
+                "|".join(sorted(findings)).encode()
+            ).hexdigest()[:16],
+            dedup_window_min=1440,
         )
-    except Exception as e:  # pragma: no cover - best-effort side channel
-        print(f"[check-systemd-unit-drift] flow-doctor report failed: {e}", file=sys.stderr)
+    except Exception as e:
+        # Fail LOUD. A silent failure here is the exact defect this rewrite
+        # fixes: the drift was detected and the telling threw.
+        print(
+            f"[check-systemd-unit-drift] ALERT PUBLISH FAILED — drift is "
+            f"UNREPORTED: {e}",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":

@@ -79,9 +79,12 @@ class TestDerivePlan:
         plan = mod.derive_plan(_events("tail_stage_failure"))
         assert plan.failed == ["parity"]
         # skip_backtester completed but its skip route would bypass the
-        # failed parity gate — must be DROPPED, loudly.
+        # failed parity gate — replaced with skip_backtester_stage_only
+        # (config#2362 Option A) so Backtester's SSM task isn't re-run
+        # while the tail gates still compose orthogonally.
         assert "skip_backtester" not in plan.skip_flags
-        assert any("skip_backtester DROPPED" in w for w in plan.warnings)
+        assert plan.skip_flags.get("skip_backtester_stage_only") is True
+        assert any("skip_backtester_stage_only" in n for n in plan.notes)
         assert set(plan.skip_flags) == {
             "skip_morning_enrich",
             "skip_data_phase1",
@@ -101,6 +104,7 @@ class TestDerivePlan:
             "skip_counterfactual",
             "skip_aggregate_costs",
             "skip_predictor_training",
+            "skip_backtester_stage_only",
             "skip_predictor_backtest",
             "skip_portfolio_optimizer_backtest",
         }
@@ -118,18 +122,40 @@ class TestDerivePlan:
     )
     def test_rerun_input_contract(self, mod, fixture):
         """The emitted input must carry the original run_date, the
-        watch-rerun role, and the sns/ec2 passthrough — the exact
-        config#2277 contract."""
+        watch-rerun role, and the sns passthrough — the exact config#2277
+        contract. config#2248: the fixtures' original execution input no
+        longer carries ec2_instance_id (the live SaturdayTrigger Input
+        dropped it — the weekly SF's own CheckSpotDispatchNeeded/
+        DispatchWeeklyFreshnessSpot states populate it from a fresh
+        ephemeral spot instead), so a rerun of a post-config#2248 execution
+        correctly omits it too and goes through that same dispatch path —
+        see test_rerun_passes_through_explicit_ec2_instance_id_when_present
+        below for the operator-override case where it IS present."""
         plan = mod.derive_plan(_events(fixture))
         inp = plan.rerun_input()
         assert inp["run_date"] == "2026-07-11"
         assert inp["pipeline_role"] == "watch-rerun"
-        assert inp["ec2_instance_id"] == ["i-09b539c844515d549"]
+        assert "ec2_instance_id" not in inp
         assert inp["sns_topic_arn"] == (
             "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts"
         )
         for flag, val in plan.skip_flags.items():
             assert inp[flag] is val is True
+
+    def test_rerun_passes_through_explicit_ec2_instance_id_when_present(self, mod):
+        """config#2248 escape hatch: rerun_input() is a generic passthrough
+        (`dict(self.original_input)`) — if an operator's original
+        StartExecution input DID carry an explicit ec2_instance_id (manual
+        override, or a redrive against a still-live launcher box), the
+        rerun must carry it through unchanged rather than stripping it, so
+        the SF's CheckSpotDispatchNeeded Choice skips a second dispatch."""
+        events = _events("early_failure")
+        started = next(e for e in events if "executionStartedEventDetails" in e)
+        inp = json.loads(started["executionStartedEventDetails"]["input"])
+        inp["ec2_instance_id"] = ["i-manualoverride"]
+        started["executionStartedEventDetails"]["input"] = json.dumps(inp)
+        plan = mod.derive_plan(events)
+        assert plan.rerun_input()["ec2_instance_id"] == ["i-manualoverride"]
 
     def test_explicit_input_run_date_wins(self, mod):
         events = _events("early_failure")
@@ -356,6 +382,17 @@ class TestStageTableLockstep:
                     "ValidatePredictorSkipWeightsFresh",
                 }
                 continue
+            if stage.name == "backtester_stage_only":
+                # config#2362 Option A additive gate: deliberately empty
+                # witness (it shares Backtester's work state with the
+                # "backtester" row, which already owns completion/failure
+                # detection for that physical task) — checked structurally
+                # here instead.
+                assert skip_targets == {"CheckSkipPredictorBacktest"}, (
+                    "CheckSkipBacktesterStageOnly's skip route changed — "
+                    "update the config#2362 Option A additive gate"
+                )
+                continue
             assert skip_targets & stage.witness, (
                 f"{stage.name}: skip route {skip_targets} no longer lands in "
                 f"witness {set(stage.witness)} — update STAGES"
@@ -369,7 +406,11 @@ class TestStageTableLockstep:
             "portfolio_optimizer_backtest",
             "parity",
         )
-        assert all_states["CheckSkipBacktester"]["Default"] == "Backtester"
+        # config#2362 Option A: CheckSkipBacktester's Default now falls
+        # through the additive CheckSkipBacktesterStageOnly gate before
+        # Backtester, rather than landing on Backtester directly.
+        assert all_states["CheckSkipBacktester"]["Default"] == "CheckSkipBacktesterStageOnly"
+        assert all_states["CheckSkipBacktesterStageOnly"]["Default"] == "Backtester"
 
 
 # ---------------------------------------------------------------------------
