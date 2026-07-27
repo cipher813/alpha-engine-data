@@ -124,6 +124,14 @@ def _legacy_weekday_listener(request, monkeypatch):
     """
     if request.node.get_closest_marker("listener_semantics"):
         return
+    # Routing mode: the CODE default is now `overseer` (I2830, applied
+    # 2026-07-27), but the great majority of this suite was written against the
+    # legacy repository_dispatch path — it asserts the urlopen POST, the
+    # `no_listener` decline, the weekday event_type, and so on. Pin the legacy
+    # mode by default so those keep testing what they were written to test;
+    # tests that assert the NEW default or the overseer path opt out with
+    # @pytest.mark.listener_semantics (or set the mode explicitly themselves).
+    monkeypatch.setattr(index, "M2_DISPATCH_TARGET", "repository_dispatch", raising=False)
     for pipeline in ("ne-preopen-trading-pipeline", "ne-postclose-trading-pipeline"):
         monkeypatch.setitem(index.PIPELINES[pipeline], "has_listener", True)
 
@@ -1560,6 +1568,7 @@ def test_m2_overseer_invoke_failure_is_nonfatal(monkeypatch):
     assert "router down" in result["agent_dispatch"]["error"]
 
 
+@pytest.mark.listener_semantics
 def test_m2_default_target_is_overseer(monkeypatch):
     """alpha-engine-config-I2830, applied 2026-07-27. Was pinned to
     `repository_dispatch` as a safe-rollout default. That default outlived its
