@@ -104,6 +104,107 @@
         ]
       }
     },
+    "t1_automations": {
+      "type": "array",
+      "minItems": 0,
+      "description": "T1 authority tier — named deterministic remediations for known-shape failures (overseer-policy.md §6). Each entry is a reviewed, non-agentic automation the alert-drain charter executes BEFORE T2 classification. Promotion requires ≥3 occurrences, deterministic remediation, verifiable success predicate, rollback path, and a reviewed authorizing issue. Demotion is automatic: ≥max_consecutive_failures predicate failures → entry disabled + finding filed. Runtime state (consecutive_failure count, demotion status) is tracked in the drain carryover ledger, NOT here — this file is the static registry.",
+      "items": {
+        "type": "object",
+        "required": ["name", "description", "authorized_by", "added", "match", "remediation_steps", "success_predicate", "rollback", "max_consecutive_failures"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+            "description": "Unique machine-readable slug for this T1 automation."
+          },
+          "description": {
+            "type": "string",
+            "minLength": 20,
+            "description": "What this automation handles — human-readable scope statement."
+          },
+          "authorized_by": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]+-I[0-9]+$",
+            "description": "Reviewed issue authorizing this T1 promotion (overseer-policy.md §6 requirement)."
+          },
+          "added": {
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "description": "Date this automation was added to the registry."
+          },
+          "match": {
+            "type": "object",
+            "required": ["alert_class"],
+            "additionalProperties": false,
+            "properties": {
+              "alert_class": {
+                "type": "string",
+                "pattern": "^[a-z0-9_]{3,60}$",
+                "description": "Must match an alert_classes entry's `class` field."
+              },
+              "severities": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "enum": ["info", "warning", "error", "critical", "alarm", "dynamic"] },
+                "description": "Optional — limit to specific severities. When absent, matches all severities of the alert_class."
+              },
+              "key_contains": {
+                "type": "string",
+                "minLength": 3,
+                "description": "Optional additional filter on the incident's corr_key. When set, the key must contain this substring to match."
+              }
+            }
+          },
+          "remediation_steps": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 10,
+            "description": "Deterministic steps the drain agent executes when this automation matches. Each step must be mechanical — no agent judgment, no branching. Steps are executed in order; any step that fails (cannot be completed mechanically) is a predicate failure.",
+            "items": {
+              "type": "string",
+              "minLength": 10
+            }
+          },
+          "success_predicate": {
+            "type": "object",
+            "required": ["description", "check"],
+            "additionalProperties": false,
+            "properties": {
+              "description": {
+                "type": "string",
+                "minLength": 10,
+                "description": "Human-readable description of what constitutes success."
+              },
+              "check": {
+                "type": "string",
+                "minLength": 10,
+                "description": "Machine-checkable success condition. The drain agent evaluates this after executing remediation_steps."
+              }
+            }
+          },
+          "rollback": {
+            "type": "object",
+            "required": ["description"],
+            "additionalProperties": false,
+            "properties": {
+              "description": {
+                "type": "string",
+                "minLength": 10,
+                "description": "How to undo the remediation if the predicate fails or the automation is later found to be incorrect."
+              }
+            }
+          },
+          "max_consecutive_failures": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10,
+            "default": 2,
+            "description": "Number of consecutive predicate failures before automatic demotion to T2 + finding filed (overseer-policy.md §6)."
+          }
+        }
+      }
+    },
     "watch_plane_liveness": { "$ref": "#/$defs/liveness_block" },
     "alert_classes": {
       "type": "array",
@@ -225,6 +326,22 @@
             "ceiling_min": { "type": "integer", "minimum": 1 },
             "margin_min": { "type": "integer", "minimum": 0 },
             "lookback_hours": { "type": "integer", "minimum": 1 },
+            "productive_when": {
+              "description": "OPTIONAL. An OR of clauses over the run artifact's own fields; an in-window artifact matching NONE of them is reported as a DEAD run (a box that booted and wrote an artifact while doing no work) — distinct from a MISSING artifact. Omit to keep existence-only semantics. Each clause is {field, <op>} with op in gt|ge|lt|le|eq; an operator outside that set RAISES in _rw_clause_holds rather than silently leaving the clause unsatisfied.",
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["field"],
+                "minProperties": 2,
+                "maxProperties": 2,
+                "properties": {
+                  "field": { "type": "string", "minLength": 1 },
+                  "gt": {}, "ge": {}, "lt": {}, "le": {}, "eq": {}
+                }
+              }
+            },
             "schedule": {
               "type": "array",
               "minItems": 1,

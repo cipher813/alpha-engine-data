@@ -10,11 +10,11 @@ name: Deploy canary-replay-dispatcher
 # code-only; --bootstrap — role creation, function creation, the disabled
 # Thursday EventBridge rule — stays operator-only). The
 # github-actions-lambda-deploy OIDC role deliberately has no iam:CreateRole /
-# iam:PutRolePolicy (fleet-wide policy; see infrastructure/iam/README.md) —
+# iam:PutRolePolicy (fleet-wide policy; see nous-ergon-ops/infrastructure/iam/README.md) —
 # IAM/profile changes still require an operator `deploy.sh --bootstrap`.
 #
 # IAM: no new grant needed — LambdaUpdate already covers
-# arn:...:function:alpha-engine-* (infrastructure/iam/github-actions-lambda-
+# arn:...:function:alpha-engine-* (nous-ergon-ops/infrastructure/iam/github-actions-lambda-
 # deploy.json), which includes this function.
 
 on:
