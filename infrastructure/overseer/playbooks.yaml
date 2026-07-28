@@ -766,3 +766,78 @@ alert_classes:
     intake: none
     response: operator
     migration_issue: alpha-engine-config-I3302   # also bypasses the email chokepoint itself
+
+# ── T1 authority tier — named deterministic remediations (overseer-policy.md §6) ──
+# Each entry is a reviewed, non-agentic automation for a known-shape failure
+# whose root cause AND remediation are stable across ≥3 occurrences. The
+# alert-drain charter consults this list BEFORE T2 classification: an incident
+# matching an active T1 entry runs its deterministic remediation and verifies
+# its success predicate with ZERO agent turns — no diagnosis, no judgment.
+#
+# Promotion contract (§6): ≥3 occurrences with the same root cause, a
+# deterministic remediation with a machine-checkable success predicate, a
+# rollback path, and a reviewed issue authorizing it (listed in authorized_by).
+#
+# Demotion is automatic: ≥max_consecutive_failures consecutive predicate
+# failures → entry disabled (state=demoted) + finding filed. Consecutive-
+# failure count resets on any successful execution. Runtime state is tracked
+# in the drain carryover ledger (DRAIN_STATE_KEY t1_runtime block), NOT here
+# — this file is the static registry; the drain agent reads both.
+#
+# Schema: playbooks.schema.json §t1_automations (additive-only evolution —
+# new OPTIONAL fields are fine; renames/removals require a schema_version bump).
+
+t1_automations:
+  # Seed entry — the drain's first non-agentic remediation path. For
+  # freshness-monitor CRITICAL staleness alerts, the T2 agent's first step is
+  # ALWAYS a deterministic S3 freshness check — an artifact fresher than the
+  # alert's SLA floor means the producer ran between alert and drain, making
+  # this T0-resolved with zero diagnosis needed. That step is agent-judgment-
+  # free and has been verified across 4 drain runs (2026-07-20 through
+  # 2026-07-27) without a false positive. Promoting it to T1 saves a full
+  # agent turn per occurrence.
+  - name: freshness-critical-auto-verify
+    description: >-
+      For freshness-monitor CRITICAL staleness alerts: HEAD the artifact in S3,
+      compare last-modified to the alert's SLA floor. If fresher, the producer
+      ran between alert and drain — the incident is T0-resolved with zero
+      diagnosis. This is the T2 agent's own first step, made deterministic.
+    authorized_by: alpha-engine-config-I4483
+    added: "2026-07-28"
+    match:
+      alert_class: freshness_monitor_staleness
+      severities: [critical]
+    remediation_steps:
+      - "Read the artifact's `s3_key_template` from `alpha-engine-config/private-docs/ARTIFACT_REGISTRY.yaml` (trust the registry template, not the alert's spelling — some surfaces render `_` as `-`)."
+      - "Run `aws s3 ls <artifact_key>` to get the last-modified timestamp."
+      - "Compare to the alert's SLA floor (the staleness threshold). If last-modified ≥ SLA floor, the incident is T0-resolved: record it with disposition `t1-resolved` and note the observed freshness timestamp. If still stale, the T1 automation declines — fall through to T2 diagnosis."
+    success_predicate:
+      description: "Artifact last-modified timestamp is ≥ the alert's SLA floor"
+      check: "aws s3 ls <artifact_key> returns a timestamp ≥ SLA floor"
+    rollback:
+      description: "Read-only verification — no state to roll back. If the predicate check was wrong (artifact actually stale), the incident falls through to T2 and is properly diagnosed."
+    max_consecutive_failures: 2
+
+  # Second seed — groom lifecycle ONLINE notices ride the bus at info severity
+  # with a dedup_key that is deterministic (mode + filter + model). They are
+  # ALWAYS T0 digest-fold (informational lifecycle heartbeat, no defect).
+  # Skipping agent classification saves ~30s per drain run.
+  - name: groom-lifecycle-digest-fold
+    description: >-
+      Groom lifecycle ONLINE notices (info severity, dedup key from
+      backlog-groom-lifecycle) are always T0 digest-fold — informational
+      heartbeat with zero defect surface. Classified deterministically.
+    authorized_by: alpha-engine-config-I4483
+    added: "2026-07-28"
+    match:
+      alert_class: groom_lifecycle_bus_events
+      severities: [info]
+    remediation_steps:
+      - "Verify the event severity is `info` and the message is a lifecycle transition (ONLINE/complete)."
+      - "Record as T0 digest-fold with disposition `t1-digest-fold`."
+    success_predicate:
+      description: "Event is info-severity lifecycle heartbeat"
+      check: "Event severity == 'info' AND message contains lifecycle transition marker"
+    rollback:
+      description: "No state changed — folding into digest is lossless (the event is still in the ledger)."
+    max_consecutive_failures: 2
