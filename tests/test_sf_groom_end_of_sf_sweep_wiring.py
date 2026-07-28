@@ -104,6 +104,34 @@ def test_sweep_payload_is_the_launch_decided_sweep_contract(states):
     }
 
 
+def _reaches(states, start, target, *, follow_catch=True):
+    """Is `target` reachable from `start` by Next/Catch edges (top level only)?
+
+    2026-07-28: these assertions used to pin DIRECT edges to
+    CheckMapLaunchOutcome. Inserting NotifyCycleComplete on the shared
+    convergence broke them without touching the invariant they actually guard —
+    "every converging path still reaches the outcome check after the sweep has
+    been attempted". Reachability is the more faithful expression of that
+    invariant and does not re-break the next time a state is inserted on the
+    same run, so per groom-sweep-policy §9 the guards are rewritten here rather
+    than the change being bent to fit them.
+    """
+    seen, stack = set(), [start]
+    while stack:
+        name = stack.pop()
+        if name == target:
+            return True
+        if name in seen or name not in states:
+            continue
+        seen.add(name)
+        st = states[name]
+        if st.get("Next"):
+            stack.append(st["Next"])
+        if follow_catch:
+            stack.extend(c["Next"] for c in st.get("Catch", []) if c.get("Next"))
+    return False
+
+
 def test_sweep_launch_failure_is_nonfatal_recorded_and_notified(states):
     """Catch → record (Pass, dispatched:false into $.sweep) → best-effort SNS
     → CheckMapLaunchOutcome (config#2311: no longer directly to the terminal
@@ -129,8 +157,8 @@ def test_sweep_launch_failure_is_nonfatal_recorded_and_notified(states):
     notify = states["NotifySweepDispatchFailure"]
     assert notify["Resource"] == "arn:aws:states:::sns:publish"
     assert "$.sweepDispatchError" in notify["Parameters"]["Message.$"]
-    assert notify["Next"] == "CheckMapLaunchOutcome"
-    assert notify["Catch"][0]["Next"] == "CheckMapLaunchOutcome"
+    assert _reaches(states, notify["Next"], "CheckMapLaunchOutcome")
+    assert _reaches(states, notify["Catch"][0]["Next"], "CheckMapLaunchOutcome")
 
     assert states["GroomDispatchComplete"]["Type"] == "Succeed"
     # A sweep-dispatch failure alone (Catch -> Record -> Notify) must never
@@ -151,7 +179,7 @@ def test_sweep_launch_failure_is_nonfatal_recorded_and_notified(states):
 def test_sweep_success_path_records_result_and_succeeds(states):
     st = states["DispatchEndOfSfSweep"]
     assert st["ResultPath"] == "$.sweep"
-    assert st["Next"] == "CheckMapLaunchOutcome"
+    assert _reaches(states, st["Next"], "CheckMapLaunchOutcome")
 
 
 def test_sweep_is_fire_and_forget_no_polling_loop(states):
@@ -234,14 +262,15 @@ def test_map_launch_failure_still_terminates_execution_failed(states):
     # of the sweep-failure sub-path). DispatchEndOfSfSweep's Catch is exempt
     # here — that's the sweep's OWN failure path, which correctly detours
     # through RecordSweepDispatchFailure/NotifySweepDispatchFailure first.
-    assert states["DispatchEndOfSfSweep"]["Next"] == "CheckMapLaunchOutcome"
+    assert _reaches(states, states["DispatchEndOfSfSweep"]["Next"],
+                    "CheckMapLaunchOutcome")
     notify = states["NotifySweepDispatchFailure"]
     nexts = [notify.get("Next")] + [c.get("Next") for c in notify.get("Catch", [])]
     for nxt in nexts:
-        assert nxt == "CheckMapLaunchOutcome", (
-            f"NotifySweepDispatchFailure routes to {nxt} instead of "
-            "CheckMapLaunchOutcome — a Map-launch failure recorded in "
-            "$.mapFailure would be lost")
+        assert _reaches(states, nxt, "CheckMapLaunchOutcome"), (
+            f"NotifySweepDispatchFailure routes to {nxt}, from which "
+            "CheckMapLaunchOutcome is unreachable — a Map-launch failure "
+            "recorded in $.mapFailure would be lost")
 
     check = states["CheckMapLaunchOutcome"]
     assert check["Type"] == "Choice"
