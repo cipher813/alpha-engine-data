@@ -38,7 +38,6 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _DAILY = _REPO_ROOT / "infrastructure" / "step_function_daily.json"
 _EOD = _REPO_ROOT / "infrastructure" / "step_function_eod.json"
 _DISPATCHER = _REPO_ROOT / "infrastructure" / "lambdas" / "data-spot-dispatcher"
-_SF_ROLE = _REPO_ROOT / "infrastructure" / "iam" / "alpha-engine-step-functions-role.json"
 
 _LAMBDA_INVOKE = "arn:aws:states:::lambda:invoke"
 _SSM_POLL = "arn:aws:states:::aws-sdk:ssm:getCommandInvocation"
@@ -643,23 +642,11 @@ class TestDispatcherLambdaAndIam:
         # No IB gateway port opened anywhere in the launcher.
         assert "4001" not in src and "4002" not in src
 
-    def test_sf_role_can_invoke_dispatcher(self):
-        # Deliverable #3 / asymmetric-grant guard: the SF role grants
-        # lambda:InvokeFunction on the dispatcher. (test_sf_iam_lambda_grants.py
-        # enforces the general rule; this pins the specific ARN prefix.)
-        role = json.loads(_SF_ROLE.read_text())
-        invoke_resources: list[str] = []
-        for st in role["Statement"]:
-            acts = st["Action"]
-            acts = acts if isinstance(acts, list) else [acts]
-            if "lambda:InvokeFunction" in acts:
-                res = st["Resource"]
-                invoke_resources += res if isinstance(res, list) else [res]
-        assert any(
-            _DISPATCHER_FN in r for r in invoke_resources
-        ), "SF role missing lambda:InvokeFunction grant for the data-spot dispatcher"
-
-
+    # NOTE: the SF role's lambda:InvokeFunction assertion moved to
+    # nous-ergon-ops/tests/test_cross_repo_sf_iam_contract.py when the IAM
+    # tree consolidated. It reads an IAM policy file, no longer in this repo;
+    # ops is private and can clone this public repo, not the reverse. The
+    # invariant is unchanged, enforced from the side that sees both halves.
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-q"]))

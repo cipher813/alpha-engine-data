@@ -7,7 +7,7 @@ name: Deploy sf-watch-reclaim-sweep-handler
 # --bootstrap is passed), so no new script flag is needed for safety.
 #
 # IAM: no new grant needed — LambdaUpdate already covers
-# arn:...:function:alpha-engine-* (infrastructure/iam/github-actions-lambda-deploy.json).
+# arn:...:function:alpha-engine-* (nous-ergon-ops/infrastructure/iam/github-actions-lambda-deploy/).
 
 on:
   push:
