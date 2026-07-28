@@ -37,14 +37,37 @@ def build_flow_doctor_config(
     *,
     db_basename: str,
     repo: str = "nousergon/nousergon-data",
+    notifier_overrides: Optional[Dict[str, Any]] = None,
 ) -> dict:
+    """Build a flow-doctor config for ``topics``.
+
+    ``notifier_overrides`` shallow-merges into EVERY notifier dict the fleet
+    spec produced — the escape hatch for a flow whose delivery posture differs
+    from its topic's canonical default. The one live use is the groom
+    CYCLE-level lifecycle flow: ``FleetTelegramTopic.GROOM``'s canonical spec is
+    ``notify_on=("info",)`` + ``disable_notification=True``, i.e. per-box
+    lifecycle pings land in ``#groom`` silently and anything above ``info`` is
+    dropped outright. That is the right default for ~18 per-box pings/day, and
+    the WRONG one for the 2 cycle-level pings/trigger the operator asked to
+    actually receive (2026-07-28 ruling).
+
+    This is a parameter rather than a second hand-written spec because
+    ``groom_flow_doctor_notify.py`` already open-codes exactly this override on
+    the box rail; two divergent copies of "how does groom traffic reach
+    Telegram" is the §2.3 one-owner-per-config-fact defect. Callers that pass
+    nothing are byte-identical to before.
+    """
     from nousergon_lib.flow_doctor_fleet import fleet_telegram_notifier_dicts
+
+    notify = fleet_telegram_notifier_dicts(topics)
+    if notifier_overrides:
+        notify = [{**spec, **notifier_overrides} for spec in notify]
 
     return {
         "flow_name": flow_name,
         "repo": repo,
         "owner": "@brianmcmahon",
-        "notify": fleet_telegram_notifier_dicts(topics),
+        "notify": notify,
         # DynamoDB, not local SQLite — dedup cooldowns must survive across
         # separate Lambda invocations (a fresh cold start gets an empty /tmp
         # every time, so SQLite there can never dedup cross-invocation;
@@ -64,7 +87,13 @@ def get_flow_doctor(
     topics: Sequence[Any],
     *,
     db_basename: str,
+    notifier_overrides: Optional[Dict[str, Any]] = None,
 ) -> Any | None:
+    # NOTE: the cache is keyed on flow_name alone, so a caller applying
+    # notifier_overrides MUST use a distinct flow_name (the groom cycle flow
+    # uses "backlog-groom-cycle" against the per-box rail's
+    # "backlog-groom-lifecycle"). Sharing a flow_name across differing
+    # overrides would silently serve whichever posture initialized first.
     if flow_name in _FLOW_DOCTOR_BY_NAME:
         return _FLOW_DOCTOR_BY_NAME[flow_name]
     if flow_name in _INIT_ATTEMPTED:
@@ -77,7 +106,10 @@ def get_flow_doctor(
         import yaml
         from nousergon_lib.logging import get_flow_doctor, setup_logging
 
-        cfg = build_flow_doctor_config(flow_name, topics, db_basename=db_basename)
+        cfg = build_flow_doctor_config(
+            flow_name, topics, db_basename=db_basename,
+            notifier_overrides=notifier_overrides,
+        )
         path = Path(f"/tmp/flow_doctor_{db_basename}.yaml")
         path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
         setup_logging(flow_name, flow_doctor_yaml=str(path))
@@ -154,6 +186,7 @@ def notify_via_flow_doctor(
     source: Optional[str] = None,
     context: Optional[Dict[str, Any]] = None,
     silent_topic: Any | None = None,
+    notifier_overrides: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Route ``text`` through flow-doctor forum topics; fallback to ``send_message``.
     Args:
@@ -171,6 +204,9 @@ def notify_via_flow_doctor(
             krepis behavior).
         context: Arbitrary key-value metadata.
         silent_topic: Optional topic for silent notifications when ``silent`` is True.
+        notifier_overrides: Per-flow delivery-posture override merged into every
+            notifier dict — see ``build_flow_doctor_config``. Requires a
+            flow_name unique to that posture (the config cache is keyed on it).
     """
     owner_repo = (context or {}).get("owner_repo")
     if owner_repo in TEST_NAMESPACE_OWNER_REPOS:
@@ -181,7 +217,10 @@ def notify_via_flow_doctor(
         )
         return False
     with _event_source_override(source):
-        fd = get_flow_doctor(flow_name, topics, db_basename=db_basename)
+        fd = get_flow_doctor(
+            flow_name, topics, db_basename=db_basename,
+            notifier_overrides=notifier_overrides,
+        )
         if fd is None:
             return send_message(text, disable_notification=silent)
 
