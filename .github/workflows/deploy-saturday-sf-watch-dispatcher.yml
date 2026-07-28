@@ -12,11 +12,11 @@ name: Deploy saturday-sf-watch-dispatcher
 # reverse). Same shape as sf-watch-spot-dispatcher's: the github-actions-lambda-
 # deploy OIDC role deliberately has no iam:CreateRole / iam:PutRolePolicy
 # (fleet-wide policy after 4 IAM-clobber incidents in 2 months; see
-# infrastructure/iam/README.md) — an IAM/profile change still requires an
+# nous-ergon-ops/infrastructure/iam/README.md) — an IAM/profile change still requires an
 # operator to run `deploy.sh --bootstrap` by hand.
 #
 # IAM: no new grant needed — LambdaUpdate already covers
-# arn:...:function:alpha-engine-* (infrastructure/iam/github-actions-lambda-
+# arn:...:function:alpha-engine-* (nous-ergon-ops/infrastructure/iam/github-actions-lambda-
 # deploy.json), which already includes this function.
 #
 # Anchors: deploy-sf-watch-spot-dispatcher.yml (template) · config#2295
