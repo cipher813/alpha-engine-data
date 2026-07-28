@@ -21,8 +21,6 @@ For each ``infrastructure/step_function*.json`` we assert the deploy script:
 
 from __future__ import annotations
 
-import fnmatch
-import json
 import re
 from pathlib import Path
 
@@ -31,7 +29,6 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _INFRA = _REPO_ROOT / "infrastructure"
 _DEPLOY = _INFRA / "deploy-infrastructure.sh"
-_GHA_DEPLOY_POLICY = _INFRA / "iam" / "github-actions-lambda-deploy.json"
 
 # The orchestration SF definitions that ship in infrastructure/ and are expected
 # to be auto-deployed on merge. Discovered by glob so a newly added SF file is
@@ -131,57 +128,10 @@ def _sf_names_deployed_by_script() -> set[str]:
     )
 
 
-def _sf_arn_patterns_granted_in_policy() -> list[str]:
-    """state-machine ARN patterns granted states:UpdateStateMachine by the role.
-
-    Returns the trailing ``stateMachine:<pattern>`` portion of every Resource
-    ARN on a statement that grants ``states:UpdateStateMachine``. Patterns may
-    contain IAM ``*`` wildcards (e.g. ``alpha-engine-*-pipeline``); coverage is
-    matched with fnmatch so a naming-convention wildcard correctly covers each
-    concrete pipeline.
-    """
-    policy = json.loads(_GHA_DEPLOY_POLICY.read_text())
-    patterns: list[str] = []
-    for stmt in policy.get("Statement", []):
-        actions = stmt.get("Action", [])
-        if isinstance(actions, str):
-            actions = [actions]
-        if "states:UpdateStateMachine" not in actions:
-            continue
-        resources = stmt.get("Resource", [])
-        if isinstance(resources, str):
-            resources = [resources]
-        for arn in resources:
-            m = re.search(r"stateMachine:([A-Za-z0-9*_.-]+)$", arn)
-            if m:
-                patterns.append(m.group(1))
-    return patterns
+# NOTE: the SF<->IAM assertion that lived here moved to
+# nous-ergon-ops/tests/test_cross_repo_sf_iam_contract.py when the IAM tree
+# consolidated. It reads an IAM policy file, no longer in this repo; ops is
+# private and can clone this public repo, not the reverse. The invariant is
+# unchanged, enforced from the side that sees both halves.
 
 
-def test_every_deployed_sf_is_granted_update_state_machine() -> None:
-    """Each SF the deploy script applies must be UpdateStateMachine-grantable.
-
-    Pins the config#1173 / 2026-06-24 runtime AccessDenied: a new SF wired into
-    deploy-infrastructure.sh whose name is not covered by the GHA deploy role's
-    UpdateStateMachine grant fails CI here instead of silently 403'ing on merge
-    and halting the next live pipeline run on stale-stamp drift.
-    """
-    deployed = _sf_names_deployed_by_script()
-    patterns = _sf_arn_patterns_granted_in_policy()
-    assert deployed, "no state-machine names parsed from deploy-infrastructure.sh"
-    assert patterns, (
-        "github-actions-lambda-deploy.json grants states:UpdateStateMachine on "
-        "no stateMachine resource"
-    )
-    missing = sorted(
-        name for name in deployed
-        if not any(fnmatch.fnmatchcase(name, pat) for pat in patterns)
-    )
-    assert not missing, (
-        f"deploy-infrastructure.sh applies update-state-machine to {missing} "
-        f"but no Resource pattern in github-actions-lambda-deploy.json grants "
-        f"states:UpdateStateMachine on them (granted patterns: {patterns}). The "
-        f"GHA deploy role will 403 at runtime, the CF stamp will not advance, "
-        f"and the next pipeline run halts on DeployDriftCheck (config#1173). "
-        f"Add/extend an ARN pattern in the InfraDeploySFDefinition statement."
-    )

@@ -416,38 +416,12 @@ class TestBranchBContents:
         )
         assert skipped["ResultPath"] == complete["ResultPath"]
 
-    def test_validation_head_object_key_is_iam_granted(self, branch_b):
-        """Cross-guard: the manifest key the SF HeadObjects must be granted
-        to the SF role in infrastructure/iam/alpha-engine-step-functions-
-        role.json (Sid HeadPredictorWeightsManifest) — the aws-sdk:s3 task
-        runs AS the state machine role, and a missing grant only surfaces
-        live as an AccessDenied on the recovery path (the worst time)."""
-        iam_path = (
-            _REPO_ROOT / "infrastructure" / "iam"
-            / "alpha-engine-step-functions-role.json"
-        )
-        policy = json.loads(iam_path.read_text())
-        key = branch_b["ValidatePredictorSkipWeightsFresh"]["Parameters"]["Key"]
-        bucket = branch_b["ValidatePredictorSkipWeightsFresh"]["Parameters"][
-            "Bucket"
-        ]
-        expected_arn = f"arn:aws:s3:::{bucket}/{key}"
-        grants = [
-            s for s in policy["Statement"]
-            if s.get("Effect") == "Allow"
-            and "s3:GetObject" in (
-                s["Action"] if isinstance(s["Action"], list) else [s["Action"]]
-            )
-            and expected_arn in (
-                s["Resource"]
-                if isinstance(s["Resource"], list) else [s["Resource"]]
-            )
-        ]
-        assert grants, (
-            f"SF role policy lacks s3:GetObject on {expected_arn} — the "
-            f"ValidatePredictorSkipWeightsFresh HeadObject would "
-            f"AccessDenied live."
-        )
+    # test_validation_head_object_key_is_iam_granted was ported to
+    # nous-ergon-ops — the SF role policy
+    # (infrastructure/iam/alpha-engine-step-functions-role.json) now lives
+    # there. The invariant (Sid HeadPredictorWeightsManifest s3:GetObject
+    # grant) is enforced in nous-ergon-ops/tests/ per the
+    # infra/drop-iam-moved-to-ops cleanup.
 
     def test_predictor_status_poll_quartet_preserved(self, branch_b):
         assert branch_b["PredictorTraining"]["Next"] == (
