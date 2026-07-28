@@ -188,6 +188,7 @@ def _month_window(now: datetime) -> dict:
         "start": start,
         "total_seconds": total_s,
         "elapsed_frac": min(max((now - start).total_seconds() / total_s, 0.0), 1.0),
+        "now": now,
     }
 
 
@@ -328,6 +329,9 @@ def _alert_over_budget(row: dict, period: str) -> bool:
             text, silent=False, severity="warning", dedup_key=dedup_key,
             flow_name=_FLOW_NAME, topics=_ALERT_TOPICS, db_basename=_DB_BASENAME,
             context={"provider": row["key"], "period": period, "pace": row["pace"]},
+            # Matches playbooks.yaml's registered `expense_collector_telegram`
+            # class source exactly (config-I3513).
+            source="flow-doctor:expense-collector",
         )
     except Exception as exc:  # noqa: BLE001 — delivery surface only
         logger.warning("over-budget alert Telegram send failed (non-fatal): %s", exc)
@@ -538,7 +542,7 @@ def _diff_row(row: dict, mw: dict, budgets: dict, key: str, counter_now: float,
     observed = mw["elapsed_frac"]
     if base_ts:
         base_dt = datetime.fromisoformat(base_ts)
-        observed = max((_now_utc() - base_dt).total_seconds() / mw["total_seconds"], 0.0)
+        observed = max((mw.get("now", _now_utc()) - base_dt).total_seconds() / mw["total_seconds"], 0.0)
         if (base_dt - mw["start"]).total_seconds() > 3600:
             row["note"] = f"measured since {base_dt:%Y-%m-%d} baseline (mid-month start)"
     row.update(mtd_cost_usd=mtd)

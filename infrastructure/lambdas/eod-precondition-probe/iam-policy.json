@@ -33,7 +33,7 @@
       "Action": "s3:ListBucket",
       "Resource": "arn:aws:s3:::alpha-engine-research",
       "Condition": {
-        "StringEquals": {
+        "StringLike": {
           "s3:prefix": [
             "feature_store/_macro_freshness.json",
             "feature_store/_universe_close_freshness.json"
