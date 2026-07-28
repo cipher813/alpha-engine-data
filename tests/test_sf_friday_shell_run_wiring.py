@@ -301,12 +301,24 @@ def _eval_intrinsic_args(s: str) -> list[str]:
     return args
 
 
+# Context-object values the spot commands reference via `$$.`. Bound to a
+# stable sentinel so byte-identity comparisons stay deterministic; the real
+# value is the SF execution name, which krepis uses as the correlation id
+# (see tests/test_sf_krepis_correlation_id.py).
+_CONTEXT_OBJECT = {"Execution.Name": "test-execution-name"}
+
+
 def _eval_expr(e: str, ctx: dict):
     """Resolve the subset of ASL intrinsics the spot commands.$ use:
-    string literals, $.var refs, States.Array(...), States.Format(...)."""
+    string literals, $.var refs, $$.context refs, States.Array(...),
+    States.Format(...)."""
     e = e.strip()
     if e.startswith("'") and e.endswith("'"):
         return e[1:-1].replace("\\'", "'")
+    if e.startswith("$$."):
+        key = e[3:]
+        assert key in _CONTEXT_OBJECT, f"unbound context-object ref: {e}"
+        return _CONTEXT_OBJECT[key]
     if e.startswith("$."):
         return ctx[e[2:]]
     if e.startswith("States.Array("):
@@ -376,6 +388,30 @@ def orig_spot_cmds() -> dict:
       reporting SUCCESS. `krepis.ssm_log_capture` is the canonical
       executable path; `test_ssm_log_capture_wrapper_executes.py` now
       proves executability (not just importability) in CI.
+    - **Regenerated 2026-07-10** as part of the weekly-SF `.env` deprecation
+      (alpha-engine-config#890 item 1, mirroring nousergon-data#485's
+      daily/eod migration): the 6 `_SPOT_STATES` entries that formerly did
+      `set -a && source /home/ec2-user/.alpha-engine.env && set +a`
+      (Backtester, Evaluator, Parity, PortfolioOptimizerBacktest,
+      PredictorBacktest, PredictorTraining) now inline-export
+      `AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1` instead — same
+      idiom as the merged daily/eod PR. Secrets still resolve via
+      `get_secret()`/SSM at runtime, unaffected by `.env` removal.
+      `DriftDetection` is left untouched (stale key, no longer a live SF
+      state per config#902 — outside `_SPOT_STATES` and outside this PR's
+      scope). `MorningEnrich`/`DataPhase1`/`RAGIngestion` are unchanged
+      (they invoke `spot_data_weekly.sh`, which self-exports the region via
+      its own `ENV_SOURCE` heredoc and never sourced `.env` directly).
+
+    - **Regenerated 2026-07-27** as part of the krepis `--correlation-id`
+      fix. krepis 0.18.8 made the correlation id mandatory (`run` exits 2
+      without `--correlation-id` or `$RUN_TOKEN`), which failed all 11
+      weekly SSM workload states on 2026-07-25. Every krepis call now
+      passes `--correlation-id {}` bound to `$$.Execution.Name`, so the
+      resolved command gains that argument immediately after `run`.
+      `_eval_expr` learned the `$$.` context-object form; the baseline
+      resolves it via `_CONTEXT_OBJECT` so byte-identity stays
+      deterministic. See `tests/test_sf_krepis_correlation_id.py`.
 
     Regenerate ONLY on a deliberate, reviewed change to a spot state's
     absent-path (`preflight_args=""`) command, by re-extracting the
@@ -433,29 +469,40 @@ class TestStrictSuperset:
     def test_initialize_input_routes_to_shell_run_gate(self, states):
         # 2026-05-27: L274 SF MutualExclusionGuard inserted a CheckMutexRole
         # Choice between InitializeInput and CheckShellRun. The strict-superset
-        # property holds because CheckMutexRole.Default → CheckShellRun (the
-        # bypass path that runs for any input without a cadence pipeline_role
-        # in {daily, weekly, eod, shell-run}), and AcquireMutex.Next →
-        # CheckShellRun (the cadence-role acquire path lands at the same
-        # downstream state). See tests/test_sf_mutex_wiring.py for the full
-        # mutex-chain contract.
+        # property holds because CheckMutexRole.Default and AcquireMutex.Next
+        # both converge on the same downstream state, whatever it is, so a
+        # non-cadence input and a successful cadence acquire always reach
+        # CheckShellRun via the identical path. See tests/test_sf_mutex_wiring.py
+        # for the full mutex-chain contract.
         # 2026-06-08 (L4517): the lib-pin drift gate precedes the mutex; its
         # paths converge on CheckMutexRole (see test_sf_lib_pin_drift_wiring.py),
         # so the mutex→CheckShellRun superset property below is unchanged.
         # config#830: CheckRunMode (cadence preset) precedes the lib-pin gate;
         # its Default → CheckSkipLibPinDriftCheck, so the superset chain holds.
+        # config#2248 (2026-07-21): CheckMutexRole.Default / AcquireMutex.Next
+        # now both land on CheckSpotDispatchNeeded (not CheckShellRun directly)
+        # — the new gate that resolves $.ec2_instance_id (from an already-
+        # present operator/rerun value, or a freshly dispatched ephemeral
+        # spot) before ANY execution can reach CheckShellRun. Its own
+        # IsPresent branch / Default both still ultimately reach CheckShellRun
+        # (immediately, or after the dispatch+bootstrap-poll chain), so the
+        # strict-superset property is preserved one gate further down.
         assert states["InitializeInput"]["Next"] == "CheckWeeklyRunDayGate"
         # config#1824: run-day gate precedes CheckRunMode; bypass Default keeps chain.
         assert states["CheckWeeklyRunDayGate"]["Default"] == "CheckRunMode"
         assert states["CheckRunMode"]["Default"] == "CheckSkipLibPinDriftCheck"
-        assert states["CheckMutexRole"]["Default"] == "CheckShellRun", (
-            "Mutex bypass path must route to CheckShellRun so the shell-run "
-            "chain remains a strict superset for non-cadence inputs"
+        assert states["CheckMutexRole"]["Default"] == "CheckSpotDispatchNeeded", (
+            "Mutex bypass path must route to CheckSpotDispatchNeeded so the "
+            "shell-run chain remains a strict superset for non-cadence inputs"
         )
-        assert states["AcquireMutex"]["Next"] == "CheckShellRun", (
-            "Mutex acquire path must also land at CheckShellRun so the "
-            "shell-run chain runs after a successful cadence acquire"
+        assert states["AcquireMutex"]["Next"] == "CheckSpotDispatchNeeded", (
+            "Mutex acquire path must also land at CheckSpotDispatchNeeded so "
+            "the shell-run chain runs after a successful cadence acquire"
         )
+        # CheckSpotDispatchNeeded's own bypass (IsPresent) branch reaches
+        # CheckShellRun directly — an operator input carrying ec2_instance_id
+        # skips the dispatch entirely, preserving the strict-superset property.
+        assert states["CheckSpotDispatchNeeded"]["Choices"][0]["Next"] == "CheckShellRun"
 
     def test_initialize_input_merge_expr_unchanged(self, states):
         # The run_date / sns_topic_arn defaults-under-input merge must be
@@ -713,6 +760,7 @@ class TestByteIdenticalAbsentPath:
         expected = (
             "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python "
             "-m krepis.ssm_log_capture run "
+            f"--correlation-id {_CONTEXT_OBJECT['Execution.Name']} "
             f"--slug {slug} --log {log} -- "
             f"{token} --preflight-only"
         )
@@ -1080,6 +1128,15 @@ class TestHappyPathTraversal:
         # SubstrateHealthGate -> CheckSubstrateHealthGate pre-check before
         # MorningEnrich (fast fail on a dead dispatch box) — two extra states
         # in the visited order on the no-skip path.
+        # config#2248 (2026-07-21): CheckMutexRole.Default now routes through
+        # CheckSpotDispatchNeeded first. The trace's $.ec2_instance_id-absent
+        # default means the Choice's IsPresent branch is NOT taken, so the
+        # trace falls through Default -> DispatchWeeklyFreshnessSpot ->
+        # MergeWeeklyFreshnessSpotInstanceId -> WaitForWeeklyFreshnessSpotBootstrap
+        # -> CheckWeeklyFreshnessSpotBootstrapStatus (a green-trace Success ->
+        # CheckShellRun, same "resolves to Success" convention this helper
+        # already applies to every other WaitFor*/Check*Status poll loop) —
+        # five extra states in the visited order before CheckShellRun.
         assert order[: order.index("CheckSkipMorningEnrich") + 4] == [
             "InitializeInput",
             "CheckWeeklyRunDayGate",
@@ -1090,6 +1147,11 @@ class TestHappyPathTraversal:
             "PipelineContractCheck",
             "PipelineContractGate",
             "CheckMutexRole",
+            "CheckSpotDispatchNeeded",
+            "DispatchWeeklyFreshnessSpot",
+            "MergeWeeklyFreshnessSpotInstanceId",
+            "WaitForWeeklyFreshnessSpotBootstrap",
+            "CheckWeeklyFreshnessSpotBootstrapStatus",
             "CheckShellRun",
             "CheckSkipMorningEnrich",
             "SubstrateHealthGate",

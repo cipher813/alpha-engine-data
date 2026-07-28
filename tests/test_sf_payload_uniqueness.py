@@ -44,8 +44,6 @@ _SF_WEEKDAY = _INFRA / "step_function_daily.json"
 _SF_EOD = _INFRA / "step_function_eod.json"
 # alpha-engine-config-I2544/I2545: the two child SFs split out of the
 
-_SF_ROLE_POLICY = _INFRA / "iam" / "alpha-engine-step-functions-role.json"
-
 
 def _flatten_states(sf_doc: dict) -> dict:
     """Flatten top-level + every Parallel branch's states into one dict.
@@ -134,6 +132,12 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # action_plan.json; flag-gated (DIRECTOR_ENABLED) + non-fatal (own Catch).
     # dry_run.$=$.research_dry → no-Opus / no-write probe on the preflight (L4504).
     "Director": frozenset({"date.$", "dry_run.$"}),
+    # config#2248: launches the launcher spot that replaces the always-on
+    # dashboard box as the $.ec2_instance_id source. Empty Payload — this
+    # Lambda takes no execution-input-derived args today (force_on_demand
+    # is reserved for a future retry loop, not currently threaded from the
+    # SF); it reads its own config entirely from Lambda env vars.
+    "DispatchWeeklyFreshnessSpot": frozenset(),
 }
 
 # config#1811: the liveness-aware SSM poll iteration — one shared payload
@@ -302,44 +306,11 @@ class TestWeekdaySFPayloadFieldSetsClosed:
         )
 
 
-# ── Finding 3: SF role has exactly one lambda:InvokeFunction Statement ──
-
-
-class TestSFRoleInvokeFunctionStatementCount:
-    """``alpha-engine-step-functions-role`` declares
-    ``lambda:InvokeFunction`` in EXACTLY ONE Statement.
-
-    Multiple statements with overlapping ARN patterns would silently
-    grant additional privileges beyond the canonical list — e.g. a
-    stale Statement from a pre-2026 refactor with a hardcoded
-    deprecated ARN would let the SF invoke a Lambda it shouldn't.
-
-    The existing ``test_every_invoked_lambda_has_iam_grant`` walks
-    every Statement's resources; that catches missing grants but NOT
-    stale ones. This test closes the other half.
-    """
-
-    def test_exactly_one_invoke_function_statement(self):
-        doc = json.loads(_SF_ROLE_POLICY.read_text())
-        invoke_stmts = []
-        for i, stmt in enumerate(doc.get("Statement", [])):
-            actions = stmt.get("Action")
-            actions_list = (
-                [actions] if isinstance(actions, str) else (actions or [])
-            )
-            if "lambda:InvokeFunction" in actions_list:
-                invoke_stmts.append(
-                    (i, stmt.get("Sid"), len(actions_list))
-                )
-        assert len(invoke_stmts) == 1, (
-            f"Expected EXACTLY 1 Statement with lambda:InvokeFunction in "
-            f"alpha-engine-step-functions-role.json; found "
-            f"{len(invoke_stmts)}: {invoke_stmts}. Multiple statements "
-            "with overlapping ARN patterns silently grant extra "
-            "privileges — consolidate into one or document a non-overlap "
-            "guarantee at PR time."
-        )
-
+# TestSFRoleInvokeFunctionStatementCount (exactly one lambda:InvokeFunction
+# Statement) was ported to nous-ergon-ops — the SF role policy
+# (infrastructure/iam/alpha-engine-step-functions-role.json) now lives there.
+# The invariant (single statement preventing stale-grant drift) is enforced
+# in nous-ergon-ops/tests/ per the infra/drop-iam-moved-to-ops cleanup.
 
 # ── Finding 5: FLOW_DOCTOR_ENABLED appears EARLY in SSM command blocks ──
 

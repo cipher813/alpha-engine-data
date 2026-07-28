@@ -15,12 +15,14 @@
 # Usage:
 #   bash infrastructure/lambdas/sf-telegram-notifier/deploy.sh             # update code only
 #   bash infrastructure/lambdas/sf-telegram-notifier/deploy.sh --bootstrap # first-time create + wire EventBridge
+#   bash infrastructure/lambdas/sf-telegram-notifier/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
 #   bash infrastructure/lambdas/sf-telegram-notifier/deploy.sh --dry-run   # show actions, do not apply
 #   bash infrastructure/lambdas/sf-telegram-notifier/deploy.sh --smoke     # invoke once with a synthetic SUCCEEDED event
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 FUNCTION_NAME="alpha-engine-sf-telegram-notifier"
 ROLE_NAME="alpha-engine-sf-telegram-notifier-role"
 POLICY_NAME="alpha-engine-sf-telegram-notifier-policy"
@@ -38,11 +40,13 @@ case "${DRY_RUN:-false}" in
   *) DRY_RUN=false ;;
 esac
 BOOTSTRAP=false
+APPLY_IAM=false
 SMOKE=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
     --bootstrap) BOOTSTRAP=true ;;
+    --apply-iam) APPLY_IAM=true ;;
     --smoke) SMOKE=true ;;
     -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
   esac
@@ -95,6 +99,14 @@ ZIP="${PKG}/function.zip"
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
 
 # ----- 2. Bootstrap (first-time only) ---------------------------------------
+
+# ----- Apply IAM only (config#2825, no bootstrap side effects) -------------
+if $APPLY_IAM; then
+  echo "Applying IAM (role=${ROLE_NAME}, policy=${POLICY_NAME})..."
+  TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
+  echo "  ✓ IAM applied."
+fi
 
 if $BOOTSTRAP; then
   echo "Bootstrapping ${FUNCTION_NAME}..."
@@ -185,6 +197,60 @@ run aws lambda add-permission \
   --action lambda:InvokeFunction \
   --principal events.amazonaws.com \
   --source-arn "${RULE_ARN}" \
+  --region "${REGION}" 2>/dev/null || true
+
+# ----- 2c. Groom dispatch SF — FAILURE statuses only (2026-07-28) -----------
+#
+# A SECOND rule rather than three more ARNs on the one above, because the
+# groom SF needs a DIFFERENT status set. The rule above fans RUNNING and
+# SUCCEEDED as well, which is right for the three pipeline SFs but wrong here:
+# the groom dispatch SF now emits its own cycle-level STARTED/COMPLETE pings
+# from NotifyCycleComplete + the decide phase, carrying the per-lane roll-up
+# this generic notifier cannot produce. Adding the groom ARN to the rule above
+# would double-report every cycle with a strictly less informative message.
+#
+# What was genuinely missing is the FAILURE half. The groom SF's own SNS
+# publishes (per-lane FailExecution, sweep-dispatch failure, top-level failure)
+# all go to `alpha-engine-alerts`, which has NO Telegram subscriber — its
+# subscribers are the alerts-forwarder and the changelog mirror. So a groom SF
+# that failed outright reached email and the Overseer intake bus but never
+# Telegram, which is why four consecutive failed cycles (2026-07-27..28)
+# produced no page. FAILED/TIMED_OUT/ABORTED here closes that, and cannot
+# collide with the cycle pings: those two are emitted from INSIDE a running
+# execution, this fires on its terminal transition.
+GROOM_RULE_NAME="alpha-engine-groom-sf-failure"
+echo "Reconciling EventBridge rule: ${GROOM_RULE_NAME}"
+GROOM_EVENT_PATTERN=$(cat <<EOF
+{
+  "source": ["aws.states"],
+  "detail-type": ["Step Functions Execution Status Change"],
+  "detail": {
+    "stateMachineArn": [
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:alpha-engine-groom-dispatch"
+    ],
+    "status": ["FAILED", "TIMED_OUT", "ABORTED"]
+  }
+}
+EOF
+)
+run aws events put-rule \
+  --name "${GROOM_RULE_NAME}" \
+  --event-pattern "${GROOM_EVENT_PATTERN}" \
+  --description "Fan groom-dispatch SF FAILURE transitions to alpha-engine-sf-telegram-notifier (successes are reported by the SF's own cycle roll-up)" \
+  --region "${REGION}" \
+  --query 'RuleArn' --output text
+
+run aws events put-targets \
+  --rule "${GROOM_RULE_NAME}" \
+  --targets "Id=1,Arn=${FN_ARN}" \
+  --region "${REGION}"
+
+run aws lambda add-permission \
+  --function-name "${FUNCTION_NAME}" \
+  --statement-id "eventbridge-${GROOM_RULE_NAME}" \
+  --action lambda:InvokeFunction \
+  --principal events.amazonaws.com \
+  --source-arn "arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${GROOM_RULE_NAME}" \
   --region "${REGION}" 2>/dev/null || true
 
 # ----- 3. Update function code (always after bootstrap, idempotent) ---------

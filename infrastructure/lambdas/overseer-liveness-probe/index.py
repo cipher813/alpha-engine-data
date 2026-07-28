@@ -1,7 +1,7 @@
 """alpha-engine-overseer-liveness-probe — registry-driven wiring + run-window
 liveness check for the whole fleet watch plane (alpha-engine-config-I2831).
 
-Consolidates the two per-probe enumerations — sf-watch-liveness-probe's config
+Consolidates the two per-probe enumerations — sf-watch-reclaim-sweep-handler's config
 -drift WIRING checks and groom-liveness-probe's RUN-WINDOW accounting — into ONE
 probe that iterates ``infrastructure/overseer/playbooks.yaml``. Each playbook
 declares an OPTIONAL ``liveness.checks`` list; a top-level
@@ -11,7 +11,7 @@ the surface is no longer enumerated in per-probe Python constants.
 
 **Read-only.** The sf-watch reclaim-checker (config#2270) and disabled-window
 sweep (config#2257) are ACTION paths with their own EC2-event trigger topology
-and 45 pinned tests; they STAY in the (now slimmed) sf-watch-liveness-probe. A
+and 45 pinned tests; they STAY in the (now slimmed) sf-watch-reclaim-sweep-handler. A
 follow-up tracks their eventual migration. This probe never mutates fleet state
 — it checks wiring + run windows, dedups by problem-set CONTENT, and alerts.
 
@@ -155,7 +155,7 @@ def _on_bus(bus: str | None) -> str:
 
 def _check_eventbridge_rule(spec: dict, now: datetime) -> tuple[list[str], dict]:
     """Rule existence/state/target (+ optional stateMachineArn registration).
-    Generalizes sf-watch-liveness-probe._check_rule: the target may be a Lambda
+    Generalizes sf-watch-reclaim-sweep-handler._check_rule: the target may be a Lambda
     (``expect_target_function``) or an SQS queue (``expect_target_queue``, the
     intake rules), and the rule may live on a custom bus (``event_bus_name``).
     Fail-loud on any error code OTHER than the "does not exist" one checked for."""
@@ -221,7 +221,7 @@ def _check_eventbridge_rule(spec: dict, now: datetime) -> tuple[list[str], dict]
 def _check_state_machines_exist(spec: dict, now: datetime) -> tuple[list[str], dict]:
     """Each named pipeline's Step Function must actually exist — the exact
     2026-06-29 dead-ARN bug class, caught directly (ported from
-    sf-watch-liveness-probe._check_state_machines_exist)."""
+    sf-watch-reclaim-sweep-handler._check_state_machines_exist)."""
     problems: list[str] = []
     sfn = _sfn_client()
     for name in spec["state_machines"]:
@@ -241,7 +241,7 @@ def _check_state_machines_exist(spec: dict, now: datetime) -> tuple[list[str], d
 
 def _check_launch_config(fn_name: str, lc: dict, env: dict[str, str]) -> list[str]:
     """The deregistered-AMI silent-break guard (ported from
-    sf-watch-liveness-probe._check_launch_config): assert the AMI/SG/subnets the
+    sf-watch-reclaim-sweep-handler._check_launch_config): assert the AMI/SG/subnets the
     DEPLOYED Lambda would launch with still exist, reading their ids from its
     LIVE env (no duplicated constants). Uses Filters (not Ids) so a missing
     resource is an EMPTY set, not an error code — unexpected API errors RAISE."""
@@ -301,7 +301,7 @@ def _check_lambda_active(spec: dict, now: datetime) -> tuple[list[str], dict]:
     """Function Active + LastUpdateStatus Successful. Optionally REPORTS a
     kill-switch env value (never alerted — a deliberate operator disable is
     state) and verifies launch-config resources. Ported from
-    sf-watch-liveness-probe._check_lambda_healthy + _check_spot_dispatch_leg."""
+    sf-watch-reclaim-sweep-handler._check_lambda_healthy + _check_spot_dispatch_leg."""
     fn_name = spec["function"]
     switch_key = spec.get("report_kill_switch")
     problems: list[str] = []
@@ -524,13 +524,13 @@ def _rw_all_expected_triggers(spec: dict, s3, now: datetime) -> list[dict]:
     return sorted(merged.values(), key=lambda d: d["at"])
 
 
-def _rw_fetch_run_artifact_timestamps(spec: dict, s3, now: datetime) -> list[datetime]:
-    """``run_start`` timestamps of recent S3 run artifacts
-    (``{artifact_prefix}{date}/{run_id}.json``). PRIMARY input — RAISES on error
-    (fail-loud); a malformed individual artifact also raises (skipping it
-    silently would let a genuinely-missed trigger hide behind a corrupt one)."""
+def _rw_fetch_run_artifacts(spec: dict, s3, now: datetime) -> list[tuple[datetime, str, dict]]:
+    """Recent S3 run artifacts (``{artifact_prefix}{date}/{run_id}.json``) as
+    (run_start, key, artifact). PRIMARY input — RAISES on error (fail-loud); a
+    malformed individual artifact also raises (skipping it silently would let a
+    genuinely-missed trigger hide behind a corrupt one)."""
     artifact_prefix = spec["artifact_prefix"]
-    stamps: list[datetime] = []
+    found: list[tuple[datetime, str, dict]] = []
     for date in _rw_lookback_dates(spec, now):
         prefix = f"{artifact_prefix}{date}/"
         token = None
@@ -548,11 +548,13 @@ def _rw_fetch_run_artifact_timestamps(spec: dict, s3, now: datetime) -> list[dat
                 run_start = art.get("run_start")
                 if not run_start:
                     continue
-                stamps.append(datetime.fromisoformat(run_start.replace("Z", "+00:00")))
+                found.append(
+                    (datetime.fromisoformat(run_start.replace("Z", "+00:00")), key, art)
+                )
             if not resp.get("IsTruncated"):
                 break
             token = resp.get("NextContinuationToken")
-    return stamps
+    return found
 
 
 def _rw_missed(spec: dict, triggers: list[dict], stamps: list[datetime]) -> list[dict]:
@@ -560,6 +562,76 @@ def _rw_missed(spec: dict, triggers: list[dict], stamps: list[datetime]) -> list
     window [T, T + ceiling + margin]."""
     window = timedelta(minutes=spec["ceiling_min"] + spec["margin_min"])
     return [trig for trig in triggers if not any(trig["at"] <= s <= trig["at"] + window for s in stamps)]
+
+
+def _rw_clause_holds(clause: dict, art: dict) -> bool:
+    """Evaluate ONE declarative ``productive_when`` clause against an artifact.
+
+    Supported: ``{field: <name>, gt|ge|lt|le|eq: <number-or-value>}``. An
+    unknown operator RAISES — a registry that outran the evaluator is a
+    packaging bug, and silently treating the clause as unsatisfied would make
+    every run look dead (or, worse, alive) for the wrong reason.
+    """
+    value = art.get(clause["field"])
+    for op, expected in clause.items():
+        if op == "field":
+            continue
+        if op == "eq":
+            if value != expected:
+                return False
+        elif op in ("gt", "ge", "lt", "le"):
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                return False
+            if not {
+                "gt": value > expected,
+                "ge": value >= expected,
+                "lt": value < expected,
+                "le": value <= expected,
+            }[op]:
+                return False
+        else:
+            raise _RegistryError(f"run_window: unknown productive_when operator {op!r}")
+    return True
+
+
+def _rw_dead_runs(spec: dict, artifacts: list[tuple[datetime, str, dict]]) -> list[str]:
+    """Run artifacts that prove a box BOOTED but not that the run did anything.
+
+    A pure existence check answers "was an artifact written?", which is not the
+    question the probe exists to answer. On 2026-07-28 all three groom lanes
+    crash-cascaded two minutes after boot — every chunk agent refused to start
+    because a truncated `runuser` left the run as root — and each lane still
+    wrote a well-formed artifact (`engaged: 0`, `floor_fail: true`,
+    `artifact_ok: true`). 378 issues went un-dispositioned and this check saw
+    full coverage, because it only ever read `run_start`.
+
+    ``productive_when`` is an OR of declarative clauses; an artifact matching
+    NONE of them is a dead run. Specs without the key keep the old
+    existence-only semantics, so this is additive per registry entry.
+    """
+    clauses = spec.get("productive_when")
+    if not clauses:
+        return []
+    label = spec["label"]
+    problems: list[str] = []
+    for run_start, key, art in sorted(artifacts, key=lambda t: t[0]):
+        if any(_rw_clause_holds(c, art) for c in clauses):
+            continue
+        detail = ", ".join(
+            f"{f}={art[f]!r}"
+            for f in ("engaged", "total_issues", "undispositioned", "floor_fail",
+                      "spot_interrupted", "elapsed_min")
+            if f in art
+        )
+        stop = str(art.get("stop_reason") or "").strip()
+        problems.append(
+            f"scheduled {label} run @ {run_start.strftime('%Y-%m-%d %H:%M')}Z RAN BUT "
+            f"DID NO WORK — the artifact exists, so run-window coverage looks green, "
+            f"but the run engaged nothing it was dispatched to engage ({detail}). "
+            f"artifact=s3://{WATCH_BUCKET}/{key}"
+            + (f" stop_reason={stop[:200]!r}" if stop else "")
+        )
+    return problems
 
 
 def _check_run_window(spec: dict, now: datetime) -> tuple[list[str], dict]:
@@ -572,14 +644,18 @@ def _check_run_window(spec: dict, now: datetime) -> tuple[list[str], dict]:
     if not triggers:
         logger.info("run_window[%s]: no mature triggers in window", label)
         return [], {}
-    stamps = _rw_fetch_run_artifact_timestamps(spec, s3, now)  # PRIMARY — fail-loud
-    misses = _rw_missed(spec, triggers, stamps)
+    artifacts = _rw_fetch_run_artifacts(spec, s3, now)  # PRIMARY — fail-loud
+    misses = _rw_missed(spec, triggers, [a[0] for a in artifacts])
     problems = [
         f"scheduled {label} run '{m['label']}' @ {m['at'].strftime('%Y-%m-%d %H:%M')}Z filed NO "
         f"terminal report (no S3 run artifact under '{spec['artifact_prefix']}' in-window) — box "
         "likely died silently (spot reclaim / OOM / pre-trap crash) or was never dispatched"
         for m in misses
     ]
+    # Second failure mode, same check: the artifact EXISTS but the run did
+    # nothing. Reported per-artifact rather than per-trigger, so one dead lane
+    # is visible even when its sibling lanes covered the same trigger.
+    problems += _rw_dead_runs(spec, artifacts)
     return problems, {}
 
 
@@ -741,26 +817,68 @@ def _iter_check_specs(registry: dict) -> list[tuple[str, dict]]:
     return specs
 
 
-def _run_checks(now: datetime) -> tuple[list[str], dict[str, str]]:
+def _run_checks(now: datetime) -> tuple[list[str], dict[str, str], int, int]:
     """Run every registry-declared liveness check, aggregating problems +
-    reported kill-switches. An unknown check type RAISES (_RegistryError,
-    fail-loud) — a registry that outran the probe's checker table is a
-    packaging bug, not a silent skip."""
+    reported kill-switches.
+
+    An unknown check type RAISES (_RegistryError, fail-loud) — a registry that
+    outran the probe's checker table is a packaging bug that makes the WHOLE
+    registry untrustworthy, not a silent skip.
+
+    A checker that raises at RUNTIME (an AWS API error — most often an IAM
+    grant that drifted from the repo policy) is ISOLATED: it becomes its own
+    problem line and every other check still runs (alpha-engine-config-I4473).
+    Before this, one `AccessDenied` on one check aborted the handler and
+    erased the coverage of all ~25 — a 2026-07-23 scheduler IAM drift left the
+    probe reporting nothing at all for four days while the alert-drain plane
+    died underneath it, unseen. Fail-loud is right; losing every *other*
+    check's coverage to one check's failure is not, because a probe's whole
+    job is to report N independent findings.
+
+    Returns (problems, kill_switches, checks_run, checks_failed)."""
     registry = _registry()
     problems: list[str] = []
     kill_switches: dict[str, str] = {}
+    checks_run = 0
+    checks_failed = 0
     for label, spec in _iter_check_specs(registry):
         ctype = spec.get("type")
         checker = CHECKERS.get(ctype)
         if checker is None:
             raise _RegistryError(f"{label}: unknown liveness check type {ctype!r}")
-        p, ks = checker(spec, now)
+        checks_run += 1
+        try:
+            p, ks = checker(spec, now)
+        except Exception as exc:  # noqa: BLE001 — isolated per I4473; recorded as a problem line below, never swallowed
+            checks_failed += 1
+            logger.error(
+                "liveness check FAILED to run: %s type=%s: %s: %s",
+                label, ctype, type(exc).__name__, exc,
+            )
+            problems.append(
+                f"{label}: liveness check '{ctype}' FAILED TO RUN "
+                f"({type(exc).__name__}: {exc}) — this check's coverage is ABSENT; "
+                "the component it watches is unverified, not healthy"
+            )
+            continue
         problems.extend(p)
         kill_switches.update(ks)
-    return problems, kill_switches
+
+    if checks_run and checks_failed == checks_run:
+        # Distinct, loudest case: the probe is structurally unable to observe
+        # anything (blanket IAM/credential/network failure). Reporting this
+        # identically to N individual check failures would understate it —
+        # the plane is not degraded, it is BLIND.
+        problems.insert(
+            0,
+            f"PROBE BLIND: all {checks_run} liveness checks failed to run — "
+            "the watch plane is unobserved, not healthy. Check the probe role's "
+            "IAM against infrastructure/lambdas/overseer-liveness-probe/iam-policy.json.",
+        )
+    return problems, kill_switches, checks_run, checks_failed
 
 
-# ── Dedup + alert (content-fingerprint, ported from sf-watch-liveness-probe) ──
+# ── Dedup + alert (content-fingerprint, ported from sf-watch-reclaim-sweep-handler) ──
 
 
 def _problem_fingerprint(problems: list[str]) -> str:
@@ -796,13 +914,26 @@ def _save_alerted_fingerprint(s3, fingerprint: str | None) -> None:
         logger.warning("could not persist overseer liveness state %s: %s", STATE_KEY, exc)
 
 
-def _alert(problems: list[str], kill_switches: dict[str, str] | None = None) -> bool:
+def _alert(
+    problems: list[str],
+    kill_switches: dict[str, str] | None = None,
+    checks_run: int = 0,
+    checks_failed: int = 0,
+) -> bool:
     lines = [
         "\U0001f6f0️ *Overseer Liveness Probe — WATCH-PLANE PROBLEM*",
         f"{len(problems)} wiring/liveness issue(s) found across the fleet watch plane "
         "(the WATCHERS' own wiring, NOT a pipeline failure):",
     ]
     lines.extend(f"• {p}" for p in problems)
+    if checks_failed:
+        # I4473: coverage caveat, stated BEFORE the closing advice — a reader
+        # must not read this report as a complete picture when part of the
+        # plane went unobserved.
+        lines.append(
+            f"⚠️ *Coverage incomplete:* {checks_failed} of {checks_run} checks could not "
+            "run — the components they watch are UNVERIFIED, not confirmed healthy."
+        )
     lines.append(
         "_A watcher may not catch (or repair) a real failure right now. Check the "
         "named rules / Step Functions / dispatcher Lambdas / intake queue._"
@@ -817,7 +948,20 @@ def _alert(problems: list[str], kill_switches: dict[str, str] | None = None) -> 
             flow_name=_FLOW_NAME,
             topics=_OPS_TOPICS,
             db_basename=_DB_BASENAME,
-            context={"problems": len(problems), "kill_switches": kill_switches or {}},
+            context={
+                "problems": len(problems),
+                "kill_switches": kill_switches or {},
+                "checks_run": checks_run,
+                "checks_failed": checks_failed,
+            },
+            # No playbooks.yaml alert_classes row exists yet for this Lambda's
+            # own identity (config-I3513 audit finding) — note this is
+            # DISTINCT from the registered `overseer_dispatch_escalation`
+            # class (source "overseer-dispatcher"), which belongs to the
+            # separate overseer-dispatcher Lambda. Using _FLOW_NAME is still
+            # strictly correct (this Lambda's own naming convention);
+            # follow-up filed to add a row.
+            source=_FLOW_NAME,
         )
     except Exception as exc:  # noqa: BLE001 — delivery surface; finding still returned
         logger.warning("overseer liveness alert Telegram send failed (non-fatal): %s", exc)
@@ -827,11 +971,14 @@ def _alert(problems: list[str], kill_switches: dict[str, str] | None = None) -> 
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """Scheduled (EventBridge) entrypoint. Iterates the playbook registry,
     runs every declared liveness check read-only, dedups by problem-set content,
-    and LOUD-alerts only on a NEW/changed problem set. Raises on an unexpected
-    AWS API failure (or an unknown registry check type) so the probe can never
-    silently no-op."""
+    and LOUD-alerts only on a NEW/changed problem set.
+
+    A runtime AWS failure in ONE check is isolated into its own problem line so
+    the rest of the plane is still observed (alpha-engine-config-I4473); an
+    unknown registry check type still RAISES, so the probe can never silently
+    no-op on a registry that outran its checker table."""
     now = datetime.now(timezone.utc)
-    problems, kill_switches = _run_checks(now)
+    problems, kill_switches, checks_run, checks_failed = _run_checks(now)
     fingerprint = _problem_fingerprint(problems) if problems else None
 
     # Always surfaced (record + log), never alerted: a deliberate operator
@@ -844,7 +991,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     alerted = False
     if problems and fingerprint != already:
         logger.warning("overseer liveness: %d NEW problem(s): %s", len(problems), problems)
-        alerted = _alert(problems, kill_switches)
+        alerted = _alert(problems, kill_switches, checks_run, checks_failed)
         if alerted:
             _save_alerted_fingerprint(s3, fingerprint)
     elif problems:
@@ -862,4 +1009,10 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         "alerted": alerted,
         "clean": not problems,
         "kill_switches": kill_switches,
+        # I4473: coverage accounting. `clean: true` with checks_failed > 0 is
+        # impossible by construction (a failed check IS a problem line), but
+        # these make "how much did we actually observe" answerable from the
+        # return payload alone, without reading logs.
+        "checks_run": checks_run,
+        "checks_failed": checks_failed,
     }

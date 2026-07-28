@@ -79,14 +79,10 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INFRA = REPO_ROOT / "infrastructure"
-IAM_DIR = INFRA / "iam"
-
 SATURDAY_SF = INFRA / "step_function.json"
 WEEKDAY_SF = INFRA / "step_function_daily.json"
 EOD_SF = INFRA / "step_function_eod.json"
 CFN_PATH = INFRA / "cloudformation" / "alpha-engine-orchestration.yaml"
-ROLE_PATH = IAM_DIR / "alpha-engine-step-functions-role.json"
-
 MUTEX_TABLE_NAME = "alpha-engine-sf-execution-mutex"
 MUTEX_TABLE_ARN = (
     "arn:aws:dynamodb:us-east-1:711398986525:table/alpha-engine-sf-execution-mutex"
@@ -97,7 +93,16 @@ CADENCE_ROLES = {"daily", "weekly", "eod", "shell-run"}
 # AcquireMutex.Next) routes into — i.e., the state that USED TO BE first
 # before this PR inserted the mutex chain in front of it.
 FORMER_FIRST_STATE_BY_SF = {
-    "saturday": ("step_function.json", "CheckShellRun"),
+    # config#2248 (2026-07-21): the mutex chain now routes into
+    # CheckSpotDispatchNeeded, not CheckShellRun directly — the new
+    # dispatch-the-launcher-spot gate (which resolves $.ec2_instance_id from
+    # either an already-present operator/rerun value or a fresh ephemeral
+    # spot) sits between the mutex and CheckShellRun, so NO execution can
+    # reach CheckShellRun / any of the 14 downstream consumer states without
+    # $.ec2_instance_id already resolved. Both the cadence-acquire path
+    # (AcquireMutex.Next) and the bypass Default converge on
+    # CheckSpotDispatchNeeded for exactly this reason.
+    "saturday": ("step_function.json", "CheckSpotDispatchNeeded"),
     "weekday": ("step_function_daily.json", "DeployDriftCheck"),
     # 2026-06-30: the EOD SF's first post-mutex state is now the re-runnability
     # guard StartTradingInstance (ec2:startInstances → SSM-readiness poll), which
@@ -574,70 +579,11 @@ class TestCfnExecutionMutexTable:
         assert "Enabled: true" in block
 
 
-# ---------------------------------------------------------------------------
-# IAM — SF role has dynamodb:PutItem on the mutex table only
-# ---------------------------------------------------------------------------
-
-class TestIamGrant:
-    """alpha-engine-step-functions-role must carry exactly dynamodb:PutItem
-    on the mutex table — no DeleteItem (design has no release path),
-    no broader DDB perms (least-privilege)."""
-
-    @pytest.fixture(scope="class")
-    def role_policy(self) -> dict:
-        return json.loads(ROLE_PATH.read_text())
-
-    def test_role_has_dynamodb_putitem_statement(self, role_policy):
-        ddb_stmts = [
-            s
-            for s in role_policy["Statement"]
-            if "dynamodb" in str(s.get("Action", "")).lower()
-        ]
-        assert len(ddb_stmts) >= 1, (
-            "alpha-engine-step-functions-role missing dynamodb:PutItem — "
-            "the SF AcquireMutex states would fail AccessDenied at runtime"
-        )
-        # Must include putItem specifically
-        actions = []
-        for s in ddb_stmts:
-            a = s.get("Action", [])
-            actions.extend([a] if isinstance(a, str) else a)
-        assert "dynamodb:PutItem" in actions, (
-            f"Expected dynamodb:PutItem in SF role; got actions {actions}"
-        )
-
-    def test_role_does_not_grant_delete_item(self, role_policy):
-        """The SF itself has no release path — dynamodb:DeleteItem on THIS
-        role would be dead permission (least-privilege violation). The
-        config#2280 verified steal (delete-after-terminal-holder) lives in
-        scripts/weekly_sf_rerun.py and runs under operator / sf-watch
-        executor credentials, never under the state machine's role."""
-        for stmt in role_policy["Statement"]:
-            a = stmt.get("Action", [])
-            actions = [a] if isinstance(a, str) else a
-            assert "dynamodb:DeleteItem" not in actions, (
-                "alpha-engine-step-functions-role should NOT grant "
-                "dynamodb:DeleteItem — the SF never deletes mutex items; "
-                "stale-item release belongs to the rerun helper (operator/"
-                "sf-watch credentials) + table TTL, not the SF role"
-            )
-
-    def test_role_ddb_grant_scoped_to_mutex_table(self, role_policy):
-        ddb_stmts = [
-            s
-            for s in role_policy["Statement"]
-            if "dynamodb" in str(s.get("Action", "")).lower()
-        ]
-        for stmt in ddb_stmts:
-            res = stmt.get("Resource", [])
-            res_list = [res] if isinstance(res, str) else res
-            for r in res_list:
-                assert r == MUTEX_TABLE_ARN or r.endswith(MUTEX_TABLE_NAME), (
-                    f"DDB grant must be scoped to the mutex table only "
-                    f"(expected {MUTEX_TABLE_ARN}); got {r}. Broader scope "
-                    f"violates least-privilege."
-                )
-
+# TestIamGrant (SF role dynamodb:PutItem on mutex table) was ported to
+# nous-ergon-ops — the SF role policy
+# (infrastructure/iam/alpha-engine-step-functions-role.json) now lives there.
+# The invariants (PutItem grant, no DeleteItem, scoped to mutex table) are
+# enforced in nous-ergon-ops/tests/ per the infra/drop-iam-moved-to-ops cleanup.
 
 class TestCfnMutexConflictAlarms:
     """CFN must wire a CloudWatch metric-filter + alarm per CFN-managed SF on the
