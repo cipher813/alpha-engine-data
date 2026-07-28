@@ -524,13 +524,13 @@ def _rw_all_expected_triggers(spec: dict, s3, now: datetime) -> list[dict]:
     return sorted(merged.values(), key=lambda d: d["at"])
 
 
-def _rw_fetch_run_artifact_timestamps(spec: dict, s3, now: datetime) -> list[datetime]:
-    """``run_start`` timestamps of recent S3 run artifacts
-    (``{artifact_prefix}{date}/{run_id}.json``). PRIMARY input — RAISES on error
-    (fail-loud); a malformed individual artifact also raises (skipping it
-    silently would let a genuinely-missed trigger hide behind a corrupt one)."""
+def _rw_fetch_run_artifacts(spec: dict, s3, now: datetime) -> list[tuple[datetime, str, dict]]:
+    """Recent S3 run artifacts (``{artifact_prefix}{date}/{run_id}.json``) as
+    (run_start, key, artifact). PRIMARY input — RAISES on error (fail-loud); a
+    malformed individual artifact also raises (skipping it silently would let a
+    genuinely-missed trigger hide behind a corrupt one)."""
     artifact_prefix = spec["artifact_prefix"]
-    stamps: list[datetime] = []
+    found: list[tuple[datetime, str, dict]] = []
     for date in _rw_lookback_dates(spec, now):
         prefix = f"{artifact_prefix}{date}/"
         token = None
@@ -548,11 +548,13 @@ def _rw_fetch_run_artifact_timestamps(spec: dict, s3, now: datetime) -> list[dat
                 run_start = art.get("run_start")
                 if not run_start:
                     continue
-                stamps.append(datetime.fromisoformat(run_start.replace("Z", "+00:00")))
+                found.append(
+                    (datetime.fromisoformat(run_start.replace("Z", "+00:00")), key, art)
+                )
             if not resp.get("IsTruncated"):
                 break
             token = resp.get("NextContinuationToken")
-    return stamps
+    return found
 
 
 def _rw_missed(spec: dict, triggers: list[dict], stamps: list[datetime]) -> list[dict]:
@@ -560,6 +562,76 @@ def _rw_missed(spec: dict, triggers: list[dict], stamps: list[datetime]) -> list
     window [T, T + ceiling + margin]."""
     window = timedelta(minutes=spec["ceiling_min"] + spec["margin_min"])
     return [trig for trig in triggers if not any(trig["at"] <= s <= trig["at"] + window for s in stamps)]
+
+
+def _rw_clause_holds(clause: dict, art: dict) -> bool:
+    """Evaluate ONE declarative ``productive_when`` clause against an artifact.
+
+    Supported: ``{field: <name>, gt|ge|lt|le|eq: <number-or-value>}``. An
+    unknown operator RAISES — a registry that outran the evaluator is a
+    packaging bug, and silently treating the clause as unsatisfied would make
+    every run look dead (or, worse, alive) for the wrong reason.
+    """
+    value = art.get(clause["field"])
+    for op, expected in clause.items():
+        if op == "field":
+            continue
+        if op == "eq":
+            if value != expected:
+                return False
+        elif op in ("gt", "ge", "lt", "le"):
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                return False
+            if not {
+                "gt": value > expected,
+                "ge": value >= expected,
+                "lt": value < expected,
+                "le": value <= expected,
+            }[op]:
+                return False
+        else:
+            raise _RegistryError(f"run_window: unknown productive_when operator {op!r}")
+    return True
+
+
+def _rw_dead_runs(spec: dict, artifacts: list[tuple[datetime, str, dict]]) -> list[str]:
+    """Run artifacts that prove a box BOOTED but not that the run did anything.
+
+    A pure existence check answers "was an artifact written?", which is not the
+    question the probe exists to answer. On 2026-07-28 all three groom lanes
+    crash-cascaded two minutes after boot — every chunk agent refused to start
+    because a truncated `runuser` left the run as root — and each lane still
+    wrote a well-formed artifact (`engaged: 0`, `floor_fail: true`,
+    `artifact_ok: true`). 378 issues went un-dispositioned and this check saw
+    full coverage, because it only ever read `run_start`.
+
+    ``productive_when`` is an OR of declarative clauses; an artifact matching
+    NONE of them is a dead run. Specs without the key keep the old
+    existence-only semantics, so this is additive per registry entry.
+    """
+    clauses = spec.get("productive_when")
+    if not clauses:
+        return []
+    label = spec["label"]
+    problems: list[str] = []
+    for run_start, key, art in sorted(artifacts, key=lambda t: t[0]):
+        if any(_rw_clause_holds(c, art) for c in clauses):
+            continue
+        detail = ", ".join(
+            f"{f}={art[f]!r}"
+            for f in ("engaged", "total_issues", "undispositioned", "floor_fail",
+                      "spot_interrupted", "elapsed_min")
+            if f in art
+        )
+        stop = str(art.get("stop_reason") or "").strip()
+        problems.append(
+            f"scheduled {label} run @ {run_start.strftime('%Y-%m-%d %H:%M')}Z RAN BUT "
+            f"DID NO WORK — the artifact exists, so run-window coverage looks green, "
+            f"but the run engaged nothing it was dispatched to engage ({detail}). "
+            f"artifact=s3://{WATCH_BUCKET}/{key}"
+            + (f" stop_reason={stop[:200]!r}" if stop else "")
+        )
+    return problems
 
 
 def _check_run_window(spec: dict, now: datetime) -> tuple[list[str], dict]:
@@ -572,14 +644,18 @@ def _check_run_window(spec: dict, now: datetime) -> tuple[list[str], dict]:
     if not triggers:
         logger.info("run_window[%s]: no mature triggers in window", label)
         return [], {}
-    stamps = _rw_fetch_run_artifact_timestamps(spec, s3, now)  # PRIMARY — fail-loud
-    misses = _rw_missed(spec, triggers, stamps)
+    artifacts = _rw_fetch_run_artifacts(spec, s3, now)  # PRIMARY — fail-loud
+    misses = _rw_missed(spec, triggers, [a[0] for a in artifacts])
     problems = [
         f"scheduled {label} run '{m['label']}' @ {m['at'].strftime('%Y-%m-%d %H:%M')}Z filed NO "
         f"terminal report (no S3 run artifact under '{spec['artifact_prefix']}' in-window) — box "
         "likely died silently (spot reclaim / OOM / pre-trap crash) or was never dispatched"
         for m in misses
     ]
+    # Second failure mode, same check: the artifact EXISTS but the run did
+    # nothing. Reported per-artifact rather than per-trigger, so one dead lane
+    # is visible even when its sibling lanes covered the same trigger.
+    problems += _rw_dead_runs(spec, artifacts)
     return problems, {}
 
 
