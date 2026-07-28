@@ -97,6 +97,9 @@ class _FakeEc2:
         # config#1979: (issue_filter -> [instance_ids]) already "live" for the
         # concurrent-tier guard's describe_instances check to find.
         self._running_tier_instances = dict(running_tier_instances or {})
+        # config-I5229: instance_id -> state name for the reconciler's
+        # InstanceIds-based describe_instances.
+        self._instance_states: dict[str, str] = {}
 
     def get_waiter(self, name):
         return _FakeWaiter()
@@ -109,11 +112,23 @@ class _FakeEc2:
         self.tags_created.append((Resources, Tags))
         return {}
 
-    def describe_instances(self, Filters):  # noqa: N803 — boto3 kwarg name
-        by_name = {f["Name"]: f["Values"] for f in Filters}
-        issue_filter = by_name.get("tag:groom-issue-filter", [None])[0]
-        ids = self._running_tier_instances.get(issue_filter, [])
-        return {"Reservations": [{"Instances": [{"InstanceId": i} for i in ids]}]} if ids else {"Reservations": []}
+    def describe_instances(self, Filters=None, InstanceIds=None):  # noqa: N803 — boto3 kwarg names
+        # config-I5229: the lane-death reconciler calls describe_instances with
+        # InstanceIds (batch lookup). The concurrent-tier guard uses Filters
+        # (tag-based lookup). Support BOTH call shapes.
+        if InstanceIds:
+            # Reconciler path — return the stubbed states for these ids.
+            instances = []
+            for iid in InstanceIds:
+                state = self._instance_states.get(iid, "terminated")
+                instances.append({"InstanceId": iid, "State": {"Name": state}})
+            return {"Reservations": [{"Instances": instances}]} if instances else {"Reservations": []}
+        if Filters:
+            by_name = {f["Name"]: f["Values"] for f in Filters}
+            issue_filter = by_name.get("tag:groom-issue-filter", [None])[0]
+            ids = self._running_tier_instances.get(issue_filter, [])
+            return {"Reservations": [{"Instances": [{"InstanceId": i} for i in ids]}]} if ids else {"Reservations": []}
+        return {"Reservations": []}
 
 
 class _FakeSsm:
@@ -132,6 +147,19 @@ class _FakeSsm:
         if Name not in self.parameters:
             raise RuntimeError(f"Parameter {Name} not found")
         return {"Parameter": {"Value": self.parameters[Name]}}
+
+
+class _FakeSfn:
+    """Fake Step Functions client for the lane-death reconciler (config-I5229).
+
+    Tracks send_task_failure calls for assertion."""
+    def __init__(self):
+        self.send_task_failure_calls: list[dict] = []
+
+    def send_task_failure(self, taskToken, error, cause):  # noqa: N803 — boto3 kwarg names
+        self.send_task_failure_calls.append({
+            "taskToken": taskToken, "error": error, "cause": cause,
+        })
 
 
 class _FakeS3Body:
@@ -180,6 +208,17 @@ class _FakeS3:
         self._objects[Key] = Body
         return {}
 
+    def head_object(self, Bucket, Key):  # noqa: N803 — boto3 kwarg names
+        # config-I5229: the lane-death reconciler uses head_object to check
+        # for completion markers without fetching the body.
+        if Key in self._objects:
+            return {"ContentLength": len(self._objects[Key])}
+        import botocore.exceptions
+        raise botocore.exceptions.ClientError(
+            {"Error": {"Code": "404", "Message": "Not Found"}},
+            "HeadObject",
+        )
+
 
 def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None, ssm_parameters=None,
          running_tier_instances=None):
@@ -188,7 +227,8 @@ def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None, ssm_param
     ssm = _FakeSsm(ssm_parameters)
     ec2 = _FakeEc2(running_tier_instances=running_tier_instances)
     s3 = _FakeS3(s3_objects)
-    clients = {"ec2": ec2, "ssm": ssm, "s3": s3}
+    sfn = _FakeSfn()
+    clients = {"ec2": ec2, "ssm": ssm, "s3": s3, "stepfunctions": sfn}
     if launch_impl is None:
         launch_impl = lambda types_, subnets, **kw: "i-stub"  # noqa: E731
     _install_stubs(launch_impl, clients)
@@ -218,6 +258,7 @@ def _load(monkeypatch, *, launch_impl=None, env=None, s3_objects=None, ssm_param
     index._test_ssm = ssm  # expose for assertions
     index._test_ec2 = ec2
     index._test_s3 = s3
+    index._test_sfn = sfn
     return index
 
 
@@ -1109,15 +1150,25 @@ def test_sweep_skip_launch_writes_decision_record_with_launch_false(monkeypatch)
 
 
 def test_sweep_decision_record_write_failure_never_blocks_dispatch(monkeypatch):
-    # Best-effort, mirrors _write_trigger_record/_write_skip_record: a record
-    # -write failure must never turn an already-successful sweep launch into
-    # a crash.
+    # config-I5229: the EXPECTATION LEDGER write (_write_dispatch_ledger_entry)
+    # is now FAIL-LOUD — a registration-write failure IS a paging condition
+    # (§2.7) and the just-launched box is terminated. The DECISION RECORD
+    # (_write_sweep_decision_record) remains best-effort: it is written AFTER
+    # the launch returns and a failure must never turn an already-successful
+    # sweep launch into a crash.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
 
-    def _boom(**kw):
-        raise RuntimeError("S3 down")
+    # Only break the decision-record write (key starts with groom/decisions/),
+    # not the expectation-ledger write (which must succeed for the launch to
+    # proceed).
+    orig_put = idx._test_s3.put_object
 
-    monkeypatch.setattr(idx._test_s3, "put_object", _boom)
+    def _fail_decision_only(Bucket, Key, Body, **kw):  # noqa: N803
+        if isinstance(Key, str) and Key.startswith("groom/decisions/"):
+            raise RuntimeError("S3 down for decision records")
+        return orig_put(Bucket, Key, Body, **kw)
+
+    monkeypatch.setattr(idx._test_s3, "put_object", _fail_decision_only)
     out = idx.handler(dict(_SWEEP_SF_EVENT), None)
     assert out["groom"]["launched"] is True
 
@@ -1219,12 +1270,17 @@ def test_symmetric_trigger_writes_queue_manifests(monkeypatch):
 
 def test_queue_manifest_write_failure_does_not_block_launch(monkeypatch):
     """Observer phase: a manifest write failure is logged (driver-side parity
-    reports it) but the boxes still launch — grooms are the primary deliverable."""
+    reports it) but the boxes still launch — grooms are the primary deliverable.
+    config-I5229: only the manifest writes fail; the expectation-ledger write
+    (now fail-loud) must still succeed."""
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     _stub_fresh_stats(monkeypatch, idx, {"low": 8, "mid": 9, "high": 10})
-    def boom(**kw):
-        raise RuntimeError("AccessDenied: s3:PutObject")
-    monkeypatch.setattr(idx._test_s3, "put_object", boom)
+    orig_put = idx._test_s3.put_object
+    def _fail_queues_only(Bucket, Key, Body, **kw):  # noqa: N803
+        if isinstance(Key, str) and Key.startswith("groom/queues/"):
+            raise RuntimeError("AccessDenied: s3:PutObject on queues")
+        return orig_put(Bucket, Key, Body, **kw)
+    monkeypatch.setattr(idx._test_s3, "put_object", _fail_queues_only)
     out = idx.handler(_demand_event(), None)
     assert out["groom"]["queue_manifests"] == {}
     assert len(out["groom"]["launches"]) == 3
@@ -1426,7 +1482,10 @@ def test_prior_launch_count_today_ignores_other_dates(monkeypatch):
     assert idx._prior_launch_count_today() == 0
 
 
-def test_dispatch_ledger_write_failure_never_blocks_the_launch(monkeypatch):
+def test_dispatch_ledger_write_failure_terminates_box_and_raises(monkeypatch):
+    """config-I5229: the ledger write is now FAIL-LOUD — a registration-write
+    failure IS a paging condition per groom-sweep-policy §2.7. The box is
+    terminated (no orphan) and the error propagates."""
     idx = _load(
         monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true", "GROOM_MAX_DISPATCHES_DAILY": "5"},
     )
@@ -1436,8 +1495,10 @@ def test_dispatch_ledger_write_failure_never_blocks_the_launch(monkeypatch):
         raise RuntimeError("S3 down")
 
     monkeypatch.setattr(idx._test_s3, "put_object", _boom)
-    out = idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
-    assert out["groom"]["launched"] is True
+    with pytest.raises(RuntimeError, match="S3 down"):
+        idx.handler({"run_mode": "full", "issue_filter": "mid-only", "schedule": "x"}, None)
+    # The just-launched box was terminated — no orphaned instance.
+    assert "i-stub" in idx._test_ec2.terminated
 
 
 def test_dispatch_ceiling_checked_after_concurrent_tier_skip(monkeypatch):
@@ -2127,3 +2188,164 @@ def test_task_token_is_read_from_the_event_not_the_context(monkeypatch):
         pass
 
     assert not hasattr(_Ctx(), "task")
+
+
+# ── Lane-death reconciler tests (alpha-engine-config-I5229) ────────────────────
+
+
+def test_reconcile_no_open_expectations_is_quiet(monkeypatch):
+    """No dispatch-ledger entries → no deaths, no pages, quiet return."""
+    idx = _load(monkeypatch, s3_objects={
+        # Only a completed entry (marker exists) — not an open expectation.
+        "groom/_control/dispatch-ledger/2026-07-28/tok1.json": json.dumps({
+            "run_token": "tok1", "tier_tag": "mid-only", "schedule": "0 1 * * *",
+            "instance_id": "i-dead", "deadline_utc": "2026-07-28T12:00:00Z",
+        }).encode(),
+        "groom/_control/completed/tok1.json": json.dumps({
+            "outcome": "success", "rc": 0,
+        }).encode(),
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    assert result["reconciled"] is True
+    assert result["open_expectations"] == 0
+    assert result["deaths"] == 0
+    assert result["overdue"] == 0
+
+
+def test_reconcile_detects_lane_death_instance_terminated(monkeypatch):
+    """Open expectation + instance terminated → lane_died verdict."""
+    idx = _load(monkeypatch, s3_objects={
+        "groom/_control/dispatch-ledger/2026-07-28/tok1.json": json.dumps({
+            "run_token": "tok1", "tier_tag": "mid-only", "schedule": "0 1 * * *",
+            "instance_id": "i-dead", "deadline_utc": "2026-07-29T12:00:00Z",
+        }).encode(),
+    })
+    # Instance not in _instance_states → defaults to "terminated"
+    result = idx.handler({"mode": "reconcile"}, None)
+    assert result["deaths"] == 1
+    assert result["overdue"] == 0
+
+
+def test_reconcile_detects_lane_death_instance_stopped(monkeypatch):
+    """Open expectation + instance stopped (terminal state) → lane_died verdict."""
+    idx = _load(monkeypatch, s3_objects={
+        "groom/_control/dispatch-ledger/2026-07-28/tok1.json": json.dumps({
+            "run_token": "tok1", "tier_tag": "mid-only", "schedule": "0 1 * * *",
+            "instance_id": "i-stopped", "deadline_utc": "2026-07-29T12:00:00Z",
+        }).encode(),
+    })
+    idx._test_ec2._instance_states["i-stopped"] = "stopped"
+    result = idx.handler({"mode": "reconcile"}, None)
+    assert result["deaths"] == 1
+
+
+def test_reconcile_detects_overdue_running_instance(monkeypatch):
+    """Open expectation + instance still running but past deadline → overdue."""
+    from datetime import datetime, timedelta, timezone
+
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    idx = _load(monkeypatch, s3_objects={
+        "groom/_control/dispatch-ledger/2026-07-28/tok1.json": json.dumps({
+            "run_token": "tok1", "tier_tag": "mid-only", "schedule": "0 1 * * *",
+            "instance_id": "i-running", "deadline_utc": past,
+        }).encode(),
+    })
+    idx._test_ec2._instance_states["i-running"] = "running"
+    result = idx.handler({"mode": "reconcile"}, None)
+    assert result["overdue"] == 1
+    assert result["deaths"] == 0
+
+
+def test_reconcile_skips_running_instance_within_deadline(monkeypatch):
+    """Open expectation + instance still running, deadline not yet reached → quiet."""
+    from datetime import datetime, timedelta, timezone
+
+    future = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat()
+    idx = _load(monkeypatch, s3_objects={
+        "groom/_control/dispatch-ledger/2026-07-28/tok1.json": json.dumps({
+            "run_token": "tok1", "tier_tag": "mid-only", "schedule": "0 1 * * *",
+            "instance_id": "i-running", "deadline_utc": future,
+        }).encode(),
+    })
+    idx._test_ec2._instance_states["i-running"] = "running"
+    result = idx.handler({"mode": "reconcile"}, None)
+    assert result["deaths"] == 0
+    assert result["overdue"] == 0
+
+
+def test_reconcile_skips_completed_lane(monkeypatch):
+    """Completion marker exists → reconciler skips, regardless of instance state."""
+    idx = _load(monkeypatch, s3_objects={
+        "groom/_control/dispatch-ledger/2026-07-28/tok1.json": json.dumps({
+            "run_token": "tok1", "tier_tag": "mid-only", "schedule": "0 1 * * *",
+            "instance_id": "i-dead", "deadline_utc": "2026-07-28T12:00:00Z",
+        }).encode(),
+        "groom/_control/completed/tok1.json": json.dumps({
+            "outcome": "success", "rc": 0,
+        }).encode(),
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    assert result["deaths"] == 0
+    assert result["open_expectations"] == 0
+
+
+def test_reconcile_describe_instances_error_is_fail_safe(monkeypatch):
+    """EC2 describe-instances fails → fail-safe: no deaths reported.
+    The reconciler must never page on a broken EC2 API — the next tick retries."""
+    idx = _load(monkeypatch, s3_objects={
+        "groom/_control/dispatch-ledger/2026-07-28/tok1.json": json.dumps({
+            "run_token": "tok1", "tier_tag": "mid-only", "schedule": "0 1 * * *",
+            "instance_id": "i-dead", "deadline_utc": "2026-07-28T12:00:00Z",
+        }).encode(),
+    })
+    # Make describe_instances with InstanceIds raise.
+    orig = idx._test_ec2.describe_instances
+
+    def _raising(*a, **kw):
+        if kw.get("InstanceIds"):
+            raise RuntimeError("simulated EC2 API outage")
+        return orig(*a, **kw)
+
+    idx._test_ec2.describe_instances = _raising
+    result = idx.handler({"mode": "reconcile"}, None)
+    assert result["deaths"] == 0
+    assert "describe_error" in result
+
+
+def test_reconcile_mode_cannot_collide_with_other_shapes(monkeypatch):
+    """mode=reconcile is checked before resolve_run_mode — an event carrying
+    both mode=reconcile AND demand-all shapes must still reconcile, not launch."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"}, s3_objects={
+        # Add a demand-all event shape that would normally launch — should be
+        # ignored because mode=reconcile short-circuits first.
+    })
+    result = idx.handler({
+        "mode": "reconcile",
+        "run_mode": "full",
+        "model": "some-model",
+        "issue_filter": "high-only",
+        "trigger": "demand-all",
+        "schedule": "should-be-ignored",
+    }, None)
+    assert result["reconciled"] is True
+    # No instance was launched — the demand-all fields were never resolved.
+
+
+def test_reconcile_sends_task_failure_for_dead_lane_with_token(monkeypatch):
+    """Lane death with a task_token → send-task-failure collapses the hung SF
+    execution immediately instead of waiting for the 6h timeout."""
+    idx = _load(monkeypatch, s3_objects={
+        "groom/_control/dispatch-ledger/2026-07-28/tok1.json": json.dumps({
+            "run_token": "tok1", "tier_tag": "mid-only", "schedule": "0 1 * * *",
+            "instance_id": "i-dead", "deadline_utc": "2026-07-29T12:00:00Z",
+            "task_token": "SF_TOKEN_DEAD_LANE",
+        }).encode(),
+    })
+    idx._test_ec2._instance_states["i-dead"] = "terminated"
+
+    result = idx.handler({"mode": "reconcile"}, None)
+    assert result["deaths"] == 1
+    assert len(idx._test_sfn.send_task_failure_calls) == 1
+    assert idx._test_sfn.send_task_failure_calls[0]["taskToken"] == "SF_TOKEN_DEAD_LANE"
+    assert idx._test_sfn.send_task_failure_calls[0]["error"] == "LaneDeath"
+    assert "i-dead" in idx._test_sfn.send_task_failure_calls[0]["cause"]
