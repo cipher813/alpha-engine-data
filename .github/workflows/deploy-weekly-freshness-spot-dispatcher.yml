@@ -12,10 +12,10 @@ name: Deploy weekly-freshness-spot-dispatcher
 # the flagless run is code-only; --bootstrap is what ADDS the IAM-role
 # creation, and stays operator-only: the github-actions-lambda-deploy OIDC
 # role deliberately has no iam:CreateRole / iam:PutRolePolicy — see
-# infrastructure/iam/README.md).
+# nous-ergon-ops/infrastructure/iam/README.md).
 #
 # IAM: no new grant needed — LambdaUpdate already covers
-# arn:...:function:alpha-engine-* (infrastructure/iam/github-actions-lambda-
+# arn:...:function:alpha-engine-* (nous-ergon-ops/infrastructure/iam/github-actions-lambda-
 # deploy.json), which already includes this function.
 
 on:
