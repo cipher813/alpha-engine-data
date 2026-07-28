@@ -1,0 +1,90 @@
+name: Deploy overseer-backstop-responder
+
+# Auto-deploy the alpha-engine-overseer-backstop-responder Lambda CODE on merge
+# to main. Same pattern as the sibling deploy-overseer-liveness-probe /
+# deploy-overseer-dispatcher workflows: this script's default/flagless run is
+# code-only (no aws iam/scheduler writes unless --bootstrap is passed), so no
+# new script flag is needed for safety.
+#
+# The playbook registry (infrastructure/overseer/playbooks.yaml) is BUNDLED into
+# the zip at deploy — a registry edit therefore deploys through THIS workflow's
+# code path (the path filter includes the registry).
+#
+# Designed per alpha-engine-config-I4480 (G9 of the 2026-07-27 conformance audit).
+# The backstop-responder subscribes directly to the alarm-backstop SNS topic and
+# performs bounded non-agentic recovery per cooldown window.
+#
+# IAM: no new grant needed — LambdaUpdate already covers
+# arn:...:function:alpha-engine-* (infrastructure/iam/github-actions-lambda-deploy.json).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/lambdas/overseer-backstop-responder/**'
+      - 'infrastructure/overseer/playbooks.yaml'
+      - '.github/workflows/deploy-overseer-backstop-responder.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-overseer-backstop-responder-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy overseer-backstop-responder Lambda (code-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: alpha-engine-data
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12 (match Lambda runtime)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Deploy overseer-backstop-responder (code-only — no --bootstrap)
+        working-directory: alpha-engine-data
+        run: bash infrastructure/lambdas/overseer-backstop-responder/deploy.sh
+
+      - name: Report deployed version
+        working-directory: alpha-engine-data
+        run: |
+          echo "Deployed commit: ${{ github.sha }}"
+          # Tolerate a not-yet-bootstrapped function: deploy.sh gracefully skips
+          # the code update until an operator runs --bootstrap (the OIDC role
+          # can't create the Lambda), so this report must NOT hard-fail the job
+          # when the function does not exist yet — matching the deploy step's
+          # own guard.
+          aws lambda get-function \
+            --function-name alpha-engine-overseer-backstop-responder \
+            --query "Configuration.[LastModified,CodeSha256]" \
+            --output text \
+            || echo "(function not bootstrapped yet — code deploy was skipped)"
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@8a904b7a817901f2520dd87131ff307ed97fee02 # main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: deploy-overseer-backstop-responder.yml
+
+  notify-main-failure:
+    needs: [deploy]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit
