@@ -69,7 +69,7 @@
     },
     "MapLaunches": {
       "Type": "Map",
-      "Comment": "config#2129: one iteration per launch decision \u2014 up to 3 (low/mid/high co-launch is the observed steady state). Each iteration independently launches (op=launch_decided, .waitForTaskToken) and waits for the box to call send-task-success on completion. Timeout (6h) routes to the existing CheckCompletionMarker / bounded-retry relaunch loop. config-I4333: replaces the old SSM poll loop (15s intervals x hours) with a sub-second task-token callback \u2014 the sweep dispatches immediately after the last tier completes.",
+      "Comment": "config#2129: one iteration per launch decision \u2014 up to 3 (low/mid/high co-launch is the observed steady state). Each iteration independently launches (op=launch_decided, .waitForTaskToken) and waits for the box to call send-task-success on completion. Timeout (6h) routes to the existing CheckCompletionMarker / bounded-retry relaunch loop. config-I4333: replaces the old SSM poll loop (15s intervals x hours) with a sub-second task-token callback \u2014 the sweep dispatches immediately after the last tier completes. config#4803: per-lane FailExecution replaced with RecordLaneFailure (a recording Pass) \u2014 every iteration succeeds from the Map's perspective, so a single lane failure no longer aborts its siblings mid-work. Post-Map aggregation (CheckMapLaneOutcomes \u2192 SetMapFailureFromLanes) inspects $.mapOutcome[*].laneOutcome.laneFailed and routes to GroomMapLaunchFailed if any lane recorded a failure, preserving fail-loud at the execution level without sibling collateral.",
       "ItemsPath": "$.decideResult.Payload.decide.launches",
       "MaxConcurrency": 3,
       "ItemSelector": {
@@ -87,7 +87,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "config#2311: a Standard Map's default ToleratedFailurePercentage=0 means ANY iteration reaching FailExecution fails the whole Map \u2014 that's still correct 'fail loud' per-lane semantics (Fleet-SF Watch must see it), but it must NOT also starve the end-of-SF sweep the way it did on 2026-07-11 (a single transient Ssm.SdkClientException 2h43m into a Haiku launch killed that iteration, the Map, and skipped DispatchEndOfSfSweep entirely \u2014 the wiring test's own 'unconditional coverage' invariant was violated in production on this exact path). Route through RecordMapLaunchFailure so the sweep still fires, then re-assert FAILED via CheckMapLaunchOutcome/GroomMapLaunchFailed after the sweep dispatch completes \u2014 preserving both properties instead of trading one for the other.",
+          "Comment": "config#2311 + config#4803: a Map-level Catch here now catches only genuine Map-level failures (States.Runtime from a malformed definition, etc.) \u2014 per-lane failures no longer fail the Map (RecordLaneFailure is a Pass, not a Fail). On a Map-level failure, route through RecordMapLaunchFailure so the sweep still fires, then re-assert FAILED via CheckMapLaunchOutcome/GroomMapLaunchFailed after the sweep dispatch completes. The healthy path (Map succeeds, all iterations complete, possibly with laneOutcome.laneFailed markers) goes through CheckMapLaneOutcomes \u2192 SetMapFailureFromLanes or DispatchEndOfSfSweep.",
           "Next": "RecordMapLaunchFailure",
           "ResultPath": "$.mapLaunchError"
         }
@@ -285,10 +285,20 @@
             "Type": "Succeed",
             "Comment": "GROOM_DISPATCH_ENABLED=false kill-switch, or config#1979's concurrent-same-tier skip \u2014 intentional no-op, not a failure."
           },
-          "FailExecution": {
-            "Type": "Fail",
-            "Error": "GroomDispatchFailure",
-            "Cause": "Backlog groom dispatch failed for this launch decision \u2014 see the SNS alert / groom-spot CloudWatch log group for detail."
+          "RecordLaneFailure": {
+            "Type": "Pass",
+            "Comment": "config#4803: record lane failure in the iteration output instead of failing the Map. A Map iteration FailExecution aborts every sibling iteration mid-work (ToleratedFailurePercentage=0) \u2014 the per-lane terminal is now a recording Pass, so every iteration 'succeeds' from the Map's perspective. Post-Map aggregation (CheckMapLaneOutcomes \u2192 SetMapFailureFromLanes) inspects $.mapOutcome[*].laneOutcome.laneFailed and routes to GroomMapLaunchFailed if any lane recorded a failure, preserving fail-loud at the execution level without sibling collateral.",
+            "Parameters": {
+              "laneFailed": true,
+              "reason": "groom_lane_failure",
+              "tier.$": "$.launchDecision.issue_filter"
+            },
+            "ResultPath": "$.laneOutcome",
+            "Next": "LaneCompleted"
+          },
+          "LaneCompleted": {
+            "Type": "Succeed",
+            "Comment": "Lane completed with failure recorded \u2014 this is a Map-iteration success, NOT a terminal lane failure. The post-Map aggregation (CheckMapLaneOutcomes \u2192 SetMapFailureFromLanes) determines the execution outcome from $.mapOutcome[*].laneOutcome.laneFailed."
           },
           "GroomRetriesExhausted": {
             "Type": "Pass",
@@ -320,11 +330,11 @@
                   "States.ALL"
                 ],
                 "Comment": "Defense-in-depth: an SNS publish failure must not block the SF from reaching its own FAILED terminal state (which is what Fleet-SF Watch's EventBridge pattern actually listens for).",
-                "Next": "FailExecution",
+                "Next": "RecordLaneFailure",
                 "ResultPath": "$.failure_notify_error"
               }
             ],
-            "Next": "FailExecution",
+            "Next": "RecordLaneFailure",
             "TimeoutSeconds": 60
           },
           "GroomLaunchStateUnknown": {
@@ -343,6 +353,65 @@
         }
       },
       "ResultPath": "$.mapOutcome",
+      "Next": "CheckMapLaneOutcomes"
+    },
+    "CheckMapLaneOutcomes": {
+      "Type": "Choice",
+      "Comment": "config#4803: inspect every iteration's output for a laneOutcome.laneFailed marker. Because the per-lane FailExecution was replaced with RecordLaneFailure (a Pass, not a Fail), every iteration 'succeeds' from the Map's perspective — no sibling abort. Each index is guarded by IsPresent (fewer than 3 iterations is a valid path) and BooleanEquals on laneFailed — if any lane recorded a failure, SetMapFailureFromLanes shapes the same $.mapFailure marker that RecordMapLaunchFailure (the Map's Catch) produces, so CheckMapLaunchOutcome routes to GroomMapLaunchFailed without changes and the execution still terminates FAILED for Fleet-SF Watch.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.mapOutcome[0]",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.mapOutcome[0].laneOutcome.laneFailed",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "SetMapFailureFromLanes"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.mapOutcome[1]",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.mapOutcome[1].laneOutcome.laneFailed",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "SetMapFailureFromLanes"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.mapOutcome[2]",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.mapOutcome[2].laneOutcome.laneFailed",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "SetMapFailureFromLanes"
+        }
+      ],
+      "Default": "DispatchEndOfSfSweep"
+    },
+    "SetMapFailureFromLanes": {
+      "Type": "Pass",
+      "Comment": "config#4803: at least one lane recorded laneFailed → shape the same $.mapFailure marker that RecordMapLaunchFailure (the Map Catch) produces. CheckMapLaunchOutcome's existing Choice (IsPresent on $.mapFailure) routes to GroomMapLaunchFailed unchanged — the execution still terminates FAILED for Fleet-SF Watch after the sweep dispatch completes.",
+      "Parameters": {
+        "failed": true,
+        "reason": "one_or_more_lanes_failed",
+        "error": {
+          "Cause": "See per-lane SNS alerts and $.mapOutcome[*].laneOutcome for detail."
+        }
+      },
+      "ResultPath": "$.mapFailure",
       "Next": "DispatchEndOfSfSweep"
     },
     "RecordMapLaunchFailure": {
@@ -358,7 +427,7 @@
     },
     "DispatchEndOfSfSweep": {
       "Type": "Task",
-      "Comment": "config#2201: ONE Haiku run_mode=sweep spot box per trigger cycle, launched AFTER every groom box has fully wound down (this state is only reached when every Map iteration hit its own GroomSucceeded/GroomSkipped \u2014 any FailExecution fails the whole Map, and hence the execution, before reaching here) \u2014 and equally via AllSkipped when zero groom boxes launched. Payload is a LITERAL launch_decided event (no pace/demand re-check \u2014 the sweep is unconditional by design; issue_filter is inert for run_mode=sweep but the launch path validates it, so the mid-only default is passed explicitly). The dispatcher tags sweep boxes groom-issue-filter=sweep \u2014 distinct from every groom tier tag \u2014 so its config#1979 concurrent guard skips ONLY when a prior cycle's sweep box is still live (launched:false, reason=concurrent_tier_skip, recorded in $.sweep), never colliding with a live mid-only groom box. Fire-and-forget: the Lambda returns as soon as the async SSM command is delivered; no polling loop here (Brian removed the wait \u2014 the sweep box self-terminates and writes its own S3 run artifact + completion marker). NON-FATAL: a sweep-launch failure must never fail the groom SF execution \u2014 Catch records it in the execution output (no-silent-caps) + SNS-notifies, then the SF still succeeds.",
+      "Comment": "config#2201: ONE Haiku run_mode=sweep spot box per trigger cycle, launched AFTER every groom box has fully wound down (this state is reached when every Map iteration hit its own GroomSucceeded/GroomSkipped/LaneCompleted \u2014 per-lane failures now record into $.mapOutcome[*].laneOutcome rather than failing the Map, so the Map always completes) \u2014 and equally via AllSkipped when zero groom boxes launched, or SetMapFailureFromLanes when lanes failed. Payload is a LITERAL launch_decided event (no pace/demand re-check \u2014 the sweep is unconditional by design; issue_filter is inert for run_mode=sweep but the launch path validates it, so the mid-only default is passed explicitly). The dispatcher tags sweep boxes groom-issue-filter=sweep \u2014 distinct from every groom tier tag \u2014 so its config#1979 concurrent guard skips ONLY when a prior cycle's sweep box is still live (launched:false, reason=concurrent_tier_skip, recorded in $.sweep), never colliding with a live mid-only groom box. Fire-and-forget: the Lambda returns as soon as the async SSM command is delivered; no polling loop here (Brian removed the wait \u2014 the sweep box self-terminates and writes its own S3 run artifact + completion marker). NON-FATAL: a sweep-launch failure must never fail the groom SF execution \u2014 Catch records it in the execution output (no-silent-caps) + SNS-notifies, then the SF still succeeds.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-scheduled-groom-dispatcher",
@@ -451,7 +520,7 @@
     },
     "HandleDecideFailure": {
       "Type": "Task",
-      "Comment": "Top-level failure alert \u2014 reached ONLY by DecideLaunches's Catch (a genuine invoke-level failure computing the decision itself, before any box exists). Per-iteration launch/poll/relaunch failures use their OWN copy of HandleFailure/FailExecution inside MapLaunches's ItemProcessor, scoped to that one tier \u2014 ASL requires globally-unique state names even across a Map's nested ItemProcessor, hence the distinct Decide-prefixed names here.",
+      "Comment": "Top-level failure alert \u2014 reached ONLY by DecideLaunches's Catch (a genuine invoke-level failure computing the decision itself, before any box exists). Per-iteration launch/poll/relaunch failures use their OWN copy of HandleFailure/RecordLaneFailure inside MapLaunches's ItemProcessor, scoped to that one tier \u2014 ASL requires globally-unique state names even across a Map's nested ItemProcessor, hence the distinct Decide-prefixed names here.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
