@@ -9,10 +9,10 @@ name: Deploy expense-collector
 # still requires an operator to run `deploy.sh --bootstrap` by hand, for the
 # same reason as the sibling dispatchers: the github-actions-lambda-deploy OIDC
 # role deliberately lacks iam:CreateRole / iam:PutRolePolicy (fleet-wide
-# policy, infrastructure/iam/README.md).
+# policy, nous-ergon-ops/infrastructure/iam/README.md).
 #
 # IAM: no new grant needed — LambdaUpdate already covers
-# arn:...:function:alpha-engine-* (infrastructure/iam/github-actions-lambda-
+# arn:...:function:alpha-engine-* (nous-ergon-ops/infrastructure/iam/github-actions-lambda-
 # deploy.json), which already includes this function.
 
 on:
