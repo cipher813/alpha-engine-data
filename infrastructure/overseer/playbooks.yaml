@@ -373,6 +373,16 @@ watch_plane_liveness:
   checks:
     - type: lambda_active
       function: alpha-engine-overseer-dispatcher
+    # alpha-engine-config-I4480 — the bounded non-agentic responder on the
+    # dumb backstop topic. Watched here so a deleted or disabled responder is
+    # a finding rather than silence. Its own LAST-RESORT watcher is a
+    # CloudWatch alarm on its Errors metric
+    # (alpha-engine-watch-plane-backstop-responder-errors) terminating in an
+    # SNS email that shares no component with this probe or the responder —
+    # the probe watching the responder and the responder re-invoking the probe
+    # is mutual, not circular, precisely because that dumb leg exists.
+    - type: lambda_active
+      function: alpha-engine-overseer-backstop-responder
     - type: sqs_queue_exists
       queue_name: nousergon-overseer-intake
       expect_dlq: nousergon-overseer-intake-dlq
