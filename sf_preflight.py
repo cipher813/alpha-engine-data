@@ -52,6 +52,32 @@ log = logging.getLogger(__name__)
 
 DEFAULT_BUCKET = "alpha-engine-research"
 
+# ── SF IAM-reachability constants (check_sf_iam_reachability) ─────────────────
+_REGION = "us-east-1"
+_ACCOUNT = "711398986525"
+_WEEKLY_SF_ARN = (
+    f"arn:aws:states:{_REGION}:{_ACCOUNT}:stateMachine:ne-weekly-freshness-pipeline"
+)
+_SF_ROLE_ARN = f"arn:aws:iam::{_ACCOUNT}:role/alpha-engine-step-functions-role"
+
+# Name tag the weekly SF's per-execution dispatch box carries. Every
+# ssm:SendCommand grant against that box is tag-scoped, not instance-scoped,
+# because the box has no stable id (nousergon-data#975).
+_WEEKLY_SPOT_TAG = "alpha-engine-weekly-freshness-spot"
+
+# Identities OTHER than the SF execution role that send SSM commands to the
+# per-execution spot box. Kept explicit because it cannot be derived from the
+# SF definition: these are Lambdas the SF invokes, which then send their own
+# SSM commands under their OWN execution role.
+#
+# This list exists because of a real miss: nousergon-data#975 tag-scoped the SF
+# role's grant but left substrate-health-gate's enumerating two static instance
+# ARNs, so the first post-merge rehearsal died on AccessDeniedException. Adding
+# a Lambda that sends SSM to this box without adding it here reopens that gap.
+_SSM_SENDING_ROLES = [
+    f"arn:aws:iam::{_ACCOUNT}:role/alpha-engine-substrate-health-gate-role",
+]
+
 # Same threshold daily_append uses (DAILY_APPEND_MISSING_THRESHOLD).
 # Pre-MorningEnrich prune (PR #134) drops stragglers, so the residual
 # count should be the chronic polygon-coverage gaps only (BF-B, BRK-B,
@@ -926,12 +952,203 @@ def check_recursion_budget_for_response_format(ctx: PreflightContext) -> CheckRe
     )
 
 
+def _walk_invoked_lambdas(node: Any, found: "set[str] | None" = None) -> "set[str]":
+    """Collect every FunctionName the SF definition invokes, at any nesting.
+
+    Walks Parallel branches and Map iterators too, so a Lambda added inside one
+    is covered without touching this function. Alias/version qualifiers are
+    kept as-is; the caller strips them when building the ARN to simulate.
+    """
+    if found is None:
+        found = set()
+    if isinstance(node, dict):
+        for key, val in node.items():
+            if key == "FunctionName" and isinstance(val, str):
+                found.add(val)
+            else:
+                _walk_invoked_lambdas(val, found)
+    elif isinstance(node, list):
+        for item in node:
+            _walk_invoked_lambdas(item, found)
+    return found
+
+
+def _lambda_base_name(function_name: str) -> str:
+    """Unqualified function name from either a bare name or a full ARN.
+
+    SF states reference Lambdas both ways — some `Parameters.FunctionName` are
+    bare (`alpha-engine-scanner:live`), others are full ARNs. Both may carry an
+    alias/version qualifier, which must be stripped before building the ARN to
+    simulate, since grants are written against `function:<name>*`.
+
+    Naively splitting on ":" yields "arn" for the ARN form, which simulates
+    against a nonexistent function and reports a false denial. That is exactly
+    what this helper exists to prevent (caught 2026-07-27 while validating this
+    check against live AWS — the check's first run "failed" a role that had the
+    grant all along).
+    """
+    if function_name.startswith("arn:aws:lambda:"):
+        # arn:aws:lambda:<region>:<account>:function:<name>[:<qualifier>]
+        parts = function_name.split(":")
+        return parts[6] if len(parts) > 6 else function_name
+    return function_name.split(":")[0]
+
+
+def _simulate(
+    iam: Any,
+    role_arn: str,
+    action: str,
+    resource_arn: str,
+    context_entries: "list[dict] | None" = None,
+) -> bool:
+    """True iff `role_arn` is allowed `action` on `resource_arn`.
+
+    Any error simulating is treated as NOT allowed. A preflight that cannot
+    evaluate a gate must not report the gate as passing — "could not check" and
+    "no problem" are different answers, and conflating them is the silent
+    degradation the weekly-SF policy forbids.
+    """
+    try:
+        resp = iam.simulate_principal_policy(
+            PolicySourceArn=role_arn,
+            ActionNames=[action],
+            ResourceArns=[resource_arn],
+            ContextEntries=context_entries or [],
+        )
+    except Exception:  # noqa: BLE001 — see docstring: cannot-check != allowed
+        return False
+    return all(r["EvalDecision"] == "allowed" for r in resp["EvaluationResults"])
+
+
+def check_sf_iam_reachability(ctx: PreflightContext) -> CheckResult:
+    """Every identity the weekly SF uses can actually reach what it targets.
+
+    Bug class this catches (three live instances on 2026-07-27 alone):
+
+    * ``alpha-engine-evaluator-role`` lacked ``s3:GetObject`` on
+      ``reference/*``. The codified policy granted it; nobody had applied it.
+      Every weekly ReportCard degraded, and it surfaced only as a stack trace
+      inside a "successful" run.
+    * ``alpha-engine-step-functions-role`` could not invoke the new
+      weekly-freshness spot dispatcher until its grant was applied — the SF
+      would have 404'd at ``DispatchWeeklyFreshnessSpot``.
+    * ``alpha-engine-substrate-health-gate-role`` could not ``ssm:SendCommand``
+      to the per-execution spot box, because its grant still enumerated two
+      static instance ARNs. Caught by a rehearsal; would otherwise have failed
+      at 02:00 Saturday.
+
+    All three were knowable in seconds via ``iam:SimulatePrincipalPolicy``, and
+    none were knowable from the repo alone — the codified policy and the live
+    role disagreed, or the live resource did not exist yet.
+
+    What this asserts, derived from the SF definition itself (so a newly-added
+    state is covered without editing this check):
+
+    1. Every ``lambda:invoke`` target EXISTS live and the SF execution role is
+       allowed ``lambda:InvokeFunction`` on it.
+    2. The SF execution role is allowed ``ssm:SendCommand`` against the
+       per-execution spot box's tag.
+    3. Every additional role in ``_SSM_SENDING_ROLES`` — identities that are
+       NOT the SF role but still send SSM to that same box — is likewise
+       allowed. This is the sibling-role gap: a fix applied to the role
+       someone was looking at, while its twin went untouched.
+
+    Read-only: `SimulatePrincipalPolicy` and `GetFunctionConfiguration` make no
+    changes and cost no spend, which is the whole point of asserting before the
+    pipeline launches anything.
+    """
+    import time
+
+    import boto3
+
+    t0 = time.time()
+    sfn = boto3.client("stepfunctions")
+    iam = boto3.client("iam")
+    lam = boto3.client("lambda")
+
+    failures: list[str] = []
+    checked = 0
+
+    try:
+        live = json.loads(
+            sfn.describe_state_machine(stateMachineArn=_WEEKLY_SF_ARN)["definition"]
+        )
+    except Exception as exc:  # noqa: BLE001 — surfaced as a fail, not swallowed
+        return CheckResult(
+            name="sf_iam_reachability",
+            status="fail",
+            message=f"could not read the weekly SF definition: {exc}",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    lambda_names = sorted(_walk_invoked_lambdas(live))
+
+    # 1. Lambda existence + SF-role invoke permission.
+    for fn in lambda_names:
+        checked += 1
+        try:
+            lam.get_function_configuration(FunctionName=fn)
+        except lam.exceptions.ResourceNotFoundException:
+            failures.append(
+                f"{fn}: invoked by the SF but does not exist live — the state "
+                f"will 404 the moment it executes"
+            )
+            continue
+        arn = f"arn:aws:lambda:{_REGION}:{_ACCOUNT}:function:{_lambda_base_name(fn)}"
+        if not _simulate(iam, _SF_ROLE_ARN, "lambda:InvokeFunction", arn):
+            failures.append(
+                f"{fn}: {_SF_ROLE_ARN.rsplit('/', 1)[-1]} is not allowed "
+                f"lambda:InvokeFunction on it"
+            )
+
+    # 2 + 3. ssm:SendCommand against the per-execution spot box, for every
+    # identity that sends to it — not just the SF role.
+    spot_ctx = [
+        {
+            "ContextKeyName": "ssm:resourceTag/Name",
+            "ContextKeyValues": [_WEEKLY_SPOT_TAG],
+            "ContextKeyType": "string",
+        }
+    ]
+    any_instance = f"arn:aws:ec2:{_REGION}:{_ACCOUNT}:instance/*"
+    for role_arn in [_SF_ROLE_ARN, *_SSM_SENDING_ROLES]:
+        checked += 1
+        if not _simulate(iam, role_arn, "ssm:SendCommand", any_instance, spot_ctx):
+            failures.append(
+                f"{role_arn.rsplit('/', 1)[-1]}: not allowed ssm:SendCommand "
+                f"against instances tagged Name={_WEEKLY_SPOT_TAG} — this role "
+                f"sends SSM to the per-execution spot box"
+            )
+
+    elapsed = time.time() - t0
+    if failures:
+        return CheckResult(
+            name="sf_iam_reachability",
+            status="fail",
+            message=f"{len(failures)} identity/target pair(s) unreachable",
+            details={"failures": failures, "checked": checked},
+            elapsed_seconds=elapsed,
+        )
+    return CheckResult(
+        name="sf_iam_reachability",
+        status="ok",
+        message=(
+            f"{checked} identity/target pair(s) reachable "
+            f"({len(lambda_names)} SF-invoked Lambda(s) exist and are invokable; "
+            f"{1 + len(_SSM_SENDING_ROLES)} role(s) can SendCommand to the spot box)"
+        ),
+        details={"lambdas": lambda_names},
+        elapsed_seconds=elapsed,
+    )
+
+
 # ArcticDB on macOS crashes in ``Aws::S3::S3Client::S3Client`` if boto3 has
 # already initialized the AWS SDK in the process — the arcticdb-bundled
 # AWS SDK conflicts with the system one. Initializing arctic FIRST avoids
 # this on macOS and is harmless on Linux. (Linux EC2 doesn't hit the race
 # at all; this matters only for local-laptop preflight runs.)
 CHECKS = [
+    check_sf_iam_reachability,
     check_arctic_connectivity,
     check_constituents_fetch,
     check_universe_drift,

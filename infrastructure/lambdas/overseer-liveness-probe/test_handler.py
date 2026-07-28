@@ -717,10 +717,98 @@ def test_run_checks_aggregates_problems_and_kill_switches():
     sqs.get_queue_url.side_effect = FakeClientError("QueueDoesNotExist")
     with patch("index._registry", return_value=reg), \
          patch("index.boto3.client", side_effect=_client_factory(**{"lambda": lam, "sqs": sqs})):
-        problems, ks = index._run_checks(NOW)
+        problems, ks, run, failed = index._run_checks(NOW)
     assert any("not Active" in p for p in problems)
     assert any("does NOT EXIST" in p for p in problems)
     assert ks == {"SF_WATCH_DISPATCH_ENABLED": "true"}
+    assert (run, failed) == (2, 0)
+
+
+# ── I4473: per-check isolation ───────────────────────────────────────────────
+
+
+def _isolation_registry():
+    """One check that will blow up (scheduler) + two that will report normally."""
+    return {
+        "playbooks": {
+            "sf-watch": {"liveness": {"checks": [
+                {"type": "lambda_active", "function": "alpha-engine-spot",
+                 "report_kill_switch": "SF_WATCH_DISPATCH_ENABLED"},
+            ]}},
+        },
+        "watch_plane_liveness": {"checks": [
+            {"type": "scheduler_schedule_exists",
+             "schedule_name": "alpha-engine-alert-drain-0400utc"},
+            {"type": "sqs_queue_exists", "queue_name": "nousergon-overseer-intake"},
+        ]},
+    }
+
+
+def test_run_checks_isolates_a_raising_check_and_still_runs_the_others():
+    """The 2026-07-23 regression: an AccessDenied on ONE check aborted the whole
+    handler, erasing ~25 checks' coverage for four days."""
+    lam = MagicMock()
+    lam.get_function_configuration.return_value = _lambda_cfg(
+        state="Pending", env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    sched = MagicMock()
+    sched.get_schedule.side_effect = FakeClientError("AccessDeniedException")
+    sqs = MagicMock()
+    sqs.get_queue_url.side_effect = FakeClientError("QueueDoesNotExist")
+    with patch("index._registry", return_value=_isolation_registry()), \
+         patch("index.boto3.client", side_effect=_client_factory(
+             **{"lambda": lam, "scheduler": sched, "sqs": sqs})):
+        problems, ks, run, failed = index._run_checks(NOW)
+
+    # the raising check became its own problem line...
+    assert any("FAILED TO RUN" in p and "scheduler_schedule_exists" in p for p in problems)
+    # ...and BOTH other checks still reported their real findings
+    assert any("not Active" in p for p in problems)
+    assert any("does NOT EXIST" in p for p in problems)
+    assert ks == {"SF_WATCH_DISPATCH_ENABLED": "true"}
+    assert (run, failed) == (3, 1)
+    assert not any("PROBE BLIND" in p for p in problems)
+
+
+def test_run_checks_unknown_type_still_raises_not_isolated():
+    """An unknown check type is a packaging bug that invalidates the whole
+    registry — it must stay fail-loud, NOT be isolated like a runtime error."""
+    reg = {"playbooks": {"x": {"liveness": {"checks": [{"type": "bogus_check"}]}}}}
+    with patch("index._registry", return_value=reg):
+        with pytest.raises(index._RegistryError):
+            index._run_checks(NOW)
+
+
+def test_run_checks_all_failing_reports_probe_blind_first():
+    reg = {"watch_plane_liveness": {"checks": [
+        {"type": "scheduler_schedule_exists", "schedule_name": "s-one"},
+        {"type": "scheduler_schedule_exists", "schedule_name": "s-two"},
+    ]}}
+    sched = MagicMock()
+    sched.get_schedule.side_effect = FakeClientError("AccessDeniedException")
+    with patch("index._registry", return_value=reg), \
+         patch("index.boto3.client", side_effect=_client_factory(scheduler=sched)):
+        problems, _ks, run, failed = index._run_checks(NOW)
+    assert run == failed == 2
+    assert problems[0].startswith("PROBE BLIND")
+    assert "all 2 liveness checks failed to run" in problems[0]
+
+
+def test_run_checks_partial_failure_is_not_probe_blind():
+    reg = {"watch_plane_liveness": {"checks": [
+        {"type": "scheduler_schedule_exists", "schedule_name": "s-one"},
+        {"type": "sqs_queue_exists", "queue_name": "nousergon-overseer-intake"},
+    ]}}
+    sched = MagicMock()
+    sched.get_schedule.side_effect = FakeClientError("AccessDeniedException")
+    sqs = MagicMock()
+    sqs.get_queue_url.return_value = {"QueueUrl": "https://q"}
+    sqs.get_queue_attributes.return_value = {"Attributes": {"RedrivePolicy": json.dumps(
+        {"deadLetterTargetArn": "arn:aws:sqs:us-east-1:711398986525:nousergon-overseer-intake-dlq"})}}
+    with patch("index._registry", return_value=reg), \
+         patch("index.boto3.client", side_effect=_client_factory(scheduler=sched, sqs=sqs)):
+        problems, _ks, run, failed = index._run_checks(NOW)
+    assert (run, failed) == (2, 1)
+    assert not any("PROBE BLIND" in p for p in problems)
 
 
 def test_registry_malformed_raises():
@@ -731,7 +819,8 @@ def test_registry_malformed_raises():
     index._REGISTRY_CACHE = None
 
 
-def _handler_with(problems, kill_switches=None, state_fingerprint=None):
+def _handler_with(problems, kill_switches=None, state_fingerprint=None,
+                  checks_run=None, checks_failed=0):
     """Drive handler with _run_checks + S3 dedup state stubbed."""
     s3 = MagicMock()
     if state_fingerprint is None:
@@ -739,11 +828,36 @@ def _handler_with(problems, kill_switches=None, state_fingerprint=None):
     else:
         s3.get_object.return_value = {"Body": _Body(json.dumps({"fingerprint": state_fingerprint}).encode())}
     notify = MagicMock(return_value=True)
-    with patch("index._run_checks", return_value=(problems, kill_switches or {})), \
+    if checks_run is None:
+        checks_run = max(len(problems), 1)
+    with patch("index._run_checks",
+               return_value=(problems, kill_switches or {}, checks_run, checks_failed)), \
          patch("index._s3_client", return_value=s3), \
          patch("index.notify_via_flow_doctor", notify):
         result = index.handler({}, None)
     return result, s3, notify
+
+
+def test_handler_reports_check_coverage_counts():
+    result, _s3, _notify = _handler_with([], checks_run=25, checks_failed=0)
+    assert result["checks_run"] == 25 and result["checks_failed"] == 0
+
+
+def test_handler_alert_names_incomplete_coverage():
+    result, _s3, notify = _handler_with(
+        ["watch_plane: liveness check 'scheduler_schedule_exists' FAILED TO RUN (X: y)"],
+        checks_run=25, checks_failed=1,
+    )
+    assert result["checks_failed"] == 1
+    text = notify.call_args[0][0]
+    assert "Coverage incomplete" in text and "1 of 25" in text
+    assert "UNVERIFIED, not confirmed healthy" in text
+
+
+def test_handler_clean_run_alert_omits_coverage_caveat():
+    _result, _s3, notify = _handler_with(["some unrelated finding"],
+                                         checks_run=25, checks_failed=0)
+    assert "Coverage incomplete" not in notify.call_args[0][0]
 
 
 def test_handler_clean_no_alert():
@@ -806,3 +920,128 @@ def test_real_registry_watch_plane_covers_dispatcher_and_intake():
     queues = {c.get("queue_name") for c in checks if c["type"] == "sqs_queue_exists"}
     assert "alpha-engine-overseer-dispatcher" in functions
     assert "nousergon-overseer-intake" in queues
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# run_window: productive_when — an artifact proves a BOOT, not a RUN
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 2026-07-28: all three groom lanes crash-cascaded two minutes after boot (a
+# comment truncated the bootstrap's `runuser`, so groom_run.sh ran as root and
+# every chunk agent refused to start). Each lane still wrote a well-formed run
+# artifact, so the existence-only check reported full coverage while 378 issues
+# went un-dispositioned.
+
+_RW_SPEC_PRODUCTIVE = dict(
+    _RW_SPEC,
+    productive_when=[{"field": "engaged", "gt": 0}, {"field": "total_issues", "eq": 0}],
+)
+
+# Verbatim fields from s3://alpha-engine-research/groom/2026-07-28/
+# 9d2004971a8e4b39ad554a47cd80ae39.json (the high lane).
+_REAL_CRASH_CASCADE_ARTIFACT = {
+    "schema_version": 10,
+    "run_start": "2026-07-17T01:05:00+00:00",  # re-dated into this suite's window
+    "run_kind": "coverage",
+    "issue_filter": "high-only",
+    "stop_reason": "3 consecutive chunk-agent crashes — aborting the run loudly "
+                   "(18 issues un-dispositioned) instead of burning the queue's "
+                   "re-queue budget",
+    "floor_fail": True,
+    "spot_interrupted": False,
+    "engaged": 0,
+    "floor": 8,
+    "total_issues": 21,
+    "processed": 9,
+    "undispositioned": 21,
+    "elapsed_min": 3,
+}
+
+
+def test_crash_cascaded_run_is_flagged_despite_writing_an_artifact():
+    """The regression this check exists for, driven by the real artifact."""
+    s3 = _FakeRunWindowS3({"2026-07-17": [_REAL_CRASH_CASCADE_ARTIFACT]})
+    with patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_run_window(_RW_SPEC_PRODUCTIVE, NOW)
+    assert len(problems) == 1, problems
+    assert "RAN BUT DID NO WORK" in problems[0]
+    assert "engaged=0" in problems[0] and "total_issues=21" in problems[0]
+    assert "chunk-agent crashes" in problems[0]
+    # ...and it must NOT also be reported as a missing artifact: the trigger IS
+    # covered. Two different findings; only the productivity one applies.
+    assert "filed NO" not in problems[0]
+
+
+def test_same_artifact_without_the_predicate_is_still_silent():
+    """Existence-only semantics are preserved for specs that don't opt in —
+    so adding the key to one registry entry cannot change another's."""
+    s3 = _FakeRunWindowS3({"2026-07-17": [_REAL_CRASH_CASCADE_ARTIFACT]})
+    with patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_run_window(_RW_SPEC, NOW)
+    assert problems == []
+
+
+def test_productive_run_is_silent():
+    art = dict(_REAL_CRASH_CASCADE_ARTIFACT, engaged=7, floor_fail=False, stop_reason="")
+    s3 = _FakeRunWindowS3({"2026-07-17": [art]})
+    with patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_run_window(_RW_SPEC_PRODUCTIVE, NOW)
+    assert problems == []
+
+
+def test_empty_queue_is_a_legitimate_zero():
+    """engaged=0 with nothing to engage is a healthy run, not a dead one."""
+    art = dict(_REAL_CRASH_CASCADE_ARTIFACT, engaged=0, total_issues=0, floor_fail=False)
+    s3 = _FakeRunWindowS3({"2026-07-17": [art]})
+    with patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_run_window(_RW_SPEC_PRODUCTIVE, NOW)
+    assert problems == []
+
+
+def test_one_dead_lane_is_visible_even_when_a_sibling_lane_covered_the_trigger():
+    """Reported per-artifact, not per-trigger: the mid lane succeeding must not
+    mask the high lane doing nothing."""
+    good = dict(_REAL_CRASH_CASCADE_ARTIFACT, engaged=12, floor_fail=False)
+    s3 = _FakeRunWindowS3({"2026-07-17": [good, _REAL_CRASH_CASCADE_ARTIFACT]})
+    with patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_run_window(_RW_SPEC_PRODUCTIVE, NOW)
+    assert len(problems) == 1 and "RAN BUT DID NO WORK" in problems[0]
+
+
+def test_unknown_operator_raises_rather_than_silently_passing():
+    spec = dict(_RW_SPEC, productive_when=[{"field": "engaged", "roughly": 3}])
+    s3 = _FakeRunWindowS3({"2026-07-17": [_REAL_CRASH_CASCADE_ARTIFACT]})
+    with patch("index._s3_client", return_value=s3):
+        with pytest.raises(index._RegistryError):
+            index._check_run_window(spec, NOW)
+
+
+def test_bool_is_not_treated_as_a_number_by_gt():
+    """`engaged: True` must not satisfy `{engaged: {gt: 0}}` — Python would say
+    True > 0, which would make a malformed artifact look productive."""
+    art = dict(_REAL_CRASH_CASCADE_ARTIFACT, engaged=True)
+    s3 = _FakeRunWindowS3({"2026-07-17": [art]})
+    with patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_run_window(_RW_SPEC_PRODUCTIVE, NOW)
+    assert len(problems) == 1
+
+
+def test_registry_declares_productive_when_for_groom():
+    """The live registry must actually opt groom in — the code path above is
+    inert otherwise, which is precisely how this failure stayed invisible."""
+    import yaml
+    reg = yaml.safe_load(
+        (Path(__file__).resolve().parents[2] / "overseer" / "playbooks.yaml").read_text()
+    )
+    checks = [
+        c
+        for pb in reg["playbooks"].values()
+        for c in ((pb.get("liveness") or {}).get("checks") or [])
+        if c.get("type") == "run_window" and c.get("label") == "groom"
+    ]
+    assert checks, "no run_window check labelled 'groom' in the registry"
+    for c in checks:
+        assert c.get("productive_when"), (
+            "the groom run_window check must declare productive_when — without it "
+            "a crash-cascaded run that writes an artifact reads as full coverage"
+        )
