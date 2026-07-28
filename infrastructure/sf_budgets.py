@@ -128,12 +128,50 @@ STAGE_BUDGETS: dict[str, StageBudget] = {
     "RAGIngestion": StageBudget(
         name="RAGIngestion",
         current_timeout_seconds=21_600,
-        # Already measured in fetch_budget.py (Polygon free tier):
-        # 5 req/min = 12s/ticker; the SEC-filings phase needs ~6000s overhead.
-        per_ticker_cost_seconds=12.5,
-        fixed_overhead_seconds=6_000,
+        # Polygon free tier: 5 req/min = 12s per request. Each request covers
+        # multiple tickers (batch fetch), so the effective per-ticker cost is
+        # lower than the raw API rate. Estimated at ~8.5s/ticker averaged across
+        # the full ticker universe (batched requests + cache hits + empty tickers
+        # that short-circuit). The SEC-filings phase accounts for most of the
+        # fixed overhead.
+        per_ticker_cost_seconds=8.5,
+        fixed_overhead_seconds=5_500,
         max_budget_seconds=21_600,  # config#2938 ruling 2: hard 6h cap
         pipeline_segment="branch_a",
+    ),
+    # ── Model/training stages (NOT universe-scaling — scale with
+    #    model count and strategy complexity, not ticker count) ──────────
+    "PredictorTraining": StageBudget(
+        name="PredictorTraining",
+        current_timeout_seconds=5_400,
+        per_ticker_cost_seconds=None,
+        fixed_overhead_seconds=5_400,
+        max_budget_seconds=10_800,
+        pipeline_segment="branch_b",
+    ),
+    "ModelZooSelect": StageBudget(
+        name="ModelZooSelect",
+        current_timeout_seconds=5_400,
+        per_ticker_cost_seconds=None,
+        fixed_overhead_seconds=5_400,
+        max_budget_seconds=10_800,
+        pipeline_segment="branch_b",
+    ),
+    "ResolveZooSpecs": StageBudget(
+        name="ResolveZooSpecs",
+        current_timeout_seconds=600,
+        per_ticker_cost_seconds=None,
+        fixed_overhead_seconds=600,
+        max_budget_seconds=1_200,
+        pipeline_segment="branch_b",
+    ),
+    "TrainSpecDispatch": StageBudget(
+        name="TrainSpecDispatch",
+        current_timeout_seconds=5_400,
+        per_ticker_cost_seconds=None,
+        fixed_overhead_seconds=5_400,
+        max_budget_seconds=10_800,
+        pipeline_segment="branch_b",
     ),
     # ── Model/inference stages (NOT universe-scaling — scale with
     #    position count and strategy complexity, not ticker count) ──────────

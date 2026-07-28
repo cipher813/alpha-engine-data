@@ -93,6 +93,10 @@ SSM_STAGE_NAMES = [
     "MorningEnrich",
     "DataPhase1",
     "RAGIngestion",
+    "PredictorTraining",
+    "ModelZooSelect",
+    "ResolveZooSpecs",
+    "TrainSpecDispatch",
     "Backtester",
     "PredictorBacktest",
     "PortfolioOptimizerBacktest",
@@ -125,6 +129,18 @@ class TestSsmExecutionTimeoutPins:
 
     def test_rag_ingestion(self):
         self._check("RAGIngestion")
+
+    def test_predictor_training(self):
+        self._check("PredictorTraining")
+
+    def test_model_zoo_select(self):
+        self._check("ModelZooSelect")
+
+    def test_resolve_zoo_specs(self):
+        self._check("ResolveZooSpecs")
+
+    def test_train_spec_dispatch(self):
+        self._check("TrainSpecDispatch")
 
     def test_backtester(self):
         self._check("Backtester")
