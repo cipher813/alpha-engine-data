@@ -14,7 +14,7 @@ name: Deploy overseer-liveness-probe
 # deliberately lacks iam:CreateRole / scheduler writes (fleet-wide policy).
 #
 # IAM: no new grant needed — LambdaUpdate already covers
-# arn:...:function:alpha-engine-* (infrastructure/iam/github-actions-lambda-deploy.json).
+# arn:...:function:alpha-engine-* (nous-ergon-ops/infrastructure/iam/github-actions-lambda-deploy/).
 
 on:
   push:
