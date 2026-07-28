@@ -15,7 +15,7 @@ name: Deploy scheduled-groom-dispatcher
 # still requires an operator to run `deploy.sh --bootstrap` by hand — the
 # github-actions-lambda-deploy OIDC role deliberately has no iam:CreateRole /
 # iam:PutRolePolicy (fleet-wide policy after 4 IAM-clobber incidents in 2
-# months traced to auto-applied IAM writes; see infrastructure/iam/README.md).
+# months traced to auto-applied IAM writes; see nous-ergon-ops/infrastructure/iam/README.md).
 # It DOES already have scheduler:Create/Update/DeleteSchedule + a scoped
 # iam:PassRole — a future refinement could split deploy.sh's --bootstrap into
 # an IAM-role-creation step (still operator-only) and a schedule-rules-only
@@ -23,7 +23,7 @@ name: Deploy scheduled-groom-dispatcher
 # live-AWS validation, not bundled into this workflow-only change.
 #
 # IAM: no new grant needed — LambdaUpdate already covers
-# arn:...:function:alpha-engine-* (infrastructure/iam/github-actions-lambda-
+# arn:...:function:alpha-engine-* (nous-ergon-ops/infrastructure/iam/github-actions-lambda-
 # deploy.json), which already includes this function.
 
 on:

@@ -25,7 +25,7 @@ name: Run ArcticDB migrations
 #
 # Public repo: no secrets/instance ids inline. OIDC role reused from this
 # repo's OWN established convention — `github-actions-lambda-deploy`
-# (infrastructure/iam/github-actions-lambda-deploy.json) already grants
+# (nous-ergon-ops/infrastructure/iam/github-actions-lambda-deploy/) already grants
 # `lambda:InvokeFunction` on `arn:...:function:alpha-engine-*` (the
 # `LambdaInvokeCanary` statement) alongside its existing `deploy.yml` /
 # `deploy-data-spot-dispatcher.yml` / `live-arcticdb-smoke.yml` uses — no new
