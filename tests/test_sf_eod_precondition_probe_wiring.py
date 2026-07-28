@@ -53,8 +53,6 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_eod.json"
-_SF_ROLE = _REPO_ROOT / "infrastructure" / "iam" / "alpha-engine-step-functions-role.json"
-
 _PROBE_FN = "alpha-engine-eod-precondition-probe"
 _DISPATCHER_FN = "alpha-engine-data-spot-dispatcher"
 
@@ -427,30 +425,11 @@ class TestHealOutcomeNotifications:
             assert tgt not in _HALT
 
 
-# ── IAM: the SF role can invoke the new Lambda + self-start-execution ───────
-
-
-class TestIamGrants:
-    @pytest.fixture(scope="class")
-    def policy(self):
-        return json.loads(_SF_ROLE.read_text())
-
-    def test_probe_lambda_is_grantable(self, policy):
-        lambda_stmt = next(
-            s for s in policy["Statement"] if s.get("Action") == "lambda:InvokeFunction"
-        )
-        assert any(
-            r.rstrip("*") == f"arn:aws:lambda:us-east-1:711398986525:function:{_PROBE_FN}"
-            for r in lambda_stmt["Resource"]
-        )
-
-    def test_self_start_execution_is_granted(self, policy):
-        assert any(
-            s.get("Action") == "states:StartExecution"
-            and s.get("Resource") == "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
-            for s in policy["Statement"]
-        )
-
+# TestIamGrants (probe Lambda grantable + self-start-execution grant) was
+# ported to nous-ergon-ops — the SF role policy
+# (infrastructure/iam/alpha-engine-step-functions-role.json) now lives there.
+# The invariants are enforced in nous-ergon-ops/tests/ per the
+# infra/drop-iam-moved-to-ops cleanup.
 
 # ── Moved verbatim from test_sf_eod_substrate_check_wiring.py (deleted
 # alpha-engine-config-I2722, 2026-07-16) — this coverage was never
