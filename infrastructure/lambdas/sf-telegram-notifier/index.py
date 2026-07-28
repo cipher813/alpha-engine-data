@@ -38,6 +38,13 @@ _SF_LABELS: dict[str, str] = {
     "ne-weekly-freshness-pipeline": "Weekly Freshness SF",
     "ne-preopen-trading-pipeline": "Pre-open Trading SF",
     "ne-postclose-trading-pipeline": "Post-close Trading SF",
+    # 2026-07-28: wired for FAILURE transitions only, via its own
+    # `alpha-engine-groom-sf-failure` rule (see deploy.sh §2c). Successes are
+    # reported by the SF's own NotifyCycleComplete roll-up, which names each
+    # lane's terminal state — strictly more informative than this generic
+    # notifier could be. Without this entry the label falls back to the raw
+    # state-machine name, which is legible but not consistent with the others.
+    "alpha-engine-groom-dispatch": "Backlog Groom Dispatch SF",
 }
 
 _PREFLIGHT_LABEL_OVERRIDE: dict[str, str] = {
