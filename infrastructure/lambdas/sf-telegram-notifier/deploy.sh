@@ -199,6 +199,60 @@ run aws lambda add-permission \
   --source-arn "${RULE_ARN}" \
   --region "${REGION}" 2>/dev/null || true
 
+# ----- 2c. Groom dispatch SF — FAILURE statuses only (2026-07-28) -----------
+#
+# A SECOND rule rather than three more ARNs on the one above, because the
+# groom SF needs a DIFFERENT status set. The rule above fans RUNNING and
+# SUCCEEDED as well, which is right for the three pipeline SFs but wrong here:
+# the groom dispatch SF now emits its own cycle-level STARTED/COMPLETE pings
+# from NotifyCycleComplete + the decide phase, carrying the per-lane roll-up
+# this generic notifier cannot produce. Adding the groom ARN to the rule above
+# would double-report every cycle with a strictly less informative message.
+#
+# What was genuinely missing is the FAILURE half. The groom SF's own SNS
+# publishes (per-lane FailExecution, sweep-dispatch failure, top-level failure)
+# all go to `alpha-engine-alerts`, which has NO Telegram subscriber — its
+# subscribers are the alerts-forwarder and the changelog mirror. So a groom SF
+# that failed outright reached email and the Overseer intake bus but never
+# Telegram, which is why four consecutive failed cycles (2026-07-27..28)
+# produced no page. FAILED/TIMED_OUT/ABORTED here closes that, and cannot
+# collide with the cycle pings: those two are emitted from INSIDE a running
+# execution, this fires on its terminal transition.
+GROOM_RULE_NAME="alpha-engine-groom-sf-failure"
+echo "Reconciling EventBridge rule: ${GROOM_RULE_NAME}"
+GROOM_EVENT_PATTERN=$(cat <<EOF
+{
+  "source": ["aws.states"],
+  "detail-type": ["Step Functions Execution Status Change"],
+  "detail": {
+    "stateMachineArn": [
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:alpha-engine-groom-dispatch"
+    ],
+    "status": ["FAILED", "TIMED_OUT", "ABORTED"]
+  }
+}
+EOF
+)
+run aws events put-rule \
+  --name "${GROOM_RULE_NAME}" \
+  --event-pattern "${GROOM_EVENT_PATTERN}" \
+  --description "Fan groom-dispatch SF FAILURE transitions to alpha-engine-sf-telegram-notifier (successes are reported by the SF's own cycle roll-up)" \
+  --region "${REGION}" \
+  --query 'RuleArn' --output text
+
+run aws events put-targets \
+  --rule "${GROOM_RULE_NAME}" \
+  --targets "Id=1,Arn=${FN_ARN}" \
+  --region "${REGION}"
+
+run aws lambda add-permission \
+  --function-name "${FUNCTION_NAME}" \
+  --statement-id "eventbridge-${GROOM_RULE_NAME}" \
+  --action lambda:InvokeFunction \
+  --principal events.amazonaws.com \
+  --source-arn "arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${GROOM_RULE_NAME}" \
+  --region "${REGION}" 2>/dev/null || true
+
 # ----- 3. Update function code (always after bootstrap, idempotent) ---------
 
 echo "Updating Lambda function code: ${FUNCTION_NAME}"
