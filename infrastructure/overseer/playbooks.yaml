@@ -234,9 +234,9 @@ playbooks:
     # per-run by groom_driver — deliberately NOT the router-injected `model:`
     # field, which only applies to routed playbooks (config-I3293).
     wake:
-      - "eventbridge: three daily fixed crons 01:00/07:00/19:00 UTC (demand-driven tier launches)"
+      - "eventbridge: three daily fixed crons 04:00/12:00/20:00 UTC + Sun 09:00 UTC (demand-driven tier launches)"
       - "demand: end-of-SF Haiku PR-sweep leg (groom_run.sh --mode pr_sweep)"
-    cadence: "3x daily fixed crons + end-of-SF sweep leg"
+    cadence: "3x daily fixed crons (+ a weekly Sunday slot) + end-of-SF sweep leg"
     executor_lambda_dir: scheduled-groom-dispatcher
     charter: alpha-engine-config/scripts/groom_run.sh
     concurrency_domain: EC2 tag lock on groom-issue-filter (tier lane; sweep has its own lane).
@@ -249,6 +249,22 @@ playbooks:
     # A trigger with no covering artifact = a silent groom death → problem line.
     # `schedule` MIRRORS scheduled-groom-dispatcher/deploy.sh SCHED_CRONS — the
     # registry is now the SSoT (was GROOM_SCHEDULE env / _DEFAULT_SCHEDULE const).
+    #
+    # config-I4988 (corrected 2026-07-28): these hours sat at 01:00/07:00/19:00,
+    # the RETIRED tier-per-slot schedule, three retirements behind the live
+    # crons. Because _rw_expected_triggers enumerates from this list, the check
+    # was accounting for triggers that no longer fire and blind to the ones that
+    # do — so on 2026-07-27/28, when four consecutive cycles failed and one lost
+    # all three lanes to a capacity event, the check that exists precisely to
+    # page on a silent groom death could not fire. A mirrored schedule with
+    # nothing enforcing the mirror is the §2.7 derive-once defect; the lockstep
+    # test added alongside this fix (tests/test_groom_schedule_lockstep.py) now
+    # fails CI the moment deploy.sh's SCHED_CRONS and this list disagree.
+    #
+    # NOTE this remains a SLOW backstop, not a fast pager: maturity is
+    # ceiling+margin = 405 min, so a lane that dies at bootstrap is still
+    # invisible here for ~7h. The fast instance-death signal is tracked
+    # separately — see the epic (config-I5194 Phase 1).
     liveness:
       checks:
         - type: run_window
@@ -259,9 +275,10 @@ playbooks:
           margin_min: 45     # box boot + report latency slack
           lookback_hours: 30
           schedule:
-            - {hour: 1, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "01:00 daily (Sonnet high-only)"}
-            - {hour: 7, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "07:00 daily (Sonnet mid-only)"}
-            - {hour: 19, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "19:00 daily (Haiku low-only)"}
+            - {hour: 4, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "04:00 UTC daily (demand-all)"}
+            - {hour: 12, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "12:00 UTC daily (demand-all)"}
+            - {hour: 20, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "20:00 UTC daily (demand-all)"}
+            - {hour: 9, minute: 0, dows: [0], label: "Sun 09:00 UTC (weekly extra slot)"}
 
   gate-sweeps:
     description: >-
