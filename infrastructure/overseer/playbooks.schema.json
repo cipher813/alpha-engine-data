@@ -326,6 +326,22 @@
             "ceiling_min": { "type": "integer", "minimum": 1 },
             "margin_min": { "type": "integer", "minimum": 0 },
             "lookback_hours": { "type": "integer", "minimum": 1 },
+            "productive_when": {
+              "description": "OPTIONAL. An OR of clauses over the run artifact's own fields; an in-window artifact matching NONE of them is reported as a DEAD run (a box that booted and wrote an artifact while doing no work) — distinct from a MISSING artifact. Omit to keep existence-only semantics. Each clause is {field, <op>} with op in gt|ge|lt|le|eq; an operator outside that set RAISES in _rw_clause_holds rather than silently leaving the clause unsatisfied.",
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["field"],
+                "minProperties": 2,
+                "maxProperties": 2,
+                "properties": {
+                  "field": { "type": "string", "minLength": 1 },
+                  "gt": {}, "ge": {}, "lt": {}, "le": {}, "eq": {}
+                }
+              }
+            },
             "schedule": {
               "type": "array",
               "minItems": 1,

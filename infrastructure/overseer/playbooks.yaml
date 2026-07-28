@@ -274,6 +274,16 @@ playbooks:
           ceiling_min: 360   # groom_spot_bootstrap.sh MAX_RUNTIME_SECONDS (360 min)
           margin_min: 45     # box boot + report latency slack
           lookback_hours: 30
+          # An artifact proves a box BOOTED, not that the run did anything.
+          # 2026-07-28: all three lanes crash-cascaded 2 min in (a truncated
+          # `runuser` left groom_run.sh as root, so every chunk agent refused
+          # to start), each still wrote a well-formed artifact, and this check
+          # reported full coverage while 378 issues went un-dispositioned.
+          # A run counts as coverage only if it engaged work — or there was no
+          # work to engage, which is the legitimate zero.
+          productive_when:
+            - {field: engaged, gt: 0}
+            - {field: total_issues, eq: 0}
           schedule:
             - {hour: 4, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "04:00 UTC daily (demand-all)"}
             - {hour: 12, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "12:00 UTC daily (demand-all)"}

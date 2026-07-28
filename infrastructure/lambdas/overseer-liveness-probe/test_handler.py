@@ -920,3 +920,128 @@ def test_real_registry_watch_plane_covers_dispatcher_and_intake():
     queues = {c.get("queue_name") for c in checks if c["type"] == "sqs_queue_exists"}
     assert "alpha-engine-overseer-dispatcher" in functions
     assert "nousergon-overseer-intake" in queues
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# run_window: productive_when — an artifact proves a BOOT, not a RUN
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 2026-07-28: all three groom lanes crash-cascaded two minutes after boot (a
+# comment truncated the bootstrap's `runuser`, so groom_run.sh ran as root and
+# every chunk agent refused to start). Each lane still wrote a well-formed run
+# artifact, so the existence-only check reported full coverage while 378 issues
+# went un-dispositioned.
+
+_RW_SPEC_PRODUCTIVE = dict(
+    _RW_SPEC,
+    productive_when=[{"field": "engaged", "gt": 0}, {"field": "total_issues", "eq": 0}],
+)
+
+# Verbatim fields from s3://alpha-engine-research/groom/2026-07-28/
+# 9d2004971a8e4b39ad554a47cd80ae39.json (the high lane).
+_REAL_CRASH_CASCADE_ARTIFACT = {
+    "schema_version": 10,
+    "run_start": "2026-07-17T01:05:00+00:00",  # re-dated into this suite's window
+    "run_kind": "coverage",
+    "issue_filter": "high-only",
+    "stop_reason": "3 consecutive chunk-agent crashes — aborting the run loudly "
+                   "(18 issues un-dispositioned) instead of burning the queue's "
+                   "re-queue budget",
+    "floor_fail": True,
+    "spot_interrupted": False,
+    "engaged": 0,
+    "floor": 8,
+    "total_issues": 21,
+    "processed": 9,
+    "undispositioned": 21,
+    "elapsed_min": 3,
+}
+
+
+def test_crash_cascaded_run_is_flagged_despite_writing_an_artifact():
+    """The regression this check exists for, driven by the real artifact."""
+    s3 = _FakeRunWindowS3({"2026-07-17": [_REAL_CRASH_CASCADE_ARTIFACT]})
+    with patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_run_window(_RW_SPEC_PRODUCTIVE, NOW)
+    assert len(problems) == 1, problems
+    assert "RAN BUT DID NO WORK" in problems[0]
+    assert "engaged=0" in problems[0] and "total_issues=21" in problems[0]
+    assert "chunk-agent crashes" in problems[0]
+    # ...and it must NOT also be reported as a missing artifact: the trigger IS
+    # covered. Two different findings; only the productivity one applies.
+    assert "filed NO" not in problems[0]
+
+
+def test_same_artifact_without_the_predicate_is_still_silent():
+    """Existence-only semantics are preserved for specs that don't opt in —
+    so adding the key to one registry entry cannot change another's."""
+    s3 = _FakeRunWindowS3({"2026-07-17": [_REAL_CRASH_CASCADE_ARTIFACT]})
+    with patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_run_window(_RW_SPEC, NOW)
+    assert problems == []
+
+
+def test_productive_run_is_silent():
+    art = dict(_REAL_CRASH_CASCADE_ARTIFACT, engaged=7, floor_fail=False, stop_reason="")
+    s3 = _FakeRunWindowS3({"2026-07-17": [art]})
+    with patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_run_window(_RW_SPEC_PRODUCTIVE, NOW)
+    assert problems == []
+
+
+def test_empty_queue_is_a_legitimate_zero():
+    """engaged=0 with nothing to engage is a healthy run, not a dead one."""
+    art = dict(_REAL_CRASH_CASCADE_ARTIFACT, engaged=0, total_issues=0, floor_fail=False)
+    s3 = _FakeRunWindowS3({"2026-07-17": [art]})
+    with patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_run_window(_RW_SPEC_PRODUCTIVE, NOW)
+    assert problems == []
+
+
+def test_one_dead_lane_is_visible_even_when_a_sibling_lane_covered_the_trigger():
+    """Reported per-artifact, not per-trigger: the mid lane succeeding must not
+    mask the high lane doing nothing."""
+    good = dict(_REAL_CRASH_CASCADE_ARTIFACT, engaged=12, floor_fail=False)
+    s3 = _FakeRunWindowS3({"2026-07-17": [good, _REAL_CRASH_CASCADE_ARTIFACT]})
+    with patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_run_window(_RW_SPEC_PRODUCTIVE, NOW)
+    assert len(problems) == 1 and "RAN BUT DID NO WORK" in problems[0]
+
+
+def test_unknown_operator_raises_rather_than_silently_passing():
+    spec = dict(_RW_SPEC, productive_when=[{"field": "engaged", "roughly": 3}])
+    s3 = _FakeRunWindowS3({"2026-07-17": [_REAL_CRASH_CASCADE_ARTIFACT]})
+    with patch("index._s3_client", return_value=s3):
+        with pytest.raises(index._RegistryError):
+            index._check_run_window(spec, NOW)
+
+
+def test_bool_is_not_treated_as_a_number_by_gt():
+    """`engaged: True` must not satisfy `{engaged: {gt: 0}}` — Python would say
+    True > 0, which would make a malformed artifact look productive."""
+    art = dict(_REAL_CRASH_CASCADE_ARTIFACT, engaged=True)
+    s3 = _FakeRunWindowS3({"2026-07-17": [art]})
+    with patch("index._s3_client", return_value=s3):
+        problems, _ = index._check_run_window(_RW_SPEC_PRODUCTIVE, NOW)
+    assert len(problems) == 1
+
+
+def test_registry_declares_productive_when_for_groom():
+    """The live registry must actually opt groom in — the code path above is
+    inert otherwise, which is precisely how this failure stayed invisible."""
+    import yaml
+    reg = yaml.safe_load(
+        (Path(__file__).resolve().parents[2] / "overseer" / "playbooks.yaml").read_text()
+    )
+    checks = [
+        c
+        for pb in reg["playbooks"].values()
+        for c in ((pb.get("liveness") or {}).get("checks") or [])
+        if c.get("type") == "run_window" and c.get("label") == "groom"
+    ]
+    assert checks, "no run_window check labelled 'groom' in the registry"
+    for c in checks:
+        assert c.get("productive_when"), (
+            "the groom run_window check must declare productive_when — without it "
+            "a crash-cascaded run that writes an artifact reads as full coverage"
+        )
