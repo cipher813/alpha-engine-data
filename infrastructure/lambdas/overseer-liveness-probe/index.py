@@ -791,6 +791,201 @@ def _check_sf_watch_invocation_success(spec: dict, now: datetime) -> tuple[list[
     return problems, {}
 
 
+# ── Check: ci_watch_invocation_success ──────────────────────────────────────
+# alpha-engine-config-#4481: mirrors the sf_watch_invocation_success pattern
+# (config-I2901) for CI-watch. For each fleet repo (declared in the check spec's
+# `repos` list), query GitHub's OWN Actions API for `main`-branch workflow runs
+# that concluded `failure` in the lookback window. For each mature failure (older
+# than `response_window_min`), assert that a ci-watch dispatch-ledger record
+# exists — the overseer-dispatcher writes one on every routed dispatch. A by-
+# design decline (concurrent_skip, disabled, signature_repeat_skip) satisfies the
+# check because it proves the dispatcher was INVOKED and made a conscious decision,
+# not crashed silently.
+#
+# The ledger is read independently of the ci-watch dispatcher's own S3 writes
+# (watch-log, signature markers) — broken writer → no ledger entries → finding.
+# The GH PAT is read from SSM (/alpha-engine/saturday_sf_watch/github_pat by
+# default); IAM for this is declared in iam-policy.json (Sid: ReadGitHubPatSsm).
+
+
+def _gh_headers(spec: dict) -> dict:
+    """Build auth headers for GitHub API calls. Reads the PAT from SSM on each
+    probe run (not cached — a rotated PAT must take effect immediately). Fail-
+    loud on SSM error: a missing PAT makes the check blind, and the probe should
+    not pretend otherwise."""
+    param = spec.get("gh_pat_ssm", "/alpha-engine/saturday_sf_watch/github_pat")
+    try:
+        pat = boto3.client("ssm", region_name=REGION).get_parameter(
+            Name=param, WithDecryption=True
+        )["Parameter"]["Value"]
+    except Exception as exc:  # noqa: BLE001 — fail-loud; see docstring
+        raise RuntimeError(f"ci_watch_invocation_success: cannot read GH PAT from {param}: {exc}") from exc
+    if not pat:
+        raise RuntimeError(f"ci_watch_invocation_success: GH PAT at {param} is empty")
+    return {
+        "Authorization": f"Bearer {pat}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "overseer-liveness-probe",
+    }
+
+
+def _list_gh_workflow_failures(owner: str, repo: str, horizon: datetime,
+                               headers: dict) -> list[dict]:
+    """Query GitHub's Actions API for failed main-branch workflow runs created
+    after `horizon`. Returns a list of run dicts with keys: id, name, head_branch,
+    head_sha, created_at, conclusion, html_url. Fail-loud on HTTP errors — a
+    non-200 means the probe cannot observe CI health, which is itself a finding
+    that must not be silently swallowed."""
+    import urllib.request  # late import to keep the module-level import clean
+    runs: list[dict] = []
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}/actions/runs"
+        f"?branch=main&status=failure&per_page=100"
+        f"&created=>={horizon.isoformat()}Z"
+    )
+    while url:
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = json.loads(resp.read())
+        except Exception as exc:  # noqa: BLE001 — fail-loud; see docstring
+            raise RuntimeError(
+                f"ci_watch_invocation_success: GitHub API error for {owner}/{repo}: {exc}"
+            ) from exc
+        runs.extend(body.get("workflow_runs", []))
+        # Follow pagination via Link header (rel="next")
+        link = resp.headers.get("Link", "") if hasattr(resp, "headers") else ""
+        next_url = ""
+        for part in link.split(","):
+            if 'rel="next"' in part:
+                start = part.find("<")
+                end = part.find(">")
+                if start >= 0 and end > start:
+                    next_url = part[start + 1:end]
+                break
+        url = next_url or None
+    return runs
+
+
+def _ci_watch_ledger_keys(s3, ledger_prefix: str, lookback_hours: int,
+                          now: datetime) -> set[tuple[str, str]]:
+    """Read dispatch ledger entries for ci-watch within the lookback window and
+    return a set of (repo, sha) pairs that have a recorded dispatch (launched or
+    benign-decline). Fail-loud on list/read errors: a broken ledger is itself a
+    finding."""
+    keys: set[tuple[str, str]] = set()
+    horizon = now - timedelta(hours=lookback_hours)
+    # List all ledger keys; the prefix is overseer/dispatch_ledger/YYYY-MM-DD/...
+    # and we need to list across enough date prefixes to cover the lookback.
+    # Simple approach: enumerate all date prefixes from horizon to now.
+    cursor = horizon.date()
+    today = now.date()
+    while cursor <= today:
+        date_prefix = f"{ledger_prefix}/{cursor.isoformat()}/"
+        try:
+            resp = s3.list_objects_v2(Bucket=WATCH_BUCKET, Prefix=date_prefix)
+        except Exception as exc:  # noqa: BLE001 — fail-loud
+            raise RuntimeError(
+                f"ci_watch_invocation_success: cannot list ledger at {date_prefix}: {exc}"
+            ) from exc
+        for obj in resp.get("Contents", []):
+            key = obj["Key"]
+            try:
+                obj_data = s3.get_object(Bucket=WATCH_BUCKET, Key=key)
+                record = json.loads(obj_data["Body"].read())
+            except Exception as exc:  # noqa: BLE001 — fail-loud
+                raise RuntimeError(
+                    f"ci_watch_invocation_success: cannot read ledger entry {key}: {exc}"
+                ) from exc
+            if not isinstance(record, dict):
+                continue
+            if record.get("playbook") != "ci-watch":
+                continue
+            payload = record.get("payload") or {}
+            repo_val = payload.get("repo", "").strip()
+            sha_val = payload.get("sha", "").strip()
+            if repo_val and sha_val:
+                keys.add((repo_val, sha_val))
+        cursor += timedelta(days=1)
+    return keys
+
+
+def _check_ci_watch_invocation_success(spec: dict, now: datetime) -> tuple[list[str], dict]:
+    """Per registered fleet repo, every MATURE (older than ``response_window_min``)
+    failed `main` workflow run within ``lookback_hours`` must have a corresponding
+    ci-watch dispatch-ledger record. A missing record means the ci-watch dispatcher
+    was NOT invoked for that failure — either the trigger wiring (EventBridge /
+    repository_dispatch / GHA) is broken, or the dispatcher crashed before the
+    router could record the ledger entry."""
+    problems: list[str] = []
+    repos: list[str] = spec["repos"]
+    ledger_prefix = spec["ledger_prefix"]
+    response_window = spec["response_window_min"]
+    lookback_hours = spec["lookback_hours"]
+
+    try:
+        headers = _gh_headers(spec)
+    except RuntimeError:
+        # PAT read failure is a single problem line, not per-repo noise
+        return [f"ci-watch: GitHub PAT read FAILED — ci_watch_invocation_success check BLIND"], {}
+
+    # Build the ledger key set: every (repo, sha) ci-watch dispatched recently
+    s3 = _s3_client()
+    try:
+        ledger_keys = _ci_watch_ledger_keys(
+            s3, ledger_prefix, lookback_hours, now
+        )
+    except RuntimeError as exc:
+        # Ledger read failure is a single problem line
+        return [f"ci-watch: dispatch ledger read FAILED: {exc}"], {}
+
+    mature_before = now - timedelta(minutes=response_window)
+    horizon = now - timedelta(hours=lookback_hours)
+    owner = "nousergon"
+
+    for repo in repos:
+        try:
+            failures = _list_gh_workflow_failures(owner, repo, horizon, headers)
+        except RuntimeError as exc:
+            problems.append(
+                f"ci-watch: cannot query GitHub API for {owner}/{repo}: {exc}"
+            )
+            continue
+
+        for run in failures:
+            created_str = run.get("created_at", "")
+            if not created_str:
+                continue
+            try:
+                created = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                continue
+            if created > mature_before:
+                continue  # not mature yet — give the dispatcher time to respond
+
+            sha = run.get("head_sha", "")
+            if not sha:
+                continue
+
+            if (repo, sha) in ledger_keys:
+                continue  # ci-watch recorded a response — all good
+
+            # Check if this is a workflow we actually care about
+            run_name = run.get("name", "unknown")
+            run_id = run.get("id", "?")
+            run_url = run.get("html_url", f"https://github.com/{owner}/{repo}/actions/runs/{run_id}")
+            problems.append(
+                f"ci-watch: {owner}/{repo} main-branch workflow '{run_name}' "
+                f"(#{run_id}) FAILED @ {created.strftime('%Y-%m-%d %H:%M')}Z with NO "
+                f"ci-watch dispatch ledger entry {response_window}+ min later — "
+                f"the ci-watch dispatcher was NOT invoked for this failure "
+                f"(broken trigger wiring or dispatcher crash before ledger write). "
+                f"Run: {run_url}"
+            )
+
+    return problems, {}
+
+
 # ── Check dispatch table + aggregation ───────────────────────────────────────
 
 CHECKERS = {
@@ -801,6 +996,7 @@ CHECKERS = {
     "run_window": _check_run_window,
     "scheduler_schedule_exists": _check_scheduler_schedule_exists,
     "sf_watch_invocation_success": _check_sf_watch_invocation_success,
+    "ci_watch_invocation_success": _check_ci_watch_invocation_success,
 }
 
 

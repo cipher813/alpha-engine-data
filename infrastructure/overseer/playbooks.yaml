@@ -141,6 +141,31 @@ playbooks:
         - type: lambda_active
           function: alpha-engine-ci-watch-dispatcher
           report_kill_switch: CI_WATCH_DISPATCH_ENABLED
+        # alpha-engine-config-#4481: ci_watch_invocation_success — catches the
+        # same wiring-vs-function gap as sf_watch_invocation_success (config-I2901):
+        # a dispatcher that is Active + correctly targeted but CRASHES on every
+        # real invocation (2016-07-17 ListBucket/403) is invisible to lambda_active.
+        # This checks: for each mature (older than response_window_min) failed
+        # main-branch CI run across the fleet repos (from GitHub's OWN execution
+        # history — independent of the dispatch ledger, so a broken writer can't
+        # hide its own breakage), the dispatch ledger at `ledger_prefix` must carry
+        # a matching ci-watch dispatch record. A by-design decline (concurrent_skip,
+        # disabled, signature_repeat_skip) satisfies the check.
+        - type: ci_watch_invocation_success
+          repos: &ci_watch_repos
+            - crucible-executor
+            - nousergon-data
+            - crucible-predictor
+            - crucible-research
+            - crucible-backtester
+            - crucible-dashboard
+            - alpha-engine-config
+            - nousergon-lib
+            - crucible-evaluator
+            - nousergon-docs
+          ledger_prefix: overseer/dispatch_ledger
+          response_window_min: 10
+          lookback_hours: 24
 
   alert-drain:
     description: >-
