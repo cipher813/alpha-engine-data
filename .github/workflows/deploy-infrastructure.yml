@@ -12,7 +12,7 @@ name: Deploy Infrastructure
 # pipeline never silently halts on stamp drift again.
 #
 # Template-content changes (adding an alarm, modifying a rule) still work
-# here because apply.sh in alpha-engine-data/infrastructure/iam/ is the
+# here because apply.sh in nous-ergon-ops/infrastructure/iam/ is the
 # source of truth for the GHA role's policy and will have been applied
 # before the PR merges.
 
