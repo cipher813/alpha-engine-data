@@ -180,4 +180,35 @@ run aws lambda put-function-event-invoke-config \
   --region "${REGION}" \
   --query 'MaximumRetryAttempts' --output text
 
+# ----- 5. Publish alert_classes projection to S3 (alpha-engine-config#5200) -----
+# The alert-drain box clones only alpha-engine-config, so the registry at
+# infrastructure/overseer/playbooks.yaml is unreachable from there. Publish a
+# lightweight projection (alert_classes only, not the full playbooks.yaml) to S3
+# so the drain can mechanically verify every observed source against the
+# declared set. The drain charter points at this S3 URI.
+#
+# Best-effort: a publish failure must not block the Lambda deploy. The IAM
+# permission (s3:PutObject on alpha-engine-research/overseer/alert_classes.json)
+# is in github-actions-lambda-deploy-policy.json (nous-ergon-ops), not yet
+# granted — once added, this step becomes fail-loud (remove the || true).
+echo "Publishing alert_classes to S3..."
+python3 -c "
+import yaml, json, sys
+try:
+    path = '${SCRIPT_DIR}/../../overseer/playbooks.yaml'
+    with open(path) as f:
+        data = yaml.safe_load(f)
+    classes = data.get('alert_classes', [])
+    payload = json.dumps({'alert_classes': classes, 'schema_version': 1}, indent=2)
+    key = 'overseer/alert_classes.json'
+    bucket = 'alpha-engine-research'
+    with open('${PKG}/alert_classes.json', 'w') as f:
+        f.write(payload)
+    print(f'Extracted {len(classes)} alert classes from playbooks.yaml')
+except Exception as e:
+    print(f'WARN alert_classes extraction failed (non-fatal): {e}', file=sys.stderr)
+    sys.exit(0)  # best-effort — see comment above
+" 2>&1
+run aws s3 cp "${PKG}/alert_classes.json" "s3://alpha-engine-research/overseer/alert_classes.json" --content-type application/json || echo "WARN alert_classes S3 publish failed (non-fatal) — check IAM: s3:PutObject on alpha-engine-research/overseer/alert_classes.json"
+
 echo "Done."
