@@ -1,8 +1,8 @@
 boto3>=1.34
 pandas>=2.0
-openpyxl>=3.1
+openpyxl>=3.1.5
 pyarrow>=25.0.0
-yfinance>=1.5.1
+yfinance>=1.5.2
 requests>=2.34.2
 pyyaml>=6.0.3
 # setuptools floor for PYSEC-2026-3447 (newly disclosed; CI's pip-audit gate
@@ -18,10 +18,10 @@ numpy>=2.4.6
 feedparser>=6.0.12
 beautifulsoup4>=4.15.0
 lxml>=6.1.1
-edgartools>=2.0
+edgartools>=5.43.1
 voyageai>=0.5.0
 jsonschema>=4.26.0
-arcticdb>=6.19.0
+arcticdb>=6.20.0
 # flow-doctor is pulled in transitively via nousergon-lib[flow-doctor].
 # NOTE: the extra MUST be hyphenated — setuptools normalizes the lib's
 # `flow_doctor` extra to `Provides-Extra: flow-doctor`; older pip doesn't
