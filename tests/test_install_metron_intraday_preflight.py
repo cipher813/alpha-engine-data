@@ -62,16 +62,51 @@ def test_preflight_failure_aborts_rather_than_warning():
     assert m, "a failed preflight must exit non-zero, not print and continue"
 
 
-def test_missing_interpreter_is_its_own_named_failure():
-    assert re.search(r'if \[ ! -x "\$PY" \]', SCRIPT), (
-        "an absent interpreter must be reported distinctly -- it is a different "
-        "remedy from an under-provisioned one"
-    )
-
-
 def test_the_message_names_the_interpreter_constraint():
     """Otherwise the next reader tries to pip-install into the 3.9 venv and fails."""
     assert "numpy>=2.4.6" in SCRIPT and "3.11+" in SCRIPT, (
         "the remedy text must say the venv needs rebuilding on a newer Python, "
         "not that packages need installing"
+    )
+
+
+def test_interpreter_is_derived_from_the_unit_not_hardcoded():
+    """Two files naming an interpreter independently is two places to be wrong.
+
+    If the installer hardcodes a venv path, it can verify one interpreter while
+    the unit runs another — and the mismatch is silent, because a passing
+    preflight looks identical either way. Parsing ExecStart makes the thing
+    tested the thing that runs, by construction.
+    """
+    assert re.search(r"PY=\$\(sed .*ExecStart.*metron-intraday\.service", SCRIPT), (
+        "the interpreter must be parsed out of the unit file's ExecStart"
+    )
+    assert '"${REPO_DIR}/.venv/bin/python"' not in SCRIPT, (
+        "a hardcoded interpreter path can drift from the unit's ExecStart"
+    )
+
+
+def test_the_venv_is_provisioned_before_the_preflight_runs():
+    """The install is what makes the claim true; the preflight proves it.
+
+    A preflight with no provisioning step turns every fresh box into a manual
+    remediation. A provisioning step with no preflight is the original defect.
+    Both, in that order.
+    """
+    install = SCRIPT.index("pip\" install -q -r")
+    check = SCRIPT.index("find_spec")
+    enable = SCRIPT.index("systemctl enable --now metron-intraday.timer")
+    assert install < check < enable, (
+        "order must be provision -> verify -> enable; "
+        f"got install={install} check={check} enable={enable}"
+    )
+
+
+def test_provisioning_requires_a_new_enough_interpreter():
+    """python3.12 explicitly: `python3 -m venv` on this box is 3.9 and cannot
+    satisfy requirements.txt, which is the whole defect."""
+    assert "python3.12 -m venv" in SCRIPT
+    assert re.search(r"command -v python3\.12", SCRIPT), (
+        "a missing python3.12 must be its own named failure, not a confusing "
+        "pip resolution error"
     )
