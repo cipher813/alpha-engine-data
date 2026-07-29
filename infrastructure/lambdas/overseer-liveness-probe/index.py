@@ -39,9 +39,11 @@ Check types (discriminated union on ``type`` — contract in playbooks.schema.js
 
 Conventions preserved from both source probes:
   * silent-unless-broken: a clean pass logs + returns, no Telegram noise.
-  * content-hash dedup: ONE sha256 fingerprint over the aggregated problem set
-    (subsumes groom's per-trigger dedup) — a standing problem doesn't re-ping,
-    and the alert state clears automatically the moment everything is clean.
+  * per-problem dedup: each problem gets its own signature; only NEW problems
+    trigger an alert, continuing ones are summarized as a count, and resolved
+    ones age out so a genuine recurrence later pages again (alpha-engine-config-I5207).
+    The flow-doctor dedup key still covers the full new+continuing set so
+    an entire run with zero new problems is fully suppressed.
   * fail-loud (CLAUDE.md no-silent-fails): every AWS describe/list is a PRIMARY
     input — an UNEXPECTED API error RAISES so a broken probe surfaces via the
     Lambda Errors metric, alarmed by the watch-plane backstop alarms in
@@ -992,40 +994,66 @@ def _run_checks(now: datetime) -> tuple[list[dict], dict[str, str], int, int]:
     return findings, kill_switches, checks_run, checks_failed
 
 
-# ── Dedup + alert (content-fingerprint, ported from sf-watch-reclaim-sweep-handler) ──
+# ── Dedup + alert (per-problem signature, alpha-engine-config-I5207) ─────────
 
 
-def _problem_fingerprint(findings: list[dict]) -> str:
-    """Fingerprint over finding DETAIL, not the rendered headline — the page's
-    wording is presentation and must never be able to re-page on its own."""
-    return hashlib.sha256(
-        "\n".join(sorted(f["detail"] for f in findings)).encode()
-    ).hexdigest()[:16]
+def _stable_problem_key(problem: str) -> str:
+    """SHA256 hex digest (first 16 hexits) of the problem text — used as a
+    per-problem dedup identity.
+
+    Each problem's FULL text is the key (including timestamps), because a
+    run-window finding for a different trigger window IS a different problem.
+    This is the correct semantic for age-out: if a problem text changes (e.g.
+    the trigger timestamp advances for a still-missing run), it becomes a NEW
+    per-problem entry — the old one resolves and the new one alerts once.
+    """
+    return hashlib.sha256(problem.encode()).hexdigest()[:16]
 
 
-def _load_alerted_fingerprint(s3) -> str | None:
-    """None means 'no state yet' OR 'currently healthy' — both mean nothing to
-    suppress against."""
+def _load_alerted_state(s3) -> dict[str, str] | None:
+    """Previously-alerted per-problem state: ``{fingerprint: problem_text}``.
+
+    Returns ``None`` when there is no prior state at all (first-ever run, or
+    the state object has never been written) — distinct from ``{}``, which
+    means \"same as healthy\" (the state was cleared after a clean pass).
+
+    A missing/403 key (the common first-run or healthy-cleared case) skips
+    the warning log — these are expected, not anomalous."""
     try:
         obj = s3.get_object(Bucket=WATCH_BUCKET, Key=STATE_KEY)
-        return json.loads(obj["Body"].read()).get("fingerprint")
+        raw = json.loads(obj["Body"].read())
+        if isinstance(raw, dict):
+            # Backward compat (I5207): old format stored a single
+            # ``fingerprint`` key — treat it as "no per-problem state"
+            # so the first run with new code treats everything as new
+            # (safe one-time re-alert, after which the new format is
+            # persisted).
+            if "fingerprint" in raw and "per_problem" not in raw:
+                return None
+            return raw.get("per_problem") or {}
+        return {}
     except Exception as exc:  # noqa: BLE001 — absence expected; bad blob recoverable
         if _error_code(exc) not in {"NoSuchKey", "404", "403", ""}:
             logger.warning("could not read overseer liveness state %s: %s", STATE_KEY, exc)
         return None
 
 
-def _save_alerted_fingerprint(s3, fingerprint: str | None) -> None:
-    """Best-effort: a write failure only risks a duplicate/missed-clear ping
+def _save_alerted_state(s3, state: dict[str, str] | None) -> None:
+    """Persist (or clear) the per-problem dedup state.
+
+    ``state is None`` (or ``{}``) clears the state — written as ``{}`` so
+    the next load sees an empty set rather than ``None``, enabling the
+    \"problems resolved\" branch without retriggering on a subsequent clean
+    pass.
+
+    Best-effort: a write failure only risks a duplicate/missed-clear ping
     next run (logged), never a missed finding — so it does NOT raise."""
+    payload = {"per_problem": state or {}, "updated_at": datetime.now(timezone.utc).isoformat()}
     try:
         s3.put_object(
             Bucket=WATCH_BUCKET,
             Key=STATE_KEY,
-            Body=json.dumps(
-                {"fingerprint": fingerprint, "updated_at": datetime.now(timezone.utc).isoformat()},
-                indent=2,
-            ).encode("utf-8"),
+            Body=json.dumps(payload, indent=2).encode("utf-8"),
             ContentType="application/json",
         )
     except Exception as exc:  # noqa: BLE001 — dedup state; failure only risks a dup ping
@@ -1066,34 +1094,90 @@ def _write_detail_report(s3, findings: list[dict], now: datetime,
     return f"s3://{WATCH_BUCKET}/{key}"
 
 
+def _alert_diff(
+    current_problems: list[str],
+    previous_state: dict[str, str] | None,
+) -> tuple[list[str], list[str], list[str]]:
+    """Diff the CURRENT problem set against the PREVIOUSLY-ALERTED per-problem
+    state.
+
+    Returns ``(new_problems, continuing_problems, resolved_keys)``:
+
+    * ``new_problems`` — problems that exist now but were NOT in the previous
+      state (ordered by the stable key for determinism). Never empty.
+    * ``continuing_problems`` — problems whose fingerprint matches one in the
+      previous state. Empty when ``previous_state is None``.
+    * ``resolved_keys`` — keys present in the previous state but NOT in the
+      current set. These should be aged out of the persisted state.
+
+    ``previous_state is None`` (no prior state at all) means every current
+    problem is treated as \"new\" — the probe has never alerted before, so
+    there is nothing to compare against."""
+    current_map: dict[str, str] = {}
+    for p in current_problems:
+        current_map[_stable_problem_key(p)] = p
+
+    if previous_state is None:
+        return list(current_map.values()), [], []
+
+    prev_keys = set(previous_state.keys())
+    cur_keys = set(current_map.keys())
+
+    new_keys = cur_keys - prev_keys
+    continuing_keys = cur_keys & prev_keys
+    resolved = list(prev_keys - cur_keys)
+
+    new_problems = [current_map[k] for k in sorted(new_keys)]
+    continuing_problems = [current_map[k] for k in sorted(continuing_keys)]
+    return new_problems, continuing_problems, resolved
+
+
 def _alert(
-    findings: list[dict],
+    new_findings: list[dict],
+    continuing_count: int,
+    resolved_count: int,
+    total_findings: int,
     kill_switches: dict[str, str] | None = None,
     checks_run: int = 0,
     checks_failed: int = 0,
     now: datetime | None = None,
 ) -> bool:
-    """Page Brian with a summary he can act on from one screen.
+    """Page Brian with a summons he can act on from one screen.
 
-    The page carries: a count, coverage, one headline per finding, and a
-    pointer. Full prose goes to S3. The prior format inlined every finding's
-    full paragraph, so a bad morning produced a wall of near-identical text in
-    which the one line that mattered — a groom run that engaged 0 of 21 issues —
-    sat below five paragraphs of the same sentence about missed drain runs."""
+    Carries: the new/continuing/resolved accounting (alpha-engine-config-I5207),
+    ONE headline per new finding, the coverage caveat, and a pointer. Full prose
+    goes to an S3 detail report.
+
+    The prior format inlined every finding's full paragraph, so a bad morning
+    produced a wall of near-identical text in which the one line that mattered —
+    a groom run that engaged 0 of 21 issues — sat below five paragraphs of the
+    same sentence about missed drain runs. It also pointed the reader at
+    CloudWatch logs for anything past the cap; the report is a better answer to
+    the same problem."""
     now = now or datetime.now(timezone.utc)
     report_uri = _write_detail_report(
-        _s3_client(), findings, now, checks_run, checks_failed
+        _s3_client(), new_findings, now, checks_run, checks_failed
     )
+
+    parts = [f"{total_findings} finding(s)"]
+    if new_findings:
+        parts.append(f"{len(new_findings)} new")
+    if continuing_count:
+        parts.append(f"{continuing_count} continuing")
+    if resolved_count:
+        parts.append(f"{resolved_count} resolved")
+
     lines = [
         "\U0001f6f0️ *Overseer Liveness — watch plane*",
-        f"{len(findings)} finding(s) · {checks_run - checks_failed}/{checks_run} checks ran "
+        f"{' · '.join(parts)} · {checks_run - checks_failed}/{checks_run} checks ran "
         "(the WATCHERS' own wiring, not a pipeline failure)",
         "",
     ]
-    shown = findings[:_MAX_HEADLINES]
-    lines.extend(f"• *{f['component']}*: {f['headline']}" for f in shown)
-    if len(findings) > _MAX_HEADLINES:
-        lines.append(f"…and {len(findings) - _MAX_HEADLINES} more")
+    lines.extend(
+        f"• *{f['component']}*: {f['headline']}" for f in new_findings[:_MAX_HEADLINES]
+    )
+    if len(new_findings) > _MAX_HEADLINES:
+        lines.append(f"…and {len(new_findings) - _MAX_HEADLINES} more new")
     if checks_failed:
         # I4473: coverage caveat, stated BEFORE the closing pointer — a reader
         # must not read this report as a complete picture when part of the
@@ -1109,19 +1193,33 @@ def _alert(
         # Degraded, and SAID so: the report write failed, so the full prose is
         # inlined here rather than dropped.
         lines.append("_Detail report unavailable (S3 write failed) — full findings inline:_")
-        lines.extend(f"— {f['detail']}" for f in findings)
+        lines.extend(f"— {f['detail']}" for f in new_findings)
     text = "\n".join(lines)
+
+    # Flow-doctor dedup key: hash the new-problem keys + continuing count so
+    # a run that only adds new problems gets through, but a run whose
+    # continuing set is unchanged does not re-page if flow-doctor called us
+    # with the same set twice (belt-and-braces — the handler never calls
+    # _alert when new_problems is empty).
+    dedup_fingerprint = hashlib.sha256(
+        "\n".join(sorted(_stable_problem_key(f["detail"]) for f in new_findings)
+                   + [f"c:{continuing_count}", f"r:{resolved_count}"]).encode()
+    ).hexdigest()[:16]
+
     try:
         return notify_via_flow_doctor(
             text,
             silent=False,
             severity="error",
-            dedup_key=f"{_FLOW_NAME}:wiring:{_problem_fingerprint(findings)}",
+            dedup_key=f"{_FLOW_NAME}:wiring:{dedup_fingerprint}",
             flow_name=_FLOW_NAME,
             topics=_OPS_TOPICS,
             db_basename=_DB_BASENAME,
             context={
-                "problems": len(findings),
+                "problems": total_findings,
+                "new": len(new_findings),
+                "continuing": continuing_count,
+                "resolved": resolved_count,
                 "detail_report": report_uri,
                 "kill_switches": kill_switches or {},
                 "checks_run": checks_run,
@@ -1143,49 +1241,81 @@ def _alert(
 
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """Scheduled (EventBridge) entrypoint. Iterates the playbook registry,
-    runs every declared liveness check read-only, dedups by problem-set content,
-    and LOUD-alerts only on a NEW/changed problem set.
+    runs every declared liveness check read-only, dedups PER PROBLEM
+    (alpha-engine-config-I5207), and LOUD-alerts only when NEW problems appear.
 
-    A runtime AWS failure in ONE check is isolated into its own problem line so
-    the rest of the plane is still observed (alpha-engine-config-I4473); an
-    unknown registry check type still RAISES, so the probe can never silently
-    no-op on a registry that outran its checker table."""
+    Per-problem dedup replaces the old aggregate-fingerprint approach: each
+    problem gets its own signature tracked in S3 state. On each run the
+    current problem set is diffed against the saved set:
+      * NEW problems page individually (capped at 5).
+      * CONTINUING problems (same signature as before) are summarized as a
+        count — the list was already delivered, the reader has seen it.
+      * RESOLVED problems (key absent from current set) age out of the state
+        so a genuine recurrence later pages again.
+
+    A runtime AWS failure in ONE check is isolated into its own problem line
+    so the rest of the plane is still observed (alpha-engine-config-I4473);
+    the per-problem dedup means a single new check failure does not re-page
+    every other standing check's problem."""
     now = datetime.now(timezone.utc)
     findings, kill_switches, checks_run, checks_failed = _run_checks(now)
-    fingerprint = _problem_fingerprint(findings) if findings else None
 
     # Always surfaced (record + log), never alerted: a deliberate operator
     # disable is state, not an incident.
     logger.info("overseer liveness: dispatch kill-switches: %s", kill_switches)
 
     s3 = _s3_client()
-    already = _load_alerted_fingerprint(s3)
+    previous_state = _load_alerted_state(s3)
 
-    details = [f["detail"] for f in findings]
+    new_count = continuing_count = resolved_count = 0
     alerted = False
-    if findings and fingerprint != already:
-        logger.warning("overseer liveness: %d NEW problem(s): %s", len(findings), details)
-        alerted = _alert(findings, kill_switches, checks_run, checks_failed, now)
-        if alerted:
-            _save_alerted_fingerprint(s3, fingerprint)
-    elif findings:
-        logger.info(
-            "overseer liveness: %d problem(s), unchanged since last alert — suppressed",
-            len(findings),
+
+    if findings:
+        # Dedup identity stays the finding's full DETAIL text (I5207 semantics
+        # unchanged): the headline is presentation, and a re-worded page must
+        # never be able to re-page on its own.
+        by_detail = {f["detail"]: f for f in findings}
+        new_details, continuing_details, resolved_keys = _alert_diff(
+            list(by_detail), previous_state
         )
+        new_findings = [by_detail[d] for d in new_details]
+        new_count = len(new_findings)
+        continuing_count = len(continuing_details)
+        resolved_count = len(resolved_keys)
+
+        if new_findings:
+            logger.warning(
+                "overseer liveness: %d new, %d continuing, %d resolved: %s",
+                new_count, continuing_count, resolved_count, new_details,
+            )
+            alerted = _alert(
+                new_findings, continuing_count, resolved_count,
+                len(findings), kill_switches, checks_run, checks_failed, now,
+            )
+            if alerted:
+                # Persist the FULL current set so the next run can diff against it.
+                _save_alerted_state(s3, {_stable_problem_key(d): d for d in by_detail})
+        else:
+            logger.info(
+                "overseer liveness: %d problem(s), unchanged since last alert — suppressed",
+                len(findings),
+            )
     else:
         logger.info("overseer liveness: all checks clean")
-        if already is not None:
-            _save_alerted_fingerprint(s3, None)  # clear dedup state now that it's healthy again
+        if previous_state is not None:
+            _save_alerted_state(s3, None)  # clear dedup state now that it's healthy again
 
     return {
         # `problems` stays the full prose list — the payload is a record, not a
         # page, and nothing that reads it benefits from the shortening.
-        "problems": details,
+        "problems": [f["detail"] for f in findings],
         "findings": findings,
         "alerted": alerted,
         "clean": not findings,
         "kill_switches": kill_switches,
+        "new": new_count,
+        "continuing": continuing_count,
+        "resolved": resolved_count,
         # I4473: coverage accounting. `clean: true` with checks_failed > 0 is
         # impossible by construction (a failed check IS a finding), but these
         # make "how much did we actually observe" answerable from the return
