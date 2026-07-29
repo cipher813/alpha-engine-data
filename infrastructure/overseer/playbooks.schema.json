@@ -96,6 +96,10 @@
             "pattern": "^alpha-engine-[a-z0-9-]+$",
             "description": "config#4474 — name of a dedicated sibling Lambda probe that covers this playbook's liveness independently (e.g. canary-replay-liveness-probe). When set, the registry's cadence→liveness contract test accepts this as proof of alternative coverage instead of requiring a run_window or invocation-success check in this entry's liveness block."
           },
+          "execution_surface": {
+            "enum": ["spot", "lambda", "laptop-launchd"],
+            "description": "config-I4993 G17 — the execution substrate this playbook runs on. 'spot' (EC2 spot instance, the fleet default), 'lambda' (serverless function invocation), 'laptop-launchd' (local macOS launchd agent running from the working tree — the laptop janitor and usage-tracker agents). Absent defaults to 'spot' for backwards compatibility (every entry written before this field existed)."
+          },
           "liveness": { "$ref": "#/$defs/liveness_block" }
         },
         "allOf": [

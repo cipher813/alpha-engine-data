@@ -32,6 +32,7 @@ playbooks:
     tier: T2
     routed: true
     enabled: true
+    execution_surface: spot
     # config-I3293 — model/wake/cadence are REGISTRY-DECLARED (this file is
     # the one place that answers "what model runs this agent, what wakes it,
     # on what cadence"). `model` is LIVE config, not documentation: the
