@@ -1,0 +1,89 @@
+name: Deploy eod-success-friday-shell-trigger
+
+# Auto-deploy the alpha-engine-eod-success-friday-shell-trigger Lambda CODE on
+# merge to main. Mirrors deploy-data-spot-dispatcher.yml — same gap, same fix:
+# a merged code change must not sit inert until someone remembers to run
+# deploy.sh by hand.
+#
+# This workflow exists because of exactly that failure mode, twice over:
+#   * 2026-07-08: an invoking SF def auto-deployed while its Lambda did not.
+#   * 2026-07-28: crucible-research-PR529 added a CloudWatch alarm to a shell
+#     script, merged, and was recorded as shipping the alarm. The script was
+#     never run, so the alarm never existed — verified absent 2026-07-29.
+# This Lambda now starts the FULL weekly pipeline after every post-close SF
+# (Brian ruling 2026-07-29), so a merged-but-undeployed change here means the
+# daily cadence silently does not happen.
+#
+# Separation of concerns: CODE only (deploy.sh with NO flag — the flagless run
+# is code-only). --bootstrap ADDS IAM-role creation and stays operator-only:
+# the github-actions-lambda-deploy OIDC role deliberately has no
+# iam:CreateRole / iam:PutRolePolicy, a fleet-wide policy after 4 IAM-clobber
+# incidents in 2 months.
+#
+# IAM: no new grant needed — LambdaUpdate already covers
+# arn:...:function:alpha-engine-*.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/lambdas/eod-success-friday-shell-trigger/**'
+      - '.github/workflows/deploy-eod-success-friday-shell-trigger.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-eod-success-friday-shell-trigger-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy eod-success-friday-shell-trigger Lambda (code-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: alpha-engine-data
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12 (match Lambda runtime)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Deploy eod-success-friday-shell-trigger (code-only — no --bootstrap)
+        working-directory: alpha-engine-data
+        run: bash infrastructure/lambdas/eod-success-friday-shell-trigger/deploy.sh
+
+      - name: Report deployed version
+        working-directory: alpha-engine-data
+        run: |
+          echo "Deployed commit: ${{ github.sha }}"
+          aws lambda get-function \
+            --function-name alpha-engine-eod-success-friday-shell-trigger \
+            --query "Configuration.[LastModified,CodeSha256]" \
+            --output text
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@8a904b7a817901f2520dd87131ff307ed97fee02 # main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: deploy-eod-success-friday-shell-trigger.yml
+
+  notify-main-failure:
+    needs: [deploy]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit
