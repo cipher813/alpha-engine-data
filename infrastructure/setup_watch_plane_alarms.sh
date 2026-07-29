@@ -3,7 +3,7 @@
 # watch/overseer-plane Lambdas (config#2266; roster extended config-I2900).
 #
 # Why this exists: the watch-plane Lambdas (saturday-sf-watch-dispatcher,
-# sf-watch-spot-dispatcher, ci-watch-dispatcher, sf-watch-liveness-probe) are
+# sf-watch-spot-dispatcher, ci-watch-dispatcher, sf-watch-reclaim-sweep-handler) are
 # the components whose JOB is to notice fleet failures — and their docstrings
 # asserted that their own failures "surface via the Lambda error metric + CW
 # alarm". Until this script, NO such alarm existed: an unhandled dispatcher
@@ -68,7 +68,7 @@ BACKSTOP_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:${BACKSTOP_TOPIC_NAME}"
 
 # The watch/overseer-plane Lambdas (deployed names verified against each
 # infrastructure/lambdas/<dir>/deploy.sh FUNCTION_NAME).
-# sf-watch-liveness-probe now carries ONLY its reclaim/sweep action paths
+# sf-watch-reclaim-sweep-handler now carries ONLY its reclaim/sweep action paths
 # config#2270/#2257; the wiring checks moved to the registry-driven
 # overseer-liveness-probe per alpha-engine-config-I2831. Both stay under this
 # dead-probe backstop. (Comment kept OUT of the array literal below so the
@@ -77,20 +77,40 @@ BACKSTOP_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:${BACKSTOP_TOPIC_NAME}"
 # substrate-health-gate (weekly-pipeline SsmDiskProbe gate) added config-I2900
 # — both were Active with zero alarm coverage; see the onboarding-checklist
 # comment above the header of this file.
+# pipeline-watchdog, canary-replay-liveness-probe, saturday-integrity-sentinel,
+# freshness-monitor, sweep-artifact-monitor added config#3240 (found during
+# the same I2900 onboarding sweep, scoped out of that issue to avoid silent
+# scope creep). Three of the five (pipeline-watchdog, saturday-integrity-
+# sentinel, freshness-monitor) already carry a separate Errors-only alarm via
+# setup_changelog_observability_alarms.sh routed to the PRIMARY alpha-engine-
+# alerts topic (Phase B "watch-the-watchers", config#1273) — that alarm stays;
+# it does not satisfy the independent-backstop-topic argument this script
+# exists for (see header), so both alarms are intentional, not duplicative.
 # arctic-migration-dispatcher added alpha-engine-config-I3242 (merge-triggered
 # in-region ArcticDB migration runner) — onboarded in the SAME PR that ships
 # it, per this file's own header convention. (Comment kept OUT of the array
 # literal below so the tests/test_watch_plane_alarms_script.py block-parser
 # isn't confused by a stray `)` inside the block.)
+# ci-watch-liveness-probe / alert-drain-liveness-probe added config#3173
+# (mid-run spot-reclaim checkers for the ci-watch and alert-drain families,
+# mirroring sf-watch-reclaim-sweep-handler's config#2270 mechanism) — onboarded in
+# the SAME PR that ships them, per this file's own header convention.
 declare -A WATCH_PLANE_FUNCTIONS=(
   ["saturday-sf-watch-dispatcher"]="alpha-engine-saturday-sf-watch-dispatcher"
   ["sf-watch-spot-dispatcher"]="alpha-engine-sf-watch-spot-dispatcher"
   ["ci-watch-dispatcher"]="alpha-engine-ci-watch-dispatcher"
-  ["sf-watch-liveness-probe"]="alpha-engine-sf-watch-liveness-probe"
+  ["ci-watch-liveness-probe"]="alpha-engine-ci-watch-liveness-probe"
+  ["sf-watch-reclaim-sweep-handler"]="alpha-engine-sf-watch-reclaim-sweep-handler"
   ["overseer-liveness-probe"]="alpha-engine-overseer-liveness-probe"
   ["overseer-dispatcher"]="alpha-engine-overseer-dispatcher"
   ["alert-drain-dispatcher"]="alpha-engine-alert-drain-dispatcher"
+  ["alert-drain-liveness-probe"]="alpha-engine-alert-drain-liveness-probe"
   ["substrate-health-gate"]="alpha-engine-substrate-health-gate"
+  ["pipeline-watchdog"]="alpha-engine-pipeline-watchdog"
+  ["canary-replay-liveness-probe"]="alpha-engine-canary-replay-liveness-probe"
+  ["saturday-integrity-sentinel"]="alpha-engine-saturday-integrity-sentinel"
+  ["freshness-monitor"]="alpha-engine-freshness-monitor"
+  ["sweep-artifact-monitor"]="alpha-engine-sweep-artifact-monitor"
   ["arctic-migration-dispatcher"]="alpha-engine-arctic-migration-dispatcher"
 )
 
@@ -227,6 +247,30 @@ run aws cloudwatch put-metric-alarm \
   --treat-missing-data "notBreaching" \
   --alarm-actions "$BACKSTOP_TOPIC_ARN" \
   --ok-actions "$BACKSTOP_TOPIC_ARN"
+
+# --- 5. Backstop Telegram forwarder (alpha-engine-config-I2899) ---------------
+# The backstop alarm topic must have a real-time channel beyond email. The
+# alpha-engine-backstop-telegram-notifier Lambda (deployed by its own deploy.sh)
+# subscribes directly to the topic and forwards every alarm to Telegram via raw
+# urllib — ZERO shared infrastructure with the smart path (no krepis, no
+# nousergon_lib, no flow-doctor, no EventBridge). Its SNS subscription is
+# managed by the topic's sole owner: setup_pipeline_deadman_alarms.sh.
+#
+# First-time deployment:
+#   bash infrastructure/lambdas/backstop-telegram-notifier/deploy.sh --bootstrap
+# After code changes:
+#   bash infrastructure/lambdas/backstop-telegram-notifier/deploy.sh
+
+FORWARDER_FUNCTION_NAME="alpha-engine-backstop-telegram-notifier"
+
+if aws lambda get-function --function-name "${FORWARDER_FUNCTION_NAME}" --region "${REGION}" >/dev/null 2>&1; then
+  echo "  Backstop Telegram forwarder ${FORWARDER_FUNCTION_NAME} is deployed."
+  echo "  (Subscription managed by setup_pipeline_deadman_alarms.sh — the topic's sole owner.)"
+else
+  echo "  WARNING: ${FORWARDER_FUNCTION_NAME} does not exist — backstop alarm pages"
+  echo "  are email-only until it is deployed. Run:"
+  echo "    bash infrastructure/lambdas/backstop-telegram-notifier/deploy.sh --bootstrap"
+fi
 
 echo ""
 echo "Done."

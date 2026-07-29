@@ -38,7 +38,14 @@ playbooks:
     # overseer-dispatcher injects it into the executor payload and the
     # executor threads it to the run script's `--model`; the run script's
     # inline default is the fallback ONLY for non-router invocation paths.
-    model: claude-opus-4-8
+    model: deepseek-v4-pro
+    # config-#5286 — dispatch semantics registry-declared (was hardcoded in the
+    # executor Lambda as DEFER_MAX_GENERATION=3 + defer-not-drop policy). The
+    # overseer-dispatcher injects these into the executor payload; the executor's
+    # own hardcoded defaults are the fallback for non-router invocation paths.
+    on_concurrent: defer
+    attempt_ceiling: 3
+    drill_isolation: true
     wake:
       - "eventbridge:alpha-engine-saturday-sf-watch-failed (fleet SF terminal failure -> triage Lambda -> router, M2)"
       - "eventbridge:alpha-engine-sf-watch-spot-interruption + alpha-engine-sf-watch-instance-terminated (reclaim/relaunch)"
@@ -59,13 +66,13 @@ playbooks:
     supports_drill: true
     kill_switch_env: SF_WATCH_DISPATCH_ENABLED  # on the EXECUTOR Lambda
     # Wiring-integrity checks the overseer-liveness-probe runs (I2831). These
-    # migrated verbatim from sf-watch-liveness-probe's per-probe constants — the
+    # migrated verbatim from sf-watch-reclaim-sweep-handler's per-probe constants — the
     # registry is now the ONE place this surface is enumerated. The pipeline
     # list is a YAML anchor so it is declared ONCE and stays lockstep with
     # saturday-sf-watch-dispatcher's PIPELINES (pinned by
     # tests/test_overseer_playbook_registry.py). The reclaim-checker (config#2270)
     # + disabled-window sweep (config#2257) ACTION paths are NOT here — they stay
-    # in the slimmed sf-watch-liveness-probe (their EC2-event trigger topology +
+    # in the slimmed sf-watch-reclaim-sweep-handler (their EC2-event trigger topology +
     # 45 pinned tests; full migration tracked as a follow-up).
     liveness:
       checks:
@@ -118,7 +125,14 @@ playbooks:
     tier: T2
     routed: true
     enabled: true
-    model: claude-opus-4-8   # config-I3293 — registry-declared, router-injected
+    model: deepseek-v4-pro   # config-I3293 — registry-declared, router-injected
+    # config-#5286 — ci-watch uses concurrent_skip on collision (no retry),
+    # not defer-not-drop: a second commit failing CI independently must get its
+    # own dispatch, not queue behind the first (per-SHA lock is the narrow
+    # guard). attempt_ceiling=1 means skip-on-first-collision with zero retry.
+    on_concurrent: skip
+    attempt_ceiling: 1
+    drill_isolation: true
     wake:
       - "gha:nousergon-lib notify-ci-failure.yml -> repository_dispatch -> sf-watch.yml ci-watch-dispatch job -> this router (main-branch CI failure)"
     cadence: "event-driven only — no scheduled wake (deprecation to drain intake tracked: config-I2845)"
@@ -134,7 +148,7 @@ playbooks:
     supports_drill: true
     kill_switch_env: CI_WATCH_DISPATCH_ENABLED  # on the EXECUTOR Lambda
     # The ci-watch executor's own liveness (was checked as part of
-    # sf-watch-liveness-probe's spot-dispatch leg; now attributed to its own
+    # sf-watch-reclaim-sweep-handler's spot-dispatch leg; now attributed to its own
     # playbook). Kill-switch value REPORTED, never alerted.
     liveness:
       checks:
@@ -154,7 +168,13 @@ playbooks:
     tier: T2
     routed: true
     enabled: true
-    model: claude-sonnet-5   # config-I3293 — registry-declared, router-injected; charter may spawn complexity-matched sub-agents (Brian ruling 2026-07-22)
+    model: deepseek-v4-pro   # config-I3293 — registry-declared, router-injected; charter may spawn complexity-matched sub-agents (Brian ruling 2026-07-22)
+    # config-#5286 — alert-drain uses concurrent_skip on collision: single-lane
+    # lock (one drain at a time), no retry on skip (at-least-once queue
+    # discipline absorbs double-processing).
+    on_concurrent: skip
+    attempt_ceiling: 1
+    drill_isolation: true
     wake:
       - "scheduler:alpha-engine-alert-drain-0400utc/1000utc/1600utc/2200utc (4x-daily non-urgent queue drain, Brian ruling 2026-07-22)"
       - "event-time: freshness-monitor CRITICAL page -> router (trigger=freshness-critical, config-I3282)"
@@ -171,11 +191,48 @@ playbooks:
     # The alert-drain executor's own liveness. Its intake queue + the two
     # intake EventBridge rules are cross-cutting infra, checked under the
     # top-level watch_plane_liveness block below.
+    #
+    # Run-window accounting (config#4474): for each MATURE expected trigger
+    # (the 4x-daily scheduler cadence below), assert an S3 drain-ledger
+    # artifact's run_start landed in [T, T+ceiling+margin]. Key on the LEDGER
+    # (overseer/drain_ledger/) rather than the completion marker
+    # (_control/completed/) — the marker is written even on rc=1 (a crashing
+    # drain looks alive), the ledger only by a charter that ran.
     liveness:
       checks:
         - type: lambda_active
           function: alpha-engine-alert-drain-dispatcher
           report_kill_switch: ALERT_DRAIN_DISPATCH_ENABLED
+        # Run-window accounting (config#4474): the drain ledger at
+        # overseer/drain_ledger/ is only written by a charter that ran to
+        # completion — the completion marker (_control/completed/) is written
+        # even on crash, so the ledger (not the marker) is the liveness signal.
+        # MAX_RUNTIME_SECONDS=10800 (180m) + boot/report margin = 210m ceiling;
+        # margin beyond the ceiling is 30m. The 4x-daily schedule mirrors the
+        # four EventBridge Scheduler names in watch_plane_liveness.
+        - type: run_window
+          label: alert-drain
+          artifact_prefix: overseer/drain_ledger/
+          ceiling_min: 210
+          margin_min: 30
+          lookback_hours: 30
+          schedule:
+            - hour: 4
+              minute: 0
+              dows: [0, 1, 2, 3, 4, 5, 6]
+              label: "04:00 UTC daily"
+            - hour: 10
+              minute: 0
+              dows: [0, 1, 2, 3, 4, 5, 6]
+              label: "10:00 UTC daily"
+            - hour: 16
+              minute: 0
+              dows: [0, 1, 2, 3, 4, 5, 6]
+              label: "16:00 UTC daily"
+            - hour: 22
+              minute: 0
+              dows: [0, 1, 2, 3, 4, 5, 6]
+              label: "22:00 UTC daily"
 
   groom:
     description: >-
@@ -197,13 +254,20 @@ playbooks:
     # per-run by groom_driver — deliberately NOT the router-injected `model:`
     # field, which only applies to routed playbooks (config-I3293).
     wake:
-      - "eventbridge: three daily fixed crons 01:00/07:00/19:00 UTC (demand-driven tier launches)"
+      - "eventbridge: three daily fixed crons 04:00/12:00/20:00 UTC + Sun 09:00 UTC (demand-driven tier launches)"
       - "demand: end-of-SF Haiku PR-sweep leg (groom_run.sh --mode pr_sweep)"
-    cadence: "3x daily fixed crons + end-of-SF sweep leg"
+    cadence: "3x daily fixed crons (+ a weekly Sunday slot) + end-of-SF sweep leg"
     executor_lambda_dir: scheduled-groom-dispatcher
     charter: alpha-engine-config/scripts/groom_run.sh
     concurrency_domain: EC2 tag lock on groom-issue-filter (tier lane; sweep has its own lane).
     supports_drill: false
+    # config-#5286 — groom is the canonical `custom_executor: true` escape
+    # hatch. Its pace/demand/tier logic (complexity-tiered per issue, demand-
+    # driven scheduling, and end-of-SF sweep leg) predates and cannot be
+    # expressed through the instance-level dispatch primitives the registry
+    # declares for routed executors. The overseer-dispatcher therefore skips
+    # injecting dispatch-semantics fields for this playbook.
+    custom_executor: true
     kill_switch_env: GROOM_DISPATCH_ENABLED
     # Run-window accounting migrated from groom-liveness-probe (config#2414/#2667):
     # for each MATURE expected trigger (fixed-cron schedule below UNION the
@@ -212,6 +276,22 @@ playbooks:
     # A trigger with no covering artifact = a silent groom death → problem line.
     # `schedule` MIRRORS scheduled-groom-dispatcher/deploy.sh SCHED_CRONS — the
     # registry is now the SSoT (was GROOM_SCHEDULE env / _DEFAULT_SCHEDULE const).
+    #
+    # config-I4988 (corrected 2026-07-28): these hours sat at 01:00/07:00/19:00,
+    # the RETIRED tier-per-slot schedule, three retirements behind the live
+    # crons. Because _rw_expected_triggers enumerates from this list, the check
+    # was accounting for triggers that no longer fire and blind to the ones that
+    # do — so on 2026-07-27/28, when four consecutive cycles failed and one lost
+    # all three lanes to a capacity event, the check that exists precisely to
+    # page on a silent groom death could not fire. A mirrored schedule with
+    # nothing enforcing the mirror is the §2.7 derive-once defect; the lockstep
+    # test added alongside this fix (tests/test_groom_schedule_lockstep.py) now
+    # fails CI the moment deploy.sh's SCHED_CRONS and this list disagree.
+    #
+    # NOTE this remains a SLOW backstop, not a fast pager: maturity is
+    # ceiling+margin = 405 min, so a lane that dies at bootstrap is still
+    # invisible here for ~7h. The fast instance-death signal is tracked
+    # separately — see the epic (config-I5194 Phase 1).
     liveness:
       checks:
         - type: run_window
@@ -221,10 +301,21 @@ playbooks:
           ceiling_min: 360   # groom_spot_bootstrap.sh MAX_RUNTIME_SECONDS (360 min)
           margin_min: 45     # box boot + report latency slack
           lookback_hours: 30
+          # An artifact proves a box BOOTED, not that the run did anything.
+          # 2026-07-28: all three lanes crash-cascaded 2 min in (a truncated
+          # `runuser` left groom_run.sh as root, so every chunk agent refused
+          # to start), each still wrote a well-formed artifact, and this check
+          # reported full coverage while 378 issues went un-dispositioned.
+          # A run counts as coverage only if it engaged work — or there was no
+          # work to engage, which is the legitimate zero.
+          productive_when:
+            - {field: engaged, gt: 0}
+            - {field: total_issues, eq: 0}
           schedule:
-            - {hour: 1, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "01:00 daily (Sonnet high-only)"}
-            - {hour: 7, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "07:00 daily (Sonnet mid-only)"}
-            - {hour: 19, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "19:00 daily (Haiku low-only)"}
+            - {hour: 4, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "04:00 UTC daily (demand-all)"}
+            - {hour: 12, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "12:00 UTC daily (demand-all)"}
+            - {hour: 20, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "20:00 UTC daily (demand-all)"}
+            - {hour: 9, minute: 0, dows: [0], label: "Sun 09:00 UTC (weekly extra slot)"}
 
   gate-sweeps:
     description: >-
@@ -287,6 +378,12 @@ playbooks:
       at-most-one-live-marker idempotency per ISO week / PR+sha).
     supports_drill: false
     kill_switch_env: CANARY_REPLAY_DISPATCH_ENABLED
+    # Liveness is covered by the dedicated canary-replay-liveness-probe sibling
+    # Lambda (its own wiring + schedule + tick cadence), NOT by the overseer's
+    # registry-driven liveness probe — this entry is inventory-only, so the
+    # run-window contract test below (config#4474) accepts this field as proof
+    # of alternative coverage instead of requiring a run_window check here.
+    sibling_probe_function: alpha-engine-canary-replay-liveness-probe
 
   arctic-migration:
     description: >-
@@ -485,6 +582,45 @@ alert_classes:
     severities: [critical]
     intake: bus
     response: drain-queue
+  # config#3305 static-chokepoint registration: crucible-research
+  # ``publish_observe_alert`` call sites detected during the cross-repo
+  # completeness sweep. All are secondary observability (non-fatal, no
+  # downstream blocking) — matched via wildcard rows where call sites
+  # share a namespace pattern.
+  - class: research_runner_observe_alerts
+    source: "research-runner:*"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: research_challenger_producers
+    source: "research:challenger_producers"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: research_producer_leaderboard_alerts
+    source: "research:producer_leaderboard"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: research_scanner_leaderboard_alerts
+    source: "research:scanner_leaderboard"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: research_signals_envelope_rejected
+    # NOTE: this class emits via ``alerts.publish`` with explicit
+    # ``severity="error"`` (not ``publish_observe_alert``), so its
+    # effective severity is error — higher than the wildcard rows
+    # above that use ``publish_observe_alert`` (warning-level).
+    source: "signals-envelope"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+  - class: research_signals_envelope_handler_observe_alerts
+    source: "signals_envelope_handler:*"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
 
   # ── data plane (nousergon-data) ──
   - class: data_constituents_drift
@@ -608,6 +744,60 @@ alert_classes:
     intake: none
     response: operator
     operator_reason: Budget-usage notice; page-only by design (no automated response exists or is wanted for spend review).
+
+  # ── Telegram-only notify_via_flow_doctor emitters (config-I3513 audit, alpha-engine-config-I3683) ──
+  # These 5 sources all route through notify_via_flow_doctor → Telegram only (no
+  # SQS intake bus event). Added during the I3513 source-propagation audit when
+  # every caller gained an explicit source= parameter but no alert_classes row
+  # existed for them. All DRAIN-BLIND by design: these are operational Telegram
+  # pages/notices, not drain-queue incidents.
+  - class: saturday_integrity_sentinel_telegram
+    source: "saturday-integrity-sentinel"
+    severities: [info, warning, error]
+    intake: none
+    response: operator
+    operator_reason: >-
+      Monday pre-open GO/NO-GO integrity page (Telegram-only by design; the
+      Saturday-sf integrity verdict is independent of the watch plane — a silent
+      sentinel can't hide its own silence).
+  - class: overseer_liveness_probe_telegram
+    source: "overseer-liveness-probe"
+    severities: [error]
+    intake: none
+    response: operator
+    operator_reason: >-
+      Watch-plane wiring/liveness probe findings (Telegram-only by design;
+      the probe IS the watch-plane's own health-check — routing its findings
+      through the watch-plane's alert-drain would create a circular dependency).
+  - class: sf_watch_liveness_probe_telegram
+    source: "sf-watch-liveness-probe"
+    severities: [error, info]
+    intake: none
+    response: operator
+    operator_reason: >-
+      Mid-run spot-reclaim escalation (error) + bounded-relaunch note (info),
+      Telegram-only by design (the reclaim action IS the repair; no drain-queue
+      remediation exists or is wanted for spot-reclaim events).
+  - class: saturday_sf_watch_dispatcher_telegram
+    source: "saturday-sf-watch-dispatcher"
+    severities: [error, info]
+    intake: none
+    response: operator
+    operator_reason: >-
+      Fleet-SF watch receipts (info) + budget-exhaustion escalation (error).
+      Telegram-only by design: these are runtime watch-plane operational notices
+      emitted alongside the agent dispatch path; the agent dispatch itself is
+      already routed through its own playbook (sf-watch).
+  - class: arctic_migration_telegram
+    source: "arctic-migration"
+    severities: [critical, warning, info]
+    intake: none
+    response: operator
+    operator_reason: >-
+      EC2/GHA migration-runner outcome notices (info=noop/success,
+      warning=refused-probe, critical=failure). Telegram-only by design: this
+      is an EC2 script, not a Lambda; it has no bus-accessible IAM role and its
+      notifications are operational pages, not drain-queue incidents.
   - class: fleet_email_digests
     source: "email:eod|backtester|director|research|training digests"
     severities: [info]
@@ -620,3 +810,78 @@ alert_classes:
     intake: none
     response: operator
     migration_issue: alpha-engine-config-I3302   # also bypasses the email chokepoint itself
+
+# ── T1 authority tier — named deterministic remediations (overseer-policy.md §6) ──
+# Each entry is a reviewed, non-agentic automation for a known-shape failure
+# whose root cause AND remediation are stable across ≥3 occurrences. The
+# alert-drain charter consults this list BEFORE T2 classification: an incident
+# matching an active T1 entry runs its deterministic remediation and verifies
+# its success predicate with ZERO agent turns — no diagnosis, no judgment.
+#
+# Promotion contract (§6): ≥3 occurrences with the same root cause, a
+# deterministic remediation with a machine-checkable success predicate, a
+# rollback path, and a reviewed issue authorizing it (listed in authorized_by).
+#
+# Demotion is automatic: ≥max_consecutive_failures consecutive predicate
+# failures → entry disabled (state=demoted) + finding filed. Consecutive-
+# failure count resets on any successful execution. Runtime state is tracked
+# in the drain carryover ledger (DRAIN_STATE_KEY t1_runtime block), NOT here
+# — this file is the static registry; the drain agent reads both.
+#
+# Schema: playbooks.schema.json §t1_automations (additive-only evolution —
+# new OPTIONAL fields are fine; renames/removals require a schema_version bump).
+
+t1_automations:
+  # Seed entry — the drain's first non-agentic remediation path. For
+  # freshness-monitor CRITICAL staleness alerts, the T2 agent's first step is
+  # ALWAYS a deterministic S3 freshness check — an artifact fresher than the
+  # alert's SLA floor means the producer ran between alert and drain, making
+  # this T0-resolved with zero diagnosis needed. That step is agent-judgment-
+  # free and has been verified across 4 drain runs (2026-07-20 through
+  # 2026-07-27) without a false positive. Promoting it to T1 saves a full
+  # agent turn per occurrence.
+  - name: freshness-critical-auto-verify
+    description: >-
+      For freshness-monitor CRITICAL staleness alerts: HEAD the artifact in S3,
+      compare last-modified to the alert's SLA floor. If fresher, the producer
+      ran between alert and drain — the incident is T0-resolved with zero
+      diagnosis. This is the T2 agent's own first step, made deterministic.
+    authorized_by: alpha-engine-config-I4483
+    added: "2026-07-28"
+    match:
+      alert_class: freshness_monitor_staleness
+      severities: [critical]
+    remediation_steps:
+      - "Read the artifact's `s3_key_template` from `alpha-engine-config/private-docs/ARTIFACT_REGISTRY.yaml` (trust the registry template, not the alert's spelling — some surfaces render `_` as `-`)."
+      - "Run `aws s3 ls <artifact_key>` to get the last-modified timestamp."
+      - "Compare to the alert's SLA floor (the staleness threshold). If last-modified ≥ SLA floor, the incident is T0-resolved: record it with disposition `t1-resolved` and note the observed freshness timestamp. If still stale, the T1 automation declines — fall through to T2 diagnosis."
+    success_predicate:
+      description: "Artifact last-modified timestamp is ≥ the alert's SLA floor"
+      check: "aws s3 ls <artifact_key> returns a timestamp ≥ SLA floor"
+    rollback:
+      description: "Read-only verification — no state to roll back. If the predicate check was wrong (artifact actually stale), the incident falls through to T2 and is properly diagnosed."
+    max_consecutive_failures: 2
+
+  # Second seed — groom lifecycle ONLINE notices ride the bus at info severity
+  # with a dedup_key that is deterministic (mode + filter + model). They are
+  # ALWAYS T0 digest-fold (informational lifecycle heartbeat, no defect).
+  # Skipping agent classification saves ~30s per drain run.
+  - name: groom-lifecycle-digest-fold
+    description: >-
+      Groom lifecycle ONLINE notices (info severity, dedup key from
+      backlog-groom-lifecycle) are always T0 digest-fold — informational
+      heartbeat with zero defect surface. Classified deterministically.
+    authorized_by: alpha-engine-config-I4483
+    added: "2026-07-28"
+    match:
+      alert_class: groom_lifecycle_bus_events
+      severities: [info]
+    remediation_steps:
+      - "Verify the event severity is `info` and the message is a lifecycle transition (ONLINE/complete)."
+      - "Record as T0 digest-fold with disposition `t1-digest-fold`."
+    success_predicate:
+      description: "Event is info-severity lifecycle heartbeat"
+      check: "Event severity == 'info' AND message contains lifecycle transition marker"
+    rollback:
+      description: "No state changed — folding into digest is lossless (the event is still in the ledger)."
+    max_consecutive_failures: 2

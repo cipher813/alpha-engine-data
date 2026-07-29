@@ -171,7 +171,7 @@ def test_default_thresholds_are_heterogeneous():
     # Specific anchor values from the design (commentary in alternative.py)
     assert ratios["analyst_consensus"] == 0.80
     assert ratios["insider_activity"] == 0.10  # episodic Form 4 filings
-    assert ratios["institutional"] == 0.20  # quarterly 13F lag
+    assert ratios["institutional"] == 0.0  # dead — replaced by inst_ownership derived table (2026-07-25)
 
 
 def test_env_override_merges(monkeypatch):
@@ -379,16 +379,18 @@ def test_at_floor_exactly_does_not_breach(monkeypatch):
 
 
 def test_env_override_can_relax_a_specific_breach(monkeypatch):
-    """Operator-tunable: if a known edgartools outage drops 13F coverage
-    to 5%, the operator can set ALT_MIN_OK_RATIOS to relax that single
-    source without breaking the others."""
+    """Operator-tunable: if insider filings drop the populated ratio below
+    its threshold, the operator can set ALT_MIN_OK_RATIOS to relax that
+    single source without breaking the others. (Uses insider_activity
+    because institutional is 0.0 — permanently dead, replaced by
+    inst_ownership derived table, 2026-07-25.)"""
     payloads = [
-        _unpopulated_source_payload(f"TKR{i}", ["institutional"])
+        _unpopulated_source_payload(f"TKR{i}", ["insider_activity"])
         for i in range(10)
     ]
     _patch_collect(monkeypatch, fetch_returns=payloads)
 
-    # Default: institutional floor is 0.20, 0/10 → breach.
+    # Default: insider floor is 0.10, 0/10 → breach.
     result_default = alternative.collect(
         bucket="test-bucket",
         s3_prefix="market_data/",
@@ -396,12 +398,12 @@ def test_env_override_can_relax_a_specific_breach(monkeypatch):
         tickers=[f"TKR{i}" for i in range(10)],
     )
     assert result_default["status"] == "error"
-    assert "institutional" in result_default["breached_sources"]
+    assert "insider_activity" in result_default["breached_sources"]
 
-    # Override: relax institutional to 0.0 → passes.
-    monkeypatch.setenv("ALT_MIN_OK_RATIOS", '{"institutional": 0.0}')
+    # Override: relax insider to 0.0 → passes.
+    monkeypatch.setenv("ALT_MIN_OK_RATIOS", '{"insider_activity": 0.0}')
     fresh_payloads = [
-        _unpopulated_source_payload(f"TKR{i}", ["institutional"])
+        _unpopulated_source_payload(f"TKR{i}", ["insider_activity"])
         for i in range(10)
     ]
     _patch_collect(monkeypatch, fetch_returns=fresh_payloads)
