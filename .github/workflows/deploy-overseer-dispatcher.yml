@@ -16,11 +16,11 @@ name: Deploy overseer-dispatcher
 # — exactly the class Brian's standing auto-deploy preference forbids. The
 # github-actions-lambda-deploy OIDC role deliberately has no iam:CreateRole /
 # iam:PutRolePolicy (fleet-wide policy after 4 IAM-clobber incidents in 2
-# months; see infrastructure/iam/README.md) — an IAM/profile change still
+# months; see nous-ergon-ops/infrastructure/iam/README.md) — an IAM/profile change still
 # requires an operator to run `deploy.sh --bootstrap` by hand.
 #
 # IAM: no new grant needed — LambdaUpdate already covers
-# arn:...:function:alpha-engine-* (infrastructure/iam/github-actions-lambda-
+# arn:...:function:alpha-engine-* (nous-ergon-ops/infrastructure/iam/github-actions-lambda-
 # deploy.json), which already includes this function.
 
 on:
@@ -28,6 +28,14 @@ on:
     branches: [main]
     paths:
       - 'infrastructure/lambdas/overseer-dispatcher/**'
+      # The router BUNDLES the registry into its zip at deploy time (deploy.sh
+      # copies infrastructure/overseer/playbooks.yaml), so a registry-only
+      # change must redeploy it — otherwise the live router keeps routing on a
+      # stale copy. Omitting this is how the alert-drain model fix (#1064)
+      # redeployed the liveness probe (whose filter DID list the registry) but
+      # not the router, leaving the router injecting the old broken model.
+      # Pinned by tests/test_overseer_playbook_registry.py.
+      - 'infrastructure/overseer/playbooks.yaml'
       - '.github/workflows/deploy-overseer-dispatcher.yml'
   workflow_dispatch:
 

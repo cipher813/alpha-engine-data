@@ -12,7 +12,7 @@ name: Deploy Infrastructure
 # pipeline never silently halts on stamp drift again.
 #
 # Template-content changes (adding an alarm, modifying a rule) still work
-# here because apply.sh in alpha-engine-data/infrastructure/iam/ is the
+# here because apply.sh in nous-ergon-ops/infrastructure/iam/ is the
 # source of truth for the GHA role's policy and will have been applied
 # before the PR merges.
 
@@ -58,7 +58,7 @@ jobs:
             --output text
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: '3.11'
 
@@ -67,7 +67,7 @@ jobs:
         # those are for other subsystems; alerts.publish needs none of them).
         # Same pin as requirements.txt so this step's nousergon_lib.alerts
         # behavior never drifts from the rest of the repo's alerting.
-        run: pip install "nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.9"
+        run: pip install "nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.21"
 
       - name: Verify SF definitions match live + S3-staged copies (config#2391)
         run: python3 infrastructure/step-functions/check-definition-drift.py

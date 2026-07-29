@@ -14,7 +14,9 @@
     {
       "Sid": "TelegramSecretsSSM",
       "Effect": "Allow",
-      "Action": ["ssm:GetParameter"],
+      "Action": [
+        "ssm:GetParameter"
+      ],
       "Resource": [
         "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_BOT_TOKEN",
         "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_CHAT_ID",
@@ -25,7 +27,10 @@
     {
       "Sid": "ReadEventBridgeRules",
       "Effect": "Allow",
-      "Action": ["events:DescribeRule", "events:ListTargetsByRule"],
+      "Action": [
+        "events:DescribeRule",
+        "events:ListTargetsByRule"
+      ],
       "Resource": [
         "arn:aws:events:us-east-1:711398986525:rule/alpha-engine-saturday-sf-watch-failed",
         "arn:aws:events:us-east-1:711398986525:rule/nousergon-alerts/overseer-intake-alert-events",
@@ -35,7 +40,9 @@
     {
       "Sid": "ReadRegisteredStateMachines",
       "Effect": "Allow",
-      "Action": ["states:DescribeStateMachine"],
+      "Action": [
+        "states:DescribeStateMachine"
+      ],
       "Resource": [
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline",
@@ -45,7 +52,9 @@
     {
       "Sid": "ReadWatchPlaneLambdaHealth",
       "Effect": "Allow",
-      "Action": ["lambda:GetFunctionConfiguration"],
+      "Action": [
+        "lambda:GetFunctionConfiguration"
+      ],
       "Resource": [
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-saturday-sf-watch-dispatcher",
         "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-sf-watch-spot-dispatcher",
@@ -57,7 +66,9 @@
     {
       "Sid": "ReadSfWatchExecutionHistory",
       "Effect": "Allow",
-      "Action": ["states:ListExecutions"],
+      "Action": [
+        "states:ListExecutions"
+      ],
       "Resource": [
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline",
@@ -67,7 +78,9 @@
     {
       "Sid": "ReadSfWatchExecutionInput",
       "Effect": "Allow",
-      "Action": ["states:DescribeExecution"],
+      "Action": [
+        "states:DescribeExecution"
+      ],
       "Resource": [
         "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:*",
         "arn:aws:states:us-east-1:711398986525:execution:ne-preopen-trading-pipeline:*",
@@ -77,7 +90,9 @@
     {
       "Sid": "ReadSfWatchLogs",
       "Effect": "Allow",
-      "Action": ["s3:GetObject"],
+      "Action": [
+        "s3:GetObject"
+      ],
       "Resource": [
         "arn:aws:s3:::alpha-engine-research/consolidated/saturday_sf_watch/*",
         "arn:aws:s3:::alpha-engine-research/consolidated/weekday_sf_watch/*",
@@ -87,7 +102,9 @@
     {
       "Sid": "ReadRouterSchedulerSchedules",
       "Effect": "Allow",
-      "Action": ["scheduler:GetSchedule"],
+      "Action": [
+        "scheduler:GetSchedule"
+      ],
       "Resource": [
         "arn:aws:scheduler:us-east-1:711398986525:schedule/default/alpha-engine-alert-drain-0400utc",
         "arn:aws:scheduler:us-east-1:711398986525:schedule/default/alpha-engine-alert-drain-1000utc",
@@ -110,7 +127,9 @@
     {
       "Sid": "ReadIntakeQueues",
       "Effect": "Allow",
-      "Action": ["sqs:GetQueueUrl"],
+      "Action": [
+        "sqs:GetQueueUrl"
+      ],
       "Resource": [
         "arn:aws:sqs:us-east-1:711398986525:nousergon-overseer-intake",
         "arn:aws:sqs:us-east-1:711398986525:nousergon-overseer-intake-dlq"
@@ -119,31 +138,52 @@
     {
       "Sid": "LivenessDedupState",
       "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
       "Resource": "arn:aws:s3:::alpha-engine-research/consolidated/overseer_liveness/*"
     },
     {
       "Sid": "RunWindowArtifactsRead",
       "Effect": "Allow",
-      "Action": ["s3:GetObject"],
-      "Resource": "arn:aws:s3:::alpha-engine-research/groom/*"
+      "Action": [
+        "s3:GetObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research/groom/*",
+        "arn:aws:s3:::alpha-engine-research/overseer/*"
+      ]
     },
     {
       "Sid": "ListConsolidatedPrefix",
       "Effect": "Allow",
-      "Action": ["s3:ListBucket"],
+      "Action": [
+        "s3:ListBucket"
+      ],
       "Resource": "arn:aws:s3:::alpha-engine-research",
       "Condition": {
-        "StringLike": { "s3:prefix": ["consolidated/*"] }
+        "StringLike": {
+          "s3:prefix": [
+            "consolidated/*"
+          ]
+        }
       }
     },
     {
       "Sid": "RunWindowArtifactsList",
       "Effect": "Allow",
-      "Action": ["s3:ListBucket"],
+      "Action": [
+        "s3:ListBucket"
+      ],
       "Resource": "arn:aws:s3:::alpha-engine-research",
       "Condition": {
-        "StringLike": { "s3:prefix": "groom/*" }
+        "StringLike": {
+          "s3:prefix": [
+            "groom/*",
+            "overseer/*"
+          ]
+        }
       }
     },
     {

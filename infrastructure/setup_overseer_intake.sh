@@ -163,8 +163,8 @@ echo "rule ${ALERT_RULE_NAME}: target ${QUEUE_NAME}"
 run events put-rule --region "$REGION" \
   --name "$CW_ALARM_RULE_NAME" \
   --state ENABLED \
-  --description "Overseer intake: every CloudWatch alarm transition to ALARM (additive tap; SNS alarm delivery unchanged) (alpha-engine-config-I2822)" \
-  --event-pattern '{"source":["aws.cloudwatch"],"detail-type":["CloudWatch Alarm State Change"],"detail":{"state":{"value":["ALARM"]}}}' > /dev/null
+  --description "Overseer intake: every CloudWatch alarm transition to ALARM (additive tap; SNS alarm delivery unchanged) — EXCLUDES watch-plane alarms (alpha-engine-watch-plane-*) which route exclusively via the independent backstop SNS (alpha-engine-config-I4476)" \
+  --event-pattern '{"source":["aws.cloudwatch"],"detail-type":["CloudWatch Alarm State Change"],"detail":{"state":{"value":["ALARM"]},"alarmName":[{"anything-but":{"prefix":"alpha-engine-watch-plane-"}}]}}' > /dev/null
 echo "rule ${CW_ALARM_RULE_NAME}: upserted on default bus"
 
 run events put-targets --region "$REGION" \
