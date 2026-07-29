@@ -58,6 +58,8 @@ import boto3
 from nousergon_lib.secrets import get_secret
 import requests
 
+from nousergon_lib.yfinance_quiet import yf_quiet
+
 from validators.price_validator import (
     ALL_FEATURE_ANOMALY_TYPES,
     DEFAULT_FEATURE_BLOCK_ANOMALY_TYPES,
@@ -902,8 +904,14 @@ _YF_INFO_BACKOFF_CAP = 4.0  # seconds — low cap; runtime-bounded, not gating
 
 # ---- 1. Analyst consensus ----
 
+@yf_quiet
 def _fetch_analyst(ticker: str) -> dict:
     """Fetch analyst rating + target price + earnings surprises.
+
+    Runs under ``@yf_quiet`` (nousergon_lib.yfinance_quiet): a delisted/renamed
+    ticker returns a 404 from Yahoo's quoteSummary API — suppress the per-symbol
+    ERROR spray and rely on the function-level ``except Exception`` catch for
+    degraded logging instead.
 
     Sources: Finnhub ``/stock/recommendation`` for rating + bull/bear
     analyst counts; yfinance ``Ticker.info`` for the consensus price
@@ -1014,8 +1022,12 @@ def _fetch_analyst(ticker: str) -> dict:
 
 # ---- 2. EPS revisions ----
 
+@yf_quiet
 def _fetch_revisions(ticker: str, bucket: str, run_date: str) -> dict:
     """Fetch current EPS estimate and compute the ~4-week estimate revision.
+
+    Runs under ``@yf_quiet`` (nousergon_lib.yfinance_quiet): a delisted/renamed
+    ticker can return a 404 — suppress per-symbol ERROR spray.
 
     Source: yfinance ``Ticker.eps_trend`` (migrated 2026-05-18 off the FMP
     ``analyst-estimates`` endpoint, which began returning 402 Payment Required
@@ -1145,8 +1157,14 @@ def _fetch_revisions(ticker: str, bucket: str, run_date: str) -> dict:
 
 # ---- 3. Options flow ----
 
+@yf_quiet
 def _fetch_options(ticker: str, run_date: str) -> dict:
-    """Fetch options-derived signals from yfinance."""
+    """Fetch options-derived signals from yfinance.
+
+    Runs under ``@yf_quiet`` (nousergon_lib.yfinance_quiet): a delisted/renamed
+    ticker returns a 404 from Yahoo's quoteSummary API accessed via
+    ``t.info`` — suppress per-symbol ERROR spray.
+    """
     result = {
         "put_call_ratio": None,
         "iv_rank": None,

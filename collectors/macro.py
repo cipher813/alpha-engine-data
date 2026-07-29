@@ -23,6 +23,7 @@ import boto3
 import numpy as np
 
 from nousergon_lib.secrets import get_secret
+from nousergon_lib.yfinance_quiet import quiet_yfinance
 import pandas as pd
 import requests
 import yfinance as yf
@@ -567,15 +568,16 @@ def _fetch_market_prices() -> dict:
 
     result: dict = {}
     try:
-        df = yf.download(
-            all_tickers,
-            period="35d",
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-            group_by="ticker",
-            threads=True,
-        )
+        with quiet_yfinance():
+            df = yf.download(
+                all_tickers,
+                period="35d",
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                group_by="ticker",
+                threads=True,
+            )
 
         def _last_close(ticker: str) -> Optional[float]:
             try:
