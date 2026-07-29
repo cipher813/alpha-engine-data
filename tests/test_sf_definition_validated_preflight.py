@@ -22,15 +22,12 @@ apply, stops covering a definition, or the IAM grant is dropped.
 
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _INFRA = _REPO_ROOT / "infrastructure"
 _DEPLOY = _INFRA / "deploy-infrastructure.sh"
-_GHA_DEPLOY_POLICY = _INFRA / "iam" / "github-actions-lambda-deploy.json"
-
 # The stamped SF definition variables the deploy script builds + applies. Every
 # one of these must be fed to the validate preflight. Includes the
 # config#1897/I2544/I2545 advisory + modelzoo child pipelines added to main
@@ -122,16 +119,8 @@ def test_abort_keys_on_result_field_not_diagnostics() -> None:
     assert re.search(r"exit 1", text)
 
 
-def test_gha_deploy_role_grants_validate_action() -> None:
-    """`states:ValidateStateMachineDefinition` is resource-less; without the
-    grant the preflight AccessDenies and (fail-closed) breaks every deploy."""
-    policy = json.loads(_GHA_DEPLOY_POLICY.read_text())
-    actions: set[str] = set()
-    for stmt in policy["Statement"]:
-        act = stmt.get("Action", [])
-        actions.update([act] if isinstance(act, str) else act)
-    assert "states:ValidateStateMachineDefinition" in actions, (
-        "github-actions-lambda-deploy.json must grant "
-        "states:ValidateStateMachineDefinition or the config#1897 preflight "
-        "fail-closes every Deploy Infrastructure run."
-    )
+# test_gha_deploy_role_grants_validate_action was ported to nous-ergon-ops
+# (infrastructure/iam/github-actions-lambda-deploy.json now lives there).
+# The invariant (states:ValidateStateMachineDefinition is granted to the
+# GHA deploy role) is enforced in nous-ergon-ops/tests/ — the IAM files
+# this test read have been removed from this repo (infra/drop-iam-moved-to-ops).

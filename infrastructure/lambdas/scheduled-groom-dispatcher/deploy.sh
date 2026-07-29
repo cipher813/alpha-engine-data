@@ -253,7 +253,7 @@ if $BOOTSTRAP; then
     run aws iam create-role \
       --role-name "${SF_ROLE_NAME}" \
       --assume-role-policy-document "${SF_TRUST}" \
-      --description "Execution role for ${SF_NAME} — invokes the groom Lambda + polls SSM (config#1472)" \
+      --description "Execution role for ${SF_NAME} - invokes the groom Lambda + polls SSM (config#1472)" \
       --query 'Role.RoleName' --output text
   else
     echo "  SF execution role exists: ${SF_ROLE_NAME}"
