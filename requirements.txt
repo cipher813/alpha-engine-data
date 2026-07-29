@@ -1,8 +1,8 @@
 boto3>=1.34
 pandas>=2.0
-openpyxl>=3.1
+openpyxl>=3.1.5
 pyarrow>=25.0.0
-yfinance>=1.5.1
+yfinance>=1.5.2
 requests>=2.34.2
 pyyaml>=6.0.3
 # setuptools floor for PYSEC-2026-3447 (newly disclosed; CI's pip-audit gate
@@ -21,7 +21,7 @@ lxml>=6.1.1
 edgartools>=2.0
 voyageai>=0.5.0
 jsonschema>=4.26.0
-arcticdb>=6.19.0
+arcticdb>=6.20.0
 # flow-doctor is pulled in transitively via nousergon-lib[flow-doctor].
 # NOTE: the extra MUST be hyphenated — setuptools normalizes the lib's
 # `flow_doctor` extra to `Provides-Extra: flow-doctor`; older pip doesn't
@@ -61,7 +61,7 @@ arcticdb>=6.19.0
 # nousergon-lib#226 registered the 9 states this repo's SF JSONs were
 # missing (2 Saturday + 7 EOD) and shipped in v0.124.8 — bumped to that tag
 # here (was v0.124.6) to unblock the new source-check test.
-nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.19
+nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.21
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,

@@ -39,6 +39,13 @@ playbooks:
     # executor threads it to the run script's `--model`; the run script's
     # inline default is the fallback ONLY for non-router invocation paths.
     model: deepseek-v4-pro
+    # config-#5286 — dispatch semantics registry-declared (was hardcoded in the
+    # executor Lambda as DEFER_MAX_GENERATION=3 + defer-not-drop policy). The
+    # overseer-dispatcher injects these into the executor payload; the executor's
+    # own hardcoded defaults are the fallback for non-router invocation paths.
+    on_concurrent: defer
+    attempt_ceiling: 3
+    drill_isolation: true
     wake:
       - "eventbridge:alpha-engine-saturday-sf-watch-failed (fleet SF terminal failure -> triage Lambda -> router, M2)"
       - "eventbridge:alpha-engine-sf-watch-spot-interruption + alpha-engine-sf-watch-instance-terminated (reclaim/relaunch)"
@@ -119,6 +126,13 @@ playbooks:
     routed: true
     enabled: true
     model: deepseek-v4-pro   # config-I3293 — registry-declared, router-injected
+    # config-#5286 — ci-watch uses concurrent_skip on collision (no retry),
+    # not defer-not-drop: a second commit failing CI independently must get its
+    # own dispatch, not queue behind the first (per-SHA lock is the narrow
+    # guard). attempt_ceiling=1 means skip-on-first-collision with zero retry.
+    on_concurrent: skip
+    attempt_ceiling: 1
+    drill_isolation: true
     wake:
       - "gha:nousergon-lib notify-ci-failure.yml -> repository_dispatch -> sf-watch.yml ci-watch-dispatch job -> this router (main-branch CI failure)"
     cadence: "event-driven only — no scheduled wake (deprecation to drain intake tracked: config-I2845)"
@@ -155,6 +169,12 @@ playbooks:
     routed: true
     enabled: true
     model: deepseek-v4-pro   # config-I3293 — registry-declared, router-injected; charter may spawn complexity-matched sub-agents (Brian ruling 2026-07-22)
+    # config-#5286 — alert-drain uses concurrent_skip on collision: single-lane
+    # lock (one drain at a time), no retry on skip (at-least-once queue
+    # discipline absorbs double-processing).
+    on_concurrent: skip
+    attempt_ceiling: 1
+    drill_isolation: true
     wake:
       - "scheduler:alpha-engine-alert-drain-0400utc/1000utc/1600utc/2200utc (4x-daily non-urgent queue drain, Brian ruling 2026-07-22)"
       - "event-time: freshness-monitor CRITICAL page -> router (trigger=freshness-critical, config-I3282)"
@@ -241,6 +261,13 @@ playbooks:
     charter: alpha-engine-config/scripts/groom_run.sh
     concurrency_domain: EC2 tag lock on groom-issue-filter (tier lane; sweep has its own lane).
     supports_drill: false
+    # config-#5286 — groom is the canonical `custom_executor: true` escape
+    # hatch. Its pace/demand/tier logic (complexity-tiered per issue, demand-
+    # driven scheduling, and end-of-SF sweep leg) predates and cannot be
+    # expressed through the instance-level dispatch primitives the registry
+    # declares for routed executors. The overseer-dispatcher therefore skips
+    # injecting dispatch-semantics fields for this playbook.
+    custom_executor: true
     kill_switch_env: GROOM_DISPATCH_ENABLED
     # Run-window accounting migrated from groom-liveness-probe (config#2414/#2667):
     # for each MATURE expected trigger (fixed-cron schedule below UNION the
@@ -274,6 +301,16 @@ playbooks:
           ceiling_min: 360   # groom_spot_bootstrap.sh MAX_RUNTIME_SECONDS (360 min)
           margin_min: 45     # box boot + report latency slack
           lookback_hours: 30
+          # An artifact proves a box BOOTED, not that the run did anything.
+          # 2026-07-28: all three lanes crash-cascaded 2 min in (a truncated
+          # `runuser` left groom_run.sh as root, so every chunk agent refused
+          # to start), each still wrote a well-formed artifact, and this check
+          # reported full coverage while 378 issues went un-dispositioned.
+          # A run counts as coverage only if it engaged work — or there was no
+          # work to engage, which is the legitimate zero.
+          productive_when:
+            - {field: engaged, gt: 0}
+            - {field: total_issues, eq: 0}
           schedule:
             - {hour: 4, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "04:00 UTC daily (demand-all)"}
             - {hour: 12, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "12:00 UTC daily (demand-all)"}

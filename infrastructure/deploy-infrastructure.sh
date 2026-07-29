@@ -322,30 +322,55 @@ update_or_create "$GROOM_ARN" "$GROOM_STAMPED" "alpha-engine-groom-dispatch" "Ba
 #
 # Ensuring the trust HERE — idempotently, before the CFN deploy, mirroring the
 # log-group prerequisites above and deploy_step_function.sh's own bootstrap —
-# makes this workflow self-sufficient: it no longer depends on a human having run
-# deploy_step_function.sh out-of-band, and it survives a role/DR rebuild. The role
-# is shared by BOTH the still-live SaturdayTrigger (events.amazonaws.com) and the
-# now-Scheduler weekday trigger (scheduler.amazonaws.com), so both principals must
-# be listed. update-assume-role-policy is idempotent (writes the full document);
-# the role always exists live (SaturdayTrigger depends on it), so no create-role
-# is attempted here — that keeps the GHA deploy role's IAM grant minimal
-# (iam:UpdateAssumeRolePolicy on this one role — see
-# infrastructure/iam/github-actions-lambda-deploy.json).
+# so both principals must be listed. The role is shared by BOTH the still-live
+# SaturdayTrigger (events.amazonaws.com) and the now-Scheduler weekday trigger
+# (scheduler.amazonaws.com).
 #
-# config#2826: the trust document itself lives in ONE place —
-# infrastructure/iam/alpha-engine-eventbridge-sfn-role.trust.json — the same
-# version-tracked snapshot deploy_step_function.sh's own bootstrap reads and
-# apply.sh/check-drift.py operate on. This step reads that file instead of
-# carrying its own inline copy, closing the exact class of drift that caused
-# this gap in the first place (two hand-maintained literals of the same
-# trust document, one of them missing a principal).
-EB_ROLE_NAME="alpha-engine-eventbridge-sfn-role"
-EB_TRUST_FILE="$SCRIPT_DIR/iam/${EB_ROLE_NAME}.trust.json"
-echo "  Ensuring $EB_ROLE_NAME trusts events.amazonaws.com + scheduler.amazonaws.com (idempotent)..."
-aws iam update-assume-role-policy \
-    --role-name "$EB_ROLE_NAME" \
-    --policy-document "file://$EB_TRUST_FILE" \
-    --region "$REGION"
+# This step VERIFIES the trust; it no longer WRITES it (#1075 follow-up).
+#
+# It used to call update-assume-role-policy against
+# infrastructure/iam/alpha-engine-eventbridge-sfn-role.trust.json. Commit
+# 506be30 ("infra: remove the IAM tree — now owned by nous-ergon-ops", #1075)
+# deleted that tree and this line was missed, so every run from 15:34 UTC on
+# 2026-07-28 died here with "Unable to load paramfile … No such file or
+# directory" (9 consecutive Deploy Infrastructure failures; see
+# alpha-engine-config-I5271).
+#
+# Restoring the write is NOT the fix. Per nous-ergon-ops
+# policies/infrastructure-ownership-policy.md §35, IAM roles/policies/trust
+# documents were consolidated to nous-ergon-ops/infrastructure/iam/ on
+# 2026-07-27; this repo no longer owns them. That repo's own
+# iam-apply-on-merge.yml deliberately withholds iam:UpdateAssumeRolePolicy
+# from its CI identity — "a CI identity that can rewrite trust policies is a
+# privilege-escalation path" (alpha-engine-config#3150) — so trust is applied
+# as a one-time bootstrap and thereafter guarded by check-drift.py's daily
+# 09:35 UTC _check_trust. A deploy identity in THIS repo rewriting that
+# document on every run is the same escalation path, one repo over.
+#
+# The #816 guarantee (EventBridge Scheduler validates RoleArn assumability at
+# CreateSchedule/UpdateSchedule time, and a --no-execute-changeset dry run does
+# not exercise it, so a missing principal surfaces only as an mid-apply
+# UPDATE_ROLLBACK_COMPLETE) now lives with the OWNER of the document rather
+# than here: nous-ergon-ops check-drift.py's _check_trust runs daily at 09:35
+# UTC against the codified trust-policy.json.
+#
+# This deploy performs NO IAM call at all. PR #1093 first tried to keep a
+# read-only `aws iam get-role` assertion here, which failed for a reason worth
+# recording: the GHA deploy identity was granted `iam:UpdateAssumeRolePolicy`
+# on this one role and nothing else, so it could WRITE the trust document but
+# not READ it —
+#
+#   AccessDenied: User: .../github-actions-lambda-deploy/GitHubActions is not
+#   authorized to perform: iam:GetRole on resource: role
+#   alpha-engine-eventbridge-sfn-role
+#
+# Broadening the deploy identity to read IAM would move in exactly the wrong
+# direction for a repo that no longer owns IAM, so the check is dropped
+# instead. RESIDUAL RISK, stated rather than hidden: a trust document missing
+# scheduler.amazonaws.com is no longer caught before the CFN apply and will
+# present as an UPDATE_ROLLBACK_COMPLETE — the #816 symptom. The daily ops
+# drift check is what closes that window now; if that proves too slow in
+# practice, the fix is a scheduled ops-side assertion, not an IAM grant here.
 
 # ── 4. Deploy/update CloudFormation stack ────────────────────────────────────
 echo ""
