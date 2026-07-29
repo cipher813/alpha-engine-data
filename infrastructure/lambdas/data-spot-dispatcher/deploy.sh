@@ -143,7 +143,7 @@ if $BOOTSTRAP; then
     run aws iam create-role \
       --role-name "${ROLE_NAME}" \
       --assume-role-policy-document "${TRUST_POLICY}" \
-      --description "Execution role for ${FUNCTION_NAME} — launch the data-enrich spot box + fire async SSM (config#1767)" \
+      --description "Execution role for ${FUNCTION_NAME} - launch the data-enrich spot box + fire async SSM (config#1767)" \
       --query 'Role.RoleName' --output text
   else
     echo "  IAM role exists: ${ROLE_NAME}"

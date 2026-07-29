@@ -322,30 +322,61 @@ update_or_create "$GROOM_ARN" "$GROOM_STAMPED" "alpha-engine-groom-dispatch" "Ba
 #
 # Ensuring the trust HERE — idempotently, before the CFN deploy, mirroring the
 # log-group prerequisites above and deploy_step_function.sh's own bootstrap —
-# makes this workflow self-sufficient: it no longer depends on a human having run
-# deploy_step_function.sh out-of-band, and it survives a role/DR rebuild. The role
-# is shared by BOTH the still-live SaturdayTrigger (events.amazonaws.com) and the
-# now-Scheduler weekday trigger (scheduler.amazonaws.com), so both principals must
-# be listed. update-assume-role-policy is idempotent (writes the full document);
-# the role always exists live (SaturdayTrigger depends on it), so no create-role
-# is attempted here — that keeps the GHA deploy role's IAM grant minimal
-# (iam:UpdateAssumeRolePolicy on this one role — see
-# infrastructure/iam/github-actions-lambda-deploy.json).
+# so both principals must be listed. The role is shared by BOTH the still-live
+# SaturdayTrigger (events.amazonaws.com) and the now-Scheduler weekday trigger
+# (scheduler.amazonaws.com).
 #
-# config#2826: the trust document itself lives in ONE place —
-# infrastructure/iam/alpha-engine-eventbridge-sfn-role.trust.json — the same
-# version-tracked snapshot deploy_step_function.sh's own bootstrap reads and
-# apply.sh/check-drift.py operate on. This step reads that file instead of
-# carrying its own inline copy, closing the exact class of drift that caused
-# this gap in the first place (two hand-maintained literals of the same
-# trust document, one of them missing a principal).
+# This step VERIFIES the trust; it no longer WRITES it (#1075 follow-up).
+#
+# It used to call update-assume-role-policy against
+# infrastructure/iam/alpha-engine-eventbridge-sfn-role.trust.json. Commit
+# 506be30 ("infra: remove the IAM tree — now owned by nous-ergon-ops", #1075)
+# deleted that tree and this line was missed, so every run from 15:34 UTC on
+# 2026-07-28 died here with "Unable to load paramfile … No such file or
+# directory" (9 consecutive Deploy Infrastructure failures; see
+# alpha-engine-config-I5271).
+#
+# Restoring the write is NOT the fix. Per nous-ergon-ops
+# policies/infrastructure-ownership-policy.md §35, IAM roles/policies/trust
+# documents were consolidated to nous-ergon-ops/infrastructure/iam/ on
+# 2026-07-27; this repo no longer owns them. That repo's own
+# iam-apply-on-merge.yml deliberately withholds iam:UpdateAssumeRolePolicy
+# from its CI identity — "a CI identity that can rewrite trust policies is a
+# privilege-escalation path" (alpha-engine-config#3150) — so trust is applied
+# as a one-time bootstrap and thereafter guarded by check-drift.py's daily
+# 09:35 UTC _check_trust. A deploy identity in THIS repo rewriting that
+# document on every run is the same escalation path, one repo over.
+#
+# What must be preserved is the #816 guarantee: EventBridge Scheduler
+# validates RoleArn assumability at CreateSchedule/UpdateSchedule time, and a
+# --no-execute-changeset dry run does not exercise it — so a missing principal
+# surfaces as an UPDATE_ROLLBACK_COMPLETE mid-apply. Failing loudly HERE, with
+# the remediation named, keeps that protection without the write.
+#
+# Principal.Service is a string for one principal and a list for several
+# (nousergon-data was bitten by exactly that shape change 2026-07-22, per
+# nous-ergon-ops check-drift.py). Matching against the raw JSON is correct for
+# both shapes and avoids a jq/python dependency this script does not otherwise
+# carry.
 EB_ROLE_NAME="alpha-engine-eventbridge-sfn-role"
-EB_TRUST_FILE="$SCRIPT_DIR/iam/${EB_ROLE_NAME}.trust.json"
-echo "  Ensuring $EB_ROLE_NAME trusts events.amazonaws.com + scheduler.amazonaws.com (idempotent)..."
-aws iam update-assume-role-policy \
-    --role-name "$EB_ROLE_NAME" \
-    --policy-document "file://$EB_TRUST_FILE" \
-    --region "$REGION"
+echo "  Verifying $EB_ROLE_NAME trusts events.amazonaws.com + scheduler.amazonaws.com..."
+EB_TRUST_DOC="$(aws iam get-role --role-name "$EB_ROLE_NAME" \
+    --query 'Role.AssumeRolePolicyDocument' --output json --region "$REGION")"
+EB_TRUST_MISSING=()
+for principal in events.amazonaws.com scheduler.amazonaws.com; do
+    printf '%s' "$EB_TRUST_DOC" | grep -q "\"$principal\"" || EB_TRUST_MISSING+=("$principal")
+done
+if [ ${#EB_TRUST_MISSING[@]} -gt 0 ]; then
+    echo "  ERROR: $EB_ROLE_NAME trust policy is missing: ${EB_TRUST_MISSING[*]}"
+    echo "         CloudFormation would fail mid-apply (UPDATE_ROLLBACK_COMPLETE) when it"
+    echo "         creates/updates WeekdayPipelineSchedule against a role that does not"
+    echo "         trust the scheduler — see #816."
+    echo "         This repo does NOT own IAM (nous-ergon-ops infrastructure-ownership-policy.md §35)."
+    echo "         Remediate in nous-ergon-ops:"
+    echo "           infrastructure/iam/apply.sh trust-policy $EB_ROLE_NAME"
+    exit 1
+fi
+echo "  OK"
 
 # ── 4. Deploy/update CloudFormation stack ────────────────────────────────────
 echo ""
