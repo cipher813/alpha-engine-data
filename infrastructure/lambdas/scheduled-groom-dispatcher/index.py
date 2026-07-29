@@ -535,11 +535,20 @@ export GROOM_RUN_TOKEN={run_token}
 """
 
 
-def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
+def _launch_instance(force_on_demand: bool = False,
+                     extra_tags: dict[str, str] | None = None) -> tuple[str, str]:
     """Launch the groom box; spot first, on-demand fallback on capacity exhaustion
     OR when force_on_demand (config#1645: the dispatch SF's last bounded relaunch
     attempt after repeated mid-run spot interruption — skip straight to on-demand
-    rather than trying the same flaky spot market a third time)."""
+    rather than trying the same flaky spot market a third time).
+
+    ``extra_tags`` (config#2292 root fix, alpha-engine-config#5303): additional
+    instance tags (notably ``groom-issue-filter``) threaded straight through to
+    ``spot_dispatch.launch_with_fallback``, which merges them into the SAME
+    ``RunInstances`` ``TagSpecifications`` as the ``Name`` tag — the box is never
+    observably untagged, so the tag is durable in CloudTrail for the
+    spot-interruption-recorder to read beyond the ~1h EC2 description window.
+    """
     return spot_dispatch.launch_with_fallback(
         INSTANCE_TYPES, SUBNETS,
         image_id=AMI_ID,
@@ -550,6 +559,7 @@ def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
         tag_name="alpha-engine-groom-spot",
         region=REGION,
         force_on_demand=force_on_demand,
+        extra_tags=extra_tags,
     )
 
 
@@ -1026,18 +1036,16 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
     # sf-watch watch-log timing) so a launch that itself fails/raises still
     # consumes ceiling budget — see _write_dispatch_ledger_entry.
     _write_dispatch_ledger_entry(run_token, tier_tag, schedule_label)
-    instance_id, market = _launch_instance(force_on_demand=force_on_demand)
+    # config#5303 / config#2292 root fix: the groom-issue-filter tag is now
+    # passed as extra_tags into the RunInstances TagSpecifications (ATOMIC with
+    # launch — the box is never observably untagged), so the tag is durable in
+    # CloudTrail for the spot-interruption-recorder to read beyond the ~1h EC2
+    # description window. No post-launch create_tags step remains.
+    instance_id, market = _launch_instance(
+        force_on_demand=force_on_demand,
+        extra_tags={GROOM_TIER_TAG_KEY: tier_tag},
+    )
     logger.info("launched groom box %s (%s)", instance_id, market)
-    # config#1979: tag the box with its lane (tier, or 'sweep' — config#2201)
-    # so the NEXT trigger's guard check (above) can find it. Best-effort — a
-    # tag-write failure must not abort an already-launched box (mirrors the
-    # fail-safe posture of the check itself).
-    try:
-        boto3.client("ec2", region_name=REGION).create_tags(
-            Resources=[instance_id], Tags=[{"Key": GROOM_TIER_TAG_KEY, "Value": tier_tag}])
-    except Exception as exc:  # noqa: BLE001 — non-fatal, mirrors _running_tier_instance_ids
-        logger.warning("groom-issue-filter tag write failed (non-fatal): %s: %s",
-                       type(exc).__name__, exc)
     # Once the box is up, ANY failure before the bootstrap command is delivered
     # would orphan it (no watchdog/trap yet). Terminate-on-error so a slow
     # SSM-online, an SSM SendCommand error, etc. tears the box down instead of
