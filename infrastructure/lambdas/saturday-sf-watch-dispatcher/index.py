@@ -11,8 +11,18 @@ that triggers the autonomous resilience agent (diagnose→fix→merge→rerun) i
 **Per-pipeline registry.** ``PIPELINES`` maps each SF name → its watch-log
 prefix + repository_dispatch event type, so the GHA workflow + dashboard filter
 by cadence and each pipeline carries its OWN kill-switch (in the agent charter).
-weekday + EOD ship PROPOSE-ONLY and soak before autonomous-merge is flipped on,
-independently of Saturday. Fan-out is additive: register a pipeline here, add its
+**All three cadences run autonomous-merge=true** (since 2026-07-07, config#1616).
+PROPOSE-ONLY is now only reachable by an operator re-flipping the per-cadence
+`/alpha-engine/<slug>_sf_watch/autonomous_merge_enabled` kill-switch; it is not
+a default and there is no soak in progress. (This paragraph previously said
+"weekday + EOD ship PROPOSE-ONLY and soak before autonomous-merge is flipped
+on" — that was written before #1616 and was three weeks stale by 2026-07-29,
+when it caused a session to report a nonexistent operator soak and to treat
+widening weekday/EOD autonomy as a decision still owed. The charter
+`alpha-engine-config/.github/sf-watch-prompt.md` is authoritative for autonomy
+and budget; this docstring is a pointer, not a second source.)
+
+Fan-out is additive: register a pipeline here, add its
 ARN to the single EventBridge rule (deploy.sh), widen the IAM ARNs.
 
 **Why this is NOT a second notifier.** The fleet already has
