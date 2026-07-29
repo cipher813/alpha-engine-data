@@ -225,9 +225,22 @@ Resources:
       # self-selects the single correct firing and Succeed-skips the rest.
       # Replaces the hand-built one-shot shift used for the 2026-07-03
       # holiday week.
-      Description: Thu-Sat 09:00 UTC — weekly pipeline fires day after last trading session (WeeklyRunDayGate self-selects; config#1824)
+      #
+      # DISABLED 2026-07-29 (Brian ruling): the weekly pipeline is now started
+      # by alpha-engine-eod-success-friday-shell-trigger on EVERY successful
+      # post-close SF, not by this cron. Leaving it ENABLED would double-run:
+      # Friday's post-close starts a full weekly Friday evening, then this
+      # cron starts a second full weekly Saturday 09:00 UTC against the same
+      # data. The mutex does not collapse them — its key is
+      # {state-machine}#{pipeline_role}#{run_date} and the two firings carry
+      # different run_dates (Fri vs Sat).
+      #
+      # Kept as a DISABLED resource rather than deleted so the schedule, its
+      # rationale and the config#1824 gate history stay one edit away if the
+      # event-driven trigger is ever reverted.
+      Description: 'RETIRED 2026-07-29 — superseded by the post-close-SF event trigger (see eod-success-friday-shell-trigger). Kept disabled for fast revert.'
       ScheduleExpression: 'cron(0 9 ? * THU-SAT *)'
-      State: ENABLED
+      State: DISABLED
       Targets:
         # SINGLE TARGET PER RULE. EventBridge dispatches the cron event
         # to every target on a rule; a duplicate target ID fans the

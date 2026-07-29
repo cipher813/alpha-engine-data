@@ -1,43 +1,58 @@
-"""alpha-engine-eod-success-friday-shell-trigger — kick the weekly shell-run.
+"""alpha-engine-eod-success-friday-shell-trigger — start the weekly SF after EOD.
 
-Subscribes to EventBridge ``Step Functions Execution Status Change`` events,
-filtered to ``ne-postclose-trading-pipeline`` + ``SUCCEEDED``. On every EOD-SF
-success the handler computes the trading_day this execution closed against
-and, if that trading_day is a Friday, starts the Saturday Step Function in
-shell-run mode (``shell_run: true``) so the spot instances boot for real
-while the workload paths short-circuit.
+NAME IS HISTORICAL. This Lambda no longer fires a Friday-only shell run; it
+starts a FULL weekly-freshness execution after EVERY successful post-close SF.
+The physical function/rule names are kept because the CloudFormation template
+references them and a rename is a separate, reversible change (tracked
+separately) — not because the name is right.
 
-Replaces the prior fixed-time EventBridge cron (``alpha-engine-friday-shell-run``,
-cron(45 20 ? * FRI *) = 13:45 PT Friday), which fired unconditionally and
-raced the EOD SF's ``StopTradingInstance`` state when EOD ran long. The
-event-driven design has three guarantees the cron lacked:
+WHY DAILY (Brian ruling 2026-07-29): the weekly pipeline was failing, and every
+failure waited a week to resurface. Defects were deferred to "next Saturday",
+Saturday failed, and the cycle restarted — 15+ hand-driven reruns across
+2026-07-26/27 to nurse one weekly through. Running the full pipeline after
+every trading day converts a weekly guessing game into a daily signal: it
+breaks today, it gets fixed today. This is the same reasoning weekly-sf-policy
+already states about rehearsal paths ("a change that would make Saturday robust
+waits for a Saturday to validate, while every Saturday runs on the un-hardened
+path") — applied to the pipeline itself rather than to changes against it.
 
-  1. **No fire on Friday-EOD failure.** If Friday's EOD never reaches
-     SUCCEEDED, this Lambda never invokes, so the shell-run does not chase
-     a broken upstream.
-  2. **Late re-runs work for free.** If Friday's EOD is fixed and re-run
-     later that day (or Saturday morning processing Friday's data), the
-     handler still sees a SUCCEEDED transition and trading_day is still
-     Friday — the shell-run starts at the fix-time, not on a stale clock.
-  3. **trading_day-bound, not wall-clock.** trading_day is derived via
-     ``nousergon_lib.trading_calendar.last_closed_trading_day`` from
-     ``detail.stopDate`` (epoch ms UTC), so a Friday EOD re-run that
-     succeeds at 02:00 UTC Saturday (= Friday evening PT) correctly stamps
-     trading_day=Fri and fires. Pure ``datetime.now()`` would have read
-     Saturday and skipped.
+Mechanism: subscribes to EventBridge ``Step Functions Execution Status Change``
+filtered to ``ne-postclose-trading-pipeline`` + ``SUCCEEDED``, derives the
+trading_day the execution closed against, and starts
+``ne-weekly-freshness-pipeline``. Three properties carried over from the
+Friday-shell design, all still load-bearing:
 
-Fail-loud semantics (per the ``feedback_wire_orphaned_producer_must_fail_loud``
-discipline — this Lambda is a new producer of shell-run starts):
+  1. **No fire on EOD failure.** If EOD never reaches SUCCEEDED this never
+     invokes, so the weekly does not chase a broken upstream.
+  2. **Late re-runs work for free.** A fixed-and-rerun EOD still produces a
+     SUCCEEDED transition with the same trading_day.
+  3. **trading_day-bound, not wall-clock.** Derived via
+     ``last_closed_trading_day`` from ``detail.stopDate``, so an EOD that
+     succeeds at 02:00 UTC (= previous evening ET) stamps the right day.
 
-  * Missing ``detail.stopDate`` → raises. SUCCEEDED events without a stop
-    timestamp are an upstream contract violation, not a silent skip.
-  * trading_calendar lookup failure → raises (lib bug surfaces fast).
-  * boto3 ``states:StartExecution`` failure → raises (do not silently
-    fail to launch the shell run; the EventBridge → Lambda retry policy
-    will retry, and CW alarms on Lambda errors will page).
+Run shape — three deliberate input choices:
 
-Non-Friday trading_day is the intended skip path and returns ``{"fired": False}``
-with a structured log line; this is NOT a swallow.
+  * ``shell_run`` is NOT set. The 2026-07-26/27 failures were WORKLOAD
+    failures (skip-parity, skip-backtester, bt-eval), which a shell run
+    short-circuits past and would never have caught. A dry pass that cannot
+    see the breakage is not a signal.
+  * ``skip_weekly_run_day_gate: true`` — the sanctioned operator bypass
+    (config#1617 skip-flag charter). Without it ``CheckWeeklyRunDayGate``
+    routes to ``WeeklyRunDayGate``, which is true only when yesterday was the
+    week's LAST trading session, so Mon-Thu firings would be rejected at
+    state one and this whole change would be a no-op.
+  * ``pipeline_role: "weekly"`` — keeps the existing mutex semantics. The
+    mutex key is ``{state-machine}#{pipeline_role}#{run_date}``, so two
+    firings for the same trading day (an EOD rerun, an EventBridge retry)
+    collapse to one execution instead of racing.
+
+Fail-loud (this is a producer of weekly-SF starts):
+
+  * Missing ``detail.stopDate`` → raises (upstream contract violation).
+  * trading_calendar lookup failure → raises.
+  * ``states:StartExecution`` failure → raises, so the EventBridge retry
+    policy engages and the Lambda Errors alarm pages. A silent failure here
+    means no weekly ran and nothing said so.
 """
 
 from __future__ import annotations
@@ -67,9 +82,6 @@ SNS_TOPIC_ARN = os.environ.get(
     f"arn:aws:sns:{REGION}:{ACCOUNT_ID}:alpha-engine-alerts",
 )
 
-FRIDAY_WEEKDAY = 4  # date.weekday(): Mon=0, Fri=4
-
-
 def _derive_trading_day_utc_ms(stop_date_ms: int):
     """trading_day = NYSE last-closed session at the EventBridge stopDate moment.
 
@@ -82,39 +94,31 @@ def _derive_trading_day_utc_ms(stop_date_ms: int):
     return last_closed_trading_day(dt_utc)
 
 
-def _build_shell_run_input() -> str:
-    # NO ec2_instance_id (config#2248, root-cause SPOF fix): this used to
-    # hardcode the always-on dashboard box id (despite the misleading
-    # TRADING_EC2_INSTANCE_ID name — it was never the trading box) into the
-    # SAME field all 14 of the weekly SF's downstream sendCommand/Lambda
-    # states key off. The SF's own CheckSpotDispatchNeeded/
-    # DispatchWeeklyFreshnessSpot states (step_function.json, right after
-    # AcquireMutex) now populate $.ec2_instance_id from a fresh ephemeral
-    # spot on every execution this Lambda starts — omitting the field here
-    # lets that dispatch path engage for the Friday shell-run exactly like
-    # it does for the real Saturday cron.
+def _build_run_input() -> str:
+    """Full weekly-freshness run input.
+
+    NO ec2_instance_id (config#2248): the SF's own CheckSpotDispatchNeeded/
+    DispatchWeeklyFreshnessSpot states populate $.ec2_instance_id from a fresh
+    ephemeral spot per execution. Hardcoding it here reintroduced a SPOF.
+
+    NO shell_run: this is a real run. See the module docstring — the failures
+    this exists to surface are workload failures a shell run skips past.
+    """
     return json.dumps(
         {
             "sns_topic_arn": SNS_TOPIC_ARN,
-            "shell_run": True,
-            # pipeline_role="shell-run" (Option-D taxonomy): tags this
-            # execution so the dashboard page-25 / Slack / CLI role filters
-            # distinguish the Friday-PM dry-pass from the canonical weekly
-            # run. The retired cron rule (alpha-engine-friday-shell-run,
-            # ROADMAP L4055) carried this tag; restored here so the
-            # event-driven path is a faithful replacement, not a surface
-            # regression. shell_run=true stays the load-bearing input.
-            "pipeline_role": "shell-run",
+            "pipeline_role": "weekly",
+            "skip_weekly_run_day_gate": True,
         }
     )
 
 
-def _start_saturday_shell_run(execution_name: str) -> str:
+def _start_weekly_run(execution_name: str) -> str:
     client = boto3.client("stepfunctions", region_name=REGION)
     resp = client.start_execution(
         stateMachineArn=SATURDAY_SF_ARN,
         name=execution_name,
-        input=_build_shell_run_input(),
+        input=_build_run_input(),
     )
     return resp["executionArn"]
 
@@ -144,29 +148,21 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         )
 
     trading_day = _derive_trading_day_utc_ms(stop_date_ms)
-    if trading_day.weekday() != FRIDAY_WEEKDAY:
-        logger.info(
-            "EOD SUCCEEDED trading_day=%s (weekday=%d) — not Friday, no shell run",
-            trading_day.isoformat(),
-            trading_day.weekday(),
-        )
-        return {
-            "fired": False,
-            "reason": "not_friday",
-            "trading_day": trading_day.isoformat(),
-        }
 
+    # No weekday filter. Every successful post-close starts a full weekly run
+    # (Brian ruling 2026-07-29) — see the module docstring for why the old
+    # Friday-only shell-run shape was the problem rather than the design.
     eod_name = detail.get("name", "unknown")
-    sat_name = f"friday-shell-{trading_day.isoformat()}-{eod_name}"[:80]
-    sat_arn = _start_saturday_shell_run(sat_name)
+    run_name = f"eod-daily-{trading_day.isoformat()}-{eod_name}"[:80]
+    run_arn = _start_weekly_run(run_name)
     logger.info(
-        "Friday EOD SUCCEEDED (trading_day=%s) → started saturday shell run: %s",
+        "EOD SUCCEEDED (trading_day=%s) -> started weekly-freshness run: %s",
         trading_day.isoformat(),
-        sat_arn,
+        run_arn,
     )
     return {
         "fired": True,
         "trading_day": trading_day.isoformat(),
-        "saturday_execution_arn": sat_arn,
-        "saturday_execution_name": sat_name,
+        "weekly_execution_arn": run_arn,
+        "weekly_execution_name": run_name,
     }

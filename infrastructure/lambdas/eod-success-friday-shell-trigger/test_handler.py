@@ -88,9 +88,15 @@ def _patch_sfn(start_execution_return: dict | None = None, side_effect=None):
     return patch("index.boto3.client", return_value=fake_client), fake_client
 
 
-def test_friday_eod_success_fires_saturday_sf_with_shell_run_input():
-    """Friday EOD SUCCEEDED → StartExecution on saturday SF with shell_run:true."""
-    _tc_mod.last_closed_trading_day.return_value = date(2026, 5, 22)  # Friday
+def test_eod_success_fires_full_weekly_run_not_a_shell_run():
+    """EOD SUCCEEDED -> StartExecution on the weekly SF as a REAL run.
+
+    shell_run must NOT be set. The 2026-07-26/27 failures this daily cadence
+    exists to surface were workload failures (skip-parity, skip-backtester,
+    bt-eval); a shell run short-circuits past exactly those, so a dry pass
+    would run green while the pipeline stayed broken.
+    """
+    _tc_mod.last_closed_trading_day.return_value = date(2026, 5, 22)
     sfn_patch, fake_client = _patch_sfn()
     with sfn_patch:
         result = index.handler(_event(), None)
@@ -98,25 +104,53 @@ def test_friday_eod_success_fires_saturday_sf_with_shell_run_input():
     fake_client.start_execution.assert_called_once()
     call_kwargs = fake_client.start_execution.call_args.kwargs
     assert call_kwargs["stateMachineArn"] == SATURDAY_ARN
-    assert call_kwargs["name"].startswith("friday-shell-2026-05-22-")
+    assert call_kwargs["name"].startswith("eod-daily-2026-05-22-")
 
     import json as _json
 
     input_dict = _json.loads(call_kwargs["input"])
-    assert input_dict["shell_run"] is True
-    # config#2248: ec2_instance_id is intentionally ABSENT — the weekly SF's
-    # own CheckSpotDispatchNeeded/DispatchWeeklyFreshnessSpot states populate
-    # it from a fresh ephemeral spot; this Lambda no longer hardcodes the
-    # always-on dashboard box id.
+    assert "shell_run" not in input_dict
+    # config#2248: ec2_instance_id intentionally ABSENT — the SF dispatches a
+    # fresh ephemeral spot per execution.
     assert "ec2_instance_id" not in input_dict
     assert input_dict["sns_topic_arn"] == index.SNS_TOPIC_ARN
-    # pipeline_role="shell-run" surface-contract tag (parity with the retired
-    # cron rule per ROADMAP L4055) so page-25 role filters bucket the dry-pass.
-    assert input_dict["pipeline_role"] == "shell-run"
-
     assert result["fired"] is True
     assert result["trading_day"] == "2026-05-22"
-    assert result["saturday_execution_arn"].endswith(":friday-shell-test")
+
+
+def test_run_day_gate_is_explicitly_bypassed():
+    """Without skip_weekly_run_day_gate the whole change is inert.
+
+    CheckWeeklyRunDayGate routes to WeeklyRunDayGate whenever
+    pipeline_role == 'weekly' AND skip_weekly_run_day_gate is false, and that
+    gate is true only when yesterday was the week's LAST trading session. So a
+    Mon-Thu firing without this flag is rejected at state one and no weekly
+    runs -- silently, since the skip path is a clean Succeed.
+    """
+    _tc_mod.last_closed_trading_day.return_value = date(2026, 5, 20)  # a Wednesday
+    sfn_patch, fake_client = _patch_sfn()
+    with sfn_patch:
+        index.handler(_event(), None)
+
+    import json as _json
+
+    input_dict = _json.loads(fake_client.start_execution.call_args.kwargs["input"])
+    assert input_dict["skip_weekly_run_day_gate"] is True
+
+
+def test_pipeline_role_weekly_preserves_mutex_dedupe():
+    """mutex key is {state-machine}#{pipeline_role}#{run_date}, so keeping
+    pipeline_role='weekly' collapses two firings for the same trading day (an
+    EOD rerun, an EventBridge retry) into one execution instead of racing."""
+    _tc_mod.last_closed_trading_day.return_value = date(2026, 5, 22)
+    sfn_patch, fake_client = _patch_sfn()
+    with sfn_patch:
+        index.handler(_event(), None)
+
+    import json as _json
+
+    input_dict = _json.loads(fake_client.start_execution.call_args.kwargs["input"])
+    assert input_dict["pipeline_role"] == "weekly"
 
 
 @pytest.mark.parametrize(
@@ -128,15 +162,15 @@ def test_friday_eod_success_fires_saturday_sf_with_shell_run_input():
         (date(2026, 5, 21), "Thu"),
     ],
 )
-def test_non_friday_eod_success_does_not_fire(trading_day, weekday_label):
+def test_every_weekday_fires_now(trading_day, weekday_label):
+    """The Friday-only filter is gone: every trading day starts a weekly run."""
     _tc_mod.last_closed_trading_day.return_value = trading_day
     sfn_patch, fake_client = _patch_sfn()
     with sfn_patch:
         result = index.handler(_event(), None)
 
-    fake_client.start_execution.assert_not_called()
-    assert result["fired"] is False
-    assert result["reason"] == "not_friday"
+    fake_client.start_execution.assert_called_once()
+    assert result["fired"] is True
     assert result["trading_day"] == trading_day.isoformat()
 
 
