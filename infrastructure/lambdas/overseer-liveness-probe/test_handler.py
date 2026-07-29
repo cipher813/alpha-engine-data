@@ -819,14 +819,19 @@ def test_registry_malformed_raises():
     index._REGISTRY_CACHE = None
 
 
-def _handler_with(problems, kill_switches=None, state_fingerprint=None,
+def _handler_with(problems, kill_switches=None, state_per_problem=None,
                   checks_run=None, checks_failed=0):
-    """Drive handler with _run_checks + S3 dedup state stubbed."""
+    """Drive handler with _run_checks + S3 dedup state stubbed.
+
+    ``state_per_problem`` is the prior ``per_problem`` dict (maps stable-key
+    to problem-text). ``None`` means the state object never existed (first
+    run); ``{}`` means the state was cleared (previously healthy)."""
     s3 = MagicMock()
-    if state_fingerprint is None:
+    if state_per_problem is None:
         s3.get_object.side_effect = FakeClientError("NoSuchKey")
     else:
-        s3.get_object.return_value = {"Body": _Body(json.dumps({"fingerprint": state_fingerprint}).encode())}
+        s3.get_object.return_value = {"Body": _Body(json.dumps(
+            {"per_problem": state_per_problem}).encode())}
     notify = MagicMock(return_value=True)
     if checks_run is None:
         checks_run = max(len(problems), 1)
@@ -866,27 +871,139 @@ def test_handler_clean_no_alert():
     notify.assert_not_called()
 
 
-def test_handler_new_problem_alerts_and_persists_fingerprint():
-    result, s3, notify = _handler_with(["EventBridge rule 'r' does NOT EXIST"])
+def test_handler_clears_dedup_state_when_healthy_again():
+    """After a problem clears, the dedup state is written as {} (not None)
+    so the next clean-fast-path does not re-trigger."""
+    result, s3, notify = _handler_with([], state_per_problem={"fp-old": "previous problem"})
+    assert result["clean"] is True
+    s3.put_object.assert_called_once()
+    body = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    assert body["per_problem"] == {}
+
+
+def test_handler_first_ever_run_alerts_everything():
+    """First run (state_per_problem=None) — every problem is 'new'."""
+    problems = ["Lambda 'x' does NOT EXIST", "rule 'y' is DISABLED"]
+    result, s3, notify = _handler_with(problems, state_per_problem=None)
     assert result["alerted"] is True
+    assert result["new"] == 2
+    assert result["continuing"] == 0
     notify.assert_called_once()
-    s3.put_object.assert_called_once()  # fingerprint persisted
+    text = notify.call_args[0][0]
+    assert "2 new" in text
+    assert "🆕 Lambda 'x' does NOT EXIST" in text
+    assert "🆕 rule 'y' is DISABLED" in text
 
 
-def test_handler_unchanged_problem_suppressed():
-    fp = index._problem_fingerprint(["EventBridge rule 'r' does NOT EXIST"])
-    result, s3, notify = _handler_with(["EventBridge rule 'r' does NOT EXIST"], state_fingerprint=fp)
+def test_handler_new_problem_added_pages_only_new():
+    """Two problems persist; ONE new one appears — only the new one pages."""
+    p1 = "Lambda 'x' does NOT EXIST"
+    p2 = "rule 'y' is DISABLED"
+    p3 = "sqs queue 'q' does NOT EXIST"
+    state = {index._stable_problem_key(p): p for p in [p1, p2]}
+    problems = [p1, p2, p3]
+    result, s3, notify = _handler_with(problems, state_per_problem=state)
+    assert result["alerted"] is True
+    assert result["new"] == 1
+    assert result["continuing"] == 2
+    text = notify.call_args[0][0]
+    assert "🆕 sqs queue 'q' does NOT EXIST" in text
+    assert "Lambda 'x' does NOT EXIST" not in text  # continuing, not re-listed
+    assert "rule 'y' is DISABLED" not in text
+    assert "continuing" in text
+
+
+def test_handler_problem_set_unchanged_suppressed():
+    """Exactly the same problem set as last time → no alert."""
+    p1 = "Lambda 'x' does NOT EXIST"
+    state = {index._stable_problem_key(p): p for p in [p1]}
+    result, s3, notify = _handler_with([p1], state_per_problem=state)
     assert result["alerted"] is False
     notify.assert_not_called()
 
 
-def test_handler_clears_dedup_state_when_healthy_again():
-    result, s3, notify = _handler_with([], state_fingerprint="stale-fp")
+def test_handler_problem_resolved_without_new_is_suppressed():
+    """One problem was alerted; now it's gone — no alert (the count just
+    decreased to zero silently)."""
+    p1 = "Lambda 'x' does NOT EXIST"
+    state = {index._stable_problem_key(p): p for p in [p1]}
+    result, s3, notify = _handler_with([], state_per_problem=state)
+    assert result["alerted"] is False
     assert result["clean"] is True
-    # cleared: put_object called with fingerprint None
-    s3.put_object.assert_called_once()
+    notify.assert_not_called()
+    # state cleared
     body = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
-    assert body["fingerprint"] is None
+    assert body["per_problem"] == {}
+
+
+def test_handler_problem_changed_replaces_old():
+    """Problem text changed → the old fingerprint resolves, new one alerts."""
+    old_p = "run '01:00' @ 2026-07-28 01:00Z filed NO report"
+    new_p = "run '01:00' @ 2026-07-29 01:00Z filed NO report"
+    state = {index._stable_problem_key(old_p): old_p}
+    result, s3, notify = _handler_with([new_p], state_per_problem=state)
+    assert result["alerted"] is True
+    assert result["new"] == 1
+    assert result["continuing"] == 0
+    assert result["resolved"] == 1
+    text = notify.call_args[0][0]
+    assert "🆕" in text and "2026-07-29" in text
+
+
+def test_handler_problem_reappears_after_resolution_pages_again():
+    """A problem that was seen, aged out, then returns should page again."""
+    p = "Lambda 'x' does NOT EXIST"
+    # First run: pages
+    result1, s3, _notify = _handler_with([p], state_per_problem=None)
+    assert result1["alerted"] is True
+
+    # Problem resolves
+    result2, _s3, _notify2 = _handler_with([], state_per_problem={index._stable_problem_key(p): p})
+    assert result2["clean"] is True
+
+    # Problem returns → should page again (state was cleared)
+    result3, _s3, notify3 = _handler_with([p], state_per_problem=None)
+    assert result3["alerted"] is True
+    assert result3["new"] == 1
+
+
+def test_handler_new_problem_count_capped_at_five():
+    """More than 5 new problems lists 5 then says '...and N more'."""
+    problems = [f"problem #{i}" for i in range(10)]
+    result, s3, notify = _handler_with(problems, state_per_problem=None)
+    assert result["alerted"] is True
+    assert result["new"] == 10
+    text = notify.call_args[0][0]
+    # First 5 with the 🆕 prefix
+    assert text.count("🆕") == 5
+    assert "and 5 more new issue(s)" in text
+
+
+def test_handler_return_includes_diff_counts():
+    """Handler return dict includes new/continuing/resolved breakdown."""
+    p_old = "Lambda 'x' does NOT EXIST"
+    p_new = "rule 'y' is DISABLED"
+    state = {index._stable_problem_key(p_old): p_old}
+    result, _s3, _notify = _handler_with([p_old, p_new], state_per_problem=state)
+    assert result["new"] == 1
+    assert result["continuing"] == 1
+    assert result["resolved"] == 0
+
+
+def test_handler_old_format_state_treated_as_first_run():
+    """Old single-fingerprint format → treated as None (first run)."""
+    s3 = MagicMock()
+    # Old state format: {"fingerprint": "...", "updated_at": "..."}
+    s3.get_object.return_value = {"Body": _Body(json.dumps(
+        {"fingerprint": "abc123", "updated_at": "2026-07-01T00:00:00+00:00"}).encode())}
+    notify = MagicMock(return_value=True)
+    with patch("index._run_checks",
+               return_value=(["rule 'r' does NOT EXIST"], {}, 1, 0)), \
+         patch("index._s3_client", return_value=s3), \
+         patch("index.notify_via_flow_doctor", notify):
+        result = index.handler({}, None)
+    assert result["alerted"] is True
+    assert result["new"] == 1
 
 
 # ── Real-registry integration (the whole point: the shipped registry drives it)
