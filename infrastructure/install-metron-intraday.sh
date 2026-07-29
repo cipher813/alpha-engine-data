@@ -9,6 +9,50 @@ set -euo pipefail
 REPO_DIR="/home/ec2-user/alpha-engine-data"
 UNIT_DIR="${REPO_DIR}/infrastructure/systemd"
 
+# PREFLIGHT: prove the interpreter can actually run the job BEFORE enabling it.
+#
+# This script used to copy units and `systemctl enable --now` without ever
+# checking that the venv named in the unit's ExecStart could import what the
+# collector needs. On 2026-07-29 that produced a timer that fired every five
+# minutes for hours with zero successful runs: the box's venv had boto3 and
+# feedparser (it was built for daily-news) but no yfinance and no pandas, so
+# every fetch helper took its `except ImportError -> return {}` branch and the
+# collector wrote an EMPTY artifact over a good one while reporting success.
+#
+# Enabling a unit is a claim that it works. An installer that makes that claim
+# without testing it moves the failure from install time -- where a human is
+# watching and the fix is obvious -- to run time, where it is a silent
+# background job. Fail here instead, loudly, with the remedy in the message.
+PY="${REPO_DIR}/.venv/bin/python"
+if [ ! -x "$PY" ]; then
+    echo "FATAL: ${PY} does not exist or is not executable." >&2
+    echo "The unit's ExecStart names this interpreter; installing the timer " >&2
+    echo "without it enables a job that cannot start." >&2
+    exit 1
+fi
+if ! "$PY" - <<'PREFLIGHT'
+import importlib.util, sys
+# The collector's HARD dependencies. Absent, it degrades to empty results
+# rather than crashing, which is why their absence has to be caught here.
+required = ("boto3", "pandas", "yfinance")
+missing = [m for m in required if importlib.util.find_spec(m) is None]
+if missing:
+    print("missing modules: " + ", ".join(missing), file=sys.stderr)
+    sys.exit(1)
+PREFLIGHT
+then
+    echo "FATAL: ${PY} cannot import the collector's required modules." >&2
+    echo "" >&2
+    echo "Provision the venv from this repo's requirements.txt before installing" >&2
+    echo "the timer. NOTE that requirements.txt pins numpy>=2.4.6, which needs" >&2
+    echo "Python 3.11+ -- a 3.9 venv cannot satisfy it and must be rebuilt on a" >&2
+    echo "newer interpreter rather than patched with older wheels." >&2
+    echo "" >&2
+    echo "Refusing to enable a timer whose job provably cannot produce output." >&2
+    exit 1
+fi
+echo "preflight ok: $("$PY" -V 2>&1) can import boto3, pandas, yfinance"
+
 cp "${UNIT_DIR}/metron-intraday.service" /etc/systemd/system/metron-intraday.service
 cp "${UNIT_DIR}/metron-intraday.timer" /etc/systemd/system/metron-intraday.timer
 systemctl daemon-reload
