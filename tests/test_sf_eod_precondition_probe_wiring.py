@@ -195,21 +195,27 @@ class TestDegradedTerminalState:
         assert guard == {"Variable": "$.degraded_summary.degraded", "IsPresent": True}
         assert comparison["Variable"] == "$.degraded_summary.degraded"
         assert comparison["BooleanEquals"] is True
-        assert c["Next"] == "DegradedSucceeded"
+        assert c["Next"] == "DegradedRun"
         assert cdo["Default"] == "NormalSucceeded"
 
-    def test_two_distinct_succeed_states_exist(self, states):
+    def test_degraded_run_is_a_fail_state(self, states):
+        """Brian's 2026-07-28 Option-A ruling (alpha-engine-config#2699):
+        the original DegradedSucceeded (Type: Succeed) left every status-keyed
+        watcher seeing green — repeating the 2026-07-15 incident's failure mode.
+        Replaced with Type: Fail so FAILED execution status engages sf-watch,
+        EventBridge, and sf-telegram-notifier with zero new plumbing."""
         assert states["NormalSucceeded"]["Type"] == "Succeed"
-        assert states["DegradedSucceeded"]["Type"] == "Succeed"
-        assert states["NormalSucceeded"] != states["DegradedSucceeded"]
+        assert states["DegradedRun"]["Type"] == "Fail"
+        assert states["DegradedRun"]["Error"] == "DegradedRun"
+        assert "Cause" in states["DegradedRun"]
 
-    def test_a_run_that_never_hits_the_gap_cannot_reach_degraded_succeeded(self, states):
-        # Structural sanity: DegradedSucceeded is reachable ONLY via
+    def test_a_run_that_never_hits_the_gap_cannot_reach_degraded_run(self, states):
+        # Structural sanity: DegradedRun is reachable ONLY via
         # CheckDegradedOutcome, which is reachable ONLY via StopTradingInstance
         # — there is no direct edge from anywhere else in the file.
         producers = [
             name for name, st in states.items()
-            if "DegradedSucceeded" in _targets(st)
+            if "DegradedRun" in _targets(st)
         ]
         assert producers == ["CheckDegradedOutcome"]
 
