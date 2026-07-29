@@ -194,7 +194,7 @@ EOF
   run aws events put-rule \
     --name "${RULE_NAME}" \
     --event-pattern "${EVENT_PATTERN}" \
-    --description "Fleet SF (weekly/preopen/postclose) terminal failure → sf-watch-dispatcher" \
+    --description "Fleet SF (weekly/preopen/postclose) terminal failure -> sf-watch-dispatcher" \
     --region "${REGION}" \
     --query 'RuleArn' --output text
 
