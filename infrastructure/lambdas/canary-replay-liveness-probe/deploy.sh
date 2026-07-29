@@ -161,7 +161,7 @@ if $BOOTSTRAP; then
     --name "${RULE_NAME}" \
     --schedule-expression 'rate(15 minutes)' \
     --state ENABLED \
-    --description "Saturday-replay canary liveness probe tick (config#2246) — self-gates on its own check window + the dispatcher rule's live State." \
+    --description "Saturday-replay canary liveness probe tick (config#2246) - self-gates on its own check window + the dispatcher rule's live State." \
     --region "${REGION}" \
     --query 'RuleArn' --output text
 
