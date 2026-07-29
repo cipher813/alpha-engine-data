@@ -113,39 +113,50 @@ def test_full_input_matches_live_cron_target() -> None:
     assert _dry_run_input("full")["pipeline_role"] == "weekly"
 
 
-def test_shell_input_matches_lambda() -> None:
-    """The ``shell`` builder must reproduce the friday-shell Lambda input."""
-    lam = _LAMBDA.read_text()
-    assert '"shell_run": True' in lam or '"shell_run": true' in lam.lower()
-    assert '"pipeline_role"' in lam and "shell-run" in lam
+def test_shell_builder_still_produces_a_shell_run() -> None:
+    """The ``shell`` builder remains the shell-run producer.
+
+    It used to be pinned against the eod-success Lambda, which sent the same
+    input. That coupling is GONE as of 2026-07-29: the Lambda now starts a FULL
+    weekly run after every post-close (Brian ruling), so it sends neither
+    shell_run nor pipeline_role="shell-run". This script is now the only
+    shell-run producer, so the assertion is on the script alone.
+    """
     obj = _dry_run_input("shell")
     assert obj["shell_run"] is True
     assert obj["pipeline_role"] == "shell-run"
+
+
+def test_eod_lambda_no_longer_starts_shell_runs() -> None:
+    """Guards the divergence above rather than leaving it implicit.
+
+    If the Lambda is reverted to shell_run mode, the daily cadence silently
+    becomes a daily DRY pass -- green executions skipping the very workload
+    stages whose failures the daily cadence exists to surface.
+    """
+    lam = _LAMBDA.read_text()
+    assert '"shell_run": True' not in lam
+    assert '"shell-run"' not in lam
+    assert '"skip_weekly_run_day_gate": True' in lam
+
+
+def test_full_run_does_not_touch_the_retired_saturday_cron(runner_text: str) -> None:
+    """do_full must NOT disable/re-enable alpha-engine-saturday.
+
+    The cron is retired (State: DISABLED in CloudFormation) now that the
+    post-close-SF event trigger starts the weekly every trading day. The old
+    suppress-then-restore dance would RE-ENABLE it as a side effect of an
+    unrelated off-cycle run, silently restoring the double-run this migration
+    removed -- and the SF mutex would not catch it, because the two firings
+    carry different run_dates.
+    """
+    body = _builder_body(runner_text, "do_full")
+    assert "disable-rule" not in body
+    assert "enable-rule" not in body
+    assert "schedule_reenable" not in body
 
 
 def test_full_targets_correct_state_machine(runner_text: str) -> None:
     assert "ne-weekly-freshness-pipeline" in runner_text
 
 
-def test_full_suppresses_then_starts_safely(runner_text: str) -> None:
-    """Fail-loud ordering: schedule re-enable, THEN disable cron, THEN start."""
-    body = _builder_body(runner_text, "do_full")
-    i_schedule = body.index("schedule_reenable")
-    i_disable = body.index("disable-rule")
-    i_start = body.index("start_execution")
-    assert i_schedule < i_disable < i_start, (
-        "do_full must schedule the auto re-enable before disabling the cron, "
-        "and disable the cron before starting the execution"
-    )
-
-
-def test_reenable_role_scoped_to_saturday_rule(runner_text: str) -> None:
-    """The scheduler role grants events:EnableRule on the Saturday rule ONLY."""
-    assert "events:EnableRule" in runner_text
-    assert "scheduler.amazonaws.com" in runner_text
-    # The inline policy Resource is the single Saturday rule ARN.
-    assert "rule/${SATURDAY_RULE}" in runner_text or "SATURDAY_RULE_ARN" in runner_text
-
-
-def test_reenable_schedule_self_deletes(runner_text: str) -> None:
-    assert "--action-after-completion DELETE" in runner_text

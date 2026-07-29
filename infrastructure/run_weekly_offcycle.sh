@@ -251,30 +251,27 @@ do_shell() {
 
 do_full() {
   echo "== OFF-CYCLE FULL WEEKLY RUN =="
-  local sat_date
-  sat_date=$(next_saturday_utc)
-  echo "Upcoming Saturday cron fire to SUPPRESS: ${sat_date} 09:00 UTC"
-  echo "Auto re-enable scheduled for:           ${sat_date} 09:30 UTC"
+  # Saturday-cron suppression REMOVED 2026-07-29 (Brian ruling). The
+  # alpha-engine-saturday cron is retired -- the weekly pipeline is now started
+  # by the post-close-SF event trigger on every trading day, and the cron is
+  # State: DISABLED in CloudFormation.
+  #
+  # This block used to: schedule a re-enable, disable the cron, run, then
+  # re-enable. Left in place it would RE-ENABLE A RETIRED CRON as a side effect
+  # of an unrelated off-cycle run -- silently restoring the double-run this
+  # migration removed (post-close starts a full weekly Friday evening, cron
+  # starts a second one Saturday 09:00 against the same data, and the mutex
+  # does not collapse them because the run_dates differ).
+  #
+  # There is nothing left to suppress: an off-cycle run and the event-driven
+  # trigger are deduped by the SF's own mutex
+  # ({state-machine}#{pipeline_role}#{run_date}).
+  echo "Saturday cron is retired — nothing to suppress."
   echo ""
-  echo "[1/3] ensure re-enable infra + schedule (BEFORE disabling cron)"
-  ensure_reenable_role
-  schedule_reenable "${sat_date}"
-  echo ""
-  echo "[2/3] disable Saturday cron"
-  run aws events disable-rule --name "${SATURDAY_RULE}" --region "${REGION}"
-  if ! $DRY_RUN; then
-    local st
-    st=$(rule_state)
-    [[ "$st" == "DISABLED" ]] \
-      || { echo "ERROR: ${SATURDAY_RULE} state is '${st}', expected DISABLED — aborting BEFORE starting run" >&2; exit 1; }
-    echo "  ✓ ${SATURDAY_RULE} is DISABLED"
-  fi
-  echo ""
-  echo "[3/3] start full weekly execution"
+  echo "[1/1] start full weekly execution"
   start_execution "offcycle-full-$(utc_stamp)" "$(full_input)"
   echo ""
-  echo "Done. Saturday cron will auto re-enable at ${sat_date} 09:30 UTC."
-  echo "To restore manually at any time: bash $0 restore"
+  echo "Done."
 }
 
 do_restore() {
