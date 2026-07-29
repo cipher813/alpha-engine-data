@@ -545,7 +545,12 @@ def _rw_fetch_run_artifacts(spec: dict, s3, now: datetime) -> list[tuple[datetim
                     continue
                 body = s3.get_object(Bucket=WATCH_BUCKET, Key=key)["Body"].read()
                 art = json.loads(body)
-                run_start = art.get("run_start")
+                # Accept either run_start (groom format) or started_at (drain
+                # ledger format). The drain ledger uses started_at because the
+                # charter agent writes it at completion, not at boot time, so
+                # "started_at" is the semantically correct name. Both parse the
+                # same way down the pipeline.
+                run_start = art.get("run_start") or art.get("started_at")
                 if not run_start:
                     continue
                 found.append(
@@ -564,6 +569,27 @@ def _rw_missed(spec: dict, triggers: list[dict], stamps: list[datetime]) -> list
     return [trig for trig in triggers if not any(trig["at"] <= s <= trig["at"] + window for s in stamps)]
 
 
+def _rw_resolve_field(field: str, art: dict):
+    """Resolve a dot-separated field path through a nested artifact dict.
+
+    ``"ingested.queue"`` resolves to ``art["ingested"]["queue"]``. A field
+    without dots behaves identically to ``art.get(field)``. If the resolved
+    value is a list (e.g. ``incidents``), its length is returned so the
+    numeric operators work without the caller knowing the schema — a
+    ``productive_when`` clause can say ``{field: "incidents", eq: 0}`` and
+    it evaluates against the number of incidents, not the list itself.
+    """
+    value = art
+    for part in field.split("."):
+        if isinstance(value, dict):
+            value = value.get(part)
+        else:
+            return None
+    if isinstance(value, list):
+        return len(value)
+    return value
+
+
 def _rw_clause_holds(clause: dict, art: dict) -> bool:
     """Evaluate ONE declarative ``productive_when`` clause against an artifact.
 
@@ -571,8 +597,11 @@ def _rw_clause_holds(clause: dict, art: dict) -> bool:
     unknown operator RAISES — a registry that outran the evaluator is a
     packaging bug, and silently treating the clause as unsatisfied would make
     every run look dead (or, worse, alive) for the wrong reason.
+
+    Fields support dot-notation for nested dict access (e.g. ``ingested.queue``)
+    and list values are auto-resolved to their length.
     """
-    value = art.get(clause["field"])
+    value = _rw_resolve_field(clause["field"], art)
     for op, expected in clause.items():
         if op == "field":
             continue
