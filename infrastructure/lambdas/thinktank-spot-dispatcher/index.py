@@ -195,7 +195,11 @@ def _already_running() -> list[str]:
     rather than returning a clean empty list, and the caller below chooses
     coverage over dedupe explicitly and records the choice.
     """
-    return spot_dispatch.running_instance_ids(tag_name=INSTANCE_TAG_NAME, region=REGION)
+    # discriminator_tags is REQUIRED positional. Empty is correct here: this
+    # dispatcher has exactly one lane (one daily run), so the Name tag alone
+    # identifies a duplicate — same shape as alert-drain-dispatcher. Lanes
+    # that DO partition (groom tiers, arctic migrations) pass a discriminator.
+    return spot_dispatch.running_instance_ids(INSTANCE_TAG_NAME, {}, region=REGION)
 
 
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
