@@ -57,8 +57,8 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install test dependencies (deploy.sh runs pytest)
-        run: python3 -m pip install pytest
+      - name: Install test dependencies (deploy.sh runs pytest; handler imports boto3)
+        run: python3 -m pip install pytest boto3
 
       - name: Deploy overseer-backstop-responder (code-only — no --bootstrap)
         working-directory: alpha-engine-data
