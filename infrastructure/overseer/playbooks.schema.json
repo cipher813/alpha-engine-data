@@ -37,6 +37,28 @@
           "charter": { "type": "string" },
           "concurrency_domain": { "type": "string" },
           "supports_drill": { "type": "boolean" },
+          "on_concurrent": {
+            "enum": ["defer", "skip"],
+            "description": "config-#5286 — what the dispatcher does when a concurrency collision is detected. 'defer' schedules a delayed re-invoke (sf-watch defer-not-drop pattern); 'skip' returns concurrent_skip immediately (ci-watch, alert-drain pattern). Must match the executor's actual behavior; the registry test pins this to the executor's literals."
+          },
+          "attempt_ceiling": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "config-#5286 — maximum number of dispatch attempts before the executor stops retrying. For 'defer' semantics, this is the defer generation cap (sf-watch: 3). For 'skip' semantics, this is 1 — skip on first collision with no retry. The overseer-dispatcher injects this into the executor payload; the executor's own hardcoded default is the fallback for non-router invocation paths."
+          },
+          "lease_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "config-#5286 — duration in seconds for the concurrency lock lease. For tag-based instance locks (the fleet's standard pattern), this is the TTL before the lock is considered stale. Optional — absent means the lock is instance-lifetime-based (exists until the EC2 instance terminates)."
+          },
+          "drill_isolation": {
+            "type": "boolean",
+            "description": "config-#5286 — whether drill runs are structurally isolated from real dispatch collisions. When true, a drill's effective dispatch key never collides with a real dispatch key (e.g. a 'drill-' prefix on run_date). When false or absent, drills share the same concurrency domain as real dispatches."
+          },
+          "custom_executor": {
+            "type": "boolean",
+            "description": "config-#5286 — escape hatch for playbooks whose dispatch logic is genuinely bespoke and cannot be expressed through registry semantics. When true, the overseer-dispatcher skips injecting dispatch-semantics fields (the executor manages its own concurrency/attempts/lease/drill behavior entirely). Default: false when absent. Groom is the canonical permanent holdout (its pace/demand/tier logic predates and cannot be expressed through the instance-level dispatch primitives)."
+          },
           "kill_switch_env": { "type": "string", "pattern": "^[A-Z0-9_]+$" },
           "model": {
             "type": "string",
@@ -326,6 +348,22 @@
             "ceiling_min": { "type": "integer", "minimum": 1 },
             "margin_min": { "type": "integer", "minimum": 0 },
             "lookback_hours": { "type": "integer", "minimum": 1 },
+            "productive_when": {
+              "description": "OPTIONAL. An OR of clauses over the run artifact's own fields; an in-window artifact matching NONE of them is reported as a DEAD run (a box that booted and wrote an artifact while doing no work) — distinct from a MISSING artifact. Omit to keep existence-only semantics. Each clause is {field, <op>} with op in gt|ge|lt|le|eq; an operator outside that set RAISES in _rw_clause_holds rather than silently leaving the clause unsatisfied.",
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["field"],
+                "minProperties": 2,
+                "maxProperties": 2,
+                "properties": {
+                  "field": { "type": "string", "minLength": 1 },
+                  "gt": {}, "ge": {}, "lt": {}, "le": {}, "eq": {}
+                }
+              }
+            },
             "schedule": {
               "type": "array",
               "minItems": 1,

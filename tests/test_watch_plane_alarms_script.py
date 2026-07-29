@@ -56,7 +56,7 @@ def test_bash_syntax_is_valid():
 
 
 class TestWatchPlaneCoverage:
-    """All eleven watch-plane Lambdas must be alarmed."""
+    """All sixteen watch-plane Lambdas must be alarmed."""
 
     @pytest.mark.parametrize(
         "fn_name",
@@ -80,6 +80,13 @@ class TestWatchPlaneCoverage:
             # (the same "new Lambda, forgot to onboard it" miss, twice).
             "alpha-engine-alert-drain-dispatcher",
             "alpha-engine-substrate-health-gate",
+            # Added config#3240: found during the same I2900 onboarding sweep,
+            # scoped out of that issue to avoid silent scope creep.
+            "alpha-engine-pipeline-watchdog",
+            "alpha-engine-canary-replay-liveness-probe",
+            "alpha-engine-saturday-integrity-sentinel",
+            "alpha-engine-freshness-monitor",
+            "alpha-engine-sweep-artifact-monitor",
             # Added alpha-engine-config-I3242: the merge-triggered in-region
             # ArcticDB migration runner — onboarded in the SAME PR that ships it,
             # per this file's own header convention.
@@ -98,7 +105,7 @@ class TestWatchPlaneCoverage:
                 ")", script_text.find("declare -A WATCH_PLANE_FUNCTIONS=(")
             )
         ]
-        assert block.count('"alpha-engine-') == 11
+        assert block.count('"alpha-engine-') == 16
 
     def test_both_errors_and_throttles_alarmed(self, script_text):
         assert "for metric in Errors Throttles" in script_text
