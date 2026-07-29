@@ -93,7 +93,6 @@ class _FakeWaiter:
 class _FakeEc2:
     def __init__(self, running_tier_instances=None):
         self.terminated = []
-        self.tags_created = []
         # config#1979: (issue_filter -> [instance_ids]) already "live" for the
         # concurrent-tier guard's describe_instances check to find.
         self._running_tier_instances = dict(running_tier_instances or {})
@@ -104,10 +103,6 @@ class _FakeEc2:
     def terminate_instances(self, InstanceIds):  # noqa: N803 — boto3 kwarg name
         self.terminated.extend(InstanceIds)
         return {"TerminatingInstances": [{"InstanceId": i} for i in InstanceIds]}
-
-    def create_tags(self, Resources, Tags):  # noqa: N803 — boto3 kwarg names
-        self.tags_created.append((Resources, Tags))
-        return {}
 
     def describe_instances(self, Filters):  # noqa: N803 — boto3 kwarg name
         by_name = {f["Name"]: f["Values"] for f in Filters}
@@ -631,14 +626,20 @@ def test_different_tier_running_does_not_block_launch(monkeypatch):
 
 
 def test_launched_instance_gets_tagged_with_its_tier(monkeypatch):
+    extra_tags_captured = {}
+
+    def _launch(types_, subnets, **kw):
+        extra_tags_captured["value"] = kw.get("extra_tags")
+        return "i-new"
+
     idx = _load(
-        monkeypatch, launch_impl=lambda types_, subnets, **kw: "i-new",  # noqa: E731
+        monkeypatch, launch_impl=_launch,  # noqa: E731
         env={"GROOM_DISPATCH_ENABLED": "true"},
     )
     idx.handler({"run_mode": "full", "issue_filter": "high-only", "schedule": "x"}, None)
-    assert idx._test_ec2.tags_created == [
-        (["i-new"], [{"Key": "groom-issue-filter", "Value": "high-only"}])
-    ]
+    # config#5303: the groom-issue-filter tag now rides the RunInstances call
+    # as extra_tags (atomic with launch), not a separate post-launch create_tags.
+    assert extra_tags_captured["value"] == {"groom-issue-filter": "high-only"}
 
 
 def test_concurrent_tier_check_fails_safe_and_still_launches(monkeypatch):
@@ -1001,13 +1002,20 @@ def test_sweep_box_tagged_with_distinct_sweep_lane(monkeypatch):
     # with its (inert) issue_filter verbatim would collide with the mid-only
     # GROOM box's tag. Sweep boxes get the distinct 'sweep' tag value instead;
     # the event's issue_filter still passes the lib filter validation.
-    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    extra_tags_captured = {}
+
+    def _launch(types_, subnets, **kw):
+        extra_tags_captured["value"] = kw.get("extra_tags")
+        return "i-stub"
+
+    idx = _load(
+        monkeypatch, launch_impl=_launch, env={"GROOM_DISPATCH_ENABLED": "true"},
+    )
     out = idx.handler(dict(_SWEEP_SF_EVENT), None)
     assert out["groom"]["tier_tag"] == "sweep"
     assert out["groom"]["issue_filter"] == "mid-only"
-    assert idx._test_ec2.tags_created == [
-        (["i-stub"], [{"Key": "groom-issue-filter", "Value": "sweep"}])
-    ]
+    # config#5303: sweep lane tag rides the RunInstances call as extra_tags.
+    assert extra_tags_captured["value"] == {"groom-issue-filter": "sweep"}
 
 
 def test_sweep_launch_skipped_when_sweep_box_already_live(monkeypatch):
