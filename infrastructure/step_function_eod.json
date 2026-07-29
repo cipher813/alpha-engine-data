@@ -1702,6 +1702,61 @@
         }
       ],
       "ResultPath": "$.stop_result",
+      "Next": "LaunchWeeklyExerciseRun"
+    },
+    "LaunchWeeklyExerciseRun": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I5489 (Brian ruling 2026-07-29): kick the FULL weekly pipeline after every trading day's postclose, so its components get 5 iteration cycles a week instead of 1. Measured justification: over the last 60 weekly executions only 11 reached a successful terminal state (41 FAILED, 5 ABORTED) — iteration rate, not compute cost, is what is blocking that pipeline from working. | WHY CHAINED HERE rather than a cron: postclose is triggered by daemon shutdown, which only happens on an actual trading day, so chaining inherits 'every trading day' for free with no NYSE-calendar logic to get wrong — and by this point PostMarketData + EODReconcile have settled the day's data, which is exactly what the weekly pipeline's data stages want. | pipeline_role='exercise' (NOT 'weekly') is load-bearing: step_function.json's CheckWeeklyRunDayGate applies the run-day gate ONLY when pipeline_role=='weekly', so a non-weekly role bypasses it automatically. No gate change was needed. Saturday's own cron (rule alpha-engine-saturday, pipeline_role='weekly') is untouched. | FIRE-AND-FORGET on purpose: states:startExecution WITHOUT .sync, so postclose does not wait on a ~4h pipeline and a weekly-SF failure can never fail the postclose execution or leave the trading box running.",
+      "Resource": "arn:aws:states:::states:startExecution",
+      "Parameters": {
+        "StateMachineArn": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
+        "Input": {
+          "sns_topic_arn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+          "pipeline_role": "exercise",
+          "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "WeeklyExerciseLaunchFailed",
+          "ResultPath": "$.weekly_exercise_launch_error"
+        }
+      ],
+      "ResultPath": "$.weekly_exercise_run",
+      "Next": "CheckDegradedOutcome"
+    },
+    "WeeklyExerciseLaunchFailed": {
+      "Type": "Task",
+      "Comment": "The exercise run failed to LAUNCH. Alert loudly, then continue to the normal terminal — postclose's own deliverable is complete by this point and must not be failed by a downstream pipeline's launch. This is the honest-degradation route required by weekly-sf-policy.md §2.3: a silent non-launch is indistinguishable from a day nobody looked at, which is the fleet's most-recorded bug class. The most likely cause is the states:StartExecution grant on alpha-engine-step-functions-role not yet covering ne-weekly-freshness-pipeline (alpha-engine-config-I5490) — until that lands, this state is the expected path and its alert is the signal.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine — weekly EXERCISE run failed to launch",
+        "Message.$": "States.Format('postclose completed but could not start the weekly exercise run. The weekly pipeline will NOT be exercised today. Error: {}', States.JsonToString($.weekly_exercise_launch_error))"
+      },
+      "ResultPath": "$.weekly_exercise_launch_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CheckDegradedOutcome",
+          "ResultPath": "$.weekly_exercise_launch_notify_error"
+        }
+      ],
       "Next": "CheckDegradedOutcome"
     },
     "CheckDegradedOutcome": {

@@ -180,8 +180,17 @@ class TestDegradedTerminalState:
         assert sdf["ResultPath"] == "$.degraded_summary"
 
     def test_stop_trading_instance_leads_to_the_degraded_check(self, states):
+        """config-I5489 inserted the weekly-exercise launch between the cost
+        guard and the degraded check, so this is now a two-hop path. What the
+        test actually protects is unchanged: StopTradingInstance is not a
+        terminal, and the degraded check is still what decides the terminal —
+        the inserted state must not swallow or bypass it.
+        """
         assert "End" not in states["StopTradingInstance"]
-        assert states["StopTradingInstance"]["Next"] == "CheckDegradedOutcome"
+        assert states["StopTradingInstance"]["Next"] == "LaunchWeeklyExerciseRun"
+        # both the success and launch-failure routes converge on the check
+        assert states["LaunchWeeklyExerciseRun"]["Next"] == "CheckDegradedOutcome"
+        assert states["WeeklyExerciseLaunchFailed"]["Next"] == "CheckDegradedOutcome"
 
     def test_degraded_outcome_routes_on_the_flag(self, states):
         # config-I2767 (2026-07-16 incident): the flag is only assigned on
