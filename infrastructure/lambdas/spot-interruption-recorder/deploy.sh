@@ -73,8 +73,10 @@ print('index.py syntax OK')
 # ----- 0b. Preflight handler unit tests --------------------------------------
 
 if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  echo "Installing pytest into ${TEST_DEPS}..."
-  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest
+  echo "Installing test deps into ${TEST_DEPS}..."
+  # boto3 (and its botocore dependency) are needed because the handler
+  # imports botocore.config.Config at module level (fa7979c sibling fix).
+  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest boto3
   echo "Running handler unit tests..."
   PYTHONPATH="${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
 fi
