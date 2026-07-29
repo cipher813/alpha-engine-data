@@ -535,13 +535,21 @@ export GROOM_RUN_TOKEN={run_token}
 """
 
 
-def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
+def _launch_instance(force_on_demand: bool = False,
+                      lane_index: int = 0) -> tuple[str, str]:
     """Launch the groom box; spot first, on-demand fallback on capacity exhaustion
     OR when force_on_demand (config#1645: the dispatch SF's last bounded relaunch
     attempt after repeated mid-run spot interruption — skip straight to on-demand
-    rather than trying the same flaky spot market a third time)."""
+    rather than trying the same flaky spot market a third time).
+
+    ``lane_index`` (config#4989): offsets the **initial** rotation position of
+    INSTANCE_TYPES and SUBNETS so co-launched lanes probe different pools on
+    their first try. A single lane (index 0) uses the declared order unchanged.
+    """
+    types = _lane_rotated(INSTANCE_TYPES, lane_index)
+    subnets = _lane_rotated(SUBNETS, lane_index)
     return spot_dispatch.launch_with_fallback(
-        INSTANCE_TYPES, SUBNETS,
+        types, subnets,
         image_id=AMI_ID,
         key_name=KEY_NAME,
         security_group_ids=[SECURITY_GROUP],
@@ -579,6 +587,50 @@ def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, i
         # command at the 3600s default, guillotining a multi-hour groom.
         execution_timeout_seconds=MAX_RUNTIME_SECONDS,
     )
+
+
+# ── Anti-affinity for co-launched lanes (alpha-engine-config#4989) ────────────
+# The demand-all path launches up to 3 lanes (low/mid/high) within the same
+# Lambda invocation. Without anti-affinity, all three launch into the SAME
+# EC2 spot pool (same instance type × same subnet/AZ). A single-pool capacity
+# event then reclaims all three boxes within seconds — losing the whole cycle.
+#
+# Strategy: rotate the INSTANCE_TYPES and SUBNETS lists per lane_index so each
+# co-launched lane starts the rotation at a different point in the matrix.
+# Even with only one instance family (Graviton), different subnets → different
+# AZs → different spot pools. When additional instance families are added
+# (multi-arch AMI support), the first-choice instance type also differs per lane.
+#
+# This is a HIGH-LEVEL permutation, not a replacement for ec2_spot.launch()'s
+# own rotation (which re-orders on capacity error at launch time). krepis's
+# rotation is a reactive retry mechanism; this is a proactive separation of
+# initial attempts. Both compose: even with per-lane offset, each lane still
+# gets the full fallback set (the other pools) if its first choice fails.
+#
+# Future work (not shipped here):
+#   - GROOM_INSTANCE_TYPES should span ≥2 instance families AND both
+#     architectures (Graviton + x86) once the groom AMI is confirmed
+#     arch-agnostic (alpha-engine-config#4989 deliverable 2)
+#   - Reclaim-aware relaunch: a lane reclaimed within N minutes should
+#     relaunch into a DIFFERENT pool (deliverable 3)
+#   - Consider capacity-optimized allocation strategy / create-fleet
+#     instead of one-off RequestSpotInstances (deliverable 4)
+
+
+def _lane_rotated(items: list[str], lane_index: int) -> list[str]:
+    """Rotate *items* so lane *lane_index* has a different first element.
+
+    Example: ``_lane_rotated(["t4g.medium", "t4g.large"], 1)`` →
+    ``["t4g.large", "t4g.medium"]``.
+    A lane with ``lane_index=0`` returns the list unchanged, so existing
+    single-lane callers are byte-identical.
+    """
+    if not items or lane_index <= 0:
+        return list(items)
+    offset = lane_index % len(items)
+    if offset == 0:
+        return list(items)
+    return list(items[offset:]) + list(items[:offset])
 
 
 GROOM_TIER_TAG_KEY = "groom-issue-filter"
@@ -967,7 +1019,8 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
                        force_on_demand: bool = False,
                        queue_manifest_key: str = "",
                        backend: str = "",
-                       task_token: str = "") -> dict:
+                       task_token: str = "",
+                       lane_index: int = 0) -> dict:
     """Launch + bootstrap the groom box. Fail-loud — any error RAISES.
 
     ``backend`` (quota-fallback 3-repo feature, default ``""`` = unchanged
@@ -1026,7 +1079,7 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
     # sf-watch watch-log timing) so a launch that itself fails/raises still
     # consumes ceiling budget — see _write_dispatch_ledger_entry.
     _write_dispatch_ledger_entry(run_token, tier_tag, schedule_label)
-    instance_id, market = _launch_instance(force_on_demand=force_on_demand)
+    instance_id, market = _launch_instance(force_on_demand=force_on_demand, lane_index=lane_index)
     logger.info("launched groom box %s (%s)", instance_id, market)
     # config#1979: tag the box with its lane (tier, or 'sweep' — config#2201)
     # so the NEXT trigger's guard check (above) can find it. Best-effort — a
@@ -1838,12 +1891,15 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         # the SF Map's wholesale States.JsonMerge (see module docstring) —
         # validated against the fixed vocabulary before use, fail-loud on
         # anything unrecognized.
+        # config#4989: anti-affinity lane index is threaded from the
+        # decide_only entry through the same JsonMerge path.
         result = _launch_groom_spot(
             run_mode, schedule_label, model, issue_filter, soft_limit_min, pr_budget,
             force_on_demand,
             queue_manifest_key=queue_manifest_key,
             backend=_resolve_launch_decided_backend(event),
             task_token=_task_token(event),
+            lane_index=event.get("lane_index", 0),
         )
         # demand-all path did (_write_trigger_record/_write_skip_record),
         # leaving sweep-mode (and any other launch_decided) dispatches with
@@ -1927,6 +1983,9 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                     entry["pr_budget"] = pr_budget
                 if backend:
                     entry["backend"] = backend
+                # config#4989: per-lane anti-affinity index for spot pool
+                # diversification across co-launched lanes.
+                entry["lane_index"] = len(entries)
                 entries.append(entry)
             _write_trigger_record(schedule_label, decisions_record, counts)
             if event.get("decide_only"):
@@ -1945,6 +2004,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                     run_mode, schedule_label, e["model"], e["issue_filter"], soft_limit_min,
                     e.get("pr_budget"), force_on_demand,
                     backend=e.get("backend", ""),
+                    lane_index=e.get("lane_index", 0),
                 )
                 for e in entries
             ]
