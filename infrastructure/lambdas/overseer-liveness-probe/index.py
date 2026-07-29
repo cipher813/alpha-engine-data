@@ -37,6 +37,12 @@ Check types (discriminated union on ``type`` — contract in playbooks.schema.js
   * ``scheduler_schedule_exists`` — EventBridge Scheduler schedule (a distinct
                                 resource type from ``eventbridge_rule``) exists
                                 and is ENABLED (alpha-engine-config-I2906).
+  * ``alarm_coverage``         — per registry-declared alarm spec, a live
+                                CloudWatch alarm matching the name pattern
+                                exists, is not indefinitely stuck in
+                                INSUFFICIENT_DATA, and its alarm actions include
+                                the expected backstop topic pattern
+                                (alpha-engine-config-I4482).
   * ``sf_watch_invocation_success`` — per mature real terminal-failure
                                 execution of a watched pipeline (read from the
                                 SFs' own execution history), the day's
@@ -189,6 +195,11 @@ def _cloudwatch_client():
 
 def _scheduler_client():
     return boto3.client("scheduler", region_name=REGION)
+
+
+def _cw_client():
+    """CloudWatch client for alarm coverage checks (alpha-engine-config-I4482)."""
+    return boto3.client("cloudwatch", region_name=REGION)
 
 
 def _on_bus(bus: str | None) -> str:
@@ -593,6 +604,83 @@ def _check_scheduler_schedule_exists(spec: dict, now: datetime) -> tuple[list[st
         problems.append(
             f"EventBridge Scheduler schedule '{name}' is {sched.get('State')}, not ENABLED"
         )
+    return problems, {}
+
+
+# ── Check: alarm_coverage (alpha-engine-config-I4482) ─────────────────────────
+
+
+def _check_alarm_coverage(spec: dict, now: datetime) -> tuple[list[str], dict]:
+    """For each registry-declared alarm spec, assert a live CloudWatch alarm
+    exists matching a declared name pattern, is not indefinitely stuck in
+    INSUFFICIENT_DATA, and its alarm actions include the expected target.
+
+    A completely missing alarm (describe_alarms returns zero matches for the
+    pattern) is a FINDING. An alarm that has been INSUFFICIENT_DATA for longer
+    than ``max_insufficient_data_hours`` (default 168 = 7 days) is a finding:
+    a sensor that neither fires nor clears is indistinguishable from a dead
+    one. An alarm whose AlarmActions don't include the expected action ARN
+    pattern is a finding (the backstop topic must be wired).
+
+    Fail-loud on unexpected API errors, in line with the fail-loud policy
+    (only the specific 'no alarms matched' case is a finding; everything
+    else RAISES)."""
+    problems: list[str] = []
+    cw = _cw_client()
+    for alarm_spec in spec["alarms"]:
+        name_pattern = alarm_spec["name_pattern"]
+        max_idh = alarm_spec.get("max_insufficient_data_hours", 168)
+        expected_action = alarm_spec["alarm_action_pattern"]
+        expect_state = alarm_spec.get("expect_state", "ALARM")
+
+        try:
+            resp = cw.describe_alarms(
+                AlarmNamePrefix=name_pattern,
+                MaxRecords=50,
+            )
+        except Exception as exc:  # noqa: BLE001 — inspect code below; re-raise if unexpected
+            raise  # fail-loud on any API error — an unreachable CloudWatch is a probe crash
+
+        alarms = resp.get("MetricAlarms", []) + resp.get("CompositeAlarms", [])
+        if not alarms:
+            problems.append(
+                f"alarm_coverage: NO alarms match pattern '{name_pattern}' — "
+                "expected at least one live alarm; the watch plane may be unwired"
+            )
+            continue
+
+        for alarm in alarms:
+            alarm_name = alarm.get("AlarmName", "unknown")
+            state = alarm.get("StateValue", "unknown")
+
+            # An indefinitely INSUFFICIENT_DATA alarm never fires AND never
+            # clears — it is indistinguishable from a disconnected sensor.
+            if state == "INSUFFICIENT_DATA":
+                transition = alarm.get("StateTransitionedTimestamp")
+                if transition is not None:
+                    id_hours = (now - transition).total_seconds() / 3600
+                else:
+                    id_hours = None
+                # If state_reason is "Unchecked: Initial", the alarm was
+                # recently created and hasn't had time to evaluate — not a
+                # finding yet.
+                state_reason = alarm.get("StateReason", "")
+                if id_hours is not None and id_hours > max_idh and "Initial" not in state_reason:
+                    problems.append(
+                        f"alarm_coverage: '{alarm_name}' has been INSUFFICIENT_DATA for "
+                        f"{id_hours:.0f}h (> {max_idh}h threshold) — a sensor that neither "
+                        "fires nor clears is indistinguishable from a dead one"
+                    )
+
+            # Check the alarm action includes the expected target.
+            alarm_actions = alarm.get("AlarmActions", [])
+            if not any(expected_action in str(a) for a in alarm_actions):
+                problems.append(
+                    f"alarm_coverage: '{alarm_name}' alarm actions {alarm_actions} "
+                    f"do not include expected pattern '{expected_action}' — the "
+                    "backstop notification topic may not be wired"
+                )
+
     return problems, {}
 
 
@@ -1484,6 +1572,7 @@ CHECKERS = {
     "sf_watch_invocation_success": _check_sf_watch_invocation_success,
     "dispatch_invocation_success": _check_dispatch_invocation_success,
     "agent_dispatch_completeness": _check_agent_dispatch_completeness,
+    "alarm_coverage": _check_alarm_coverage,
 }
 
 
@@ -1529,7 +1618,7 @@ def _run_checks(now: datetime) -> tuple[list[dict], dict[str, str], int, int]:
     check's coverage to one check's failure is not, because a probe's whole
     job is to report N independent findings.
 
-    Returns (findings, kill_switches, checks_run, checks_failed)."""
+    Returns (findings, kill_switches, checks_run, checks_failed, reconciliation)."""
     registry = _registry()
     findings: list[dict] = []
     kill_switches: dict[str, str] = {}
@@ -1574,7 +1663,8 @@ def _run_checks(now: datetime) -> tuple[list[dict], dict[str, str], int, int]:
             "the watch plane is unobserved, not healthy. Check the probe role's "
             "IAM against infrastructure/lambdas/overseer-liveness-probe/iam-policy.json.",
         ))
-    return findings, kill_switches, checks_run, checks_failed
+    reconciliation = _compute_reconciliation(registry)
+    return findings, kill_switches, checks_run, checks_failed, reconciliation
 
 
 # ── Dedup + alert (per-problem signature, alpha-engine-config-I5207) ─────────
@@ -1822,6 +1912,41 @@ def _alert(
         return False
 
 
+def _compute_reconciliation(registry: dict) -> dict:
+    """Registry-vs-live reconciliation summary (alpha-engine-config-I4482 item 3).
+
+    Returns declared counts for the handler's return payload:
+      - playbooks_declared:  playbooks with a ``liveness.checks`` block
+      - schedule_checks_declared: total ``scheduler_schedule_exists`` check specs
+      - alarm_coverage_declared: total ``alarm_coverage`` check specs
+    """
+    playbooks = registry.get("playbooks") or {}
+    n_playbooks = sum(
+        1 for pb in playbooks.values()
+        if isinstance(pb.get("liveness"), dict) and pb["liveness"].get("checks")
+    )
+    n_schedule = 0
+    n_alarm = 0
+    for pb in playbooks.values():
+        for spec in (pb.get("liveness") or {}).get("checks") or []:
+            if spec.get("type") == "scheduler_schedule_exists":
+                n_schedule += 1
+            elif spec.get("type") == "alarm_coverage":
+                n_alarm += 1
+    # Also count watch_plane_liveness (top-level, cross-cutting checks).
+    wpl = (registry.get("watch_plane_liveness") or {}).get("checks") or []
+    for spec in wpl:
+        if spec.get("type") == "scheduler_schedule_exists":
+            n_schedule += 1
+        elif spec.get("type") == "alarm_coverage":
+            n_alarm += 1
+    return {
+        "playbooks_declared": n_playbooks,
+        "schedule_checks_declared": n_schedule,
+        "alarm_coverage_declared": n_alarm,
+    }
+
+
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """Scheduled (EventBridge) entrypoint. Iterates the playbook registry,
     runs every declared liveness check read-only, dedups PER PROBLEM
@@ -1841,7 +1966,12 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     the per-problem dedup means a single new check failure does not re-page
     every other standing check's problem."""
     now = datetime.now(timezone.utc)
-    findings, kill_switches, checks_run, checks_failed = _run_checks(now)
+    # main renamed `problems` -> structured `findings`; this branch added the
+    # 5th return value. The branch's `_problem_fingerprint(problems)` line is
+    # dropped: that helper no longer exists on main — the per-problem dedup
+    # (I5207) replaced the single whole-payload fingerprint, so keeping it
+    # would NameError on the first invocation.
+    findings, kill_switches, checks_run, checks_failed, reconciliation = _run_checks(now)
 
     # Always surfaced (record + log), never alerted: a deliberate operator
     # disable is state, not an incident.
@@ -1888,6 +2018,14 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         if previous_state is not None:
             _save_alerted_state(s3, None)  # clear dedup state now that it's healthy again
 
+    logger.info(
+        "overseer liveness: reconciliation — %d playbooks, %d schedule checks, "
+        "%d alarm coverage checks",
+        reconciliation["playbooks_declared"],
+        reconciliation["schedule_checks_declared"],
+        reconciliation["alarm_coverage_declared"],
+    )
+
     return {
         # `problems` stays the full prose list — the payload is a record, not a
         # page, and nothing that reads it benefits from the shortening.
@@ -1905,4 +2043,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         # payload alone, without reading logs.
         "checks_run": checks_run,
         "checks_failed": checks_failed,
+        # I4482: registry-vs-live reconciliation — how many playbooks and
+        # check types are declared. Lets the reader distinguish "100% clean on
+        # 3 checks" from "100% clean on 50 checks" without reading the registry.
+        "reconciliation": reconciliation,
     }

@@ -674,6 +674,92 @@ def test_scheduler_schedule_unexpected_error_raises():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# alarm_coverage (alpha-engine-config-I4482)
+# ══════════════════════════════════════════════════════════════════════════
+
+_ALARM_SPEC = {
+    "type": "alarm_coverage",
+    "alarms": [
+        {"name_pattern": "alpha-engine-watch-plane-overseer-dispatcher",
+         "alarm_action_pattern": "alpha-engine-alarm-backstop",
+         "max_insufficient_data_hours": 168},
+    ],
+}
+
+_ALARM_MATCHING = {
+    "AlarmName": "alpha-engine-watch-plane-overseer-dispatcher-errors",
+    "StateValue": "ALARM",
+    "AlarmActions": ["arn:aws:sns:us-east-1:123456789012:alpha-engine-alarm-backstop"],
+    "StateTransitionedTimestamp": NOW - timedelta(hours=2),
+}
+
+
+def test_alarm_coverage_clean():
+    cw = MagicMock()
+    cw.describe_alarms.return_value = {
+        "MetricAlarms": [_ALARM_MATCHING],
+        "CompositeAlarms": [],
+    }
+    with patch("index.boto3.client", side_effect=_client_factory(cloudwatch=cw)):
+        problems, _ = index._check_alarm_coverage(_ALARM_SPEC, NOW)
+    assert problems == []
+
+
+def test_alarm_coverage_no_alarms_found():
+    cw = MagicMock()
+    cw.describe_alarms.return_value = {"MetricAlarms": [], "CompositeAlarms": []}
+    with patch("index.boto3.client", side_effect=_client_factory(cloudwatch=cw)):
+        problems, _ = index._check_alarm_coverage(_ALARM_SPEC, NOW)
+    assert len(problems) == 1
+    assert "NO alarms match" in problems[0]
+
+
+def test_alarm_coverage_stuck_insufficient_data():
+    cw = MagicMock()
+    stale = dict(_ALARM_MATCHING,
+                 StateValue="INSUFFICIENT_DATA",
+                 StateTransitionedTimestamp=NOW - timedelta(hours=200),
+                 StateReason="No data for 200 hours")
+    cw.describe_alarms.return_value = {
+        "MetricAlarms": [stale],
+        "CompositeAlarms": [],
+    }
+    with patch("index.boto3.client", side_effect=_client_factory(cloudwatch=cw)):
+        problems, _ = index._check_alarm_coverage(_ALARM_SPEC, NOW)
+    assert any("INSUFFICIENT_DATA" in p and "> 168h" in p for p in problems)
+
+
+def test_alarm_coverage_insufficient_data_initial_not_a_finding():
+    """An alarm with 'Unchecked: Initial' reason and recent transition should
+    not be flagged — it was just created and hasn't evaluated yet."""
+    cw = MagicMock()
+    recent = dict(_ALARM_MATCHING,
+                  StateValue="INSUFFICIENT_DATA",
+                  StateTransitionedTimestamp=NOW - timedelta(hours=2),
+                  StateReason="Unchecked: Initial")
+    cw.describe_alarms.return_value = {
+        "MetricAlarms": [recent],
+        "CompositeAlarms": [],
+    }
+    with patch("index.boto3.client", side_effect=_client_factory(cloudwatch=cw)):
+        problems, _ = index._check_alarm_coverage(_ALARM_SPEC, NOW)
+    assert not any("INSUFFICIENT_DATA" in p for p in problems)
+
+
+def test_alarm_coverage_wrong_alarm_action():
+    cw = MagicMock()
+    wrong_topic = dict(_ALARM_MATCHING,
+                       AlarmActions=["arn:aws:sns:us-east-1:123456789012:wrong-topic"])
+    cw.describe_alarms.return_value = {
+        "MetricAlarms": [wrong_topic],
+        "CompositeAlarms": [],
+    }
+    with patch("index.boto3.client", side_effect=_client_factory(cloudwatch=cw)):
+        problems, _ = index._check_alarm_coverage(_ALARM_SPEC, NOW)
+    assert any("do not include expected pattern" in p for p in problems)
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # sf_watch_invocation_success
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -875,7 +961,9 @@ def test_run_checks_aggregates_problems_and_kill_switches():
     sqs.get_queue_url.side_effect = FakeClientError("QueueDoesNotExist")
     with patch("index._registry", return_value=reg), \
          patch("index.boto3.client", side_effect=_client_factory(**{"lambda": lam, "sqs": sqs})):
-        problems, ks, run, failed = index._run_checks(NOW)
+        # main made `problems` structured (hence `_details`); this branch added
+        # the 5th return value (`_recon`). Both are required.
+        problems, ks, run, failed, _recon = index._run_checks(NOW)
     details = _details(problems)
     assert any("not Active" in p for p in details)
     assert any("does NOT EXIST" in p for p in details)
@@ -916,7 +1004,7 @@ def test_run_checks_isolates_a_raising_check_and_still_runs_the_others():
     with patch("index._registry", return_value=_isolation_registry()), \
          patch("index.boto3.client", side_effect=_client_factory(
              **{"lambda": lam, "scheduler": sched, "sqs": sqs})):
-        problems, ks, run, failed = index._run_checks(NOW)
+        problems, ks, run, failed, _recon = index._run_checks(NOW)
 
     details = _details(problems)
     # the raising check became its own problem line...
@@ -947,7 +1035,7 @@ def test_run_checks_all_failing_reports_probe_blind_first():
     sched.get_schedule.side_effect = FakeClientError("AccessDeniedException")
     with patch("index._registry", return_value=reg), \
          patch("index.boto3.client", side_effect=_client_factory(scheduler=sched)):
-        problems, _ks, run, failed = index._run_checks(NOW)
+        problems, _ks, run, failed, _recon = index._run_checks(NOW)
     assert run == failed == 2
     assert problems[0]["detail"].startswith("PROBE BLIND")
     assert "all 2 liveness checks failed to run" in problems[0]["detail"]
@@ -966,7 +1054,7 @@ def test_run_checks_partial_failure_is_not_probe_blind():
         {"deadLetterTargetArn": "arn:aws:sqs:us-east-1:711398986525:nousergon-overseer-intake-dlq"})}}
     with patch("index._registry", return_value=reg), \
          patch("index.boto3.client", side_effect=_client_factory(scheduler=sched, sqs=sqs)):
-        problems, _ks, run, failed = index._run_checks(NOW)
+        problems, _ks, run, failed, _recon = index._run_checks(NOW)
     assert (run, failed) == (2, 1)
     assert not any("PROBE BLIND" in p for p in _details(problems))
 
@@ -1000,7 +1088,9 @@ def _handler_with(problems, kill_switches=None, state_per_problem=None,
     if checks_run is None:
         checks_run = max(len(problems), 1)
     with patch("index._run_checks",
-               return_value=(problems, kill_switches or {}, checks_run, checks_failed)), \
+               return_value=(problems, kill_switches or {}, checks_run, checks_failed,
+                             {"playbooks_declared": 0, "schedule_checks_declared": 0,
+                              "alarm_coverage_declared": 0})), \
          patch("index._s3_client", return_value=s3), \
          patch("index.notify_via_flow_doctor", notify):
         result = index.handler({}, None)
