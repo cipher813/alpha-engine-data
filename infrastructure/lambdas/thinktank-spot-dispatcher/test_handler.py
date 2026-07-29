@@ -113,6 +113,76 @@ class TestBootstrapCommand:
         assert "shutdown -h now" in cmd
 
 
+class TestLibCallSignatures:
+    """Bind every spot_dispatch call against the REAL library signature.
+
+    The 2026-07-29 smoke run died on
+    ``running_instance_ids() missing 1 required positional argument:
+    'discriminator_tags'`` — an error every unit test above missed, because
+    they monkeypatch ``_already_running`` and the ``spot_dispatch`` functions
+    themselves, so no test ever touched the real signature. Mocks make a
+    call site untestable exactly where it talks to someone else's contract.
+    ``inspect.signature().bind()`` closes that without needing AWS.
+    """
+
+    def test_running_instance_ids_call_binds(self):
+        import inspect
+
+        from nousergon_lib import spot_dispatch as real
+
+        mod = _load()
+        inspect.signature(real.running_instance_ids).bind(
+            mod.INSTANCE_TAG_NAME, {}, region=mod.REGION
+        )
+
+    def test_launch_with_fallback_call_binds(self):
+        import inspect
+
+        from nousergon_lib import spot_dispatch as real
+
+        mod = _load()
+        inspect.signature(real.launch_with_fallback).bind(
+            mod.INSTANCE_TYPES,
+            mod.SUBNETS,
+            image_id=mod.AMI_ID,
+            key_name=mod.KEY_NAME,
+            security_group_ids=[mod.SECURITY_GROUP],
+            iam_instance_profile=mod.IAM_PROFILE,
+            volume_size_gb=mod.VOLUME_SIZE_GB,
+            tag_name=mod.INSTANCE_TAG_NAME,
+            region=mod.REGION,
+            force_on_demand=False,
+        )
+
+    def test_send_async_command_call_binds(self):
+        import inspect
+
+        from nousergon_lib import spot_dispatch as real
+
+        mod = _load()
+        inspect.signature(real.send_async_command).bind(
+            "i-abc",
+            mod._bootstrap_command("tok"),
+            comment="x",
+            region=mod.REGION,
+            cw_log_group=mod.CW_LOG_GROUP,
+            execution_timeout_seconds=mod.RUN_TIMEOUT_SECONDS,
+        )
+
+    def test_wait_ssm_online_and_terminate_calls_bind(self):
+        import inspect
+
+        from nousergon_lib import spot_dispatch as real
+
+        mod = _load()
+        inspect.signature(real.wait_ssm_online).bind(
+            "i-abc", region=mod.REGION, ssm_online_budget_sec=mod.SSM_ONLINE_BUDGET_SEC
+        )
+        inspect.signature(real.terminate_on_failure).bind(
+            "i-abc", region=mod.REGION, label="thinktank-spot"
+        )
+
+
 class TestDispatchPosture:
     def test_disabled_dispatcher_raises_rather_than_returning_a_quiet_noop(self):
         """A disabled dispatcher must never be indistinguishable from a healthy
