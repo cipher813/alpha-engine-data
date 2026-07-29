@@ -344,6 +344,11 @@
             "type": { "const": "run_window" },
             "label": { "type": "string", "minLength": 1 },
             "artifact_prefix": { "type": "string", "minLength": 1 },
+            "run_start_field": {
+              "description": "OPTIONAL, default 'run_start'. Name of the artifact field holding the run's start timestamp (ISO-8601). The fleet's run artifacts do NOT share one schema: the groom artifact carries 'run_start', the alert-drain ledger carries 'started_at'. An in-window artifact missing the DECLARED field raises rather than being skipped — the silent skip made 100% of mature alert-drain triggers read as silent deaths while the drain was running normally (false pages 2026-07-29). Retire once G16 (alpha-engine-config-I5284) unifies the execution artifact.",
+              "type": "string",
+              "minLength": 1
+            },
             "decision_record_prefix": { "type": "string", "minLength": 1 },
             "ceiling_min": { "type": "integer", "minimum": 1 },
             "margin_min": { "type": "integer", "minimum": 0 },
