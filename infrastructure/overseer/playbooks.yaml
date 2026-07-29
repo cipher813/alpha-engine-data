@@ -155,6 +155,18 @@ playbooks:
         - type: lambda_active
           function: alpha-engine-ci-watch-dispatcher
           report_kill_switch: CI_WATCH_DISPATCH_ENABLED
+        # config-I5262: ci-watch dispatches are recorded at
+        # ci_watch/_control/dispatched/{repo}-{sha}.json; completion markers
+        # live at ci_watch/_control/completed/{repo}-{sha}.json with the
+        # same filename. A dispatched record with no matching completion
+        # marker after response_window_min means the box died before writing
+        # its outcome (the exact failure that triggered this issue).
+        - type: dispatch_invocation_success
+          family: ci-watch
+          dispatch_prefix: ci_watch/_control/dispatched/
+          completion_prefix: ci_watch/_control/completed/
+          response_window_min: 60
+          lookback_hours: 24
 
   alert-drain:
     description: >-
@@ -316,6 +328,21 @@ playbooks:
             - {hour: 12, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "12:00 UTC daily (demand-all)"}
             - {hour: 20, minute: 0, dows: [0, 1, 2, 3, 4, 5, 6], label: "20:00 UTC daily (demand-all)"}
             - {hour: 9, minute: 0, dows: [0], label: "Sun 09:00 UTC (weekly extra slot)"}
+        # config-I5262: the run_window check above asserts a run ARTIFACT was
+        # written — but the artifact is written even on a crash-cascaded lane
+        # (2026-07-28 proof: all 3 lanes died 2 min in, each wrote a valid
+        # artifact with engaged=0, floor_fail=true). This check is the
+        # INVOCATION-SUCCESS signal: for every dispatch-ledger entry (a box was
+        # launched with a run_token), assert a completion marker exists at
+        # groom/_control/completed/{run_token}.json. A mature dispatch with no
+        # completion marker means the box died before writing any outcome.
+        - type: dispatch_invocation_success
+          family: groom
+          dispatch_prefix: groom/_control/dispatch-ledger/
+          completion_prefix: groom/_control/completed/
+          completion_key_field: run_token
+          response_window_min: 30
+          lookback_hours: 30
 
   gate-sweeps:
     description: >-
