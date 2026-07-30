@@ -826,6 +826,54 @@ def _lane_glyph(state: str) -> str:
     return _LANE_GLYPHS.get(state, "❔")
 
 
+# Zero-launch vocabulary (policy §2.4: "degraded exits are named exits";
+# alpha-engine-config-I5689). CheckAnyLaunches routes EVERY empty-launches
+# decide to AllSkipped, but those skips are not equivalent: a light backlog is
+# the system correctly declining to spend, while a concurrency skip is a cycle
+# the backlog needed and did not get. Before this table both rendered as
+# "✅ COMPLETE / (no lanes launched)".
+#
+# Structured as {reason: (glyph, healthy, blurb)}. `healthy` is what feeds
+# `degraded`; an UNKNOWN reason is deliberately NOT healthy — a skip shape
+# invented downstream must surface as itself rather than inherit the benign
+# default (§2.4: "the absence of a signal must never be readable as a benign
+# signal"). `_SKIP_REASONS` is asserted total against the dispatcher's own
+# emitted reasons by test_groom_cycle_notifications.py.
+_SKIP_REASONS = {
+    # Healthy: nothing to do, no spend, backlog not starved.
+    "demand_gate_skip": ("⚪", True, "no tier cleared the demand floor"),
+    # (No pace-gate entry: the pre-boot pace gate was DISMANTLED by Brian's
+    # 2026-07-14 ruling — see the module docstring. A row for a retired
+    # mechanism is the §9 "guard scoped to a design that no longer exists"
+    # defect, so it stays absent and the meta-test below keeps it that way.)
+    # Degraded: the backlog needed this cycle and did not get it.
+    "concurrent_cycle_skip": (
+        "🟡", False, "an earlier cycle was still running — backlog untouched"),
+    "concurrent_cycle_probe_failed": (
+        "🟡", False, "could not prove no cycle was running — skipped fail-safe"),
+    "demand_all_failed": (
+        "🔴", False, "enumeration failed — demand could not be computed"),
+}
+
+#: The no-reason case. A plain light-backlog decide returns ``launches: []``
+#: with NO reason key at all (see the AllSkipped comment in
+#: step_function_groom.json), so absence here means the demand gate, not an
+#: unrecognized shape. Kept distinct from the unknown-reason fallback below
+#: because conflating them is what would let a future reason-less degraded
+#: skip read as healthy.
+_SKIP_REASON_ABSENT = ("⚪", True, "no tier cleared the demand floor")
+
+
+def _skip_verdict(reason: str | None) -> tuple[str, bool, str]:
+    """Classify a zero-launch cycle. Total over its input by construction."""
+    if not reason:
+        return _SKIP_REASON_ABSENT
+    known = _SKIP_REASONS.get(reason)
+    if known:
+        return known
+    return ("❔", False, f"unrecognized skip reason {reason!r}")
+
+
 def _lane_rows(map_outcome: list) -> tuple[list[str], bool]:
     """Render one row per lane; return (rows, any_degraded).
 
@@ -894,6 +942,25 @@ def _notify_cycle_complete(cycle: dict) -> dict:
 
     rows, degraded = _lane_rows(map_outcome)
 
+    # Zero-launch cycles (I5689). AllSkipped is reached by several distinct
+    # routes and only some are healthy, so classify rather than assume. This
+    # runs on the AllSkipped path only: when lanes DID launch, mapOutcome is
+    # non-empty and the decide reason is not a skip verdict.
+    skip_reason = None
+    skip_healthy = True
+    if not rows:
+        decide = (
+            ((cycle.get("decideResult") or {}).get("Payload") or {}).get("decide")
+            or {}
+        )
+        skip_reason = decide.get("reason")
+        glyph, skip_healthy, blurb = _skip_verdict(skip_reason)
+        blockers = decide.get("blocking_executions") or []
+        blocker_note = f" [{', '.join(str(b) for b in blockers)}]" if blockers else ""
+        rows = [f"  cycle  {glyph} 0 lanes — {blurb}{blocker_note}"]
+        if not skip_healthy:
+            degraded = True
+
     # The sweep is dispatched fire-and-forget (DispatchEndOfSfSweep is a plain
     # lambda:invoke, not .waitForTaskToken), so at this point we can honestly
     # report only whether its BOX was launched — never that it finished. Say
@@ -915,6 +982,11 @@ def _notify_cycle_complete(cycle: dict) -> dict:
         head = f"✅ Groom cycle {schedule_label} COMPLETE"
         severity = "info"
 
+    # A skip row describes the CYCLE, not a lane — `lanes` stays 0 so any
+    # consumer counting launched lanes is unaffected by the new row (§10.1
+    # reads lane counts; the skip verdict travels in its own fields).
+    lane_count = len(map_outcome)
+
     lane_block = "\n".join(rows) if rows else "  (no lanes launched)"
     text = f"{head}\n{lane_block}\n{sweep_line}"
     if map_failure:
@@ -924,9 +996,22 @@ def _notify_cycle_complete(cycle: dict) -> dict:
         text, severity=severity,
         dedup_key=f"{_CYCLE_FLOW_NAME}:complete:{_utc_today()}:{schedule_label}",
         context={"schedule": schedule_label, "degraded": degraded,
-                 "lane_count": len(rows)},
+                 "lane_count": lane_count, "skip_reason": skip_reason},
     )
-    return {"notified": True, "degraded": degraded, "lanes": len(rows)}
+    # `skip_reason` / `skip_healthy` are emitted as FACTS, not as a verdict on
+    # §10.1. A concurrency skip exits the SF SUCCEEDED, so terminal status alone
+    # cannot distinguish a completed cycle from a starved one — these two fields
+    # are what lets a §10.1 implementation tell them apart without re-deriving
+    # anything (§2.7 derive-once). Deliberately NOT a `cycle_completed` boolean:
+    # scoring is §10.1's to define, and asserting it here would make this a
+    # second source of truth for the governing metric.
+    return {
+        "notified": True,
+        "degraded": degraded,
+        "lanes": lane_count,
+        "skip_reason": skip_reason,
+        "skip_healthy": skip_healthy if not map_outcome else None,
+    }
 
 
 def _decide_result(decide_payload: dict, schedule_label: str) -> dict:
