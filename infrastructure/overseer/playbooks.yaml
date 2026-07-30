@@ -533,9 +533,8 @@ alert_classes:
     intake: bus
     response: drain-queue
   - class: backtester_champion_promotion
-    # NOTE stale 'crucible-backtester/' prefix in the emitter literal —
-    # config-I3302 renames it; row updated when that lands.
-    source: "crucible-backtester/optimizer/champion_promotion.py::run_weekly_evaluation"
+    # I3302 rename complete: code now emits the canonical alpha-engine-backtester/ prefix.
+    source: "alpha-engine-backtester/optimizer/champion_promotion.py::run_weekly_evaluation"
     severities: [error]
     intake: bus
     response: drain-queue
@@ -615,6 +614,16 @@ alert_classes:
     response: drain-queue
   - class: research_scanner_leaderboard_alerts
     source: "research:scanner_leaderboard"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: research_experiment_record_alerts
+    source: "research:experiment_record"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: research_thinktank_daily_alerts
+    source: "research:thinktank_daily"
     severities: [warning]
     intake: bus
     response: drain-queue
