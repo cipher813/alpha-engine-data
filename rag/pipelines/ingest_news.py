@@ -33,7 +33,11 @@ Architecture:
               events + entities)
 
 Idempotency: pre-checked via the lib's ``document_exists`` — re-runs
-on the same (ticker, date, source) skip the embedding call entirely.
+of the SAME article (matched via ``external_id``, the aggregator's
+composite fingerprint) skip the embedding call entirely. Distinct
+articles for one (ticker, source, day) are no longer collapsed onto a
+single row (config#2957) — ``external_id`` is what makes per-article
+dedup possible instead of per-(ticker, source, day).
 
 Chunking: news articles are short (title + body excerpt = typically
 <500 tokens). We emit ONE chunk per article per ticker. For longer
@@ -134,10 +138,11 @@ def ingest_articles(
     Args:
         articles: aggregated news articles (from NewsAggregator).
         filed_date: the canonical filed_date stamped on every document
-            this run. Per the RAG schema this is the dedup key
-            alongside (ticker, doc_type, source). For news, all
-            articles in one ingest batch share a filed_date — typically
-            the calendar date the batch was fetched.
+            this run. For news, all articles in one ingest batch share a
+            filed_date — typically the calendar date the batch was
+            fetched. Per-article dedup within that shared filed_date is
+            keyed on each article's ``external_id`` (config#2957), not
+            filed_date alone.
         ticker_to_sector: optional ticker → GICS sector map. Sector is
             an optional column on the RAG documents table; omit to
             skip sector tagging.
@@ -167,6 +172,14 @@ def ingest_articles(
         "n_failures": 0,
     }
 
+    # Pass 1: resolve dedup + dry-run/empty-text skips and build the list
+    # of documents that actually need an embedding. config#2956
+    # deliverable 3 — accumulate ALL pending chunk bodies across every
+    # article/ticker in this run and call ``embed_texts_fn`` ONCE (it
+    # already batches internally in blocks of up to 128, see
+    # ``nousergon_lib.rag.embeddings.embed_texts``) instead of once PER
+    # article, which was the previous N-embedding-calls-per-run shape.
+    pending: list[dict[str, Any]] = []
     for article in articles:
         body = _chunk_text(article)
         if not body or len(body) < 20:
@@ -175,9 +188,19 @@ def ingest_articles(
 
         rag_source = _rag_source(_canonical_source(article))
 
+        # Stable per-article identity for dedup (config#2957): the
+        # aggregator's own composite fingerprint (normalized title +
+        # URL host+path, alpha-engine-data collectors/news_aggregator.py
+        # ``_article_fingerprint``) already groups source variants of the
+        # same real-world story, so re-ingesting the SAME article (even
+        # from a later run / different day's fetch) yields the SAME
+        # external_id. Without this, rag.documents' dedup key collapses
+        # every article for one (ticker, source, day) onto a single row.
+        external_id = article.canonical_fingerprint or None
+
         for ticker in article.tickers:
             stats["n_documents_attempted"] += 1
-            if document_exists_fn(ticker, "news", filed_date, rag_source):
+            if document_exists_fn(ticker, "news", filed_date, rag_source, external_id):
                 stats["n_documents_skipped_exists"] += 1
                 continue
             if dry_run:
@@ -189,47 +212,73 @@ def ingest_articles(
                 )
                 stats["n_documents_ingested"] += 1
                 continue
-            try:
-                # One chunk per news article — short bodies. If the
-                # excerpt grows in a future adapter (e.g. Benzinga full
-                # body), split here at ~400-token windows mirroring
-                # ingest_8k_filings._chunk_text.
-                section_label = (
-                    article.canonical_title[:100] if article.canonical_title
-                    else "news"
-                )
-                chunks = [{
-                    "content": body,
-                    "section_label": section_label,
-                }]
-                embeddings = embed_texts_fn([chunks[0]["content"]])
-                chunks[0]["embedding"] = embeddings[0]
+            # One chunk per news article — short bodies. If the excerpt
+            # grows in a future adapter (e.g. Benzinga full body), split
+            # here at ~400-token windows mirroring
+            # ingest_8k_filings._chunk_text.
+            section_label = (
+                article.canonical_title[:100] if article.canonical_title
+                else "news"
+            )
+            pending.append({
+                "article": article,
+                "ticker": ticker,
+                "rag_source": rag_source,
+                "external_id": external_id,
+                "chunk": {"content": body, "section_label": section_label},
+            })
 
-                doc_id = ingest_document_fn(
-                    ticker=ticker,
-                    sector=ticker_to_sector.get(ticker),
-                    doc_type="news",
-                    source=rag_source,
-                    filed_date=filed_date,
-                    title=article.canonical_title or None,
-                    url=article.canonical_url or None,
-                    chunks=chunks,
+    if pending:
+        try:
+            embeddings = embed_texts_fn([item["chunk"]["content"] for item in pending])
+        except Exception as e:
+            # A batch-level embedding failure (e.g. Voyage API outage)
+            # fails every pending document this run — isolated per-run,
+            # not per-document, since there is now one shared API call.
+            # Still fail soft: log and count, don't crash the caller.
+            stats["n_failures"] += len(pending)
+            logger.warning(
+                "[news_ingest] batch embedding failed for %d pending "
+                "document(s): %s", len(pending), e,
+            )
+            pending = []
+        else:
+            for item, embedding in zip(pending, embeddings):
+                item["chunk"]["embedding"] = embedding
+
+    # Pass 2: ingest each document, isolating per-document failures so
+    # one bad write doesn't drop the rest of the batch.
+    for item in pending:
+        article = item["article"]
+        ticker = item["ticker"]
+        rag_source = item["rag_source"]
+        try:
+            doc_id = ingest_document_fn(
+                ticker=ticker,
+                sector=ticker_to_sector.get(ticker),
+                doc_type="news",
+                source=rag_source,
+                filed_date=filed_date,
+                title=article.canonical_title or None,
+                url=article.canonical_url or None,
+                chunks=[item["chunk"]],
+                external_id=item["external_id"],
+            )
+            if doc_id:
+                stats["n_documents_ingested"] += 1
+                logger.info(
+                    "Ingested news for %s on %s (%s): %s",
+                    ticker, filed_date, rag_source,
+                    article.canonical_title[:80],
                 )
-                if doc_id:
-                    stats["n_documents_ingested"] += 1
-                    logger.info(
-                        "Ingested news for %s on %s (%s): %s",
-                        ticker, filed_date, rag_source,
-                        article.canonical_title[:80],
-                    )
-                else:
-                    stats["n_failures"] += 1
-            except Exception as e:
+            else:
                 stats["n_failures"] += 1
-                logger.warning(
-                    "[news_ingest] failed for %s %s: %s",
-                    ticker, article.canonical_url, e,
-                )
+        except Exception as e:
+            stats["n_failures"] += 1
+            logger.warning(
+                "[news_ingest] failed for %s %s: %s",
+                ticker, article.canonical_url, e,
+            )
 
     logger.info(
         "[news_ingest] complete: %s", stats,

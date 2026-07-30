@@ -312,6 +312,26 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     function_name = spec["executor_function"]
     executor_payload = _stringify_bools(payload)
+    # config-I3293 — the registry is the SSoT for the agent's model: inject
+    # the playbook's declared `model` into the executor payload unless the
+    # caller explicitly overrode it (drills/operator invokes may). Executors
+    # thread it to the run script's --model; absent both, the run script's
+    # inline default applies (non-router invocation fallback).
+    if spec.get("model") and "model" not in executor_payload:
+        executor_payload["model"] = spec["model"]
+    # config-#5286 — inject dispatch semantics from the registry UNLESS the
+    # playbook is a `custom_executor` (its dispatch logic is genuinely bespoke
+    # and cannot be expressed through these primitives — groom's pace/demand/
+    # tier logic is the canonical example). Each field is the executor's OWN
+    # default override: the overseer-dispatcher only injects what the registry
+    # declares; the executor's hardcoded default remains the fallback for non-
+    # router invocation paths. Executors that have not been migrated to read
+    # these fields will simply ignore them (backward compatible).
+    if not spec.get("custom_executor"):
+        for key in ("on_concurrent", "attempt_ceiling", "lease_seconds",
+                     "drill_isolation"):
+            if key in spec and key not in executor_payload:
+                executor_payload[key] = spec[key]
     started_at = datetime.now(timezone.utc).isoformat()
     try:
         verdict = _invoke_executor(function_name, executor_payload)

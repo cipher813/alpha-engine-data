@@ -12,6 +12,8 @@ name: Live FRED Smoke
 # Secret gate: requires repo secret FRED_API_KEY. Forks without the
 # secret get a clean skip rather than a failing CI status.
 
+permissions: {}
+
 on:
   pull_request:
     branches: [main]
@@ -26,10 +28,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: "3.12"
           cache: pip

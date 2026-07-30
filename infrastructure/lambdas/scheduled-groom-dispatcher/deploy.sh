@@ -23,27 +23,32 @@
 # Lambda) + ssm:GetCommandInvocation (to poll) + sns:Publish (to alert on
 # failure) — it never touches secrets or launches anything itself.
 #
-# Cadence (UTC). Reduced 3->2/day on 2026-06-29 (the 15:00 UTC / 8am-PT run was
-# dropped per usage pacing); a 3rd schedule was re-added 2026-07-01 (config#1495
-# follow-up) at the SAME 15:00 UTC slot, now running a DIFFERENT tier — Opus,
-# complexity:high ONLY — not a reinstatement of the old Sonnet drain-phase run.
-# UNIFORM 3x/day, all 7 days, since 2026-07-02: the Sat-skip on the 07:00 slot
-# (originally "avoid colliding with the 09:00 UTC Saturday pipeline") was never
-# evidence-based — investigated and confirmed the groom and the weekly SF share
-# NEITHER the Claude Max quota (groom = Max-plan OAuth token; weekly SF Research/
-# Predictor = separate pay-as-you-go ANTHROPIC_API_KEY) NOR EC2 spot capacity
-# (disjoint instance families: groom t3/t3a/t2.medium vs weekly-SF c5/m5/c6i/c5a/
-# r5/r5a/r6i.large). No exceptions kept — the weekly SF can also now land on any
-# day (e.g. Friday, per the holiday-aware weekly-schedule-adjuster, #578) without
-# the groom cadence needing to track it.
-# Off-peak tier-split cadence (2026-07-07): avoid Anthropic Max weekday peak
-# (5–11am PT / 12:00–18:00 UTC PDT) and Brian's interactive hours where possible.
-# config#2409 (2026-07-13): the 01:00 high-only slot moved off Opus onto Sonnet
-# — dedicated queue/budget/off-peak schedule, no longer a distinct model tier.
-#   01:00 daily     cron(0 1 * * ? *)         FULL   Sonnet, high-only      # 6pm PT, every day
-#   07:00 daily     cron(0 7 * * ? *)         FULL   Sonnet, mid-only       # 12am PT, every day
-#   19:00 daily     cron(0 19 * * ? *)        FULL   Haiku,  low-only       # 12pm PT, every day
-#   Sun 09:00       cron(0 9 ? * SUN *)       FULL   Haiku,  gated-reverify # weekly stale-gate lane (config#1891)
+# alpha-engine-config-I5371 adds one further grant: states:ListExecutions,
+# scoped to the alpha-engine-groom-dispatch state machine ONLY. The decide phase
+# uses it to enforce a CYCLE SINGLETON — it lists RUNNING siblings of its own
+# execution and skips when an earlier cycle is still alive. Read-only, and the
+# narrowest resource scope the API allows.
+#
+# That grant is LOAD-BEARING FOR AVAILABILITY, not just correctness:
+# _concurrent_cycle_blockers() fails CLOSED, so an AccessDenied is treated as
+# "cannot establish singleton" and skips the cycle. A deploy that ships the code
+# without the policy therefore stops ALL grooming, silently, until the grant
+# lands. Run `deploy.sh --apply-iam` BEFORE (or with) any deploy that first
+# introduces it — the GHA auto-deploy OIDC role deliberately lacks
+# iam:PutRolePolicy (fleet single-writer rule), so a code-only deploy cannot
+# apply it for you.
+#
+# Cadence (UTC). Three symmetric demand-all triggers per day + Sunday extra slot.
+# Each trigger evaluates the FULL backlog and launches 0..3 tier boxes via
+# decide_trigger / _primary_backend_for. All tiers route through DeepSeek primary.
+# The end-of-SF sweep (DispatchEndOfSfSweep in step_function_groom.json) continues
+# to run unconditionally after every trigger cycle — it covers the PR set
+# regardless of how many groom boxes launch.
+#  04:00 daily     cron(0 4 * * ? *)         FULL   demand-all  # 9pm PT
+#  12:00 daily     cron(0 12 * * ? *)        FULL   demand-all  # 5am PT
+#  20:00 daily     cron(0 20 * * ? *)        FULL   demand-all  # 1pm PT
+#  Sun 09:00       cron(0 9 ? * SUN *)       FULL   demand-all  # weekly extra slot
+#  Models: krepis.router selects per GROOM_ROUTER_CLASS — zero Anthropic
 #
 # SCHED_NAMES is the source of truth: any live scheduler rule under the
 # alpha-engine-scheduled-groom- prefix that is NOT in SCHED_NAMES is PRUNED
@@ -72,12 +77,14 @@
 # Usage:
 #   bash .../scheduled-groom-dispatcher/deploy.sh             # update code only (also the CI auto-deploy path)
 #   bash .../scheduled-groom-dispatcher/deploy.sh --bootstrap # operator-only: create/update IAM roles + wire EventBridge Scheduler
+#   bash .../scheduled-groom-dispatcher/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
 #   bash .../scheduled-groom-dispatcher/deploy.sh --dry-run   # show actions, do not apply
 #   bash .../scheduled-groom-dispatcher/deploy.sh --smoke     # invoke once with a synthetic schedule event (⚠ fires a REAL groom)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 FUNCTION_NAME="alpha-engine-scheduled-groom-dispatcher"
 ROLE_NAME="alpha-engine-scheduled-groom-dispatcher-role"
 POLICY_NAME="alpha-engine-scheduled-groom-dispatcher-policy"
@@ -105,22 +112,22 @@ SCHED_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}"
 # schedule label, plus model/issue_filter per tier — config#1760 tier-split).
 # deploy.sh prune drops orphaned rule names when cadence changes.
 SCHED_NAMES=(
-  "alpha-engine-scheduled-groom-0100-daily-opus-high"
-  "alpha-engine-scheduled-groom-0700-daily-mid"
-  "alpha-engine-scheduled-groom-1900-daily-low"
-  "alpha-engine-scheduled-groom-sun0900-weekly-gated-reverify"
+  "alpha-engine-scheduled-groom-0400-daily"
+  "alpha-engine-scheduled-groom-1200-daily"
+  "alpha-engine-scheduled-groom-2000-daily"
+  "alpha-engine-scheduled-groom-sun0900-weekly"
 )
 SCHED_CRONS=(
-  "cron(0 1 * * ? *)"
-  "cron(0 7 * * ? *)"
-  "cron(0 19 * * ? *)"
+  "cron(0 4 * * ? *)"
+  "cron(0 12 * * ? *)"
+  "cron(0 20 * * ? *)"
   "cron(0 9 ? * SUN *)"
 )
 SCHED_INPUTS=(
-  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 1 * * *"}'
-  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 7 * * *"}'
-  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 19 * * *"}'
-  '{"run_mode":"full","model":"claude-haiku-4-5","issue_filter":"gated-reverify","schedule":"0 9 * * 0"}'
+  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 4 * * *"}'
+  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 12 * * *"}'
+  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 20 * * *"}'
+  '{"run_mode":"full","trigger":"demand-all","pr_budget":100,"schedule":"0 9 * * 0"}'
 )
 # Prefix used to discover live rules for prune reconciliation (see step 2f).
 SCHED_PREFIX="alpha-engine-scheduled-groom-"
@@ -135,11 +142,13 @@ case "${DRY_RUN:-false}" in
   *) DRY_RUN=false ;;
 esac
 BOOTSTRAP=false
+APPLY_IAM=false
 SMOKE=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
     --bootstrap) BOOTSTRAP=true ;;
+    --apply-iam) APPLY_IAM=true ;;
     --smoke) SMOKE=true ;;
     -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
   esac
@@ -194,6 +203,14 @@ echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
 
 # ----- 2. Bootstrap (first-time only) ---------------------------------------
 
+# ----- Apply IAM only (config#2825, no bootstrap side effects) -------------
+if $APPLY_IAM; then
+  echo "Applying IAM (role=${ROLE_NAME}, policy=${POLICY_NAME})..."
+  TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
+  echo "  ✓ IAM applied."
+fi
+
 if $BOOTSTRAP; then
   echo "Bootstrapping ${FUNCTION_NAME}..."
 
@@ -221,6 +238,11 @@ if $BOOTSTRAP; then
   fi
 
   # --- 2b. Lambda function ---
+  # GROOM_MAX_DISPATCHES_DAILY (config#3173, generalizing config#2269's
+  # sf-watch pattern): pinned here (not left to index.py's own default) so a
+  # live env tweak never silently survives a redeploy — same rationale as
+  # sf-watch's SF_WATCH_MAX_DISPATCHES_* (config#1818 lesson). Change via a
+  # PR editing this value, not a console edit.
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
   if ! aws lambda get-function --function-name "${FUNCTION_NAME}" --query 'Configuration.FunctionName' --output text >/dev/null 2>&1; then
     echo "  Creating Lambda: ${FUNCTION_NAME}"
@@ -232,7 +254,7 @@ if $BOOTSTRAP; then
       --zip-file "fileb://${ZIP}" \
       --timeout 300 \
       --memory-size 256 \
-      --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+      --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid,high"}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -246,7 +268,7 @@ if $BOOTSTRAP; then
     run aws iam create-role \
       --role-name "${SF_ROLE_NAME}" \
       --assume-role-policy-document "${SF_TRUST}" \
-      --description "Execution role for ${SF_NAME} — invokes the groom Lambda + polls SSM (config#1472)" \
+      --description "Execution role for ${SF_NAME} - invokes the groom Lambda + polls SSM (config#1472)" \
       --query 'Role.RoleName' --output text
   else
     echo "  SF execution role exists: ${SF_ROLE_NAME}"
@@ -349,6 +371,128 @@ EOF
     fi
   done
 
+  # --- 2e-bis. The lane-death reconciler rule (alpha-engine-config-I5229).
+  #
+  # Deliberately NOT in SCHED_NAMES: every rule there targets the STEP FUNCTION
+  # and starts a dispatch cycle. This one targets the LAMBDA directly with
+  # {"mode":"reconcile"} and must never start a cycle. It also sits outside
+  # SCHED_PREFIX so step 2f's prune reconciliation does not delete it.
+  #
+  # Why it must exist at all: groom-sweep-policy §2.7 makes the reconciler the
+  # property the others depend on, and §2.2 holds that a recovery path which has
+  # never executed is presumed broken. A reconciler with no trigger is exactly
+  # that — the code merges, the tests pass, and nothing ever runs it. Every
+  # 5 minutes is well inside the ~6h lane budget it is watching and costs one
+  # short Lambda invocation.
+  RECON_SCHED_NAME="alpha-engine-groom-lane-reconciler-5min"
+  RECON_SCHED_CRON="rate(5 minutes)"
+  # Built with python3, NOT a heredoc. In an unquoted heredoc bash unescapes
+  # only \$, \`, \\ and \<newline> — a backslash before a double quote is
+  # PRESERVED. So `\\\"` emitted `\\"` rather than `\"`, and every
+  # create-schedule call died on `Invalid JSON: Expecting ',' delimiter`.
+  # Counting backslashes through two layers of quoting is not a thing to get
+  # right by inspection; json.dumps cannot get it wrong.
+  recon_target=$(python3 -c 'import json,sys; print(json.dumps({"Arn": sys.argv[1], "RoleArn": sys.argv[2], "Input": json.dumps({"mode": "reconcile"})}))' "${FN_ARN}" "${SCHED_ROLE_ARN}")
+  echo "  Applying Scheduler invoke-Lambda policy for the reconciler"
+  run aws iam put-role-policy \
+    --role-name "${SCHED_ROLE_NAME}" \
+    --policy-name "${SCHED_POLICY_NAME}-recon-invoke" \
+    --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"lambda:InvokeFunction\"],\"Resource\":\"${FN_ARN}\"}]}"
+
+  if aws scheduler get-schedule --name "${RECON_SCHED_NAME}" --region "${REGION}" \
+      --query 'Name' --output text >/dev/null 2>&1; then
+    echo "  Updating reconciler rule: ${RECON_SCHED_NAME} → ${RECON_SCHED_CRON}"
+    run aws scheduler update-schedule \
+      --name "${RECON_SCHED_NAME}" \
+      --schedule-expression "${RECON_SCHED_CRON}" \
+      --flexible-time-window '{"Mode":"OFF"}' \
+      --target "${recon_target}" \
+      --region "${REGION}" \
+      --query 'ScheduleArn' --output text
+  else
+    echo "  Creating reconciler rule: ${RECON_SCHED_NAME} → ${RECON_SCHED_CRON}"
+    run aws scheduler create-schedule \
+      --name "${RECON_SCHED_NAME}" \
+      --schedule-expression "${RECON_SCHED_CRON}" \
+      --flexible-time-window '{"Mode":"OFF"}' \
+      --target "${recon_target}" \
+      --region "${REGION}" \
+      --query 'ScheduleArn' --output text
+  fi
+  if ! $DRY_RUN; then
+    aws scheduler get-schedule --name "${RECON_SCHED_NAME}" --region "${REGION}" \
+      --query 'Name' --output text >/dev/null \
+      || { echo "ERROR: reconciler rule ${RECON_SCHED_NAME} not found after create/update" >&2; exit 1; }
+  fi
+
+  # --- 2e-ter. INDEPENDENT sweep schedules (Brian's ruling 2026-07-30).
+  #
+  # Until now the PR sweep ran only as DispatchEndOfSfSweep, the last state of
+  # the groom cycle — so sweep frequency was hostage to groom health. That is
+  # not theoretical: on 2026-07-30 two of three cycles ended in
+  # `concurrent_cycle_skip`, and the sweep did not run on either. The sweep has
+  # no dependency on groom OUTPUT (it classifies open PRs), so the coupling
+  # bought nothing.
+  #
+  # These rules give it its own trigger, interleaved 4h after each groom:
+  #
+  #   groom  04:00 12:00 20:00 UTC   (9pm / 5am / 1pm PT — unchanged)
+  #   sweep  00:00 08:00 16:00 UTC   (5pm / 1am / 9am PT)
+  #
+  # DispatchEndOfSfSweep is deliberately KEPT. groom-sweep-policy §2.5 makes it
+  # the unconditional tail-catcher — "making it conditional on groom success
+  # starves it exactly when it is most needed" — and removing it is an
+  # orchestration change requiring a policy amendment, not a schedule tweak.
+  # Keeping both yields a sweep roughly every 4h at one cheap box per run.
+  #
+  # Collisions are already handled: the dispatcher tags sweep boxes
+  # `groom-issue-filter=sweep`, distinct from every groom tier tag, so the
+  # config#1979 concurrent guard skips when a prior sweep box is still live.
+  #
+  # NAMED OUTSIDE SCHED_PREFIX on purpose. Step 2f prunes any live rule under
+  # `alpha-engine-scheduled-groom-` that is absent from SCHED_NAMES, and
+  # SCHED_NAMES entries target the STEP FUNCTION (a full groom cycle). These
+  # target the LAMBDA with run_mode=sweep, so a shared prefix would have them
+  # deleted on the next deploy.
+  SWEEP_SCHED_NAMES=(
+    "alpha-engine-groom-sweep-0000-daily"
+    "alpha-engine-groom-sweep-0800-daily"
+    "alpha-engine-groom-sweep-1600-daily"
+  )
+  SWEEP_SCHED_CRONS=(
+    "cron(0 0 * * ? *)"
+    "cron(0 8 * * ? *)"
+    "cron(0 16 * * ? *)"
+  )
+  # Mirrors the DispatchEndOfSfSweep payload in step_function_groom.json:
+  # a literal launch_decided sweep event. `issue_filter` is inert for
+  # run_mode=sweep but the launch path validates it, so it is passed
+  # explicitly rather than defaulted.
+  for i in "${!SWEEP_SCHED_NAMES[@]}"; do
+    sname="${SWEEP_SCHED_NAMES[$i]}"
+    scron="${SWEEP_SCHED_CRONS[$i]}"
+    sweep_target=$(python3 -c 'import json,sys; print(json.dumps({"Arn": sys.argv[1], "RoleArn": sys.argv[2], "Input": json.dumps({"run_mode": "sweep", "launch_decided": True, "model": "deepseek-v4-flash", "issue_filter": "mid-only", "schedule": sys.argv[3]})}))' "${FN_ARN}" "${SCHED_ROLE_ARN}" "${sname}")
+    if aws scheduler get-schedule --name "${sname}" --region "${REGION}" \
+        --query 'Name' --output text >/dev/null 2>&1; then
+      echo "  Updating sweep rule: ${sname} → ${scron}"
+      run aws scheduler update-schedule --name "${sname}" \
+        --schedule-expression "${scron}" --schedule-expression-timezone "UTC" \
+        --flexible-time-window '{"Mode":"OFF"}' --target "${sweep_target}" \
+        --region "${REGION}" --query 'ScheduleArn' --output text
+    else
+      echo "  Creating sweep rule: ${sname} → ${scron}"
+      run aws scheduler create-schedule --name "${sname}" \
+        --schedule-expression "${scron}" --schedule-expression-timezone "UTC" \
+        --flexible-time-window '{"Mode":"OFF"}' --target "${sweep_target}" \
+        --region "${REGION}" --query 'ScheduleArn' --output text
+    fi
+    if ! $DRY_RUN; then
+      aws scheduler get-schedule --name "${sname}" --region "${REGION}" \
+        --query 'Name' --output text >/dev/null \
+        || { echo "ERROR: sweep rule ${sname} not found after create/update" >&2; exit 1; }
+    fi
+  done
+
   # --- 2f. Prune reconciliation: delete any live rule under SCHED_PREFIX that is
   # no longer in SCHED_NAMES (so dropping a cadence above removes it live too,
   # rather than silently orphaning a still-firing schedule). Added 2026-06-29
@@ -393,7 +537,7 @@ echo "✓ Code deployed."
 echo "Updating Lambda environment (flow-doctor SSM hydration)..."
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
-  --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1}' \
+  --environment 'Variables={LOG_LEVEL=INFO,GROOM_DISPATCH_ENABLED=true,GROOM_MAX_DISPATCHES_DAILY=40,FLOW_DOCTOR_ENABLED=1,ALPHA_ENGINE_DEPLOYED=1,GROOM_PRIMARY_DEEPSEEK_TIERS="low,mid,high"}' \
   --region "${REGION}" \
   --query 'LastUpdateStatus' --output text
 if ! $DRY_RUN; then

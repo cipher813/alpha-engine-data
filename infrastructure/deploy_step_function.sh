@@ -95,29 +95,30 @@ fi
 # downstream pipelines (4 incidents in 2 months). Codified IAM is now
 # the single writer.
 
-echo "Ensuring IAM role exists: $ROLE_NAME..."
+echo "Checking IAM role exists: $ROLE_NAME..."
 
-# Trust policy (one-time bootstrap; safe to re-run)
-TRUST_POLICY='{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {"Service": "states.amazonaws.com"},
-      "Action": "sts:AssumeRole"
-    }
-  ]
-}'
-
-aws iam create-role \
-  --role-name "$ROLE_NAME" \
-  --assume-role-policy-document "$TRUST_POLICY" \
-  --region "$REGION" 2>/dev/null || echo "  Role already exists"
+# This script no longer CREATES the role (#1075 follow-up, alpha-engine-config-I5271).
+# IAM roles/policies/trust documents were consolidated into
+# nous-ergon-ops/infrastructure/iam/ on 2026-07-27
+# (infrastructure-ownership-policy.md §35); the trust snapshot this block used to
+# read out of $SCRIPT_DIR/iam/ was deleted from this repo by 506be30 and the
+# reference was missed, so the create-role call could only ever fail here.
+#
+# Role bootstrap belongs to that repo's apply.sh (which has its own create-or-skip
+# path). This script's job is the Step Function definition; it asserts its IAM
+# precondition and fails loud with the remediation rather than trying to satisfy it.
+if ! aws iam get-role --role-name "$ROLE_NAME" --region "$REGION" >/dev/null 2>&1; then
+  echo "  ERROR: role $ROLE_NAME does not exist."
+  echo "         IAM is owned by nous-ergon-ops (infrastructure-ownership-policy.md §35)."
+  echo "         Bootstrap it there first:"
+  echo "           infrastructure/iam/apply.sh $ROLE_NAME"
+  exit 1
+fi
 
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 echo "  Role ARN: $ROLE_ARN"
-echo "  Inline policy is codified in infrastructure/iam/${ROLE_NAME}.json"
-echo "  Apply via: ./infrastructure/iam/apply.sh $ROLE_NAME"
+echo "  Role + inline policy + trust are codified in nous-ergon-ops/infrastructure/iam/${ROLE_NAME}/"
+echo "  Apply via (in nous-ergon-ops): infrastructure/iam/apply.sh $ROLE_NAME"
 
 # ── 3. State Machine — SINGLE-WRITER CONTRACT (config#2273) ────────────────
 #
@@ -274,30 +275,35 @@ echo "  State machine ARN: $SM_ARN"
 # sfn-role.json's states:StartExecution grant covering both state
 # machines), so the trust policy must list both services rather than
 # splitting into per-trigger roles.
+#
+# config#2826: read from the version-tracked infrastructure/iam/ snapshot
+# rather than an inline literal, so this bootstrap and
+# deploy-infrastructure.sh's own step 3b re-assertion read the exact same
+# document and can never drift apart.
 
 EB_ROLE_NAME="alpha-engine-eventbridge-sfn-role"
-EB_TRUST='{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {"Service": ["events.amazonaws.com", "scheduler.amazonaws.com"]},
-      "Action": "sts:AssumeRole"
-    }
-  ]
-}'
 
-aws iam create-role \
-  --role-name "$EB_ROLE_NAME" \
-  --assume-role-policy-document "$EB_TRUST" \
-  --region "$REGION" 2>/dev/null || \
-aws iam update-assume-role-policy \
-  --role-name "$EB_ROLE_NAME" \
-  --policy-document "$EB_TRUST" \
-  --region "$REGION"
+# Same ownership change as the $ROLE_NAME block above: verify, never create or
+# rewrite. Both principals must be present — EventBridge Scheduler validates
+# RoleArn assumability at CreateSchedule time (#816), and a trust document
+# missing scheduler.amazonaws.com surfaces only as a mid-apply CFN rollback.
+# Principal.Service is a string for one principal and a list for several, so the
+# raw JSON is matched rather than a fixed shape.
+EB_TRUST_DOC="$(aws iam get-role --role-name "$EB_ROLE_NAME" \
+  --query 'Role.AssumeRolePolicyDocument' --output json --region "$REGION" 2>/dev/null || true)"
+EB_TRUST_MISSING=()
+for principal in events.amazonaws.com scheduler.amazonaws.com; do
+  printf '%s' "$EB_TRUST_DOC" | grep -q "\"$principal\"" || EB_TRUST_MISSING+=("$principal")
+done
+if [ ${#EB_TRUST_MISSING[@]} -gt 0 ]; then
+  echo "  ERROR: $EB_ROLE_NAME trust policy missing (or role absent): ${EB_TRUST_MISSING[*]}"
+  echo "         IAM is owned by nous-ergon-ops (infrastructure-ownership-policy.md §35)."
+  echo "         Remediate there: infrastructure/iam/apply.sh trust-policy $EB_ROLE_NAME"
+  exit 1
+fi
 
 echo "  EventBridge rule + targets: managed by CFN orchestration template"
-echo "  EventBridge IAM role bootstrap: $EB_ROLE_NAME (idempotent; trusts events.amazonaws.com + scheduler.amazonaws.com)"
+echo "  EventBridge IAM role: $EB_ROLE_NAME verified (trusts events.amazonaws.com + scheduler.amazonaws.com)"
 
 # ── 5. Disable old crons (optional) ────────────────────────────────────────
 

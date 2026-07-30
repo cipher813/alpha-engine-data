@@ -48,10 +48,16 @@ class _SpotCapacityExhausted(_SpotLaunchError):
     pass
 
 
+class _SpotQuotaExceededError(_SpotLaunchError):
+    """config#2698 — account-wide spot quota (e.g. MaxSpotInstanceCountExceeded),
+    distinct from ordinary per-pool capacity exhaustion."""
+
+
 def _install_stubs(launch_impl, boto_clients):
     ec2_spot_mod = types.ModuleType("nousergon_lib.ec2_spot")
     ec2_spot_mod.SpotLaunchError = _SpotLaunchError
     ec2_spot_mod.SpotCapacityExhausted = _SpotCapacityExhausted
+    ec2_spot_mod.SpotQuotaExceededError = _SpotQuotaExceededError
     ec2_spot_mod.launch = launch_impl
     sys.modules["nousergon_lib.ec2_spot"] = ec2_spot_mod
 
@@ -235,29 +241,38 @@ def test_valid_event_launches_spot_and_sends_async_ssm(monkeypatch):
     # ride the SAME RunInstances call as the launch itself (extra_tags), not
     # a separate post-launch create_tags call — used by both the concurrency
     # guard AND the fleet spot-orphan-reaper's completion check.
-    assert calls["extra_tags"] == {
-        "sf-watch-cadence": "saturday",
-        "sf-watch-pipeline": "ne-weekly-freshness-pipeline",
-        "sf-watch-run-date": "2026-07-11",
-    }
+    # I5751/I5727: launch_with_fallback tags every launch with
+    # LaunchMarket/LaunchReason, so assert the caller's own tags by key
+    # rather than exact-dict equality — the contract is "these tags ride
+    # RunInstances", never "nothing else may".
+    assert calls["extra_tags"]["sf-watch-cadence"] == "saturday"
+    assert calls["extra_tags"]["sf-watch-pipeline"] == "ne-weekly-freshness-pipeline"
+    assert calls["extra_tags"]["sf-watch-run-date"] == "2026-07-11"
+    assert calls["extra_tags"]["LaunchMarket"] == "spot"
+    assert calls["extra_tags"]["LaunchReason"] == "spot_ok"
     assert idx._test_ec2.terminated == []
     sent = idx._test_ssm.sent[0]
     cmd = sent["Parameters"]["commands"][0]
-    # sf_watch_spot_bootstrap.sh (alpha-engine-config) takes its SF fields as
-    # CLI FLAGS, not env vars.
-    assert "exec bash infrastructure/sf_watch_spot_bootstrap.sh" in cmd
-    assert '--pipeline "ne-weekly-freshness-pipeline"' in cmd
-    assert '--cadence-slug "saturday"' in cmd
-    assert '--execution-arn "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:run-1"' in cmd
-    assert '--run-date "2026-07-11"' in cmd
-    assert '--failed-state "RationaleClustering"' in cmd
-    assert '--watch-log-key "consolidated/saturday_sf_watch/2026-07-11.json"' in cmd
-    assert '--is-preflight "false"' in cmd
+    # Cut over to the unified artifact (EPIC config-I4992 step 4): the SF
+    # fields cross as ENV, because that is what the unified bootstrap reads.
+    assert "exec bash infrastructure/overseer_spot_bootstrap.sh --playbook sf-watch" in cmd
+    assert "sf_watch_spot_bootstrap.sh" not in cmd
+    assert 'export SF_PIPELINE="ne-weekly-freshness-pipeline"' in cmd
+    assert 'export SF_CADENCE_SLUG="saturday"' in cmd
+    assert 'export SF_EXECUTION_ARN="arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:run-1"' in cmd
+    assert 'export SF_RUN_DATE="2026-07-11"' in cmd
+    assert 'export SF_FAILED_STATE="RationaleClustering"' in cmd
+    assert 'export SF_WATCH_LOG_KEY="consolidated/saturday_sf_watch/2026-07-11.json"' in cmd
+    assert 'export SF_IS_PREFLIGHT="false"' in cmd
     assert "export HOME=/root" in cmd
-    # cause is base64-encoded, never raw, in the constructed shell command.
+    assert "--pipeline" not in cmd and "--cadence-slug" not in cmd
+    # The cause stays BASE64 across the boundary — it is arbitrary SF failure
+    # text and this command is an f-string. The unified bootstrap decodes
+    # SF_CAUSE_B64 into SF_CAUSE (alpha-engine-config-PR5563).
     expected_b64 = base64.b64encode(b"States.Timeout").decode("ascii")
-    assert f'--cause-b64 "{expected_b64}"' in cmd
+    assert f'export SF_CAUSE_B64="{expected_b64}"' in cmd
     assert "States.Timeout" not in cmd
+    assert "export SF_CAUSE=" not in cmd
     # run_token is NOT threaded into the box (no in-box consumer — the
     # completion marker keys directly on cadence/pipeline/run_date) — only a
     # Lambda-side correlation id, surfaced via the SSM Comment field instead.
@@ -280,7 +295,7 @@ def test_cause_with_shell_metacharacters_is_safely_base64_encoded(monkeypatch):
     assert "curl evil.example" not in cmd
     assert "whoami" not in cmd
     expected_b64 = base64.b64encode(dangerous_cause.encode("utf-8")).decode("ascii")
-    assert f'--cause-b64 "{expected_b64}"' in cmd
+    assert f'export SF_CAUSE_B64="{expected_b64}"' in cmd
 
 
 def test_on_demand_fallback_on_spot_capacity_exhaustion(monkeypatch):
@@ -488,7 +503,7 @@ def test_deferred_invocation_latest_failed_launches_against_newest_execution_arn
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
     # The dispatch was RETARGETED at the newest failed execution — the
     # originally-reported run-1 may be stale by the time the defer fires.
-    assert f'--execution-arn "{newest}"' in cmd
+    assert f'export SF_EXECUTION_ARN="{newest}"' in cmd
     assert 'run-1"' not in cmd
 
 
@@ -597,7 +612,7 @@ def test_empty_watch_log_key_is_synthesized_from_pipeline_prefix(monkeypatch):
     out = idx.handler(_event(watch_log_key=""), _FakeContext())
     assert out["launched"] is True
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
-    assert '--watch-log-key "consolidated/saturday_sf_watch/2026-07-11.json"' in cmd
+    assert 'export SF_WATCH_LOG_KEY="consolidated/saturday_sf_watch/2026-07-11.json"' in cmd
 
 
 def test_empty_watch_log_key_unknown_pipeline_dispatches_without_key(monkeypatch):
@@ -615,7 +630,7 @@ def test_empty_watch_log_key_unknown_pipeline_dispatches_without_key(monkeypatch
     # dispatches, with the flag empty.
     assert out["launched"] is True
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
-    assert '--watch-log-key ""' in cmd
+    assert 'export SF_WATCH_LOG_KEY=""' in cmd
 
 
 def test_malformed_defer_generation_returns_clean_false(monkeypatch):
@@ -848,7 +863,7 @@ def test_disabled_flag_short_circuits(monkeypatch):
 def test_deploy_sh_launch_config_pins_match_index_defaults(monkeypatch):
     """LOCKSTEP GUARD (config#2265): deploy.sh pins SF_WATCH_AMI_ID /
     SF_WATCH_SECURITY_GROUP / SF_WATCH_SUBNETS into the deployed Lambda env —
-    the observable source of truth sf-watch-liveness-probe reads to verify the
+    the observable source of truth sf-watch-reclaim-sweep-handler reads to verify the
     launch config (AMI/SG/subnets) still exists twice daily. The pins MUST
     equal this module's own in-code defaults, or the probe would verify a
     DIFFERENT launch config than the one an env-stripped dispatcher would
@@ -923,17 +938,21 @@ def test_drill_event_launches_with_drill_scoped_run_date_and_drill_tag(monkeypat
     # Tags: the normal discriminator triple (run_date drill-scoped) PLUS the
     # drill marker tag fleet consumers filter on — all riding the SAME
     # RunInstances call as the launch (config#2292 root fix).
-    assert calls["extra_tags"] == {
-        "sf-watch-cadence": "saturday",
-        "sf-watch-pipeline": "ne-weekly-freshness-pipeline",
-        "sf-watch-run-date": drill_date,
-        "sf-watch-drill": "true",
-    }
+    # I5751/I5727: launch_with_fallback tags every launch with
+    # LaunchMarket/LaunchReason, so assert the caller's own tags by key
+    # rather than exact-dict equality — the contract is "these tags ride
+    # RunInstances", never "nothing else may".
+    assert calls["extra_tags"]["sf-watch-cadence"] == "saturday"
+    assert calls["extra_tags"]["sf-watch-pipeline"] == "ne-weekly-freshness-pipeline"
+    assert calls["extra_tags"]["sf-watch-run-date"] == drill_date
+    assert calls["extra_tags"]["sf-watch-drill"] == "true"
+    assert calls["extra_tags"]["LaunchMarket"] == "spot"
+    assert calls["extra_tags"]["LaunchReason"] == "spot_ok"
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
-    assert '--is-drill "true"' in cmd
-    assert f'--run-date "{drill_date}"' in cmd
+    assert 'export SF_IS_DRILL="true"' in cmd
+    assert f'export SF_RUN_DATE="{drill_date}"' in cmd
     # The synthesized watch_log_key is drill-scoped too (never a real key).
-    assert f'--watch-log-key "consolidated/saturday_sf_watch/{drill_date}.json"' in cmd
+    assert f'export SF_WATCH_LOG_KEY="consolidated/saturday_sf_watch/{drill_date}.json"' in cmd
 
 
 def test_drill_run_date_is_synthesized_never_taken_from_payload(monkeypatch):
@@ -946,7 +965,7 @@ def test_drill_run_date_is_synthesized_never_taken_from_payload(monkeypatch):
     assert out["launched"] is True
     assert out["run_date"] == _expected_drill_run_date()
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
-    assert '--run-date "2026-07-11"' not in cmd
+    assert 'export SF_RUN_DATE="2026-07-11"' not in cmd
 
 
 def test_drill_run_date_can_never_collide_with_a_real_run_date(monkeypatch):
@@ -1018,4 +1037,4 @@ def test_non_drill_dispatch_carries_no_drill_tag_and_is_drill_false(monkeypatch)
     assert out["is_drill"] is False
     assert "sf-watch-drill" not in calls["extra_tags"]
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
-    assert '--is-drill "false"' in cmd
+    assert 'export SF_IS_DRILL="false"' in cmd

@@ -223,6 +223,90 @@ class TestSingleTickerIngest:
         embed.assert_not_called()
 
 
+# ── external_id dedup (config#2957) ─────────────────────────────────────
+
+
+class TestExternalIdDedup:
+    def test_document_exists_called_with_external_id(self):
+        """config#2957: document_exists_fn must be called with the
+        article's canonical_fingerprint as external_id so per-article
+        (not just per-day) dedup is possible."""
+        article = _make_article(fingerprint="fp-xyz", tickers=("AAPL",))
+        exists = MagicMock(return_value=False)
+        ingest_articles(
+            [article],
+            filed_date=date(2026, 5, 13),
+            embed_texts_fn=MagicMock(return_value=[[0.0]]),
+            document_exists_fn=exists,
+            ingest_document_fn=MagicMock(return_value="doc"),
+        )
+        exists.assert_called_once_with("AAPL", "news", date(2026, 5, 13), "news_polygon", "fp-xyz")
+
+    def test_ingest_document_called_with_external_id(self):
+        """config#2957: ingest_document_fn must receive external_id so
+        the new per-article partial unique index actually dedups."""
+        article = _make_article(fingerprint="fp-abc", tickers=("AAPL",))
+        ingest = MagicMock(return_value="doc")
+        ingest_articles(
+            [article],
+            filed_date=date(2026, 5, 13),
+            embed_texts_fn=MagicMock(return_value=[[0.0]]),
+            document_exists_fn=MagicMock(return_value=False),
+            ingest_document_fn=ingest,
+        )
+        assert ingest.call_args.kwargs["external_id"] == "fp-abc"
+
+    def test_two_distinct_same_day_articles_both_attempted_with_different_external_id(self):
+        """config#2957 acceptance: two distinct same-day articles for one
+        ticker/source must each get their own dedup identity — a fake
+        document_exists keyed on (ticker, external_id) (mirroring the new
+        partial unique index) lets BOTH persist instead of the second
+        silently colliding on the old (ticker, source, day)-only key."""
+        a1 = _make_article(fingerprint="fp-1", tickers=("AAPL",), title="Apple headline 1")
+        a2 = _make_article(fingerprint="fp-2", tickers=("AAPL",), title="Apple headline 2")
+
+        seen_external_ids: set[str] = set()
+
+        def fake_exists(ticker, doc_type, filed_date, source, external_id=None):
+            return external_id in seen_external_ids
+
+        def fake_ingest(*, external_id, **kw):
+            seen_external_ids.add(external_id)
+            return f"doc-{external_id}"
+
+        stats = ingest_articles(
+            [a1, a2],
+            filed_date=date(2026, 5, 13),
+            embed_texts_fn=MagicMock(return_value=[[0.0]]),
+            document_exists_fn=fake_exists,
+            ingest_document_fn=fake_ingest,
+        )
+        assert stats["n_documents_ingested"] == 2
+        assert stats["n_documents_skipped_exists"] == 0
+
+    def test_same_article_reingested_dedups_via_external_id(self):
+        """config#2957 acceptance: re-ingesting the SAME article (same
+        fingerprint) still dedups, even against a fake keyed on
+        (ticker, external_id) rather than just (ticker, source, day)."""
+        article = _make_article(fingerprint="fp-same", tickers=("AAPL",))
+        seen_external_ids = {"fp-same"}  # already ingested in a prior run
+        exists = MagicMock(side_effect=lambda t, dt, fd, s, external_id=None: external_id in seen_external_ids)
+        embed = MagicMock()
+        ingest = MagicMock()
+
+        stats = ingest_articles(
+            [article],
+            filed_date=date(2026, 5, 13),
+            embed_texts_fn=embed,
+            document_exists_fn=exists,
+            ingest_document_fn=ingest,
+        )
+        assert stats["n_documents_skipped_exists"] == 1
+        assert stats["n_documents_ingested"] == 0
+        embed.assert_not_called()
+        ingest.assert_not_called()
+
+
 # ── Multi-ticker article ────────────────────────────────────────────────
 
 
@@ -394,3 +478,136 @@ def test_stats_shape_has_canonical_keys():
     assert set(stats.keys()) == expected_keys
     # Empty input → all zero
     assert all(v == 0 for v in stats.values())
+
+
+# ── Batched embeddings (config#2956 deliverable 3) ──────────────────────
+
+
+class TestBatchedEmbeddings:
+    def test_one_embed_call_for_multiple_pending_articles(self):
+        """The N-article batch must call embed_texts_fn ONCE with all N
+        chunk bodies, not once per article (the previous shape)."""
+        a1 = _make_article(fingerprint="a", tickers=("AAPL",), body="Apple body text here.")
+        a2 = _make_article(fingerprint="b", tickers=("MSFT",), body="Microsoft body text here.")
+        a3 = _make_article(fingerprint="c", tickers=("GOOGL",), body="Google body text here.")
+        embed = MagicMock(return_value=[[0.1], [0.2], [0.3]])
+        ingest = MagicMock(side_effect=lambda **kw: f"doc-{kw['ticker']}")
+
+        stats = ingest_articles(
+            [a1, a2, a3],
+            filed_date=date(2026, 5, 13),
+            embed_texts_fn=embed,
+            document_exists_fn=MagicMock(return_value=False),
+            ingest_document_fn=ingest,
+        )
+
+        embed.assert_called_once()
+        (texts_arg,), _ = embed.call_args
+        assert len(texts_arg) == 3
+        assert stats["n_documents_ingested"] == 3
+        assert ingest.call_count == 3
+
+    def test_each_document_gets_its_own_embedding_by_position(self):
+        """Batched embeddings must map back to the correct document by
+        list position, not get mixed up across articles."""
+        a1 = _make_article(fingerprint="a", tickers=("AAPL",), body="Apple body text here.")
+        a2 = _make_article(fingerprint="b", tickers=("MSFT",), body="Microsoft body text here.")
+        embed = MagicMock(return_value=[["embA"], ["embB"]])
+        ingest = MagicMock(return_value="doc-id")
+
+        ingest_articles(
+            [a1, a2],
+            filed_date=date(2026, 5, 13),
+            embed_texts_fn=embed,
+            document_exists_fn=MagicMock(return_value=False),
+            ingest_document_fn=ingest,
+        )
+
+        calls_by_ticker = {c.kwargs["ticker"]: c.kwargs["chunks"][0]["embedding"] for c in ingest.call_args_list}
+        assert calls_by_ticker["AAPL"] == ["embA"]
+        assert calls_by_ticker["MSFT"] == ["embB"]
+
+    def test_skipped_existing_documents_excluded_from_embed_batch(self):
+        """document_exists-skipped articles must not be embedded at all —
+        the batch only covers documents that will actually be ingested."""
+        a1 = _make_article(fingerprint="a", tickers=("AAPL",), body="Apple body text here.")
+        a2 = _make_article(fingerprint="b", tickers=("MSFT",), body="Microsoft body text here.")
+        embed = MagicMock(return_value=[["embA"]])
+        exists = MagicMock(side_effect=lambda ticker, *a: ticker == "MSFT")
+
+        stats = ingest_articles(
+            [a1, a2],
+            filed_date=date(2026, 5, 13),
+            embed_texts_fn=embed,
+            document_exists_fn=exists,
+            ingest_document_fn=MagicMock(return_value="doc"),
+        )
+
+        (texts_arg,), _ = embed.call_args
+        assert len(texts_arg) == 1
+        assert stats["n_documents_skipped_exists"] == 1
+        assert stats["n_documents_ingested"] == 1
+
+    def test_no_embed_call_when_nothing_pending(self):
+        """dry_run / all-skipped batches must not call the embedder at
+        all (empty batch short-circuit)."""
+        article = _make_article(tickers=("AAPL",))
+        embed = MagicMock()
+
+        ingest_articles(
+            [article],
+            filed_date=date(2026, 5, 13),
+            embed_texts_fn=embed,
+            document_exists_fn=MagicMock(return_value=True),  # already exists
+            ingest_document_fn=MagicMock(),
+        )
+
+        embed.assert_not_called()
+
+    def test_batch_level_embed_failure_counts_all_pending_as_failures(self):
+        """A single batched embed call failing (e.g. Voyage API outage)
+        must fail soft — count every pending document as a failure and
+        NOT raise, rather than crashing the whole ingest run."""
+        a1 = _make_article(fingerprint="a", tickers=("AAPL",), body="Apple body text here.")
+        a2 = _make_article(fingerprint="b", tickers=("MSFT",), body="Microsoft body text here.")
+        embed = MagicMock(side_effect=RuntimeError("voyage API down"))
+        ingest = MagicMock()
+
+        stats = ingest_articles(
+            [a1, a2],
+            filed_date=date(2026, 5, 13),
+            embed_texts_fn=embed,
+            document_exists_fn=MagicMock(return_value=False),
+            ingest_document_fn=ingest,
+        )
+
+        assert stats["n_failures"] == 2
+        assert stats["n_documents_ingested"] == 0
+        ingest.assert_not_called()
+
+    def test_per_document_ingest_failure_still_isolated_after_batching(self):
+        """Batching the embed call must not weaken per-document ingest
+        failure isolation — one bad ingest_document call still doesn't
+        drop the rest of the batch."""
+        a1 = _make_article(fingerprint="a", tickers=("AAPL",), body="Apple body text here.")
+        a2 = _make_article(fingerprint="b", tickers=("MSFT",), body="Microsoft body text here.")
+        a3 = _make_article(fingerprint="c", tickers=("GOOGL",), body="Google body text here.")
+
+        def ingest_side_effect(*, ticker, **kw):
+            if ticker == "MSFT":
+                raise RuntimeError("pgvector temporary failure")
+            return f"doc-{ticker}"
+
+        embed = MagicMock(return_value=[[0.0], [0.0], [0.0]])
+        ingest = MagicMock(side_effect=ingest_side_effect)
+
+        stats = ingest_articles(
+            [a1, a2, a3],
+            filed_date=date(2026, 5, 13),
+            embed_texts_fn=embed,
+            document_exists_fn=MagicMock(return_value=False),
+            ingest_document_fn=ingest,
+        )
+        assert stats["n_documents_ingested"] == 2
+        assert stats["n_failures"] == 1
+        embed.assert_called_once()

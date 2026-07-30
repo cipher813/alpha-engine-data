@@ -47,6 +47,42 @@ demand-all path always did (`_write_trigger_record`); an enumeration FAILURE
 now writes one too (config-I2540), so a missing record unambiguously means
 the scheduler never invoked this Lambda.
 
+DeepSeek quota-fallback direct invoke (3-repo feature): the on-box quota
+classifier above can now, on wind-down, invoke THIS SAME Lambda directly via
+`lambda:InvokeFunction` (never EventBridge) with
+`{"mode": "fallback", "tier": "<low|mid|high>"}` to launch exactly one
+replacement box for that tier running the DeepSeek backend
+(`GROOM_BACKEND=deepseek`) instead of retrying Claude — see
+`_handle_fallback_dispatch`. Reuses `_launch_groom_spot` verbatim (same
+concurrency guard, daily ceiling, spot/on-demand + SSM mechanics); the
+DeepSeek tier->model mapping (`nousergon_lib.groom_eligibility.
+FALLBACK_TIER_MODELS`) is consumed on-box, not by this Lambda.
+
+DeepSeek PRIMARY-mode backend selection (alpha-engine-config-I3479, Brian
+ruling 2026-07-22): distinct from the quota-FALLBACK leg above — that one is
+a rescue for an already-in-flight Claude run hitting mid-run quota
+exhaustion; THIS is a pre-planned routing decision made at scheduled-dispatch
+time, before any Claude attempt, for the low/mid tiers moving off the Claude
+Max plan onto direct DeepSeek. Governed by `GROOM_PRIMARY_DEEPSEEK_TIERS`
+(env, comma-separated tier names, unset/empty = feature fully OFF — ships
+this way): `_primary_backend_for()` returns `GROOM_BACKEND_DEEPSEEK` iff the
+env set is non-empty AND every tier in a launch's bundle is a member of it,
+so a bundle containing "high" (e.g. a high+mid attach-upward bundle) always
+stays on Claude — high remains on the Max plan by ruling. Applied at the
+three scheduled-dispatch entry points that decide a bundle's tiers: the
+demand-all per-launch loop, the single-tier demand-gate path, and threaded
+through the decide_only -> launch_decided SF round-trip (the Map state's
+`States.JsonMerge` passes each decide-time entry dict — including an
+additive `backend` key when present — through to the launch_decided
+invocation WHOLESALE, so no ASL change was needed). Sweep-mode and the
+quota-fallback `mode=fallback` leg are UNCHANGED by this feature. Reuses the
+SAME `GROOM_BACKEND=deepseek` on-box contract the fallback leg already
+established: alpha-engine-config-PR3487's bootstrap OVERRIDES `GROOM_MODEL`
+from its own `FALLBACK_TIER_MODELS` mirror (deepest tier of the bundle) when
+`GROOM_BACKEND=deepseek` — this Lambda's `model`/`GROOM_MODEL` stays a
+Claude-side default/pass-through in the PRIMARY case too, never a DeepSeek
+model id this Lambda selects itself.
+
 Managed OUTSIDE CloudFormation (same as before): operator-deployed via
 `deploy.sh --bootstrap`. Merging the PR has ZERO live effect until the new code +
 IAM are deployed AND the GHA `schedule:` crons are disabled (the gated cutover).
@@ -65,6 +101,7 @@ from zoneinfo import ZoneInfo
 import boto3
 from flow_doctor_telegram import notify_via_flow_doctor
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from nousergon_lib import groom_eligibility as ge
@@ -78,28 +115,125 @@ REGION = os.environ.get("AWS_REGION", "us-east-1")
 _FLOW_NAME = "scheduled-groom-dispatcher"
 _DB_BASENAME = "flow_doctor_scheduled_groom_dispatcher"
 _GROOM_LIFECYCLE_TOPICS = (FleetTelegramTopic.GROOM,)
+
+# ── Cycle-level lifecycle rail (2026-07-28 operator ruling) ───────────────────
+# The groom's terminal reporting used to live exclusively on the BOX: groom_run.sh
+# emits ONLINE/FINISHED/WOUND-DOWN pings at severity=info, which
+# FleetTelegramTopic.GROOM's canonical spec delivers to #groom with
+# disable_notification=True. Two consequences, both confirmed live 2026-07-28:
+#
+#   1. A completion ping is delivered but never BUZZES, so the operator
+#      experiences "start + errors only" even though a FINISHED message exists.
+#   2. More seriously, a per-box trap structurally cannot report a box that
+#      never reached it. On the 12:00Z cycle all three lanes' spot boxes were
+#      reclaimed instance-terminated-no-capacity at 12:02Z; ZERO notifications
+#      fired on any rail and the SF sat in TaskSubmitted for four hours
+#      (config-I4987/I4989). GroomDispatchComplete is a bare Succeed — cycle
+#      completion had no notifier anywhere.
+#
+# The fix is to report from the ORCHESTRATOR, which survives the box's death:
+# one buzzing STARTED per trigger and one buzzing COMPLETE roll-up naming every
+# lane's terminal state. Deliberately CYCLE-level, not per-lane — un-silencing
+# the ~18 per-box pings/day is how the 11-day alert-fatigue outage happened.
+# Per-box pings keep their existing silent-in-topic posture untouched.
+#
+# Distinct flow_name is REQUIRED, not cosmetic: flow_doctor_telegram caches the
+# built config by flow_name, so sharing one with the silent rail would serve
+# whichever posture initialized first.
+_CYCLE_FLOW_NAME = "backlog-groom-cycle"
+_CYCLE_DB_BASENAME = "flow_doctor_backlog_groom_cycle"
+# Mirrors the override groom_flow_doctor_notify.py:96-98 open-codes on the box
+# rail — the canonical GROOM spec is info-only/silent, and a severity above
+# `info` sent against it is DROPPED rather than merely silenced.
+_CYCLE_NOTIFIER_OVERRIDES = {
+    "notify_on": ["info", "warning", "error", "critical"],
+    "disable_notification": False,
+}
+
 # Kill-switch: GROOM_DISPATCH_ENABLED=false disables the trigger without deleting
 # the EventBridge Scheduler rules. Default ON.
 DISPATCH_ENABLED = os.environ.get("GROOM_DISPATCH_ENABLED", "true").lower() == "true"
+
+# config#3173 — mechanical per-day dispatch ceiling, generalizing the
+# config#2269 sf-watch pattern to groom. Groom already has TWO of the three
+# arc-continuity legs the config#3137 charter asks for: a box that dies
+# mid-run auto-relaunches up to config#1645's bounded retry (escalating loud
+# on exhaustion), and a trigger that never fires at all is caught by the
+# overseer-liveness-probe's run_window check reading this same
+# groom/decisions/{date}/ ledger (config#2667). The missing leg is THIS one:
+# an outermost runaway backstop bounding TOTAL launches/day across every
+# trigger + relaunch + sweep, so a broken EventBridge rule or a relaunch loop
+# gone wrong can't spot-cycle indefinitely. Default 40 is a conservative
+# multiple of the observed legitimate ceiling (3 daily cron slots x up to 3
+# co-launched tiers x up to 3 attempts each [1 + config#1645's 2 relaunches],
+# plus 3 sweep boxes x 3 attempts = ~36/day worst case under a genuinely bad
+# AWS day) — NOT a Brian-ruled number like sf-watch's config#2269 values;
+# tune via this env var in a follow-up PR if real volume needs it. Fails
+# LOUD (raises) on a ledger-count read error, mirroring this function's
+# existing fail-loud posture — silently failing open here would risk masking
+# a genuine runaway on the exact day S3 also hiccups.
+GROOM_MAX_DISPATCHES_DAILY = int(os.environ.get("GROOM_MAX_DISPATCHES_DAILY", "40"))
 
 # config#1933 demand-driven dispatch: enumerate actionable issues per tier
 # BEFORE any spot spend and launch only when the slot's queue (own tier +
 # starving lower tiers) clears the floor or an escape valve fires. Kill-switch
 # independent of GROOM_DISPATCH_ENABLED — flipping this off restores the
 # legacy unconditional slot launches without touching schedules.
+#
+# config-I3227 (2026-07-21): the enumeration ALSO counts org-wide OPEN PRs
+# labeled ge.RULING_PENDING_LABEL ("ruling:pending-exec" — config-I3199,
+# folded into groom_driver.py's on-box tier queues by config#3210) into these
+# same per-tier totals — see _enumerate_ruling_pending_prs. Before this, a
+# backlog of ruled PRs alone could never clear a tier's floor or trip the
+# anti-starvation escape valve (they contributed ZERO demand), so they only
+# ever got worked when unrelated issue demand happened to launch a run.
 DEMAND_GATE_ENABLED = os.environ.get("GROOM_DEMAND_GATE_ENABLED", "true").lower() == "true"
 BACKLOG_REPOS = (
     "nousergon/alpha-engine-config", "nousergon/metron-ops",
     "nousergon/vires-ops", "nousergon/telos-ops",
 )
+# config-I3227: the org this Lambda's PR enumeration searches org-wide. Never
+# a hardcoded repo list (config#2294 precedent — see alpha-engine-config's
+# scripts/groom_driver.py::open_prs()/gh_repo_enum.search_prs_org_wide, which
+# _enumerate_ruling_pending_prs below mirrors but does not import — that
+# repo's scripts/ package is not a dependency of this Lambda).
+_GH_ORG = "nousergon"
 _RESEARCH_BUCKET = "alpha-engine-research"
 
 # ── Spot launch config (env-overridable; defaults mirror spot_data_weekly.sh) ──
-# t3/t3a/t2 .medium (4 GB) across all 6 default-VPC subnets; the lib CLI rotates
-# on capacity error. Cheap-first type order biases pool selection toward price.
+# t4g .medium/.large (arm64/Graviton) across all 6 default-VPC subnets; the lib
+# CLI rotates on capacity error. Cheap-first type order biases toward price.
+# Graviton is ~20% cheaper than the prior t3.medium at equal perf and the Compute
+# Savings Plan (instance-family-agnostic) already covers it — cost-I2864. CRITICAL:
+# every type here MUST be arm64 to match the arm64 AMI below — an arm64 AMI will
+# not boot on an x86 instance type (and vice-versa).
+# alpha-engine-config-I4989. The pool was `t4g.medium,t4g.large` — two types,
+# but ONE instance family, so effectively one spot capacity pool. Measured
+# 2026-07-30 20:00 UTC: all three lanes reclaimed
+# (`instance-terminated-no-capacity`) at the SAME SECOND, 6.5 minutes in,
+# taking out the whole cycle. Two types in one family is diversification in
+# name only.
+#
+# HARD CONSTRAINT: GROOM_AMI_ID is arm64 (Amazon Linux 2023 Graviton), and one
+# AMI serves one architecture — so x86 types CANNOT be added here without a
+# second AMI and an architecture-aware selection step. The widening therefore
+# stays arm64 and spans FAMILIES and GENERATIONS instead, which is what
+# actually separates capacity pools:
+#
+#   t4g  burstable      (current; CPU-credit throttling under sustained load)
+#   c6g/c7g  compute    2 vCPU / 4 GiB at .large — same shape as t4g.medium,
+#                       without the credit ceiling
+#   m6g/m7g  general    2 vCPU / 8 GiB at .large — headroom for agent runs
+#
+# All entries are >= 4 GiB, the floor a groom agent run needs. Override via
+# GROOM_INSTANCE_TYPES; anything added must be arm64 or the launch will fail
+# the AMI architecture check.
 INSTANCE_TYPES = [
     t.strip()
-    for t in os.environ.get("GROOM_INSTANCE_TYPES", "t3.medium,t3a.medium,t2.medium").split(",")
+    for t in os.environ.get(
+        "GROOM_INSTANCE_TYPES",
+        "t4g.medium,c6g.large,c7g.large,m6g.large,m7g.large,t4g.large",
+    ).split(",")
     if t.strip()
 ]
 SUBNETS = [
@@ -111,7 +245,7 @@ SUBNETS = [
     ).split(",")
     if s.strip()
 ]
-AMI_ID = os.environ.get("GROOM_AMI_ID", "ami-0c421724a94bba6d6")  # Amazon Linux 2023 x86_64
+AMI_ID = os.environ.get("GROOM_AMI_ID", "ami-02e447f4c654c7179")  # Amazon Linux 2023 arm64/Graviton (cost-I2864)
 KEY_NAME = os.environ.get("GROOM_KEY_NAME", "alpha-engine-key")
 SECURITY_GROUP = os.environ.get("GROOM_SECURITY_GROUP", "sg-03cd3c4bd91e610b0")
 IAM_PROFILE = os.environ.get("GROOM_IAM_PROFILE", "alpha-engine-executor-profile")
@@ -121,9 +255,33 @@ GROOM_REPO = os.environ.get("GROOM_REPO", "nousergon/alpha-engine-config")
 GROOM_BRANCH = os.environ.get("GROOM_BRANCH", "main")
 # The BOX reads the PAT via its instance profile (this Lambda does not).
 GROOM_GH_PAT_SSM = os.environ.get("GROOM_GH_PAT_SSM", "/alpha-engine/saturday_sf_watch/github_pat")
-# Hard ceiling for the on-box SSM command (matches the bootstrap watchdog). The
-# in-run soft budget (~340 min) is the binding stop; this is the backstop.
-MAX_RUNTIME_SECONDS = int(os.environ.get("GROOM_MAX_RUNTIME_SECONDS", "21600"))
+# ONE authoritative runtime bound for a lane (groom-sweep-policy §2.1: "where
+# two mechanisms bound the same thing, the TIGHTER one is the real budget
+# regardless of intent").
+#
+# Measured 2026-07-30, three copies that did NOT agree:
+#
+#   SF LaunchGroomSpot TimeoutSeconds  10800s (180 min)  <- tightest, the REAL budget
+#   this constant                      21600s (360 min)  -> SSM command timeout
+#                                                        -> the reconciler's deadline_utc
+#   groom_spot_bootstrap.sh watchdog   21600s (360 min)  -> the box's own kill
+#
+# The comment above this line claimed it "matches the bootstrap watchdog" — it
+# did, and both were wrong, because the SF had been tightened to 180 min
+# without them. The consequence is not cosmetic: the SF gives up on the lane at
+# 180 min and fires a relaunch while the ORIGINAL box is still working for
+# another three hours, and the relaunch's concurrent-tier guard then refuses
+# because that box is alive. That is exactly the alpha-engine-config-I4987
+# no-op relaunch, manufactured on a timer.
+#
+# The reconciler was mis-armed the same way: its deadline_utc was now + 360 min,
+# so a lane the SF had already abandoned would not read as overdue for another
+# three hours.
+#
+# 10800 is therefore the value, and it is BOUND to the SF definition by
+# test_runtime_bound_is_single_and_authoritative — both files live in this
+# repo, so the binding is enforceable rather than aspirational.
+MAX_RUNTIME_SECONDS = int(os.environ.get("GROOM_MAX_RUNTIME_SECONDS", "10800"))
 SSM_ONLINE_BUDGET_SEC = int(os.environ.get("GROOM_SSM_ONLINE_BUDGET_SEC", "180"))
 CW_LOG_GROUP = os.environ.get("GROOM_CW_LOG_GROUP", "/alpha-engine/groom-spot")
 
@@ -138,13 +296,82 @@ _DEFAULT_RUN_MODE = "full"
 # structurally closed.
 _VALID_ISSUE_FILTERS = set(ge.VALID_ISSUE_FILTERS)
 _DEFAULT_ISSUE_FILTER = "mid-only"
-_DEFAULT_MODEL = "claude-sonnet-5"
+_DEFAULT_MODEL = "deepseek-v4-pro"
 # Defense-in-depth allowlist for the model id (embedded verbatim into the SSM
 # shell command below) — model ids are Lambda-config-controlled, not raw user
 # input, but this is cheap and rules out shell-metacharacter injection outright.
 _MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
+# ── Quota-fallback direct-invoke dispatch (3-repo feature, this is the
+# Lambda-side leg) ────────────────────────────────────────────────────────
+# When an on-box groom run hits mid-run Claude-quota exhaustion, it winds down
+# cleanly (existing config#1803 behavior, UNCHANGED) and then invokes THIS
+# Lambda directly via `lambda:InvokeFunction` — bypassing EventBridge Scheduler
+# entirely — with a payload shaped `{"mode": "fallback", "tier": "<low|mid|
+# high>"}`. `mode` is not a key any of the 3 live SCHED_INPUTS (deploy.sh) or
+# any other invocation shape in this handler (decide_only/launch_decided/
+# demand-all/legacy) ever sets, so this is a purely additive discriminator —
+# it can never intercept a real cron/SF-driven invocation.
+# `GROOM_BACKEND=deepseek` is threaded through the SAME `_launch_groom_spot`
+# call every other path uses (no duplicated launch/SSM code) so the box runs
+# the DeepSeek fallback provider. The tier -> DeepSeek-model mapping
+# (`nousergon_lib.groom_eligibility.FALLBACK_TIER_MODELS`, a sibling PR) is
+# consumed on-box by alpha-engine-config's groom_spot_bootstrap.sh /
+# groom_driver.py — this Lambda does not import or reference that dict.
+_VALID_FALLBACK_TIERS = set(ge.TIERS)  # {"low", "mid", "high"}
+GROOM_BACKEND_DEEPSEEK = "deepseek"
 
+# ── PRIMARY-mode DeepSeek selection for SCHEDULED dispatch (alpha-engine-
+# config-I3479, Brian ruling 2026-07-22) ────────────────────────────────────
+# Comma-separated tier names (e.g. "low,mid"). Unset/empty (the SHIPPED
+# default) means this feature is fully OFF — every scheduled-dispatch path
+# below computes `backend=None` for every bundle and behaves byte-identically
+# to pre-PRIMARY-mode code. Armed by setting this on the Lambda (see deploy.sh
+# for why the value must be pinned there, not just set live via console/CLI).
+GROOM_PRIMARY_DEEPSEEK_TIERS = {
+    t.strip()
+    for t in os.environ.get("GROOM_PRIMARY_DEEPSEEK_TIERS", "").split(",")
+    if t.strip()
+}
+_unknown_primary_tiers = GROOM_PRIMARY_DEEPSEEK_TIERS - set(ge.TIERS)
+if _unknown_primary_tiers:
+    logger.warning(
+        "GROOM_PRIMARY_DEEPSEEK_TIERS contains unrecognized tier name(s) %s "
+        "(valid: %s) — these can never match a launch bundle and are "
+        "effectively inert; check for a typo",
+        sorted(_unknown_primary_tiers), sorted(ge.TIERS),
+    )
+
+
+def _primary_backend_for(tiers) -> str | None:
+    """PRIMARY-mode DeepSeek selection (alpha-engine-config-I3479): returns
+    ``GROOM_BACKEND_DEEPSEEK`` iff ``GROOM_PRIMARY_DEEPSEEK_TIERS`` is armed
+    (non-empty) AND every tier in this launch's bundle is a member of it —
+    else ``None`` (the unchanged Claude path). A bundle containing a tier
+    NOT in the armed set therefore stays on Claude: the env var controls
+    exactly which tiers use DeepSeek primary, and "any-foreign-tier-blocks-
+    the-whole-bundle" means a mixed bundle can never split backends mid-box
+    (one box, one provider). As of 2026-07-24 all three tiers (low, mid,
+    high) are armed for DeepSeek primary.
+
+    Distinct from (and orthogonal to) ``GROOM_BACKEND_DEEPSEEK``'s existing
+    quota-FALLBACK use in ``_handle_fallback_dispatch`` — that path is a
+    rescue for an already-in-flight Claude run hitting mid-run quota
+    exhaustion and ALWAYS threads the DeepSeek backend regardless of this
+    env var; this helper only ever governs the PRIMARY (pre-planned,
+    no-Claude-attempt-first) scheduled dispatch paths.
+
+    Ships UNARMED: ``GROOM_PRIMARY_DEEPSEEK_TIERS`` unset/empty means this
+    always returns ``None`` — today's Claude-only dispatch behavior is
+    byte-identical until an operator arms the env var.
+    """
+    if not GROOM_PRIMARY_DEEPSEEK_TIERS:
+        return None
+    if not tiers:
+        return None
+    if not all(t in GROOM_PRIMARY_DEEPSEEK_TIERS for t in tiers):
+        return None
+    return GROOM_BACKEND_DEEPSEEK
 
 
 
@@ -209,6 +436,60 @@ def _resolve_soft_limit_min(event: dict) -> int | None:
     return n
 
 
+def _task_token(event: dict) -> str:
+    """The SF task token for this ``launch_decided`` invocation, or "".
+
+    config-I4333: the token arrives INSIDE the Lambda ``Payload``, under the key
+    ``Token``. The SF merges the context object's ``$$.Task`` — literally
+    ``{"Token": "..."}`` — into the payload's existing wholesale
+    ``States.JsonMerge``, so the key name is the context object's own, and no
+    string-building or escaping is involved. Three earlier attempts got this
+    wrong and none could ever have worked:
+
+      * a top-level ``TaskToken`` sibling of ``Payload`` in the SF
+        ``Parameters`` — rejected by Step Functions at RUNTIME (not by
+        ``validate-state-machine-definition``, which returned OK), since
+        ``TaskToken`` is not a field of the Lambda Invoke API:
+        "The field \"TaskToken\" is not supported by Step Functions".
+      * ``getattr(getattr(context, "task", None), "token", "")`` — a Python
+        Lambda ``context`` has no ``task`` attribute, so this silently
+        returned "" on every invocation and the ""-is-legitimate fallback
+        masked it.
+      * building the key with ``States.Format('{{"task_token":"{}"}}', ...)``
+        — ``States.Format`` cannot emit a literal brace by doubling OR by
+        backslash-escaping; both forms fail with "matching '}' not found".
+        Verified against the live TestState API, not assumed.
+
+    An absent token is legitimate (manual invoke, sweep dispatch), so "" is a
+    valid result — but it means no callback will be sent, and the SF then
+    depends on its timeout path.
+    """
+    raw = event.get("Token")
+    return str(raw).strip() if raw else ""
+
+
+def _resolve_launch_decided_backend(event: dict) -> str:
+    """Validate the ``backend`` threaded through a ``launch_decided`` SF
+    invocation (PRIMARY-mode DeepSeek selection, alpha-engine-config-I3479)
+    against the fixed vocabulary — only ``GROOM_BACKEND_DEEPSEEK``
+    ("deepseek") or absent/empty is valid. Fails LOUD (raises) on anything
+    else rather than silently dropping an unrecognized value onto the
+    default Claude path (no-silent-swallows) — a malformed ``backend`` in
+    the decide -> launch round-trip means the SF's item merge or a caller
+    drifted, and that must surface immediately, not quietly run the wrong
+    provider (or the right provider under a typo'd/unexpected value)."""
+    raw = event.get("backend")
+    if raw is None or raw == "":
+        return ""
+    backend = str(raw).strip().lower()
+    if backend != GROOM_BACKEND_DEEPSEEK:
+        raise ValueError(
+            f"invalid backend in launch_decided event: {raw!r} — must be "
+            f"{GROOM_BACKEND_DEEPSEEK!r} or absent/empty"
+        )
+    return backend
+
+
 def _resolve_pr_budget(event: dict) -> int | None:
     """Optional per-schedule PR budget override (config#1769).
 
@@ -234,7 +515,9 @@ def _resolve_pr_budget(event: dict) -> int | None:
 def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: str,
                        run_token: str, soft_limit_min: int | None = None,
                        pr_budget: int | None = None,
-                       queue_manifest_key: str = "") -> str:
+                       queue_manifest_key: str = "",
+                       backend: str = "",
+                       task_token: str = "") -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec bootstrap.
 
     Runs as root on the box. The heavy, version-controlled logic lives in the
@@ -246,6 +529,12 @@ def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: st
     retired — groom boxes are pure issue-coverage workers now; PR merge-
     readiness sweeping moved to the single end-of-SF run_mode=sweep box the
     dispatch SF launches after every Map wind-down.
+
+    ``backend`` (quota-fallback 3-repo feature): a Lambda-code literal
+    (``GROOM_BACKEND_DEEPSEEK`` — never event-sourced text), so unlike
+    ``model``/``issue_filter`` it needs no shell-metacharacter allowlist
+    before embedding. Empty by default — every existing caller's command
+    shape is byte-for-byte unchanged.
     """
     soft_limit_flag = f" --soft-limit-min {soft_limit_min}" if soft_limit_min else ""
     pr_budget_export = f"export GROOM_PR_BUDGET={pr_budget}\n" if pr_budget else ""
@@ -255,6 +544,26 @@ def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: st
     # root-shell command line.
     manifest_export = (f"export GROOM_QUEUE_MANIFEST_KEY={queue_manifest_key}\n"
                        if queue_manifest_key else "")
+    # Quota-fallback (3-repo feature): GROOM_BACKEND is consumed on-box by
+    # alpha-engine-config's groom_spot_bootstrap.sh/groom_driver.py to route
+    # the run through DeepSeek instead of Claude — this Lambda passes the flag
+    # through verbatim, it does not select the DeepSeek model itself.
+    backend_export = f"export GROOM_BACKEND={backend}\n" if backend else ""
+    # Push the ONE authoritative runtime bound to the box so its watchdog
+    # cannot drift from the SF's lane timeout. groom_spot_bootstrap.sh reads
+    # `${MAX_RUNTIME_SECONDS:-...}`, so its own default becomes a fallback for
+    # manual runs only — every dispatched box now inherits this value.
+    # Without this export the box killed itself at its own 360-min default
+    # while the SF had already abandoned the lane at 180 (see the constant).
+    runtime_bound_export = f"export MAX_RUNTIME_SECONDS={MAX_RUNTIME_SECONDS}\n"
+    # Arming the DeepSeek fallback dispatch: when a Claude-backed groom run
+    # hits quota exhaustion, the on-box groom_run.sh checks this flag and —
+    # if enabled — invokes this Lambda again with mode=fallback to launch a
+    # DeepSeek rescue box. Safe to enable unconditionally: DeepSeek-backed
+    # runs never trigger Claude quota signatures, so the flag is harmless
+    # there but critical for high-tier Claude runs (I3483 companion).
+    fallback_enabled_export = "export GROOM_DEEPSEEK_FALLBACK_ENABLED=true\n"
+    task_token_export = f"export GROOM_SF_TASK_TOKEN={task_token}\n" if task_token else ""
     return f"""set -uo pipefail
 export AWS_DEFAULT_REGION={REGION}
 # SSM RunShellScript runs as root with NO $HOME set; git config/clone need it.
@@ -277,15 +586,25 @@ cd /home/ec2-user/alpha-engine-config
 export GROOM_MODEL={model}
 export GROOM_ISSUE_FILTER={issue_filter}
 export GROOM_RUN_TOKEN={run_token}
-{pr_budget_export}{manifest_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
+{pr_budget_export}{manifest_export}{fallback_enabled_export}{backend_export}{runtime_bound_export}{task_token_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
 """
 
 
-def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
+def _launch_instance(force_on_demand: bool = False,
+                     tier_tag: str = "") -> tuple[str, str]:
     """Launch the groom box; spot first, on-demand fallback on capacity exhaustion
     OR when force_on_demand (config#1645: the dispatch SF's last bounded relaunch
     attempt after repeated mid-run spot interruption — skip straight to on-demand
-    rather than trying the same flaky spot market a third time)."""
+    rather than trying the same flaky spot market a third time).
+
+    ``tier_tag`` (config#5303 root fix): the load-bearing ``groom-issue-filter``
+    discriminator tag now rides the SAME RunInstances call via ``extra_tags``
+    (config#2292 root fix, already adopted by sf-watch/ci-watch dispatchers) —
+    the box is NEVER observably untagged after launch, so a spot-reclaim CloudTrail
+    record (which only sees ``TagSpecifications``, not post-launch ``CreateTags``)
+    retains lane attribution for the full 90-day CloudTrail retention window.
+    """
+    extra_tags = {GROOM_TIER_TAG_KEY: tier_tag} if tier_tag else None
     return spot_dispatch.launch_with_fallback(
         INSTANCE_TYPES, SUBNETS,
         image_id=AMI_ID,
@@ -294,6 +613,7 @@ def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
         iam_instance_profile=IAM_PROFILE,
         volume_size_gb=VOLUME_SIZE_GB,
         tag_name="alpha-engine-groom-spot",
+        extra_tags=extra_tags,
         region=REGION,
         force_on_demand=force_on_demand,
     )
@@ -308,15 +628,17 @@ def _wait_ssm_online(instance_id: str) -> None:
 
 def _send_bootstrap(instance_id: str, run_mode: str, run_url: str, model: str, issue_filter: str,
                     run_token: str, soft_limit_min: int | None = None,
-                    pr_budget: int | None = None, queue_manifest_key: str = "") -> str:
+                    pr_budget: int | None = None, queue_manifest_key: str = "",
+                    backend: str = "", task_token: str = "") -> str:
     """Fire the async, detached SSM command that runs the groom + self-terminates."""
     return spot_dispatch.send_async_command(
         instance_id,
         _bootstrap_command(
             run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
-            queue_manifest_key,
+            queue_manifest_key, backend, task_token,
         ),
-        comment=f"backlog groom ({run_mode}, {model}, {issue_filter}) — config#1432/#1495/#1645",
+        comment=(f"backlog groom ({run_mode}, {model}, {issue_filter}"
+                 f"{f', {backend}' if backend else ''}) — config#1432/#1495/#1645"),
         region=REGION,
         cw_log_group=CW_LOG_GROUP,
         # Execution timeout (NOT the start timeout) — without this SSM kills the
@@ -342,6 +664,101 @@ def _tier_tag(run_mode: str, issue_filter: str) -> str:
     groom boxes guard per issue_filter tier; sweep boxes guard as one
     distinct 'sweep' lane regardless of the (inert) issue_filter they carry."""
     return _SWEEP_TIER_TAG if run_mode == "sweep" else issue_filter
+
+
+class ConcurrentCycleError(RuntimeError):
+    """The cycle-singleton probe could not reach a verdict (alpha-engine-config-I5371).
+
+    Distinct from "a sibling cycle IS running": this means we do not KNOW.
+    Raised so the decide phase fails CLOSED rather than launching blind — see
+    ``_concurrent_cycle_blockers`` for why that asymmetry is the correct default.
+    """
+
+
+def _dispatch_state_machine_arn(execution_arn: str) -> str:
+    """The state-machine ARN owning ``execution_arn``.
+
+    ``arn:aws:states:R:A:execution:<SM_NAME>:<EXEC_NAME>``
+      -> ``arn:aws:states:R:A:stateMachine:<SM_NAME>``
+
+    Fail-loud on any other shape: a silently-wrong ARN here would make
+    ``list_executions`` return an empty set, which reads exactly like
+    "no sibling cycles" — the §2.4 absence-as-benign failure this whole
+    guard exists to prevent.
+    """
+    parts = execution_arn.split(":")
+    if len(parts) != 8 or parts[:3] != ["arn", "aws", "states"] or parts[5] != "execution":
+        raise ConcurrentCycleError(
+            f"unparseable execution ARN for cycle-singleton check: {execution_arn!r}")
+    return ":".join(parts[:5] + ["stateMachine", parts[6]])
+
+
+def _concurrent_cycle_blockers(execution_arn: str) -> list[dict]:
+    """RUNNING sibling executions of this dispatch SF that started BEFORE us.
+
+    **Why this guard exists (alpha-engine-config-I5371).** The dispatch SF
+    carried ``TimeoutSeconds: 72000`` (20h) against an 8h trigger cadence and
+    no singleton state, so up to three cycles could be alive at once *by
+    construction* — no failure required. Measured live 2026-07-29: two
+    executions RUNNING simultaneously (started 7/28 21:00 PT and 7/29 05:00
+    PT, both hung on their task-token callback), plus a third that ran 18h
+    before failing. Each independently enumerated the backlog and dispatched
+    an agent at the same issue, producing 19 duplicate PRs across 16 clusters
+    — e.g. crucible-dashboard#588/#589/#590, three PRs against config#4790
+    opened three minutes apart under three different branch conventions.
+
+    **Oldest-wins, not newest-wins.** The comparison key is
+    ``(startDate, executionArn)`` — a total order, so exactly one live cycle
+    survives even when two start in the same millisecond. Newest-wins would
+    let a fresh trigger repeatedly preempt a cycle that is doing real work.
+
+    **Fail CLOSED, unlike the sibling lane guard.** ``_running_tier_instance_ids``
+    deliberately fails open ("an optimization, not a correctness gate") because
+    a missed lane-skip costs one redundant box. This guard fails closed because
+    the costs are asymmetric: a wrongly-skipped cycle self-heals on the next 8h
+    trigger at zero cost, while a wrongly-launched concurrent cycle leaves
+    duplicate PRs that need a human to disentangle. Callers surface the skip by
+    name (never silently — §2.4).
+    """
+    if not execution_arn:
+        # Direct/legacy invoke with no SF context (manual `aws lambda invoke`,
+        # the DeepSeek fallback path). There is no cycle to be a sibling OF, so
+        # there is nothing to guard — this is a real absence, not an unknown.
+        return []
+
+    sm_arn = _dispatch_state_machine_arn(execution_arn)
+    try:
+        sfn = boto3.client("stepfunctions", region_name=REGION)
+        running: list[dict] = []
+        kwargs = {"stateMachineArn": sm_arn, "statusFilter": "RUNNING", "maxResults": 100}
+        while True:
+            page = sfn.list_executions(**kwargs)
+            running.extend(page.get("executions", []))
+            token = page.get("nextToken")
+            if not token:
+                break
+            kwargs["nextToken"] = token
+    except Exception as exc:  # noqa: BLE001 — converted to a NAMED closed failure
+        raise ConcurrentCycleError(
+            f"could not list RUNNING executions of {sm_arn}: {exc}") from exc
+
+    mine = next((e for e in running if e.get("executionArn") == execution_arn), None)
+    if mine is None:
+        # We are executing, so we MUST appear in our own RUNNING set. Absence
+        # means the listing is not describing reality (wrong SM, truncated
+        # page, IAM-filtered result) — refuse to conclude "no siblings".
+        raise ConcurrentCycleError(
+            f"this execution ({execution_arn}) absent from its own RUNNING set "
+            f"({len(running)} listed) — cannot establish singleton")
+
+    def _key(ex: dict) -> tuple:
+        return (ex.get("startDate"), ex.get("executionArn") or "")
+
+    return sorted(
+        (e for e in running
+         if e.get("executionArn") != execution_arn and _key(e) < _key(mine)),
+        key=_key,
+    )
 
 
 def _running_tier_instance_ids(tier_tag: str) -> list[str]:
@@ -377,6 +794,340 @@ def _running_tier_instance_ids(tier_tag: str) -> list[str]:
         return []
 
 
+def _utc_today() -> str:
+    """UTC calendar date — the dedup/ledger partition key used throughout."""
+    return datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
+
+
+def _notify_cycle(text: str, *, severity: str, dedup_key: str, context: dict) -> None:
+    """Send one CYCLE-level lifecycle ping (buzzing) — never raises.
+
+    Best-effort per groom-sweep-policy §8 ("a notify hiccup must never block a
+    relaunch or a status check"): the dispatch decision and the SF's terminal
+    routing are the primary deliverables, and a Telegram failure must not take
+    either down. The failure is still recorded in this Lambda's CW logs.
+    """
+    try:
+        notify_via_flow_doctor(
+            text, silent=False, severity=severity, dedup_key=dedup_key,
+            flow_name=_CYCLE_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
+            db_basename=_CYCLE_DB_BASENAME,
+            context=context,
+            notifier_overrides=_CYCLE_NOTIFIER_OVERRIDES,
+            # Matches playbooks.yaml's registered `groom_dispatch_telegram_only`
+            # class source exactly (config-I3513).
+            source="flow-doctor:scheduled-groom-dispatcher",
+        )
+    except Exception as exc:  # noqa: BLE001 — secondary observability
+        logger.warning("cycle lifecycle Telegram failed (non-fatal): %s", exc)
+
+
+def _notify_cycle_started(decide_payload: dict, schedule_label: str) -> None:
+    """Buzzing STARTED ping naming exactly which lanes this trigger launches.
+
+    Emitted from the decide phase — the single chokepoint every `decide_only`
+    response passes through — so the ping reflects what was actually decided,
+    derived from the same values the SF is about to fan out (policy §2.7: the
+    record is a receipt written by the dispatching code, never a second
+    declaration that can drift).
+
+    A ZERO-lane decision is announced too, not skipped. "No pings today" must
+    never be readable as either "nothing was due" or "the trigger never fired"
+    — that ambiguity is §2.4's absence-of-signal defect and it is exactly what
+    cost an operator session on 2026-07-27.
+    """
+    launches = decide_payload.get("launches") or []
+    lanes = [str(e.get("issue_filter") or "?") for e in launches]
+    counts = decide_payload.get("counts") or {}
+    counts_line = (
+        "\nbacklog: " + ", ".join(f"{t}={counts[t]}" for t in sorted(counts))
+        if counts else ""
+    )
+    if lanes:
+        head = f"🟢 Groom cycle {schedule_label} STARTED"
+        body = f"\nlanes: {', '.join(lanes)} · sweep queued{counts_line}"
+    else:
+        # Not an error — a legitimately quiet backlog. Still announced.
+        head = f"⚪ Groom cycle {schedule_label} STARTED — 0 lanes"
+        reason = str(decide_payload.get("reason") or "below demand floor")
+        body = f"\nno tier cleared the demand floor ({reason}); sweep still runs{counts_line}"
+    _notify_cycle(
+        head + body,
+        severity="info",
+        # Per-trigger-per-day key: a relaunch inside the same cycle must not
+        # re-announce, but tomorrow's same-labelled trigger must.
+        dedup_key=f"{_CYCLE_FLOW_NAME}:started:{_utc_today()}:{schedule_label}",
+        context={"schedule": schedule_label, "lanes": lanes, "counts": counts},
+    )
+
+
+# Terminal-state vocabulary (policy §2.4: "degraded exits are named exits").
+# Maps the completion-marker / lane-outcome tokens the box and the SF produce
+# onto the glyph the roll-up shows. An UNKNOWN token is never silently
+# dropped — _lane_glyph renders it verbatim with a ❔ so a new terminal state
+# invented downstream shows up as itself rather than disappearing.
+_LANE_GLYPHS = {
+    "success": "✅", "clean": "✅",
+    "interrupted": "🟠", "quota_stop": "🟠", "spot_stop": "🟠",
+    "skipped": "⚪", "not_launched": "⚪",
+    "timeout": "🔴", "failure": "🔴", "crash_cascade": "🔴",
+    "no_artifact": "🔴", "floor_fail": "🔴",
+    "turn_budget_exceeded": "🟡", "floor_near_miss": "🟡",
+    "lane_failed": "🔴",
+}
+
+
+def _lane_glyph(state: str) -> str:
+    return _LANE_GLYPHS.get(state, "❔")
+
+
+# Zero-launch vocabulary (policy §2.4: "degraded exits are named exits";
+# alpha-engine-config-I5689). CheckAnyLaunches routes EVERY empty-launches
+# decide to AllSkipped, but those skips are not equivalent: a light backlog is
+# the system correctly declining to spend, while a concurrency skip is a cycle
+# the backlog needed and did not get. Before this table both rendered as
+# "✅ COMPLETE / (no lanes launched)".
+#
+# Structured as {reason: (glyph, healthy, blurb)}. `healthy` is what feeds
+# `degraded`; an UNKNOWN reason is deliberately NOT healthy — a skip shape
+# invented downstream must surface as itself rather than inherit the benign
+# default (§2.4: "the absence of a signal must never be readable as a benign
+# signal"). `_SKIP_REASONS` is asserted total against the dispatcher's own
+# emitted reasons by test_groom_cycle_notifications.py.
+_SKIP_REASONS = {
+    # Healthy: nothing to do, no spend, backlog not starved.
+    "demand_gate_skip": ("⚪", True, "no tier cleared the demand floor"),
+    # (No pace-gate entry: the pre-boot pace gate was DISMANTLED by Brian's
+    # 2026-07-14 ruling — see the module docstring. A row for a retired
+    # mechanism is the §9 "guard scoped to a design that no longer exists"
+    # defect, so it stays absent and the meta-test below keeps it that way.)
+    # Degraded: the backlog needed this cycle and did not get it.
+    "concurrent_cycle_skip": (
+        "🟡", False, "an earlier cycle was still running — backlog untouched"),
+    "concurrent_cycle_probe_failed": (
+        "🟡", False, "could not prove no cycle was running — skipped fail-safe"),
+    "demand_all_failed": (
+        "🔴", False, "enumeration failed — demand could not be computed"),
+}
+
+#: The no-reason case. A plain light-backlog decide returns ``launches: []``
+#: with NO reason key at all (see the AllSkipped comment in
+#: step_function_groom.json), so absence here means the demand gate, not an
+#: unrecognized shape. Kept distinct from the unknown-reason fallback below
+#: because conflating them is what would let a future reason-less degraded
+#: skip read as healthy.
+_SKIP_REASON_ABSENT = ("⚪", True, "no tier cleared the demand floor")
+
+
+def _skip_verdict(reason: str | None) -> tuple[str, bool, str]:
+    """Classify a zero-launch cycle. Total over its input by construction."""
+    if not reason:
+        return _SKIP_REASON_ABSENT
+    known = _SKIP_REASONS.get(reason)
+    if known:
+        return known
+    return ("❔", False, f"unrecognized skip reason {reason!r}")
+
+
+def _lane_rows(map_outcome: list) -> tuple[list[str], bool]:
+    """Render one row per lane; return (rows, any_degraded).
+
+    Totality matters more than prettiness here: every element of map_outcome
+    produces a row, including one whose shape this code did not anticipate.
+    A lane that produced no recognizable outcome renders as `no outcome
+    reported` rather than being filtered out of the roll-up — a lane silently
+    missing from the summary is precisely the failure this ping exists to
+    surface (config-I4987).
+    """
+    rows: list[str] = []
+    degraded = False
+    for i, item in enumerate(map_outcome or []):
+        if not isinstance(item, dict):
+            rows.append(f"  lane{i}  ❔ malformed outcome")
+            degraded = True
+            continue
+        lane_outcome = item.get("laneOutcome") or {}
+        launch = item.get("groomLaunch") or item.get("groom") or {}
+        tier = str(
+            item.get("issue_filter")
+            or launch.get("issue_filter")
+            or lane_outcome.get("issue_filter")
+            or f"lane{i}"
+        )
+        if lane_outcome.get("laneFailed"):
+            state = str(lane_outcome.get("reason") or "lane_failed")
+        else:
+            state = str(
+                lane_outcome.get("completion")
+                or launch.get("completion")
+                or launch.get("reason")
+                or ("success" if launch.get("launched") else "")
+            )
+        if not state:
+            state = "no outcome reported"
+            degraded = True
+        elif _lane_glyph(state) in ("🔴", "🟠", "❔"):
+            degraded = True
+        rows.append(f"  {tier:<6} {_lane_glyph(state)} {state}")
+    return rows, degraded
+
+
+def _notify_cycle_complete(cycle: dict) -> dict:
+    """Buzzing COMPLETE roll-up — one ping per trigger, every lane named.
+
+    Invoked by the dispatch SF immediately before its terminal Succeed/Fail
+    routing, so it fires on BOTH outcomes: a cycle that ends FAILED is exactly
+    the one whose roll-up the operator most needs. Returns a small record the
+    SF stores under $.cycleNotify for post-hoc verification (§2.8).
+    """
+    # The SF hands us its whole state object (`"cycle.$": "$"`) rather than
+    # cherry-picked fields. That is deliberate and load-bearing: `$.mapFailure`
+    # is ABSENT on the two healthy paths, and a `Parameters` reference to an
+    # absent field raises States.Runtime, which no Catch can intercept
+    # (policy §2.2 — "uncatchable failure classes are eliminated by
+    # construction, never caught"). Passing the root and reading with .get()
+    # here moves that from an SF-runtime concern to ordinary Python.
+    sched_input = cycle.get("schedInput") or {}
+    schedule_label = str(
+        cycle.get("schedule") or sched_input.get("schedule") or "unknown"
+    )
+    map_outcome = cycle.get("mapOutcome") or []
+    sweep = cycle.get("sweep") or {}
+    map_failure = cycle.get("mapFailure")
+
+    rows, degraded = _lane_rows(map_outcome)
+
+    # Zero-launch cycles (I5689). AllSkipped is reached by several distinct
+    # routes and only some are healthy, so classify rather than assume. This
+    # runs on the AllSkipped path only: when lanes DID launch, mapOutcome is
+    # non-empty and the decide reason is not a skip verdict.
+    skip_reason = None
+    skip_healthy = True
+    if not rows:
+        decide = (
+            ((cycle.get("decideResult") or {}).get("Payload") or {}).get("decide")
+            or {}
+        )
+        skip_reason = decide.get("reason")
+        glyph, skip_healthy, blurb = _skip_verdict(skip_reason)
+        blockers = decide.get("blocking_executions") or []
+        blocker_note = f" [{', '.join(str(b) for b in blockers)}]" if blockers else ""
+        rows = [f"  cycle  {glyph} 0 lanes — {blurb}{blocker_note}"]
+        if not skip_healthy:
+            degraded = True
+
+    # The sweep is dispatched fire-and-forget (DispatchEndOfSfSweep is a plain
+    # lambda:invoke, not .waitForTaskToken), so at this point we can honestly
+    # report only whether its BOX was launched — never that it finished. Say
+    # exactly that rather than implying a completion we did not observe; the
+    # sweep box files its own terminal ping on the per-box rail.
+    if sweep.get("dispatched") is False or sweep.get("launched") is False:
+        sweep_line = f"  sweep  🔴 not dispatched ({sweep.get('reason', 'unknown')})"
+        degraded = True
+    elif sweep:
+        sweep_line = "  sweep  ✅ box launched (runs to quiescence; reports separately)"
+    else:
+        sweep_line = "  sweep  ❔ no dispatch record"
+        degraded = True
+
+    if map_failure or degraded:
+        head = f"🟡 Groom cycle {schedule_label} COMPLETE — degraded"
+        severity = "warning"
+    else:
+        head = f"✅ Groom cycle {schedule_label} COMPLETE"
+        severity = "info"
+
+    # A skip row describes the CYCLE, not a lane — `lanes` stays 0 so any
+    # consumer counting launched lanes is unaffected by the new row (§10.1
+    # reads lane counts; the skip verdict travels in its own fields).
+    lane_count = len(map_outcome)
+
+    lane_block = "\n".join(rows) if rows else "  (no lanes launched)"
+    text = f"{head}\n{lane_block}\n{sweep_line}"
+    if map_failure:
+        text += f"\nmap failure: {map_failure}"
+
+    _notify_cycle(
+        text, severity=severity,
+        dedup_key=f"{_CYCLE_FLOW_NAME}:complete:{_utc_today()}:{schedule_label}",
+        context={"schedule": schedule_label, "degraded": degraded,
+                 "lane_count": lane_count, "skip_reason": skip_reason},
+    )
+    # `skip_reason` / `skip_healthy` are emitted as FACTS, not as a verdict on
+    # §10.1. A concurrency skip exits the SF SUCCEEDED, so terminal status alone
+    # cannot distinguish a completed cycle from a starved one — these two fields
+    # are what lets a §10.1 implementation tell them apart without re-deriving
+    # anything (§2.7 derive-once). Deliberately NOT a `cycle_completed` boolean:
+    # scoring is §10.1's to define, and asserting it here would make this a
+    # second source of truth for the governing metric.
+    return {
+        "notified": True,
+        "degraded": degraded,
+        "lanes": lane_count,
+        "skip_reason": skip_reason,
+        "skip_healthy": skip_healthy if not map_outcome else None,
+    }
+
+
+def _decide_result(decide_payload: dict, schedule_label: str) -> dict:
+    """SINGLE chokepoint for every ``decide_only`` response.
+
+    Every early return in the decide phase routes through here so the STARTED
+    ping cannot be missed on one branch and present on another — including the
+    two zero-lane branches (enumeration failure, demand-gate skip), which are
+    the ones a per-branch notify would most likely have been forgotten on.
+    """
+    _notify_cycle_started(decide_payload, schedule_label)
+    return {"decide": decide_payload}
+
+
+def _handle_cycle_complete(event: dict) -> dict:
+    """``{"mode": "cycle_complete", "cycle": {...}}`` — SF terminal roll-up.
+
+    A FOURTH invocation shape alongside fallback / decide_only / launch_decided,
+    checked early and returned immediately. Deliberately total: any exception
+    is caught and reported in-band, because this state sits on the SF's path to
+    BOTH terminal states and must never convert a completed cycle into a
+    States.TaskFailed.
+    """
+    try:
+        return {"cycleNotify": _notify_cycle_complete(event.get("cycle") or {})}
+    except Exception as exc:  # noqa: BLE001 — never fail the terminal routing
+        logger.warning("cycle-complete notification failed (non-fatal): %s", exc)
+        return {"cycleNotify": {"notified": False, "error": str(exc)}}
+
+
+def _notify_concurrent_cycle_skip(blockers: list[dict], schedule_label: str,
+                                  execution_arn: str) -> None:
+    """Loud ping for a whole-cycle singleton skip — never raises.
+
+    Deliberately NOT silent: unlike the per-lane skip (a routine, expected
+    outcome of a long-running lane), a cycle-level skip means the PREVIOUS
+    cycle is still alive after a full trigger interval, which is either a
+    genuinely long run or a hang. Both warrant a look.
+    """
+    names = ", ".join(str(b.get("name") or b.get("executionArn") or "?") for b in blockers)
+    text = (
+        "⚪ Backlog groom CYCLE SKIPPED — an earlier dispatch cycle is still "
+        f"RUNNING (alpha-engine-config-I5371). still-running: {names}. "
+        f"schedule={schedule_label}. Zero enumeration, zero spot/WET spend; "
+        "this cycle's queue rides the next trigger. A repeat of this skip "
+        "means the earlier cycle is hung, not slow — check its task-token "
+        "callback state."
+    )
+    try:
+        notify_via_flow_doctor(
+            text, silent=False, severity="warning",
+            dedup_key=f"{_FLOW_NAME}:concurrent_cycle_skip:{_utc_today()}",
+            flow_name=_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={"schedule": schedule_label, "execution_arn": execution_arn,
+                     "blocking_executions": names},
+        )
+    except Exception as exc:  # noqa: BLE001 — notification must never block the skip
+        logger.warning("concurrent-cycle skip notification failed (non-fatal): %s", exc)
+
+
 def _notify_concurrent_skip(tier_tag: str, existing_ids: list[str], schedule_label: str) -> None:
     """Best-effort loud ping for a concurrent-same-lane skip — never raises."""
     text = (
@@ -395,9 +1146,374 @@ def _notify_concurrent_skip(tier_tag: str, existing_ids: list[str], schedule_lab
             context={"schedule": schedule_label, "tier_tag": tier_tag,
                      "existing_instance_ids": existing_ids},
             silent_topic=FleetTelegramTopic.GROOM,
+            # Matches playbooks.yaml's registered `groom_dispatch_telegram_only`
+            # class source exactly (config-I3513).
+            source="flow-doctor:scheduled-groom-dispatcher",
         )
     except Exception as exc:  # noqa: BLE001 — secondary observability
         logger.warning("concurrent-lane skip Telegram failed (non-fatal): %s", exc)
+
+
+# config#3173 — dedicated ceiling ledger, deliberately SEPARATE from the
+# groom/decisions/{date}/ decision-record ecosystem (which has two
+# heterogeneous schemas — schema_version 1's flattened single-slot record and
+# schema_version 2's nested `decisions` list — that would need careful
+# reconciling to count launches from). One key = one launch ATTEMPT, written
+# by the dispatcher itself (never the agent), mirroring config#2269's
+# invariant that a crashed/misbehaving agent can neither reset nor starve the
+# count.
+_DISPATCH_LEDGER_PREFIX = "groom/_control/dispatch-ledger"
+
+
+def _prior_launch_count_today() -> int:
+    """Count today's already-recorded launch ATTEMPTS (config#3173) — the
+    outermost runaway backstop checked by ``_launch_groom_spot`` before any
+    new spot/on-demand spend. Fails LOUD (raises) on a read error rather than
+    failing open, matching this function's fail-loud posture."""
+    today = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
+    prefix = f"{_DISPATCH_LEDGER_PREFIX}/{today}/"
+    s3 = boto3.client("s3", region_name=REGION)
+    count = 0
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=_RESEARCH_BUCKET, Prefix=prefix):
+        count += len(page.get("Contents", []))
+    return count
+
+
+# config-I5229 (lane-death pager): the reconciler structurally depends on
+# _write_dispatch_ledger_entry succeeding — a failed write means a lane can
+# die silently with no reconciler record to detect it. That IS a paging
+# condition (§2.7: "a registration-write failure is itself a paging
+# condition"). The function now FAILS LOUD (raises on S3 put failure); the
+# one caller (_launch_groom_spot) terminates the just-launched box on error
+# so a failed write never orphans an instance.
+_LEDGER_WRITE_FAILED_MSG = (
+    "dispatch ledger write FAILED (config-I5229 — registration-write failure "
+    "IS a paging condition; lane-death reconciler cannot cover a lane it never "
+    "recorded)"
+)
+
+# The legitimate completion-marker outcome values the box's write_completion_marker
+# (groom_run.sh) writes. The reconciler considers ANY completion marker as
+# "lane completed cleanly" regardless of the outcome value — this set is
+# documentation, not a guard. An outcome NOT in this set still reads as
+# "completed" for reconciler purposes (see _reconcile_lane_death).
+_COMPLETION_OUTCOMES = frozenset({
+    "success", "interrupted", "quota_stop", "spot_stop",
+    "timeout", "failure", "crash_cascade",
+})
+
+
+def _describe_instance_type(instance_id: str) -> str:
+    """The instance type actually launched, or "" if it cannot be read.
+
+    alpha-engine-config-I4989. `launch_with_fallback` returns only
+    (instance_id, market), so the TYPE that won the capacity race is not
+    otherwise recorded anywhere durable — and without it "how often is each
+    type used, and which ones get reclaimed" is unanswerable, which is exactly
+    the question a diversified pool creates. One extra DescribeInstances call
+    per launch is a fair price for that.
+
+    Best-effort by design: this feeds observability, and the ledger write it
+    contributes to is fail-loud for a DIFFERENT reason (the reconciler needs
+    the record to exist at all). Failing the launch because a describe hiccuped
+    would trade a real capability for a reporting nicety.
+    """
+    try:
+        resp = boto3.client("ec2", region_name=REGION).describe_instances(
+            InstanceIds=[instance_id])
+        for reservation in resp.get("Reservations", []):
+            for inst in reservation.get("Instances", []):
+                return str(inst.get("InstanceType", ""))
+    except Exception as exc:  # noqa: BLE001 — observability only; see docstring
+        logger.warning("instance-type lookup failed for %s (non-fatal): %s",
+                       instance_id, exc)
+    return ""
+
+
+def _write_dispatch_ledger_entry(run_token: str, tier_tag: str, schedule_label: str,
+                                  instance_id: str = "", deadline_utc: str = "",
+                                  task_token: str = "", instance_type: str = "",
+                                  market: str = "") -> None:
+    """Record a launch ATTEMPT for the daily ceiling count (config#3173) AND
+    an expectation record for the lane-death reconciler (config-I5229).
+
+    Previously best-effort (a ledger-write failure silently logged and the
+    launch proceeded). config-I5229 (lane-death pager): a failed ledger write
+    means the reconciler can never see this launch, so a lane death would go
+    undetected — that IS a paging condition per groom-sweep-policy §2.7.
+    FAILS LOUD: raises on S3 put failure; the caller terminates the
+    just-launched box so a failed write never orphans an instance.
+
+    Written AFTER the EC2 launch (so instance_id is known) but BEFORE the
+    SSM bootstrap — the launch consumes ceiling budget regardless of whether
+    the subsequent bootstrap succeeds, preserving the existing anti-runaway
+    semantics (an attempt-then-immediately-fail loop still trips the ceiling
+    eventually, never spin invisibly)."""
+    today = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
+    key = f"{_DISPATCH_LEDGER_PREFIX}/{today}/{run_token}.json"
+    fields: dict = {
+        "run_token": run_token, "tier_tag": tier_tag, "schedule": schedule_label,
+        "instance_id": instance_id,
+        "deadline_utc": deadline_utc,
+        "recorded_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+    }
+    if task_token:
+        fields["task_token"] = task_token
+    # I4989: which type/market actually won the capacity race. Recorded here
+    # rather than only as an EC2 tag because terminated instances age out of
+    # describe-instances in ~1h, while this ledger persists — so reclaim rate
+    # BY TYPE stays answerable after the fact, which is the whole point of
+    # widening the pool.
+    if instance_type:
+        fields["instance_type"] = instance_type
+    if market:
+        fields["market"] = market
+    body = json.dumps(fields)
+    boto3.client("s3", region_name=REGION).put_object(
+        Bucket=_RESEARCH_BUCKET, Key=key, Body=body.encode(),
+        ContentType="application/json")
+
+
+# ── Lane-death reconciler (alpha-engine-config-I5229 Phase 1) ─────────────────
+# Screens every open expectation (dispatch-ledger entry with no matching
+# completion marker under groom/_control/completed/) against live EC2 state.
+# Failure-mode-agnostic per groom-sweep-policy §2.7: it does not enumerate
+# causes — it checks two OUTCOMES (is the instance alive? is it past its
+# deadline?) and pages on either. Any reason a box stops existing produces
+# the same verdict.
+
+_RECONCILE_COMPLETED_PREFIX = "groom/_control/completed"
+
+# Expectations this reconciler has already ACTIONED (paged + send-task-failure).
+# Without it the reconciler re-detects the same dead lane on every 5-minute
+# tick for as long as the ledger entry is in the scan window, and re-pages —
+# which is exactly what Brian saw on 2026-07-30 after the reconciler shipped.
+# The per-run_token dedup key on the notification did NOT hold across
+# invocations, so the fix belongs here, at the source: an actioned expectation
+# is a CLOSED expectation.
+#
+# Deliberately a SEPARATE prefix from `completed/`: that marker means "the box
+# finished its work and said so", and writing a death into it would make a
+# reclaimed lane indistinguishable from a successful one to every other
+# consumer of that prefix.
+_RECONCILE_ACTIONED_PREFIX = "groom/_control/reconciled"
+# describe-instances returns terminated instances for only ~1h (AWS docs).
+# An instance absent from the response is treated as lane_died — the
+# unmatched expectation IS the signal (§2.7).
+_ALIVE_STATES = frozenset({"running", "pending"})
+
+
+def _reconcile_lane_death() -> dict:
+    """Reconciler entry point — enumerate open expectations, check each one
+    against live EC2 state, page on death or deadline exceedance.
+
+    Returns a small record for the Lambda response payload (so the schedule
+    invocation has a visible result, mirroring every other mode's return)."""
+    now = datetime.now(ZoneInfo("UTC"))
+
+    # Scan TODAY and YESTERDAY. The ledger is date-partitioned and a lane can
+    # easily outlive the partition it was registered in — a box launched at
+    # 23:50 UTC that dies at 00:10 has its expectation filed under yesterday.
+    # Scanning only today leaves a blind window every single day, in which the
+    # reconciler reports "0 open expectations" and looks perfectly healthy
+    # (§2.4: the absence of a signal must never read as a benign signal).
+    # Two days is sufficient because the lane budget is 6h; widen this if that
+    # budget ever exceeds 24h.
+    scan_days = [
+        (now - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in (0, 1)
+    ]
+
+    s3 = boto3.client("s3", region_name=REGION)
+    ec2 = boto3.client("ec2", region_name=REGION)
+
+    # 1. Collect open expectations — ledger entries with no completion marker.
+    open_expectations: list[dict] = []
+    seen_tokens: set[str] = set()
+    paginator = s3.get_paginator("list_objects_v2")
+    for day in scan_days:
+        ledger_prefix = f"{_DISPATCH_LEDGER_PREFIX}/{day}/"
+        for page in paginator.paginate(Bucket=_RESEARCH_BUCKET, Prefix=ledger_prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                run_token = key.rsplit("/", 1)[-1]
+                if not run_token.endswith(".json"):
+                    continue
+                run_token = run_token[:-5]  # strip ".json"
+                if run_token in seen_tokens:
+                    continue  # same token filed under both days — count once
+                # Already actioned by a previous tick — closed, not open.
+                actioned_key = f"{_RECONCILE_ACTIONED_PREFIX}/{run_token}.json"
+                try:
+                    s3.head_object(Bucket=_RESEARCH_BUCKET, Key=actioned_key)
+                    seen_tokens.add(run_token)
+                    continue
+                except Exception:
+                    pass
+                completed_key = f"{_RECONCILE_COMPLETED_PREFIX}/{run_token}.json"
+                try:
+                    s3.head_object(Bucket=_RESEARCH_BUCKET, Key=completed_key)
+                    seen_tokens.add(run_token)
+                    continue  # has completion marker — lane completed cleanly
+                except Exception:
+                    pass  # no completion marker — open expectation
+                try:
+                    body_raw = s3.get_object(Bucket=_RESEARCH_BUCKET, Key=key)["Body"].read()
+                    exp = json.loads(body_raw.decode())
+                    exp["_ledger_key"] = key
+                    open_expectations.append(exp)
+                    seen_tokens.add(run_token)
+                except Exception as exc:
+                    logger.warning("reconciler: ledger entry read failed for %s: %s", key, exc)
+
+    if not open_expectations:
+        return {"reconciled": True, "open_expectations": 0, "deaths": 0,
+                "overdue": 0, "checked_at": now.isoformat()}
+
+    # 2. Batch describe-instances for all instance_ids.
+    instance_ids = [e["instance_id"] for e in open_expectations
+                    if e.get("instance_id")]
+    instance_states: dict[str, str] = {}
+    if instance_ids:
+        try:
+            resp = ec2.describe_instances(InstanceIds=instance_ids)
+            for reservation in resp.get("Reservations", []):
+                for inst in reservation.get("Instances", []):
+                    instance_states[inst["InstanceId"]] = inst["State"]["Name"]
+        except Exception as exc:
+            logger.warning("reconciler: describe-instances failed: %s", exc)
+            # Fail-safe: treat ALL as unknown (not dead) — never page on a
+            # broken EC2 API. The next reconciler tick retries.
+            return {"reconciled": True, "open_expectations": len(open_expectations),
+                    "deaths": 0, "overdue": 0, "describe_error": str(exc),
+                    "checked_at": now.isoformat()}
+
+    # 3. Check each expectation.
+    deaths = 0
+    overdue_count = 0
+    sfn = boto3.client("stepfunctions", region_name=REGION)
+    for exp in open_expectations:
+        instance_id = exp.get("instance_id", "")
+        state = instance_states.get(instance_id)
+        page = False
+        reason = ""
+
+        if state is None or state not in _ALIVE_STATES:
+            # Instance not found in describe-instances, or is in a terminal
+            # state (stopped, terminated, shutting-down).
+            page = True
+            reason = f"lane_died: instance {instance_id} is {state or 'absent'} — not in {sorted(_ALIVE_STATES)}"
+        elif exp.get("deadline_utc"):
+            try:
+                deadline = datetime.fromisoformat(exp["deadline_utc"])
+            except (ValueError, TypeError):
+                deadline = None
+            if deadline and now > deadline:
+                page = True
+                reason = f"overdue: instance {instance_id} running past deadline {exp['deadline_utc']}"
+
+        if not page:
+            continue
+
+        if state is None or state not in _ALIVE_STATES:
+            deaths += 1
+        else:
+            overdue_count += 1
+
+        # Page via the cycle notification rail (buzzing, #groom thread).
+        tier_tag = exp.get("tier_tag", "unknown")
+        schedule_label = exp.get("schedule", "unknown")
+        text = (
+            f"🔴 Groom lane DEATH — {reason}\n"
+            f"tier={tier_tag}  schedule={schedule_label}\n"
+            f"run_token={exp.get('run_token')}  instance={instance_id}"
+        )
+        _notify_cycle(
+            text, severity="error",
+            dedup_key=f"{_CYCLE_FLOW_NAME}:lane_death:{exp.get('run_token', '')}",
+            context={"expectation": {k: v for k, v in exp.items()
+                                     if not k.startswith("_")},
+                     "reason": reason, "instance_state": state},
+        )
+
+        # Close the expectation BEFORE the send-task-failure below. Ordering is
+        # deliberate: if the marker write fails we must not have already paged
+        # AND actioned without a record, and if send-task-failure fails the
+        # expectation is still closed — the page has been delivered, and
+        # re-paging every 5 minutes forever is strictly worse than one missed
+        # SF collapse (which the 6h TimeoutSeconds still covers).
+        try:
+            boto3.client("s3", region_name=REGION).put_object(
+                Bucket=_RESEARCH_BUCKET,
+                Key=f"{_RECONCILE_ACTIONED_PREFIX}/{exp.get('run_token', '')}.json",
+                Body=json.dumps({
+                    "outcome": "lane_died" if state not in _ALIVE_STATES else "overdue",
+                    "reason": reason,
+                    "instance_id": instance_id,
+                    "instance_state": state,
+                    "actioned_at": now.isoformat(),
+                }).encode(),
+                ContentType="application/json")
+        except Exception as exc:  # noqa: BLE001 — see ordering note above
+            logger.warning(
+                "reconciler: could not close expectation %s (will re-page next "
+                "tick): %s", exp.get("run_token"), exc)
+
+        # Collapse the SF execution immediately for a dead box — the task
+        # token would otherwise sit outstanding for 6h (the TimeoutSeconds
+        # on the .waitForTaskToken call). send-task-failure routes the SF
+        # into its existing bounded-retry relaunch loop, which is exactly
+        # the correct recovery path.
+        task_token = exp.get("task_token", "")
+        if task_token and (state is None or state not in _ALIVE_STATES):
+            try:
+                sfn.send_task_failure(
+                    taskToken=task_token,
+                    error="LaneDeath",
+                    cause=f"Reconciler detected lane death: {reason}",
+                )
+                logger.info(
+                    "reconciler: send-task-failure for %s (token %s…): %s",
+                    exp.get("run_token", "?"), task_token[:12], reason,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "reconciler: send-task-failure failed for %s (token %s…): %s",
+                    exp.get("run_token", "?"), task_token[:12], exc,
+                )
+
+    return {"reconciled": True, "open_expectations": len(open_expectations),
+            "deaths": deaths, "overdue": overdue_count,
+            "checked_at": now.isoformat()}
+
+
+def _notify_dispatch_ceiling_exhausted(prior: int, ceiling: int, tier_tag: str,
+                                       schedule_label: str) -> None:
+    """LOUD (non-silent) escalation — budget exhaustion means the day's
+    runaway backstop has fired; a human needs to look, never a silent skip."""
+    text = (
+        "🔴 Backlog groom dispatch ceiling EXHAUSTED (config#3173) — "
+        f"{prior} launches already recorded today >= ceiling {ceiling} "
+        f"(GROOM_MAX_DISPATCHES_DAILY). Suppressing this launch. lane={tier_tag} "
+        f"schedule={schedule_label}. If legitimate (a genuinely bad AWS day with "
+        "many relaunches), raise the ceiling via a PR; if NOT legitimate, "
+        "something is dispatching groom in a loop — investigate."
+    )
+    today = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
+    try:
+        notify_via_flow_doctor(
+            text, silent=False, severity="error",
+            dedup_key=f"{_FLOW_NAME}:dispatch_ceiling_exhausted:{today}",
+            flow_name=_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={"schedule": schedule_label, "tier_tag": tier_tag,
+                     "prior_dispatch_count": prior, "dispatch_ceiling": ceiling},
+            # Matches playbooks.yaml's registered `groom_dispatch_telegram_only`
+            # class source exactly (config-I3513).
+            source="flow-doctor:scheduled-groom-dispatcher",
+        )
+    except Exception as exc:  # noqa: BLE001 — secondary observability
+        logger.warning("dispatch-ceiling-exhausted Telegram failed (non-fatal): %s", exc)
 
 
 def _terminate_instance(instance_id: str) -> None:
@@ -412,8 +1528,19 @@ def _terminate_instance(instance_id: str) -> None:
 def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_filter: str,
                        soft_limit_min: int | None = None, pr_budget: int | None = None,
                        force_on_demand: bool = False,
-                       queue_manifest_key: str = "") -> dict:
-    """Launch + bootstrap the groom box. Fail-loud — any error RAISES."""
+                       queue_manifest_key: str = "",
+                       backend: str = "",
+                       task_token: str = "") -> dict:
+    """Launch + bootstrap the groom box. Fail-loud — any error RAISES.
+
+    ``backend`` (quota-fallback 3-repo feature, default ``""`` = unchanged
+    Claude path): threaded through to ``_send_bootstrap``/``_bootstrap_command``
+    as ``GROOM_BACKEND``. This is the ONE launch chokepoint every dispatch
+    path in this file already shares — the quota-fallback direct-invoke path
+    (``_handle_fallback_dispatch``) reuses it verbatim rather than
+    duplicating the concurrency guard (config#1979), the daily dispatch
+    ceiling (config#3173), or the spot/on-demand + SSM-send-command mechanics.
+    """
     if not DISPATCH_ENABLED:
         logger.warning("GROOM_DISPATCH_ENABLED=false — groom spot NOT launched")
         return {"launched": False, "reason": "disabled"}
@@ -435,23 +1562,67 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
                 "issue_filter": issue_filter, "tier_tag": tier_tag,
                 "existing_instance_ids": existing}
 
+    # config#3173: outermost runaway backstop — checked LAST, after every
+    # other suppression, so it fires even when a caller bypasses the demand
+    # gate (queue_manifest_key / launch_decided relaunches). Counts every
+    # attempt recorded so far today via the dedicated ledger (never the
+    # agent's own output — see _prior_launch_count_today).
+    prior_dispatches = _prior_launch_count_today()
+    if prior_dispatches >= GROOM_MAX_DISPATCHES_DAILY:
+        logger.error(
+            "groom dispatch ceiling EXHAUSTED: %d prior launches today >= "
+            "ceiling %d — suppressing lane %s", prior_dispatches,
+            GROOM_MAX_DISPATCHES_DAILY, tier_tag)
+        _notify_dispatch_ceiling_exhausted(
+            prior_dispatches, GROOM_MAX_DISPATCHES_DAILY, tier_tag, schedule_label)
+        return {"launched": False, "reason": "dispatch_ceiling_exhausted",
+                "issue_filter": issue_filter, "tier_tag": tier_tag,
+                "prior_dispatch_count": prior_dispatches,
+                "dispatch_ceiling": GROOM_MAX_DISPATCHES_DAILY}
+
     # config#1645: a fresh token per launch ATTEMPT (not per schedule) — the
     # dispatch Step Function's relaunch loop calls this Lambda again with a new
     # execution, so each attempt gets its own S3 completion-marker key. A dead
     # box's stale marker (if any) can never be mistaken for THIS attempt's.
     run_token = uuid.uuid4().hex
-    instance_id, market = _launch_instance(force_on_demand=force_on_demand)
-    logger.info("launched groom box %s (%s)", instance_id, market)
-    # config#1979: tag the box with its lane (tier, or 'sweep' — config#2201)
-    # so the NEXT trigger's guard check (above) can find it. Best-effort — a
-    # tag-write failure must not abort an already-launched box (mirrors the
-    # fail-safe posture of the check itself).
+    # config#3173: record the attempt BEFORE the launch fires (mirrors the
+    # sf-watch watch-log timing) so a launch that itself fails/raises still
+    # consumes ceiling budget. Best-effort: a pre-launch ledger-write
+    # failure must never block the launch it's recording.
     try:
-        boto3.client("ec2", region_name=REGION).create_tags(
-            Resources=[instance_id], Tags=[{"Key": GROOM_TIER_TAG_KEY, "Value": tier_tag}])
-    except Exception as exc:  # noqa: BLE001 — non-fatal, mirrors _running_tier_instance_ids
-        logger.warning("groom-issue-filter tag write failed (non-fatal): %s: %s",
-                       type(exc).__name__, exc)
+        _write_dispatch_ledger_entry(run_token, tier_tag, schedule_label)
+    except Exception as exc:
+        logger.warning("dispatch ledger pre-launch write failed (non-fatal): %s", exc)
+
+    instance_id, market = _launch_instance(force_on_demand=force_on_demand,
+                                           tier_tag=tier_tag)
+    logger.info("launched groom box %s (%s)", instance_id, market)
+
+    # config#5303: the load-bearing groom-issue-filter tag is now passed as
+    # extra_tags on the RunInstances call itself (see _launch_instance), not
+    # applied via a post-launch create_tags — so the tag is ATOMIC with launch
+    # and visible in CloudTrail RunInstances events for the full 90-day
+    # retention window. No post-launch tagging step remains to retry or fail.
+
+    # config-I5229 (lane-death pager): the expectation record is written AFTER
+    # the EC2 launch (so instance_id is known) but BEFORE the SSM bootstrap.
+    # The deadline is set to now + MAX_RUNTIME_SECONDS, matching the box's own
+    # watchdog. The write is FAIL-LOUD: a failed ledger write means the
+    # reconciler can never detect this lane's death, which IS a paging
+    # condition per groom-sweep-policy §2.7. On failure we terminate the
+    # just-launched box (no orphaned instance) and raise.
+    deadline_utc = (datetime.now(ZoneInfo("UTC")) + timedelta(seconds=MAX_RUNTIME_SECONDS)).isoformat()
+    try:
+        _write_dispatch_ledger_entry(
+            run_token, tier_tag, schedule_label,
+            instance_id=instance_id, deadline_utc=deadline_utc,
+            task_token=task_token,
+            instance_type=_describe_instance_type(instance_id), market=market,
+        )
+    except Exception:
+        logger.exception(_LEDGER_WRITE_FAILED_MSG)
+        _terminate_instance(instance_id)
+        raise
     # Once the box is up, ANY failure before the bootstrap command is delivered
     # would orphan it (no watchdog/trap yet). Terminate-on-error so a slow
     # SSM-online, an SSM SendCommand error, etc. tears the box down instead of
@@ -469,14 +1640,14 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
         )
         command_id = _send_bootstrap(
             instance_id, run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
-            queue_manifest_key,
+            queue_manifest_key, backend, task_token,
         )
     except Exception:
         _terminate_instance(instance_id)
         raise
     logger.info(
         "groom dispatched: instance=%s market=%s command=%s run_mode=%s model=%s issue_filter=%s "
-        "schedule=%s run_token=%s",
+        "schedule=%s run_token=%s backend=%s",
         instance_id,
         market,
         command_id,
@@ -485,6 +1656,7 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
         issue_filter,
         schedule_label,
         run_token,
+        backend or "claude",
     )
     return {
         "launched": True,
@@ -497,6 +1669,7 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
         "tier_tag": tier_tag,
         "run_token": run_token,
         **({"pr_budget": pr_budget} if pr_budget is not None else {}),
+        **({"backend": backend} if backend else {}),
     }
 
 
@@ -526,6 +1699,115 @@ def _github_token() -> str:
     return resp["Parameter"]["Value"].strip()
 
 
+def _gh_rest(path: str, token: str):
+    """Minimal authenticated GET against the GitHub REST API — mirrors this
+    module's existing per-repo issue-list transport verbatim (urllib +
+    ``token`` auth, NOT ``Bearer``: matches every other call in this file)."""
+    req = urllib.request.Request(
+        f"https://api.github.com{path}",
+        headers={"Authorization": f"token {token}",
+                 "Accept": "application/vnd.github+json",
+                 "User-Agent": "scheduled-groom-dispatcher"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _list_org_repos(token: str) -> list[str]:
+    """Live ``owner/name`` org-wide enumeration (``GET /orgs/{org}/repos``,
+    paginated) — the fallback path's repo list when the org-wide PR search
+    itself fails. Never a hand-maintained constant (config#2294 precedent:
+    a hardcoded list silently misses a repo created after the list was last
+    updated)."""
+    repos: list[str] = []
+    page = 1
+    while True:
+        batch = _gh_rest(f"/orgs/{_GH_ORG}/repos?per_page=100&page={page}", token)
+        if not batch:
+            break
+        repos.extend(r["full_name"] for r in batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return repos
+
+
+def _ruling_pending_prs_for_repo(repo: str, token: str) -> list[dict]:
+    """Fallback per-repo fetch: OPEN PRs on ``repo`` carrying
+    ``ge.RULING_PENDING_LABEL``. The ``/issues`` endpoint's ``labels=``
+    filter also matches issues sharing the label — keep only items carrying
+    a ``pull_request`` key, mirroring the issue/PR split every other
+    enumeration in this file already does (e.g. ``_enumerate_tier_stats``'s
+    ``"pull_request" in it`` check)."""
+    out: list[dict] = []
+    page = 1
+    while True:
+        batch = _gh_rest(
+            f"/repos/{repo}/issues?state=open"
+            f"&labels={urllib.parse.quote(ge.RULING_PENDING_LABEL)}"
+            f"&per_page=100&page={page}", token)
+        for it in batch:
+            if "pull_request" in it:
+                out.append(it)
+        if len(batch) < 100:
+            break
+        page += 1
+    return out
+
+
+def _enumerate_ruling_pending_prs(token: str) -> list[dict]:
+    """Org-wide OPEN PRs labeled ``ge.RULING_PENDING_LABEL`` (config-I3199 /
+    config-I3227 — binding operator rulings awaiting execution, folded into
+    every on-box tier lane by groom_driver.py's ``ruling_exec_pr_pool`` since
+    config#3210, but structurally invisible to THIS Lambda's pre-boot demand
+    count until now).
+
+    Search-primary (``GET /search/issues?q=org:{org} is:pr is:open
+    label:"..."``, paginated), falling back to a live per-repo org-wide walk
+    (never a hardcoded repo list — config#2294) only if the search call
+    itself errors. Mirrors the search-then-fallback shape
+    alpha-engine-config's ``gh_repo_enum.search_prs_org_wide`` uses for the
+    identical problem (config#2838) — reimplemented locally against this
+    Lambda's own urllib/token transport rather than imported, since that
+    repo's ``scripts/`` package is not (and must not become) a dependency of
+    this public-adjacent Lambda: it lives in the PRIVATE
+    ``alpha-engine-config`` repo.
+
+    Each returned dict is tagged ``repo`` (``owner/name``) alongside the raw
+    GitHub fields (``number``, ``title``, ``labels``, ``updated_at``) the
+    callers below already consume for issues.
+    """
+    query = f'org:{_GH_ORG} is:pr is:open label:"{ge.RULING_PENDING_LABEL}"'
+    try:
+        items: list[dict] = []
+        page = 1
+        while True:
+            batch = _gh_rest(
+                f"/search/issues?q={urllib.parse.quote(query)}&per_page=100&page={page}",
+                token)
+            results = batch.get("items", [])
+            items.extend(results)
+            if len(results) < 100:
+                break
+            page += 1
+        for it in items:
+            it["repo"] = it["repository_url"].split("/repos/", 1)[1]
+        return items
+    except Exception as exc:  # noqa: BLE001 — fail-safe to the per-repo walk, never to "zero ruled PRs"
+        logger.warning(
+            "org-wide ruling:pending-exec PR search failed (%s) — falling "
+            "back to a live per-repo org walk", exc)
+        out: list[dict] = []
+        for repo in _list_org_repos(token):
+            try:
+                for it in _ruling_pending_prs_for_repo(repo, token):
+                    it["repo"] = repo
+                    out.append(it)
+            except Exception as exc2:  # noqa: BLE001 — one repo's failure must not blank the rest
+                logger.warning("ruling:pending-exec PR fetch for %s failed (%s)", repo, exc2)
+        return out
+
+
 def _enumerate_tier_stats(token: str) -> tuple[dict, dict, bool]:
     """(counts per tier, oldest wait-hours per tier, has actionable P0).
 
@@ -533,6 +1815,11 @@ def _enumerate_tier_stats(token: str) -> tuple[dict, dict, bool]:
     "sitting untouched" signal for the ARCH §66 escape valve. Freshness-skip
     is NOT applied here (the on-box driver enumeration stays authoritative);
     the slight overcount only ever biases toward launching.
+
+    config-I3227: also folds in org-wide OPEN PRs labeled
+    ``ge.RULING_PENDING_LABEL`` (see ``_enumerate_ruling_pending_prs``) into
+    the SAME counts/oldest maps — a ruled-PR-only backlog now clears the
+    floor or trips the escape valve exactly like an issue-only one would.
     """
     counts: dict[str, int] = {t: 0 for t in ge.TIERS}
     oldest: dict[str, float] = {t: 0.0 for t in ge.TIERS}
@@ -567,18 +1854,36 @@ def _enumerate_tier_stats(token: str) -> tuple[dict, dict, bool]:
             if len(batch) < 100:
                 break
             page += 1
+    for pr in _enumerate_ruling_pending_prs(token):
+        labels = [lbl["name"] for lbl in pr.get("labels", [])]
+        tier = ge.is_actionable(labels)
+        if tier is None:
+            continue
+        counts[tier] += 1
+        updated = datetime.fromisoformat(
+            str(pr.get("updated_at", "")).replace("Z", "+00:00"))
+        waited = max(0.0, (now - updated).total_seconds() / 3600.0)
+        oldest[tier] = max(oldest[tier], waited)
+        if "P0" in labels:
+            has_p0 = True
     return counts, oldest, has_p0
 
 
 def _write_decision_record(slot_tier: str, decision, counts: dict,
-                           schedule_label: str) -> None:
+                           schedule_label: str, backend: str = "") -> None:
     """groom/decisions/{date}/{slot}.json — a skipped slot must be
-    distinguishable from a broken scheduler (no-silent-caps). Best-effort."""
+    distinguishable from a broken scheduler (no-silent-caps). Best-effort.
+
+    ``backend`` (PRIMARY-mode DeepSeek selection, alpha-engine-config-I3479):
+    additive — present only when this slot's bundle was routed to DeepSeek,
+    omitted entirely on the (today, default-unarmed) Claude path, so the
+    record shape stays byte-identical until the feature is armed."""
     date = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
     key = f"groom/decisions/{date}/{slot_tier}.json"
     body = json.dumps({
         "schema_version": 1, "slot_tier": slot_tier, "schedule": schedule_label,
         "counts": counts, **decision.as_record(),
+        **({"backend": backend} if backend else {}),
         "decided_at": datetime.now(ZoneInfo("UTC")).isoformat(),
     })
     try:
@@ -612,6 +1917,9 @@ def _notify_demand_trigger_failed(exc: Exception, schedule_label: str) -> None:
             flow_name=_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
             db_basename=_DB_BASENAME,
             context={"schedule": schedule_label, "error": str(exc)},
+            # Matches playbooks.yaml's registered `groom_dispatch_telegram_only`
+            # class source exactly (config-I3513).
+            source="flow-doctor:scheduled-groom-dispatcher",
         )
     except Exception as notify_exc:  # noqa: BLE001 — secondary observability
         logger.warning("trigger-failed Telegram failed (non-fatal): %s", notify_exc)
@@ -632,17 +1940,29 @@ def _notify_demand_skip(decision, counts: dict, schedule_label: str) -> None:
             db_basename=_DB_BASENAME,
             context={"schedule": schedule_label, **decision.as_record()},
             silent_topic=FleetTelegramTopic.GROOM,
+            # Matches playbooks.yaml's registered `groom_dispatch_telegram_only`
+            # class source exactly (config-I3513).
+            source="flow-doctor:scheduled-groom-dispatcher",
         )
     except Exception as exc:  # noqa: BLE001 — secondary observability
         logger.warning("demand-skip Telegram failed (non-fatal): %s", exc)
 
 
 def _demand_decision(issue_filter: str, schedule_label: str):
-    """config#1933 enumerate-then-decide. Returns a SlotDecision, or None to
-    proceed with the legacy unconditional launch (gate off / non-slot run /
-    enumeration failure — the gate is an optimization, NEVER a correctness
-    gate, so any error here fail-safes to launching). Counts are passed to
-    the record writer via the decision closure below."""
+    """config#1933 enumerate-then-decide. Returns ``(decision, counts,
+    backend)``, or None to proceed with the legacy unconditional launch
+    (gate off / non-slot run / enumeration failure — the gate is an
+    optimization, NEVER a correctness gate, so any error here fail-safes to
+    launching). Counts are passed to the record writer via the decision
+    closure below.
+
+    ``backend`` (PRIMARY-mode DeepSeek selection, alpha-engine-config-I3479):
+    computed once here from the decided bundle's ``.tiers`` via
+    ``_primary_backend_for`` — "" (unchanged Claude path) unless
+    ``GROOM_PRIMARY_DEEPSEEK_TIERS`` is armed and every tier in the bundle
+    qualifies. Written into the SAME decision record the caller already
+    writes, so the demand-gate log distinguishes DeepSeek-primary launches
+    without a second enumeration/decision pass."""
     if not DEMAND_GATE_ENABLED:
         return None
     try:
@@ -654,68 +1974,43 @@ def _demand_decision(issue_filter: str, schedule_label: str):
     try:
         counts, oldest, has_p0 = _enumerate_tier_stats(_github_token())
         decision = ge.decide_slot(slot_tiers[0], counts, oldest, has_p0)
-        _write_decision_record(slot_tiers[0], decision, counts, schedule_label)
-        return decision, counts
+        backend = _primary_backend_for(decision.tiers) or ""
+        _write_decision_record(slot_tiers[0], decision, counts, schedule_label, backend)
+        return decision, counts, backend
     except Exception as exc:  # noqa: BLE001 — fail-safe to legacy launch
         logger.warning("demand gate unavailable (%s) — legacy unconditional "
                        "launch", exc)
         return None
 
 
-def _load_recent_engagements() -> dict:
-    """(repo, number) -> engagement horizon epoch from the last
-    ``ge.ENGAGEMENT_LOOKBACK_DAYS`` days' S3 run artifacts (same schema the
-    driver's config#1893 fresh-skip reads).
-
-    RAISES on any read failure (config#2142). This was previously fail-safe
-    ``{}`` ("skip nothing — counting a few extra issues"), which masked a
-    total AccessDenied on the ``groom/{date}/`` engagement scan for every
-    trigger from ship (2026-07-08) to 2026-07-10: fresh-skip enumeration ran
-    with an empty map on 8 consecutive triggers with zero pipeline signal,
-    inflating every advertised per-tier count. The trigger handler's own
-    catch is the recording surface: it skips the trigger (fail-closed, no
-    launch on over-counted queues) AND pages ops-health.
-
-    config#2038: the lookback (was a hardcoded ``range(3)``) and the engaged-
-    disposition set (was a hardcoded tuple literal) had silently drifted from
-    groom_driver.py's own constants (4-day lookback, same 4 dispositions) —
-    this module already imports ``nousergon_lib.groom_eligibility`` as the
-    declared single source of truth for exactly this class of drift; the two
-    values just weren't pulled from it yet. Read them from ``ge`` so they
-    can't re-drift.
-    """
-    out: dict = {}
-    s3 = boto3.client("s3", region_name=REGION)
-    now = datetime.now(ZoneInfo("UTC"))
-    for d in range(ge.ENGAGEMENT_LOOKBACK_DAYS):
-        date = (now - timedelta(days=d)).strftime("%Y-%m-%d")
-        resp = s3.list_objects_v2(Bucket=_RESEARCH_BUCKET, Prefix=f"groom/{date}/")
-        for obj in resp.get("Contents", []) or []:
-            if not obj["Key"].endswith(".json"):
-                continue
-            art = json.loads(s3.get_object(Bucket=_RESEARCH_BUCKET, Key=obj["Key"])["Body"].read())
-            run_start = art.get("run_start", "")
-            if not run_start:
-                continue
-            horizon = (datetime.fromisoformat(run_start.replace("Z", "+00:00")).timestamp()
-                       + int(art.get("elapsed_min", 0)) * 60 + ge.FRESH_SKIP_SLACK_SEC)
-            for rec in art.get("issues", []):
-                if rec.get("disposition") in ge.ENGAGED_DISPOSITIONS:
-                    k = (rec.get("repo", ""), rec.get("number"))
-                    out[k] = max(out.get(k, 0.0), horizon)
-    return out
-
-
 def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list, dict]:
-    """Tier stats with config#1893 fresh-skip applied (P0 exempt).
+    """Tier stats (config#2146: the 72h fresh-skip cooldown this function
+    used to apply is retired — eligibility is disposition-structural now,
+    ``ge.is_actionable`` alone decides membership; see groom_eligibility's
+    module docstring for the Brian ruling. ``_load_recent_engagements`` (the
+    engagement-horizon S3 scan fresh-skip used to consume) is removed with
+    it — it had no other caller).
 
     Returns (counts, oldest_wait_hours, p0_tiers, tier_issues) —
     the first three for ge.decide_trigger(); ``tier_issues`` maps tier →
     the actual issue dicts behind each count (repo/number/title/labels/
     updated_at), consumed by ``_write_queue_manifests`` (config#2152: the
     enumerate-once queue manifest — counts and queue derive from the SAME
-    walk by construction, so they can never diverge)."""
-    engagements = _load_recent_engagements()
+    walk by construction, so they can never diverge).
+
+    config-I3227: org-wide OPEN PRs labeled ``ge.RULING_PENDING_LABEL`` (see
+    ``_enumerate_ruling_pending_prs``) are folded into the SAME
+    counts/oldest/p0_tiers/tier_issues this function already builds for
+    issues — one enumeration, one set of outputs, so ``decide_trigger()``
+    sees ruled PRs and issues as one undifferentiated demand pool per tier
+    (a ruled-PR-only backlog now clears the floor or trips the anti-
+    starvation escape valve exactly like an issue-only one would; the
+    escape valve is generic over ANY tier's oldest wait, so a ruled PR that
+    has sat past ``max_wait_hours`` fires it the same way an actionable P0
+    issue does — no separate carve-out needed). PR titles are prefixed
+    ``[PR] `` in ``tier_issues``, mirroring the disambiguation convention
+    ``groom_driver.py``'s ``gated_reverify_pr_pool``/``ruling_exec_pr_pool``
+    already use for the identical PR-vs-issue ambiguity."""
     counts: dict[str, int] = {t: 0 for t in ge.TIERS}
     oldest: dict[str, float] = {t: 0.0 for t in ge.TIERS}
     tier_issues: dict[str, list[dict]] = {t: [] for t in ge.TIERS}
@@ -744,9 +2039,6 @@ def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list, dict]:
                 is_p0 = "P0" in labels
                 updated_epoch = datetime.fromisoformat(
                     str(it.get("updated_at", "")).replace("Z", "+00:00")).timestamp()
-                engaged = engagements.get((repo, it["number"]))
-                if engaged and not is_p0 and ge.fresh_skip_active(engaged, updated_epoch, now_epoch):
-                    continue
                 counts[tier] += 1
                 tier_issues[tier].append({
                     "repo": repo, "number": it["number"],
@@ -759,6 +2051,24 @@ def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list, dict]:
             if len(batch) < 100:
                 break
             page += 1
+    for pr in _enumerate_ruling_pending_prs(token):
+        labels = [lbl["name"] for lbl in pr.get("labels", [])]
+        tier = ge.is_actionable(labels)
+        if tier is None:
+            continue
+        is_p0 = "P0" in labels
+        pr_repo = pr.get("repo", "")
+        updated_epoch = datetime.fromisoformat(
+            str(pr.get("updated_at", "")).replace("Z", "+00:00")).timestamp()
+        counts[tier] += 1
+        tier_issues[tier].append({
+            "repo": pr_repo, "number": pr.get("number"),
+            "title": f"[PR] {pr.get('title', '')}", "labels": labels,
+            "updated_at": str(pr.get("updated_at", "")),
+        })
+        oldest[tier] = max(oldest[tier], (now_epoch - updated_epoch) / 3600.0)
+        if is_p0:
+            p0_tiers.add(tier)
     return counts, oldest, sorted(p0_tiers), tier_issues
 
 
@@ -827,13 +2137,20 @@ def _write_skip_record(schedule_label: str, skip_reason: str, **extra) -> None:
         logger.warning("skip record write failed (non-fatal): %s", exc)
 
 
-def _write_trigger_record(schedule_label: str, launches: list, counts: dict) -> None:
-    """One record per trigger evaluation — groom/decisions/{date}/{HHMM}.json."""
+def _write_trigger_record(schedule_label: str, decisions_record: list, counts: dict) -> None:
+    """One record per trigger evaluation — groom/decisions/{date}/{HHMM}.json.
+
+    ``decisions_record`` is the list of per-decision dicts the demand-all
+    handler loop has already built (each a ``SlotDecision.as_record()``,
+    optionally carrying an additive ``backend`` key — PRIMARY-mode DeepSeek
+    selection, alpha-engine-config-I3479) — NOT raw ``SlotDecision`` objects,
+    so the backend augmentation happens exactly once, at the same place the
+    launch entries themselves are built, rather than being recomputed here."""
     now = datetime.now(ZoneInfo("UTC"))
     key = f"groom/decisions/{now:%Y-%m-%d}/trigger-{now:%H%M}.json"
     body = json.dumps({
         "schema_version": 2, "trigger": "demand-all", "schedule": schedule_label,
-        "counts": counts, "decisions": [d.as_record() for d in launches],
+        "counts": counts, "decisions": decisions_record,
         "decided_at": now.isoformat(),
     })
     try:
@@ -850,8 +2167,10 @@ def _write_sweep_decision_record(schedule_label: str, run_mode: str, launched: d
     invocation) previously wrote NO ``groom/decisions/{date}/*.json`` record at
     all — unlike the ``demand-all`` full-mode path, which always has via
     ``_write_trigger_record``/``_write_skip_record``. That left the dispatch
-    decision log — the ground-truth input ``groom-liveness-probe`` now reads
-    (config#2667) to detect a silently-missing run artifact — structurally
+    decision log — the ground-truth input the ``overseer-liveness-probe``
+    ``run_window`` check now reads (config#2667; the reader moved off the
+    retired groom-liveness-probe in I2831) to detect a silently-missing run
+    artifact — structurally
     blind to sweep dispatches: a sweep box that died silently after this
     Lambda logged "dispatched" left no trace for the probe to even know a
     trigger had fired.
@@ -862,7 +2181,16 @@ def _write_sweep_decision_record(schedule_label: str, run_mode: str, launched: d
     version 2, a ``decisions`` list of ``{launch, ...}`` dicts) so the probe's
     reader treats both trigger kinds identically. Best-effort non-fatal,
     mirroring the demand-all writers: a record-write failure must never block
-    or crash the (fire-and-forget) sweep dispatch itself."""
+    or crash the (fire-and-forget) sweep dispatch itself.
+
+    ``launched.get("backend")`` (PRIMARY-mode DeepSeek selection,
+    alpha-engine-config-I3479): additive — present in the per-decision
+    record only when ``_launch_groom_spot`` actually threaded a backend
+    (itself only truthy when a launch_decided caller resolved one via
+    ``_resolve_launch_decided_backend``), omitted entirely for every other
+    (Claude, or unarmed) launch_decided dispatch — sweep boxes included, so
+    this record stays byte-identical to its pre-PRIMARY-mode shape by
+    default."""
     now = datetime.now(ZoneInfo("UTC"))
     key = f"groom/decisions/{now:%Y-%m-%d}/sweep-{now:%H%M%S}.json"
     launch_ok = bool(launched.get("launched"))
@@ -875,6 +2203,7 @@ def _write_sweep_decision_record(schedule_label: str, run_mode: str, launched: d
             "model": launched.get("model", ""),
             "reason": launched.get("reason", "launch_decided"),
             "tier_tag": launched.get("tier_tag", ""),
+            **({"backend": launched["backend"]} if launched.get("backend") else {}),
         }],
         "decided_at": now.isoformat(),
     })
@@ -886,13 +2215,117 @@ def _write_sweep_decision_record(schedule_label: str, run_mode: str, launched: d
         logger.warning("sweep decision record write failed (non-fatal): %s", exc)
 
 
+def _write_fallback_decision_record(schedule_label: str, tier: str, backend: str,
+                                    launched: dict) -> None:
+    """groom/decisions/{date}/fallback-{HHMMSS}.json — records a quota-fallback
+    direct-invoke dispatch (``{"mode": "fallback", "tier": ...}`` — see
+    ``_handle_fallback_dispatch``). Own key prefix (``fallback-{HHMMSS}``, not
+    ``trigger-``/``sweep-``) so a same-minute demand-all evaluation or
+    end-of-SF sweep never collides with this on S3.
+
+    Same schema_version 2 shape (a ``decisions`` list of ``{launch, ...}``
+    dicts) every other dispatch path in this file already writes, so the
+    overseer-liveness-probe's ``run_window`` reader (config#2667) treats a
+    quota-fallback dispatch identically to a demand-all/sweep one — a
+    fallback box that dies silently must leave the same trace a scheduled one
+    would, closing the exact blind-spot class config-I2540/config#2667
+    already fixed for the other two dispatch shapes rather than reopening it
+    for this new third one. Best-effort non-fatal, mirroring every other
+    decision-record writer here: a record-write failure must never block or
+    crash the (fire-and-forget) fallback dispatch itself."""
+    now = datetime.now(ZoneInfo("UTC"))
+    key = f"groom/decisions/{now:%Y-%m-%d}/fallback-{now:%H%M%S}.json"
+    launch_ok = bool(launched.get("launched"))
+    body = json.dumps({
+        "schema_version": 2, "trigger": "quota_fallback", "tier": tier,
+        "backend": backend, "schedule": schedule_label,
+        "decisions": [{
+            "launch": launch_ok,
+            "issue_filter": launched.get("issue_filter", ""),
+            "model": launched.get("model", ""),
+            "reason": launched.get("reason", "quota_fallback"),
+            "tier_tag": launched.get("tier_tag", ""),
+        }],
+        "decided_at": now.isoformat(),
+    })
+    try:
+        boto3.client("s3", region_name=REGION).put_object(
+            Bucket=_RESEARCH_BUCKET, Key=key, Body=body.encode(),
+            ContentType="application/json")
+    except Exception as exc:  # noqa: BLE001 — mirrors _write_sweep_decision_record: observability only, never blocks the launch it's recording
+        logger.warning("fallback decision record write failed (non-fatal): %s", exc)
+
+
+def _handle_fallback_dispatch(event: dict) -> dict:
+    """Direct ``lambda:InvokeFunction`` quota-fallback path (3-repo feature;
+    this Lambda is one leg — see ``nousergon_lib``'s new
+    ``FALLBACK_TIER_MODELS`` dict and ``alpha-engine-config``'s
+    ``groom_driver.py`` quota classifier for the other two).
+
+    A groom box that hits mid-run Claude-quota exhaustion winds down cleanly
+    (existing config#1803 behavior, UNCHANGED by this change) and then
+    invokes THIS Lambda directly, bypassing EventBridge Scheduler entirely,
+    with ``{"mode": "fallback", "tier": "<low|mid|high>"}``. ``mode`` is not a
+    key any of the 3 live SCHED_INPUTS (deploy.sh) or any other invocation
+    shape this handler reads (``decide_only``/``launch_decided``/``demand-
+    all``/legacy) ever sets — this is a purely additive discriminator that
+    can never intercept a real cron/SF-driven invocation.
+
+    Deliberately SKIPS ``ge.decide_trigger()``'s demand-eligibility gate
+    (config#1933) entirely — a quota-fallback dispatch is a rescue for
+    already-decided, already-in-flight work the exhausted run didn't finish,
+    not a fresh demand re-evaluation — and launches EXACTLY ONE box for the
+    named tier via the SAME ``_launch_groom_spot`` chokepoint every other
+    dispatch path in this file uses (no duplicated launch/SSM code): it gets
+    the config#1979 concurrency guard, the config#3173 daily ceiling, and the
+    spot/on-demand + SSM-send-command mechanics for free, with
+    ``GROOM_BACKEND_DEEPSEEK`` threaded through so the box runs the DeepSeek
+    fallback provider. The tier -> DeepSeek-model mapping itself
+    (``FALLBACK_TIER_MODELS``) is consumed on-box by alpha-engine-config's
+    groom_spot_bootstrap.sh/groom_driver.py — this Lambda does not import or
+    reference that dict; ``GROOM_MODEL`` here is only the (inert-for-
+    deepseek) Claude-side default so the bootstrap command shape stays
+    unchanged for the field.
+
+    Fails LOUD (raises ``ValueError``) on a missing/invalid tier rather than
+    silently falling through to an unrelated demand-all launch — a malformed
+    fallback payload must never masquerade as a normal scheduled trigger.
+
+    Known, deliberately out-of-scope gotcha: the invoking box may still carry
+    the ``groom-issue-filter=<tier>-only`` tag while mid-terminate when this
+    fires, which COULD trip ``_launch_groom_spot``'s concurrent-tier-skip
+    guard and suppress the very fallback launch this path exists for.
+    Termination-before-invoke sequencing is an alpha-engine-config
+    ``groom_driver.py`` wind-down concern, not this Lambda's.
+    """
+    tier = str(event.get("tier") or "").strip().lower()
+    if tier not in _VALID_FALLBACK_TIERS:
+        raise ValueError(
+            f"invalid quota-fallback tier: {event.get('tier')!r} — must be "
+            f"one of {sorted(_VALID_FALLBACK_TIERS)}"
+        )
+    issue_filter = f"{tier}-only"
+    model = _resolve_model(event)
+    schedule_label = str(event.get("schedule") or "quota-fallback")
+    logger.info(
+        "quota-fallback dispatch: tier=%s issue_filter=%s model=%s backend=%s schedule=%s",
+        tier, issue_filter, model, GROOM_BACKEND_DEEPSEEK, schedule_label,
+    )
+    result = _launch_groom_spot(
+        "full", schedule_label, model, issue_filter,
+        backend=GROOM_BACKEND_DEEPSEEK,
+    )
+    _write_fallback_decision_record(schedule_label, tier, GROOM_BACKEND_DEEPSEEK, result)
+    return {"groom": result}
+
+
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """EventBridge Scheduler handler — launches the groom spot box on cadence.
 
     `event` is the schedule's JSON input, e.g. {"run_mode": "full", "model":
-    "claude-sonnet-5", "issue_filter": "high-only", "schedule": "0 1 * * *"}.
-    `model`/`issue_filter` default to the Sonnet mid-tier queue when absent
-    (the two pre-existing Sonnet schedules don't set them). `soft_limit_min` is
+    "deepseek-v4-pro", "issue_filter": "high-only", "schedule": "0 1 * * *"}.
+    `model`/`issue_filter` default to the DeepSeek mid-tier queue when absent
+    (the pre-existing schedules don't set them). `soft_limit_min` is
     a manual-invoke-ONLY bounded-test override — no live schedule sets it.
     `pr_budget` is set only on the dedicated high-only schedule (config#1769).
     `force_on_demand` (config#1645) is set only by the dispatch Step Function's
@@ -917,8 +2350,38 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     per-box states unchanged. Legacy direct invokes (no `decide_only` /
     `launch_decided` key) behave EXACTLY as before — decide AND launch in one
     call, same response shapes — for any caller not yet on the new SF flow.
+
+    Quota-fallback direct invoke (3-repo feature, ``mode: "fallback"``): a
+    THIRD invocation shape, checked first and returned early —
+    ``{"mode": "fallback", "tier": "<low|mid|high>"}`` fired by
+    ``lambda:InvokeFunction`` (never EventBridge) when an on-box groom run
+    winds down on mid-run Claude-quota exhaustion. See
+    ``_handle_fallback_dispatch`` for the full contract; no live schedule or
+    other caller ever sets a top-level ``mode`` key, so this cannot collide
+    with any invocation shape above.
+
+    PRIMARY-mode DeepSeek backend (alpha-engine-config-I3479): NOT a new
+    invocation shape — an additive ``backend`` field that rides the existing
+    demand-all / single-tier-demand-gate / decide_only / launch_decided
+    paths above. See ``_primary_backend_for`` and the module docstring for
+    the full contract; default (``GROOM_PRIMARY_DEEPSEEK_TIERS`` unset) is
+    every launch resolving ``backend=""``, byte-identical to pre-I3479
+    behavior.
     """
     event = event or {}
+    if event.get("mode") == "fallback":
+        return _handle_fallback_dispatch(event)
+    if event.get("mode") == "cycle_complete":
+        # 2026-07-28: SF terminal roll-up. Checked here, alongside `fallback`,
+        # for the same reason — no live schedule or other caller sets a
+        # top-level `mode`, so this cannot collide with any shape below.
+        return _handle_cycle_complete(event)
+    if event.get("mode") == "reconcile":
+        # config-I5229 (lane-death pager): EventBridge Scheduler (~5 min
+        # cadence) invokes this mode to screen open expectations against
+        # live EC2 state. No other caller sets a top-level `mode`, so this
+        # cannot collide with any other invocation shape.
+        return _reconcile_lane_death()
     run_mode = _resolve_run_mode(event)
     model = _resolve_model(event)
     issue_filter = _resolve_issue_filter(event)
@@ -950,6 +2413,39 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     if queue_manifest_key and not re.fullmatch(r"[A-Za-z0-9._/-]{1,512}", queue_manifest_key):
         raise ValueError(f"invalid queue_manifest_key: {queue_manifest_key!r}")
 
+    # ── Cycle singleton (alpha-engine-config-I5371) ───────────────────────────
+    # Checked on the DECIDE phase only, and BEFORE enumeration: a skipped cycle
+    # must cost zero GitHub calls, not a full backlog walk we then discard.
+    #
+    # Deliberately NOT applied to `launch_decided`: that shape is a per-lane
+    # launch *within* an already-decided cycle (including the SF's bounded
+    # relaunch retries and the unconditional end-of-SF sweep). Blocking it here
+    # would let the singleton guard cancel the surviving cycle's own lanes —
+    # the opposite of what it is for. Lane-level concurrency stays owned by the
+    # config#1979 tag guard in `_launch_groom_spot`.
+    if event.get("decide_only"):
+        execution_arn = str(event.get("executionArn") or "")
+        try:
+            blockers = _concurrent_cycle_blockers(execution_arn)
+        except ConcurrentCycleError as exc:
+            # Fail CLOSED with a NAMED reason (§2.4: never a silent residual).
+            logger.error("cycle-singleton probe INDETERMINATE — skipping this "
+                         "cycle rather than risking a concurrent one: %s", exc)
+            _notify_concurrent_cycle_skip(
+                [{"name": f"<probe failed: {exc}>"}], schedule_label, execution_arn)
+            return _decide_result(
+                {"launches": [], "reason": "concurrent_cycle_probe_failed",
+                 "detail": str(exc)}, schedule_label)
+        if blockers:
+            names = [str(b.get("name") or b.get("executionArn")) for b in blockers]
+            logger.warning(
+                "cycle singleton: %d earlier dispatch cycle(s) still RUNNING (%s) "
+                "— skipping this cycle's enumeration entirely", len(blockers), names)
+            _notify_concurrent_cycle_skip(blockers, schedule_label, execution_arn)
+            return _decide_result(
+                {"launches": [], "reason": "concurrent_cycle_skip",
+                 "blocking_executions": names}, schedule_label)
+
     if event.get("launch_decided"):
         # config#2129: a decide_only call (or the SF's bounded-relaunch loop
         # re-invoking for the SAME already-decided box) already made this
@@ -961,15 +2457,43 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         # unconditional by design, so bypassing the demand gates is
         # exactly right; the config#1979 concurrent guard (on the distinct
         # 'sweep' lane tag) is the only pre-launch check that applies.
+        # alpha-engine-config-I3479 (PRIMARY-mode DeepSeek): a decide_only
+        # entry that carried a "backend" key round-trips here verbatim via
+        # the SF Map's wholesale States.JsonMerge (see module docstring) —
+        # validated against the fixed vocabulary before use, fail-loud on
+        # anything unrecognized.
         result = _launch_groom_spot(
             run_mode, schedule_label, model, issue_filter, soft_limit_min, pr_budget,
             force_on_demand,
             queue_manifest_key=queue_manifest_key,
+            backend=_resolve_launch_decided_backend(event),
+            task_token=_task_token(event),
         )
-        # config#2667: record this decision too — previously only the
         # demand-all path did (_write_trigger_record/_write_skip_record),
         # leaving sweep-mode (and any other launch_decided) dispatches with
         # no entry in the dispatch-decision log at all.
+        # config-I4333: when invoked with .waitForTaskToken and the box was NOT
+        # launched (concurrent skip, kill-switch), call send-task-success with
+        # launched:false so the SF doesn't wait 6h for a callback that will never
+        # come. The box handles the launched:true callback itself in its finish() trap.
+        task_token = _task_token(event)
+        if task_token and not result.get("launched"):
+            try:
+                boto3.client("stepfunctions", region_name=REGION).send_task_success(
+                    taskToken=task_token,
+                    output=json.dumps({
+                        "groomLaunch": {
+                            "Payload": {
+                                "groom": {
+                                    "launched": False,
+                                    "reason": result.get("reason", "not_launched")
+                                }
+                            }
+                        }
+                    })
+                )
+            except Exception as exc:
+                logger.warning("send-task-success for launched:false failed (non-fatal — SF timeout catcher covers this): %s", exc)
         _write_sweep_decision_record(schedule_label, run_mode, result)
         return {"groom": result}
 
@@ -984,8 +2508,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         try:
             counts, oldest, p0_tiers, tier_issues = _enumerate_tier_stats_fresh(_github_token())
             launches = ge.decide_trigger(counts, oldest, p0_tiers)
-        except Exception as exc:  # noqa: BLE001 — fail-closed: skip this trigger rather than launching with stale (no-fresh-skip) legacy counts; recorded via ops-health page (config#2142)
-            logger.warning("demand trigger unavailable (%s) — skipping trigger (legacy fallthrough retired, fresh-skip-less enumeration over-counts the queue)", exc)
+        except Exception as exc:  # noqa: BLE001 — fail-closed: skip this trigger rather than launching on a partial/failed GitHub enumeration sweep; recorded via ops-health page (config#2142)
+            logger.warning("demand trigger unavailable (%s) — skipping trigger (legacy fallthrough retired, config#2146: a failed enumeration sweep must never launch on an incomplete count)", exc)
             _notify_demand_trigger_failed(exc, schedule_label)
             # config-I2540: an enumeration failure must still leave a decision
             # record — a missing groom/decisions/{date}/trigger-*.json file
@@ -995,19 +2519,28 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             _write_skip_record(schedule_label, "demand_all_failed", error=str(exc))
             err = {"launched": False, "reason": "demand_all_failed", "error": str(exc)}
             if event.get("decide_only"):
-                return {"decide": {"launches": [], **err}}
+                return _decide_result({"launches": [], **err}, schedule_label)
             return {"groom": err}
         if launches is not None:
             manifest_keys = _write_queue_manifests(schedule_label, launches, tier_issues)
-            _write_trigger_record(schedule_label, launches, counts)
             entries = []
+            decisions_record = []
             for d in launches:
+                # alpha-engine-config-I3479 (PRIMARY-mode DeepSeek): computed
+                # once per bundle from its own .tiers, folded into BOTH the
+                # decision record (below) and the launch entry (further
+                # below) — additive in each, "" is inert/omitted.
+                backend = _primary_backend_for(d.tiers) or ""
+                record = dict(d.as_record())
+                if backend:
+                    record["backend"] = backend
+                decisions_record.append(record)
                 if not d.launch:
                     logger.info("demand trigger: %s", d.reason)
                     _notify_demand_skip(d, counts, schedule_label)
                     continue
-                logger.info("demand trigger LAUNCH — %s (filter=%s model=%s)",
-                            d.reason, d.issue_filter, d.model)
+                logger.info("demand trigger LAUNCH — %s (filter=%s model=%s backend=%s)",
+                            d.reason, d.issue_filter, d.model, backend or "claude")
                 # config#2201: SlotDecision no longer carries partition_index/
                 # partition_count at all — those fields were fully removed
                 # from nousergon-lib's SlotDecision (confirmed on the lib's
@@ -1016,20 +2549,26 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 entry = {"model": d.model, "issue_filter": d.issue_filter}
                 if pr_budget is not None and "high" in d.tiers:
                     entry["pr_budget"] = pr_budget
+                if backend:
+                    entry["backend"] = backend
                 entries.append(entry)
-            decisions_record = [d.as_record() for d in launches]
+            _write_trigger_record(schedule_label, decisions_record, counts)
             if event.get("decide_only"):
                 # config#2152: manifests are written at DECIDE time (above) —
                 # the enumerate-once product of the same walk as the counts —
-                # so the two-phase SF path records them here too.
-                return {"decide": {"trigger": "demand-all", "counts": counts,
-                                   "decisions": decisions_record,
-                                   "queue_manifests": manifest_keys,
-                                   "launches": entries}}
+                # so the two-phase SF path records them here too. Each entry's
+                # optional "backend" key (I3479) rides the SF Map's wholesale
+                # per-item merge straight into the matching launch_decided
+                # invocation — see the module docstring.
+                return _decide_result({"trigger": "demand-all", "counts": counts,
+                                       "decisions": decisions_record,
+                                       "queue_manifests": manifest_keys,
+                                       "launches": entries}, schedule_label)
             results = [
                 _launch_groom_spot(
                     run_mode, schedule_label, e["model"], e["issue_filter"], soft_limit_min,
                     e.get("pr_budget"), force_on_demand,
+                    backend=e.get("backend", ""),
                 )
                 for e in entries
             ]
@@ -1038,34 +2577,45 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                               "queue_manifests": manifest_keys,
                               "launches": results}}
 
+    # alpha-engine-config-I3479 (PRIMARY-mode DeepSeek): when
+    # GROOM_PRIMARY_DEEPSEEK_TIERS is armed, ALL launch paths use DeepSeek —
+    # including gated-reverify, manifest drains, and force_on_demand relaunches.
+    # The per-tier scoping in _primary_backend_for (via the demand-gate branch
+    # below) still applies to the demand-all path for mixed-bundle scenarios,
+    # but with all three tiers armed today (low,mid,high) the distinction is moot.
+    backend = GROOM_BACKEND_DEEPSEEK if GROOM_PRIMARY_DEEPSEEK_TIERS else ""
     if run_mode == "full" and not force_on_demand and not queue_manifest_key:
         decided = _demand_decision(issue_filter, schedule_label)
         if decided is not None:
-            decision, counts = decided
+            decision, counts, decided_backend = decided
             if not decision.launch:
                 logger.info("demand gate SKIP — %s", decision.reason)
                 _notify_demand_skip(decision, counts, schedule_label)
                 skip = {"launched": False, "reason": "demand_gate_skip",
                         "decision": decision.as_record(), "counts": counts}
                 if event.get("decide_only"):
-                    return {"decide": {"launches": [], **skip}}
+                    return _decide_result({"launches": [], **skip}, schedule_label)
                 return {"groom": skip}
             # Launch with the DECIDED bundle + cheapest adequate model — the
             # schedule's model is only the slot default; high never runs
             # below its own tier's model, and a bundle without high never pays for it.
             issue_filter = decision.issue_filter
             model = decision.model
-            logger.info("demand gate LAUNCH — %s (filter=%s model=%s)",
-                        decision.reason, issue_filter, model)
+            backend = decided_backend
+            logger.info("demand gate LAUNCH — %s (filter=%s model=%s backend=%s)",
+                        decision.reason, issue_filter, model, backend or "claude")
 
     if event.get("decide_only"):
         entry = {"model": model, "issue_filter": issue_filter}
         if pr_budget is not None:
             entry["pr_budget"] = pr_budget
-        return {"decide": {"launches": [entry]}}
+        if backend:
+            entry["backend"] = backend
+        return _decide_result({"launches": [entry]}, schedule_label)
 
     result = _launch_groom_spot(
         run_mode, schedule_label, model, issue_filter, soft_limit_min, pr_budget, force_on_demand,
         queue_manifest_key=queue_manifest_key,
+        backend=backend,
     )
     return {"groom": result}

@@ -109,3 +109,105 @@ def test_main_reports_drift_exit_code_via_cli(cd, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert exit_code == 1
     assert "drift" in out.lower()
+
+
+class TestDriftReportingPath:
+    """The FAILURE path must actually report (alpha-engine-config-I4509).
+
+    These are the tests that were missing. `_report_drift` (formerly
+    `_flow_doctor_report`) was broken for an unknown length of time and nobody
+    noticed, because it only runs when drift is FOUND and the daily check
+    normally passes. Two independent faults were live simultaneously:
+    `flow_doctor.init()` does not exist in flow-doctor 0.8.7, and the env
+    hydration for flow-doctor.yaml was incomplete regardless.
+
+    A reporting path exercised only on failure needs a test that exercises
+    failure. That is the whole lesson.
+    """
+
+    def test_report_publishes_via_krepis(self, cd, monkeypatch):
+        module, _, _ = cd
+        captured = {}
+
+        def fake_publish(**kwargs):
+            captured.update(kwargs)
+
+        monkeypatch.setitem(
+            __import__("sys").modules, "krepis.alerts",
+            type("M", (), {"publish": staticmethod(fake_publish)})
+        )
+        module._report_drift(["daily-news.service: DIVERGED"])
+
+        assert captured, "drift must publish an alert, not just print"
+        assert captured["severity"] == "error"
+        assert captured["source"] == "check-systemd-unit-drift"
+        assert "daily-news.service" in captured["message"], (
+            "the alert must name the drifting unit — an alert that says "
+            "'drift detected' sends you to the box to find out what"
+        )
+
+    def test_report_dedups_on_findings_not_message(self, cd, monkeypatch):
+        # Same drift persisting should alert once a day; DIFFERENT drift must
+        # produce a different key so it pages immediately.
+        module, _, _ = cd
+        keys = []
+
+        def fake_publish(**kwargs):
+            keys.append(kwargs["dedup_key"])
+
+        monkeypatch.setitem(
+            __import__("sys").modules, "krepis.alerts",
+            type("M", (), {"publish": staticmethod(fake_publish)})
+        )
+        module._report_drift(["a.service: DIVERGED"])
+        module._report_drift(["a.service: DIVERGED"])
+        module._report_drift(["b.service: DIVERGED"])
+
+        assert keys[0] == keys[1], "identical findings must share a dedup key"
+        assert keys[2] != keys[0], "different findings must not be deduped together"
+
+    def test_publish_failure_is_loud_not_swallowed(self, cd, monkeypatch, capsys):
+        # The exact defect this rewrite fixes: drift was detected and the
+        # telling threw, silently.
+        module, _, _ = cd
+
+        def boom(**kwargs):
+            raise RuntimeError("simulated transport failure")
+
+        monkeypatch.setitem(
+            __import__("sys").modules, "krepis.alerts",
+            type("M", (), {"publish": staticmethod(boom)})
+        )
+        module._report_drift(["a.service: DIVERGED"])
+
+        err = capsys.readouterr().err
+        assert "UNREPORTED" in err, (
+            "a failure to publish must be loud — silent failure here is "
+            "indistinguishable from no drift"
+        )
+
+    def test_flow_doctor_init_is_not_resurrected(self):
+        """`flow_doctor.init` has not existed for some time -- guard the CALL.
+
+        Parsed with `ast` rather than grepped, deliberately. A source-text
+        guard trips on the module's own docstring explaining why this API is
+        gone, which pushes the next person to delete the explanation rather
+        than keep the guard. Matching a real Call node means prose is free to
+        name the dead API as often as it is useful to.
+        """
+        import ast
+
+        tree = ast.parse(_SCRIPT_PATH.read_text())
+        bad = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "init"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "flow_doctor"
+        ]
+        assert not bad, (
+            "flow_doctor.init() does not exist in flow-doctor 0.8.7 -- it "
+            "exports FlowDoctor/FlowDoctorBuilder. Use krepis.alerts (the "
+            "canonical CLI, config#1649)."
+        )

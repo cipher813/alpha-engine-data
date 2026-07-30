@@ -65,7 +65,13 @@ SCHEMA_VERSION = 1
 
 
 # ── CIK lookup (mirror of ingest_8k_filings._get_cik) ──────────────────
+#
+# config#2956: backed by the shared ``/tmp`` file cache (see
+# ``_cik_lookup.load_cik_map``) so a cold in-memory cache in THIS process
+# doesn't re-download company_tickers.json if another pipeline step
+# already fetched it this run/day.
 
+from rag.pipelines._cik_lookup import load_cik_map  # noqa: E402
 
 _CIK_CACHE: dict[str, str] = {}
 
@@ -75,16 +81,8 @@ def _get_cik(ticker: str, *, http=requests) -> str | None:
     if ticker in _CIK_CACHE:
         return _CIK_CACHE[ticker]
     try:
-        resp = http.get(
-            "https://www.sec.gov/files/company_tickers.json",
-            headers=_SEC_HEADERS, timeout=10,
-        )
-        if resp.status_code == 200:
-            for entry in resp.json().values():
-                _CIK_CACHE[entry.get("ticker", "").upper()] = str(
-                    entry.get("cik_str", "")
-                )
-            return _CIK_CACHE.get(ticker.upper())
+        _CIK_CACHE.update(load_cik_map(http=http, headers=_SEC_HEADERS))
+        return _CIK_CACHE.get(ticker.upper())
     except Exception as e:
         logger.warning("[form4] CIK lookup failed for %s: %s", ticker, e)
     return None
@@ -573,7 +571,7 @@ def main():
     )
     grp.add_argument(
         "--from-signals", action="store_true",
-        help="Load tickers from latest signals.json on S3.",
+        help="Load tickers from the scanner decision set (universe-membership cuts.scanner_candidates).",
     )
     parser.add_argument(
         "--lookback-days", type=int, default=90,
@@ -593,8 +591,8 @@ def main():
     if args.tickers:
         tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
     else:
-        from rag.pipelines._signals_universe import load_signals_tickers
-        tickers = load_signals_tickers(bucket=args.bucket)
+        from rag.pipelines._rag_scope import load_rag_scope_tickers
+        tickers = load_rag_scope_tickers(bucket=args.bucket)
     if not tickers:
         logger.error("[ingest_form4] no tickers — aborting")
         return

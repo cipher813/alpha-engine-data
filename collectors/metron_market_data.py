@@ -66,6 +66,10 @@ FX_PREFIX = "market_data/fx/"
 # History artifacts (per-symbol / per-currency) — power Metron's Performance NAV
 # reconstruction (close series) + as-of-date realized/dividend FX conversion.
 CLOSE_HISTORY_PREFIX = "market_data/close_history/"
+# Consolidated close-history artifact containing all symbols' close series + currency map
+# (one file instead of N per-ticker files — metron-ops#233). Written alongside per-ticker
+# files during the transition period; the consumer prefers this when present.
+CONSOLIDATED_CLOSE_HISTORY_KEY = f"{CLOSE_HISTORY_PREFIX}consolidated.json"
 FX_HISTORY_PREFIX = "market_data/fx_history/"
 # Factor/sector ETFs whose close-history Metron's RISK (factor model) + ATTRIBUTION
 # (Brinson sector) need. These are NOT in any held universe, so unless their history is
@@ -1085,6 +1089,15 @@ def collect_history(
             _write_json(s3_client, bucket, f"{FX_HISTORY_PREFIX}{ccy}.json", {
                 "schema_version": FX_HISTORY_SCHEMA_VERSION, "currency": ccy,
                 "base": BASE_CURRENCY, "rates": [list(p) for p in series]})
+        # Consolidated artifact (metron-ops#233): a single file with all symbols' close
+        # series + currency map, so the consumer reads one S3 get_object instead of N.
+        # Written alongside per-ticker files during the transition period.
+        _write_json(s3_client, bucket, CONSOLIDATED_CLOSE_HISTORY_KEY, {
+            "schema_version": CLOSE_HISTORY_SCHEMA_VERSION,
+            "adjustment_basis": CLOSE_HISTORY_ADJUSTMENT_BASIS,
+            "series": {sym: [list(p) for p in series] for sym, series in closes.items()},
+            "currency": {sym: ccy_by_yf.get(sym, "USD") for sym in closes},
+        })
     except Exception as e:  # fail loud to the phase registry
         logger.error("[metron_market_data] history write failed: %s", e)
         return {"status": "error", "error": str(e)}
@@ -1755,6 +1768,90 @@ def collect_security_performance(
 
 # ── Valuation medians (SP1500-broad sector & country peer benchmark) ──────────
 
+# Country-specific iShares MSCI ETFs whose yfinance ``top_holdings`` serve as a
+# proxy universe for ex-US large-cap stocks in the country-valuation-medians
+# benchmark (metron-ops#222 / Option A — extend yfinance collection). Each ETF's
+# top 10 holdings are unioned into the medians universe so a non-US holding
+# benchmarks against its actual country peers rather than the SP1500-only
+# (US-domiciled) default that leaves non-US country buckets thin or empty.
+#
+# Selected symbols cover the majority of MSCI EAFE developed-market weight by
+# market cap. Fail-soft per ETF: a ticker that yfinance can't resolve makes no
+# contribution; a country whose ETF is temporarily unreachable falls back to
+# whatever the held universe provides that country.
+_EAFE_COUNTRY_ETFS: dict[str, str] = {
+    "EWJ": "Japan",
+    "EWU": "United Kingdom",
+    "EWG": "Germany",
+    "EWQ": "France",
+    "EWL": "Switzerland",
+    "EWA": "Australia",
+    "EWC": "Canada",
+    "EWH": "Hong Kong",
+    "EIS": "Israel",
+}
+
+
+def _eafe_tickers() -> set[str]:
+    """Derive an ex-US large-cap proxy ticker set from country-ETF top holdings.
+
+    Reads the top 10 holdings of each country-specific iShares MSCI ETF in
+    ``_EAFE_COUNTRY_ETFS`` via yfinance ``funds_data.top_holdings`` — ~9 ETFs →
+    ~90 stock tickers across the major developed-market countries the MSCI EAFE
+    index represents. These supplement the SP1500-broad medians universe so a
+    non-US holding's country-median benchmark draws from a meaningful set of
+    country peers rather than falling through to the US-domiciled-only default.
+
+    Fail-soft per ETF: a transient yfinance miss on one country degrades to
+    whatever subset was successfully fetched; all failures return ``set()`` (no
+    ex-US contribution, logged). Never raises.
+
+    yfinance alone is the entire data path (Option A mandate — no new provider,
+    no paid feed). The top-holdings data is the same source the existing
+    ``yf.Ticker(sym).info`` fetcher reads; the ~9 light-weight fund_data calls
+    (~2 s each, sequential rate-limited) add negligible latency to the weekly
+    valuation-medians pass compared to the per-ticker ~900-name info fan-out.
+    """
+    import yfinance as yf
+
+    result: set[str] = set()
+    n_success = 0
+    for etf, country in sorted(_EAFE_COUNTRY_ETFS.items()):
+        try:
+            t = yf.Ticker(etf)
+            th = t.funds_data.top_holdings
+            if th is not None and len(th) > 0:
+                symbols = {str(s).strip() for s in th.index if s and str(s).strip()}
+                result.update(symbols)
+                n_success += 1
+                logger.info(
+                    "[metron_market_data] eafe_tickers: %d tickers from %s (%s)",
+                    len(symbols), etf, country,
+                )
+            else:
+                logger.warning(
+                    "[metron_market_data] eafe_tickers: empty holdings for %s (%s)",
+                    etf, country,
+                )
+        except Exception as e:  # noqa: BLE001 — fail-soft per ETF; one country's miss degrades to the rest
+            logger.warning(
+                "[metron_market_data] eafe_tickers: failed to fetch %s (%s): %s",
+                etf, country, e,
+            )
+
+    if result:
+        logger.info(
+            "[metron_market_data] eafe_tickers: %d total tickers from %d/%d country ETFs",
+            len(result), n_success, len(_EAFE_COUNTRY_ETFS),
+        )
+    else:
+        logger.warning(
+            "[metron_market_data] eafe_tickers: no tickers fetched — ex-US country "
+            "medians will fall back to the current SP1500-only benchmark",
+        )
+    return result
+
+
 # camelCase yfinance .info key → snake_case median output field (the consumer maps these
 # 1:1 to the per-holding multiple, so band and row are directly comparable).
 _MEDIAN_OUT_NAME = {
@@ -1801,9 +1898,22 @@ def _yfinance_valuation(yf_symbols: list[str]) -> dict[str, dict]:
 
 
 def _default_medians_universe(bucket: str, s3_client: Any) -> list[str]:
-    """The broad benchmark universe = SP1500 ∪ Metron held/watchlist (``load_price_derived_universe``)."""
+    """The broad benchmark universe = SP1500 ∪ Metron held/watchlist ∪ EAFE proxy.
+
+    SP1500 and the Metron universe are loaded from S3 via ``load_price_derived_universe``
+    (fail-soft to empty). The EAFE proxy tickers are derived live from country-ETF top
+    holdings (``_eafe_tickers``, fail-soft to empty) — a yfinance-only extension that
+    fills the ex-US large-cap gap in ``by_country`` medians (metron-ops#222)."""
     holdings, _ = load_price_derived_universe(bucket, s3_client)
-    return [h["yf_symbol"] for h in holdings]
+    sp1500_symbols = {h["yf_symbol"] for h in holdings}
+    eafe = _eafe_tickers()
+    all_symbols = sorted(sp1500_symbols | eafe)
+    if eafe:
+        logger.info(
+            "[metron_market_data] medians universe: %d SP1500 ∪ %d EAFE proxy = %d total",
+            len(sp1500_symbols), len(eafe), len(all_symbols),
+        )
+    return all_symbols
 
 
 def _grouped_medians(rows: list[dict], group_key: str) -> dict[str, dict]:
@@ -2107,6 +2217,40 @@ def collect_intraday(
         "indices": dict(sorted(indices.items())),
         "fund_proxies": dict(sorted(fund_proxies.items())),
     }
+    # An EMPTY fetch is a failed run, and writing it destroys the last good one.
+    #
+    # `indices` and `fund_proxies` come from fixed non-empty constants and are
+    # fetched unconditionally, so zero of them is never a legitimate state --
+    # unlike `quotes`, which is legitimately empty for an account holding
+    # nothing. That asymmetry is what makes this a precise assertion rather than
+    # a heuristic on volume.
+    #
+    # Observed live 2026-07-29: `yfinance` was absent from the box's venv, so
+    # every `_yfinance_*` helper took its `except ImportError -> return {}`
+    # branch, logged a warning, and the run reported
+    # `{'status': 'ok', 'quotes': 0, 'indices': 0, 'fund_proxies': 0}` while
+    # OVERWRITING latest.json with a 126-byte artifact containing no quotes at
+    # all. The producer replaced good data with nothing and called it success.
+    # Every ImportError branch is marked `# pragma: no cover - yfinance/pandas
+    # are prod deps`, which is exactly the assumption that broke; this is the
+    # assertion the pragma was standing in for.
+    #
+    # Refuse before the write, not after: a consumer reading a stale as_of_utc
+    # can tell the feed is old, but one reading a fresh timestamp over an empty
+    # body cannot tell anything is wrong.
+    if not indices or not fund_proxies:
+        missing = [n for n, v in (("indices", indices), ("fund_proxies", fund_proxies)) if not v]
+        logger.error(
+            "[metron_market_data] intraday fetch returned NOTHING for %s -- these come "
+            "from fixed symbol lists and can never be legitimately empty. Refusing to "
+            "overwrite %slatest.json with an empty artifact. Check that yfinance and "
+            "pandas are importable in this interpreter.",
+            " and ".join(missing), INTRADAY_PREFIX,
+        )
+        return {"status": "error", "error": f"empty intraday fetch for {','.join(missing)}",
+                "quotes": len(quotes), "indices": len(indices),
+                "fund_proxies": len(fund_proxies)}
+
     if dry_run:
         logger.info("[metron_market_data] DRY-RUN intraday: %d quotes, %d indices, %d fund-proxies (not written)",
                     len(quotes), len(indices), len(fund_proxies))

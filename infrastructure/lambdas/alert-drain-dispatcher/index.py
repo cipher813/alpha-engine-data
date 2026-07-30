@@ -103,13 +103,23 @@ CW_LOG_GROUP = os.environ.get("ALERT_DRAIN_CW_LOG_GROUP", "/alpha-engine/alert-d
 
 _BOOL_RE = re.compile(r"^(true|false)$")
 _TRIGGER_RE = re.compile(r"^[a-z0-9_-]{0,64}$")
+# config-I3293 — optional registry-declared model, injected by the overseer
+# router from playbooks.yaml. Empty = absent = run-script inline default.
+# alpha-engine-config-I4478/I4516: provider-agnostic, mirroring
+# scheduled-groom-dispatcher's long-standing pattern. Was `^claude-...$`, which
+# structurally could NOT carry the DeepSeek model IDs the fleet actually runs
+# (2026-07-24 zero-Anthropic-model ruling) — so the registry, which is the
+# declared SSoT for each playbook's model, could not express the live policy.
+# Still a strict anchored allow-list of shell-safe characters: the value is
+# interpolated into the bootstrap command, so the injection guard is the point.
+_MODEL_RE = re.compile(r"^([a-z0-9][a-z0-9._-]{0,63})?$")
 
 
 class _InvalidEvent(ValueError):
     """A required event field is missing or fails its allowlist."""
 
 
-def _resolve_event_fields(event: dict) -> tuple[str, str, str]:
+def _resolve_event_fields(event: dict) -> tuple[str, str, str, str]:
     """Validate + synthesize the run identity. A drill's run id ALWAYS carries
     the ``drill-`` prefix (drill-vs-real isolation on the completion-marker
     and ledger keys, config#2223 pattern) and a real run's never does."""
@@ -119,18 +129,47 @@ def _resolve_event_fields(event: dict) -> tuple[str, str, str]:
     trigger = str(event.get("trigger") or "").strip()
     if not _TRIGGER_RE.match(trigger):
         raise _InvalidEvent(f"malformed 'trigger' in event: {trigger!r}")
+    model = str(event.get("model") or "").strip()
+    if not _MODEL_RE.match(model):
+        raise _InvalidEvent(f"malformed 'model' in event: {model!r}")
     now = datetime.now(timezone.utc)
     prefix = "drill-" if is_drill == "true" else "drain-"
     run_id = f"{prefix}{now:%Y-%m-%dT%H%MZ}"
-    return run_id, is_drill, trigger
+    return run_id, is_drill, trigger, model
 
 
-def _bootstrap_command(run_id: str, is_drill: str) -> str:
+def _bootstrap_command(run_id: str, is_drill: str, model: str = "") -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec the
-    alert_drain_spot_bootstrap.sh entrypoint. Prelude failure shuts the box
-    down (mirrors the sibling dispatchers' prelude fail() trap exactly)."""
+    UNIFIED overseer_spot_bootstrap.sh with ``--playbook alert-drain``.
+    Prelude failure shuts the box down (mirrors the sibling dispatchers'
+    prelude fail() trap exactly).
+
+    Cutover, alpha-engine-config-I5284 / EPIC I4992 step 2. alert-drain is
+    first because it is the simplest agent playbook and runs 4x daily, which
+    is the fastest real evidence available — NOT because it is broken. The
+    EPIC's original rationale ("already at 100% failure, nothing to regress")
+    expired when config-I4996 restored it; it has since completed 12
+    consecutive runs. So this is a cutover of a WORKING component and carries
+    a revert lever accordingly: restoring the two lines below to
+    ``infrastructure/alert_drain_spot_bootstrap.sh --run-id … --is-drill …``
+    returns to the legacy path, which stays on disk until a real run proves
+    the unified one.
+
+    ``run_id`` and ``is_drill`` are EXPORTED rather than passed as flags: the
+    unified bootstrap reads ``DRAIN_RUN_ID`` / ``DRAIN_IS_DRILL`` from the
+    environment (per-playbook identity is registry data, not argv) and
+    forwards unrecognised argv to the run script. Passing them as flags would
+    leave both unset — the run script would invent a ``<ts>-adhoc`` run id and,
+    worse, read the drill flag as false and drain the real queue.
+
+    ``model`` (config-I3293) is the registry-declared agent model injected by
+    the overseer router; exported as DRAIN_MODEL for the bootstrap's runuser
+    env passthrough (empty → alert_drain_run.sh's inline default applies —
+    its ``:-`` expansion treats empty as unset). Regex-validated upstream
+    (_MODEL_RE) so the f-string interpolation cannot inject shell."""
     return f"""set -uo pipefail
 export AWS_DEFAULT_REGION={REGION}
+export DRAIN_MODEL="{model}"
 # SSM RunShellScript runs as root with NO $HOME set; git config/clone need it.
 export HOME=/root
 fail() {{ echo "[alert-drain-prelude] FATAL: $1"; shutdown -h now; exit 1; }}
@@ -145,8 +184,9 @@ git clone --depth 1 --branch {DRAIN_CONFIG_BRANCH} \
   "https://x-access-token:${{PAT}}@github.com/{DRAIN_CONFIG_REPO}.git" \
   /home/ec2-user/alpha-engine-config || fail "clone failed"
 cd /home/ec2-user/alpha-engine-config
-exec bash infrastructure/alert_drain_spot_bootstrap.sh \
-  --run-id "{run_id}" --is-drill "{is_drill}"
+export DRAIN_RUN_ID="{run_id}"
+export DRAIN_IS_DRILL="{is_drill}"
+exec bash infrastructure/overseer_spot_bootstrap.sh --playbook alert-drain
 """
 
 
@@ -182,10 +222,11 @@ def _wait_ssm_online(instance_id: str) -> None:
     )
 
 
-def _send_bootstrap(instance_id: str, run_id: str, is_drill: str) -> str:
+def _send_bootstrap(instance_id: str, run_id: str, is_drill: str,
+                    model: str = "") -> str:
     return spot_dispatch.send_async_command(
         instance_id,
-        _bootstrap_command(run_id, is_drill),
+        _bootstrap_command(run_id, is_drill, model),
         comment=f"alert-drain ({run_id})",
         region=REGION,
         cw_log_group=CW_LOG_GROUP,
@@ -207,7 +248,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     ``{"launched": false, "reason": ...}``, never raises."""
     event = event or {}
     try:
-        run_id, is_drill, trigger = _resolve_event_fields(event)
+        run_id, is_drill, trigger, model = _resolve_event_fields(event)
     except _InvalidEvent as exc:
         logger.error("invalid alert-drain event: %s", exc)
         return {"launched": False, "reason": "invalid_event", "error": str(exc)}
@@ -252,7 +293,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     try:
         _wait_ssm_online(instance_id)
-        command_id = _send_bootstrap(instance_id, run_id, is_drill)
+        command_id = _send_bootstrap(instance_id, run_id, is_drill, model)
     except Exception as exc:  # noqa: BLE001 — converted to a clean launched:false (router escalates)
         _terminate_instance(instance_id)
         logger.error("alert-drain post-launch step failed for %s: %s: %s",

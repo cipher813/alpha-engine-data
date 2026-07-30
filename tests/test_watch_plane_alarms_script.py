@@ -1,7 +1,11 @@
-"""Pins the watch-plane Lambda alarm setup script (config#2266).
+"""Pins the watch-plane Lambda alarm setup script (config#2266; roster
+extended to 8 functions + an intake-queue age alarm by config-I2900/I2910;
+extended to 9 functions by alpha-engine-config-I3242's arctic-migration-
+dispatcher onboarding; extended to 11 functions by config#3173's
+ci-watch-liveness-probe + alert-drain-liveness-probe onboarding).
 
 setup_watch_plane_alarms.sh puts CloudWatch Errors + Throttles alarms on each
-of the four watch-plane Lambdas — the components whose job is to notice fleet
+of the watch-plane Lambdas — the components whose job is to notice fleet
 failures, and whose own failures were previously the one unmonitored failure
 mode (docstrings claimed an "error metric + CW alarm" backstop that did not
 exist). These tests pin the load-bearing shape:
@@ -52,7 +56,7 @@ def test_bash_syntax_is_valid():
 
 
 class TestWatchPlaneCoverage:
-    """All five watch-plane Lambdas must be alarmed."""
+    """All sixteen watch-plane Lambdas must be alarmed."""
 
     @pytest.mark.parametrize(
         "fn_name",
@@ -60,8 +64,33 @@ class TestWatchPlaneCoverage:
             "alpha-engine-saturday-sf-watch-dispatcher",
             "alpha-engine-sf-watch-spot-dispatcher",
             "alpha-engine-ci-watch-dispatcher",
-            "alpha-engine-sf-watch-liveness-probe",
+            # Added config#3173: mid-run spot-reclaim checkers for the
+            # ci-watch and alert-drain families, mirroring
+            # sf-watch-reclaim-sweep-handler's config#2270 mechanism — onboarded in
+            # the same PR that ships them.
+            "alpha-engine-ci-watch-liveness-probe",
+            "alpha-engine-alert-drain-liveness-probe",
+            "alpha-engine-sf-watch-reclaim-sweep-handler",
+            # The registry-driven unified probe (alpha-engine-config-I2831) — its
+            # own Errors metric is the dead-probe backstop the fail-loud contract
+            # assumes, same as the sibling probes.
+            "alpha-engine-overseer-liveness-probe",
             "alpha-engine-overseer-dispatcher",
+            # Added config-I2900: both were Active with ZERO alarm coverage
+            # (the same "new Lambda, forgot to onboard it" miss, twice).
+            "alpha-engine-alert-drain-dispatcher",
+            "alpha-engine-substrate-health-gate",
+            # Added config#3240: found during the same I2900 onboarding sweep,
+            # scoped out of that issue to avoid silent scope creep.
+            "alpha-engine-pipeline-watchdog",
+            "alpha-engine-canary-replay-liveness-probe",
+            "alpha-engine-saturday-integrity-sentinel",
+            "alpha-engine-freshness-monitor",
+            "alpha-engine-sweep-artifact-monitor",
+            # Added alpha-engine-config-I3242: the merge-triggered in-region
+            # ArcticDB migration runner — onboarded in the SAME PR that ships it,
+            # per this file's own header convention.
+            "alpha-engine-arctic-migration-dispatcher",
         ],
     )
     def test_lambda_is_present(self, script_text, fn_name):
@@ -70,13 +99,13 @@ class TestWatchPlaneCoverage:
             "it silently reopens the 'who watches the watcher' gap (config#2266)."
         )
 
-    def test_four_functions_declared(self, script_text):
+    def test_all_functions_declared(self, script_text):
         block = script_text[
             script_text.find("declare -A WATCH_PLANE_FUNCTIONS=(") : script_text.find(
                 ")", script_text.find("declare -A WATCH_PLANE_FUNCTIONS=(")
             )
         ]
-        assert block.count('"alpha-engine-') == 5
+        assert block.count('"alpha-engine-') == 16
 
     def test_both_errors_and_throttles_alarmed(self, script_text):
         assert "for metric in Errors Throttles" in script_text
@@ -122,8 +151,11 @@ class TestAlarmSemantics:
         # Opposite of the deadman alarms: these alarm on PRESENCE of errors,
         # and AWS/Lambda emits no Errors datapoint when idle — "breaching"
         # would page continuously on every quiet 5-minute window.
-        assert '--treat-missing-data "notBreaching"' in script_text
-        assert '--treat-missing-data "breaching"' not in script_text
+        # Must check only the Errors/Throttles section (the new
+        # Invocations-floor alarms use breaching intentionally).
+        errors_block = script_text[:script_text.find("invocations-floor")] if "invocations-floor" in script_text else script_text
+        assert '--treat-missing-data "notBreaching"' in errors_block
+        assert '--treat-missing-data "breaching"' not in errors_block
 
     def test_five_minute_single_period_window(self, script_text):
         assert "--period 300" in script_text
@@ -168,6 +200,85 @@ class TestDocstringsNowTruthful:
         )
 
 
+class TestLivenessInvocationsFloorAlarms:
+    """Invocations-floor alarms for liveness probes (alpha-engine-config-I5567):
+    fires when a probe that should run on a schedule stops being invoked
+    entirely — the exact blind spot the Errors/Throttles NotBreaching alarms
+    have."""
+
+    def _invocations_block(self, script_text: str) -> str:
+        pos = script_text.find("Per-liveness-probe Invocations-floor alarms")
+        assert pos != -1, "Invocations-floor alarm block not found"
+        # Block ends at the next section header (--- N.) or EOF.
+        next_section = script_text.find("\n# ---", pos + 10)
+        return script_text[pos:next_section] if next_section != -1 else script_text[pos:]
+
+    def test_invocations_metric_used(self, script_text):
+        block = self._invocations_block(script_text)
+        assert '--metric-name "Invocations"' in block
+
+    def test_threshold_zero_lte(self, script_text):
+        block = self._invocations_block(script_text)
+        assert "--threshold 0" in block
+        assert '--comparison-operator "LessThanOrEqualToThreshold"' in block
+
+    def test_treat_missing_data_is_breaching(self, script_text):
+        block = self._invocations_block(script_text)
+        # Opposite of the Errors/Throttles alarms: INVOCATIONS absence IS the
+        # condition being detected — breaching, not notBreaching.
+        assert '--treat-missing-data "breaching"' in block
+        assert '--treat-missing-data "notBreaching"' not in block
+
+    def test_twenty_four_hour_window(self, script_text):
+        block = self._invocations_block(script_text)
+        assert "--period 86400" in block
+
+    def test_sum_statistic(self, script_text):
+        block = self._invocations_block(script_text)
+        assert '--statistic "Sum"' in block
+
+    def test_single_period_datum(self, script_text):
+        block = self._invocations_block(script_text)
+        assert "--evaluation-periods 1" in block
+        assert "--datapoints-to-alarm 1" in block
+
+    def test_gated_on_liveness_label(self, script_text):
+        block = self._invocations_block(script_text)
+        assert 'case "$label" in' in block
+        assert "*liveness*" in block
+
+    def test_routes_to_backstop_topic(self, script_text):
+        block = self._invocations_block(script_text)
+        assert '--alarm-actions "$BACKSTOP_TOPIC_ARN"' in block
+        assert '--ok-actions "$BACKSTOP_TOPIC_ARN"' in block
+
+    def test_alarm_name_convention(self, script_text):
+        block = self._invocations_block(script_text)
+        assert "invocations-floor" in block
+        assert 'alpha-engine-watch-plane-${label}' in block
+
+    def test_all_liveness_labels_have_invocation_floor(self, script_text):
+        """Every WATCH_PLANE_FUNCTIONS entry whose label contains 'liveness'
+        is iterated by the Invocations-floor for loop — verified by counting
+        liveness labels in the declaration block and checking the for-loop
+        guard pattern matches *liveness* (which catches all of them at runtime,
+        even though the static text only has one put-metric-alarm call inside
+        the case body)."""
+        # Count liveness labels in the declaration block.
+        dec_start = script_text.find("declare -A WATCH_PLANE_FUNCTIONS=(")
+        dec_end = script_text.find(")", dec_start)
+        dec_block = script_text[dec_start:dec_end]
+        liveness_labels = [line for line in dec_block.split("\n") if "liveness" in line]
+        assert len(liveness_labels) >= 4, f"Expected >=4 liveness labels, found {len(liveness_labels)}"
+        # Verify the for loop exists with *liveness* pattern (catches all at runtime).
+        invoc_block = script_text[script_text.find("Per-liveness-probe Invocations-floor"):]
+        assert "for label in \"${!WATCH_PLANE_FUNCTIONS[@]}\"" in invoc_block
+        assert "*liveness*)" in invoc_block
+        assert "put-metric-alarm" in invoc_block
+        # Verify uniqueness: the alarm name uses ${label} so each iteration creates a distinct name.
+        assert 'alpha-engine-watch-plane-${label}-invocations-floor' in invoc_block
+
+
 class TestOverseerIntakeDlqAlarm:
     """The intake DLQ depth alarm (alpha-engine-config-I2823) rides this
     script so its backstop-topic + fail-fast discipline applies to it too."""
@@ -179,3 +290,48 @@ class TestOverseerIntakeDlqAlarm:
     def test_dlq_alarm_routes_to_backstop(self, script_text):
         dlq_block = script_text[script_text.find("overseer-intake-dlq-depth"):]
         assert '--alarm-actions "$BACKSTOP_TOPIC_ARN"' in dlq_block
+
+
+class TestOverseerIntakeAgeAlarm:
+    """The intake queue age-of-oldest-message alarm (alpha-engine-config-I2910)
+    — a dead drain never fails delivery, so it never reaches the DLQ; this is
+    the alarm that catches messages that were never received at all."""
+
+    def _age_block(self, script_text: str) -> str:
+        pos = script_text.find("overseer-intake-age")
+        assert pos != -1, "alpha-engine-watch-plane-overseer-intake-age alarm not found"
+        return script_text[pos:]
+
+    def test_age_alarm_present_and_targets_the_live_queue_not_the_dlq(self, script_text):
+        block = self._age_block(script_text)
+        assert "ApproximateAgeOfOldestMessage" in block
+        # Must target the live intake queue, NOT the DLQ (that's the point —
+        # a dead drain leaves messages on the live queue, never on the DLQ).
+        dims_line = block[block.find("--dimensions"): block.find("--dimensions") + 80]
+        assert "Value=nousergon-overseer-intake" in dims_line
+        assert "Value=nousergon-overseer-intake-dlq" not in dims_line
+
+    def test_age_alarm_routes_to_backstop(self, script_text):
+        block = self._age_block(script_text)
+        assert '--alarm-actions "$BACKSTOP_TOPIC_ARN"' in block
+        assert '--ok-actions "$BACKSTOP_TOPIC_ARN"' in block
+
+    def test_threshold_within_issue_band_18_to_24h(self, script_text):
+        # alpha-engine-config-I2910: "~18-24h, comfortably above the 12h
+        # drain cadence". Pin the threshold to that band in seconds.
+        block = self._age_block(script_text)
+        assert "--threshold 72000" in block
+        assert 18 * 3600 <= 72000 <= 24 * 3600
+
+    def test_age_alarm_missing_data_not_breaching(self, script_text):
+        block = self._age_block(script_text)
+        threshold_pos = block.find("--threshold 72000")
+        tail = block[threshold_pos:]
+        assert '--treat-missing-data "notBreaching"' in tail
+
+    def test_age_alarm_rides_alongside_dlq_alarm(self, script_text):
+        # I2910 explicitly asks for this alarm "alongside the existing DLQ
+        # alarm" in the same script, not a separate provisioning path.
+        assert script_text.find("overseer-intake-dlq-depth") < script_text.find(
+            "overseer-intake-age"
+        )

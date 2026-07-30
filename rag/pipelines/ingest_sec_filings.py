@@ -48,6 +48,15 @@ _CHUNK_OVERLAP = 50
 
 
 # ── CIK lookup ───────────────────────────────────────────────────────────────
+#
+# config#2956: the process-level ``_CIK_CACHE`` dict below only lives for
+# ONE pipeline step (each is a separate ``python -m`` invocation), so a
+# cold cache used to always re-download the ~10k-entry company_tickers.json
+# from EDGAR. ``_cik_lookup.load_cik_map`` backs a cold in-memory cache
+# with a shared ``/tmp`` file cache (mtime TTL) so only the FIRST step in a
+# run (or day) actually hits EDGAR.
+
+from rag.pipelines._cik_lookup import load_cik_map  # noqa: E402
 
 _CIK_CACHE: dict[str, str] = {}
 
@@ -57,22 +66,8 @@ def _get_cik(ticker: str) -> str | None:
     if ticker in _CIK_CACHE:
         return _CIK_CACHE[ticker]
 
-    try:
-        resp = requests.get(
-            "https://www.sec.gov/files/company_tickers.json",
-            headers=_SEC_HEADERS,
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            for entry in data.values():
-                t = entry.get("ticker", "").upper()
-                cik = str(entry.get("cik_str", ""))
-                _CIK_CACHE[t] = cik
-            return _CIK_CACHE.get(ticker.upper())
-    except Exception as e:
-        logger.warning("CIK lookup failed: %s", e)
-    return None
+    _CIK_CACHE.update(load_cik_map(http=requests, headers=_SEC_HEADERS))
+    return _CIK_CACHE.get(ticker.upper())
 
 
 # ── Filing search via EDGAR submissions API ──────────────────────────────────
@@ -282,7 +277,6 @@ def ingest_ticker(
         )
         if doc_id:
             ingested += 1
-            logger.info("Ingested %s %s %s: %d chunks", ticker, form_type, filed_date, len(all_chunks))
 
     return ingested
 
@@ -294,7 +288,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Ingest SEC filings into RAG store")
     parser.add_argument("--tickers", type=str, help="Comma-separated ticker list")
-    parser.add_argument("--from-signals", action="store_true", help="Load tickers from latest signals.json on S3")
+    parser.add_argument("--from-signals", action="store_true", help="Load tickers from the scanner decision set (universe-membership cuts.scanner_candidates)")
     parser.add_argument("--lookback-years", type=int, default=2, help="Years of filings to backfill")
     parser.add_argument("--dry-run", action="store_true", help="Print what would be ingested without writing")
     args = parser.parse_args()
@@ -302,17 +296,11 @@ def main():
     if args.tickers:
         tickers = [t.strip().upper() for t in args.tickers.split(",")]
     elif args.from_signals:
-        import boto3
-        s3 = boto3.client("s3")
-        resp = s3.list_objects_v2(Bucket="alpha-engine-research", Prefix="signals/", Delimiter="/")
-        prefixes = sorted([p["Prefix"] for p in resp.get("CommonPrefixes", [])])
-        if not prefixes:
-            logger.error("No signals found on S3")
-            return
-        obj = s3.get_object(Bucket="alpha-engine-research", Key=f"{prefixes[-1]}signals.json")
-        data = json.loads(obj["Body"].read())
-        tickers = [s["ticker"] for s in data.get("universe", []) if s.get("ticker")]
-        logger.info("Loaded %d tickers from signals", len(tickers))
+        # config-I5700: the corpus scope is the scanner decision set, not
+        # signals.json::universe (a 903-row SIZING envelope). One resolver
+        # for every pipeline — this used to be an inline copy.
+        from rag.pipelines._rag_scope import load_rag_scope_tickers
+        tickers = load_rag_scope_tickers()
     else:
         parser.error("Provide --tickers or --from-signals")
         return
