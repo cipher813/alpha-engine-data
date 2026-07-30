@@ -126,6 +126,14 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # Health for this mechanism is skipped_at_watermark in
     # run_news_pipeline's RUN STATS line (policy §5), not artifact age.
     "rag/pipelines/_watermarks.py": 1,
+    # rag/corpus_freshness/latest.json — the freshness verdict published by
+    # the assertion that REPLACED the inline weekly news fetch
+    # (alpha-engine-config-I5702). Registered with a real SLA row in
+    # ARTIFACT_REGISTRY.yaml (artifact_id: rag_corpus_freshness), NOT
+    # grandfathered like its sibling rag/watermarks/ prefix: a stale verdict
+    # means the assertion itself stopped running — nobody is checking whether
+    # the corpus is warm — and nothing else surfaces that.
+    "rag/pipelines/assert_corpus_freshness.py": 1,
     "builders/migrate_universe_vwap.py": 1,
     "builders/prune_delisted_tickers.py": 1,
     # builders/backfill_delisted_audit/{date}-{HHMMSSZ}.json — per-run audit record for
