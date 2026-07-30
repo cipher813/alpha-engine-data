@@ -62,6 +62,20 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # rag/pipelines/ ingest-side scripts are scope-exempt — they write
 # to RAG-corpus S3 not the freshness-monitored production bucket).
 EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
+    # alpha-engine-config-I5718 — the §10.2 fault-injection verdict surface,
+    # s3://alpha-engine-research/groom/_control/fault-injection/{date}.json.
+    # One PUT per programme run (weekly, plus on any change to the dispatch
+    # definition or the harness).
+    #
+    # This artifact IS freshness-relevant and belongs in ARTIFACT_REGISTRY.yaml
+    # rather than grandfathered_paths: a stale verdict means
+    # the standing gate stopped running, and §10.2 holds that a failure mode
+    # not exercised in the current programme is UNVERIFIED, never passing. A
+    # gate that silently stops is the one failure this artifact exists to make
+    # visible. The registry lives in alpha-engine-config, so the entry rides a
+    # separate PR there — pinned here first so this repo's guard is honest
+    # about the new PUT site either way.
+    "scripts/fault_injection_run.py": 1,
     "builders/_price_cache_writeboth.py": 2,
     # universe_freshness.json + weekly/<date>/manifest.json (schema_drift_incidents,
     # config#1150) + feature_store/_freshness.json (ArcticDB freshness-monitor
