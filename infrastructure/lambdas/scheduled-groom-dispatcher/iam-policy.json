@@ -123,6 +123,12 @@
       "Resource": "arn:aws:s3:::alpha-engine-research/groom/queues/*"
     },
     {
+      "Sid": "WriteGroomControlLedger",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/groom/_control/*"
+    },
+    {
       "Sid": "FlowDoctorDedupStore",
       "Effect": "Allow",
       "Action": [
@@ -141,7 +147,7 @@
       "Sid": "SendTaskFailureOnLaneDeath",
       "Effect": "Allow",
       "Action": "states:SendTaskFailure",
-      "Resource": "arn:aws:states:us-east-1:711398986525:execution:groom-dispatch:*"
+      "Resource": "*"
     }
   ]
 }
