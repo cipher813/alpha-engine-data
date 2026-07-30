@@ -95,7 +95,7 @@ import logging
 import os
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import boto3
@@ -207,9 +207,33 @@ _RESEARCH_BUCKET = "alpha-engine-research"
 # Savings Plan (instance-family-agnostic) already covers it — cost-I2864. CRITICAL:
 # every type here MUST be arm64 to match the arm64 AMI below — an arm64 AMI will
 # not boot on an x86 instance type (and vice-versa).
+# alpha-engine-config-I4989. The pool was `t4g.medium,t4g.large` — two types,
+# but ONE instance family, so effectively one spot capacity pool. Measured
+# 2026-07-30 20:00 UTC: all three lanes reclaimed
+# (`instance-terminated-no-capacity`) at the SAME SECOND, 6.5 minutes in,
+# taking out the whole cycle. Two types in one family is diversification in
+# name only.
+#
+# HARD CONSTRAINT: GROOM_AMI_ID is arm64 (Amazon Linux 2023 Graviton), and one
+# AMI serves one architecture — so x86 types CANNOT be added here without a
+# second AMI and an architecture-aware selection step. The widening therefore
+# stays arm64 and spans FAMILIES and GENERATIONS instead, which is what
+# actually separates capacity pools:
+#
+#   t4g  burstable      (current; CPU-credit throttling under sustained load)
+#   c6g/c7g  compute    2 vCPU / 4 GiB at .large — same shape as t4g.medium,
+#                       without the credit ceiling
+#   m6g/m7g  general    2 vCPU / 8 GiB at .large — headroom for agent runs
+#
+# All entries are >= 4 GiB, the floor a groom agent run needs. Override via
+# GROOM_INSTANCE_TYPES; anything added must be arm64 or the launch will fail
+# the AMI architecture check.
 INSTANCE_TYPES = [
     t.strip()
-    for t in os.environ.get("GROOM_INSTANCE_TYPES", "t4g.medium,t4g.large").split(",")
+    for t in os.environ.get(
+        "GROOM_INSTANCE_TYPES",
+        "t4g.medium,c6g.large,c7g.large,m6g.large,m7g.large,t4g.large",
+    ).split(",")
     if t.strip()
 ]
 SUBNETS = [
@@ -231,9 +255,33 @@ GROOM_REPO = os.environ.get("GROOM_REPO", "nousergon/alpha-engine-config")
 GROOM_BRANCH = os.environ.get("GROOM_BRANCH", "main")
 # The BOX reads the PAT via its instance profile (this Lambda does not).
 GROOM_GH_PAT_SSM = os.environ.get("GROOM_GH_PAT_SSM", "/alpha-engine/saturday_sf_watch/github_pat")
-# Hard ceiling for the on-box SSM command (matches the bootstrap watchdog). The
-# in-run soft budget (~340 min) is the binding stop; this is the backstop.
-MAX_RUNTIME_SECONDS = int(os.environ.get("GROOM_MAX_RUNTIME_SECONDS", "21600"))
+# ONE authoritative runtime bound for a lane (groom-sweep-policy §2.1: "where
+# two mechanisms bound the same thing, the TIGHTER one is the real budget
+# regardless of intent").
+#
+# Measured 2026-07-30, three copies that did NOT agree:
+#
+#   SF LaunchGroomSpot TimeoutSeconds  10800s (180 min)  <- tightest, the REAL budget
+#   this constant                      21600s (360 min)  -> SSM command timeout
+#                                                        -> the reconciler's deadline_utc
+#   groom_spot_bootstrap.sh watchdog   21600s (360 min)  -> the box's own kill
+#
+# The comment above this line claimed it "matches the bootstrap watchdog" — it
+# did, and both were wrong, because the SF had been tightened to 180 min
+# without them. The consequence is not cosmetic: the SF gives up on the lane at
+# 180 min and fires a relaunch while the ORIGINAL box is still working for
+# another three hours, and the relaunch's concurrent-tier guard then refuses
+# because that box is alive. That is exactly the alpha-engine-config-I4987
+# no-op relaunch, manufactured on a timer.
+#
+# The reconciler was mis-armed the same way: its deadline_utc was now + 360 min,
+# so a lane the SF had already abandoned would not read as overdue for another
+# three hours.
+#
+# 10800 is therefore the value, and it is BOUND to the SF definition by
+# test_runtime_bound_is_single_and_authoritative — both files live in this
+# repo, so the binding is enforceable rather than aspirational.
+MAX_RUNTIME_SECONDS = int(os.environ.get("GROOM_MAX_RUNTIME_SECONDS", "10800"))
 SSM_ONLINE_BUDGET_SEC = int(os.environ.get("GROOM_SSM_ONLINE_BUDGET_SEC", "180"))
 CW_LOG_GROUP = os.environ.get("GROOM_CW_LOG_GROUP", "/alpha-engine/groom-spot")
 
@@ -501,6 +549,13 @@ def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: st
     # the run through DeepSeek instead of Claude — this Lambda passes the flag
     # through verbatim, it does not select the DeepSeek model itself.
     backend_export = f"export GROOM_BACKEND={backend}\n" if backend else ""
+    # Push the ONE authoritative runtime bound to the box so its watchdog
+    # cannot drift from the SF's lane timeout. groom_spot_bootstrap.sh reads
+    # `${MAX_RUNTIME_SECONDS:-...}`, so its own default becomes a fallback for
+    # manual runs only — every dispatched box now inherits this value.
+    # Without this export the box killed itself at its own 360-min default
+    # while the SF had already abandoned the lane at 180 (see the constant).
+    runtime_bound_export = f"export MAX_RUNTIME_SECONDS={MAX_RUNTIME_SECONDS}\n"
     # Arming the DeepSeek fallback dispatch: when a Claude-backed groom run
     # hits quota exhaustion, the on-box groom_run.sh checks this flag and —
     # if enabled — invokes this Lambda again with mode=fallback to launch a
@@ -531,7 +586,7 @@ cd /home/ec2-user/alpha-engine-config
 export GROOM_MODEL={model}
 export GROOM_ISSUE_FILTER={issue_filter}
 export GROOM_RUN_TOKEN={run_token}
-{pr_budget_export}{manifest_export}{fallback_enabled_export}{backend_export}{task_token_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
+{pr_budget_export}{manifest_export}{fallback_enabled_export}{backend_export}{runtime_bound_export}{task_token_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
 """
 
 
@@ -1125,25 +1180,311 @@ def _prior_launch_count_today() -> int:
     return count
 
 
-def _write_dispatch_ledger_entry(run_token: str, tier_tag: str, schedule_label: str) -> None:
-    """Record a launch ATTEMPT for the daily ceiling count (config#3173).
-    Written just BEFORE the launch fires (mirroring sf-watch's watch-log
-    timing) so even a launch that subsequently fails/raises still consumes
-    budget — an attempt-then-immediately-fail loop must still trip the
-    ceiling eventually, never spin invisibly. Best-effort: a ledger-write
-    failure must never block the launch it's recording."""
+# config-I5229 (lane-death pager): the reconciler structurally depends on
+# _write_dispatch_ledger_entry succeeding — a failed write means a lane can
+# die silently with no reconciler record to detect it. That IS a paging
+# condition (§2.7: "a registration-write failure is itself a paging
+# condition"). The function now FAILS LOUD (raises on S3 put failure); the
+# one caller (_launch_groom_spot) terminates the just-launched box on error
+# so a failed write never orphans an instance.
+_LEDGER_WRITE_FAILED_MSG = (
+    "dispatch ledger write FAILED (config-I5229 — registration-write failure "
+    "IS a paging condition; lane-death reconciler cannot cover a lane it never "
+    "recorded)"
+)
+
+# The legitimate completion-marker outcome values the box's write_completion_marker
+# (groom_run.sh) writes. The reconciler considers ANY completion marker as
+# "lane completed cleanly" regardless of the outcome value — this set is
+# documentation, not a guard. An outcome NOT in this set still reads as
+# "completed" for reconciler purposes (see _reconcile_lane_death).
+_COMPLETION_OUTCOMES = frozenset({
+    "success", "interrupted", "quota_stop", "spot_stop",
+    "timeout", "failure", "crash_cascade",
+})
+
+
+def _describe_instance_type(instance_id: str) -> str:
+    """The instance type actually launched, or "" if it cannot be read.
+
+    alpha-engine-config-I4989. `launch_with_fallback` returns only
+    (instance_id, market), so the TYPE that won the capacity race is not
+    otherwise recorded anywhere durable — and without it "how often is each
+    type used, and which ones get reclaimed" is unanswerable, which is exactly
+    the question a diversified pool creates. One extra DescribeInstances call
+    per launch is a fair price for that.
+
+    Best-effort by design: this feeds observability, and the ledger write it
+    contributes to is fail-loud for a DIFFERENT reason (the reconciler needs
+    the record to exist at all). Failing the launch because a describe hiccuped
+    would trade a real capability for a reporting nicety.
+    """
+    try:
+        resp = boto3.client("ec2", region_name=REGION).describe_instances(
+            InstanceIds=[instance_id])
+        for reservation in resp.get("Reservations", []):
+            for inst in reservation.get("Instances", []):
+                return str(inst.get("InstanceType", ""))
+    except Exception as exc:  # noqa: BLE001 — observability only; see docstring
+        logger.warning("instance-type lookup failed for %s (non-fatal): %s",
+                       instance_id, exc)
+    return ""
+
+
+def _write_dispatch_ledger_entry(run_token: str, tier_tag: str, schedule_label: str,
+                                  instance_id: str = "", deadline_utc: str = "",
+                                  task_token: str = "", instance_type: str = "",
+                                  market: str = "") -> None:
+    """Record a launch ATTEMPT for the daily ceiling count (config#3173) AND
+    an expectation record for the lane-death reconciler (config-I5229).
+
+    Previously best-effort (a ledger-write failure silently logged and the
+    launch proceeded). config-I5229 (lane-death pager): a failed ledger write
+    means the reconciler can never see this launch, so a lane death would go
+    undetected — that IS a paging condition per groom-sweep-policy §2.7.
+    FAILS LOUD: raises on S3 put failure; the caller terminates the
+    just-launched box so a failed write never orphans an instance.
+
+    Written AFTER the EC2 launch (so instance_id is known) but BEFORE the
+    SSM bootstrap — the launch consumes ceiling budget regardless of whether
+    the subsequent bootstrap succeeds, preserving the existing anti-runaway
+    semantics (an attempt-then-immediately-fail loop still trips the ceiling
+    eventually, never spin invisibly)."""
     today = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
     key = f"{_DISPATCH_LEDGER_PREFIX}/{today}/{run_token}.json"
-    body = json.dumps({
+    fields: dict = {
         "run_token": run_token, "tier_tag": tier_tag, "schedule": schedule_label,
+        "instance_id": instance_id,
+        "deadline_utc": deadline_utc,
         "recorded_at": datetime.now(ZoneInfo("UTC")).isoformat(),
-    })
-    try:
-        boto3.client("s3", region_name=REGION).put_object(
-            Bucket=_RESEARCH_BUCKET, Key=key, Body=body.encode(),
-            ContentType="application/json")
-    except Exception as exc:  # noqa: BLE001 — observability, never blocks dispatch
-        logger.warning("dispatch ledger write failed (non-fatal): %s", exc)
+    }
+    if task_token:
+        fields["task_token"] = task_token
+    # I4989: which type/market actually won the capacity race. Recorded here
+    # rather than only as an EC2 tag because terminated instances age out of
+    # describe-instances in ~1h, while this ledger persists — so reclaim rate
+    # BY TYPE stays answerable after the fact, which is the whole point of
+    # widening the pool.
+    if instance_type:
+        fields["instance_type"] = instance_type
+    if market:
+        fields["market"] = market
+    body = json.dumps(fields)
+    boto3.client("s3", region_name=REGION).put_object(
+        Bucket=_RESEARCH_BUCKET, Key=key, Body=body.encode(),
+        ContentType="application/json")
+
+
+# ── Lane-death reconciler (alpha-engine-config-I5229 Phase 1) ─────────────────
+# Screens every open expectation (dispatch-ledger entry with no matching
+# completion marker under groom/_control/completed/) against live EC2 state.
+# Failure-mode-agnostic per groom-sweep-policy §2.7: it does not enumerate
+# causes — it checks two OUTCOMES (is the instance alive? is it past its
+# deadline?) and pages on either. Any reason a box stops existing produces
+# the same verdict.
+
+_RECONCILE_COMPLETED_PREFIX = "groom/_control/completed"
+
+# Expectations this reconciler has already ACTIONED (paged + send-task-failure).
+# Without it the reconciler re-detects the same dead lane on every 5-minute
+# tick for as long as the ledger entry is in the scan window, and re-pages —
+# which is exactly what Brian saw on 2026-07-30 after the reconciler shipped.
+# The per-run_token dedup key on the notification did NOT hold across
+# invocations, so the fix belongs here, at the source: an actioned expectation
+# is a CLOSED expectation.
+#
+# Deliberately a SEPARATE prefix from `completed/`: that marker means "the box
+# finished its work and said so", and writing a death into it would make a
+# reclaimed lane indistinguishable from a successful one to every other
+# consumer of that prefix.
+_RECONCILE_ACTIONED_PREFIX = "groom/_control/reconciled"
+# describe-instances returns terminated instances for only ~1h (AWS docs).
+# An instance absent from the response is treated as lane_died — the
+# unmatched expectation IS the signal (§2.7).
+_ALIVE_STATES = frozenset({"running", "pending"})
+
+
+def _reconcile_lane_death() -> dict:
+    """Reconciler entry point — enumerate open expectations, check each one
+    against live EC2 state, page on death or deadline exceedance.
+
+    Returns a small record for the Lambda response payload (so the schedule
+    invocation has a visible result, mirroring every other mode's return)."""
+    now = datetime.now(ZoneInfo("UTC"))
+
+    # Scan TODAY and YESTERDAY. The ledger is date-partitioned and a lane can
+    # easily outlive the partition it was registered in — a box launched at
+    # 23:50 UTC that dies at 00:10 has its expectation filed under yesterday.
+    # Scanning only today leaves a blind window every single day, in which the
+    # reconciler reports "0 open expectations" and looks perfectly healthy
+    # (§2.4: the absence of a signal must never read as a benign signal).
+    # Two days is sufficient because the lane budget is 6h; widen this if that
+    # budget ever exceeds 24h.
+    scan_days = [
+        (now - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in (0, 1)
+    ]
+
+    s3 = boto3.client("s3", region_name=REGION)
+    ec2 = boto3.client("ec2", region_name=REGION)
+
+    # 1. Collect open expectations — ledger entries with no completion marker.
+    open_expectations: list[dict] = []
+    seen_tokens: set[str] = set()
+    paginator = s3.get_paginator("list_objects_v2")
+    for day in scan_days:
+        ledger_prefix = f"{_DISPATCH_LEDGER_PREFIX}/{day}/"
+        for page in paginator.paginate(Bucket=_RESEARCH_BUCKET, Prefix=ledger_prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                run_token = key.rsplit("/", 1)[-1]
+                if not run_token.endswith(".json"):
+                    continue
+                run_token = run_token[:-5]  # strip ".json"
+                if run_token in seen_tokens:
+                    continue  # same token filed under both days — count once
+                # Already actioned by a previous tick — closed, not open.
+                actioned_key = f"{_RECONCILE_ACTIONED_PREFIX}/{run_token}.json"
+                try:
+                    s3.head_object(Bucket=_RESEARCH_BUCKET, Key=actioned_key)
+                    seen_tokens.add(run_token)
+                    continue
+                except Exception:
+                    pass
+                completed_key = f"{_RECONCILE_COMPLETED_PREFIX}/{run_token}.json"
+                try:
+                    s3.head_object(Bucket=_RESEARCH_BUCKET, Key=completed_key)
+                    seen_tokens.add(run_token)
+                    continue  # has completion marker — lane completed cleanly
+                except Exception:
+                    pass  # no completion marker — open expectation
+                try:
+                    body_raw = s3.get_object(Bucket=_RESEARCH_BUCKET, Key=key)["Body"].read()
+                    exp = json.loads(body_raw.decode())
+                    exp["_ledger_key"] = key
+                    open_expectations.append(exp)
+                    seen_tokens.add(run_token)
+                except Exception as exc:
+                    logger.warning("reconciler: ledger entry read failed for %s: %s", key, exc)
+
+    if not open_expectations:
+        return {"reconciled": True, "open_expectations": 0, "deaths": 0,
+                "overdue": 0, "checked_at": now.isoformat()}
+
+    # 2. Batch describe-instances for all instance_ids.
+    instance_ids = [e["instance_id"] for e in open_expectations
+                    if e.get("instance_id")]
+    instance_states: dict[str, str] = {}
+    if instance_ids:
+        try:
+            resp = ec2.describe_instances(InstanceIds=instance_ids)
+            for reservation in resp.get("Reservations", []):
+                for inst in reservation.get("Instances", []):
+                    instance_states[inst["InstanceId"]] = inst["State"]["Name"]
+        except Exception as exc:
+            logger.warning("reconciler: describe-instances failed: %s", exc)
+            # Fail-safe: treat ALL as unknown (not dead) — never page on a
+            # broken EC2 API. The next reconciler tick retries.
+            return {"reconciled": True, "open_expectations": len(open_expectations),
+                    "deaths": 0, "overdue": 0, "describe_error": str(exc),
+                    "checked_at": now.isoformat()}
+
+    # 3. Check each expectation.
+    deaths = 0
+    overdue_count = 0
+    sfn = boto3.client("stepfunctions", region_name=REGION)
+    for exp in open_expectations:
+        instance_id = exp.get("instance_id", "")
+        state = instance_states.get(instance_id)
+        page = False
+        reason = ""
+
+        if state is None or state not in _ALIVE_STATES:
+            # Instance not found in describe-instances, or is in a terminal
+            # state (stopped, terminated, shutting-down).
+            page = True
+            reason = f"lane_died: instance {instance_id} is {state or 'absent'} — not in {sorted(_ALIVE_STATES)}"
+        elif exp.get("deadline_utc"):
+            try:
+                deadline = datetime.fromisoformat(exp["deadline_utc"])
+            except (ValueError, TypeError):
+                deadline = None
+            if deadline and now > deadline:
+                page = True
+                reason = f"overdue: instance {instance_id} running past deadline {exp['deadline_utc']}"
+
+        if not page:
+            continue
+
+        if state is None or state not in _ALIVE_STATES:
+            deaths += 1
+        else:
+            overdue_count += 1
+
+        # Page via the cycle notification rail (buzzing, #groom thread).
+        tier_tag = exp.get("tier_tag", "unknown")
+        schedule_label = exp.get("schedule", "unknown")
+        text = (
+            f"🔴 Groom lane DEATH — {reason}\n"
+            f"tier={tier_tag}  schedule={schedule_label}\n"
+            f"run_token={exp.get('run_token')}  instance={instance_id}"
+        )
+        _notify_cycle(
+            text, severity="error",
+            dedup_key=f"{_CYCLE_FLOW_NAME}:lane_death:{exp.get('run_token', '')}",
+            context={"expectation": {k: v for k, v in exp.items()
+                                     if not k.startswith("_")},
+                     "reason": reason, "instance_state": state},
+        )
+
+        # Close the expectation BEFORE the send-task-failure below. Ordering is
+        # deliberate: if the marker write fails we must not have already paged
+        # AND actioned without a record, and if send-task-failure fails the
+        # expectation is still closed — the page has been delivered, and
+        # re-paging every 5 minutes forever is strictly worse than one missed
+        # SF collapse (which the 6h TimeoutSeconds still covers).
+        try:
+            boto3.client("s3", region_name=REGION).put_object(
+                Bucket=_RESEARCH_BUCKET,
+                Key=f"{_RECONCILE_ACTIONED_PREFIX}/{exp.get('run_token', '')}.json",
+                Body=json.dumps({
+                    "outcome": "lane_died" if state not in _ALIVE_STATES else "overdue",
+                    "reason": reason,
+                    "instance_id": instance_id,
+                    "instance_state": state,
+                    "actioned_at": now.isoformat(),
+                }).encode(),
+                ContentType="application/json")
+        except Exception as exc:  # noqa: BLE001 — see ordering note above
+            logger.warning(
+                "reconciler: could not close expectation %s (will re-page next "
+                "tick): %s", exp.get("run_token"), exc)
+
+        # Collapse the SF execution immediately for a dead box — the task
+        # token would otherwise sit outstanding for 6h (the TimeoutSeconds
+        # on the .waitForTaskToken call). send-task-failure routes the SF
+        # into its existing bounded-retry relaunch loop, which is exactly
+        # the correct recovery path.
+        task_token = exp.get("task_token", "")
+        if task_token and (state is None or state not in _ALIVE_STATES):
+            try:
+                sfn.send_task_failure(
+                    taskToken=task_token,
+                    error="LaneDeath",
+                    cause=f"Reconciler detected lane death: {reason}",
+                )
+                logger.info(
+                    "reconciler: send-task-failure for %s (token %s…): %s",
+                    exp.get("run_token", "?"), task_token[:12], reason,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "reconciler: send-task-failure failed for %s (token %s…): %s",
+                    exp.get("run_token", "?"), task_token[:12], exc,
+                )
+
+    return {"reconciled": True, "open_expectations": len(open_expectations),
+            "deaths": deaths, "overdue": overdue_count,
+            "checked_at": now.isoformat()}
 
 
 def _notify_dispatch_ceiling_exhausted(prior: int, ceiling: int, tier_tag: str,
@@ -1246,16 +1587,42 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
     run_token = uuid.uuid4().hex
     # config#3173: record the attempt BEFORE the launch fires (mirrors the
     # sf-watch watch-log timing) so a launch that itself fails/raises still
-    # consumes ceiling budget — see _write_dispatch_ledger_entry.
-    _write_dispatch_ledger_entry(run_token, tier_tag, schedule_label)
+    # consumes ceiling budget. Best-effort: a pre-launch ledger-write
+    # failure must never block the launch it's recording.
+    try:
+        _write_dispatch_ledger_entry(run_token, tier_tag, schedule_label)
+    except Exception as exc:
+        logger.warning("dispatch ledger pre-launch write failed (non-fatal): %s", exc)
+
     instance_id, market = _launch_instance(force_on_demand=force_on_demand,
                                            tier_tag=tier_tag)
     logger.info("launched groom box %s (%s)", instance_id, market)
+
     # config#5303: the load-bearing groom-issue-filter tag is now passed as
     # extra_tags on the RunInstances call itself (see _launch_instance), not
     # applied via a post-launch create_tags — so the tag is ATOMIC with launch
     # and visible in CloudTrail RunInstances events for the full 90-day
     # retention window. No post-launch tagging step remains to retry or fail.
+
+    # config-I5229 (lane-death pager): the expectation record is written AFTER
+    # the EC2 launch (so instance_id is known) but BEFORE the SSM bootstrap.
+    # The deadline is set to now + MAX_RUNTIME_SECONDS, matching the box's own
+    # watchdog. The write is FAIL-LOUD: a failed ledger write means the
+    # reconciler can never detect this lane's death, which IS a paging
+    # condition per groom-sweep-policy §2.7. On failure we terminate the
+    # just-launched box (no orphaned instance) and raise.
+    deadline_utc = (datetime.now(ZoneInfo("UTC")) + timedelta(seconds=MAX_RUNTIME_SECONDS)).isoformat()
+    try:
+        _write_dispatch_ledger_entry(
+            run_token, tier_tag, schedule_label,
+            instance_id=instance_id, deadline_utc=deadline_utc,
+            task_token=task_token,
+            instance_type=_describe_instance_type(instance_id), market=market,
+        )
+    except Exception:
+        logger.exception(_LEDGER_WRITE_FAILED_MSG)
+        _terminate_instance(instance_id)
+        raise
     # Once the box is up, ANY failure before the bootstrap command is delivered
     # would orphan it (no watchdog/trap yet). Terminate-on-error so a slow
     # SSM-online, an SSM SendCommand error, etc. tears the box down instead of
@@ -2009,6 +2376,12 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         # for the same reason — no live schedule or other caller sets a
         # top-level `mode`, so this cannot collide with any shape below.
         return _handle_cycle_complete(event)
+    if event.get("mode") == "reconcile":
+        # config-I5229 (lane-death pager): EventBridge Scheduler (~5 min
+        # cadence) invokes this mode to screen open expectations against
+        # live EC2 state. No other caller sets a top-level `mode`, so this
+        # cannot collide with any other invocation shape.
+        return _reconcile_lane_death()
     run_mode = _resolve_run_mode(event)
     model = _resolve_model(event)
     issue_filter = _resolve_issue_filter(event)

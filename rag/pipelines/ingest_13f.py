@@ -341,6 +341,7 @@ def main():
              "the inst_ownership table).",
     )
     add_scope_arg(grp)
+    grp.add_argument("--from-signals", action="store_true", help="Load tickers from the scanner decision set (universe-membership cuts.scanner_candidates)")
     parser.add_argument(
         "--dry-run", action="store_true",
         help="Discover + format but don't write to S3/RAG.",
@@ -356,10 +357,13 @@ def main():
     s3 = boto3.client("s3")
 
     tickers: list[str] | None = None
-    if args.tickers or args.scope:
-        tickers = resolve_tickers_from_args(args, s3_client=s3)
+    tickers = resolve_tickers_from_args(args, s3_client=s3)
+    if not tickers and args.from_signals:
+        from rag.pipelines._rag_scope import load_rag_scope_tickers
+        tickers = load_rag_scope_tickers(bucket=args.bucket, s3_client=s3)
+    if args.tickers or args.scope or args.from_signals:
         if not tickers:
-            logger.error("[ingest_13f] --scope holdings+candidates+board60 requested but no tickers found — aborting")
+            logger.error("[ingest_13f] scope/from-signals requested but no tickers found — aborting")
             return
 
     inst_df = read_inst_ownership_parquet(s3_client=s3, bucket=args.bucket)

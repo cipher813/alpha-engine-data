@@ -300,6 +300,7 @@ def main():
     parser.add_argument("--tickers", type=str, help="Comma-separated ticker list")
     add_scope_arg(parser)
     parser.add_argument("--bucket", type=str, default=DEFAULT_BUCKET)
+    parser.add_argument("--from-signals", action="store_true", help="Load tickers from the scanner decision set (universe-membership cuts.scanner_candidates)")
     parser.add_argument("--lookback-years", type=int, default=2, help="Years of filings to backfill")
     parser.add_argument(
         "--lookback-days", type=int, default=None,
@@ -312,8 +313,14 @@ def main():
     args = parser.parse_args()
 
     tickers = resolve_tickers_from_args(args)
+    if not tickers and args.from_signals:
+        # config-I5700: the corpus scope is the scanner decision set, not
+        # signals.json::universe (a 903-row SIZING envelope). One resolver
+        # for every pipeline — this used to be an inline copy.
+        from rag.pipelines._rag_scope import load_rag_scope_tickers
+        tickers = load_rag_scope_tickers()
     if not tickers:
-        parser.error("Provide --tickers or --scope holdings+candidates+board60")
+        parser.error("Provide --tickers, --scope, or --from-signals")
         return
     logger.info("Resolved %d tickers for SEC filings ingestion", len(tickers))
 
