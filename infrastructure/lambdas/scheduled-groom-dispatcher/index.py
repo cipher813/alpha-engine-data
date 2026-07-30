@@ -207,9 +207,33 @@ _RESEARCH_BUCKET = "alpha-engine-research"
 # Savings Plan (instance-family-agnostic) already covers it — cost-I2864. CRITICAL:
 # every type here MUST be arm64 to match the arm64 AMI below — an arm64 AMI will
 # not boot on an x86 instance type (and vice-versa).
+# alpha-engine-config-I4989. The pool was `t4g.medium,t4g.large` — two types,
+# but ONE instance family, so effectively one spot capacity pool. Measured
+# 2026-07-30 20:00 UTC: all three lanes reclaimed
+# (`instance-terminated-no-capacity`) at the SAME SECOND, 6.5 minutes in,
+# taking out the whole cycle. Two types in one family is diversification in
+# name only.
+#
+# HARD CONSTRAINT: GROOM_AMI_ID is arm64 (Amazon Linux 2023 Graviton), and one
+# AMI serves one architecture — so x86 types CANNOT be added here without a
+# second AMI and an architecture-aware selection step. The widening therefore
+# stays arm64 and spans FAMILIES and GENERATIONS instead, which is what
+# actually separates capacity pools:
+#
+#   t4g  burstable      (current; CPU-credit throttling under sustained load)
+#   c6g/c7g  compute    2 vCPU / 4 GiB at .large — same shape as t4g.medium,
+#                       without the credit ceiling
+#   m6g/m7g  general    2 vCPU / 8 GiB at .large — headroom for agent runs
+#
+# All entries are >= 4 GiB, the floor a groom agent run needs. Override via
+# GROOM_INSTANCE_TYPES; anything added must be arm64 or the launch will fail
+# the AMI architecture check.
 INSTANCE_TYPES = [
     t.strip()
-    for t in os.environ.get("GROOM_INSTANCE_TYPES", "t4g.medium,t4g.large").split(",")
+    for t in os.environ.get(
+        "GROOM_INSTANCE_TYPES",
+        "t4g.medium,c6g.large,c7g.large,m6g.large,m7g.large,t4g.large",
+    ).split(",")
     if t.strip()
 ]
 SUBNETS = [
@@ -1149,9 +1173,37 @@ _COMPLETION_OUTCOMES = frozenset({
 })
 
 
+def _describe_instance_type(instance_id: str) -> str:
+    """The instance type actually launched, or "" if it cannot be read.
+
+    alpha-engine-config-I4989. `launch_with_fallback` returns only
+    (instance_id, market), so the TYPE that won the capacity race is not
+    otherwise recorded anywhere durable — and without it "how often is each
+    type used, and which ones get reclaimed" is unanswerable, which is exactly
+    the question a diversified pool creates. One extra DescribeInstances call
+    per launch is a fair price for that.
+
+    Best-effort by design: this feeds observability, and the ledger write it
+    contributes to is fail-loud for a DIFFERENT reason (the reconciler needs
+    the record to exist at all). Failing the launch because a describe hiccuped
+    would trade a real capability for a reporting nicety.
+    """
+    try:
+        resp = boto3.client("ec2", region_name=REGION).describe_instances(
+            InstanceIds=[instance_id])
+        for reservation in resp.get("Reservations", []):
+            for inst in reservation.get("Instances", []):
+                return str(inst.get("InstanceType", ""))
+    except Exception as exc:  # noqa: BLE001 — observability only; see docstring
+        logger.warning("instance-type lookup failed for %s (non-fatal): %s",
+                       instance_id, exc)
+    return ""
+
+
 def _write_dispatch_ledger_entry(run_token: str, tier_tag: str, schedule_label: str,
                                   instance_id: str = "", deadline_utc: str = "",
-                                  task_token: str = "") -> None:
+                                  task_token: str = "", instance_type: str = "",
+                                  market: str = "") -> None:
     """Record a launch ATTEMPT for the daily ceiling count (config#3173) AND
     an expectation record for the lane-death reconciler (config-I5229).
 
@@ -1177,6 +1229,15 @@ def _write_dispatch_ledger_entry(run_token: str, tier_tag: str, schedule_label: 
     }
     if task_token:
         fields["task_token"] = task_token
+    # I4989: which type/market actually won the capacity race. Recorded here
+    # rather than only as an EC2 tag because terminated instances age out of
+    # describe-instances in ~1h, while this ledger persists — so reclaim rate
+    # BY TYPE stays answerable after the fact, which is the whole point of
+    # widening the pool.
+    if instance_type:
+        fields["instance_type"] = instance_type
+    if market:
+        fields["market"] = market
     body = json.dumps(fields)
     boto3.client("s3", region_name=REGION).put_object(
         Bucket=_RESEARCH_BUCKET, Key=key, Body=body.encode(),
@@ -1480,6 +1541,7 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
             run_token, tier_tag, schedule_label,
             instance_id=instance_id, deadline_utc=deadline_utc,
             task_token=task_token,
+            instance_type=_describe_instance_type(instance_id), market=market,
         )
     except Exception:
         logger.exception(_LEDGER_WRITE_FAILED_MSG)
