@@ -376,6 +376,10 @@
             },
             {
               "Variable": "$.mapOutcome[0].laneOutcome.laneFailed",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.mapOutcome[0].laneOutcome.laneFailed",
               "BooleanEquals": true
             }
           ],
@@ -389,6 +393,10 @@
             },
             {
               "Variable": "$.mapOutcome[1].laneOutcome.laneFailed",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.mapOutcome[1].laneOutcome.laneFailed",
               "BooleanEquals": true
             }
           ],
@@ -398,6 +406,10 @@
           "And": [
             {
               "Variable": "$.mapOutcome[2]",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.mapOutcome[2].laneOutcome.laneFailed",
               "IsPresent": true
             },
             {
