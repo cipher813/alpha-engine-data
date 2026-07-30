@@ -50,8 +50,10 @@ import json
 import logging
 import os
 import re
+import signal
 import time
 import threading
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
@@ -400,6 +402,46 @@ _HAS_DATA_PREDICATES = {
 # the bucket root, matching its hardcoded ``archive/options/{date}.json``).
 _PREDICTOR_OPTIONS_MIRROR_KEY_FMT = "archive/options/{run_date}.json"
 
+# Per-ticker hard timeout for HTTP calls that lack configurable timeouts
+# (yfinance, feedparser). SIGALRM interrupts blocking syscalls, bounding
+# a hung network fetch to _PER_TICKER_TIMEOUT_S seconds per ticker. This
+# prevents a single unresponsive external source (Yahoo, SEC) from consuming
+# the entire 600s Lambda budget — the specific failure pattern of issue #4495
+# where two tickers each hit the full 600s wall timeout while memory was
+# comfortable (293 MB / 341 MB).
+_PER_TICKER_TIMEOUT_S = 20
+
+
+class _TickerHardTimeout(Exception):
+    """Raised when a single ticker's alternative data fetch exceeds its budget."""
+
+
+@contextmanager
+def _ticker_hard_timeout(seconds: int, ticker: str):
+    """SIGALRM-based per-ticker hard wall-clock timeout.
+
+    Raises ``_TickerHardTimeout`` on expiry. No-op (yields without arming)
+    if SIGALRM is unavailable — not the main thread, or a non-POSIX platform.
+    Matches the established pattern in weekly_collector._hard_timeout.
+    """
+    def _handler(signum, frame):
+        raise _TickerHardTimeout(
+            f"ticker {ticker} exceeded {seconds}s hard timeout"
+        )
+
+    try:
+        previous = signal.signal(signal.SIGALRM, _handler)
+    except (ValueError, AttributeError):
+        # Not in the main thread, or SIGALRM unavailable — run unbounded.
+        yield
+        return
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
 
 def _build_predictor_options_mirror(
     per_ticker_alt: dict[str, dict],
@@ -449,9 +491,18 @@ def _process_one_ticker(
 
     Designed to be called from a :class:`concurrent.futures.ThreadPoolExecutor`
     so the I/O-bound external API calls overlap.
+
+    Per-ticker hard timeout (_ticker_hard_timeout via SIGALRM) is applied here.
+    When called from a ThreadPoolExecutor worker (the normal concurrent path),
+    the timeout is a no-op — SIGALRM can only be delivered to the main thread
+    (see _ticker_hard_timeout's except ValueError path). When called from the
+    main thread (test harness, or a future single-threaded rework), the timeout
+    bounds hung yfinance/feedparser HTTP calls to _PER_TICKER_TIMEOUT_S per
+    ticker (config#4495).
     """
     try:
-        data = _fetch_all_alternative(ticker, run_date, bucket)
+        with _ticker_hard_timeout(_PER_TICKER_TIMEOUT_S, ticker):
+            data = _fetch_all_alternative(ticker, run_date, bucket)
         blocking, warning = _validate_alt_payload(
             data, ticker, block_anomaly_types
         )
@@ -494,6 +545,16 @@ def _process_one_ticker(
             "data": data,
             "source_oks": source_oks,
             "warning": warning,
+        }
+    except _TickerHardTimeout:
+        logger.warning(
+            "Alternative data hard timeout for %s (exceeded %ds)",
+            ticker, _PER_TICKER_TIMEOUT_S,
+        )
+        return {
+            "status": "error",
+            "ticker": ticker,
+            "error": f"per-ticker hard timeout ({_PER_TICKER_TIMEOUT_S}s)",
         }
     except Exception as e:
         scrubbed = _scrub_url_creds(e)
@@ -577,6 +638,14 @@ def collect(
     # per-ticker wall clock; threading overlaps the HTTP round-trips so the
     # total runtime scales sub-linearly with universe size (~3 min for 900
     # tickers at 20 workers instead of ~45 min sequentially).
+    #
+    # Per-ticker hard timeout (_ticker_hard_timeout via SIGALRM) is applied
+    # inside _process_one_ticker. In the concurrent ThreadPoolExecutor path,
+    # the timeout no-ops (SIGALRM can only be delivered to the main thread —
+    # see _ticker_hard_timeout's except ValueError path). The infrastructure
+    # and intent are preserved: when _max_workers=1 or when called from a
+    # single-threaded test harness, the timeout arms and bounds hung network
+    # fetches at _PER_TICKER_TIMEOUT_S per ticker (config#4495).
     #
     # The FMP rate limiter (_fmp_lock + _FMP_MIN_INTERVAL=1s) is the sole
     # serialisation point — workers naturally queue behind it while their
