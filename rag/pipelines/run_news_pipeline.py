@@ -53,8 +53,7 @@ def main() -> int:
     )
     grp.add_argument(
         "--from-signals", action="store_true",
-        help="Load tickers from the latest signals.json on S3 "
-             "(canonical Saturday SF posture).",
+        help="Load tickers from the scanner decision set (universe-membership cuts.scanner_candidates)",
     )
     parser.add_argument(
         "--hours", type=int, default=168,
@@ -87,8 +86,8 @@ def main() -> int:
     if args.tickers:
         tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
     else:
-        from rag.pipelines._signals_universe import load_signals_tickers
-        tickers = load_signals_tickers(bucket=args.bucket)
+        from rag.pipelines._rag_scope import load_rag_scope_tickers
+        tickers = load_rag_scope_tickers(bucket=args.bucket)
     if not tickers:
         logger.error("[run_news_pipeline] no tickers — aborting")
         return 1
@@ -101,7 +100,7 @@ def main() -> int:
 
     # ── Step 1: build aggregator + fetch ─────────────────────────
     logger.info("[run_news_pipeline] step 1/4 — fetch via multi-source aggregator")
-    from collectors.news_aggregator import NewsAggregator
+    from collectors.news_aggregator_async import AsyncNewsAggregator
     from collectors.news_sources.gdelt import GdeltNewsAdapter
     from collectors.news_sources.polygon import PolygonNewsAdapter
     from collectors.news_sources.yahoo_rss import YahooRssNewsAdapter
@@ -119,12 +118,28 @@ def main() -> int:
         "[run_news_pipeline] weekly Polygon news budget = %ds for %d tickers",
         poly_budget, len(tickers),
     )
-    aggregator = NewsAggregator(sources=[
+    # config-I5703: ASYNC aggregator, matching collectors/daily_news.py. The
+    # sync NewsAggregator sums its sources sequentially — its own docstring
+    # says "Sequential per-source today; PR D adds async parallel fan-in" — and
+    # PR D landed as AsyncNewsAggregator wired into the DAILY path only
+    # (2026-06-09, after the sync version TimedOut every weekday producing
+    # nothing, ROADMAP L4573). The weekly path, which is the one on a decision
+    # pipeline's critical path, never got the fix. Polygon is the long pole
+    # either way; this recovers the GDELT + Yahoo wall-clock that was being
+    # added to it rather than overlapped.
+    aggregator = AsyncNewsAggregator(sources=[
         PolygonNewsAdapter(max_fetch_seconds=poly_budget),
         GdeltNewsAdapter(ticker_name_map=_load_ticker_name_map()),
         YahooRssNewsAdapter(),
     ])
-    articles = aggregator.fetch(tickers, hours=args.hours)
+    # AsyncNewsAggregator.fetch is a coroutine — drive it from this sync entry
+    # point, same shape as collectors/daily_news.py.
+    import functools
+
+    import anyio
+    articles = anyio.run(
+        functools.partial(aggregator.fetch, tickers, hours=args.hours)
+    )
     logger.info(
         "[run_news_pipeline] step 1 — %d aggregated articles "
         "(across %d source-variants)",
@@ -251,26 +266,26 @@ def _load_ticker_name_map() -> dict[str, str]:
 def _load_ticker_sector_map(tickers: list[str]) -> dict[str, str]:
     """Build a {ticker: sector} map for RAG ingest's sector tagging.
 
-    Reads from the latest signals.json's universe — same source the
-    research module uses. Missing entries leave sector=None for that
-    ticker (acceptable per the RAG ingest contract).
+    Reads sectors from ``signals/latest.json``. This is a legitimate use of
+    the wide ``universe`` array — it is a per-name ATTRIBUTE lookup, not a
+    scope decision (config-I5700 changed only the latter), and the sizing
+    envelope covering the whole board is exactly what makes it a good sector
+    source. Missing entries leave sector=None for that ticker (acceptable per
+    the RAG ingest contract).
+
+    config-I5703: reads the ``latest.json`` POINTER rather than listing and
+    sorting prefixes. ``list_objects_v2`` caps ``CommonPrefixes`` at 1000, so
+    the old scan silently returns the 1000th-oldest date once the partition
+    count crosses a page — a stale sector map with no error.
     """
     try:
-        from rag.pipelines._signals_universe import DEFAULT_BUCKET
+        from rag.pipelines._rag_scope import DEFAULT_BUCKET
         import boto3
         import json
         s3 = boto3.client("s3")
-        resp = s3.list_objects_v2(
-            Bucket=DEFAULT_BUCKET, Prefix="signals/", Delimiter="/",
-        )
-        prefixes = sorted(
-            [p["Prefix"] for p in resp.get("CommonPrefixes", [])]
-        )
-        if not prefixes:
-            return {}
         obj = s3.get_object(
             Bucket=DEFAULT_BUCKET,
-            Key=f"{prefixes[-1]}signals.json",
+            Key="signals/latest.json",
         )
         data = json.loads(obj["Body"].read())
         out: dict[str, str] = {}
