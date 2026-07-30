@@ -49,9 +49,21 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# An equity ticker every downstream vendor can actually resolve: 1-5 letters,
+# optionally a share-class suffix (BRK.B, BF-B). Deliberately strict.
+#
+# Why this exists: the held-position artifact is Metron's, and Metron holds
+# more than equities. Measured 2026-07-30, the live held set contained
+# ``912828YK0`` — a US Treasury CUSIP. Every ingestion source in this package
+# is equity-only (EDGAR by CIK, Finnhub earnings, Polygon news), so a CUSIP is
+# a guaranteed wasted request PER SOURCE, PER RUN, forever, and lands in the
+# corpus as a permanent gap that no watermark can ever close.
+_TICKER_RE = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
 
 DEFAULT_BUCKET = "alpha-engine-research"
 
@@ -168,7 +180,20 @@ def load_rag_scope(
         )
 
     held = _load_holdings(s3_client, bucket)
-    tickers = sorted(set(cut_tickers) | set(held))
+    candidates = sorted(set(cut_tickers) | set(held))
+
+    # Drop anything no equity source can resolve (see _TICKER_RE). Named in the
+    # log rather than silently dropped — a non-equity holding is a real
+    # position that will carry no corpus evidence, which a reader of the
+    # coverage numbers has to be able to account for.
+    tickers = [t for t in candidates if _TICKER_RE.match(t)]
+    rejected = [t for t in candidates if not _TICKER_RE.match(t)]
+    if rejected:
+        logger.warning(
+            "[rag_scope] dropped %d non-equity identifier(s) no ingestion "
+            "source can resolve: %s — these carry NO corpus evidence",
+            len(rejected), rejected,
+        )
 
     logger.info(
         "[rag_scope] resolved %d ticker(s) for run_date=%s — scanner cut %r %d "
@@ -182,6 +207,7 @@ def load_rag_scope(
             "total": len(tickers),
             SCOPE_CUT: len(set(cut_tickers)),
             "held": len(set(held)),
+            "rejected_non_equity": len(rejected),
         },
         "run_date": membership.get("run_date"),
         "source": cut.get("source") or key,

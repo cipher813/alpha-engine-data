@@ -119,6 +119,29 @@ class TestLoadRagScope:
         assert tickers == ["AAPL", "MSFT"]
         assert any("HELD NAMES WILL NOT BE COVERED" in r.message for r in caplog.records)
 
+    def test_non_equity_identifiers_are_dropped_loudly(self, caplog):
+        # Measured live 2026-07-30: the held set carried 912828YK0, a US
+        # Treasury CUSIP. Every ingestion source here is equity-only, so it is
+        # a wasted request per source per run, forever — and a permanent
+        # corpus gap no watermark can close. Dropped, but NAMED.
+        from rag.pipelines._rag_scope import load_rag_scope
+
+        s3 = self._s3(holdings=("912828YK0", "HELD"))
+        with caplog.at_level("WARNING"):
+            scope = load_rag_scope(s3_client=s3)
+        assert "912828YK0" not in scope["tickers"]
+        assert scope["counts"]["rejected_non_equity"] == 1
+        assert any("912828YK0" in r.message for r in caplog.records)
+
+    def test_share_class_tickers_survive_the_filter(self):
+        # BRK.B / BF-B are real, resolvable tickers — the filter must not be
+        # so strict that it silently drops legitimate holdings.
+        from rag.pipelines._rag_scope import load_rag_scope
+
+        scope = load_rag_scope(s3_client=self._s3(holdings=("BRK.B", "BF-B")))
+        assert {"BRK.B", "BF-B"} <= set(scope["tickers"])
+        assert scope["counts"]["rejected_non_equity"] == 0
+
     def test_scope_is_far_narrower_than_the_sizing_envelope(self):
         # The regression guard. 903 -> ~68 is the whole point; a resolver that
         # silently returns board-scale output is the defect returning.
