@@ -2231,14 +2231,37 @@ def test_task_token_is_read_from_the_event_not_the_context(monkeypatch):
 
 # ── Lane-death reconciler tests (alpha-engine-config-I5229) ────────────────────
 
+# The ledger is date-partitioned and the reconciler scans today + yesterday, so
+# a fixture pinned to a literal date passes on the day it is written and is
+# dead every day after. That is exactly what happened here: these tests were
+# authored 2026-07-28 with a hardcoded `dispatch-ledger/<that date>/` prefix and
+# had been silently returning `open_expectations: 0` ever since — five tests
+# asserting nothing, while the PR body claimed "135/135 passing".
+#
+# Derive the partition from the same clock the reconciler uses. `_ledger_key`
+# takes an offset so the date-boundary case can be exercised deliberately
+# rather than by accident.
+
+
+def _ledger_key(run_token: str = "tok1", *, days_ago: int = 0) -> str:
+    from datetime import datetime, timedelta, timezone
+    day = (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+    return f"groom/_control/dispatch-ledger/{day}/{run_token}.json"
+
+
+def _future_deadline(hours: int = 6) -> str:
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+
+
 
 def test_reconcile_no_open_expectations_is_quiet(monkeypatch):
     """No dispatch-ledger entries → no deaths, no pages, quiet return."""
     idx = _load(monkeypatch, s3_objects={
         # Only a completed entry (marker exists) — not an open expectation.
-        "groom/_control/dispatch-ledger/2026-07-28/tok1.json": json.dumps({
+        _ledger_key(): json.dumps({
             "run_token": "tok1", "tier_tag": "mid-only", "schedule": "0 1 * * *",
-            "instance_id": "i-dead", "deadline_utc": "2026-07-28T12:00:00Z",
+            "instance_id": "i-dead", "deadline_utc": _future_deadline(),
         }).encode(),
         "groom/_control/completed/tok1.json": json.dumps({
             "outcome": "success", "rc": 0,
@@ -2254,9 +2277,9 @@ def test_reconcile_no_open_expectations_is_quiet(monkeypatch):
 def test_reconcile_detects_lane_death_instance_terminated(monkeypatch):
     """Open expectation + instance terminated → lane_died verdict."""
     idx = _load(monkeypatch, s3_objects={
-        "groom/_control/dispatch-ledger/2026-07-28/tok1.json": json.dumps({
+        _ledger_key(): json.dumps({
             "run_token": "tok1", "tier_tag": "mid-only", "schedule": "0 1 * * *",
-            "instance_id": "i-dead", "deadline_utc": "2026-07-29T12:00:00Z",
+            "instance_id": "i-dead", "deadline_utc": _future_deadline(),
         }).encode(),
     })
     # Instance not in _instance_states → defaults to "terminated"
@@ -2268,9 +2291,9 @@ def test_reconcile_detects_lane_death_instance_terminated(monkeypatch):
 def test_reconcile_detects_lane_death_instance_stopped(monkeypatch):
     """Open expectation + instance stopped (terminal state) → lane_died verdict."""
     idx = _load(monkeypatch, s3_objects={
-        "groom/_control/dispatch-ledger/2026-07-28/tok1.json": json.dumps({
+        _ledger_key(): json.dumps({
             "run_token": "tok1", "tier_tag": "mid-only", "schedule": "0 1 * * *",
-            "instance_id": "i-stopped", "deadline_utc": "2026-07-29T12:00:00Z",
+            "instance_id": "i-stopped", "deadline_utc": _future_deadline(),
         }).encode(),
     })
     idx._test_ec2._instance_states["i-stopped"] = "stopped"
@@ -2284,7 +2307,7 @@ def test_reconcile_detects_overdue_running_instance(monkeypatch):
 
     past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     idx = _load(monkeypatch, s3_objects={
-        "groom/_control/dispatch-ledger/2026-07-28/tok1.json": json.dumps({
+        _ledger_key(): json.dumps({
             "run_token": "tok1", "tier_tag": "mid-only", "schedule": "0 1 * * *",
             "instance_id": "i-running", "deadline_utc": past,
         }).encode(),
@@ -2301,7 +2324,7 @@ def test_reconcile_skips_running_instance_within_deadline(monkeypatch):
 
     future = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat()
     idx = _load(monkeypatch, s3_objects={
-        "groom/_control/dispatch-ledger/2026-07-28/tok1.json": json.dumps({
+        _ledger_key(): json.dumps({
             "run_token": "tok1", "tier_tag": "mid-only", "schedule": "0 1 * * *",
             "instance_id": "i-running", "deadline_utc": future,
         }).encode(),
@@ -2315,9 +2338,9 @@ def test_reconcile_skips_running_instance_within_deadline(monkeypatch):
 def test_reconcile_skips_completed_lane(monkeypatch):
     """Completion marker exists → reconciler skips, regardless of instance state."""
     idx = _load(monkeypatch, s3_objects={
-        "groom/_control/dispatch-ledger/2026-07-28/tok1.json": json.dumps({
+        _ledger_key(): json.dumps({
             "run_token": "tok1", "tier_tag": "mid-only", "schedule": "0 1 * * *",
-            "instance_id": "i-dead", "deadline_utc": "2026-07-28T12:00:00Z",
+            "instance_id": "i-dead", "deadline_utc": _future_deadline(),
         }).encode(),
         "groom/_control/completed/tok1.json": json.dumps({
             "outcome": "success", "rc": 0,
@@ -2332,9 +2355,9 @@ def test_reconcile_describe_instances_error_is_fail_safe(monkeypatch):
     """EC2 describe-instances fails → fail-safe: no deaths reported.
     The reconciler must never page on a broken EC2 API — the next tick retries."""
     idx = _load(monkeypatch, s3_objects={
-        "groom/_control/dispatch-ledger/2026-07-28/tok1.json": json.dumps({
+        _ledger_key(): json.dumps({
             "run_token": "tok1", "tier_tag": "mid-only", "schedule": "0 1 * * *",
-            "instance_id": "i-dead", "deadline_utc": "2026-07-28T12:00:00Z",
+            "instance_id": "i-dead", "deadline_utc": _future_deadline(),
         }).encode(),
     })
     # Make describe_instances with InstanceIds raise.
@@ -2374,9 +2397,9 @@ def test_reconcile_sends_task_failure_for_dead_lane_with_token(monkeypatch):
     """Lane death with a task_token → send-task-failure collapses the hung SF
     execution immediately instead of waiting for the 6h timeout."""
     idx = _load(monkeypatch, s3_objects={
-        "groom/_control/dispatch-ledger/2026-07-28/tok1.json": json.dumps({
+        _ledger_key(): json.dumps({
             "run_token": "tok1", "tier_tag": "mid-only", "schedule": "0 1 * * *",
-            "instance_id": "i-dead", "deadline_utc": "2026-07-29T12:00:00Z",
+            "instance_id": "i-dead", "deadline_utc": _future_deadline(),
             "task_token": "SF_TOKEN_DEAD_LANE",
         }).encode(),
     })
@@ -2523,3 +2546,64 @@ def test_cycle_singleton_does_not_block_launch_decided(monkeypatch):
                        "executionArn": f"{_EXEC_PREFIX}:c"}, None)
     assert out["groom"]["launched"] is True
     assert idx._test_sfn.calls == [], "launch_decided must not consult the singleton"
+
+
+def test_reconcile_sees_yesterdays_partition(monkeypatch):
+    """A lane registered before UTC midnight is still reconciled after it.
+
+    The ledger is date-partitioned. A box launched at 23:50 UTC that dies at
+    00:10 has its expectation filed under YESTERDAY, and a reconciler scanning
+    only today would report `open_expectations: 0` — perfectly healthy-looking,
+    every single day, for a window as wide as the lane budget. Fixed alongside
+    the date-pinned fixtures (alpha-engine-config-I5229).
+    """
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key("tok-yesterday", days_ago=1): json.dumps({
+            "run_token": "tok-yesterday", "tier_tag": "mid-only",
+            "schedule": "0 1 * * *", "instance_id": "i-dead",
+            "deadline_utc": _future_deadline(),
+        }).encode(),
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    assert result["open_expectations"] == 1, (
+        "an expectation filed before UTC midnight became invisible to the reconciler"
+    )
+    assert result["deaths"] == 1
+
+
+def test_reconcile_counts_a_token_once_across_partitions(monkeypatch):
+    """The same run_token under both days is one expectation, not two."""
+    body = json.dumps({
+        "run_token": "tok1", "tier_tag": "mid-only", "schedule": "0 1 * * *",
+        "instance_id": "i-dead", "deadline_utc": _future_deadline(),
+    }).encode()
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key("tok1", days_ago=0): body,
+        _ledger_key("tok1", days_ago=1): body,
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    assert result["open_expectations"] == 1
+    assert result["deaths"] == 1, "one dead lane must not page twice"
+
+
+def test_reconciler_fixtures_are_not_date_pinned():
+    """Meta-test: no reconciler fixture may hardcode a ledger partition date.
+
+    A date-pinned fixture inside a rolling window passes on the day it is
+    written and asserts nothing thereafter — silently, because the test still
+    reports green. Five of these sat dead in this file from 2026-07-28 until
+    2026-07-30. The class is cheap to exclude permanently, so exclude it.
+    """
+    import re
+    from pathlib import Path
+
+    source = Path(__file__).read_text(encoding="utf-8")
+    # Strip comments so the explanatory prose above may name the original date.
+    code = "\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith("#")
+    )
+    pinned = re.findall(r'dispatch-ledger/\d{4}-\d{2}-\d{2}', code)
+    assert not pinned, (
+        f"date-pinned ledger partition(s) in test fixtures: {sorted(set(pinned))} — "
+        "derive the partition from the clock via _ledger_key() instead"
+    )

@@ -1205,35 +1205,52 @@ def _reconcile_lane_death() -> dict:
     Returns a small record for the Lambda response payload (so the schedule
     invocation has a visible result, mirroring every other mode's return)."""
     now = datetime.now(ZoneInfo("UTC"))
-    today = now.strftime("%Y-%m-%d")
-    ledger_prefix = f"{_DISPATCH_LEDGER_PREFIX}/{today}/"
+
+    # Scan TODAY and YESTERDAY. The ledger is date-partitioned and a lane can
+    # easily outlive the partition it was registered in — a box launched at
+    # 23:50 UTC that dies at 00:10 has its expectation filed under yesterday.
+    # Scanning only today leaves a blind window every single day, in which the
+    # reconciler reports "0 open expectations" and looks perfectly healthy
+    # (§2.4: the absence of a signal must never read as a benign signal).
+    # Two days is sufficient because the lane budget is 6h; widen this if that
+    # budget ever exceeds 24h.
+    scan_days = [
+        (now - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in (0, 1)
+    ]
 
     s3 = boto3.client("s3", region_name=REGION)
     ec2 = boto3.client("ec2", region_name=REGION)
 
     # 1. Collect open expectations — ledger entries with no completion marker.
     open_expectations: list[dict] = []
+    seen_tokens: set[str] = set()
     paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=_RESEARCH_BUCKET, Prefix=ledger_prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            run_token = key.rsplit("/", 1)[-1]
-            if not run_token.endswith(".json"):
-                continue
-            run_token = run_token[:-5]  # strip ".json"
-            completed_key = f"{_RECONCILE_COMPLETED_PREFIX}/{run_token}.json"
-            try:
-                s3.head_object(Bucket=_RESEARCH_BUCKET, Key=completed_key)
-                continue  # has completion marker — lane completed cleanly
-            except Exception:
-                pass  # no completion marker — open expectation
-            try:
-                body_raw = s3.get_object(Bucket=_RESEARCH_BUCKET, Key=key)["Body"].read()
-                exp = json.loads(body_raw.decode())
-                exp["_ledger_key"] = key
-                open_expectations.append(exp)
-            except Exception as exc:
-                logger.warning("reconciler: ledger entry read failed for %s: %s", key, exc)
+    for day in scan_days:
+        ledger_prefix = f"{_DISPATCH_LEDGER_PREFIX}/{day}/"
+        for page in paginator.paginate(Bucket=_RESEARCH_BUCKET, Prefix=ledger_prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                run_token = key.rsplit("/", 1)[-1]
+                if not run_token.endswith(".json"):
+                    continue
+                run_token = run_token[:-5]  # strip ".json"
+                if run_token in seen_tokens:
+                    continue  # same token filed under both days — count once
+                completed_key = f"{_RECONCILE_COMPLETED_PREFIX}/{run_token}.json"
+                try:
+                    s3.head_object(Bucket=_RESEARCH_BUCKET, Key=completed_key)
+                    seen_tokens.add(run_token)
+                    continue  # has completion marker — lane completed cleanly
+                except Exception:
+                    pass  # no completion marker — open expectation
+                try:
+                    body_raw = s3.get_object(Bucket=_RESEARCH_BUCKET, Key=key)["Body"].read()
+                    exp = json.loads(body_raw.decode())
+                    exp["_ledger_key"] = key
+                    open_expectations.append(exp)
+                    seen_tokens.add(run_token)
+                except Exception as exc:
+                    logger.warning("reconciler: ledger entry read failed for %s: %s", key, exc)
 
     if not open_expectations:
         return {"reconciled": True, "open_expectations": 0, "deaths": 0,
