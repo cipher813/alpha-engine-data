@@ -82,7 +82,15 @@ DEFAULT_LOOKBACK_MIN = int(os.environ.get("RECONCILE_LOOKBACK_MIN", "90"))
 # CloudTrail RunInstances record this Lambda ALREADY fetches and indexes for
 # reclaim attribution — so the sweep below costs no additional API calls, only
 # a second read of an index that is already in memory.
-FALLBACK_PREFIX = os.environ.get("FALLBACK_PREFIX", "overseer/fallbacks")
+# Deliberately a SUB-prefix of the interruption series, not a sibling
+# `overseer/fallbacks`. The sibling reads better and costs an operator step: this
+# Lambda's role is granted s3:PutObject on `overseer/interruptions/*` only, and
+# widening it would make the PR undeployable by the merge button alone
+# (pull-request-policy.md §4.2 — and iam-policy-change-guard enforces exactly
+# that, correctly). An S3 prefix name is not a security boundary, so paying a
+# standing human step for a naming preference is the wrong trade. `_fallbacks`
+# cannot collide with the date-partitioned record keys beside it.
+FALLBACK_PREFIX = os.environ.get("FALLBACK_PREFIX", "overseer/interruptions/_fallbacks")
 FALLBACK_SCHEMA_VERSION = 1
 
 LAUNCH_MARKET_TAG = "LaunchMarket"

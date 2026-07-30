@@ -83,21 +83,30 @@ def _puts(aws, prefix):
             if c.kwargs["Key"].startswith(prefix)]
 
 
+FALLBACK_PREFIX = "overseer/interruptions/_fallbacks/"
+
+
+def _interruptions(aws):
+    """Reclaim records only. The I5727 fallback series is a SUB-prefix of this
+    one (it rides the same S3 grant), so a plain prefix match catches both."""
+    return [(k, b) for k, b in _puts(aws, "overseer/interruptions/")
+            if not k.startswith(FALLBACK_PREFIX)]
+
+
 def _written(aws):
-    got = _puts(aws, "overseer/interruptions/")
+    got = _interruptions(aws)
     assert got, "no interruption record was written"
     return got[-1][1]
 
 
 def _fallback_daily(aws):
-    got = _puts(aws, "overseer/fallbacks/_daily/")
+    got = _puts(aws, "overseer/interruptions/_fallbacks/_daily/")
     assert got, "no fallback rollup was written"
     return got[-1][1]
 
 
 def _fallback_records(aws):
-    return [b for k, b in _puts(aws, "overseer/fallbacks/")
-            if "/_daily/" not in k]
+    return [b for k, b in _puts(aws, FALLBACK_PREFIX) if "/_daily/" not in k]
 
 
 # ── reconcile ────────────────────────────────────────────────────────────────
@@ -120,7 +129,7 @@ def test_reconcile_records_a_real_eviction_with_full_attribution(aws):
 def test_record_key_is_partitioned_by_the_event_date_not_today(aws):
     """A backfill run must not file historical events under the run date."""
     index.handler({"mode": "reconcile"}, None)
-    key = _puts(aws, "overseer/interruptions/")[-1][0]
+    key = _interruptions(aws)[-1][0]
     assert key.startswith("overseer/interruptions/2026-07-28/")
     assert REAL_EVICTION["eventID"] in key
 
@@ -132,7 +141,7 @@ def test_already_recorded_is_skipped_not_rewritten(aws):
     assert out["records_written"] == 0 and out["already_recorded"] == 1
     # The fallback rollup still writes every tick by design (its absence is
     # what a consumer renders as stale), so assert on the SERIES under test.
-    assert not _puts(aws, "overseer/interruptions/")
+    assert not _interruptions(aws)
 
 
 def test_multi_instance_eviction_yields_distinct_records(aws):
@@ -141,7 +150,7 @@ def test_multi_instance_eviction_yields_distinct_records(aws):
     aws.ct.lookup_events.return_value = {"Events": [{"CloudTrailEvent": json.dumps(ev)}]}
     out = index.handler({"mode": "reconcile"}, None)
     assert out["records_written"] == 2
-    keys = [k for k, _ in _puts(aws, "overseer/interruptions/")]
+    keys = [k for k, _ in _interruptions(aws)]
     assert len(set(keys)) == 2, f"event_ids collided: {keys}"
 
 
@@ -251,7 +260,7 @@ def test_on_demand_termination_is_not_a_reclaim(aws):
     assert "skipped" in out
     # The fallback rollup still writes every tick by design (its absence is
     # what a consumer renders as stale), so assert on the SERIES under test.
-    assert not _puts(aws, "overseer/interruptions/")
+    assert not _interruptions(aws)
 
 
 def test_running_state_change_is_ignored(aws):
@@ -262,7 +271,7 @@ def test_running_state_change_is_ignored(aws):
     assert out["skipped"] == "state=running"
     # The fallback rollup still writes every tick by design (its absence is
     # what a consumer renders as stale), so assert on the SERIES under test.
-    assert not _puts(aws, "overseer/interruptions/")
+    assert not _interruptions(aws)
 
 
 def test_event_without_instance_id_raises(aws):
