@@ -115,6 +115,41 @@ REGION = os.environ.get("AWS_REGION", "us-east-1")
 _FLOW_NAME = "scheduled-groom-dispatcher"
 _DB_BASENAME = "flow_doctor_scheduled_groom_dispatcher"
 _GROOM_LIFECYCLE_TOPICS = (FleetTelegramTopic.GROOM,)
+
+# ── Cycle-level lifecycle rail (2026-07-28 operator ruling) ───────────────────
+# The groom's terminal reporting used to live exclusively on the BOX: groom_run.sh
+# emits ONLINE/FINISHED/WOUND-DOWN pings at severity=info, which
+# FleetTelegramTopic.GROOM's canonical spec delivers to #groom with
+# disable_notification=True. Two consequences, both confirmed live 2026-07-28:
+#
+#   1. A completion ping is delivered but never BUZZES, so the operator
+#      experiences "start + errors only" even though a FINISHED message exists.
+#   2. More seriously, a per-box trap structurally cannot report a box that
+#      never reached it. On the 12:00Z cycle all three lanes' spot boxes were
+#      reclaimed instance-terminated-no-capacity at 12:02Z; ZERO notifications
+#      fired on any rail and the SF sat in TaskSubmitted for four hours
+#      (config-I4987/I4989). GroomDispatchComplete is a bare Succeed — cycle
+#      completion had no notifier anywhere.
+#
+# The fix is to report from the ORCHESTRATOR, which survives the box's death:
+# one buzzing STARTED per trigger and one buzzing COMPLETE roll-up naming every
+# lane's terminal state. Deliberately CYCLE-level, not per-lane — un-silencing
+# the ~18 per-box pings/day is how the 11-day alert-fatigue outage happened.
+# Per-box pings keep their existing silent-in-topic posture untouched.
+#
+# Distinct flow_name is REQUIRED, not cosmetic: flow_doctor_telegram caches the
+# built config by flow_name, so sharing one with the silent rail would serve
+# whichever posture initialized first.
+_CYCLE_FLOW_NAME = "backlog-groom-cycle"
+_CYCLE_DB_BASENAME = "flow_doctor_backlog_groom_cycle"
+# Mirrors the override groom_flow_doctor_notify.py:96-98 open-codes on the box
+# rail — the canonical GROOM spec is info-only/silent, and a severity above
+# `info` sent against it is DROPPED rather than merely silenced.
+_CYCLE_NOTIFIER_OVERRIDES = {
+    "notify_on": ["info", "warning", "error", "critical"],
+    "disable_notification": False,
+}
+
 # Kill-switch: GROOM_DISPATCH_ENABLED=false disables the trigger without deleting
 # the EventBridge Scheduler rules. Default ON.
 DISPATCH_ENABLED = os.environ.get("GROOM_DISPATCH_ENABLED", "true").lower() == "true"
@@ -500,11 +535,21 @@ export GROOM_RUN_TOKEN={run_token}
 """
 
 
-def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
+def _launch_instance(force_on_demand: bool = False,
+                     tier_tag: str = "") -> tuple[str, str]:
     """Launch the groom box; spot first, on-demand fallback on capacity exhaustion
     OR when force_on_demand (config#1645: the dispatch SF's last bounded relaunch
     attempt after repeated mid-run spot interruption — skip straight to on-demand
-    rather than trying the same flaky spot market a third time)."""
+    rather than trying the same flaky spot market a third time).
+
+    ``tier_tag`` (config#5303 root fix): the load-bearing ``groom-issue-filter``
+    discriminator tag now rides the SAME RunInstances call via ``extra_tags``
+    (config#2292 root fix, already adopted by sf-watch/ci-watch dispatchers) —
+    the box is NEVER observably untagged after launch, so a spot-reclaim CloudTrail
+    record (which only sees ``TagSpecifications``, not post-launch ``CreateTags``)
+    retains lane attribution for the full 90-day CloudTrail retention window.
+    """
+    extra_tags = {GROOM_TIER_TAG_KEY: tier_tag} if tier_tag else None
     return spot_dispatch.launch_with_fallback(
         INSTANCE_TYPES, SUBNETS,
         image_id=AMI_ID,
@@ -513,6 +558,7 @@ def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
         iam_instance_profile=IAM_PROFILE,
         volume_size_gb=VOLUME_SIZE_GB,
         tag_name="alpha-engine-groom-spot",
+        extra_tags=extra_tags,
         region=REGION,
         force_on_demand=force_on_demand,
     )
@@ -565,6 +611,101 @@ def _tier_tag(run_mode: str, issue_filter: str) -> str:
     return _SWEEP_TIER_TAG if run_mode == "sweep" else issue_filter
 
 
+class ConcurrentCycleError(RuntimeError):
+    """The cycle-singleton probe could not reach a verdict (alpha-engine-config-I5371).
+
+    Distinct from "a sibling cycle IS running": this means we do not KNOW.
+    Raised so the decide phase fails CLOSED rather than launching blind — see
+    ``_concurrent_cycle_blockers`` for why that asymmetry is the correct default.
+    """
+
+
+def _dispatch_state_machine_arn(execution_arn: str) -> str:
+    """The state-machine ARN owning ``execution_arn``.
+
+    ``arn:aws:states:R:A:execution:<SM_NAME>:<EXEC_NAME>``
+      -> ``arn:aws:states:R:A:stateMachine:<SM_NAME>``
+
+    Fail-loud on any other shape: a silently-wrong ARN here would make
+    ``list_executions`` return an empty set, which reads exactly like
+    "no sibling cycles" — the §2.4 absence-as-benign failure this whole
+    guard exists to prevent.
+    """
+    parts = execution_arn.split(":")
+    if len(parts) != 8 or parts[:3] != ["arn", "aws", "states"] or parts[5] != "execution":
+        raise ConcurrentCycleError(
+            f"unparseable execution ARN for cycle-singleton check: {execution_arn!r}")
+    return ":".join(parts[:5] + ["stateMachine", parts[6]])
+
+
+def _concurrent_cycle_blockers(execution_arn: str) -> list[dict]:
+    """RUNNING sibling executions of this dispatch SF that started BEFORE us.
+
+    **Why this guard exists (alpha-engine-config-I5371).** The dispatch SF
+    carried ``TimeoutSeconds: 72000`` (20h) against an 8h trigger cadence and
+    no singleton state, so up to three cycles could be alive at once *by
+    construction* — no failure required. Measured live 2026-07-29: two
+    executions RUNNING simultaneously (started 7/28 21:00 PT and 7/29 05:00
+    PT, both hung on their task-token callback), plus a third that ran 18h
+    before failing. Each independently enumerated the backlog and dispatched
+    an agent at the same issue, producing 19 duplicate PRs across 16 clusters
+    — e.g. crucible-dashboard#588/#589/#590, three PRs against config#4790
+    opened three minutes apart under three different branch conventions.
+
+    **Oldest-wins, not newest-wins.** The comparison key is
+    ``(startDate, executionArn)`` — a total order, so exactly one live cycle
+    survives even when two start in the same millisecond. Newest-wins would
+    let a fresh trigger repeatedly preempt a cycle that is doing real work.
+
+    **Fail CLOSED, unlike the sibling lane guard.** ``_running_tier_instance_ids``
+    deliberately fails open ("an optimization, not a correctness gate") because
+    a missed lane-skip costs one redundant box. This guard fails closed because
+    the costs are asymmetric: a wrongly-skipped cycle self-heals on the next 8h
+    trigger at zero cost, while a wrongly-launched concurrent cycle leaves
+    duplicate PRs that need a human to disentangle. Callers surface the skip by
+    name (never silently — §2.4).
+    """
+    if not execution_arn:
+        # Direct/legacy invoke with no SF context (manual `aws lambda invoke`,
+        # the DeepSeek fallback path). There is no cycle to be a sibling OF, so
+        # there is nothing to guard — this is a real absence, not an unknown.
+        return []
+
+    sm_arn = _dispatch_state_machine_arn(execution_arn)
+    try:
+        sfn = boto3.client("stepfunctions", region_name=REGION)
+        running: list[dict] = []
+        kwargs = {"stateMachineArn": sm_arn, "statusFilter": "RUNNING", "maxResults": 100}
+        while True:
+            page = sfn.list_executions(**kwargs)
+            running.extend(page.get("executions", []))
+            token = page.get("nextToken")
+            if not token:
+                break
+            kwargs["nextToken"] = token
+    except Exception as exc:  # noqa: BLE001 — converted to a NAMED closed failure
+        raise ConcurrentCycleError(
+            f"could not list RUNNING executions of {sm_arn}: {exc}") from exc
+
+    mine = next((e for e in running if e.get("executionArn") == execution_arn), None)
+    if mine is None:
+        # We are executing, so we MUST appear in our own RUNNING set. Absence
+        # means the listing is not describing reality (wrong SM, truncated
+        # page, IAM-filtered result) — refuse to conclude "no siblings".
+        raise ConcurrentCycleError(
+            f"this execution ({execution_arn}) absent from its own RUNNING set "
+            f"({len(running)} listed) — cannot establish singleton")
+
+    def _key(ex: dict) -> tuple:
+        return (ex.get("startDate"), ex.get("executionArn") or "")
+
+    return sorted(
+        (e for e in running
+         if e.get("executionArn") != execution_arn and _key(e) < _key(mine)),
+        key=_key,
+    )
+
+
 def _running_tier_instance_ids(tier_tag: str) -> list[str]:
     """Instance ids for a LIVE (pending/running) groom-spot box already working
     THIS ``tier_tag`` lane (config#1979; an ``issue_filter`` for groom boxes,
@@ -596,6 +737,255 @@ def _running_tier_instance_ids(tier_tag: str) -> list[str]:
             "correctness gate): %s", tier_tag, exc,
         )
         return []
+
+
+def _utc_today() -> str:
+    """UTC calendar date — the dedup/ledger partition key used throughout."""
+    return datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
+
+
+def _notify_cycle(text: str, *, severity: str, dedup_key: str, context: dict) -> None:
+    """Send one CYCLE-level lifecycle ping (buzzing) — never raises.
+
+    Best-effort per groom-sweep-policy §8 ("a notify hiccup must never block a
+    relaunch or a status check"): the dispatch decision and the SF's terminal
+    routing are the primary deliverables, and a Telegram failure must not take
+    either down. The failure is still recorded in this Lambda's CW logs.
+    """
+    try:
+        notify_via_flow_doctor(
+            text, silent=False, severity=severity, dedup_key=dedup_key,
+            flow_name=_CYCLE_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
+            db_basename=_CYCLE_DB_BASENAME,
+            context=context,
+            notifier_overrides=_CYCLE_NOTIFIER_OVERRIDES,
+            # Matches playbooks.yaml's registered `groom_dispatch_telegram_only`
+            # class source exactly (config-I3513).
+            source="flow-doctor:scheduled-groom-dispatcher",
+        )
+    except Exception as exc:  # noqa: BLE001 — secondary observability
+        logger.warning("cycle lifecycle Telegram failed (non-fatal): %s", exc)
+
+
+def _notify_cycle_started(decide_payload: dict, schedule_label: str) -> None:
+    """Buzzing STARTED ping naming exactly which lanes this trigger launches.
+
+    Emitted from the decide phase — the single chokepoint every `decide_only`
+    response passes through — so the ping reflects what was actually decided,
+    derived from the same values the SF is about to fan out (policy §2.7: the
+    record is a receipt written by the dispatching code, never a second
+    declaration that can drift).
+
+    A ZERO-lane decision is announced too, not skipped. "No pings today" must
+    never be readable as either "nothing was due" or "the trigger never fired"
+    — that ambiguity is §2.4's absence-of-signal defect and it is exactly what
+    cost an operator session on 2026-07-27.
+    """
+    launches = decide_payload.get("launches") or []
+    lanes = [str(e.get("issue_filter") or "?") for e in launches]
+    counts = decide_payload.get("counts") or {}
+    counts_line = (
+        "\nbacklog: " + ", ".join(f"{t}={counts[t]}" for t in sorted(counts))
+        if counts else ""
+    )
+    if lanes:
+        head = f"🟢 Groom cycle {schedule_label} STARTED"
+        body = f"\nlanes: {', '.join(lanes)} · sweep queued{counts_line}"
+    else:
+        # Not an error — a legitimately quiet backlog. Still announced.
+        head = f"⚪ Groom cycle {schedule_label} STARTED — 0 lanes"
+        reason = str(decide_payload.get("reason") or "below demand floor")
+        body = f"\nno tier cleared the demand floor ({reason}); sweep still runs{counts_line}"
+    _notify_cycle(
+        head + body,
+        severity="info",
+        # Per-trigger-per-day key: a relaunch inside the same cycle must not
+        # re-announce, but tomorrow's same-labelled trigger must.
+        dedup_key=f"{_CYCLE_FLOW_NAME}:started:{_utc_today()}:{schedule_label}",
+        context={"schedule": schedule_label, "lanes": lanes, "counts": counts},
+    )
+
+
+# Terminal-state vocabulary (policy §2.4: "degraded exits are named exits").
+# Maps the completion-marker / lane-outcome tokens the box and the SF produce
+# onto the glyph the roll-up shows. An UNKNOWN token is never silently
+# dropped — _lane_glyph renders it verbatim with a ❔ so a new terminal state
+# invented downstream shows up as itself rather than disappearing.
+_LANE_GLYPHS = {
+    "success": "✅", "clean": "✅",
+    "interrupted": "🟠", "quota_stop": "🟠", "spot_stop": "🟠",
+    "skipped": "⚪", "not_launched": "⚪",
+    "timeout": "🔴", "failure": "🔴", "crash_cascade": "🔴",
+    "no_artifact": "🔴", "floor_fail": "🔴",
+    "turn_budget_exceeded": "🟡", "floor_near_miss": "🟡",
+    "lane_failed": "🔴",
+}
+
+
+def _lane_glyph(state: str) -> str:
+    return _LANE_GLYPHS.get(state, "❔")
+
+
+def _lane_rows(map_outcome: list) -> tuple[list[str], bool]:
+    """Render one row per lane; return (rows, any_degraded).
+
+    Totality matters more than prettiness here: every element of map_outcome
+    produces a row, including one whose shape this code did not anticipate.
+    A lane that produced no recognizable outcome renders as `no outcome
+    reported` rather than being filtered out of the roll-up — a lane silently
+    missing from the summary is precisely the failure this ping exists to
+    surface (config-I4987).
+    """
+    rows: list[str] = []
+    degraded = False
+    for i, item in enumerate(map_outcome or []):
+        if not isinstance(item, dict):
+            rows.append(f"  lane{i}  ❔ malformed outcome")
+            degraded = True
+            continue
+        lane_outcome = item.get("laneOutcome") or {}
+        launch = item.get("groomLaunch") or item.get("groom") or {}
+        tier = str(
+            item.get("issue_filter")
+            or launch.get("issue_filter")
+            or lane_outcome.get("issue_filter")
+            or f"lane{i}"
+        )
+        if lane_outcome.get("laneFailed"):
+            state = str(lane_outcome.get("reason") or "lane_failed")
+        else:
+            state = str(
+                lane_outcome.get("completion")
+                or launch.get("completion")
+                or launch.get("reason")
+                or ("success" if launch.get("launched") else "")
+            )
+        if not state:
+            state = "no outcome reported"
+            degraded = True
+        elif _lane_glyph(state) in ("🔴", "🟠", "❔"):
+            degraded = True
+        rows.append(f"  {tier:<6} {_lane_glyph(state)} {state}")
+    return rows, degraded
+
+
+def _notify_cycle_complete(cycle: dict) -> dict:
+    """Buzzing COMPLETE roll-up — one ping per trigger, every lane named.
+
+    Invoked by the dispatch SF immediately before its terminal Succeed/Fail
+    routing, so it fires on BOTH outcomes: a cycle that ends FAILED is exactly
+    the one whose roll-up the operator most needs. Returns a small record the
+    SF stores under $.cycleNotify for post-hoc verification (§2.8).
+    """
+    # The SF hands us its whole state object (`"cycle.$": "$"`) rather than
+    # cherry-picked fields. That is deliberate and load-bearing: `$.mapFailure`
+    # is ABSENT on the two healthy paths, and a `Parameters` reference to an
+    # absent field raises States.Runtime, which no Catch can intercept
+    # (policy §2.2 — "uncatchable failure classes are eliminated by
+    # construction, never caught"). Passing the root and reading with .get()
+    # here moves that from an SF-runtime concern to ordinary Python.
+    sched_input = cycle.get("schedInput") or {}
+    schedule_label = str(
+        cycle.get("schedule") or sched_input.get("schedule") or "unknown"
+    )
+    map_outcome = cycle.get("mapOutcome") or []
+    sweep = cycle.get("sweep") or {}
+    map_failure = cycle.get("mapFailure")
+
+    rows, degraded = _lane_rows(map_outcome)
+
+    # The sweep is dispatched fire-and-forget (DispatchEndOfSfSweep is a plain
+    # lambda:invoke, not .waitForTaskToken), so at this point we can honestly
+    # report only whether its BOX was launched — never that it finished. Say
+    # exactly that rather than implying a completion we did not observe; the
+    # sweep box files its own terminal ping on the per-box rail.
+    if sweep.get("dispatched") is False or sweep.get("launched") is False:
+        sweep_line = f"  sweep  🔴 not dispatched ({sweep.get('reason', 'unknown')})"
+        degraded = True
+    elif sweep:
+        sweep_line = "  sweep  ✅ box launched (runs to quiescence; reports separately)"
+    else:
+        sweep_line = "  sweep  ❔ no dispatch record"
+        degraded = True
+
+    if map_failure or degraded:
+        head = f"🟡 Groom cycle {schedule_label} COMPLETE — degraded"
+        severity = "warning"
+    else:
+        head = f"✅ Groom cycle {schedule_label} COMPLETE"
+        severity = "info"
+
+    lane_block = "\n".join(rows) if rows else "  (no lanes launched)"
+    text = f"{head}\n{lane_block}\n{sweep_line}"
+    if map_failure:
+        text += f"\nmap failure: {map_failure}"
+
+    _notify_cycle(
+        text, severity=severity,
+        dedup_key=f"{_CYCLE_FLOW_NAME}:complete:{_utc_today()}:{schedule_label}",
+        context={"schedule": schedule_label, "degraded": degraded,
+                 "lane_count": len(rows)},
+    )
+    return {"notified": True, "degraded": degraded, "lanes": len(rows)}
+
+
+def _decide_result(decide_payload: dict, schedule_label: str) -> dict:
+    """SINGLE chokepoint for every ``decide_only`` response.
+
+    Every early return in the decide phase routes through here so the STARTED
+    ping cannot be missed on one branch and present on another — including the
+    two zero-lane branches (enumeration failure, demand-gate skip), which are
+    the ones a per-branch notify would most likely have been forgotten on.
+    """
+    _notify_cycle_started(decide_payload, schedule_label)
+    return {"decide": decide_payload}
+
+
+def _handle_cycle_complete(event: dict) -> dict:
+    """``{"mode": "cycle_complete", "cycle": {...}}`` — SF terminal roll-up.
+
+    A FOURTH invocation shape alongside fallback / decide_only / launch_decided,
+    checked early and returned immediately. Deliberately total: any exception
+    is caught and reported in-band, because this state sits on the SF's path to
+    BOTH terminal states and must never convert a completed cycle into a
+    States.TaskFailed.
+    """
+    try:
+        return {"cycleNotify": _notify_cycle_complete(event.get("cycle") or {})}
+    except Exception as exc:  # noqa: BLE001 — never fail the terminal routing
+        logger.warning("cycle-complete notification failed (non-fatal): %s", exc)
+        return {"cycleNotify": {"notified": False, "error": str(exc)}}
+
+
+def _notify_concurrent_cycle_skip(blockers: list[dict], schedule_label: str,
+                                  execution_arn: str) -> None:
+    """Loud ping for a whole-cycle singleton skip — never raises.
+
+    Deliberately NOT silent: unlike the per-lane skip (a routine, expected
+    outcome of a long-running lane), a cycle-level skip means the PREVIOUS
+    cycle is still alive after a full trigger interval, which is either a
+    genuinely long run or a hang. Both warrant a look.
+    """
+    names = ", ".join(str(b.get("name") or b.get("executionArn") or "?") for b in blockers)
+    text = (
+        "⚪ Backlog groom CYCLE SKIPPED — an earlier dispatch cycle is still "
+        f"RUNNING (alpha-engine-config-I5371). still-running: {names}. "
+        f"schedule={schedule_label}. Zero enumeration, zero spot/WET spend; "
+        "this cycle's queue rides the next trigger. A repeat of this skip "
+        "means the earlier cycle is hung, not slow — check its task-token "
+        "callback state."
+    )
+    try:
+        notify_via_flow_doctor(
+            text, silent=False, severity="warning",
+            dedup_key=f"{_FLOW_NAME}:concurrent_cycle_skip:{_utc_today()}",
+            flow_name=_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={"schedule": schedule_label, "execution_arn": execution_arn,
+                     "blocking_executions": names},
+        )
+    except Exception as exc:  # noqa: BLE001 — notification must never block the skip
+        logger.warning("concurrent-cycle skip notification failed (non-fatal): %s", exc)
 
 
 def _notify_concurrent_skip(tier_tag: str, existing_ids: list[str], schedule_label: str) -> None:
@@ -773,18 +1163,14 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
     # sf-watch watch-log timing) so a launch that itself fails/raises still
     # consumes ceiling budget — see _write_dispatch_ledger_entry.
     _write_dispatch_ledger_entry(run_token, tier_tag, schedule_label)
-    instance_id, market = _launch_instance(force_on_demand=force_on_demand)
+    instance_id, market = _launch_instance(force_on_demand=force_on_demand,
+                                           tier_tag=tier_tag)
     logger.info("launched groom box %s (%s)", instance_id, market)
-    # config#1979: tag the box with its lane (tier, or 'sweep' — config#2201)
-    # so the NEXT trigger's guard check (above) can find it. Best-effort — a
-    # tag-write failure must not abort an already-launched box (mirrors the
-    # fail-safe posture of the check itself).
-    try:
-        boto3.client("ec2", region_name=REGION).create_tags(
-            Resources=[instance_id], Tags=[{"Key": GROOM_TIER_TAG_KEY, "Value": tier_tag}])
-    except Exception as exc:  # noqa: BLE001 — non-fatal, mirrors _running_tier_instance_ids
-        logger.warning("groom-issue-filter tag write failed (non-fatal): %s: %s",
-                       type(exc).__name__, exc)
+    # config#5303: the load-bearing groom-issue-filter tag is now passed as
+    # extra_tags on the RunInstances call itself (see _launch_instance), not
+    # applied via a post-launch create_tags — so the tag is ATOMIC with launch
+    # and visible in CloudTrail RunInstances events for the full 90-day
+    # retention window. No post-launch tagging step remains to retry or fail.
     # Once the box is up, ANY failure before the bootstrap command is delivered
     # would orphan it (no watchdog/trap yet). Terminate-on-error so a slow
     # SSM-online, an SSM SendCommand error, etc. tears the box down instead of
@@ -1533,6 +1919,11 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     event = event or {}
     if event.get("mode") == "fallback":
         return _handle_fallback_dispatch(event)
+    if event.get("mode") == "cycle_complete":
+        # 2026-07-28: SF terminal roll-up. Checked here, alongside `fallback`,
+        # for the same reason — no live schedule or other caller sets a
+        # top-level `mode`, so this cannot collide with any shape below.
+        return _handle_cycle_complete(event)
     run_mode = _resolve_run_mode(event)
     model = _resolve_model(event)
     issue_filter = _resolve_issue_filter(event)
@@ -1563,6 +1954,39 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     queue_manifest_key = str(event.get("queue_manifest_key") or "")
     if queue_manifest_key and not re.fullmatch(r"[A-Za-z0-9._/-]{1,512}", queue_manifest_key):
         raise ValueError(f"invalid queue_manifest_key: {queue_manifest_key!r}")
+
+    # ── Cycle singleton (alpha-engine-config-I5371) ───────────────────────────
+    # Checked on the DECIDE phase only, and BEFORE enumeration: a skipped cycle
+    # must cost zero GitHub calls, not a full backlog walk we then discard.
+    #
+    # Deliberately NOT applied to `launch_decided`: that shape is a per-lane
+    # launch *within* an already-decided cycle (including the SF's bounded
+    # relaunch retries and the unconditional end-of-SF sweep). Blocking it here
+    # would let the singleton guard cancel the surviving cycle's own lanes —
+    # the opposite of what it is for. Lane-level concurrency stays owned by the
+    # config#1979 tag guard in `_launch_groom_spot`.
+    if event.get("decide_only"):
+        execution_arn = str(event.get("executionArn") or "")
+        try:
+            blockers = _concurrent_cycle_blockers(execution_arn)
+        except ConcurrentCycleError as exc:
+            # Fail CLOSED with a NAMED reason (§2.4: never a silent residual).
+            logger.error("cycle-singleton probe INDETERMINATE — skipping this "
+                         "cycle rather than risking a concurrent one: %s", exc)
+            _notify_concurrent_cycle_skip(
+                [{"name": f"<probe failed: {exc}>"}], schedule_label, execution_arn)
+            return _decide_result(
+                {"launches": [], "reason": "concurrent_cycle_probe_failed",
+                 "detail": str(exc)}, schedule_label)
+        if blockers:
+            names = [str(b.get("name") or b.get("executionArn")) for b in blockers]
+            logger.warning(
+                "cycle singleton: %d earlier dispatch cycle(s) still RUNNING (%s) "
+                "— skipping this cycle's enumeration entirely", len(blockers), names)
+            _notify_concurrent_cycle_skip(blockers, schedule_label, execution_arn)
+            return _decide_result(
+                {"launches": [], "reason": "concurrent_cycle_skip",
+                 "blocking_executions": names}, schedule_label)
 
     if event.get("launch_decided"):
         # config#2129: a decide_only call (or the SF's bounded-relaunch loop
@@ -1637,7 +2061,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             _write_skip_record(schedule_label, "demand_all_failed", error=str(exc))
             err = {"launched": False, "reason": "demand_all_failed", "error": str(exc)}
             if event.get("decide_only"):
-                return {"decide": {"launches": [], **err}}
+                return _decide_result({"launches": [], **err}, schedule_label)
             return {"groom": err}
         if launches is not None:
             manifest_keys = _write_queue_manifests(schedule_label, launches, tier_issues)
@@ -1678,10 +2102,10 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 # optional "backend" key (I3479) rides the SF Map's wholesale
                 # per-item merge straight into the matching launch_decided
                 # invocation — see the module docstring.
-                return {"decide": {"trigger": "demand-all", "counts": counts,
-                                   "decisions": decisions_record,
-                                   "queue_manifests": manifest_keys,
-                                   "launches": entries}}
+                return _decide_result({"trigger": "demand-all", "counts": counts,
+                                       "decisions": decisions_record,
+                                       "queue_manifests": manifest_keys,
+                                       "launches": entries}, schedule_label)
             results = [
                 _launch_groom_spot(
                     run_mode, schedule_label, e["model"], e["issue_filter"], soft_limit_min,
@@ -1712,7 +2136,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 skip = {"launched": False, "reason": "demand_gate_skip",
                         "decision": decision.as_record(), "counts": counts}
                 if event.get("decide_only"):
-                    return {"decide": {"launches": [], **skip}}
+                    return _decide_result({"launches": [], **skip}, schedule_label)
                 return {"groom": skip}
             # Launch with the DECIDED bundle + cheapest adequate model — the
             # schedule's model is only the slot default; high never runs
@@ -1729,7 +2153,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             entry["pr_budget"] = pr_budget
         if backend:
             entry["backend"] = backend
-        return {"decide": {"launches": [entry]}}
+        return _decide_result({"launches": [entry]}, schedule_label)
 
     result = _launch_groom_spot(
         run_mode, schedule_label, model, issue_filter, soft_limit_min, pr_budget, force_on_demand,

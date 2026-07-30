@@ -53,8 +53,6 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_eod.json"
-_SF_ROLE = _REPO_ROOT / "infrastructure" / "iam" / "alpha-engine-step-functions-role.json"
-
 _PROBE_FN = "alpha-engine-eod-precondition-probe"
 _DISPATCHER_FN = "alpha-engine-data-spot-dispatcher"
 
@@ -182,8 +180,17 @@ class TestDegradedTerminalState:
         assert sdf["ResultPath"] == "$.degraded_summary"
 
     def test_stop_trading_instance_leads_to_the_degraded_check(self, states):
+        """config-I5489 inserted the weekly-exercise launch between the cost
+        guard and the degraded check, so this is now a two-hop path. What the
+        test actually protects is unchanged: StopTradingInstance is not a
+        terminal, and the degraded check is still what decides the terminal —
+        the inserted state must not swallow or bypass it.
+        """
         assert "End" not in states["StopTradingInstance"]
-        assert states["StopTradingInstance"]["Next"] == "CheckDegradedOutcome"
+        assert states["StopTradingInstance"]["Next"] == "LaunchWeeklyExerciseRun"
+        # both the success and launch-failure routes converge on the check
+        assert states["LaunchWeeklyExerciseRun"]["Next"] == "CheckDegradedOutcome"
+        assert states["WeeklyExerciseLaunchFailed"]["Next"] == "CheckDegradedOutcome"
 
     def test_degraded_outcome_routes_on_the_flag(self, states):
         # config-I2767 (2026-07-16 incident): the flag is only assigned on
@@ -197,21 +204,27 @@ class TestDegradedTerminalState:
         assert guard == {"Variable": "$.degraded_summary.degraded", "IsPresent": True}
         assert comparison["Variable"] == "$.degraded_summary.degraded"
         assert comparison["BooleanEquals"] is True
-        assert c["Next"] == "DegradedSucceeded"
+        assert c["Next"] == "DegradedRun"
         assert cdo["Default"] == "NormalSucceeded"
 
-    def test_two_distinct_succeed_states_exist(self, states):
+    def test_degraded_run_is_a_fail_state(self, states):
+        """Brian's 2026-07-28 Option-A ruling (alpha-engine-config#2699):
+        the original DegradedSucceeded (Type: Succeed) left every status-keyed
+        watcher seeing green — repeating the 2026-07-15 incident's failure mode.
+        Replaced with Type: Fail so FAILED execution status engages sf-watch,
+        EventBridge, and sf-telegram-notifier with zero new plumbing."""
         assert states["NormalSucceeded"]["Type"] == "Succeed"
-        assert states["DegradedSucceeded"]["Type"] == "Succeed"
-        assert states["NormalSucceeded"] != states["DegradedSucceeded"]
+        assert states["DegradedRun"]["Type"] == "Fail"
+        assert states["DegradedRun"]["Error"] == "DegradedRun"
+        assert "Cause" in states["DegradedRun"]
 
-    def test_a_run_that_never_hits_the_gap_cannot_reach_degraded_succeeded(self, states):
-        # Structural sanity: DegradedSucceeded is reachable ONLY via
+    def test_a_run_that_never_hits_the_gap_cannot_reach_degraded_run(self, states):
+        # Structural sanity: DegradedRun is reachable ONLY via
         # CheckDegradedOutcome, which is reachable ONLY via StopTradingInstance
         # — there is no direct edge from anywhere else in the file.
         producers = [
             name for name, st in states.items()
-            if "DegradedSucceeded" in _targets(st)
+            if "DegradedRun" in _targets(st)
         ]
         assert producers == ["CheckDegradedOutcome"]
 
@@ -427,30 +440,11 @@ class TestHealOutcomeNotifications:
             assert tgt not in _HALT
 
 
-# ── IAM: the SF role can invoke the new Lambda + self-start-execution ───────
-
-
-class TestIamGrants:
-    @pytest.fixture(scope="class")
-    def policy(self):
-        return json.loads(_SF_ROLE.read_text())
-
-    def test_probe_lambda_is_grantable(self, policy):
-        lambda_stmt = next(
-            s for s in policy["Statement"] if s.get("Action") == "lambda:InvokeFunction"
-        )
-        assert any(
-            r.rstrip("*") == f"arn:aws:lambda:us-east-1:711398986525:function:{_PROBE_FN}"
-            for r in lambda_stmt["Resource"]
-        )
-
-    def test_self_start_execution_is_granted(self, policy):
-        assert any(
-            s.get("Action") == "states:StartExecution"
-            and s.get("Resource") == "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
-            for s in policy["Statement"]
-        )
-
+# TestIamGrants (probe Lambda grantable + self-start-execution grant) was
+# ported to nous-ergon-ops — the SF role policy
+# (infrastructure/iam/alpha-engine-step-functions-role.json) now lives there.
+# The invariants are enforced in nous-ergon-ops/tests/ per the
+# infra/drop-iam-moved-to-ops cleanup.
 
 # ── Moved verbatim from test_sf_eod_substrate_check_wiring.py (deleted
 # alpha-engine-config-I2722, 2026-07-16) — this coverage was never
