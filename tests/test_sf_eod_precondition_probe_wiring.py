@@ -345,6 +345,7 @@ class TestHealLoopDispatchChain:
         assert st["Parameters"]["FunctionName"] == _DISPATCHER_FN
         assert st["Parameters"]["Payload"] == {
             "workload": "post-market-data", "force_on_demand": True,
+            "execution_id.$": "$$.Execution.Id",
         }
         assert st["Next"] == "HealCheckPostMarketDataSpotLaunched"
 
@@ -366,6 +367,7 @@ class TestHealLoopDispatchChain:
         assert st["Parameters"]["FunctionName"] == _DISPATCHER_FN
         assert st["Parameters"]["Payload"] == {
             "workload": "post-market-arctic-append", "force_on_demand": True,
+            "execution_id.$": "$$.Execution.Id",
         }
 
     def test_arctic_success_chains_to_reprobe(self, states):
