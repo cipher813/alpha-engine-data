@@ -255,9 +255,33 @@ GROOM_REPO = os.environ.get("GROOM_REPO", "nousergon/alpha-engine-config")
 GROOM_BRANCH = os.environ.get("GROOM_BRANCH", "main")
 # The BOX reads the PAT via its instance profile (this Lambda does not).
 GROOM_GH_PAT_SSM = os.environ.get("GROOM_GH_PAT_SSM", "/alpha-engine/saturday_sf_watch/github_pat")
-# Hard ceiling for the on-box SSM command (matches the bootstrap watchdog). The
-# in-run soft budget (~340 min) is the binding stop; this is the backstop.
-MAX_RUNTIME_SECONDS = int(os.environ.get("GROOM_MAX_RUNTIME_SECONDS", "21600"))
+# ONE authoritative runtime bound for a lane (groom-sweep-policy §2.1: "where
+# two mechanisms bound the same thing, the TIGHTER one is the real budget
+# regardless of intent").
+#
+# Measured 2026-07-30, three copies that did NOT agree:
+#
+#   SF LaunchGroomSpot TimeoutSeconds  10800s (180 min)  <- tightest, the REAL budget
+#   this constant                      21600s (360 min)  -> SSM command timeout
+#                                                        -> the reconciler's deadline_utc
+#   groom_spot_bootstrap.sh watchdog   21600s (360 min)  -> the box's own kill
+#
+# The comment above this line claimed it "matches the bootstrap watchdog" — it
+# did, and both were wrong, because the SF had been tightened to 180 min
+# without them. The consequence is not cosmetic: the SF gives up on the lane at
+# 180 min and fires a relaunch while the ORIGINAL box is still working for
+# another three hours, and the relaunch's concurrent-tier guard then refuses
+# because that box is alive. That is exactly the alpha-engine-config-I4987
+# no-op relaunch, manufactured on a timer.
+#
+# The reconciler was mis-armed the same way: its deadline_utc was now + 360 min,
+# so a lane the SF had already abandoned would not read as overdue for another
+# three hours.
+#
+# 10800 is therefore the value, and it is BOUND to the SF definition by
+# test_runtime_bound_is_single_and_authoritative — both files live in this
+# repo, so the binding is enforceable rather than aspirational.
+MAX_RUNTIME_SECONDS = int(os.environ.get("GROOM_MAX_RUNTIME_SECONDS", "10800"))
 SSM_ONLINE_BUDGET_SEC = int(os.environ.get("GROOM_SSM_ONLINE_BUDGET_SEC", "180"))
 CW_LOG_GROUP = os.environ.get("GROOM_CW_LOG_GROUP", "/alpha-engine/groom-spot")
 
@@ -525,6 +549,13 @@ def _bootstrap_command(run_mode: str, run_url: str, model: str, issue_filter: st
     # the run through DeepSeek instead of Claude — this Lambda passes the flag
     # through verbatim, it does not select the DeepSeek model itself.
     backend_export = f"export GROOM_BACKEND={backend}\n" if backend else ""
+    # Push the ONE authoritative runtime bound to the box so its watchdog
+    # cannot drift from the SF's lane timeout. groom_spot_bootstrap.sh reads
+    # `${MAX_RUNTIME_SECONDS:-...}`, so its own default becomes a fallback for
+    # manual runs only — every dispatched box now inherits this value.
+    # Without this export the box killed itself at its own 360-min default
+    # while the SF had already abandoned the lane at 180 (see the constant).
+    runtime_bound_export = f"export MAX_RUNTIME_SECONDS={MAX_RUNTIME_SECONDS}\n"
     # Arming the DeepSeek fallback dispatch: when a Claude-backed groom run
     # hits quota exhaustion, the on-box groom_run.sh checks this flag and —
     # if enabled — invokes this Lambda again with mode=fallback to launch a
@@ -555,7 +586,7 @@ cd /home/ec2-user/alpha-engine-config
 export GROOM_MODEL={model}
 export GROOM_ISSUE_FILTER={issue_filter}
 export GROOM_RUN_TOKEN={run_token}
-{pr_budget_export}{manifest_export}{fallback_enabled_export}{backend_export}{task_token_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
+{pr_budget_export}{manifest_export}{fallback_enabled_export}{backend_export}{runtime_bound_export}{task_token_export}exec bash infrastructure/groom_spot_bootstrap.sh --mode {run_mode} --run-url "{run_url}"{soft_limit_flag}
 """
 
 

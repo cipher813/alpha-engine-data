@@ -282,3 +282,63 @@ def test_lane_death_catch_precedes_the_catch_all():
     assert order.index(("LaneDeath",)) < order.index(("States.ALL",)), (
         "the LaneDeath Catch sits after States.ALL and is therefore unreachable"
     )
+
+
+# ── §2.1: ONE authoritative runtime bound for a lane ─────────────────────────
+
+
+def _dispatcher_max_runtime() -> int:
+    import re
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "infrastructure" / "lambdas"
+           / "scheduled-groom-dispatcher" / "index.py").read_text()
+    m = re.search(r'GROOM_MAX_RUNTIME_SECONDS",\s*"(\d+)"', src)
+    assert m, "could not read MAX_RUNTIME_SECONDS from the dispatcher"
+    return int(m.group(1))
+
+
+def test_runtime_bound_is_single_and_authoritative():
+    """The box must never outlive the lane the SF is waiting on.
+
+    groom-sweep-policy §2.1: "where two mechanisms bound the same thing, the
+    TIGHTER one is the real budget regardless of intent."
+
+    Measured 2026-07-30 — three copies that did not agree:
+
+        SF LaunchGroomSpot TimeoutSeconds   10800s (180 min)  <- real budget
+        dispatcher MAX_RUNTIME_SECONDS      21600s (360 min)
+        bootstrap watchdog default          21600s (360 min)
+
+    The failure is not cosmetic. The SF abandons the lane at 180 min and fires
+    a relaunch while the ORIGINAL box works on for another three hours; the
+    relaunch's concurrent-tier guard then refuses because that box is alive —
+    the alpha-engine-config-I4987 no-op relaunch, manufactured on a timer. The
+    reconciler was mis-armed identically: deadline_utc was now + 360 min, so a
+    lane the SF had already given up on stayed 'not overdue' for three hours.
+    """
+    lane_timeout = _lane_state()["TimeoutSeconds"]
+    box_bound = _dispatcher_max_runtime()
+    assert box_bound <= lane_timeout, (
+        f"the box may run {box_bound}s but the SF abandons the lane at "
+        f"{lane_timeout}s — every timeout leaves an orphan box that blocks its "
+        "own relaunch"
+    )
+
+
+def test_the_runtime_bound_reaches_the_box():
+    """A constant the box never receives is not a bound.
+
+    groom_spot_bootstrap.sh reads `${MAX_RUNTIME_SECONDS:-<default>}`. If the
+    dispatcher does not export it, the box silently uses its own default and
+    the value tested above governs nothing on the machine it is about.
+    """
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "infrastructure" / "lambdas"
+           / "scheduled-groom-dispatcher" / "index.py").read_text()
+    assert "export MAX_RUNTIME_SECONDS=" in src, (
+        "the dispatcher never exports MAX_RUNTIME_SECONDS, so the box falls "
+        "back to its own default and the two can diverge freely"
+    )
+    assert "{runtime_bound_export}" in src, (
+        "the export is built but never interpolated into the bootstrap command"
+    )
