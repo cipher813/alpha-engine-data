@@ -32,6 +32,7 @@ playbooks:
     tier: T2
     routed: true
     enabled: true
+    execution_surface: spot
     # config-I3293 — model/wake/cadence are REGISTRY-DECLARED (this file is
     # the one place that answers "what model runs this agent, what wakes it,
     # on what cadence"). `model` is LIVE config, not documentation: the
@@ -39,6 +40,13 @@ playbooks:
     # executor threads it to the run script's `--model`; the run script's
     # inline default is the fallback ONLY for non-router invocation paths.
     model: deepseek-v4-pro
+    # config-#5286 — dispatch semantics registry-declared (was hardcoded in the
+    # executor Lambda as DEFER_MAX_GENERATION=3 + defer-not-drop policy). The
+    # overseer-dispatcher injects these into the executor payload; the executor's
+    # own hardcoded defaults are the fallback for non-router invocation paths.
+    on_concurrent: defer
+    attempt_ceiling: 3
+    drill_isolation: true
     wake:
       - "eventbridge:alpha-engine-saturday-sf-watch-failed (fleet SF terminal failure -> triage Lambda -> router, M2)"
       - "eventbridge:alpha-engine-sf-watch-spot-interruption + alpha-engine-sf-watch-instance-terminated (reclaim/relaunch)"
@@ -119,6 +127,13 @@ playbooks:
     routed: true
     enabled: true
     model: deepseek-v4-pro   # config-I3293 — registry-declared, router-injected
+    # config-#5286 — ci-watch uses concurrent_skip on collision (no retry),
+    # not defer-not-drop: a second commit failing CI independently must get its
+    # own dispatch, not queue behind the first (per-SHA lock is the narrow
+    # guard). attempt_ceiling=1 means skip-on-first-collision with zero retry.
+    on_concurrent: skip
+    attempt_ceiling: 1
+    drill_isolation: true
     wake:
       - "gha:nousergon-lib notify-ci-failure.yml -> repository_dispatch -> sf-watch.yml ci-watch-dispatch job -> this router (main-branch CI failure)"
     cadence: "event-driven only — no scheduled wake (deprecation to drain intake tracked: config-I2845)"
@@ -155,6 +170,12 @@ playbooks:
     routed: true
     enabled: true
     model: deepseek-v4-pro   # config-I3293 — registry-declared, router-injected; charter may spawn complexity-matched sub-agents (Brian ruling 2026-07-22)
+    # config-#5286 — alert-drain uses concurrent_skip on collision: single-lane
+    # lock (one drain at a time), no retry on skip (at-least-once queue
+    # discipline absorbs double-processing).
+    on_concurrent: skip
+    attempt_ceiling: 1
+    drill_isolation: true
     wake:
       - "scheduler:alpha-engine-alert-drain-0400utc/1000utc/1600utc/2200utc (4x-daily non-urgent queue drain, Brian ruling 2026-07-22)"
       - "event-time: freshness-monitor CRITICAL page -> router (trigger=freshness-critical, config-I3282)"
@@ -190,9 +211,19 @@ playbooks:
         # MAX_RUNTIME_SECONDS=10800 (180m) + boot/report margin = 210m ceiling;
         # margin beyond the ceiling is 30m. The 4x-daily schedule mirrors the
         # four EventBridge Scheduler names in watch_plane_liveness.
+        #
+        # run_start_field: the drain ledger keys its start timestamp
+        # `started_at`; the groom artifact this check was ported from uses
+        # `run_start`. Reading groom's name against the drain's schema found
+        # nothing, and the reader skipped past every ledger silently, so all
+        # four daily triggers were reported as silent deaths while the drain
+        # was running normally (false pages 2026-07-29). The reader now RAISES
+        # on a missing declared field. Retire this key when G16
+        # (alpha-engine-config-I5284) gives every playbook one artifact schema.
         - type: run_window
           label: alert-drain
           artifact_prefix: overseer/drain_ledger/
+          run_start_field: started_at
           ceiling_min: 210
           margin_min: 30
           lookback_hours: 30
@@ -241,6 +272,13 @@ playbooks:
     charter: alpha-engine-config/scripts/groom_run.sh
     concurrency_domain: EC2 tag lock on groom-issue-filter (tier lane; sweep has its own lane).
     supports_drill: false
+    # config-#5286 — groom is the canonical `custom_executor: true` escape
+    # hatch. Its pace/demand/tier logic (complexity-tiered per issue, demand-
+    # driven scheduling, and end-of-SF sweep leg) predates and cannot be
+    # expressed through the instance-level dispatch primitives the registry
+    # declares for routed executors. The overseer-dispatcher therefore skips
+    # injecting dispatch-semantics fields for this playbook.
+    custom_executor: true
     kill_switch_env: GROOM_DISPATCH_ENABLED
     # Run-window accounting migrated from groom-liveness-probe (config#2414/#2667):
     # for each MATURE expected trigger (fixed-cron schedule below UNION the
@@ -495,9 +533,8 @@ alert_classes:
     intake: bus
     response: drain-queue
   - class: backtester_champion_promotion
-    # NOTE stale 'crucible-backtester/' prefix in the emitter literal —
-    # config-I3302 renames it; row updated when that lands.
-    source: "crucible-backtester/optimizer/champion_promotion.py::run_weekly_evaluation"
+    # I3302 rename complete: code now emits the canonical alpha-engine-backtester/ prefix.
+    source: "alpha-engine-backtester/optimizer/champion_promotion.py::run_weekly_evaluation"
     severities: [error]
     intake: bus
     response: drain-queue
@@ -536,6 +573,13 @@ alert_classes:
   - class: predictor_observe_calibration
     source: "predictor.inference.observe_calibration"
     severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: deploy_notification_predictor
+    # config#3305 static-chokepoint registration: predictor deploy scripts
+    # that call ``krepis.alerts publish --source <path>/deploy.sh``.
+    source: "alpha-engine-predictor/infrastructure/deploy.sh"
+    severities: [error]
     intake: bus
     response: drain-queue
 
@@ -580,6 +624,16 @@ alert_classes:
     severities: [warning]
     intake: bus
     response: drain-queue
+  - class: research_experiment_record_alerts
+    source: "research:experiment_record"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: research_thinktank_daily_alerts
+    source: "research:thinktank_daily"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
   - class: research_signals_envelope_rejected
     # NOTE: this class emits via ``alerts.publish`` with explicit
     # ``severity="error"`` (not ``publish_observe_alert``), so its
@@ -592,6 +646,28 @@ alert_classes:
   - class: research_signals_envelope_handler_observe_alerts
     source: "signals_envelope_handler:*"
     severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: research_experiment_record
+    # config#3305 static-chokepoint registration: ``publish_observe_alert``
+    # for experiment_record emission failures (secondary observability, never
+    # blocks the shadow signal write itself).
+    source: "research:experiment_record"
+    severities: [info, warning]
+    intake: bus
+    response: drain-queue
+  - class: research_thinktank_daily
+    # config#3305 static-chokepoint registration: thinktank daily run outcome
+    # notification (DEGRADED/ok — secondary observability, not a gating check).
+    source: "research:thinktank_daily"
+    severities: [info, warning]
+    intake: bus
+    response: drain-queue
+  - class: deploy_notification_research
+    # config#3305 static-chokepoint registration: research deploy scripts that
+    # call ``krepis.alerts publish --source <path>/deploy.sh``.
+    source: "alpha-engine-research/infrastructure/deploy.sh"
+    severities: [error]
     intake: bus
     response: drain-queue
 
@@ -642,6 +718,20 @@ alert_classes:
   - class: data_sf_definition_drift
     source: "alpha-engine-data/infrastructure/step-functions/check-definition-drift.py"
     severities: [dynamic]
+    intake: bus
+    response: drain-queue
+  - class: deploy_notification_data_plane
+    # config#3305 static-chokepoint registration: data-plane deploy scripts
+    # that call ``krepis.alerts publish --source <path>/deploy.sh``.
+    source: "alpha-engine-data/infrastructure/deploy.sh"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+  - class: deploy_notification_changelog
+    # config#3305 static-chokepoint registration: changelog mirror deploy
+    # script that calls ``krepis.alerts publish``.
+    source: "alpha-engine-data/changelog-incident-mirror/deploy.sh"
+    severities: [error]
     intake: bus
     response: drain-queue
 

@@ -95,7 +95,7 @@ import logging
 import os
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import boto3
@@ -535,11 +535,21 @@ export GROOM_RUN_TOKEN={run_token}
 """
 
 
-def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
+def _launch_instance(force_on_demand: bool = False,
+                     tier_tag: str = "") -> tuple[str, str]:
     """Launch the groom box; spot first, on-demand fallback on capacity exhaustion
     OR when force_on_demand (config#1645: the dispatch SF's last bounded relaunch
     attempt after repeated mid-run spot interruption — skip straight to on-demand
-    rather than trying the same flaky spot market a third time)."""
+    rather than trying the same flaky spot market a third time).
+
+    ``tier_tag`` (config#5303 root fix): the load-bearing ``groom-issue-filter``
+    discriminator tag now rides the SAME RunInstances call via ``extra_tags``
+    (config#2292 root fix, already adopted by sf-watch/ci-watch dispatchers) —
+    the box is NEVER observably untagged after launch, so a spot-reclaim CloudTrail
+    record (which only sees ``TagSpecifications``, not post-launch ``CreateTags``)
+    retains lane attribution for the full 90-day CloudTrail retention window.
+    """
+    extra_tags = {GROOM_TIER_TAG_KEY: tier_tag} if tier_tag else None
     return spot_dispatch.launch_with_fallback(
         INSTANCE_TYPES, SUBNETS,
         image_id=AMI_ID,
@@ -548,6 +558,7 @@ def _launch_instance(force_on_demand: bool = False) -> tuple[str, str]:
         iam_instance_profile=IAM_PROFILE,
         volume_size_gb=VOLUME_SIZE_GB,
         tag_name="alpha-engine-groom-spot",
+        extra_tags=extra_tags,
         region=REGION,
         force_on_demand=force_on_demand,
     )
@@ -598,6 +609,101 @@ def _tier_tag(run_mode: str, issue_filter: str) -> str:
     groom boxes guard per issue_filter tier; sweep boxes guard as one
     distinct 'sweep' lane regardless of the (inert) issue_filter they carry."""
     return _SWEEP_TIER_TAG if run_mode == "sweep" else issue_filter
+
+
+class ConcurrentCycleError(RuntimeError):
+    """The cycle-singleton probe could not reach a verdict (alpha-engine-config-I5371).
+
+    Distinct from "a sibling cycle IS running": this means we do not KNOW.
+    Raised so the decide phase fails CLOSED rather than launching blind — see
+    ``_concurrent_cycle_blockers`` for why that asymmetry is the correct default.
+    """
+
+
+def _dispatch_state_machine_arn(execution_arn: str) -> str:
+    """The state-machine ARN owning ``execution_arn``.
+
+    ``arn:aws:states:R:A:execution:<SM_NAME>:<EXEC_NAME>``
+      -> ``arn:aws:states:R:A:stateMachine:<SM_NAME>``
+
+    Fail-loud on any other shape: a silently-wrong ARN here would make
+    ``list_executions`` return an empty set, which reads exactly like
+    "no sibling cycles" — the §2.4 absence-as-benign failure this whole
+    guard exists to prevent.
+    """
+    parts = execution_arn.split(":")
+    if len(parts) != 8 or parts[:3] != ["arn", "aws", "states"] or parts[5] != "execution":
+        raise ConcurrentCycleError(
+            f"unparseable execution ARN for cycle-singleton check: {execution_arn!r}")
+    return ":".join(parts[:5] + ["stateMachine", parts[6]])
+
+
+def _concurrent_cycle_blockers(execution_arn: str) -> list[dict]:
+    """RUNNING sibling executions of this dispatch SF that started BEFORE us.
+
+    **Why this guard exists (alpha-engine-config-I5371).** The dispatch SF
+    carried ``TimeoutSeconds: 72000`` (20h) against an 8h trigger cadence and
+    no singleton state, so up to three cycles could be alive at once *by
+    construction* — no failure required. Measured live 2026-07-29: two
+    executions RUNNING simultaneously (started 7/28 21:00 PT and 7/29 05:00
+    PT, both hung on their task-token callback), plus a third that ran 18h
+    before failing. Each independently enumerated the backlog and dispatched
+    an agent at the same issue, producing 19 duplicate PRs across 16 clusters
+    — e.g. crucible-dashboard#588/#589/#590, three PRs against config#4790
+    opened three minutes apart under three different branch conventions.
+
+    **Oldest-wins, not newest-wins.** The comparison key is
+    ``(startDate, executionArn)`` — a total order, so exactly one live cycle
+    survives even when two start in the same millisecond. Newest-wins would
+    let a fresh trigger repeatedly preempt a cycle that is doing real work.
+
+    **Fail CLOSED, unlike the sibling lane guard.** ``_running_tier_instance_ids``
+    deliberately fails open ("an optimization, not a correctness gate") because
+    a missed lane-skip costs one redundant box. This guard fails closed because
+    the costs are asymmetric: a wrongly-skipped cycle self-heals on the next 8h
+    trigger at zero cost, while a wrongly-launched concurrent cycle leaves
+    duplicate PRs that need a human to disentangle. Callers surface the skip by
+    name (never silently — §2.4).
+    """
+    if not execution_arn:
+        # Direct/legacy invoke with no SF context (manual `aws lambda invoke`,
+        # the DeepSeek fallback path). There is no cycle to be a sibling OF, so
+        # there is nothing to guard — this is a real absence, not an unknown.
+        return []
+
+    sm_arn = _dispatch_state_machine_arn(execution_arn)
+    try:
+        sfn = boto3.client("stepfunctions", region_name=REGION)
+        running: list[dict] = []
+        kwargs = {"stateMachineArn": sm_arn, "statusFilter": "RUNNING", "maxResults": 100}
+        while True:
+            page = sfn.list_executions(**kwargs)
+            running.extend(page.get("executions", []))
+            token = page.get("nextToken")
+            if not token:
+                break
+            kwargs["nextToken"] = token
+    except Exception as exc:  # noqa: BLE001 — converted to a NAMED closed failure
+        raise ConcurrentCycleError(
+            f"could not list RUNNING executions of {sm_arn}: {exc}") from exc
+
+    mine = next((e for e in running if e.get("executionArn") == execution_arn), None)
+    if mine is None:
+        # We are executing, so we MUST appear in our own RUNNING set. Absence
+        # means the listing is not describing reality (wrong SM, truncated
+        # page, IAM-filtered result) — refuse to conclude "no siblings".
+        raise ConcurrentCycleError(
+            f"this execution ({execution_arn}) absent from its own RUNNING set "
+            f"({len(running)} listed) — cannot establish singleton")
+
+    def _key(ex: dict) -> tuple:
+        return (ex.get("startDate"), ex.get("executionArn") or "")
+
+    return sorted(
+        (e for e in running
+         if e.get("executionArn") != execution_arn and _key(e) < _key(mine)),
+        key=_key,
+    )
 
 
 def _running_tier_instance_ids(tier_tag: str) -> list[str]:
@@ -720,6 +826,54 @@ def _lane_glyph(state: str) -> str:
     return _LANE_GLYPHS.get(state, "❔")
 
 
+# Zero-launch vocabulary (policy §2.4: "degraded exits are named exits";
+# alpha-engine-config-I5689). CheckAnyLaunches routes EVERY empty-launches
+# decide to AllSkipped, but those skips are not equivalent: a light backlog is
+# the system correctly declining to spend, while a concurrency skip is a cycle
+# the backlog needed and did not get. Before this table both rendered as
+# "✅ COMPLETE / (no lanes launched)".
+#
+# Structured as {reason: (glyph, healthy, blurb)}. `healthy` is what feeds
+# `degraded`; an UNKNOWN reason is deliberately NOT healthy — a skip shape
+# invented downstream must surface as itself rather than inherit the benign
+# default (§2.4: "the absence of a signal must never be readable as a benign
+# signal"). `_SKIP_REASONS` is asserted total against the dispatcher's own
+# emitted reasons by test_groom_cycle_notifications.py.
+_SKIP_REASONS = {
+    # Healthy: nothing to do, no spend, backlog not starved.
+    "demand_gate_skip": ("⚪", True, "no tier cleared the demand floor"),
+    # (No pace-gate entry: the pre-boot pace gate was DISMANTLED by Brian's
+    # 2026-07-14 ruling — see the module docstring. A row for a retired
+    # mechanism is the §9 "guard scoped to a design that no longer exists"
+    # defect, so it stays absent and the meta-test below keeps it that way.)
+    # Degraded: the backlog needed this cycle and did not get it.
+    "concurrent_cycle_skip": (
+        "🟡", False, "an earlier cycle was still running — backlog untouched"),
+    "concurrent_cycle_probe_failed": (
+        "🟡", False, "could not prove no cycle was running — skipped fail-safe"),
+    "demand_all_failed": (
+        "🔴", False, "enumeration failed — demand could not be computed"),
+}
+
+#: The no-reason case. A plain light-backlog decide returns ``launches: []``
+#: with NO reason key at all (see the AllSkipped comment in
+#: step_function_groom.json), so absence here means the demand gate, not an
+#: unrecognized shape. Kept distinct from the unknown-reason fallback below
+#: because conflating them is what would let a future reason-less degraded
+#: skip read as healthy.
+_SKIP_REASON_ABSENT = ("⚪", True, "no tier cleared the demand floor")
+
+
+def _skip_verdict(reason: str | None) -> tuple[str, bool, str]:
+    """Classify a zero-launch cycle. Total over its input by construction."""
+    if not reason:
+        return _SKIP_REASON_ABSENT
+    known = _SKIP_REASONS.get(reason)
+    if known:
+        return known
+    return ("❔", False, f"unrecognized skip reason {reason!r}")
+
+
 def _lane_rows(map_outcome: list) -> tuple[list[str], bool]:
     """Render one row per lane; return (rows, any_degraded).
 
@@ -788,6 +942,25 @@ def _notify_cycle_complete(cycle: dict) -> dict:
 
     rows, degraded = _lane_rows(map_outcome)
 
+    # Zero-launch cycles (I5689). AllSkipped is reached by several distinct
+    # routes and only some are healthy, so classify rather than assume. This
+    # runs on the AllSkipped path only: when lanes DID launch, mapOutcome is
+    # non-empty and the decide reason is not a skip verdict.
+    skip_reason = None
+    skip_healthy = True
+    if not rows:
+        decide = (
+            ((cycle.get("decideResult") or {}).get("Payload") or {}).get("decide")
+            or {}
+        )
+        skip_reason = decide.get("reason")
+        glyph, skip_healthy, blurb = _skip_verdict(skip_reason)
+        blockers = decide.get("blocking_executions") or []
+        blocker_note = f" [{', '.join(str(b) for b in blockers)}]" if blockers else ""
+        rows = [f"  cycle  {glyph} 0 lanes — {blurb}{blocker_note}"]
+        if not skip_healthy:
+            degraded = True
+
     # The sweep is dispatched fire-and-forget (DispatchEndOfSfSweep is a plain
     # lambda:invoke, not .waitForTaskToken), so at this point we can honestly
     # report only whether its BOX was launched — never that it finished. Say
@@ -809,6 +982,11 @@ def _notify_cycle_complete(cycle: dict) -> dict:
         head = f"✅ Groom cycle {schedule_label} COMPLETE"
         severity = "info"
 
+    # A skip row describes the CYCLE, not a lane — `lanes` stays 0 so any
+    # consumer counting launched lanes is unaffected by the new row (§10.1
+    # reads lane counts; the skip verdict travels in its own fields).
+    lane_count = len(map_outcome)
+
     lane_block = "\n".join(rows) if rows else "  (no lanes launched)"
     text = f"{head}\n{lane_block}\n{sweep_line}"
     if map_failure:
@@ -818,9 +996,22 @@ def _notify_cycle_complete(cycle: dict) -> dict:
         text, severity=severity,
         dedup_key=f"{_CYCLE_FLOW_NAME}:complete:{_utc_today()}:{schedule_label}",
         context={"schedule": schedule_label, "degraded": degraded,
-                 "lane_count": len(rows)},
+                 "lane_count": lane_count, "skip_reason": skip_reason},
     )
-    return {"notified": True, "degraded": degraded, "lanes": len(rows)}
+    # `skip_reason` / `skip_healthy` are emitted as FACTS, not as a verdict on
+    # §10.1. A concurrency skip exits the SF SUCCEEDED, so terminal status alone
+    # cannot distinguish a completed cycle from a starved one — these two fields
+    # are what lets a §10.1 implementation tell them apart without re-deriving
+    # anything (§2.7 derive-once). Deliberately NOT a `cycle_completed` boolean:
+    # scoring is §10.1's to define, and asserting it here would make this a
+    # second source of truth for the governing metric.
+    return {
+        "notified": True,
+        "degraded": degraded,
+        "lanes": lane_count,
+        "skip_reason": skip_reason,
+        "skip_healthy": skip_healthy if not map_outcome else None,
+    }
 
 
 def _decide_result(decide_payload: dict, schedule_label: str) -> dict:
@@ -849,6 +1040,37 @@ def _handle_cycle_complete(event: dict) -> dict:
     except Exception as exc:  # noqa: BLE001 — never fail the terminal routing
         logger.warning("cycle-complete notification failed (non-fatal): %s", exc)
         return {"cycleNotify": {"notified": False, "error": str(exc)}}
+
+
+def _notify_concurrent_cycle_skip(blockers: list[dict], schedule_label: str,
+                                  execution_arn: str) -> None:
+    """Loud ping for a whole-cycle singleton skip — never raises.
+
+    Deliberately NOT silent: unlike the per-lane skip (a routine, expected
+    outcome of a long-running lane), a cycle-level skip means the PREVIOUS
+    cycle is still alive after a full trigger interval, which is either a
+    genuinely long run or a hang. Both warrant a look.
+    """
+    names = ", ".join(str(b.get("name") or b.get("executionArn") or "?") for b in blockers)
+    text = (
+        "⚪ Backlog groom CYCLE SKIPPED — an earlier dispatch cycle is still "
+        f"RUNNING (alpha-engine-config-I5371). still-running: {names}. "
+        f"schedule={schedule_label}. Zero enumeration, zero spot/WET spend; "
+        "this cycle's queue rides the next trigger. A repeat of this skip "
+        "means the earlier cycle is hung, not slow — check its task-token "
+        "callback state."
+    )
+    try:
+        notify_via_flow_doctor(
+            text, silent=False, severity="warning",
+            dedup_key=f"{_FLOW_NAME}:concurrent_cycle_skip:{_utc_today()}",
+            flow_name=_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={"schedule": schedule_label, "execution_arn": execution_arn,
+                     "blocking_executions": names},
+        )
+    except Exception as exc:  # noqa: BLE001 — notification must never block the skip
+        logger.warning("concurrent-cycle skip notification failed (non-fatal): %s", exc)
 
 
 def _notify_concurrent_skip(tier_tag: str, existing_ids: list[str], schedule_label: str) -> None:
@@ -903,25 +1125,229 @@ def _prior_launch_count_today() -> int:
     return count
 
 
-def _write_dispatch_ledger_entry(run_token: str, tier_tag: str, schedule_label: str) -> None:
-    """Record a launch ATTEMPT for the daily ceiling count (config#3173).
-    Written just BEFORE the launch fires (mirroring sf-watch's watch-log
-    timing) so even a launch that subsequently fails/raises still consumes
-    budget — an attempt-then-immediately-fail loop must still trip the
-    ceiling eventually, never spin invisibly. Best-effort: a ledger-write
-    failure must never block the launch it's recording."""
+# config-I5229 (lane-death pager): the reconciler structurally depends on
+# _write_dispatch_ledger_entry succeeding — a failed write means a lane can
+# die silently with no reconciler record to detect it. That IS a paging
+# condition (§2.7: "a registration-write failure is itself a paging
+# condition"). The function now FAILS LOUD (raises on S3 put failure); the
+# one caller (_launch_groom_spot) terminates the just-launched box on error
+# so a failed write never orphans an instance.
+_LEDGER_WRITE_FAILED_MSG = (
+    "dispatch ledger write FAILED (config-I5229 — registration-write failure "
+    "IS a paging condition; lane-death reconciler cannot cover a lane it never "
+    "recorded)"
+)
+
+# The legitimate completion-marker outcome values the box's write_completion_marker
+# (groom_run.sh) writes. The reconciler considers ANY completion marker as
+# "lane completed cleanly" regardless of the outcome value — this set is
+# documentation, not a guard. An outcome NOT in this set still reads as
+# "completed" for reconciler purposes (see _reconcile_lane_death).
+_COMPLETION_OUTCOMES = frozenset({
+    "success", "interrupted", "quota_stop", "spot_stop",
+    "timeout", "failure", "crash_cascade",
+})
+
+
+def _write_dispatch_ledger_entry(run_token: str, tier_tag: str, schedule_label: str,
+                                  instance_id: str = "", deadline_utc: str = "",
+                                  task_token: str = "") -> None:
+    """Record a launch ATTEMPT for the daily ceiling count (config#3173) AND
+    an expectation record for the lane-death reconciler (config-I5229).
+
+    Previously best-effort (a ledger-write failure silently logged and the
+    launch proceeded). config-I5229 (lane-death pager): a failed ledger write
+    means the reconciler can never see this launch, so a lane death would go
+    undetected — that IS a paging condition per groom-sweep-policy §2.7.
+    FAILS LOUD: raises on S3 put failure; the caller terminates the
+    just-launched box so a failed write never orphans an instance.
+
+    Written AFTER the EC2 launch (so instance_id is known) but BEFORE the
+    SSM bootstrap — the launch consumes ceiling budget regardless of whether
+    the subsequent bootstrap succeeds, preserving the existing anti-runaway
+    semantics (an attempt-then-immediately-fail loop still trips the ceiling
+    eventually, never spin invisibly)."""
     today = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
     key = f"{_DISPATCH_LEDGER_PREFIX}/{today}/{run_token}.json"
-    body = json.dumps({
+    fields: dict = {
         "run_token": run_token, "tier_tag": tier_tag, "schedule": schedule_label,
+        "instance_id": instance_id,
+        "deadline_utc": deadline_utc,
         "recorded_at": datetime.now(ZoneInfo("UTC")).isoformat(),
-    })
-    try:
-        boto3.client("s3", region_name=REGION).put_object(
-            Bucket=_RESEARCH_BUCKET, Key=key, Body=body.encode(),
-            ContentType="application/json")
-    except Exception as exc:  # noqa: BLE001 — observability, never blocks dispatch
-        logger.warning("dispatch ledger write failed (non-fatal): %s", exc)
+    }
+    if task_token:
+        fields["task_token"] = task_token
+    body = json.dumps(fields)
+    boto3.client("s3", region_name=REGION).put_object(
+        Bucket=_RESEARCH_BUCKET, Key=key, Body=body.encode(),
+        ContentType="application/json")
+
+
+# ── Lane-death reconciler (alpha-engine-config-I5229 Phase 1) ─────────────────
+# Screens every open expectation (dispatch-ledger entry with no matching
+# completion marker under groom/_control/completed/) against live EC2 state.
+# Failure-mode-agnostic per groom-sweep-policy §2.7: it does not enumerate
+# causes — it checks two OUTCOMES (is the instance alive? is it past its
+# deadline?) and pages on either. Any reason a box stops existing produces
+# the same verdict.
+
+_RECONCILE_COMPLETED_PREFIX = "groom/_control/completed"
+# describe-instances returns terminated instances for only ~1h (AWS docs).
+# An instance absent from the response is treated as lane_died — the
+# unmatched expectation IS the signal (§2.7).
+_ALIVE_STATES = frozenset({"running", "pending"})
+
+
+def _reconcile_lane_death() -> dict:
+    """Reconciler entry point — enumerate open expectations, check each one
+    against live EC2 state, page on death or deadline exceedance.
+
+    Returns a small record for the Lambda response payload (so the schedule
+    invocation has a visible result, mirroring every other mode's return)."""
+    now = datetime.now(ZoneInfo("UTC"))
+
+    # Scan TODAY and YESTERDAY. The ledger is date-partitioned and a lane can
+    # easily outlive the partition it was registered in — a box launched at
+    # 23:50 UTC that dies at 00:10 has its expectation filed under yesterday.
+    # Scanning only today leaves a blind window every single day, in which the
+    # reconciler reports "0 open expectations" and looks perfectly healthy
+    # (§2.4: the absence of a signal must never read as a benign signal).
+    # Two days is sufficient because the lane budget is 6h; widen this if that
+    # budget ever exceeds 24h.
+    scan_days = [
+        (now - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in (0, 1)
+    ]
+
+    s3 = boto3.client("s3", region_name=REGION)
+    ec2 = boto3.client("ec2", region_name=REGION)
+
+    # 1. Collect open expectations — ledger entries with no completion marker.
+    open_expectations: list[dict] = []
+    seen_tokens: set[str] = set()
+    paginator = s3.get_paginator("list_objects_v2")
+    for day in scan_days:
+        ledger_prefix = f"{_DISPATCH_LEDGER_PREFIX}/{day}/"
+        for page in paginator.paginate(Bucket=_RESEARCH_BUCKET, Prefix=ledger_prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                run_token = key.rsplit("/", 1)[-1]
+                if not run_token.endswith(".json"):
+                    continue
+                run_token = run_token[:-5]  # strip ".json"
+                if run_token in seen_tokens:
+                    continue  # same token filed under both days — count once
+                completed_key = f"{_RECONCILE_COMPLETED_PREFIX}/{run_token}.json"
+                try:
+                    s3.head_object(Bucket=_RESEARCH_BUCKET, Key=completed_key)
+                    seen_tokens.add(run_token)
+                    continue  # has completion marker — lane completed cleanly
+                except Exception:
+                    pass  # no completion marker — open expectation
+                try:
+                    body_raw = s3.get_object(Bucket=_RESEARCH_BUCKET, Key=key)["Body"].read()
+                    exp = json.loads(body_raw.decode())
+                    exp["_ledger_key"] = key
+                    open_expectations.append(exp)
+                    seen_tokens.add(run_token)
+                except Exception as exc:
+                    logger.warning("reconciler: ledger entry read failed for %s: %s", key, exc)
+
+    if not open_expectations:
+        return {"reconciled": True, "open_expectations": 0, "deaths": 0,
+                "overdue": 0, "checked_at": now.isoformat()}
+
+    # 2. Batch describe-instances for all instance_ids.
+    instance_ids = [e["instance_id"] for e in open_expectations
+                    if e.get("instance_id")]
+    instance_states: dict[str, str] = {}
+    if instance_ids:
+        try:
+            resp = ec2.describe_instances(InstanceIds=instance_ids)
+            for reservation in resp.get("Reservations", []):
+                for inst in reservation.get("Instances", []):
+                    instance_states[inst["InstanceId"]] = inst["State"]["Name"]
+        except Exception as exc:
+            logger.warning("reconciler: describe-instances failed: %s", exc)
+            # Fail-safe: treat ALL as unknown (not dead) — never page on a
+            # broken EC2 API. The next reconciler tick retries.
+            return {"reconciled": True, "open_expectations": len(open_expectations),
+                    "deaths": 0, "overdue": 0, "describe_error": str(exc),
+                    "checked_at": now.isoformat()}
+
+    # 3. Check each expectation.
+    deaths = 0
+    overdue_count = 0
+    sfn = boto3.client("stepfunctions", region_name=REGION)
+    for exp in open_expectations:
+        instance_id = exp.get("instance_id", "")
+        state = instance_states.get(instance_id)
+        page = False
+        reason = ""
+
+        if state is None or state not in _ALIVE_STATES:
+            # Instance not found in describe-instances, or is in a terminal
+            # state (stopped, terminated, shutting-down).
+            page = True
+            reason = f"lane_died: instance {instance_id} is {state or 'absent'} — not in {sorted(_ALIVE_STATES)}"
+        elif exp.get("deadline_utc"):
+            try:
+                deadline = datetime.fromisoformat(exp["deadline_utc"])
+            except (ValueError, TypeError):
+                deadline = None
+            if deadline and now > deadline:
+                page = True
+                reason = f"overdue: instance {instance_id} running past deadline {exp['deadline_utc']}"
+
+        if not page:
+            continue
+
+        if state is None or state not in _ALIVE_STATES:
+            deaths += 1
+        else:
+            overdue_count += 1
+
+        # Page via the cycle notification rail (buzzing, #groom thread).
+        tier_tag = exp.get("tier_tag", "unknown")
+        schedule_label = exp.get("schedule", "unknown")
+        text = (
+            f"🔴 Groom lane DEATH — {reason}\n"
+            f"tier={tier_tag}  schedule={schedule_label}\n"
+            f"run_token={exp.get('run_token')}  instance={instance_id}"
+        )
+        _notify_cycle(
+            text, severity="error",
+            dedup_key=f"{_CYCLE_FLOW_NAME}:lane_death:{exp.get('run_token', '')}",
+            context={"expectation": {k: v for k, v in exp.items()
+                                     if not k.startswith("_")},
+                     "reason": reason, "instance_state": state},
+        )
+
+        # Collapse the SF execution immediately for a dead box — the task
+        # token would otherwise sit outstanding for 6h (the TimeoutSeconds
+        # on the .waitForTaskToken call). send-task-failure routes the SF
+        # into its existing bounded-retry relaunch loop, which is exactly
+        # the correct recovery path.
+        task_token = exp.get("task_token", "")
+        if task_token and (state is None or state not in _ALIVE_STATES):
+            try:
+                sfn.send_task_failure(
+                    taskToken=task_token,
+                    error="LaneDeath",
+                    cause=f"Reconciler detected lane death: {reason}",
+                )
+                logger.info(
+                    "reconciler: send-task-failure for %s (token %s…): %s",
+                    exp.get("run_token", "?"), task_token[:12], reason,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "reconciler: send-task-failure failed for %s (token %s…): %s",
+                    exp.get("run_token", "?"), task_token[:12], exc,
+                )
+
+    return {"reconciled": True, "open_expectations": len(open_expectations),
+            "deaths": deaths, "overdue": overdue_count,
+            "checked_at": now.isoformat()}
 
 
 def _notify_dispatch_ceiling_exhausted(prior: int, ceiling: int, tier_tag: str,
@@ -1024,20 +1450,41 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
     run_token = uuid.uuid4().hex
     # config#3173: record the attempt BEFORE the launch fires (mirrors the
     # sf-watch watch-log timing) so a launch that itself fails/raises still
-    # consumes ceiling budget — see _write_dispatch_ledger_entry.
-    _write_dispatch_ledger_entry(run_token, tier_tag, schedule_label)
-    instance_id, market = _launch_instance(force_on_demand=force_on_demand)
-    logger.info("launched groom box %s (%s)", instance_id, market)
-    # config#1979: tag the box with its lane (tier, or 'sweep' — config#2201)
-    # so the NEXT trigger's guard check (above) can find it. Best-effort — a
-    # tag-write failure must not abort an already-launched box (mirrors the
-    # fail-safe posture of the check itself).
+    # consumes ceiling budget. Best-effort: a pre-launch ledger-write
+    # failure must never block the launch it's recording.
     try:
-        boto3.client("ec2", region_name=REGION).create_tags(
-            Resources=[instance_id], Tags=[{"Key": GROOM_TIER_TAG_KEY, "Value": tier_tag}])
-    except Exception as exc:  # noqa: BLE001 — non-fatal, mirrors _running_tier_instance_ids
-        logger.warning("groom-issue-filter tag write failed (non-fatal): %s: %s",
-                       type(exc).__name__, exc)
+        _write_dispatch_ledger_entry(run_token, tier_tag, schedule_label)
+    except Exception as exc:
+        logger.warning("dispatch ledger pre-launch write failed (non-fatal): %s", exc)
+
+    instance_id, market = _launch_instance(force_on_demand=force_on_demand,
+                                           tier_tag=tier_tag)
+    logger.info("launched groom box %s (%s)", instance_id, market)
+
+    # config#5303: the load-bearing groom-issue-filter tag is now passed as
+    # extra_tags on the RunInstances call itself (see _launch_instance), not
+    # applied via a post-launch create_tags — so the tag is ATOMIC with launch
+    # and visible in CloudTrail RunInstances events for the full 90-day
+    # retention window. No post-launch tagging step remains to retry or fail.
+
+    # config-I5229 (lane-death pager): the expectation record is written AFTER
+    # the EC2 launch (so instance_id is known) but BEFORE the SSM bootstrap.
+    # The deadline is set to now + MAX_RUNTIME_SECONDS, matching the box's own
+    # watchdog. The write is FAIL-LOUD: a failed ledger write means the
+    # reconciler can never detect this lane's death, which IS a paging
+    # condition per groom-sweep-policy §2.7. On failure we terminate the
+    # just-launched box (no orphaned instance) and raise.
+    deadline_utc = (datetime.now(ZoneInfo("UTC")) + timedelta(seconds=MAX_RUNTIME_SECONDS)).isoformat()
+    try:
+        _write_dispatch_ledger_entry(
+            run_token, tier_tag, schedule_label,
+            instance_id=instance_id, deadline_utc=deadline_utc,
+            task_token=task_token,
+        )
+    except Exception:
+        logger.exception(_LEDGER_WRITE_FAILED_MSG)
+        _terminate_instance(instance_id)
+        raise
     # Once the box is up, ANY failure before the bootstrap command is delivered
     # would orphan it (no watchdog/trap yet). Terminate-on-error so a slow
     # SSM-online, an SSM SendCommand error, etc. tears the box down instead of
@@ -1791,6 +2238,12 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         # for the same reason — no live schedule or other caller sets a
         # top-level `mode`, so this cannot collide with any shape below.
         return _handle_cycle_complete(event)
+    if event.get("mode") == "reconcile":
+        # config-I5229 (lane-death pager): EventBridge Scheduler (~5 min
+        # cadence) invokes this mode to screen open expectations against
+        # live EC2 state. No other caller sets a top-level `mode`, so this
+        # cannot collide with any other invocation shape.
+        return _reconcile_lane_death()
     run_mode = _resolve_run_mode(event)
     model = _resolve_model(event)
     issue_filter = _resolve_issue_filter(event)
@@ -1821,6 +2274,39 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     queue_manifest_key = str(event.get("queue_manifest_key") or "")
     if queue_manifest_key and not re.fullmatch(r"[A-Za-z0-9._/-]{1,512}", queue_manifest_key):
         raise ValueError(f"invalid queue_manifest_key: {queue_manifest_key!r}")
+
+    # ── Cycle singleton (alpha-engine-config-I5371) ───────────────────────────
+    # Checked on the DECIDE phase only, and BEFORE enumeration: a skipped cycle
+    # must cost zero GitHub calls, not a full backlog walk we then discard.
+    #
+    # Deliberately NOT applied to `launch_decided`: that shape is a per-lane
+    # launch *within* an already-decided cycle (including the SF's bounded
+    # relaunch retries and the unconditional end-of-SF sweep). Blocking it here
+    # would let the singleton guard cancel the surviving cycle's own lanes —
+    # the opposite of what it is for. Lane-level concurrency stays owned by the
+    # config#1979 tag guard in `_launch_groom_spot`.
+    if event.get("decide_only"):
+        execution_arn = str(event.get("executionArn") or "")
+        try:
+            blockers = _concurrent_cycle_blockers(execution_arn)
+        except ConcurrentCycleError as exc:
+            # Fail CLOSED with a NAMED reason (§2.4: never a silent residual).
+            logger.error("cycle-singleton probe INDETERMINATE — skipping this "
+                         "cycle rather than risking a concurrent one: %s", exc)
+            _notify_concurrent_cycle_skip(
+                [{"name": f"<probe failed: {exc}>"}], schedule_label, execution_arn)
+            return _decide_result(
+                {"launches": [], "reason": "concurrent_cycle_probe_failed",
+                 "detail": str(exc)}, schedule_label)
+        if blockers:
+            names = [str(b.get("name") or b.get("executionArn")) for b in blockers]
+            logger.warning(
+                "cycle singleton: %d earlier dispatch cycle(s) still RUNNING (%s) "
+                "— skipping this cycle's enumeration entirely", len(blockers), names)
+            _notify_concurrent_cycle_skip(blockers, schedule_label, execution_arn)
+            return _decide_result(
+                {"launches": [], "reason": "concurrent_cycle_skip",
+                 "blocking_executions": names}, schedule_label)
 
     if event.get("launch_decided"):
         # config#2129: a decide_only call (or the SF's bounded-relaunch loop
