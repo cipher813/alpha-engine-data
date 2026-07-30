@@ -165,8 +165,78 @@ for label in "${!WATCH_PLANE_FUNCTIONS[@]}"; do
   done
 done
 
+# --- 2b. Invocation-floor alarms for liveness probes (alpha-engine-config#5567) -
+# Every liveness-probe alarm in the fleet watches Errors or Throttles with
+# TreatMissingData=notBreaching. This means a probe that STOPS BEING INVOKED
+# (schedule disabled, scheduler role permission lost, Lambda deleted, EventBridge
+# target detached) produces no Errors datapoints, same as a healthy probe, and
+# the alarm stays OK indefinitely. The invocation-floor alarm closes that gap.
+#
+# The existing Errors/Throttles alarms detect a probe that runs AND FAILS.
+# These Invocation alarms detect a probe that NEVER RUNS — absence-of-signal
+# as the alarm condition itself (TreatMissingData=breaching, the inverse of the
+# error alarms above).
+#
+# Window sized to the liveness probes' 2x/day schedule (fixed UTC times):
+# Period=3600 (1h), EvaluationPeriods=12, Statistic=Sum, Threshold=1 — at least
+# 1 invocation in any 12-hour window. Missing data (the probe never ran) treats
+# every period as breaching (Sum=0), firing the alarm when the probe misses an
+# entire 12-hour window.
+#
+# Metric semantics: AWS/Lambda emits Invocations datapoints for every
+# invocation. Missing data here means NO invocations — exactly the condition
+# being detected. TreatMissingData=breaching is mandatory; notBreaching would
+# reproduce the defect being fixed.
+#
+# Lambdas whose names contain "liveness-probe" get both an Invocation-floor
+# alarm HERE and their Errors/Throttles alarms (from the per-Lambda loop
+# above). Both are intentional — detecting a failed run AND a never-ran probe
+# are distinct failure modes that need distinct alarms.
+
 echo ""
-echo "Done — $(( ${#WATCH_PLANE_FUNCTIONS[@]} * 2 )) watch-plane alarms upserted, routed to $BACKSTOP_TOPIC_ARN."
+echo "==> Creating per-liveness-probe Invocation-floor alarms..."
+for label in "${!WATCH_PLANE_FUNCTIONS[@]}"; do
+  fn_name="${WATCH_PLANE_FUNCTIONS[$label]}"
+
+  # Only liveness probes need Invocation-floor alarms — other watch-plane
+  # Lambdas (dispatchers, gates, sentinels) are event-driven; their expected
+  # invocation rate depends on fleet activity, not a fixed schedule.
+  if [[ "$label" != *"liveness-probe"* ]]; then
+    continue
+  fi
+
+  alarm_name="alpha-engine-watch-plane-${label}-invocations"
+  echo "  -> $alarm_name (FunctionName=$fn_name)"
+
+  run aws cloudwatch put-metric-alarm \
+    --region "$REGION" \
+    --alarm-name "$alarm_name" \
+    --alarm-description "Liveness-probe Invocation-floor alarm: fires when ${fn_name} has zero invocations in a 12-hour window — the probe stopped running, not just running and failing (alpha-engine-config#5567). TreatMissingData=breaching: absence of Invocations IS the alarm condition. Provisioned by infrastructure/setup_watch_plane_alarms.sh." \
+    --namespace "AWS/Lambda" \
+    --metric-name "Invocations" \
+    --dimensions "Name=FunctionName,Value=${fn_name}" \
+    --statistic "Sum" \
+    --period 3600 \
+    --evaluation-periods 12 \
+    --datapoints-to-alarm 12 \
+    --threshold 1 \
+    --comparison-operator "LessThanThreshold" \
+    --treat-missing-data "breaching" \
+    --alarm-actions "$BACKSTOP_TOPIC_ARN" \
+    --ok-actions "$BACKSTOP_TOPIC_ARN" >/dev/null
+done
+
+# ── Re-examination of notBreathing on error/throttle alarms (alpha-engine-
+# config#5567 deliverable 2). For a metric (Errors, Throttles) that only emits
+# on failure, TreatMissingData=notBreaching is the correct setting: missing
+# datapoints mean "no failures," which IS the healthy state. The gap closed
+# here is not that Error/Throttle alarms need different TreatMissingData — it
+# is that THE LIVENESS DIMENSION (invocations) had no alarm at all. The
+# invocation-floor alarms above now cover that dimension. Decision recorded
+# rather than left implicit.
+
+echo ""
+echo "Done — $(( ${#WATCH_PLANE_FUNCTIONS[@]} * 2 )) watch-plane Errors/Throttles alarms + $(for l in "${!WATCH_PLANE_FUNCTIONS[@]}"; do [[ "$l" == *"liveness-probe"* ]] && echo 1; done | wc -l) Invocation-floor alarms upserted, routed to $BACKSTOP_TOPIC_ARN."
 echo ""
 echo "Validation:"
 echo "  aws cloudwatch describe-alarms --region $REGION \\"
