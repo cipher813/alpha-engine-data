@@ -5,7 +5,8 @@ Phase 1 (before research): constituents, prices, macro, universe returns.
 Phase 2 (after research): alternative data for promoted tickers.
 
 Phase 1 runs on EC2 via SSM RunCommand (price refresh takes 15-25 min).
-Phase 2 runs as Lambda (< 10 min for ~30 tickers).
+Phase 2 runs as Lambda (concurrent ThreadPoolExecutor, ~3-5 min for
+900+ tickers; timeout=900s).
 
 Usage:
     python weekly_collector.py --phase 1              # Phase 1 only
@@ -74,6 +75,7 @@ from nousergon_lib.phase_registry import PhaseRegistry
 # lift of the five inline _find_config / load_config / config_loader copies into
 # the shared-lib chokepoint. load_config below delegates to it.
 from nousergon_lib.config import resolve_experiment_config
+from nousergon_lib.yfinance_quiet import quiet_yfinance
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = str(Path(__file__).parent / "flow-doctor.yaml")
 setup_logging(
@@ -1275,19 +1277,20 @@ def _self_heal_chronic_polygon_gaps(
             )
             end_excl = target_ts + _pd.Timedelta(days=1)
 
-            yf_df = _yf.download(
-                ticker,
-                start=start_ts.strftime("%Y-%m-%d"),
-                end=end_excl.strftime("%Y-%m-%d"),
-                progress=False,
-                auto_adjust=True,
-                # Bound the network call so a hung yfinance fetch can't stall
-                # the heal indefinitely. The 2026-06-11 incident was an
-                # unbounded yf.download here; the SF state isolation is the
-                # primary fix, this is defence-in-depth so a single ticker's
-                # stall is capped rather than eating the whole state timeout.
-                timeout=30,
-            )
+            with quiet_yfinance():
+                yf_df = _yf.download(
+                    ticker,
+                    start=start_ts.strftime("%Y-%m-%d"),
+                    end=end_excl.strftime("%Y-%m-%d"),
+                    progress=False,
+                    auto_adjust=True,
+                    # Bound the network call so a hung yfinance fetch can't stall
+                    # the heal indefinitely. The 2026-06-11 incident was an
+                    # unbounded yf.download here; the SF state isolation is the
+                    # primary fix, this is defence-in-depth so a single ticker's
+                    # stall is capped rather than eating the whole state timeout.
+                    timeout=30,
+                )
             if isinstance(yf_df.columns, _pd.MultiIndex):
                 yf_df.columns = yf_df.columns.get_level_values(0)
 

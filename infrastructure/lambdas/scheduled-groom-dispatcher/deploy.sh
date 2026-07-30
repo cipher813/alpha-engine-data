@@ -23,6 +23,21 @@
 # Lambda) + ssm:GetCommandInvocation (to poll) + sns:Publish (to alert on
 # failure) — it never touches secrets or launches anything itself.
 #
+# alpha-engine-config-I5371 adds one further grant: states:ListExecutions,
+# scoped to the alpha-engine-groom-dispatch state machine ONLY. The decide phase
+# uses it to enforce a CYCLE SINGLETON — it lists RUNNING siblings of its own
+# execution and skips when an earlier cycle is still alive. Read-only, and the
+# narrowest resource scope the API allows.
+#
+# That grant is LOAD-BEARING FOR AVAILABILITY, not just correctness:
+# _concurrent_cycle_blockers() fails CLOSED, so an AccessDenied is treated as
+# "cannot establish singleton" and skips the cycle. A deploy that ships the code
+# without the policy therefore stops ALL grooming, silently, until the grant
+# lands. Run `deploy.sh --apply-iam` BEFORE (or with) any deploy that first
+# introduces it — the GHA auto-deploy OIDC role deliberately lacks
+# iam:PutRolePolicy (fleet single-writer rule), so a code-only deploy cannot
+# apply it for you.
+#
 # Cadence (UTC). Three symmetric demand-all triggers per day + Sunday extra slot.
 # Each trigger evaluates the FULL backlog and launches 0..3 tier boxes via
 # decide_trigger / _primary_backend_for. All tiers route through DeepSeek primary.
@@ -353,6 +368,128 @@ EOF
       aws scheduler get-schedule --name "${name}" --region "${REGION}" \
         --query 'Name' --output text >/dev/null \
         || { echo "ERROR: Scheduler rule ${name} not found after create/update" >&2; exit 1; }
+    fi
+  done
+
+  # --- 2e-bis. The lane-death reconciler rule (alpha-engine-config-I5229).
+  #
+  # Deliberately NOT in SCHED_NAMES: every rule there targets the STEP FUNCTION
+  # and starts a dispatch cycle. This one targets the LAMBDA directly with
+  # {"mode":"reconcile"} and must never start a cycle. It also sits outside
+  # SCHED_PREFIX so step 2f's prune reconciliation does not delete it.
+  #
+  # Why it must exist at all: groom-sweep-policy §2.7 makes the reconciler the
+  # property the others depend on, and §2.2 holds that a recovery path which has
+  # never executed is presumed broken. A reconciler with no trigger is exactly
+  # that — the code merges, the tests pass, and nothing ever runs it. Every
+  # 5 minutes is well inside the ~6h lane budget it is watching and costs one
+  # short Lambda invocation.
+  RECON_SCHED_NAME="alpha-engine-groom-lane-reconciler-5min"
+  RECON_SCHED_CRON="rate(5 minutes)"
+  # Built with python3, NOT a heredoc. In an unquoted heredoc bash unescapes
+  # only \$, \`, \\ and \<newline> — a backslash before a double quote is
+  # PRESERVED. So `\\\"` emitted `\\"` rather than `\"`, and every
+  # create-schedule call died on `Invalid JSON: Expecting ',' delimiter`.
+  # Counting backslashes through two layers of quoting is not a thing to get
+  # right by inspection; json.dumps cannot get it wrong.
+  recon_target=$(python3 -c 'import json,sys; print(json.dumps({"Arn": sys.argv[1], "RoleArn": sys.argv[2], "Input": json.dumps({"mode": "reconcile"})}))' "${FN_ARN}" "${SCHED_ROLE_ARN}")
+  echo "  Applying Scheduler invoke-Lambda policy for the reconciler"
+  run aws iam put-role-policy \
+    --role-name "${SCHED_ROLE_NAME}" \
+    --policy-name "${SCHED_POLICY_NAME}-recon-invoke" \
+    --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"lambda:InvokeFunction\"],\"Resource\":\"${FN_ARN}\"}]}"
+
+  if aws scheduler get-schedule --name "${RECON_SCHED_NAME}" --region "${REGION}" \
+      --query 'Name' --output text >/dev/null 2>&1; then
+    echo "  Updating reconciler rule: ${RECON_SCHED_NAME} → ${RECON_SCHED_CRON}"
+    run aws scheduler update-schedule \
+      --name "${RECON_SCHED_NAME}" \
+      --schedule-expression "${RECON_SCHED_CRON}" \
+      --flexible-time-window '{"Mode":"OFF"}' \
+      --target "${recon_target}" \
+      --region "${REGION}" \
+      --query 'ScheduleArn' --output text
+  else
+    echo "  Creating reconciler rule: ${RECON_SCHED_NAME} → ${RECON_SCHED_CRON}"
+    run aws scheduler create-schedule \
+      --name "${RECON_SCHED_NAME}" \
+      --schedule-expression "${RECON_SCHED_CRON}" \
+      --flexible-time-window '{"Mode":"OFF"}' \
+      --target "${recon_target}" \
+      --region "${REGION}" \
+      --query 'ScheduleArn' --output text
+  fi
+  if ! $DRY_RUN; then
+    aws scheduler get-schedule --name "${RECON_SCHED_NAME}" --region "${REGION}" \
+      --query 'Name' --output text >/dev/null \
+      || { echo "ERROR: reconciler rule ${RECON_SCHED_NAME} not found after create/update" >&2; exit 1; }
+  fi
+
+  # --- 2e-ter. INDEPENDENT sweep schedules (Brian's ruling 2026-07-30).
+  #
+  # Until now the PR sweep ran only as DispatchEndOfSfSweep, the last state of
+  # the groom cycle — so sweep frequency was hostage to groom health. That is
+  # not theoretical: on 2026-07-30 two of three cycles ended in
+  # `concurrent_cycle_skip`, and the sweep did not run on either. The sweep has
+  # no dependency on groom OUTPUT (it classifies open PRs), so the coupling
+  # bought nothing.
+  #
+  # These rules give it its own trigger, interleaved 4h after each groom:
+  #
+  #   groom  04:00 12:00 20:00 UTC   (9pm / 5am / 1pm PT — unchanged)
+  #   sweep  00:00 08:00 16:00 UTC   (5pm / 1am / 9am PT)
+  #
+  # DispatchEndOfSfSweep is deliberately KEPT. groom-sweep-policy §2.5 makes it
+  # the unconditional tail-catcher — "making it conditional on groom success
+  # starves it exactly when it is most needed" — and removing it is an
+  # orchestration change requiring a policy amendment, not a schedule tweak.
+  # Keeping both yields a sweep roughly every 4h at one cheap box per run.
+  #
+  # Collisions are already handled: the dispatcher tags sweep boxes
+  # `groom-issue-filter=sweep`, distinct from every groom tier tag, so the
+  # config#1979 concurrent guard skips when a prior sweep box is still live.
+  #
+  # NAMED OUTSIDE SCHED_PREFIX on purpose. Step 2f prunes any live rule under
+  # `alpha-engine-scheduled-groom-` that is absent from SCHED_NAMES, and
+  # SCHED_NAMES entries target the STEP FUNCTION (a full groom cycle). These
+  # target the LAMBDA with run_mode=sweep, so a shared prefix would have them
+  # deleted on the next deploy.
+  SWEEP_SCHED_NAMES=(
+    "alpha-engine-groom-sweep-0000-daily"
+    "alpha-engine-groom-sweep-0800-daily"
+    "alpha-engine-groom-sweep-1600-daily"
+  )
+  SWEEP_SCHED_CRONS=(
+    "cron(0 0 * * ? *)"
+    "cron(0 8 * * ? *)"
+    "cron(0 16 * * ? *)"
+  )
+  # Mirrors the DispatchEndOfSfSweep payload in step_function_groom.json:
+  # a literal launch_decided sweep event. `issue_filter` is inert for
+  # run_mode=sweep but the launch path validates it, so it is passed
+  # explicitly rather than defaulted.
+  for i in "${!SWEEP_SCHED_NAMES[@]}"; do
+    sname="${SWEEP_SCHED_NAMES[$i]}"
+    scron="${SWEEP_SCHED_CRONS[$i]}"
+    sweep_target=$(python3 -c 'import json,sys; print(json.dumps({"Arn": sys.argv[1], "RoleArn": sys.argv[2], "Input": json.dumps({"run_mode": "sweep", "launch_decided": True, "model": "deepseek-v4-flash", "issue_filter": "mid-only", "schedule": sys.argv[3]})}))' "${FN_ARN}" "${SCHED_ROLE_ARN}" "${sname}")
+    if aws scheduler get-schedule --name "${sname}" --region "${REGION}" \
+        --query 'Name' --output text >/dev/null 2>&1; then
+      echo "  Updating sweep rule: ${sname} → ${scron}"
+      run aws scheduler update-schedule --name "${sname}" \
+        --schedule-expression "${scron}" --schedule-expression-timezone "UTC" \
+        --flexible-time-window '{"Mode":"OFF"}' --target "${sweep_target}" \
+        --region "${REGION}" --query 'ScheduleArn' --output text
+    else
+      echo "  Creating sweep rule: ${sname} → ${scron}"
+      run aws scheduler create-schedule --name "${sname}" \
+        --schedule-expression "${scron}" --schedule-expression-timezone "UTC" \
+        --flexible-time-window '{"Mode":"OFF"}' --target "${sweep_target}" \
+        --region "${REGION}" --query 'ScheduleArn' --output text
+    fi
+    if ! $DRY_RUN; then
+      aws scheduler get-schedule --name "${sname}" --region "${REGION}" \
+        --query 'Name' --output text >/dev/null \
+        || { echo "ERROR: sweep rule ${sname} not found after create/update" >&2; exit 1; }
     fi
   done
 

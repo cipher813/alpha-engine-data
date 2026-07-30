@@ -2,10 +2,11 @@
 
 Companion to test_sf_completion_marker_wiring.py (Saturday) and
 test_sf_completion_marker_wiring_daily.py (preopen). config-I2702 deliverable
-#4 deliberately keeps NormalSucceeded/DegradedSucceeded as two distinct named
-terminals (visible in the SF console/notifications) — so unlike the other two
-SFs, this one writes the marker TWICE (once per outcome) rather than
-converging both paths onto one shared marker state.
+#4 + Brian's 2026-07-28 Option-A ruling (alpha-engine-config#2699) keeps the
+degraded path as a distinct Fail terminal (DegradedRun), visible to all
+status-keyed watchers — so unlike the other two SFs, this one writes the
+marker TWICE (once per outcome) rather than converging both paths onto one
+shared marker state.
 """
 
 from __future__ import annotations
@@ -25,13 +26,13 @@ def eod_states():
 
 
 @pytest.mark.parametrize(
-    "marker_name,succeed_target",
+    "marker_name,terminal_target",
     [
         ("WriteCompletionMarkerNormal", "NormalSucceeded"),
-        ("WriteCompletionMarkerDegraded", "DegradedSucceeded"),
+        ("WriteCompletionMarkerDegraded", "DegradedRun"),
     ],
 )
-def test_marker_state_shape(eod_states, marker_name, succeed_target):
+def test_marker_state_shape(eod_states, marker_name, terminal_target):
     st = eod_states[marker_name]
     assert st["Type"] == "Task"
     assert st["Resource"] == "arn:aws:states:::aws-sdk:s3:putObject"
@@ -41,7 +42,7 @@ def test_marker_state_shape(eod_states, marker_name, succeed_target):
     body = st["Parameters"]["Body.$"]
     assert "ne-postclose-trading-pipeline" in body
     assert "$$.Execution.Id" in body
-    assert st["Next"] == succeed_target
+    assert st["Next"] == terminal_target
     assert "Catch" not in st
     (retry,) = st["Retry"]
     assert retry["ErrorEquals"] == ["States.ALL"]
