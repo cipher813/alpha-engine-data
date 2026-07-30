@@ -1253,6 +1253,20 @@ def _write_dispatch_ledger_entry(run_token: str, tier_tag: str, schedule_label: 
 # the same verdict.
 
 _RECONCILE_COMPLETED_PREFIX = "groom/_control/completed"
+
+# Expectations this reconciler has already ACTIONED (paged + send-task-failure).
+# Without it the reconciler re-detects the same dead lane on every 5-minute
+# tick for as long as the ledger entry is in the scan window, and re-pages —
+# which is exactly what Brian saw on 2026-07-30 after the reconciler shipped.
+# The per-run_token dedup key on the notification did NOT hold across
+# invocations, so the fix belongs here, at the source: an actioned expectation
+# is a CLOSED expectation.
+#
+# Deliberately a SEPARATE prefix from `completed/`: that marker means "the box
+# finished its work and said so", and writing a death into it would make a
+# reclaimed lane indistinguishable from a successful one to every other
+# consumer of that prefix.
+_RECONCILE_ACTIONED_PREFIX = "groom/_control/reconciled"
 # describe-instances returns terminated instances for only ~1h (AWS docs).
 # An instance absent from the response is treated as lane_died — the
 # unmatched expectation IS the signal (§2.7).
@@ -1297,6 +1311,14 @@ def _reconcile_lane_death() -> dict:
                 run_token = run_token[:-5]  # strip ".json"
                 if run_token in seen_tokens:
                     continue  # same token filed under both days — count once
+                # Already actioned by a previous tick — closed, not open.
+                actioned_key = f"{_RECONCILE_ACTIONED_PREFIX}/{run_token}.json"
+                try:
+                    s3.head_object(Bucket=_RESEARCH_BUCKET, Key=actioned_key)
+                    seen_tokens.add(run_token)
+                    continue
+                except Exception:
+                    pass
                 completed_key = f"{_RECONCILE_COMPLETED_PREFIX}/{run_token}.json"
                 try:
                     s3.head_object(Bucket=_RESEARCH_BUCKET, Key=completed_key)
@@ -1382,6 +1404,29 @@ def _reconcile_lane_death() -> dict:
                                      if not k.startswith("_")},
                      "reason": reason, "instance_state": state},
         )
+
+        # Close the expectation BEFORE the send-task-failure below. Ordering is
+        # deliberate: if the marker write fails we must not have already paged
+        # AND actioned without a record, and if send-task-failure fails the
+        # expectation is still closed — the page has been delivered, and
+        # re-paging every 5 minutes forever is strictly worse than one missed
+        # SF collapse (which the 6h TimeoutSeconds still covers).
+        try:
+            boto3.client("s3", region_name=REGION).put_object(
+                Bucket=_RESEARCH_BUCKET,
+                Key=f"{_RECONCILE_ACTIONED_PREFIX}/{exp.get('run_token', '')}.json",
+                Body=json.dumps({
+                    "outcome": "lane_died" if state not in _ALIVE_STATES else "overdue",
+                    "reason": reason,
+                    "instance_id": instance_id,
+                    "instance_state": state,
+                    "actioned_at": now.isoformat(),
+                }).encode(),
+                ContentType="application/json")
+        except Exception as exc:  # noqa: BLE001 — see ordering note above
+            logger.warning(
+                "reconciler: could not close expectation %s (will re-page next "
+                "tick): %s", exp.get("run_token"), exc)
 
         # Collapse the SF execution immediately for a dead box — the task
         # token would otherwise sit outstanding for 6h (the TimeoutSeconds
