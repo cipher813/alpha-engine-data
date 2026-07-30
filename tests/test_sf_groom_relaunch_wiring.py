@@ -232,3 +232,53 @@ def test_task_token_travels_inside_the_lambda_payload(states):
 def test_wait_for_task_token_resource_still_declared(states):
     """The token plumbing above is only meaningful with the callback integration."""
     assert states["LaunchGroomSpot"]["Resource"].endswith(".waitForTaskToken")
+
+
+# ── I5229 regression: fast detection must ACCELERATE recovery, not replace it ──
+
+
+def _lane_state():
+    import json
+    from pathlib import Path
+    d = json.loads((Path(__file__).resolve().parents[1]
+                    / "infrastructure" / "step_function_groom.json").read_text())
+    m = [v for v in d["States"].values() if v.get("Type") == "Map"][0]
+    return ((m.get("ItemProcessor") or m.get("Iterator"))["States"]
+            ["LaunchGroomSpot"])
+
+
+def test_lane_death_routes_to_the_relaunch_path_not_the_terminal_one():
+    """The reconciler must not convert a recoverable death into a dead lane.
+
+    The lane reconciler sends send-task-failure(error="LaneDeath") within ~5
+    minutes of a box dying. Before this Catch entry existed that failure fell
+    through to States.ALL -> HandleFailure, which is TERMINAL — so shipping the
+    reconciler made recovery strictly WORSE: a spot reclaim used to recover via
+    States.Timeout -> CheckCompletionMarkerTaskToken -> relaunch (3 attempts,
+    the last forced to on-demand), and instead failed permanently.
+
+    Measured live, 2026-07-30 20:00 UTC: all three lanes reclaimed for spot
+    capacity, `LaunchGroomSpot` visited exactly 3 times (once per lane), zero
+    visits to CheckCompletionMarkerTaskToken or PrepRelaunch.
+    """
+    catches = _lane_state()["Catch"]
+    routes = {tuple(c["ErrorEquals"]): c["Next"] for c in catches}
+    assert ("LaneDeath",) in routes, (
+        "no Catch for the reconciler's LaneDeath error — a detected lane death "
+        "falls to States.ALL and the lane never relaunches"
+    )
+    timeout_target = routes[("States.Timeout",)]
+    assert routes[("LaneDeath",)] == timeout_target, (
+        "LaneDeath must route to the SAME state as States.Timeout "
+        f"({timeout_target}) — fast detection should accelerate the existing "
+        "recovery, never bypass it"
+    )
+
+
+def test_lane_death_catch_precedes_the_catch_all():
+    """Order matters: States.ALL first would make the LaneDeath entry dead."""
+    catches = _lane_state()["Catch"]
+    order = [tuple(c["ErrorEquals"]) for c in catches]
+    assert order.index(("LaneDeath",)) < order.index(("States.ALL",)), (
+        "the LaneDeath Catch sits after States.ALL and is therefore unreachable"
+    )
