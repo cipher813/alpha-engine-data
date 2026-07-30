@@ -53,17 +53,34 @@ jobs:
       - name: Guard the staging derivation (no credentials needed)
         run: pip install --quiet pytest && python -m pytest tests/test_fault_injection_staging.py -q
 
+      # The full programme needs AWS and therefore only runs on the SCHEDULE
+      # (and on demand) — not on pull_request. Two reasons, and the second is
+      # the load-bearing one:
+      #
+      #   1. A PR from a fork cannot hold OIDC credentials, so a credentialed
+      #      step there is unrunnable by construction.
+      #   2. §10.2's gate is the WEEKLY programme. Making every PR block on it
+      #      would mean the first missing role or expired credential turns a
+      #      standing gate into a thing people disable — which is precisely how
+      #      an exercise programme dies.
+      #
+      # The derivation tests above DO run on every PR without credentials, so
+      # the two dangerous swaps (production Lambda, production SNS topic) stay
+      # guarded on the path that actually changes them.
       - name: Configure AWS credentials
         id: creds
+        if: github.event_name != 'pull_request'
         continue-on-error: true
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::711398986525:role/github-actions-fault-injection
           aws-region: us-east-1
 
-      # §2.4 no-silent-caps: if credentials are unavailable the gate reports
-      # UNVERIFIED and fails, rather than passing on a run that never happened.
+      # §2.4 no-silent-caps: on the scheduled run, unavailable credentials mean
+      # every failure mode is UNVERIFIED, and the gate FAILS rather than passing
+      # on an exercise that did not happen.
       - name: Run the injection programme
+        if: github.event_name != 'pull_request'
         run: |
           if [ "${{ steps.creds.outcome }}" != "success" ]; then
             echo "::error::AWS credentials unavailable — the injection programme did NOT run."
