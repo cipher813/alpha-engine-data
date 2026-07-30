@@ -32,6 +32,7 @@ playbooks:
     tier: T2
     routed: true
     enabled: true
+    execution_surface: spot
     # config-I3293 — model/wake/cadence are REGISTRY-DECLARED (this file is
     # the one place that answers "what model runs this agent, what wakes it,
     # on what cadence"). `model` is LIVE config, not documentation: the
@@ -210,9 +211,19 @@ playbooks:
         # MAX_RUNTIME_SECONDS=10800 (180m) + boot/report margin = 210m ceiling;
         # margin beyond the ceiling is 30m. The 4x-daily schedule mirrors the
         # four EventBridge Scheduler names in watch_plane_liveness.
+        #
+        # run_start_field: the drain ledger keys its start timestamp
+        # `started_at`; the groom artifact this check was ported from uses
+        # `run_start`. Reading groom's name against the drain's schema found
+        # nothing, and the reader skipped past every ledger silently, so all
+        # four daily triggers were reported as silent deaths while the drain
+        # was running normally (false pages 2026-07-29). The reader now RAISES
+        # on a missing declared field. Retire this key when G16
+        # (alpha-engine-config-I5284) gives every playbook one artifact schema.
         - type: run_window
           label: alert-drain
           artifact_prefix: overseer/drain_ledger/
+          run_start_field: started_at
           ceiling_min: 210
           margin_min: 30
           lookback_hours: 30
@@ -543,9 +554,8 @@ alert_classes:
     intake: bus
     response: drain-queue
   - class: backtester_champion_promotion
-    # NOTE stale 'crucible-backtester/' prefix in the emitter literal —
-    # config-I3302 renames it; row updated when that lands.
-    source: "crucible-backtester/optimizer/champion_promotion.py::run_weekly_evaluation"
+    # I3302 rename complete: code now emits the canonical alpha-engine-backtester/ prefix.
+    source: "alpha-engine-backtester/optimizer/champion_promotion.py::run_weekly_evaluation"
     severities: [error]
     intake: bus
     response: drain-queue
@@ -584,6 +594,13 @@ alert_classes:
   - class: predictor_observe_calibration
     source: "predictor.inference.observe_calibration"
     severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: deploy_notification_predictor
+    # config#3305 static-chokepoint registration: predictor deploy scripts
+    # that call ``krepis.alerts publish --source <path>/deploy.sh``.
+    source: "alpha-engine-predictor/infrastructure/deploy.sh"
+    severities: [error]
     intake: bus
     response: drain-queue
 
@@ -628,6 +645,16 @@ alert_classes:
     severities: [warning]
     intake: bus
     response: drain-queue
+  - class: research_experiment_record_alerts
+    source: "research:experiment_record"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: research_thinktank_daily_alerts
+    source: "research:thinktank_daily"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
   - class: research_signals_envelope_rejected
     # NOTE: this class emits via ``alerts.publish`` with explicit
     # ``severity="error"`` (not ``publish_observe_alert``), so its
@@ -640,6 +667,28 @@ alert_classes:
   - class: research_signals_envelope_handler_observe_alerts
     source: "signals_envelope_handler:*"
     severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: research_experiment_record
+    # config#3305 static-chokepoint registration: ``publish_observe_alert``
+    # for experiment_record emission failures (secondary observability, never
+    # blocks the shadow signal write itself).
+    source: "research:experiment_record"
+    severities: [info, warning]
+    intake: bus
+    response: drain-queue
+  - class: research_thinktank_daily
+    # config#3305 static-chokepoint registration: thinktank daily run outcome
+    # notification (DEGRADED/ok — secondary observability, not a gating check).
+    source: "research:thinktank_daily"
+    severities: [info, warning]
+    intake: bus
+    response: drain-queue
+  - class: deploy_notification_research
+    # config#3305 static-chokepoint registration: research deploy scripts that
+    # call ``krepis.alerts publish --source <path>/deploy.sh``.
+    source: "alpha-engine-research/infrastructure/deploy.sh"
+    severities: [error]
     intake: bus
     response: drain-queue
 
@@ -690,6 +739,20 @@ alert_classes:
   - class: data_sf_definition_drift
     source: "alpha-engine-data/infrastructure/step-functions/check-definition-drift.py"
     severities: [dynamic]
+    intake: bus
+    response: drain-queue
+  - class: deploy_notification_data_plane
+    # config#3305 static-chokepoint registration: data-plane deploy scripts
+    # that call ``krepis.alerts publish --source <path>/deploy.sh``.
+    source: "alpha-engine-data/infrastructure/deploy.sh"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+  - class: deploy_notification_changelog
+    # config#3305 static-chokepoint registration: changelog mirror deploy
+    # script that calls ``krepis.alerts publish``.
+    source: "alpha-engine-data/changelog-incident-mirror/deploy.sh"
+    severities: [error]
     intake: bus
     response: drain-queue
 
