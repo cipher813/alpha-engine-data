@@ -174,29 +174,40 @@ def test_every_write_surface_has_put_object_grant():
 # ── I5229: the reconciler's own grants must match live ARN shapes ────────────
 
 
-def test_send_task_failure_resource_matches_the_real_execution_arn():
-    """The lane reconciler's send_task_failure must actually be permitted.
+def test_send_task_failure_is_unscoped_because_iam_permits_nothing_narrower():
+    """`states:SendTaskFailure` must be granted on `"*"` — narrower is broken.
 
-    Execution ARNs are
-    `arn:aws:states:<region>:<acct>:execution:<STATE_MACHINE_NAME>:<exec>`, and
-    the state machine is `alpha-engine-groom-dispatch`. The grant shipped as
-    `execution:groom-dispatch:*` — missing the `alpha-engine-` prefix — so every
-    send_task_failure would have been AccessDenied and a detected lane death
-    would never have been reported back to the SF. Verified against a live
-    execution ARN 2026-07-30.
+    The action takes a task TOKEN, not a resource, and Step Functions supports
+    NO resource-level permissions for it. Measured 2026-07-30 with
+    `iam simulate-custom-policy`:
+
+        Resource "*"                                        -> allowed
+        Resource "execution:alpha-engine-groom-dispatch:*"   -> implicitDeny
+
+    — and the ARN-scoped result is `implicitDeny` even for the *correct* ARN.
+    So an execution-scoped grant does not restrict the action, it silently
+    DISABLES it, and the reconciler would detect a dead lane and then be denied
+    when reporting it: the one thing the feature exists to do.
+
+    This test exists because the grant shipped as
+    `execution:groom-dispatch:*` (also missing the `alpha-engine-` prefix) and
+    a first attempt to fix it merely corrected the prefix — which would still
+    have been implicitDeny, while a naive fnmatch-based test asserting "the
+    grant matches a real execution ARN" would have PASSED. Assert the thing IAM
+    actually evaluates, not the thing that looks tighter.
+
+    The real bound is the token: a caller can only fail a task whose token it
+    holds, and those tokens are minted by this Lambda's own dispatch path.
     """
-    real_execution_arn = (
-        "arn:aws:states:us-east-1:711398986525:execution:"
-        "alpha-engine-groom-dispatch:476a6a5b-c098-4cfb-8a61-2a240576c2e7"
-    )
-    allowed = any(
-        stmt.get("Effect") == "Allow"
+    unscoped = [
+        stmt for stmt in _statements()
+        if stmt.get("Effect") == "Allow"
         and "states:SendTaskFailure" in _actions(stmt)
-        and any(fnmatch.fnmatch(real_execution_arn, res) for res in _resources(stmt))
-        for stmt in _statements()
-    )
-    assert allowed, (
-        "iam-policy.json grants no states:SendTaskFailure matching a real "
-        f"execution ARN ({real_execution_arn}) — the reconciler can detect a "
-        "dead lane but never tell the Step Function about it."
+        and "*" in _resources(stmt)
+    ]
+    assert unscoped, (
+        'states:SendTaskFailure must be granted with Resource "*" — Step '
+        "Functions supports no resource-level permissions for it, so any ARN "
+        "scoping evaluates implicitDeny and disables the reconciler's only "
+        "means of reporting a dead lane."
     )

@@ -147,7 +147,7 @@
       "Sid": "SendTaskFailureOnLaneDeath",
       "Effect": "Allow",
       "Action": "states:SendTaskFailure",
-      "Resource": "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-groom-dispatch:*"
+      "Resource": "*"
     }
   ]
 }
