@@ -1444,7 +1444,7 @@
             },
             "DataPhase2": {
               "Type": "Task",
-              "Comment": "Phase 2: alternative data for promoted tickers (Lambda). Successor is CheckSkipEvalJudge (post-2026-05-07 reorder) — judge + agent-justification triple run on Research's decision_artifacts/, no dependency on Predictor or Backtester output, so they run before predictor training to land their results in S3 before Evaluator generates the weekly email.",
+              "Comment": "Phase 2: alternative data for promoted tickers (Lambda). Successor is CheckSkipEvalJudge (post-2026-05-07 reorder) — judge + agent-justification triple run on Research's decision_artifacts/, no dependency on Predictor or Backtester output, so they run before predictor training to land their results in S3 before Evaluator generates the weekly email. TimeoutSeconds 900 (2026-07-30, was 600): the concurrent ThreadPoolExecutor in collectors/alternative.py overlaps I/O-bound API calls so the Lambda completes in ~3-5 min for 900+ tickers (was ~30 at original design), but 600 s left zero headroom for a provider degradation. 900 s is the Lambda max standard timeout — the Lambda's own timeout (deploy.sh LAMBDA_TIMEOUT) must move in lockstep.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-data-collector:live",
@@ -1453,7 +1453,7 @@
                   "dry_run.$": "$.data_phase2_dry"
                 }
               },
-              "TimeoutSeconds": 600,
+              "TimeoutSeconds": 900,
               "Retry": [
                 {
                   "ErrorEquals": [
