@@ -711,7 +711,13 @@ def test_launched_instance_gets_tagged_with_its_tier(monkeypatch):
     idx.handler({"run_mode": "full", "issue_filter": "high-only", "schedule": "x"}, None)
     # config#5303: the groom-issue-filter tag now rides the RunInstances call
     # as extra_tags (atomic with launch), not a separate post-launch create_tags.
-    assert extra_tags_captured["value"] == {"groom-issue-filter": "high-only"}
+    # I5727 (nousergon-lib v0.124.23): launch_with_fallback now adds
+    # LaunchMarket/LaunchReason to extra_tags on EVERY launch, so this asserts
+    # the caller's tag survives rather than exact-dict equality — the contract
+    # is "the lane tag rides RunInstances", not "nothing else does".
+    assert extra_tags_captured["value"]["groom-issue-filter"] == "high-only"
+    assert extra_tags_captured["value"]["LaunchMarket"] == "spot"
+    assert extra_tags_captured["value"]["LaunchReason"] == "spot_ok"
 
 
 def test_concurrent_tier_check_fails_safe_and_still_launches(monkeypatch):
@@ -1087,7 +1093,13 @@ def test_sweep_box_tagged_with_distinct_sweep_lane(monkeypatch):
     assert out["groom"]["tier_tag"] == "sweep"
     assert out["groom"]["issue_filter"] == "mid-only"
     # config#5303: sweep lane tag rides the RunInstances call as extra_tags.
-    assert extra_tags_captured["value"] == {"groom-issue-filter": "sweep"}
+    # I5727 (nousergon-lib v0.124.23): launch_with_fallback now adds
+    # LaunchMarket/LaunchReason to extra_tags on EVERY launch, so this asserts
+    # the caller's tag survives rather than exact-dict equality — the contract
+    # is "the lane tag rides RunInstances", not "nothing else does".
+    assert extra_tags_captured["value"]["groom-issue-filter"] == "sweep"
+    assert extra_tags_captured["value"]["LaunchMarket"] == "spot"
+    assert extra_tags_captured["value"]["LaunchReason"] == "spot_ok"
 
 
 def test_sweep_launch_skipped_when_sweep_box_already_live(monkeypatch):
