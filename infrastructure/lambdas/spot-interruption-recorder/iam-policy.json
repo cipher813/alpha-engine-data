@@ -24,16 +24,13 @@
       "Resource": "*"
     },
     {
-      "Sid": "WriteInterruptionAndFallbackSeries",
+      "Sid": "WriteInterruptionSeries",
       "Effect": "Allow",
       "Action": [
         "s3:PutObject",
         "s3:GetObject"
       ],
-      "Resource": [
-        "arn:aws:s3:::alpha-engine-research/overseer/interruptions/*",
-        "arn:aws:s3:::alpha-engine-research/overseer/fallbacks/*"
-      ]
+      "Resource": "arn:aws:s3:::alpha-engine-research/overseer/interruptions/*"
     },
     {
       "Sid": "HeadObjectForIdempotency",
