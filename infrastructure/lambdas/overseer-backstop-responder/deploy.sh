@@ -1,96 +1,231 @@
 #!/usr/bin/env bash
-# deploy.sh — create or update alpha-engine-overseer-backstop-responder and
-# subscribe it to the dumb backstop SNS topic (alpha-engine-config-I4480).
+# deploy.sh — Create or update the alpha-engine-overseer-backstop-responder Lambda
+# and wire its SNS subscription to the backstop alarm topic.
 #
-# WHY (overseer-policy.md §1, §4 inv. 1/3/16, §5 layer D): the backstop topic's
-# only subscriber was an email address, so degradation of the Overseer plane
-# itself terminated in a notification. This Lambda makes that class' response
-# bounded and automatic: report plane state, attempt ONE allowlisted recovery
-# per cooldown window, escalate on the second firing.
+# This Lambda subscribes DIRECTLY to alpha-engine-alarm-backstop SNS topic (not
+# via EventBridge) and:
+#   1. Gathers fleet state (kill-switches, queue depth/age, last ledger, probe state)
+#   2. Attempts ONE bounded recovery per alarm per cooldown window:
+#      - Re-invoke the liveness probe (read-only, always safe)
+#      - Re-dispatch alert-drain via the router (for intake-age alarm)
+#   3. Escalates loudly on second occurrence within the window
+#   4. Forwards an enhanced page to Telegram
 #
-# DEPENDENCIES: boto3 (in the runtime) and the standard library. Nothing else,
-# deliberately — §4 inv. 3 makes the backstop's dumbness permanent, and a
-# third-party dependency is one more thing that can fail non-obviously in the
-# one component that must survive everything else failing. There is no
-# requirements.txt to install and no vendored wheel: the zip is index.py.
+# Designed per alpha-engine-config-I4480 (G9 of the 2026-07-27 conformance audit).
+# The backstop must stay dumb: no agent, no queue, no bus dependency.
 #
-# IAM (iam-policy.json): logs + ssm:GetParameter on the two Telegram params +
-# read-only lambda:GetFunctionConfiguration / sqs attributes /
-# cloudwatch:GetMetricStatistics + lambda:InvokeFunction scoped to EXACTLY the
-# router and the liveness probe + s3 Get/Put confined to the cooldown prefix.
-# No IAM, no deletes, no config writes, no EC2, no queue consumption. The
-# InvokeFunction grant naming two ARNs is the enforcement layer under the
-# in-code action allowlist — an added allowlist row that named a third function
-# would AccessDenied rather than act.
+# Zero pip dependencies — the handler uses only the Python standard library +
+# boto3 (Lambda runtime built-in). No requirements.txt needed.
+# The playbooks.yaml registry is bundled from the repo SSoT.
 #
-# DEPLOY ATOMICITY (§4 inv. 5 — the rule this component exists to honour):
-# the sibling dispatchers/probes are operator-deployed, so merging their PRs has
-# ZERO live effect. That pattern is precisely the defect that disarmed the
-# liveness probe for four days (alpha-engine-config-I4472/G1). This component
-# was therefore applied LIVE in-session BEFORE its PR was opened; the PR
-# documents what is already running. Re-running this script is idempotent.
+# Managed outside CloudFormation — same rationale as backstop-telegram-notifier +
+# other operator-deployed Lambdas.
 #
 # Usage:
-#   bash .../overseer-backstop-responder/deploy.sh             # update code only
-#   bash .../overseer-backstop-responder/deploy.sh --bootstrap # create + wire SNS
+#   bash deploy.sh                                   # update code only
+#   bash deploy.sh --bootstrap                       # first-time create
+#   bash deploy.sh --dry-run                         # show actions, do not apply
+#   bash deploy.sh --smoke                           # invoke once with a synthetic ALARM
+
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FUNCTION_NAME="alpha-engine-overseer-backstop-responder"
+ROLE_NAME="alpha-engine-overseer-backstop-responder-role"
+POLICY_NAME="alpha-engine-overseer-backstop-responder-policy"
+BACKSTOP_TOPIC_NAME="alpha-engine-alarm-backstop"
 REGION="${AWS_REGION:-us-east-1}"
-ACCOUNT="711398986525"
-FUNCTION="alpha-engine-overseer-backstop-responder"
-ROLE="alpha-engine-overseer-backstop-responder-role"
-TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT}:alpha-engine-alarm-backstop"
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BOOTSTRAP="false"
-[ "${1:-}" = "--bootstrap" ] && BOOTSTRAP="true"
+ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 
-log() { echo "[backstop-responder-deploy] $*"; }
+case "${DRY_RUN:-false}" in
+  true|1|yes|TRUE|YES) DRY_RUN=true ;;
+  *) DRY_RUN=false ;;
+esac
+BOOTSTRAP=false
+SMOKE=false
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=true ;;
+    --bootstrap) BOOTSTRAP=true ;;
+    --smoke) SMOKE=true ;;
+    -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
+  esac
+done
 
-BUILD="$(mktemp -d)"
-trap 'rm -rf "$BUILD"' EXIT
-cp "${HERE}/index.py" "${BUILD}/index.py"
-( cd "$BUILD" && zip -qr function.zip index.py )
-log "package built ($(du -h "${BUILD}/function.zip" | cut -f1))"
+run() {
+  if $DRY_RUN; then
+    echo "DRY: $*"
+  else
+    "$@"
+  fi
+}
 
-if [ "$BOOTSTRAP" = "true" ]; then
-  log "bootstrap: role ${ROLE}"
-  aws iam create-role --role-name "$ROLE" \
-    --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}' \
-    >/dev/null 2>&1 || log "role exists"
-  # Idempotent: put-role-policy overwrites in place, so re-running picks up any
-  # grant change in iam-policy.json without a delete/recreate cycle.
-  aws iam put-role-policy --role-name "$ROLE" \
-    --policy-name "${ROLE}-inline" \
-    --policy-document "file://${HERE}/iam-policy.json" >/dev/null
-  log "inline policy applied"
-  sleep 10  # IAM propagation before the first CreateFunction
+# ----- 0. Validate handler syntax -------------------------------------------
 
-  aws lambda create-function --function-name "$FUNCTION" \
-    --runtime python3.12 --handler index.handler \
-    --role "arn:aws:iam::${ACCOUNT}:role/${ROLE}" \
-    --zip-file "fileb://${BUILD}/function.zip" \
-    --timeout 120 --memory-size 256 \
-    --description "Bounded non-agentic recovery + decision-shaped page for Overseer plane alarms (I4480)" \
-    --region "$REGION" >/dev/null 2>&1 \
-    || { log "function exists — updating code instead"
-         aws lambda update-function-code --function-name "$FUNCTION" \
-           --zip-file "fileb://${BUILD}/function.zip" --region "$REGION" >/dev/null; }
+python3 -c "
+import ast
+src = open('${SCRIPT_DIR}/index.py').read()
+ast.parse(src)
+print('index.py syntax OK')
+"
 
-  log "subscribing to ${TOPIC_ARN}"
-  aws lambda add-permission --function-name "$FUNCTION" \
-    --statement-id sns-backstop-invoke --action lambda:InvokeFunction \
-    --principal sns.amazonaws.com --source-arn "$TOPIC_ARN" \
-    --region "$REGION" >/dev/null 2>&1 || log "invoke permission exists"
-  aws sns subscribe --topic-arn "$TOPIC_ARN" --protocol lambda \
-    --notification-endpoint "arn:aws:lambda:${REGION}:${ACCOUNT}:function:${FUNCTION}" \
-    --region "$REGION" >/dev/null
-  log "subscribed (the existing email subscription is untouched — two"
-  log "independent paths sharing no component, per §5 layer D)"
+LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${LAMBDAS_DIR}/../.." && pwd)"
+REGISTRY_SRC="${REPO_ROOT}/infrastructure/overseer/playbooks.yaml"
+
+# ----- 0b. Preflight handler unit tests (shared gate — config#2381) ----------
+# Delegates to the one _shared/run_handler_tests.sh so this gate can never
+# re-drift into the naive no-install `python3 -m pytest` form (config#2295).
+# Handler imports boto3 (Lambda runtime built-in) at module scope, and tests
+# stub it via unittest.mock — boto3 must be installed for the import to work.
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+run_handler_tests "${SCRIPT_DIR}" boto3
+
+# ----- 1. Package: zip handler + playbooks registry -------------------------
+
+PKG=$(mktemp -d)
+trap "rm -rf '$PKG'" EXIT
+
+cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
+
+# Bundle the playbook registry (same SSoT as overseer-dispatcher + liveness-probe).
+if [[ -f "${REGISTRY_SRC}" ]]; then
+  cp "${REGISTRY_SRC}" "${PKG}/playbooks.yaml"
+  echo "Bundled playbooks.yaml from ${REGISTRY_SRC}"
 else
-  aws lambda update-function-code --function-name "$FUNCTION" \
-    --zip-file "fileb://${BUILD}/function.zip" --region "$REGION" >/dev/null
-  log "code updated"
+  echo "WARNING: playbooks.yaml not found at ${REGISTRY_SRC} — Lambda will fail to load registry"
+  echo "Continuing; deploy.sh --smoke will catch this."
 fi
 
-aws lambda wait function-updated --function-name "$FUNCTION" --region "$REGION"
-log "done — ${FUNCTION} is live"
+ZIP="${PKG}/function.zip"
+(cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
+echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
+
+# ----- 2. Bootstrap (first-time only) ---------------------------------------
+
+if $BOOTSTRAP; then
+  echo "Bootstrapping ${FUNCTION_NAME}..."
+
+  TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  if ! aws iam get-role --role-name "${ROLE_NAME}" --query 'Role.RoleName' --output text >/dev/null 2>&1; then
+    echo "  Creating IAM role: ${ROLE_NAME}"
+    run aws iam create-role \
+      --role-name "${ROLE_NAME}" \
+      --assume-role-policy-document "${TRUST_POLICY}" \
+      --query 'Role.RoleName' --output text
+  else
+    echo "  IAM role exists: ${ROLE_NAME}"
+  fi
+
+  echo "  Applying inline policy: ${POLICY_NAME}"
+  run aws iam put-role-policy \
+    --role-name "${ROLE_NAME}" \
+    --policy-name "${POLICY_NAME}" \
+    --policy-document "file://${SCRIPT_DIR}/iam-policy.json"
+
+  if ! $DRY_RUN; then
+    echo "  Waiting 10s for IAM role propagation..."
+    sleep 10
+  fi
+
+  ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
+  if ! aws lambda get-function --function-name "${FUNCTION_NAME}" --query 'Configuration.FunctionName' --output text >/dev/null 2>&1; then
+    echo "  Creating Lambda: ${FUNCTION_NAME}"
+    run aws lambda create-function \
+      --function-name "${FUNCTION_NAME}" \
+      --runtime python3.12 \
+      --role "${ROLE_ARN}" \
+      --handler index.handler \
+      --zip-file "fileb://${ZIP}" \
+      --timeout 60 \
+      --memory-size 256 \
+      --region "${REGION}" \
+      --environment "Variables={COOLDOWN_MINUTES=60,LOG_LEVEL=INFO}" \
+      --query 'FunctionArn' --output text
+  else
+    echo "  Lambda exists, code will be updated in step 3"
+  fi
+fi
+
+# ----- 2b. Reconcile SNS subscription (ALWAYS — not bootstrap-gated) ---------
+
+BACKSTOP_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:${BACKSTOP_TOPIC_NAME}"
+FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
+
+echo "Reconciling SNS subscription: ${BACKSTOP_TOPIC_ARN} -> ${FUNCTION_NAME}"
+
+# Give SNS permission to invoke the Lambda
+run aws lambda add-permission \
+  --function-name "${FUNCTION_NAME}" \
+  --statement-id "sns-${BACKSTOP_TOPIC_NAME}" \
+  --action lambda:InvokeFunction \
+  --principal sns.amazonaws.com \
+  --source-arn "${BACKSTOP_TOPIC_ARN}" \
+  --region "${REGION}" 2>/dev/null || true
+
+# Check if an SNS->Lambda subscription already exists
+EXISTING_SUB=$(aws sns list-subscriptions-by-topic \
+  --topic-arn "${BACKSTOP_TOPIC_ARN}" \
+  --query "Subscriptions[?Protocol=='lambda' && Endpoint=='${FN_ARN}'].SubscriptionArn" \
+  --output text --region "${REGION}" 2>/dev/null || echo "")
+
+if [[ -z "$EXISTING_SUB" || "$EXISTING_SUB" == "None" ]]; then
+  echo "  Subscribing ${FUNCTION_NAME} to ${BACKSTOP_TOPIC_NAME}..."
+  run aws sns subscribe \
+    --region "${REGION}" \
+    --topic-arn "${BACKSTOP_TOPIC_ARN}" \
+    --protocol lambda \
+    --notification-endpoint "${FN_ARN}" \
+    --query 'SubscriptionArn' --output text
+else
+  echo "  Subscription already exists: ${EXISTING_SUB}"
+fi
+
+# ----- 3. Update function code (always after bootstrap, idempotent) ----------
+
+echo "Updating Lambda function code: ${FUNCTION_NAME}"
+run aws lambda update-function-code \
+  --function-name "${FUNCTION_NAME}" \
+  --zip-file "fileb://${ZIP}" \
+  --region "${REGION}" \
+  --query 'LastUpdateStatus' --output text
+
+if ! $DRY_RUN; then
+  aws lambda wait function-updated \
+    --function-name "${FUNCTION_NAME}" \
+    --region "${REGION}"
+fi
+
+echo "Deploy complete."
+
+# ----- 4. Smoke (synthetic ALARM event) -------------------------------------
+
+if $SMOKE; then
+  echo ""
+  echo "Smoke-testing via direct invoke (synthetic ALARM event)..."
+  RESP=$(mktemp)
+  SMOKE_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:${BACKSTOP_TOPIC_NAME}"
+  PAYLOAD=$(cat <<EOF
+{
+  "Records": [
+    {
+      "Sns": {
+        "MessageId": "smoke-test-$(date +%s)",
+        "TopicArn": "${SMOKE_TOPIC_ARN}",
+        "Message": "{\"AlarmName\":\"alpha-engine-watch-plane-overseer-intake-age\",\"AlarmDescription\":\"Overseer intake queue message age exceeds threshold — synthetic smoke test for backstop responder (alpha-engine-config-I4480).\",\"AWSAccountId\":\"${ACCOUNT_ID}\",\"NewStateValue\":\"ALARM\",\"NewStateReason\":\"Smoke test: verifying backstop responder state gathering + recovery attempt + Telegram delivery (alpha-engine-config-I4480).\",\"StateChangeTime\":\"$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)\",\"Region\":\"${REGION}\",\"OldStateValue\":\"OK\",\"Trigger\":{\"MetricName\":\"ApproximateAgeOfOldestMessage\",\"Namespace\":\"AWS/SQS\",\"StatisticType\":\"Maximum\",\"Statistic\":\"MAX\",\"Period\":300,\"EvaluationPeriods\":1,\"ComparisonOperator\":\"GreaterThanOrEqualToThreshold\",\"Threshold\":3600,\"Dimensions\":[{\"name\":\"QueueName\",\"value\":\"nousergon-overseer-intake\"}]}}"
+      }
+    }
+  ]
+}
+EOF
+)
+  aws lambda invoke \
+    --function-name "${FUNCTION_NAME}" \
+    --cli-binary-format raw-in-base64-out \
+    --payload "${PAYLOAD}" \
+    --region "${REGION}" \
+    "${RESP}" >/dev/null
+  cat "${RESP}"
+  echo ""
+  rm -f "${RESP}"
+fi
