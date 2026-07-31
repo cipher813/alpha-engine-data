@@ -30,6 +30,15 @@
 # scheduled invocation once this code is deployed — see the PR body for why
 # the code deploy itself is ALSO held pending that same bootstrap pass.
 #
+# alpha-engine-config#4481 (2026-07-31): added ssm:GetParameter for
+# /alpha-engine/saturday_sf_watch/github_pat (Sid: ReadGitHubPatSsm in
+# iam-policy.json) so the ci_watch_invocation_success check can query
+# GitHub's Actions API for main-branch run failures independently of the
+# ci-watch dispatcher's own dispatch ledger. An operator must re-run
+# `deploy.sh --apply-iam` to pick up the new SSM grant before the
+# ci-watch check can read the PAT — AccessDenied / crash visible in the
+# probe alert log until applied.
+#
 # Cadence (UTC): twice daily, offset from the slimmed sf-watch probe's sweep
 # cadence (06:45/14:45) purely to avoid simultaneous invocation — this is a
 # config-drift + run-window check, not tied to any pipeline's own schedule:
