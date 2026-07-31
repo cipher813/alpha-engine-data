@@ -200,6 +200,29 @@ BACKLOG_REPOS = (
 _GH_ORG = "nousergon"
 _RESEARCH_BUCKET = "alpha-engine-research"
 
+# ── Trigger-health reconciler leg (alpha-engine-config-I4988) ─────────────────
+# The lane-death leg screens EXPECTATIONS (launched lanes) and is blind to a
+# dispatcher that never gets to launch anything: a trigger whose
+# Scheduler→SF→Lambda chain broke below the scheduler leaves no expectation
+# at all. This leg closes that gap from the dispatch SF's OWN execution
+# receipts — the SF records one execution per scheduled fire, and the
+# Lambda's first act is writing its decision record
+# (groom/decisions/{date}/trigger-{HHMM}.json for demand-all incl. the
+# zero-launch skip path, sweep-{HHMM}.json for sweep mode, config#2667). An
+# execution with no such record means the dispatcher died before writing its
+# receipt → page. No schedule mirror anywhere: enumeration comes from the SF
+# executions (the scheduler's receipts), not a second declaration of
+# SCHED_CRONS — the §2.7 derive-once defect config-I4988 retired the
+# run_window mirror for. The one hole left (a Scheduler rule that never
+# fires at all produces no execution) is covered by the registry's
+# scheduler_schedule_exists wiring checks for the four groom schedules.
+_DISPATCH_SF_ARN = (
+    f"arn:aws:states:{REGION}:711398986525:stateMachine:alpha-engine-groom-dispatch"
+)
+_TRIGGER_HEALTH_LOOKBACK_HOURS = 30   # mirrors run_window's lookback_hours
+_TRIGGER_HEALTH_MATURITY_MIN = 45     # Lambda runs seconds into the execution; the SF's single retry waits 60s
+
+
 # ── Spot launch config (env-overridable; defaults mirror spot_data_weekly.sh) ──
 # t4g .medium/.large (arm64/Graviton) across all 6 default-VPC subnets; the lib
 # CLI rotates on capacity error. Cheap-first type order biases toward price.
@@ -1545,6 +1568,134 @@ def _reconcile_lane_death() -> dict:
             "checked_at": now.isoformat()}
 
 
+def _reconcile_trigger_health() -> dict:
+    """Trigger-health reconciler leg (alpha-engine-config-I4988) — page when a
+    dispatch-SF execution left no decision record.
+
+    The lane-death leg above pages on a lane that died AFTER launch. This leg
+    pages on a dispatch that never got as far as writing its decision record —
+    the Scheduler→SF→Lambda chain broke below the scheduler (Lambda crash, IAM
+    regression, SF definition breakage) and no groom cycle ran at all for that
+    slot. This is the signal the retired Overseer ``run_window`` groom check
+    existed to emit; the receipt-based design here replaces it (config-I5229's
+    "reconciler-fed" remedy) without the schedule mirror whose drift was the
+    config-I4988 defect.
+
+    Contract, per groom-sweep-policy §2.7: the signal is a RECEIPT — the
+    decision record the dispatcher itself writes on every trigger evaluation
+    (``trigger-{HHMM}.json`` for demand-all including the zero-launch skip
+    path, ``sweep-{HHMM}.json`` for sweep mode, config#2667). Expected triggers
+    are enumerated from the dispatch SF's OWN execution history (the
+    scheduler's receipts), never from a mirrored schedule. A Scheduler rule
+    that never fires at all produces no execution and is invisible here — that
+    wiring leg is the registry's ``scheduler_schedule_exists`` checks for the
+    four groom schedules (name+state only, no cron mirror).
+
+    Fail-safe: a list-executions error skips the tick (never page on a broken
+    SF API); the next 5-min tick retries.
+    """
+    now = datetime.now(ZoneInfo("UTC"))
+    s3 = boto3.client("s3", region_name=REGION)
+    sfn = boto3.client("stepfunctions", region_name=REGION)
+    try:
+        resp = sfn.list_executions(
+            stateMachineArn=_DISPATCH_SF_ARN, maxResults=100)
+    except Exception as exc:  # noqa: BLE001 — fail-safe, never page on a broken API
+        logger.warning(
+            "trigger-health: list-executions failed (%s) — skipping this tick "
+            "(fail-safe; the next 5-min tick retries)", exc)
+        return {"checked": 0, "missing": [], "paged": 0, "error": str(exc)}
+
+    horizon = now - timedelta(hours=_TRIGGER_HEALTH_LOOKBACK_HOURS)
+    mature_before = now - timedelta(minutes=_TRIGGER_HEALTH_MATURITY_MIN)
+    checked = 0
+    paged = 0
+    missing: list[dict] = []
+    for ex in resp.get("executions", []):
+        started = ex.get("startDate")
+        if started is None:
+            continue
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=ZoneInfo("UTC"))
+        else:
+            started = started.astimezone(ZoneInfo("UTC"))
+        # The decision record is written seconds into the execution (the
+        # Lambda is the SF's second step; its single retry waits 60s). Only
+        # executions that had their full maturity window count as misses.
+        if not (horizon <= started <= mature_before):
+            continue
+        checked += 1
+
+        date = started.strftime("%Y-%m-%d")
+        hhmm = started.strftime("%H%M")
+        slot_id = f"{date}-{hhmm}"
+        actioned_key = f"groom/_control/reconciled-trigger/{slot_id}.json"
+        try:
+            s3.head_object(Bucket=_RESEARCH_BUCKET, Key=actioned_key)
+            continue  # already actioned — one page per dead slot
+        except Exception:
+            pass  # not actioned — fall through to the record check
+
+        record_keys = [
+            f"groom/decisions/{date}/trigger-{hhmm}.json",
+            f"groom/decisions/{date}/sweep-{hhmm}.json",
+        ]
+        if any(_s3_key_exists(s3, key) for key in record_keys):
+            continue  # receipt present — dispatch chain delivered this slot
+
+        missing.append({
+            "execution_arn": ex.get("executionArn"),
+            "execution_name": ex.get("name"),
+            "execution_status": ex.get("status"),
+            "started": started.isoformat(),
+            "slot": slot_id,
+            "checked_keys": record_keys,
+        })
+        paged += 1
+        _notify_cycle(
+            "🔴 Groom dispatch trigger DEATH — execution "
+            f"{ex.get('name') or ex.get('executionArn')} started {started:%Y-%m-%d %H:%M}Z "
+            f"but NO decision record under groom/decisions/{date}/ "
+            f"(checked trigger-{hhmm}.json / sweep-{hhmm}.json). The dispatch chain "
+            "Scheduler→SF→Lambda broke below the scheduler — no groom cycle ran for "
+            "this slot. Manual triage needed (alpha-engine-config-I4988).",
+            severity="error",
+            dedup_key=f"{_CYCLE_FLOW_NAME}:trigger_death:{date}:{hhmm}",
+            context={"trigger_health": missing[-1]},
+        )
+        # Actioned marker — mirror the lane-death leg: after one page, never
+        # re-page the same dead slot on every 5-min tick. Best-effort with a
+        # loud log (a marker-write failure re-pages the slot next tick, which
+        # the flow-doctor dedup key above already bounds).
+        try:
+            s3.put_object(
+                Bucket=_RESEARCH_BUCKET,
+                Key=actioned_key,
+                Body=json.dumps({
+                    "outcome": "trigger_death",
+                    "slot": slot_id,
+                    "execution_arn": ex.get("executionArn"),
+                    "actioned_at": now.isoformat(),
+                }).encode(),
+                ContentType="application/json")
+        except Exception as exc:  # noqa: BLE001 — see marker comment above
+            logger.warning(
+                "trigger-health: actioned-marker write failed for %s (will "
+                "re-page next tick): %s", slot_id, exc)
+
+    return {"checked": checked, "missing": missing, "paged": paged}
+
+
+def _s3_key_exists(s3, key: str) -> bool:
+    """True iff ``key`` exists. head_object on a missing key raises
+    ClientError/404 — the same shape the lane-death leg relies on."""
+    try:
+        s3.head_object(Bucket=_RESEARCH_BUCKET, Key=key)
+        return True
+    except Exception:  # noqa: BLE001 — any failure reads as "no receipt"
+        return False
+
+
 def _notify_dispatch_ceiling_exhausted(prior: int, ceiling: int, tier_tag: str,
                                        schedule_label: str) -> None:
     """LOUD (non-silent) escalation — budget exhaustion means the day's
@@ -2439,9 +2590,14 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     if event.get("mode") == "reconcile":
         # config-I5229 (lane-death pager): EventBridge Scheduler (~5 min
         # cadence) invokes this mode to screen open expectations against
-        # live EC2 state. No other caller sets a top-level `mode`, so this
-        # cannot collide with any other invocation shape.
-        return _reconcile_lane_death()
+        # live EC2 state. config-I4988 (trigger-health leg, added with the
+        # run_window retirement): the same tick also screens dispatch-SF
+        # executions for their decision-record receipts. No other caller
+        # sets a top-level `mode`, so this cannot collide with any other
+        # invocation shape.
+        lane = _reconcile_lane_death()
+        trigger = _reconcile_trigger_health()
+        return {**lane, "trigger_health": trigger}
     run_mode = _resolve_run_mode(event)
     model = _resolve_model(event)
     issue_filter = _resolve_issue_filter(event)
