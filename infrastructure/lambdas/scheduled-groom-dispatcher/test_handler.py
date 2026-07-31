@@ -2916,3 +2916,173 @@ def test_pool_spans_more_than_one_instance_family(monkeypatch):
         f"pool spans only {families} — separate capacity pools require separate "
         "FAMILIES, not just separate sizes"
     )
+
+
+# ── Completion-aware lane classification (alpha-engine-config-I5914) ──────────
+#
+# Instance state is not a proxy for run completion. A lane that finished its
+# work and was reclaimed during wind-down — before writing its completion
+# marker — is dead by EC2 state and successful by every measure that matters.
+#
+# Measured 2026-07-31 20:00 UTC: the high-only lane wrote
+# groom/2026-07-31/303ace0ac87148e0a21c5ba235bb5f4e.json at 20:35:50Z with
+# "FINAL: 4 closed, engaged=10/10, stop='queue drained'" and rc=0, was reclaimed
+# at 20:38Z, and was paged as a 🔴 lane DEATH indistinguishable from the sibling
+# lane that genuinely lost four chunks of work.
+
+def _artifact_key(run_token: str, *, days_ago: int = 0) -> str:
+    from datetime import datetime, timedelta, timezone
+    day = (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+    return f"groom/{day}/{run_token}.json"
+
+
+def _dead_lane_objects(run_token: str, **extra) -> dict:
+    objs = {
+        _ledger_key(run_token): json.dumps({
+            "run_token": run_token, "tier_tag": "high-only",
+            "schedule": "0 20 * * *", "instance_id": "i-dead",
+            "deadline_utc": _future_deadline(),
+        }).encode(),
+    }
+    objs.update(extra)
+    return objs
+
+
+def test_completed_lane_reclaimed_post_run_is_not_paged_as_a_death(monkeypatch):
+    """The 2026-07-31 high-only case, replayed."""
+    idx = _load(monkeypatch, s3_objects=_dead_lane_objects(
+        "tok-done", **{_artifact_key("tok-done"): b'{"final": true}'}))
+    notifications = _spy_notify(monkeypatch, idx)
+    out = idx.handler({"mode": "reconcile"}, None)
+
+    assert out["deaths"] == 0, "a completed lane must not count as a death"
+    assert out["reclaimed_post_run"] == 1
+    assert len(notifications) == 1
+    text, kw = notifications[0]
+    assert kw["severity"] == "warning", (
+        "a lane that completed its work must not page at error severity"
+    )
+    assert "DEATH" not in text
+    assert "completing" in text or "completed" in text
+
+
+def test_lane_with_no_artifact_still_pages_as_a_death(monkeypatch):
+    """The genuine-loss case must keep its existing behaviour exactly."""
+    idx = _load(monkeypatch, s3_objects=_dead_lane_objects("tok-lost"))
+    notifications = _spy_notify(monkeypatch, idx)
+    out = idx.handler({"mode": "reconcile"}, None)
+
+    assert out["deaths"] == 1
+    assert out["reclaimed_post_run"] == 0
+    text, kw = notifications[0]
+    assert kw["severity"] == "error"
+    assert "DEATH" in text
+
+
+def test_actioned_marker_records_the_true_outcome(monkeypatch):
+    """Every consumer of this key was being told `lane_died` for a success."""
+    idx = _load(monkeypatch, s3_objects=_dead_lane_objects(
+        "tok-done", **{_artifact_key("tok-done"): b"{}"}))
+    _spy_notify(monkeypatch, idx)
+    idx.handler({"mode": "reconcile"}, None)
+
+    written = getattr(idx._test_s3, "_objects", {})
+    key = "groom/_control/reconciled/tok-done.json"
+    assert key in written, f"expectation not closed; wrote {list(written)}"
+    record = json.loads(written[key].decode() if isinstance(written[key], bytes)
+                        else written[key])
+    assert record["outcome"] == "lane_reclaimed_post_run"
+    assert record["completion_evidence"], "the proving key must be recorded"
+
+
+def test_completion_probe_covers_the_previous_day_partition(monkeypatch):
+    """The artifact is partitioned by the RUN's UTC date, not the tick's.
+
+    A lane launched at 23:5x writes to the previous day's prefix; probing only
+    today would re-page it as a death every tick until the ledger aged out.
+    """
+    idx = _load(monkeypatch, s3_objects=_dead_lane_objects(
+        "tok-x", **{_artifact_key("tok-x", days_ago=1): b"{}"}))
+    _spy_notify(monkeypatch, idx)
+    out = idx.handler({"mode": "reconcile"}, None)
+    assert out["reclaimed_post_run"] == 1 and out["deaths"] == 0
+
+
+def test_completion_marker_alone_still_proves_completion(monkeypatch):
+    """The pre-existing signal keeps working — the artifact is additive."""
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key("tok-m"): json.dumps({
+            "run_token": "tok-m", "tier_tag": "mid-only",
+            "schedule": "0 20 * * *", "instance_id": "i-dead",
+            "deadline_utc": _future_deadline(),
+        }).encode(),
+        "groom/_control/completed/tok-m.json": b'{"outcome": "success"}',
+    })
+    notifications = _spy_notify(monkeypatch, idx)
+    out = idx.handler({"mode": "reconcile"}, None)
+    # A completion marker closes the expectation BEFORE the death check, so this
+    # lane is never even an open expectation.
+    assert out["deaths"] == 0 and not notifications
+
+
+# ── The SF's relaunch guard is real now (alpha-engine-config-I5914) ───────────
+#
+# CheckCompletionMarkerTaskToken has existed since config#1645 writing
+# $.markerResult that NOTHING read: CheckRetryBudget branched on retry_count vs
+# max_retries alone. The state's NAME asserted a guard the machine did not have.
+
+def test_retry_marker_reports_completion_for_a_finished_lane(monkeypatch):
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key("tok-fin"): json.dumps({
+            "run_token": "tok-fin", "tier_tag": "high-only",
+            "schedule": "0 20 * * *", "instance_id": "i-1",
+        }).encode(),
+        _artifact_key("tok-fin"): b"{}",
+    })
+    out = idx.handler({"retryMarker": True, "run_mode": "full",
+                       "launchDecision": {"issue_filter": "high-only"}}, None)
+    assert out["lane_completed"] is True
+    assert out["run_token"] == "tok-fin"
+    assert out["evidence"]
+
+
+def test_retry_marker_reports_incomplete_for_a_truncated_lane(monkeypatch):
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key("tok-cut"): json.dumps({
+            "run_token": "tok-cut", "tier_tag": "high-only",
+            "schedule": "0 20 * * *", "instance_id": "i-1",
+        }).encode(),
+    })
+    out = idx.handler({"retryMarker": True, "run_mode": "full",
+                       "launchDecision": {"issue_filter": "high-only"}}, None)
+    assert out["lane_completed"] is False, (
+        "a lane with no artifact must stay relaunchable"
+    )
+
+
+def test_retry_marker_resolves_the_lane_from_launch_decision(monkeypatch):
+    """The lane identity is NESTED under launchDecision, not top-level.
+
+    Reading `event["issue_filter"]` resolves empty for every lane, so all three
+    would share one tier_tag and answer for each other.
+    """
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key("tok-high"): json.dumps({
+            "run_token": "tok-high", "tier_tag": "high-only",
+            "schedule": "0 20 * * *", "instance_id": "i-1",
+        }).encode(),
+        _artifact_key("tok-high"): b"{}",
+    })
+    # Asking about a DIFFERENT lane must not match high-only's artifact.
+    out = idx.handler({"retryMarker": True, "run_mode": "full",
+                       "launchDecision": {"issue_filter": "low-only"}}, None)
+    assert out["tier_tag"] == "low-only"
+    assert out["lane_completed"] is False
+
+
+def test_retry_marker_fails_soft_when_the_ledger_is_unreadable(monkeypatch):
+    """An unreadable ledger must not suppress a legitimate relaunch."""
+    idx = _load(monkeypatch, s3_objects={})
+    out = idx.handler({"retryMarker": True, "run_mode": "full",
+                       "launchDecision": {"issue_filter": "mid-only"}}, None)
+    assert out["lane_completed"] is False
