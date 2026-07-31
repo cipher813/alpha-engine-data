@@ -165,85 +165,73 @@ for label in "${!WATCH_PLANE_FUNCTIONS[@]}"; do
   done
 done
 
-# --- 2b. Invocation-floor alarms for liveness probes (alpha-engine-config#5567) -
-# Every liveness-probe alarm in the fleet watches Errors or Throttles with
-# TreatMissingData=notBreaching. This means a probe that STOPS BEING INVOKED
-# (schedule disabled, scheduler role permission lost, Lambda deleted, EventBridge
-# target detached) produces no Errors datapoints, same as a healthy probe, and
-# the alarm stays OK indefinitely. The invocation-floor alarm closes that gap.
-#
-# The existing Errors/Throttles alarms detect a probe that runs AND FAILS.
-# These Invocation alarms detect a probe that NEVER RUNS — absence-of-signal
-# as the alarm condition itself (TreatMissingData=breaching, the inverse of the
-# error alarms above).
-#
-# Window sized to the liveness probes' 2x/day schedule (fixed UTC times):
-# Period=3600 (1h), EvaluationPeriods=12, Statistic=Sum, Threshold=1 — at least
-# 1 invocation in any 12-hour window. Missing data (the probe never ran) treats
-# every period as breaching (Sum=0), firing the alarm when the probe misses an
-# entire 12-hour window.
-#
-# Metric semantics: AWS/Lambda emits Invocations datapoints for every
-# invocation. Missing data here means NO invocations — exactly the condition
-# being detected. TreatMissingData=breaching is mandatory; notBreaching would
-# reproduce the defect being fixed.
-#
-# Lambdas whose names contain "liveness-probe" get both an Invocation-floor
-# alarm HERE and their Errors/Throttles alarms (from the per-Lambda loop
-# above). Both are intentional — detecting a failed run AND a never-ran probe
-# are distinct failure modes that need distinct alarms.
-
-echo ""
-echo "==> Creating per-liveness-probe Invocation-floor alarms..."
+INVOCATION_ALARM_COUNT=0
 for label in "${!WATCH_PLANE_FUNCTIONS[@]}"; do
-  fn_name="${WATCH_PLANE_FUNCTIONS[$label]}"
-
-  # Only liveness probes need Invocation-floor alarms — other watch-plane
-  # Lambdas (dispatchers, gates, sentinels) are event-driven; their expected
-  # invocation rate depends on fleet activity, not a fixed schedule.
-  if [[ "$label" != *"liveness-probe"* ]]; then
-    continue
-  fi
-
-  alarm_name="alpha-engine-watch-plane-${label}-invocations"
-  echo "  -> $alarm_name (FunctionName=$fn_name)"
-
-  run aws cloudwatch put-metric-alarm \
-    --region "$REGION" \
-    --alarm-name "$alarm_name" \
-    --alarm-description "Liveness-probe Invocation-floor alarm: fires when ${fn_name} has zero invocations in a 12-hour window — the probe stopped running, not just running and failing (alpha-engine-config#5567). TreatMissingData=breaching: absence of Invocations IS the alarm condition. Provisioned by infrastructure/setup_watch_plane_alarms.sh." \
-    --namespace "AWS/Lambda" \
-    --metric-name "Invocations" \
-    --dimensions "Name=FunctionName,Value=${fn_name}" \
-    --statistic "Sum" \
-    --period 3600 \
-    --evaluation-periods 12 \
-    --datapoints-to-alarm 12 \
-    --threshold 1 \
-    --comparison-operator "LessThanThreshold" \
-    --treat-missing-data "breaching" \
-    --alarm-actions "$BACKSTOP_TOPIC_ARN" \
-    --ok-actions "$BACKSTOP_TOPIC_ARN" >/dev/null
+  case "$label" in
+    *liveness*) INVOCATION_ALARM_COUNT=$(( INVOCATION_ALARM_COUNT + 1 )) ;;
+  esac
 done
-
-# ── Re-examination of notBreathing on error/throttle alarms (alpha-engine-
-# config#5567 deliverable 2). For a metric (Errors, Throttles) that only emits
-# on failure, TreatMissingData=notBreaching is the correct setting: missing
-# datapoints mean "no failures," which IS the healthy state. The gap closed
-# here is not that Error/Throttle alarms need different TreatMissingData — it
-# is that THE LIVENESS DIMENSION (invocations) had no alarm at all. The
-# invocation-floor alarms above now cover that dimension. Decision recorded
-# rather than left implicit.
-
 echo ""
-echo "Done — $(( ${#WATCH_PLANE_FUNCTIONS[@]} * 2 )) watch-plane Errors/Throttles alarms + $(for l in "${!WATCH_PLANE_FUNCTIONS[@]}"; do [[ "$l" == *"liveness-probe"* ]] && echo 1; done | wc -l) Invocation-floor alarms upserted, routed to $BACKSTOP_TOPIC_ARN."
+echo "Done — $(( ${#WATCH_PLANE_FUNCTIONS[@]} * 2 + INVOCATION_ALARM_COUNT )) watch-plane alarms upserted ($(( ${#WATCH_PLANE_FUNCTIONS[@]} * 2 )) Errors/Throttles + ${INVOCATION_ALARM_COUNT} Invocations-floor), routed to $BACKSTOP_TOPIC_ARN."
 echo ""
 echo "Validation:"
 echo "  aws cloudwatch describe-alarms --region $REGION \\"
 echo "    --alarm-name-prefix alpha-engine-watch-plane- \\"
 echo "    --query 'MetricAlarms[].[AlarmName,StateValue]' --output table"
 
-# --- 3. Overseer intake DLQ depth (alpha-engine-config-I2823) ----------------
+# --- 3. Per-liveness-probe Invocations-floor alarms (alpha-engine-config-I5567) ---
+# Every Errors/Throttles alarm above can only detect a probe that runs and
+# FAILS. A probe that STOPS RUNNING entirely (schedule disabled, scheduler
+# role permission lost, Lambda deleted, EventBridge target detached) produces
+# no Errors datapoints, and TreatMissingData=notBreaching renders that
+# identical to a healthy probe — the alarm stays OK indefinitely.
+#
+# These Invocations alarms close that gap. For any label containing "liveness"
+# (the probes whose entire job is detecting dead components), alarm when the
+# Sum of Invocations over a 24-hour window is <= 0 — meaning the probe ran
+# zero times or never emitted an Invocations metric at all. TreatMissingData
+# is breaching because absence IS the condition being detected.
+#
+# Window: Period=86400 (24h), EvaluationPeriods=1, DatapointsToAlarm=1.
+# All probes should run at least once per day (the smallest common cadence).
+# A probe whose cadence is less-than-daily would need its own window, but no
+# such probe exists in the watch plane today — adding one means adding a
+# schedule-specific window here too.
+#
+# Metric: AWS/Lambda Invocations, Statistic=Sum, Threshold=0,
+# ComparisonOperator=LessThanOrEqualToThreshold.
+#   Sum > 0  (probe invoked at least once) → OK
+#   Sum = 0  (probe ran zero times)        → ALARM
+#   No datapoint (TreatMissingData=breaching) → ALARM
+echo ""
+echo "==> Creating per-liveness-probe Invocations-floor alarms..."
+for label in "${!WATCH_PLANE_FUNCTIONS[@]}"; do
+  case "$label" in
+    *liveness*)
+      fn_name="${WATCH_PLANE_FUNCTIONS[$label]}"
+      alarm_name="alpha-engine-watch-plane-${label}-invocations-floor"
+      echo "  -> $alarm_name (FunctionName=$fn_name)"
+      run aws cloudwatch put-metric-alarm \
+        --region "$REGION" \
+        --alarm-name "$alarm_name" \
+        --alarm-description "Invocations-floor alarm for the ${label} Lambda: fires when Sum(Invocations) over 24h <= 0 — the probe stopped running entirely (alpha-engine-config-I5567). TreatMissingData=breaching because absence is the condition being detected, distinguishing this from the Errors/Throttles alarms where missing data is the healthy steady state. Routes to the INDEPENDENT ${BACKSTOP_TOPIC_NAME} topic (not alpha-engine-alerts). Provisioned by infrastructure/setup_watch_plane_alarms.sh." \
+        --namespace "AWS/Lambda" \
+        --metric-name "Invocations" \
+        --dimensions "Name=FunctionName,Value=${fn_name}" \
+        --statistic "Sum" \
+        --period 86400 \
+        --evaluation-periods 1 \
+        --datapoints-to-alarm 1 \
+        --threshold 0 \
+        --comparison-operator "LessThanOrEqualToThreshold" \
+        --treat-missing-data "breaching" \
+        --alarm-actions "$BACKSTOP_TOPIC_ARN" \
+        --ok-actions "$BACKSTOP_TOPIC_ARN" >/dev/null
+      ;;
+  esac
+done
+
+# --- 4. Overseer intake DLQ depth (alpha-engine-config-I2823) ----------------
 # A message landing on the intake DLQ means EventBridge delivered an alert
 # event 5x and the queue rejected it every time — structured alert events are
 # being LOST. Same backstop-topic routing rationale as the Lambda alarms.
@@ -267,7 +255,7 @@ run aws cloudwatch put-metric-alarm \
   --alarm-actions "$BACKSTOP_TOPIC_ARN" \
   --ok-actions "$BACKSTOP_TOPIC_ARN"
 
-# --- 4. Overseer intake queue age-of-oldest-message (alpha-engine-config-I2910)
+# --- 5. Overseer intake queue age-of-oldest-message (alpha-engine-config-I2910)
 # The DLQ-depth alarm above only fires once EventBridge has delivered an
 # alert event, the queue received it, and processing failed 5x (redrive
 # exhaustion). It says NOTHING about the case where the twice-daily drain
@@ -318,7 +306,7 @@ run aws cloudwatch put-metric-alarm \
   --alarm-actions "$BACKSTOP_TOPIC_ARN" \
   --ok-actions "$BACKSTOP_TOPIC_ARN"
 
-# --- 5. Backstop Telegram forwarder (alpha-engine-config-I2899) ---------------
+# --- 6. Backstop Telegram forwarder (alpha-engine-config-I2899) ---------------
 # The backstop alarm topic must have a real-time channel beyond email. The
 # alpha-engine-backstop-telegram-notifier Lambda (deployed by its own deploy.sh)
 # subscribes directly to the topic and forwards every alarm to Telegram via raw
