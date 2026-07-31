@@ -2405,6 +2405,145 @@ def test_reconcile_mode_cannot_collide_with_other_shapes(monkeypatch):
     # No instance was launched — the demand-all fields were never resolved.
 
 
+# ── Trigger-health reconciler tests (alpha-engine-config-I4988) ────────────────
+# The trigger-health leg screens dispatch-SF executions for their decision-
+# record receipts. Same date-proofing discipline as the lane-death tests:
+# derive the partition and slot keys from the same clock the reconciler
+# uses (now-relative startDates), never literal dates.
+
+
+def _sfn_exec(hours_ago: float, name: str = "exec1", status: str = "SUCCEEDED"):
+    """boto3-shaped execution record with a now-relative startDate."""
+    from datetime import datetime, timedelta, timezone
+    return {
+        "executionArn": f"{_EXEC_PREFIX}:{name}",
+        "name": name,
+        "status": status,
+        "startDate": datetime.now(timezone.utc) - timedelta(hours=hours_ago),
+    }
+
+
+def _decision_key_for_execution(execution: dict, kind: str = "trigger") -> str:
+    """The decision-record key the dispatcher would have written for this
+    execution's start minute — derive, never hardcode (the date-proofing
+    lesson of the lane-death fixtures)."""
+    from datetime import datetime, timezone
+    started = execution["startDate"].astimezone(timezone.utc)
+    return f"groom/decisions/{started:%Y-%m-%d}/{kind}-{started:%H%M}.json"
+
+
+def test_trigger_health_quiet_when_decision_record_exists(monkeypatch):
+    """Mature execution with its trigger decision record → no page."""
+    exec_ = _sfn_exec(hours_ago=3)
+    idx = _load(monkeypatch, sfn_executions=[exec_], s3_objects={
+        _decision_key_for_execution(exec_): b'{"trigger": "demand-all"}',
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    th = result["trigger_health"]
+    assert th["checked"] == 1
+    assert th["paged"] == 0
+    assert th["missing"] == []
+
+
+def test_trigger_health_pages_when_execution_left_no_record(monkeypatch):
+    """Mature execution with NO decision record → page + actioned marker."""
+    exec_ = _sfn_exec(hours_ago=3)
+    idx = _load(monkeypatch, sfn_executions=[exec_], s3_objects={})
+    result = idx.handler({"mode": "reconcile"}, None)
+    th = result["trigger_health"]
+    assert th["checked"] == 1
+    assert th["paged"] == 1
+    assert len(th["missing"]) == 1
+    assert th["missing"][0]["execution_name"] == "exec1"
+    # Actioned marker written so the next 5-min tick does not re-page.
+    from datetime import timezone
+    started = exec_["startDate"].astimezone(timezone.utc)
+    slot_id = f"{started:%Y-%m-%d}-{started:%H%M}"
+    assert f"groom/_control/reconciled-trigger/{slot_id}.json" in idx._test_s3._objects
+
+
+def test_trigger_health_sweep_record_satisfies(monkeypatch):
+    """A sweep-mode execution is satisfied by its sweep-{HHMM} record."""
+    exec_ = _sfn_exec(hours_ago=3)
+    idx = _load(monkeypatch, sfn_executions=[exec_], s3_objects={
+        _decision_key_for_execution(exec_, kind="sweep"): b'{"trigger": "sweep"}',
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    th = result["trigger_health"]
+    assert th["checked"] == 1
+    assert th["paged"] == 0
+
+
+def test_trigger_health_skips_execution_within_maturity(monkeypatch):
+    """An execution younger than the maturity window is not yet a miss — the
+    SF's single retry (60s) plus Lambda latency can still land the record."""
+    exec_ = _sfn_exec(hours_ago=0.25)  # 15 min — under the 45-min maturity
+    idx = _load(monkeypatch, sfn_executions=[exec_], s3_objects={})
+    result = idx.handler({"mode": "reconcile"}, None)
+    th = result["trigger_health"]
+    assert th["checked"] == 0
+    assert th["paged"] == 0
+
+
+def test_trigger_health_actioned_slot_is_not_repaged(monkeypatch):
+    """An actioned marker suppresses the re-page on the next tick."""
+    exec_ = _sfn_exec(hours_ago=3)
+    from datetime import timezone
+    started = exec_["startDate"].astimezone(timezone.utc)
+    slot_id = f"{started:%Y-%m-%d}-{started:%H%M}"
+    idx = _load(monkeypatch, sfn_executions=[exec_], s3_objects={
+        f"groom/_control/reconciled-trigger/{slot_id}.json": b'{"outcome": "trigger_death"}',
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    th = result["trigger_health"]
+    assert th["checked"] == 1
+    assert th["paged"] == 0
+    assert th["missing"] == []
+
+
+def test_trigger_health_no_executions_is_quiet(monkeypatch):
+    idx = _load(monkeypatch, sfn_executions=[], s3_objects={})
+    result = idx.handler({"mode": "reconcile"}, None)
+    th = result["trigger_health"]
+    assert th["checked"] == 0
+    assert th["paged"] == 0
+
+
+def test_trigger_health_list_executions_error_is_fail_safe(monkeypatch):
+    """A broken SF API must never page — the tick is skipped and retried."""
+    idx = _load(monkeypatch, sfn_executions=[], sfn_error=RuntimeError("sfn down"))
+    result = idx.handler({"mode": "reconcile"}, None)
+    th = result["trigger_health"]
+    assert th["checked"] == 0
+    assert th["paged"] == 0
+    assert "error" in th
+    # The lane-death leg still ran (its own result unaffected).
+    assert result["reconciled"] is True
+
+
+def test_trigger_health_ignores_stale_execution_outside_lookback(monkeypatch):
+    """Executions older than the 30h lookback are outside the check window."""
+    exec_ = _sfn_exec(hours_ago=50)
+    idx = _load(monkeypatch, sfn_executions=[exec_], s3_objects={})
+    result = idx.handler({"mode": "reconcile"}, None)
+    th = result["trigger_health"]
+    assert th["checked"] == 0
+    assert th["paged"] == 0
+
+
+def test_trigger_health_pages_running_execution_without_record(monkeypatch):
+    """The 2026-07-28 shape: an execution still RUNNING (SF waiting on a task
+    token) but no decision record — the dispatcher died mid-flight. Must page
+    even though the execution never reached a terminal state."""
+    exec_ = _sfn_exec(hours_ago=3, status="RUNNING")
+    idx = _load(monkeypatch, sfn_executions=[exec_], s3_objects={})
+    result = idx.handler({"mode": "reconcile"}, None)
+    th = result["trigger_health"]
+    assert th["checked"] == 1
+    assert th["paged"] == 1
+    assert th["missing"][0]["execution_status"] == "RUNNING"
+
+
 def test_reconcile_sends_task_failure_for_dead_lane_with_token(monkeypatch):
     """Lane death with a task_token → send-task-failure collapses the hung SF
     execution immediately instead of waiting for the 6h timeout."""

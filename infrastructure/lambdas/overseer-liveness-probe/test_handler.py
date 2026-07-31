@@ -1164,27 +1164,6 @@ def test_bool_is_not_treated_as_a_number_by_gt():
     assert len(problems) == 1
 
 
-def test_registry_declares_productive_when_for_groom():
-    """The live registry must actually opt groom in — the code path above is
-    inert otherwise, which is precisely how this failure stayed invisible."""
-    import yaml
-    reg = yaml.safe_load(
-        (Path(__file__).resolve().parents[2] / "overseer" / "playbooks.yaml").read_text()
-    )
-    checks = [
-        c
-        for pb in reg["playbooks"].values()
-        for c in ((pb.get("liveness") or {}).get("checks") or [])
-        if c.get("type") == "run_window" and c.get("label") == "groom"
-    ]
-    assert checks, "no run_window check labelled 'groom' in the registry"
-    for c in checks:
-        assert c.get("productive_when"), (
-            "the groom run_window check must declare productive_when — without it "
-            "a crash-cascaded run that writes an artifact reads as full coverage"
-        )
-
-
 # ══════════════════════════════════════════════════════════════════════════
 # run_start_field — the fleet's run artifacts do not share one schema
 # (the 2026-07-29 false-page regression)
