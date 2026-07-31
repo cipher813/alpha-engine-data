@@ -1,19 +1,21 @@
 name: Deploy expense-collector
 
-# Auto-deploy the alpha-engine-expense-collector Lambda CODE on merge to main.
-# Same pattern as deploy-usage-pace-alert.yml: this script's default/flagless
-# run is already code-only (no aws iam/scheduler writes happen unless
-# --bootstrap is passed), so no new script flag was needed to make this safe.
+# Auto-deploy the alpha-engine-expense-collector Lambda CODE AND SCHEDULES
+# on merge to main.
 #
-# A change to SCHED_NAMES/SCHED_CRONS (the collector's OWN invocation cadence)
-# still requires an operator to run `deploy.sh --bootstrap` by hand, for the
-# same reason as the sibling dispatchers: the github-actions-lambda-deploy OIDC
-# role deliberately lacks iam:CreateRole / iam:PutRolePolicy (fleet-wide
-# policy, nous-ergon-ops/infrastructure/iam/README.md).
+# Runs deploy.sh twice: flagless for Lambda code, then --reconcile-schedules
+# for EventBridge Scheduler rule upsert + prune. Both halves run under the
+# github-actions-lambda-deploy OIDC role, which holds scheduler:* and the
+# scoped iam:PassRole the reconciler needs but deliberately lacks iam:CreateRole
+# / iam:PutRolePolicy (fleet single-writer rule after 4 IAM-clobber incidents).
 #
-# IAM: no new grant needed — LambdaUpdate already covers
-# arn:...:function:alpha-engine-* (nous-ergon-ops/infrastructure/iam/github-actions-lambda-
-# deploy.json), which already includes this function.
+# alpha-engine-config-I5805: before the --reconcile-schedules split, a merged
+# cadence change was inert until an operator ran --bootstrap by hand — which is
+# how the reconcile-monthly rule sat in source for months without ever being
+# created. The CI path now creates/updates/prunes schedules on every merge.
+#
+# IAM: no new grant needed — github-actions-lambda-deploy already covers
+# scheduler:{Get,List,Create,Update,Delete}Schedule + the scoped iam:PassRole.
 
 on:
   push:
@@ -33,7 +35,7 @@ permissions:
 
 jobs:
   deploy:
-    name: Deploy expense-collector Lambda (code-only)
+    name: Deploy expense-collector Lambda (code + schedules)
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -56,9 +58,13 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Deploy expense-collector (code-only — no --bootstrap)
+      - name: Deploy expense-collector code (flagless — the CI path, step 1)
         working-directory: alpha-engine-data
         run: bash infrastructure/lambdas/expense-collector/deploy.sh
+
+      - name: Reconcile expense-collector schedules (--reconcile-schedules — the CI path, step 2)
+        working-directory: alpha-engine-data
+        run: bash infrastructure/lambdas/expense-collector/deploy.sh --reconcile-schedules
 
       - name: Report deployed version
         working-directory: alpha-engine-data
