@@ -30,6 +30,14 @@
 # scheduled invocation once this code is deployed — see the PR body for why
 # the code deploy itself is ALSO held pending that same bootstrap pass.
 #
+# alpha-engine-config-I5262 (2026-07-29): added s3:GetObject + s3:ListBucket
+# on the ci_watch/* prefix (ci-watch dispatch-invocation-success check, a new
+# subtype of the generalized dispatch_outcome check that reads
+# ci_watch/_control/dispatched/ records and asserts matching completion markers
+# at ci_watch/_control/completed/). Also added the same for groom/*
+# dispatch-ledger and alert-drain/* completion markers (all three dispatch
+# families). An operator must re-run `deploy.sh --apply-iam` to pick these up.
+#
 # Cadence (UTC): twice daily, offset from the slimmed sf-watch probe's sweep
 # cadence (06:45/14:45) purely to avoid simultaneous invocation — this is a
 # config-drift + run-window check, not tied to any pipeline's own schedule:
