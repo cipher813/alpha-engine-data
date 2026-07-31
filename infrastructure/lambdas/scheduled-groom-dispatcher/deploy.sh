@@ -386,10 +386,13 @@ EOF
   # short Lambda invocation.
   RECON_SCHED_NAME="alpha-engine-groom-lane-reconciler-5min"
   RECON_SCHED_CRON="rate(5 minutes)"
-  recon_target=$(cat <<EOF
-{"Arn":"${FN_ARN}","RoleArn":"${SCHED_ROLE_ARN}","Input":"{\\\"mode\\\":\\\"reconcile\\\"}"}
-EOF
-)
+  # Built with python3, NOT a heredoc. In an unquoted heredoc bash unescapes
+  # only \$, \`, \\ and \<newline> — a backslash before a double quote is
+  # PRESERVED. So `\\\"` emitted `\\"` rather than `\"`, and every
+  # create-schedule call died on `Invalid JSON: Expecting ',' delimiter`.
+  # Counting backslashes through two layers of quoting is not a thing to get
+  # right by inspection; json.dumps cannot get it wrong.
+  recon_target=$(python3 -c 'import json,sys; print(json.dumps({"Arn": sys.argv[1], "RoleArn": sys.argv[2], "Input": json.dumps({"mode": "reconcile"})}))' "${FN_ARN}" "${SCHED_ROLE_ARN}")
   echo "  Applying Scheduler invoke-Lambda policy for the reconciler"
   run aws iam put-role-policy \
     --role-name "${SCHED_ROLE_NAME}" \
@@ -468,10 +471,7 @@ EOF
   for i in "${!SWEEP_SCHED_NAMES[@]}"; do
     sname="${SWEEP_SCHED_NAMES[$i]}"
     scron="${SWEEP_SCHED_CRONS[$i]}"
-    sweep_target=$(cat <<EOF
-{"Arn":"${FN_ARN}","RoleArn":"${SCHED_ROLE_ARN}","Input":"{\\\"run_mode\\\":\\\"sweep\\\",\\\"launch_decided\\\":true,\\\"model\\\":\\\"deepseek-v4-flash\\\",\\\"issue_filter\\\":\\\"mid-only\\\",\\\"schedule\\\":\\\"${sname}\\\"}"}
-EOF
-)
+    sweep_target=$(python3 -c 'import json,sys; print(json.dumps({"Arn": sys.argv[1], "RoleArn": sys.argv[2], "Input": json.dumps({"run_mode": "sweep", "launch_decided": True, "model": "deepseek-v4-flash", "issue_filter": "mid-only", "schedule": sys.argv[3]})}))' "${FN_ARN}" "${SCHED_ROLE_ARN}" "${sname}")
     if aws scheduler get-schedule --name "${sname}" --region "${REGION}" \
         --query 'Name' --output text >/dev/null 2>&1; then
       echo "  Updating sweep rule: ${sname} → ${scron}"
