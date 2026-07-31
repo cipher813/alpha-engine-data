@@ -193,8 +193,8 @@ playbooks:
     # intake EventBridge rules are cross-cutting infra, checked under the
     # top-level watch_plane_liveness block below.
     #
-    # Run-window accounting (config#4474): for each MATURE expected trigger
-    # (the 4x-daily scheduler cadence below), assert an S3 drain-ledger
+    # Run-window accounting (alpha-engine-config#4474): for each MATURE expected
+    # trigger (the 4x-daily scheduler cadence below), assert an S3 drain-ledger
     # artifact's run_start landed in [T, T+ceiling+margin]. Key on the LEDGER
     # (overseer/drain_ledger/) rather than the completion marker
     # (_control/completed/) — the marker is written even on rc=1 (a crashing
@@ -378,6 +378,25 @@ playbooks:
     routed: false
     enabled: true
     executor_function: alpha-engine-canary-replay-dispatcher
+    # alpha-engine-config#4474: run-window liveness accounting. The dedicated
+    # canary-replay-liveness-probe sibling Lambda ticks every 15min and provides
+    # per-invocation health; this registry-level run_window is an additional
+    # backstop asserting that a completion marker exists for each scheduled
+    # trigger (Wednesday drills + Thursday weekly canary). The marker prefix
+    # is tmp/canary/ (written by canary_replay_spot_bootstrap.sh even on probe
+    # failure, so only missing markers = completely skipped launch = problem).
+    liveness:
+      checks:
+        - type: run_window
+          label: canary-replay
+          artifact_prefix: tmp/canary/
+          ceiling_min: 120
+          margin_min: 60
+          lookback_hours: 240
+          schedule:
+            - {hour: 15, minute: 0, dows: [3], label: "Wednesday sf-watch canary drill"}
+            - {hour: 15, minute: 30, dows: [3], label: "Wednesday ci-watch canary drill"}
+            - {hour: 9, minute: 0, dows: [4], label: "Thursday weekly canary replay"}
     wake:
       - "scheduler:alpha-engine-ci-watch-canary-drill-weekly + alpha-engine-sf-watch-canary-drill-weekly (Wednesday drills; router re-point tracked config-I2832)"
     cadence: "weekly Wednesday drills; liveness tick every 15min (eventbridge:alpha-engine-canary-replay-liveness-probe-tick)"
