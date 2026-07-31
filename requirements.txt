@@ -1,4 +1,4 @@
-boto3>=1.43.58
+boto3>=1.43.59
 pandas>=2.0
 openpyxl>=3.1.5
 pyarrow>=25.0.0
@@ -15,10 +15,10 @@ setuptools>=83.0.0
 # + a pure fallback) → Lambda-safe, no platform wheels. metron-ops#111.
 embit>=0.8.0
 numpy>=2.4.6
-feedparser>=6.0.12
+feedparser>=6.0.14
 beautifulsoup4>=4.15.0
 lxml>=6.1.1
-edgartools>=5.43.1
+edgartools>=5.44.0
 voyageai>=0.5.0
 jsonschema>=4.26.0
 arcticdb>=6.20.0
@@ -61,7 +61,7 @@ arcticdb>=6.20.0
 # nousergon-lib#226 registered the 9 states this repo's SF JSONs were
 # missing (2 Saturday + 7 EOD) and shipped in v0.124.8 — bumped to that tag
 # here (was v0.124.6) to unblock the new source-check test.
-nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.22
+nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.25
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,
@@ -79,4 +79,4 @@ nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nouse
 # cannot run the commands the SF emits. 0.18.8 is also the version that made
 # the correlation id MANDATORY (`run` exits 2 without it), so this floor pins
 # both halves of the same contract. See tests/test_sf_krepis_correlation_id.py.
-krepis==0.24.0  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
+krepis==0.24.2  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
