@@ -180,7 +180,15 @@ run aws lambda put-function-event-invoke-config \
   --region "${REGION}" \
   --query 'MaximumRetryAttempts' --output text
 
-# ----- 5. Publish alert_classes projection to S3 (alpha-engine-config#5200) -----
+# ----- 5. Auto-apply IAM policy (idempotent — #4472) ------------------------
+# Merge that changes iam-policy.json applies it without a deferred operator
+# step. Gracefully fails when the caller lacks iam:PutRolePolicy (CI auto-
+# deploy role); the drift check backstops any missed apply.
+TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}" \
+  || log "WARN: IAM auto-apply failed (expected in CI — role lacks iam:PutRolePolicy)"
+
+# ----- 6. Publish alert_classes projection to S3 (alpha-engine-config#5200) -----
 # The alert-drain box clones only alpha-engine-config, so the registry at
 # infrastructure/overseer/playbooks.yaml is unreachable from there. Publish a
 # lightweight projection (alert_classes only, not the full playbooks.yaml) to S3
