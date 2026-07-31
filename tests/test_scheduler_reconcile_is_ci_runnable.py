@@ -209,3 +209,52 @@ class TestDriftCheckerSeesEveryDeclaredRule:
         assert errors and errors[0]["kind"] == "source-error", (
             f"unbalanced arrays should produce a source-error, got {errors}"
         )
+
+
+class TestDeployAssertionIsScopedToItsOwnDispatcher:
+    """A deploy may only assert rules it can itself create.
+
+    alpha-engine-config-I5805 follow-up. The first version of the assertion
+    ran unscoped, so the groom deploy failed on three rules belonging to
+    `expense-collector` and `sf-watch-reclaim-sweep-handler` — real defects, but
+    ones this workflow has no power to fix. A deploy gate that cannot be made
+    green by the deploy is a gate everyone learns to ignore.
+    """
+
+    GROOM_DEPLOY_SH = (
+        "infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh"
+    )
+
+    def test_deploy_workflow_scopes_the_assertion(self):
+        wf = WORKFLOW.read_text(encoding="utf-8")
+        assert f"--source {self.GROOM_DEPLOY_SH}" in wf, (
+            "the post-deploy assertion must pass --source naming this "
+            "dispatcher's deploy.sh; unscoped belongs to the daily sweep only"
+        )
+
+    def test_daily_sweep_stays_unscoped(self):
+        """Fleet-wide coverage has to live somewhere, and it is the sweep."""
+        sweep = (
+            REPO_ROOT / ".github" / "workflows" / "sf-arn-drift-check.yml"
+        ).read_text(encoding="utf-8")
+        assert "check-schedule-drift.py" in sweep
+        assert "--source" not in sweep.split("check-schedule-drift.py")[1][:200], (
+            "sf-arn-drift-check.yml must run the checker UNSCOPED — it owns no "
+            "deploy, so it is the only place a sibling dispatcher's missing "
+            "schedule can surface"
+        )
+
+    def test_source_filter_selects_only_that_dispatcher(self):
+        checker = _load_checker()
+        rules, _, _ = checker.discover_codified_rules()
+        scoped = [r for r in rules if r["source_file"] == self.GROOM_DEPLOY_SH]
+        assert scoped, "no rules discovered for the groom dispatcher"
+        assert len(scoped) < len(rules), (
+            "the groom dispatcher should own a strict subset of fleet rules — "
+            "if it owns all of them the scoping test proves nothing"
+        )
+        # The 8 this dispatcher owns: 4 groom + 3 sweep + 1 reconciler.
+        assert len(scoped) == 8, (
+            f"expected 8 rules for the groom dispatcher, found {len(scoped)}: "
+            f"{sorted(r['name'] for r in scoped)}"
+        )

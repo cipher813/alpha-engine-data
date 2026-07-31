@@ -38,10 +38,21 @@ Drift cases (all exit non-zero):
   * ``source-error``      — the arrays in a deploy.sh do not pair up (a name
                             with no cron, or vice versa). The script is broken.
 
+**Scope matters.** A deploy workflow must pass ``--source`` naming its own
+deploy.sh, so it asserts only rules it can itself create. The unscoped run is
+for the daily sweep, which owns no deploy and is therefore free to fail on
+anything. Getting this backwards makes a correct deploy red forever on a
+sibling's defect, and a check that is always red is a check nobody reads. The
+first version of this script did exactly that: the groom deploy went red on
+three missing rules belonging to expense-collector and
+sf-watch-reclaim-sweep-handler (real defects, tracked as
+alpha-engine-config-I5815 — but not ones the groom deploy can fix).
+
 Usage:
-  ./infrastructure/scheduler/check-schedule-drift.py             # every discovered rule
-  ./infrastructure/scheduler/check-schedule-drift.py --rule NAME # one rule
-  ./infrastructure/scheduler/check-schedule-drift.py --json      # machine-readable
+  ./infrastructure/scheduler/check-schedule-drift.py                # every discovered rule
+  ./infrastructure/scheduler/check-schedule-drift.py --source PATH  # one deploy.sh
+  ./infrastructure/scheduler/check-schedule-drift.py --rule NAME    # one rule
+  ./infrastructure/scheduler/check-schedule-drift.py --json         # machine-readable
 
 Requires AWS creds with ``scheduler:GetSchedule`` and ``scheduler:ListSchedules``.
 In CI this runs twice, under two different identities and for two different
@@ -203,8 +214,30 @@ def _live_names_under(prefix: str) -> list[str]:
     return out.split() if out else []
 
 
-def check(rule_filter: str | None = None) -> tuple[list[dict], int]:
+def check(
+    rule_filter: str | None = None, source_filter: str | None = None
+) -> tuple[list[dict], int]:
     rules, findings, prefixes = discover_codified_rules()
+
+    if source_filter:
+        # Scope to one dispatcher. A deploy workflow may only assert the rules
+        # it is itself responsible for: the groom deploy cannot create
+        # expense-collector's schedules, so failing it on their absence turns a
+        # correct deploy red forever and trains everyone to ignore the check.
+        # Fleet-wide coverage belongs to the daily sweep, which owns no deploy.
+        rules = [r for r in rules if r["source_file"] == source_filter]
+        findings = [f for f in findings if f.get("source_file") == source_filter]
+        if not rules:
+            print(
+                f"No codified rules found in {source_filter!r} — check the path",
+                file=sys.stderr,
+            )
+            return findings, 0
+        # Prefix-scoped orphan detection is meaningless under a source filter:
+        # a prefix can be shared, and the filtered rule set is not the full
+        # denominator. Skip it rather than report every sibling as orphaned.
+        prefixes = set()
+
     if rule_filter:
         rules = [r for r in rules if r["name"] == rule_filter]
         if not rules:
@@ -256,11 +289,18 @@ def check(rule_filter: str | None = None) -> tuple[list[dict], int]:
 def main() -> int:
     ap = argparse.ArgumentParser(description="EventBridge Scheduler drift check")
     ap.add_argument("--rule", help="check a single rule by name")
+    ap.add_argument(
+        "--source",
+        help=(
+            "scope to one deploy.sh (repo-relative path). Use this in a deploy "
+            "workflow so it asserts only the rules it can itself create."
+        ),
+    )
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     args = ap.parse_args()
 
     try:
-        findings, checked = check(args.rule)
+        findings, checked = check(args.rule, args.source)
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
@@ -268,7 +308,8 @@ def main() -> int:
     if args.json:
         print(json.dumps({"checked": checked, "findings": findings}, indent=2))
     else:
-        print(f"scheduler drift — {checked} codified rule(s) checked")
+        scope = f" from {args.source}" if args.source else ""
+        print(f"scheduler drift — {checked} codified rule(s) checked{scope}")
         if not findings:
             print(
                 "  ✓ every codified rule exists live, ENABLED, "
