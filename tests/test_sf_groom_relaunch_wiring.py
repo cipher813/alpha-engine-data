@@ -103,7 +103,22 @@ def test_prep_relaunch_carries_the_fields_its_successors_read(states):
     for key in _PRESERVE_PATHS:
         assert key in params, f"PrepRelaunch must carry {key} through relaunch"
     assert params["retry_count.$"] == "States.MathAdd($.retry_count, 1)"
-    assert "fod.$" in params
+    # I5923: `fod` is CONSTRUCTED here rather than passed through verbatim,
+    # because it now carries `attempt` — the instance-type pool offset, which
+    # must advance with retry_count. A Pass cannot read its own output, so the
+    # increment is computed twice from the same input.
+    fod = params["fod"]
+    assert set(fod) == {"force_on_demand.$", "launch_decided", "attempt.$"}, (
+        f"PrepRelaunch's fod keys drifted: {sorted(fod)}"
+    )
+    assert fod["force_on_demand.$"] == "$.fod.force_on_demand", (
+        "PrepRelaunch must preserve the inbound force_on_demand — constructing "
+        "fod from scratch must not silently reset an escalation already made"
+    )
+    assert fod["attempt.$"] == params["retry_count.$"], (
+        "fod.attempt must advance with retry_count or the pool rotation stops "
+        "tracking the ladder position"
+    )
     assert st["Next"] == "CheckForceOnDemand"
 
 
@@ -113,7 +128,13 @@ def test_set_force_on_demand_carries_the_fields_its_successors_read(states):
     for key in _PRESERVE_PATHS:
         assert key in params
     assert st["Next"] == "LaunchGroomSpot"
-    assert params["fod"] == {"force_on_demand": True, "launch_decided": True}
+    assert params["fod"] == {
+        "force_on_demand": True,
+        "launch_decided": True,
+        # I5923: the on-demand rung reports its ladder position too, so the
+        # launch log and the dispatch ledger say WHICH attempt escalated.
+        "attempt.$": "$.retry_count",
+    }
 
 
 def test_no_state_references_a_retired_poll_loop_field(states):
@@ -184,15 +205,46 @@ def test_every_lane_task_declares_a_timeout(states):
     assert not missing, f"Task states with no declared timeout: {missing}"
 
 
+#: The groom dispatch cadence: 04:00, 12:00 and 20:00 UTC (EventBridge Scheduler
+#: `alpha-engine-scheduled-groom-{0400,1200,2000}-daily`, verified live
+#: 2026-07-31). The cycle-singleton guard (alpha-engine-config-I5371) skips a
+#: dispatch while an earlier execution is still RUNNING, so an execution that can
+#: outlive this interval starves the following cycle.
+_CYCLE_CADENCE_SECONDS = 8 * 3600
+
+
 def test_state_machine_declares_a_global_ceiling():
-    """A runaway backstop, not a budget — the per-lane timeout is the budget."""
+    """A runaway backstop, not a budget — the per-lane timeout is the budget.
+
+    alpha-engine-config-I5923 restated this invariant. It previously required
+    ``ceiling > lane_timeout * (max_retries + 1)`` — that every attempt in the
+    ladder could independently burn the FULL lane timeout. That held only while
+    max_retries was 1 (2 x 3h = 6h < the 7h ceiling) and it was never the real
+    requirement: a relaunch is triggered BY a death, so a sequence of N attempts
+    each running the full healthy duration cannot occur — the first such attempt
+    would have succeeded. Requiring headroom for it forced a ceiling of 12h at
+    max_retries=3, which exceeds the 8h cycle cadence and would have let one
+    stuck execution starve the next cycle through the I5371 singleton guard.
+
+    The two bounds that ARE load-bearing:
+
+      * lower — room for one attempt that dies near its own ceiling PLUS one
+        full healthy retry, so recovery is never preempted mid-run;
+      * upper — strictly under the cycle cadence, so a stuck execution can
+        never suppress the following cycle.
+    """
     doc = json.loads(_SF_PATH.read_text())
     ceiling = doc.get("TimeoutSeconds")
     assert ceiling, "the state machine must declare a top-level TimeoutSeconds"
     lane = doc["States"]["MapLaunches"]["ItemProcessor"]["States"]["LaunchGroomSpot"]
-    max_attempts = doc["States"]["MapLaunches"]["ItemSelector"]["max_retries"] + 1
-    assert ceiling > lane["TimeoutSeconds"] * max_attempts, (
-        "the global ceiling must not preempt a legitimate full relaunch sequence"
+    assert ceiling > lane["TimeoutSeconds"] * 2, (
+        "the global ceiling must leave room for one near-ceiling death plus one "
+        "full healthy retry"
+    )
+    assert ceiling < _CYCLE_CADENCE_SECONDS, (
+        "the global ceiling must stay under the 8h cycle cadence — an execution "
+        "that can outlive the interval starves the next cycle via the I5371 "
+        "cycle-singleton guard"
     )
 
 
