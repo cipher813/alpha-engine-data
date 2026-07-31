@@ -2675,3 +2675,105 @@ def test_actioned_marker_is_not_written_to_the_completed_prefix(monkeypatch):
         "lane would read as a successful one"
     )
     assert actioned, "no reconciled/ marker written; the expectation stays open"
+
+
+# ── Spot retry ladder: instance-type rotation (alpha-engine-config-I5923) ─────
+#
+# Brian ruling 2026-07-31: "we should be attempting different instance types
+# before using on demand. at least two different types. otherwise we are
+# practically defaulting to on demand during prime time."
+#
+# `krepis.ec2_spot.launch` walks `for instance_type in instance_types: for
+# subnet_id in subnets` in FIXED order and rotates only on a launch-time
+# capacity ERROR. A mid-run reclamation is not a launch error, so before this
+# change every relaunch restarted at the head of the pool — the exact type that
+# had just proved exhausted. The state-machine half (max_retries, the attempt
+# counter on both relaunch paths) is pinned in
+# tests/test_groom_instance_type_rotation.py.
+
+def test_rotation_changes_the_leading_type_each_attempt(monkeypatch):
+    """Consecutive attempts for one lane must not lead with the same type."""
+    idx = _load(monkeypatch)
+    leads = [idx._rotated_instance_types("mid-only", n)[0] for n in range(3)]
+    assert len(set(leads)) == 3, (
+        f"attempts 0..2 lead with {leads} — a relaunch must not re-enter the "
+        "capacity pool that just failed"
+    )
+
+
+def test_rotation_is_a_rotation_not_a_truncation(monkeypatch):
+    """Every type stays reachable on every attempt.
+
+    A genuinely scarce window must still be able to walk the whole pool before
+    the caller escalates to on-demand; the rotation changes ORDER, not
+    membership.
+    """
+    idx = _load(monkeypatch)
+    for attempt in range(len(idx.INSTANCE_TYPES) + 2):
+        rotated = idx._rotated_instance_types("mid-only", attempt)
+        assert sorted(rotated) == sorted(idx.INSTANCE_TYPES)
+
+
+def test_co_launched_lanes_lead_with_different_types(monkeypatch):
+    """alpha-engine-config-I4989 — the three lanes must not converge.
+
+    They co-launch with MaxConcurrency=3; sharing one ordered pool put all three
+    on the same type in the same AZ, so one capacity event took the whole cycle
+    (measured 2026-07-30 and again 2026-07-31).
+    """
+    idx = _load(monkeypatch)
+    leads = {
+        lane: idx._rotated_instance_types(lane, 0)[0]
+        for lane in ("low-only", "mid-only", "high-only")
+    }
+    assert len(set(leads.values())) == 3, f"lanes converge on one pool: {leads}"
+
+
+def test_rotation_survives_an_absent_or_malformed_attempt(monkeypatch):
+    """Degrade to the pre-rotation order, never raise.
+
+    The value only selects WHICH pool is tried first, so a launch that does not
+    happen is strictly worse than one starting at the wrong offset.
+    """
+    idx = _load(monkeypatch)
+    assert idx._resolve_attempt({}) == 0
+    assert idx._resolve_attempt({"attempt": None}) == 0
+    assert idx._resolve_attempt({"attempt": "not-a-number"}) == 0
+    assert idx._resolve_attempt({"attempt": -5}) == 0
+    assert idx._resolve_attempt({"attempt": "2"}) == 2
+    assert idx._rotated_instance_types("unknown-lane", 0) == idx.INSTANCE_TYPES
+
+
+def test_launch_passes_the_rotated_pool_to_the_launcher(monkeypatch):
+    """End-to-end: the rotation must actually reach ec2_spot.launch.
+
+    A rotation computed and then discarded at the call site is the failure this
+    guards — the whole defect being fixed is that the launcher was always handed
+    the same fixed-order list.
+    """
+    seen = {}
+
+    def _launch(types_, subnets, **kw):
+        seen["types"] = list(types_)
+        return "i-rot"
+
+    idx = _load(monkeypatch, launch_impl=_launch,
+                env={"GROOM_DISPATCH_ENABLED": "true"})
+    idx.handler({"run_mode": "full", "schedule": "0 20 * * *",
+                 "issue_filter": "mid-only", "launch_decided": True,
+                 "attempt": 2}, None)
+    expected = idx._rotated_instance_types("mid-only", 2)
+    assert seen["types"] == expected, (
+        f"launcher received {seen.get('types')}, expected the rotated pool "
+        f"{expected} — the rotation was computed and discarded"
+    )
+
+
+def test_pool_spans_more_than_one_instance_family(monkeypatch):
+    """Two types in one family is diversification in name only (I4989)."""
+    idx = _load(monkeypatch)
+    families = {t.split(".")[0] for t in idx.INSTANCE_TYPES}
+    assert len(families) >= 3, (
+        f"pool spans only {families} — separate capacity pools require separate "
+        "FAMILIES, not just separate sizes"
+    )
