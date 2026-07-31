@@ -440,6 +440,56 @@ def _resolve_force_on_demand(event: dict) -> bool:
     return bool(event.get("force_on_demand", False))
 
 
+def _resolve_attempt(event: dict) -> int:
+    """alpha-engine-config-I5923: which launch ATTEMPT this is for the lane —
+    0 for the initial launch, 1..max_retries for each bounded relaunch. Set by
+    the dispatch Step Function (``$.fod.attempt``, seeded 0 in the Map's
+    ItemSelector and bumped in PrepRelaunch/SetForceOnDemand). Drives the
+    instance-type pool rotation in :func:`_rotated_instance_types`.
+
+    Absent or malformed → 0. This is deliberately NOT fail-loud: the value only
+    selects WHICH capacity pool is tried first, so a bad value degrades to the
+    pre-rotation behaviour rather than blocking a launch. A launch that does not
+    happen is strictly worse than one that starts at the wrong pool offset."""
+    try:
+        return max(0, int(event.get("attempt", 0)))
+    except (TypeError, ValueError):
+        logger.warning("malformed attempt %r — treating as 0", event.get("attempt"))
+        return 0
+
+
+def _rotated_instance_types(tier_tag: str, attempt: int) -> list[str]:
+    """Return INSTANCE_TYPES rotated so a different family leads each attempt.
+
+    alpha-engine-config-I5923 (Brian ruling 2026-07-31: "we should be attempting
+    different instance types before using on demand. at least two different
+    types"). ``krepis.ec2_spot.launch`` walks ``for instance_type in
+    instance_types: for subnet_id in subnets`` in FIXED order and rotates only
+    on a launch-time capacity ERROR. A mid-run reclamation is not a launch
+    error, so every relaunch previously restarted at ``t4g.medium`` — the very
+    pool that had just proved exhausted. Bumping max_retries alone would have
+    produced three attempts against one capacity pool.
+
+    The offset also folds in the LANE (alpha-engine-config-I4989): the three
+    lanes co-launch with MaxConcurrency=3 and, sharing one ordered pool, all
+    landed on the same type in the same AZ — so one capacity event took the
+    whole cycle (measured 2026-07-30 and again 2026-07-31). Lane ordinal plus
+    attempt separates both axes with one formula.
+
+    The rotation is a ROTATION, not a truncation: every type stays reachable on
+    every attempt, just in a different order, so a genuinely scarce window still
+    walks the entire pool before the caller escalates to on-demand.
+    """
+    if not INSTANCE_TYPES:
+        return INSTANCE_TYPES
+    # Deterministic per-lane ordinal. sorted() rather than a hand-kept dict so a
+    # new lane cannot silently collide with an existing one's offset.
+    lanes = sorted(_VALID_ISSUE_FILTERS) if _VALID_ISSUE_FILTERS else []
+    lane_ordinal = lanes.index(tier_tag) if tier_tag in lanes else 0
+    offset = (lane_ordinal + attempt) % len(INSTANCE_TYPES)
+    return INSTANCE_TYPES[offset:] + INSTANCE_TYPES[:offset]
+
+
 def _resolve_soft_limit_min(event: dict) -> int | None:
     """Optional bounded-test override — NOT set by any of the 3 live schedules
     (their SCHED_INPUTS carry no such key), only by a manual `aws lambda invoke`
@@ -614,7 +664,8 @@ export GROOM_RUN_TOKEN={run_token}
 
 
 def _launch_instance(force_on_demand: bool = False,
-                     tier_tag: str = "") -> tuple[str, str]:
+                     tier_tag: str = "",
+                     attempt: int = 0) -> tuple[str, str]:
     """Launch the groom box; spot first, on-demand fallback on capacity exhaustion
     OR when force_on_demand (config#1645: the dispatch SF's last bounded relaunch
     attempt after repeated mid-run spot interruption — skip straight to on-demand
@@ -628,8 +679,15 @@ def _launch_instance(force_on_demand: bool = False,
     retains lane attribution for the full 90-day CloudTrail retention window.
     """
     extra_tags = {GROOM_TIER_TAG_KEY: tier_tag} if tier_tag else None
+    # I5923: rotate the pool by (lane, attempt) so a relaunch after a mid-run
+    # reclamation leads with a DIFFERENT capacity pool than the one that just
+    # died, and so co-launched lanes do not all lead with the same type.
+    instance_types = _rotated_instance_types(tier_tag, attempt)
+    logger.info("launch attempt %d for lane %s — instance-type order: %s "
+                "(force_on_demand=%s)", attempt, tier_tag or "?",
+                ",".join(instance_types), force_on_demand)
     return spot_dispatch.launch_with_fallback(
-        INSTANCE_TYPES, SUBNETS,
+        instance_types, SUBNETS,
         image_id=AMI_ID,
         key_name=KEY_NAME,
         security_group_ids=[SECURITY_GROUP],
@@ -1681,7 +1739,8 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
                        force_on_demand: bool = False,
                        queue_manifest_key: str = "",
                        backend: str = "",
-                       task_token: str = "") -> dict:
+                       task_token: str = "",
+                       attempt: int = 0) -> dict:
     """Launch + bootstrap the groom box. Fail-loud — any error RAISES.
 
     ``backend`` (quota-fallback 3-repo feature, default ``""`` = unchanged
@@ -1746,7 +1805,8 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
         logger.warning("dispatch ledger pre-launch write failed (non-fatal): %s", exc)
 
     instance_id, market = _launch_instance(force_on_demand=force_on_demand,
-                                           tier_tag=tier_tag)
+                                           tier_tag=tier_tag,
+                                           attempt=attempt)
     logger.info("launched groom box %s (%s)", instance_id, market)
 
     # config#5303: the load-bearing groom-issue-filter tag is now passed as
@@ -2544,11 +2604,13 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     soft_limit_min = _resolve_soft_limit_min(event)
     pr_budget = _resolve_pr_budget(event)
     force_on_demand = _resolve_force_on_demand(event)
+    attempt = _resolve_attempt(event)
     schedule_label = str(event.get("schedule") or "unknown")
     logger.info(
         "scheduled groom trigger: run_mode=%s model=%s issue_filter=%s soft_limit_min=%s "
-        "pr_budget=%s force_on_demand=%s schedule=%s decide_only=%s launch_decided=%s",
-        run_mode, model, issue_filter, soft_limit_min, pr_budget, force_on_demand, schedule_label,
+        "pr_budget=%s force_on_demand=%s attempt=%s schedule=%s decide_only=%s launch_decided=%s",
+        run_mode, model, issue_filter, soft_limit_min, pr_budget, force_on_demand, attempt,
+        schedule_label,
         bool(event.get("decide_only")), bool(event.get("launch_decided")),
     )
 
@@ -2624,6 +2686,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             queue_manifest_key=queue_manifest_key,
             backend=_resolve_launch_decided_backend(event),
             task_token=_task_token(event),
+            attempt=attempt,
         )
         # demand-all path did (_write_trigger_record/_write_skip_record),
         # leaving sweep-mode (and any other launch_decided) dispatches with
@@ -2773,5 +2836,6 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         run_mode, schedule_label, model, issue_filter, soft_limit_min, pr_budget, force_on_demand,
         queue_manifest_key=queue_manifest_key,
         backend=backend,
+        attempt=attempt,
     )
     return {"groom": result}
