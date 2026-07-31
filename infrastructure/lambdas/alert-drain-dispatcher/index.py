@@ -105,7 +105,14 @@ _BOOL_RE = re.compile(r"^(true|false)$")
 _TRIGGER_RE = re.compile(r"^[a-z0-9_-]{0,64}$")
 # config-I3293 — optional registry-declared model, injected by the overseer
 # router from playbooks.yaml. Empty = absent = run-script inline default.
-_MODEL_RE = re.compile(r"^(claude-[a-z0-9.-]{1,60})?$")
+# alpha-engine-config-I4478/I4516: provider-agnostic, mirroring
+# scheduled-groom-dispatcher's long-standing pattern. Was `^claude-...$`, which
+# structurally could NOT carry the DeepSeek model IDs the fleet actually runs
+# (2026-07-24 zero-Anthropic-model ruling) — so the registry, which is the
+# declared SSoT for each playbook's model, could not express the live policy.
+# Still a strict anchored allow-list of shell-safe characters: the value is
+# interpolated into the bootstrap command, so the injection guard is the point.
+_MODEL_RE = re.compile(r"^([a-z0-9][a-z0-9._-]{0,63})?$")
 
 
 class _InvalidEvent(ValueError):
@@ -133,8 +140,27 @@ def _resolve_event_fields(event: dict) -> tuple[str, str, str, str]:
 
 def _bootstrap_command(run_id: str, is_drill: str, model: str = "") -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec the
-    alert_drain_spot_bootstrap.sh entrypoint. Prelude failure shuts the box
-    down (mirrors the sibling dispatchers' prelude fail() trap exactly).
+    UNIFIED overseer_spot_bootstrap.sh with ``--playbook alert-drain``.
+    Prelude failure shuts the box down (mirrors the sibling dispatchers'
+    prelude fail() trap exactly).
+
+    Cutover, alpha-engine-config-I5284 / EPIC I4992 step 2. alert-drain is
+    first because it is the simplest agent playbook and runs 4x daily, which
+    is the fastest real evidence available — NOT because it is broken. The
+    EPIC's original rationale ("already at 100% failure, nothing to regress")
+    expired when config-I4996 restored it; it has since completed 12
+    consecutive runs. So this is a cutover of a WORKING component and carries
+    a revert lever accordingly: restoring the two lines below to
+    ``infrastructure/alert_drain_spot_bootstrap.sh --run-id … --is-drill …``
+    returns to the legacy path, which stays on disk until a real run proves
+    the unified one.
+
+    ``run_id`` and ``is_drill`` are EXPORTED rather than passed as flags: the
+    unified bootstrap reads ``DRAIN_RUN_ID`` / ``DRAIN_IS_DRILL`` from the
+    environment (per-playbook identity is registry data, not argv) and
+    forwards unrecognised argv to the run script. Passing them as flags would
+    leave both unset — the run script would invent a ``<ts>-adhoc`` run id and,
+    worse, read the drill flag as false and drain the real queue.
 
     ``model`` (config-I3293) is the registry-declared agent model injected by
     the overseer router; exported as DRAIN_MODEL for the bootstrap's runuser
@@ -158,8 +184,9 @@ git clone --depth 1 --branch {DRAIN_CONFIG_BRANCH} \
   "https://x-access-token:${{PAT}}@github.com/{DRAIN_CONFIG_REPO}.git" \
   /home/ec2-user/alpha-engine-config || fail "clone failed"
 cd /home/ec2-user/alpha-engine-config
-exec bash infrastructure/alert_drain_spot_bootstrap.sh \
-  --run-id "{run_id}" --is-drill "{is_drill}"
+export DRAIN_RUN_ID="{run_id}"
+export DRAIN_IS_DRILL="{is_drill}"
+exec bash infrastructure/overseer_spot_bootstrap.sh --playbook alert-drain
 """
 
 

@@ -44,8 +44,6 @@ _SF_WEEKDAY = _INFRA / "step_function_daily.json"
 _SF_EOD = _INFRA / "step_function_eod.json"
 # alpha-engine-config-I2544/I2545: the two child SFs split out of the
 
-_SF_ROLE_POLICY = _INFRA / "iam" / "alpha-engine-step-functions-role.json"
-
 
 def _flatten_states(sf_doc: dict) -> dict:
     """Flatten top-level + every Parallel branch's states into one dict.
@@ -80,6 +78,12 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # config#693 (L4595): pre-spend pipeline-contract preflight gate, wired
     # directly after LibPinDriftGate's pass-through (predictor-inference Lambda).
     "PipelineContractCheck": frozenset({"action"}),
+    # config#2348: pre-spend evaluator Lambda-SHA drift gate pair, wired
+    # directly after PipelineContractGate's pass-through. Two separate Lambda
+    # invokes (grading, then director) — each checks its OWN :live alias's
+    # baked GIT_SHA against origin/main independently.
+    "EvaluatorDeployDriftCheck": frozenset({"action"}),
+    "EvaluatorDirectorDeployDriftCheck": frozenset({"action"}),
     # config#1824 weekly run-day gate (pure calendar; mirrors LibPinDriftCheck shape).
     "WeeklyRunDayGate": frozenset({"action"}),
     "Scanner": frozenset({"dry_run_llm.$", "run_date.$"}),
@@ -97,7 +101,6 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # alpha-engine-config-I2515 Phase B: keeps the no_agent champion-baseline
     # shadow alive for the producer leaderboard post graph-runner removal.
     "ChallengerShadow": frozenset({"mode", "date.$"}),
-    "DataPhase2": frozenset({"dry_run.$", "phase"}),
     "EvalJudgeSubmitFirstSaturday": frozenset(
         {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days"}
     ),
@@ -134,6 +137,12 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # action_plan.json; flag-gated (DIRECTOR_ENABLED) + non-fatal (own Catch).
     # dry_run.$=$.research_dry → no-Opus / no-write probe on the preflight (L4504).
     "Director": frozenset({"date.$", "dry_run.$"}),
+    # config#2248: launches the launcher spot that replaces the always-on
+    # dashboard box as the $.ec2_instance_id source. Empty Payload — this
+    # Lambda takes no execution-input-derived args today (force_on_demand
+    # is reserved for a future retry loop, not currently threaded from the
+    # SF); it reads its own config entirely from Lambda env vars.
+    "DispatchWeeklyFreshnessSpot": frozenset(),
 }
 
 # config#1811: the liveness-aware SSM poll iteration — one shared payload
@@ -302,44 +311,11 @@ class TestWeekdaySFPayloadFieldSetsClosed:
         )
 
 
-# ── Finding 3: SF role has exactly one lambda:InvokeFunction Statement ──
-
-
-class TestSFRoleInvokeFunctionStatementCount:
-    """``alpha-engine-step-functions-role`` declares
-    ``lambda:InvokeFunction`` in EXACTLY ONE Statement.
-
-    Multiple statements with overlapping ARN patterns would silently
-    grant additional privileges beyond the canonical list — e.g. a
-    stale Statement from a pre-2026 refactor with a hardcoded
-    deprecated ARN would let the SF invoke a Lambda it shouldn't.
-
-    The existing ``test_every_invoked_lambda_has_iam_grant`` walks
-    every Statement's resources; that catches missing grants but NOT
-    stale ones. This test closes the other half.
-    """
-
-    def test_exactly_one_invoke_function_statement(self):
-        doc = json.loads(_SF_ROLE_POLICY.read_text())
-        invoke_stmts = []
-        for i, stmt in enumerate(doc.get("Statement", [])):
-            actions = stmt.get("Action")
-            actions_list = (
-                [actions] if isinstance(actions, str) else (actions or [])
-            )
-            if "lambda:InvokeFunction" in actions_list:
-                invoke_stmts.append(
-                    (i, stmt.get("Sid"), len(actions_list))
-                )
-        assert len(invoke_stmts) == 1, (
-            f"Expected EXACTLY 1 Statement with lambda:InvokeFunction in "
-            f"alpha-engine-step-functions-role.json; found "
-            f"{len(invoke_stmts)}: {invoke_stmts}. Multiple statements "
-            "with overlapping ARN patterns silently grant extra "
-            "privileges — consolidate into one or document a non-overlap "
-            "guarantee at PR time."
-        )
-
+# TestSFRoleInvokeFunctionStatementCount (exactly one lambda:InvokeFunction
+# Statement) was ported to nous-ergon-ops — the SF role policy
+# (infrastructure/iam/alpha-engine-step-functions-role.json) now lives there.
+# The invariant (single statement preventing stale-grant drift) is enforced
+# in nous-ergon-ops/tests/ per the infra/drop-iam-moved-to-ops cleanup.
 
 # ── Finding 5: FLOW_DOCTOR_ENABLED appears EARLY in SSM command blocks ──
 
@@ -596,6 +572,16 @@ class TestEODSFTopLevelFieldsClosed:
             "heal_replay_dispatch_failed_notify",
             "heal_converged_notify",
             "heal_nonconvergent_notify",
+            # config-I5489: postclose chains the weekly pipeline as an
+            # "exercise" run on every trading day. LaunchWeeklyExerciseRun
+            # emits the fire-and-forget StartExecution result (or its Catch
+            # error); WeeklyExerciseLaunchFailed emits the alert's SNS
+            # ResultPath (and its own Catch error, so a failure to alert
+            # about a failure to launch still cannot strand the execution).
+            "weekly_exercise_run",
+            "weekly_exercise_launch_error",
+            "weekly_exercise_launch_notify",
+            "weekly_exercise_launch_notify_error",
         }
     )
 
@@ -656,7 +642,13 @@ class TestEODSFTopLevelFieldsClosed:
 # REVERSED — ModelZooSelect is back inline in Branch B (the Sunday child SF and
 # the advisory child SF are retired; the weekly SF runs the full pre-split
 # pattern again, all-Saturday).
-_EXPECTED_SATURDAY_SPOT_STATE_COUNT = 10
+# 10 → 11 on alpha-engine-config-I5759 (2026-07-31): DataPhase2 was
+# repointed from a lambda:invoke to the spot dispatch->poll quartet. Its
+# wall clock is a provider-imposed serial floor (2 Finnhub calls/ticker x
+# a 1.1s sleep held inside a module-global lock = 2.2 s/ticker, measured
+# flat at 903 tickers), so ~33 min against Lambda's 900s HARD maximum —
+# a ceiling no further bump can raise.
+_EXPECTED_SATURDAY_SPOT_STATE_COUNT = 11
 
 
 def _spot_states(sf_path: Path) -> list[str]:
@@ -688,14 +680,14 @@ def _spot_states(sf_path: Path) -> list[str]:
 
 
 class TestSaturdaySFSpotStateCount:
-    """Closes the spot-state set as exactly 9 (see the count-history
+    """Closes the spot-state set at the declared count (see the count-history
     changelog comment above `_EXPECTED_SATURDAY_SPOT_STATE_COUNT`).
     Pre-rewire test_sf_friday_shell_run_wiring.py parametrizes over the
     expected names but doesn't assert an EXACT count — an orphaned legacy
     spot state from an incomplete refactor would slip through.
     """
 
-    def test_exactly_nine_spot_states_in_saturday_sf(self):
+    def test_spot_state_count_is_exactly_the_declared_count(self):
         spots = _spot_states(_SF_SATURDAY)
         assert len(spots) == _EXPECTED_SATURDAY_SPOT_STATE_COUNT, (
             f"Saturday SF should have EXACTLY "

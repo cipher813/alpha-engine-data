@@ -11,8 +11,18 @@ that triggers the autonomous resilience agent (diagnose→fix→merge→rerun) i
 **Per-pipeline registry.** ``PIPELINES`` maps each SF name → its watch-log
 prefix + repository_dispatch event type, so the GHA workflow + dashboard filter
 by cadence and each pipeline carries its OWN kill-switch (in the agent charter).
-weekday + EOD ship PROPOSE-ONLY and soak before autonomous-merge is flipped on,
-independently of Saturday. Fan-out is additive: register a pipeline here, add its
+**All three cadences run autonomous-merge=true** (since 2026-07-07, config#1616).
+PROPOSE-ONLY is now only reachable by an operator re-flipping the per-cadence
+`/alpha-engine/<slug>_sf_watch/autonomous_merge_enabled` kill-switch; it is not
+a default and there is no soak in progress. (This paragraph previously said
+"weekday + EOD ship PROPOSE-ONLY and soak before autonomous-merge is flipped
+on" — that was written before #1616 and was three weeks stale by 2026-07-29,
+when it caused a session to report a nonexistent operator soak and to treat
+widening weekday/EOD autonomy as a decision still owed. The charter
+`alpha-engine-config/.github/sf-watch-prompt.md` is authoritative for autonomy
+and budget; this docstring is a pointer, not a second source.)
+
+Fan-out is additive: register a pipeline here, add its
 ARN to the single EventBridge rule (deploy.sh), widen the IAM ARNs.
 
 **Why this is NOT a second notifier.** The fleet already has
@@ -174,7 +184,12 @@ DISPATCH_REPO = os.environ.get("DISPATCH_REPO", "nousergon/alpha-engine-config")
 # OPERATOR-OWNED runtime flag like AGENT_DISPATCH_ENABLED (deploy.sh preserves
 # it across redeploys). Flip gated on the reshaped weekly SF's first live run
 # (gate:weekly-sf) — see alpha-engine-config-I2823.
-M2_DISPATCH_TARGET = os.environ.get("M2_DISPATCH_TARGET", "repository_dispatch")
+# alpha-engine-config-I2830 (applied 2026-07-27): default is `overseer`.
+# The router dispatches by PLAYBOOK rather than event type, so it listens for
+# all three pipelines — this default is what gives weekday/EOD SF coverage,
+# with no sf-watch.yml gate edit. Kept in lockstep with deploy.sh's two
+# defaults (pinned by test_m2_default_is_overseer_in_code_and_deploy).
+M2_DISPATCH_TARGET = os.environ.get("M2_DISPATCH_TARGET", "overseer")
 OVERSEER_FUNCTION = os.environ.get("OVERSEER_FUNCTION", "alpha-engine-overseer-dispatcher")
 # Dedicated fine-grained PAT (SecureString) scoped to the SF-path repos, shared
 # across pipelines. Read at dispatch time only — never logged.
@@ -209,7 +224,12 @@ PIPELINES: dict[str, dict[str, object]] = {
         "label": "Pre-open Trading",
         "watch_prefix": "consolidated/weekday_sf_watch",
         "dispatch_event_type": "weekday-sf-failure",
-        "has_listener": True,
+        # I4510: FALSE under repository_dispatch — sf-watch.yml gates its
+        # dispatch job to saturday-sf-failure only (config#2004), so this event
+        # type has no consumer on the GitHub path. `_has_listener()` overrides
+        # this to True when M2_DISPATCH_TARGET=overseer, where the router IS
+        # the listener for every pipeline.
+        "has_listener": False,
         # config#1900 — fast-path signature scope for THIS pipeline only.
         # `poll_states` are the SSM-poll Task states whose Lambda output carries
         # the raw host-death evidence (status/status_details/ping_status);
@@ -245,7 +265,12 @@ PIPELINES: dict[str, dict[str, object]] = {
         "label": "Post-close Trading",
         "watch_prefix": "consolidated/eod_sf_watch",
         "dispatch_event_type": "eod-sf-failure",
-        "has_listener": True,
+        # I4510: FALSE under repository_dispatch — sf-watch.yml gates its
+        # dispatch job to saturday-sf-failure only (config#2004), so this event
+        # type has no consumer on the GitHub path. `_has_listener()` overrides
+        # this to True when M2_DISPATCH_TARGET=overseer, where the router IS
+        # the listener for every pipeline.
+        "has_listener": False,
     },
     # alpha-engine-config-I2890 (2026-07-17): the ne-weekly-advisory-pipeline
     # (I2544) and ne-modelzoo-sunday-pipeline (I2545) child SFs were retired —
@@ -393,9 +418,43 @@ def _prior_dispatch_count(existing_events: list[dict]) -> int:
     return sum(1 for ev in existing_events if ev.get("action") in _BUDGET_CONSUMING_ACTIONS)
 
 
-def _max_dispatches(cadence_slug: str) -> int:
+def _pipeline_role(describe_resp: dict | None) -> str:
+    """``pipeline_role`` from the failed execution's input, or "".
+
+    Mirrors :func:`_is_preflight`'s parsing exactly — same field, same
+    fail-soft posture. An unreadable input yields "", which routes to the
+    CONSERVATIVE ceiling below rather than the permissive one.
+    """
+    if not describe_resp:
+        return ""
+    try:
+        payload = json.loads(describe_resp.get("input") or "{}")
+    except (ValueError, TypeError):
+        return ""
+    role = payload.get("pipeline_role")
+    return role.strip().lower() if isinstance(role, str) else ""
+
+
+def _max_dispatches(cadence_slug: str, pipeline_role: str = "") -> int:
     """Per-cadence dispatch ceiling (config#2269) — 8 for saturday, 2 for
-    weekday/eod, conservative 2 for any unruled future cadence."""
+    weekday/eod, conservative 2 for any unruled future cadence.
+
+    alpha-engine-config-I5502: ``cadence_slug`` is a FROZEN PER-PIPELINE
+    label, not a day derivation, so every run of ne-weekly-freshness-pipeline
+    resolves to "saturday" — including the weekday EXERCISE runs that
+    alpha-engine-config-I5489 chains off postclose. Because the budget is
+    keyed on (cadence, pipeline, run_date) and each trading day brings a new
+    run_date, the Saturday ceiling of 8 would REFILL DAILY: up to 40 agent
+    dispatches a week where 8 was ruled, each one a spot box plus a frontier
+    model run, against a pipeline that currently fails ~4 runs in 5.
+
+    An exercise run is a debugging cycle, not the week's belief refresh, so
+    it takes the conservative ceiling. The real Saturday run
+    (``pipeline_role="weekly"``, or absent on manual/recovery invocations)
+    is unchanged.
+    """
+    if pipeline_role == "exercise":
+        return _DEFAULT_MAX_DISPATCHES
     return SF_WATCH_MAX_DISPATCHES.get(cadence_slug, _DEFAULT_MAX_DISPATCHES)
 
 
@@ -748,7 +807,8 @@ def _build_event_record(
     is_preflight = _is_preflight(describe_resp)
     already_escalated = bool(existing_events) and _already_escalated_today(existing_events)
     prior_dispatches = _prior_dispatch_count(existing_events or [])
-    dispatch_ceiling = _max_dispatches(str(cfg.get("cadence_slug", "")))
+    pipeline_role = _pipeline_role(describe_resp)
+    dispatch_ceiling = _max_dispatches(str(cfg.get("cadence_slug", "")), pipeline_role)
     budget_exhausted = prior_dispatches >= dispatch_ceiling
     if operator_abort:
         dispatch_suppressed = "operator_abort"
@@ -760,7 +820,7 @@ def _build_event_record(
         dispatch_suppressed = None
     will_dispatch = (
         AGENT_DISPATCH_ENABLED
-        and bool(cfg.get("has_listener", True))
+        and _has_listener(cfg)  # I4510: mode-aware
         and dispatch_suppressed is None
     )
     record: dict = {
@@ -780,7 +840,11 @@ def _build_event_record(
         "lane": None,
         "action": "dispatch" if will_dispatch else "observe",
         "agent_dispatch_enabled": AGENT_DISPATCH_ENABLED,
-        "has_listener": bool(cfg.get("has_listener", True)),
+        # I4510: the watch-log must record whether a listener REALLY existed
+        # for this dispatch, not a static flag — the 2026-07-27 record said
+        # has_listener:true / action:"dispatch" for a weekday failure that no
+        # job could ever consume, making the audit trail itself false.
+        "has_listener": _has_listener(cfg),
         # config#1827/preflight: null unless the dispatch was withheld for a
         # recorded reason; "operator_abort"/"preflight" make the withholding
         # auditable in the watch-log and on the dashboard.
@@ -791,6 +855,11 @@ def _build_event_record(
         # (additive fields — S3 schema contract allows ADD only).
         record["prior_dispatch_count"] = prior_dispatches
         record["dispatch_ceiling"] = dispatch_ceiling
+        # I5502: WHY the ceiling is what it is. Without this, an exercise run
+        # capped at 2 and a Saturday run capped at 8 are indistinguishable in
+        # the watch-log, and "why did this only get 2 attempts" costs an
+        # execution-history dig to answer.
+        record["pipeline_role"] = pipeline_role or None
     return record
 
 
@@ -879,7 +948,7 @@ def _notify(record: dict, key: str, pipeline_name: str, dispatch: dict) -> bool:
     if not _watch_is_acting(record, dispatch):
         return False
     cfg = PIPELINES.get(pipeline_name) or {}
-    has_listener = bool(cfg.get("has_listener", True))
+    has_listener = _has_listener(cfg)  # I4510: mode-aware, not a static flag
     cadence = _pipeline_label(pipeline_name)
     label = f"{cadence} Preflight SF" if record["is_preflight"] else f"{cadence} SF"
     # config#1827: an operator-abort suppresses the dispatch even when the flag +
@@ -1010,6 +1079,38 @@ def _get_github_pat() -> str:
     return resp["Parameter"]["Value"]
 
 
+def _has_listener(cfg: dict) -> bool:
+    """Is there actually something on the other end of a dispatch for this
+    pipeline, RIGHT NOW, given the live routing mode?
+
+    alpha-engine-config-I4510. The static per-pipeline `has_listener` flag was
+    hardcoded True for all three pipelines, but `.github/workflows/sf-watch.yml`
+    gates its dispatch job to `saturday-sf-failure` only (the 2026-07-08
+    Saturday-only narrowing, config#2004). So a weekday/EOD failure POSTed a
+    repository_dispatch that GitHub accepted (204) and no job ever consumed --
+    while Telegram announced "autonomous fix ACTIVE -- resilience agent
+    dispatched". On 2026-07-27 that claim was made about a pre-open failure 23
+    minutes before market open with nothing whatsoever behind it.
+
+    The answer genuinely depends on the routing mode, which is why a static
+    flag could never be right:
+
+      M2_DISPATCH_TARGET=overseer            -> the router is pipeline-agnostic
+                                                (it dispatches by playbook, not
+                                                by event type), so EVERY
+                                                pipeline has a live listener.
+      M2_DISPATCH_TARGET=repository_dispatch -> depends on sf-watch.yml's job
+                                                gate, i.e. the static flag.
+
+    This also makes flipping M2_DISPATCH_TARGET to `overseer` the single action
+    that enables weekday/EOD coverage -- no GHA gate edit -- matching the
+    standing direction to cede sf-watch dispatch to the Overseer rather than
+    patch the legacy path."""
+    if M2_DISPATCH_TARGET == "overseer":
+        return True
+    return bool(cfg.get("has_listener", True))
+
+
 def _maybe_dispatch_agent(
     record: dict, run_date: str, key: str, cfg: dict, pipeline_name: str, sm_arn: str
 ) -> dict:
@@ -1031,7 +1132,7 @@ def _maybe_dispatch_agent(
         return {"dispatched": False, "reason": record["dispatch_suppressed"]}
     if not AGENT_DISPATCH_ENABLED:
         return {"dispatched": False, "reason": "disabled"}
-    if not cfg.get("has_listener", True):
+    if not _has_listener(cfg):
         # config#1535: don't fire a repository_dispatch that no workflow is
         # listening for — a wasted HTTP call, and inconsistent with the
         # notification copy correctly saying "no autonomous fix" for this

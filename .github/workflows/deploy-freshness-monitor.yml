@@ -17,7 +17,7 @@ name: Deploy freshness-monitor
 # IAM: the github-actions-lambda-deploy role's LambdaUpdate grant was collapsed
 # from an enumerated function list to arn:...:function:alpha-engine-* (which now
 # covers this function and freed ~4.6KB under the 10,240-char inline-policy
-# ceiling). Apply via infrastructure/iam/apply.sh at merge.
+# ceiling). Apply via nous-ergon-ops/infrastructure/iam/apply.sh at merge.
 
 on:
   push:

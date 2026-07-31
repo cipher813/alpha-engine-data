@@ -1,0 +1,74 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-overseer-backstop-responder:*"
+    },
+    {
+      "Sid": "TelegramSecretsSSM",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter"
+      ],
+      "Resource": [
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_BOT_TOKEN",
+        "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_CHAT_ID"
+      ]
+    },
+    {
+      "Sid": "ReadPlaneState",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:GetFunctionConfiguration",
+        "sqs:GetQueueUrl",
+        "sqs:GetQueueAttributes",
+        "cloudwatch:GetMetricStatistics"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "RecoveryActionsOnlyTheseTwoFunctions",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:InvokeFunction"
+      ],
+      "Resource": [
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-overseer-dispatcher",
+        "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-overseer-liveness-probe"
+      ]
+    },
+    {
+      "Sid": "CooldownStateOnly",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research/overseer/_backstop/*"
+    },
+    {
+      "Sid": "ReadLedgerFreshnessOnly",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "overseer/drain_ledger/*",
+            "overseer/dispatch_ledger/*",
+            "overseer/_backstop/*"
+          ]
+        }
+      }
+    }
+  ]
+}

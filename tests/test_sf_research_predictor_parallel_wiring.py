@@ -274,8 +274,46 @@ class TestBranchAContents:
         assert branch_a["CheckSkipDataPhase2"]["Default"] == "DataPhase2"
 
     def test_eval_chain_after_dataphase2_in_branch_a(self, branch_a):
-        assert branch_a["DataPhase2"]["Next"] == "CheckSkipEvalJudge"
+        # alpha-engine-config-I5759: DataPhase2 dispatches to spot, so its
+        # success edge is the Success arm of CheckDataPhase2Status rather
+        # than DataPhase2.Next. Same shape as RAGIngestion above it.
+        assert branch_a["DataPhase2"]["Next"] == "InitDataPhase2PollCount"
+        success_arm = [
+            c for c in branch_a["CheckDataPhase2Status"]["Choices"]
+            if c.get("StringEquals") == "Success"
+        ]
+        assert len(success_arm) == 1
+        assert success_arm[0]["Next"] == "CheckSkipEvalJudge"
         assert branch_a["CheckSkipEvalJudge"]["Default"] == "ComputeEvalCadence"
+
+    def test_data_phase2_poll_loop_is_bounded(self, branch_a):
+        """alpha-engine-config-I5687: a poll loop added AFTER that finding
+        ships with its budget, and budget exhaustion must not converge on the
+        success path — an exhausted bound that reaches CheckSkipEvalJudge
+        would render a timed-out collection as a completed one."""
+        assert branch_a["InitDataPhase2PollCount"]["Result"] == 0
+        assert branch_a["InitDataPhase2PollCount"]["ResultPath"] == "$.data_phase2_polls"
+        bound = [
+            c for c in branch_a["CheckDataPhase2Status"]["Choices"]
+            if "And" in c
+        ]
+        assert len(bound) == 1, "the bounded in-progress arm is missing"
+        caps = [
+            cond["NumericLessThan"] for cond in bound[0]["And"]
+            if "NumericLessThan" in cond
+        ]
+        assert caps == [216], f"poll bound changed to {caps} without updating this test"
+        # The counter must actually advance, or the bound is decorative.
+        assert (
+            branch_a["DataPhase2Wait"]["Parameters"]["polls.$"]
+            == "States.MathAdd($.data_phase2_polls, 1)"
+        )
+        assert branch_a["MergeDataPhase2PollCount"]["ResultPath"] == "$.data_phase2_polls"
+        # Exhaustion falls to the retry gate, never to the judge chain.
+        assert branch_a["CheckDataPhase2Status"]["Default"] == "DataPhase2RetryGate"
+        assert branch_a["DataPhase2RetryGate"]["Choices"][0]["Next"] == (
+            "PublishResearchFailureImmediate"
+        )
 
     def test_eval_judge_quartet_preserved(self, branch_a):
         assert branch_a["EvalJudgePollChoice"]["Type"] == "Choice"
@@ -416,38 +454,12 @@ class TestBranchBContents:
         )
         assert skipped["ResultPath"] == complete["ResultPath"]
 
-    def test_validation_head_object_key_is_iam_granted(self, branch_b):
-        """Cross-guard: the manifest key the SF HeadObjects must be granted
-        to the SF role in infrastructure/iam/alpha-engine-step-functions-
-        role.json (Sid HeadPredictorWeightsManifest) — the aws-sdk:s3 task
-        runs AS the state machine role, and a missing grant only surfaces
-        live as an AccessDenied on the recovery path (the worst time)."""
-        iam_path = (
-            _REPO_ROOT / "infrastructure" / "iam"
-            / "alpha-engine-step-functions-role.json"
-        )
-        policy = json.loads(iam_path.read_text())
-        key = branch_b["ValidatePredictorSkipWeightsFresh"]["Parameters"]["Key"]
-        bucket = branch_b["ValidatePredictorSkipWeightsFresh"]["Parameters"][
-            "Bucket"
-        ]
-        expected_arn = f"arn:aws:s3:::{bucket}/{key}"
-        grants = [
-            s for s in policy["Statement"]
-            if s.get("Effect") == "Allow"
-            and "s3:GetObject" in (
-                s["Action"] if isinstance(s["Action"], list) else [s["Action"]]
-            )
-            and expected_arn in (
-                s["Resource"]
-                if isinstance(s["Resource"], list) else [s["Resource"]]
-            )
-        ]
-        assert grants, (
-            f"SF role policy lacks s3:GetObject on {expected_arn} — the "
-            f"ValidatePredictorSkipWeightsFresh HeadObject would "
-            f"AccessDenied live."
-        )
+    # test_validation_head_object_key_is_iam_granted was ported to
+    # nous-ergon-ops — the SF role policy
+    # (infrastructure/iam/alpha-engine-step-functions-role.json) now lives
+    # there. The invariant (Sid HeadPredictorWeightsManifest s3:GetObject
+    # grant) is enforced in nous-ergon-ops/tests/ per the
+    # infra/drop-iam-moved-to-ops cleanup.
 
     def test_predictor_status_poll_quartet_preserved(self, branch_b):
         assert branch_b["PredictorTraining"]["Next"] == (
@@ -720,25 +732,90 @@ class TestPerBranchErrorIsolation:
         ]
 
     def test_thinktank_coverage_is_non_blocking(self, branch_a):
-        """config#3218 (§119 rule 3): CLAUDE.md asserts ThinkTankCoverage's
-        gap_fill top-up is observe-only and must never halt the pipeline —
-        this pins that claim against the live SF wiring instead of leaving
-        it a doc-only assumption. The Catch must route to the SAME state as
-        the success path's Next (CheckSkipRegimeRetrospectiveEval), so a
-        thesis-generation failure is silently absorbed rather than
-        detouring the run onto a different, untested path."""
+        """config#3218 (§119 rule 3): the gap_fill top-up is observe-only and
+        must never halt the pipeline.
+
+        alpha-engine-config-I5758 changed HOW that holds. It used to be
+        "absorbed silently" — the Catch pointed straight at the success path's
+        Next. That silence is precisely why 13 consecutive days of 900s Lambda
+        timeouts (2026-07-17 onward) went unnoticed while the
+        thinktank_coverage challenger arm was absent from the loop.
+
+        Non-blocking is now reached VIA ThinkTankDegraded, which sets a visible
+        flag first. weekly-sf-policy.md §2.3 permits fail-open only with a flag
+        that propagates to the terminal notification; champion-challenger-policy
+        §3 requires a cycle with no arm output to be recorded as a MISS rather
+        than omitted. So this asserts the PROPERTY (converges to the shared
+        successor without failing the branch) plus the flag, not a literal
+        target."""
         state = branch_a["ThinkTankCoverage"]
         catch_targets = [c["Next"] for c in state["Catch"]]
-        assert catch_targets == ["CheckSkipRegimeRetrospectiveEval"]
-        assert catch_targets == [state["Next"]]
+        assert catch_targets == ["ThinkTankDegraded"]
         assert "BranchAFailed" not in catch_targets
-        # Failure output must be quarantined off the success ResultPath so a
-        # caught error can never masquerade as a real thinktank_result.
+
+        degraded = branch_a["ThinkTankDegraded"]
+        # The flag itself — a fail-open without one is what this replaced.
+        assert degraded["Result"] is True
+        assert degraded["ResultPath"] == "$.thinktank_degraded"
+        # ...and it converges on the same successor the success path reaches,
+        # so the branch is never detoured onto an untested path.
+        assert degraded["Next"] == "CheckSkipRegimeRetrospectiveEval"
+        assert (
+            branch_a["CheckThinkTankStatus"]["Choices"][0]["Next"]
+            == "CheckSkipRegimeRetrospectiveEval"
+        )
+
+        # Failure output must be quarantined off the dispatch ResultPath so a
+        # caught error can never masquerade as a real dispatch result.
         assert [c["ErrorEquals"] for c in state["Catch"]] == [["States.ALL"]]
-        assert state["ResultPath"] == "$.thinktank_result"
+        assert state["ResultPath"] == "$.thinktank_dispatch"
         assert all(
             c["ResultPath"] != state["ResultPath"] for c in state["Catch"]
         )
+
+    def test_thinktank_runs_on_spot_not_a_ceilinged_lambda(self, branch_a):
+        """alpha-engine-config-I5758 / I5208, ARCHITECTURE §47: a long-running
+        agent loop runs on owned compute behind a dispatcher, never on a
+        metered/ceilinged runtime.
+
+        The regression this pins is specific and already happened: the spot
+        migration shipped for the DAILY cadence while this state kept invoking
+        alpha-engine-research-thinktank directly at TimeoutSeconds 900 — the
+        AWS Lambda maximum — so the weekly SF re-entered the exact failure the
+        migration had fixed. Measured 2026-07-30 on watch-rerun-2026-07-29-1:
+        two States.Timeouts, 30 min of wall-clock, zero output."""
+        state = branch_a["ThinkTankCoverage"]
+        fn = state["Parameters"]["FunctionName"]
+        assert fn == "alpha-engine-thinktank-spot-dispatcher", (
+            f"ThinkTankCoverage must dispatch to spot, not invoke {fn!r} "
+            "directly — 900s is the AWS Lambda maximum and this workload does "
+            "not fit in it"
+        )
+        assert "alpha-engine-research-thinktank" not in fn
+        # The dispatcher launches and returns; it never babysits the run, so
+        # this Task's timeout bounds a LAUNCH, not the agent loop.
+        assert state["TimeoutSeconds"] <= 600
+
+    def test_thinktank_poll_loop_is_bounded(self, branch_a):
+        """alpha-engine-config-I5687: the other 15 poll loops in this pipeline
+        are unbounded and instance-liveness-blind, which cost 5h11m of blind
+        polling on 2026-07-29. A new loop ships bounded rather than adding a
+        16th instance of that defect.
+
+        Also pins that the counter actually ADVANCES — a bound whose counter
+        never increments is an unbounded loop wearing a bound."""
+        choice = branch_a["CheckThinkTankStatus"]
+        in_progress = choice["Choices"][1]["And"]
+        # config#2275: the IsPresent guard must PRECEDE the dereference.
+        assert in_progress[0]["Variable"] == "$.thinktank_polls"
+        assert in_progress[0]["IsPresent"] is True
+        bound = [c for c in in_progress if "NumericLessThan" in c]
+        assert bound and bound[0]["NumericLessThan"] > 0
+        # Exhausting the budget must degrade, never spin.
+        assert choice["Default"] == "ThinkTankDegraded"
+        # The increment exists and feeds back into the same variable.
+        assert "States.MathAdd" in branch_a["ThinkTankWait"]["Parameters"]["polls.$"]
+        assert branch_a["MergeThinkTankPollCount"]["ResultPath"] == "$.thinktank_polls"
 
     def test_predictor_failure_routes_to_branch_b_failed(self, branch_b):
         """PredictorTraining failures (Task Catch + WaitForPredictorTraining

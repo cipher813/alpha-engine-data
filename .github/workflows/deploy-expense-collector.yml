@@ -9,10 +9,10 @@ name: Deploy expense-collector
 # still requires an operator to run `deploy.sh --bootstrap` by hand, for the
 # same reason as the sibling dispatchers: the github-actions-lambda-deploy OIDC
 # role deliberately lacks iam:CreateRole / iam:PutRolePolicy (fleet-wide
-# policy, infrastructure/iam/README.md).
+# policy, nous-ergon-ops/infrastructure/iam/README.md).
 #
 # IAM: no new grant needed — LambdaUpdate already covers
-# arn:...:function:alpha-engine-* (infrastructure/iam/github-actions-lambda-
+# arn:...:function:alpha-engine-* (nous-ergon-ops/infrastructure/iam/github-actions-lambda-
 # deploy.json), which already includes this function.
 
 on:
@@ -71,7 +71,7 @@ jobs:
 
       - name: Append to system-wide deploy changelog
         if: always()
-        uses: nousergon/nousergon-docs/.github/actions/append-changelog@main
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@6ed6c2050ecd4e87284283c7ee16539672704fc9 # main
         with:
           deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
           deploy_workflow: deploy-expense-collector.yml
@@ -79,5 +79,5 @@ jobs:
   notify-main-failure:
     needs: [deploy]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@62597e550c08c0b7a7fe0af490cb141e344061b3 # main
     secrets: inherit
