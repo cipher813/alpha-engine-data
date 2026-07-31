@@ -906,10 +906,18 @@ def _assert_scope_stable(
     scheme) — there is nothing to compare against and refusing to collect
     would be worse than collecting. Fail-CLOSED on a baseline that exists and
     disagrees, which is the case this guard is for.
+
+    The search window is 7 days — a one-week Saturday-to-Saturday gap.
+    A 14-day window crossed the 2026-07-21 I5814 scope-change boundary
+    (alternative went from 27 promoted-only tickers to the full 903-ticker
+    constituent universe), causing a false-positive churn-violation on every
+    run whose only prior manifest was pre-I5814. The tighter window means a
+    missing-manifest week (spot termination between file writes and manifest
+    PUT) fails open rather than falling back to a stale pre-change baseline.
     """
     prior_key = None
     prior_n = None
-    for days_back in range(1, 15):
+    for days_back in range(1, 8):
         dt = date.fromisoformat(run_date) - timedelta(days=days_back)
         key = f"{s3_prefix}weekly/{dt}/alternative/manifest.json"
         try:
@@ -924,7 +932,7 @@ def _assert_scope_stable(
 
     if prior_n is None:
         logger.warning(
-            "Alternative scope: no prior manifest within 14 days of %s — "
+            "Alternative scope: no prior manifest within 7 days of %s — "
             "collecting %d tickers with no baseline to compare against, so a "
             "scope change cannot be detected this run.",
             run_date, n_tickers,
