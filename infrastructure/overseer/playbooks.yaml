@@ -227,6 +227,27 @@ playbooks:
           ceiling_min: 210
           margin_min: 30
           lookback_hours: 30
+          # An artifact proves the drain CHARTER RAN, not that it drained
+          # anything. The exit-contract backstop (alert_drain_run.sh line 202)
+          # already ensures the ledger only exists for a run that completed
+          # the charter steps, but unlike the groom artifact (which is written
+          # at BOOT time — a crash-cascade writes an artifact but no groom
+          # agent ever runs), the drain ledger is written at charter completion
+          # by the agent itself. So the ledger IS the proof of a complete run.
+          #
+          # productive_when tracks whether the drain found ACTUAL events:
+          # ingested:queue > 0 means the intake queue had messages and the
+          # drain consumed them. The empty-queue case (ingested.queue == 0)
+          # is the legitimate zero — "nothing to drain" is a complete,
+          # successful run of the dispatch pipe. The two clauses together
+          # ensure that ANY well-formed ledger (with an ingested dict)
+          # is recognized as productive, making this a DOCUMENTARY
+          # declaration rather than a detection tool — the real value is
+          # in having the contract explicit so a future schema change
+          # cannot silently break it.
+          productive_when:
+            - {field: ingested.queue, gt: 0}
+            - {field: ingested.queue, eq: 0}
           schedule:
             - hour: 4
               minute: 0
