@@ -394,3 +394,81 @@ def test_the_runtime_bound_reaches_the_box():
     assert "{runtime_bound_export}" in src, (
         "the export is built but never interpolated into the bootstrap command"
     )
+
+
+# ── The completion check actually gates the relaunch (I5914) ──────────────────
+#
+# CheckCompletionMarkerTaskToken has existed since config#1645 writing
+# $.markerResult that NOTHING read: CheckRetryBudget branched on retry_count vs
+# max_retries alone. The state's NAME asserted a guard the state machine did not
+# have, and the invocation it made was the expensive decide_only backlog
+# enumeration whose output was then discarded.
+#
+# That was inert only while the ladder was unreachable for reclaimed lanes (the
+# I5919 catch gap). Inverting the catch default made the ladder live for every
+# reclaim, which turns "relaunch without checking completion" into "re-run a
+# lane that already drained its queue".
+
+def test_retry_budget_checks_completion_before_spending_a_retry(states):
+    """The completion branch must exist AND be evaluated first.
+
+    Choice rules are evaluated in order; a retry-budget rule placed ahead of the
+    completion rule would relaunch a finished lane whenever budget remained.
+    """
+    choices = states["CheckRetryBudget"]["Choices"]
+    blob = json.dumps(choices)
+    assert "lane_completed" in blob, (
+        "CheckRetryBudget never consults the completion result — $.markerResult "
+        "is written by the state above and read by nobody"
+    )
+    first = json.dumps(choices[0])
+    assert "lane_completed" in first, (
+        "the completion check must be the FIRST choice rule, ahead of the "
+        "retry-budget rule"
+    )
+    assert "retry_count" in json.dumps(choices[1:]), (
+        "the retry-budget rule must still exist after the completion rule"
+    )
+
+
+def test_completion_branch_does_not_relaunch(states):
+    """A completed lane must terminate the iteration, not re-enter the ladder."""
+    completed = states["CheckRetryBudget"]["Choices"][0]
+    assert completed["Next"] == "GroomSucceeded", (
+        f"completed lane routes to {completed['Next']!r} — anything that "
+        "reaches LaunchGroomSpot again re-runs a dispositioned queue"
+    )
+    assert states["GroomSucceeded"]["Type"] == "Succeed"
+
+
+def test_completion_branch_guards_against_an_absent_marker_result(states):
+    """CheckCompletionMarkerTaskToken's own Catch routes here WITHOUT the field.
+
+    A bare BooleanEquals on a missing path is an evaluation error, not a
+    non-match, so the IsPresent guard is load-bearing rather than defensive.
+    """
+    completed = states["CheckRetryBudget"]["Choices"][0]
+    assert "And" in completed, "the completion rule must be an And-guarded pair"
+    ops = [set(rule) - {"Variable", "Comment"} for rule in completed["And"]]
+    assert {"IsPresent"} in ops, "no IsPresent guard on $.markerResult"
+    assert {"BooleanEquals"} in ops, "no BooleanEquals on the completion flag"
+    catch_targets = {c["Next"] for c in states["CheckCompletionMarkerTaskToken"]["Catch"]}
+    assert "CheckRetryBudget" in catch_targets, (
+        "this test's premise changed: the marker-check Catch no longer reaches "
+        "CheckRetryBudget, so re-derive whether the IsPresent guard is still "
+        "load-bearing"
+    )
+
+
+def test_marker_check_receives_the_lane_identity(states):
+    """The Lambda cannot resolve WHICH lane to check without launchDecision.
+
+    Without it every lane resolves to the same tier_tag and the three lanes
+    answer for each other.
+    """
+    payload = states["CheckCompletionMarkerTaskToken"]["Parameters"]["Payload"]
+    assert payload.get("launchDecision.$") == "$.launchDecision", (
+        "CheckCompletionMarkerTaskToken must pass launchDecision or the "
+        "completion check cannot identify the lane"
+    )
+    assert payload.get("retryMarker") is True
