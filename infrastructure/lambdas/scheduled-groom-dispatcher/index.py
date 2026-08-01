@@ -1384,6 +1384,161 @@ _RECONCILE_ACTIONED_PREFIX = "groom/_control/reconciled"
 # unmatched expectation IS the signal (§2.7).
 _ALIVE_STATES = frozenset({"running", "pending"})
 
+#: Where groom_driver.py writes its run artifact: `groom/{YYYY-MM-DD}/{token}.json`.
+#: alpha-engine-config-I5914 — this is the SECOND, earlier completion signal.
+#: The driver logs `[driver] run artifact written` BEFORE `groom_run: agent
+#: exited`, and the box's own completion marker is written later still, during
+#: wind-down. A lane reclaimed between those two points has finished all of its
+#: work and left NO completion marker, so every consumer that keys off the
+#: marker alone concludes the run was lost.
+#:
+#: Measured 2026-07-31 20:00 UTC: the high-only lane wrote
+#: `groom/2026-07-31/303ace0ac87148e0a21c5ba235bb5f4e.json` at 20:35:50Z with
+#: `FINAL: 4 closed, engaged=10/10, stop='queue drained'` and rc=0, was reclaimed
+#: at 20:38Z, and was then paged as a lane DEATH.
+_RUN_ARTIFACT_PREFIX = "groom"
+
+
+def _lane_run_completed(run_token: str, days: list[str]) -> str:
+    """Return the S3 key proving this run finished, or "" if none exists.
+
+    Checks the box's completion marker first (the authoritative signal) and
+    falls back to the run artifact (written earlier, so it survives a reclaim
+    during wind-down).
+
+    ``days`` must cover the run's OWN UTC date, which is not necessarily the
+    caller's: the artifact is date-partitioned by when the run started, so a
+    lane launched at 23:5x writes to the previous day's prefix.
+
+    Best-effort by design — a probe failure returns "" and the caller falls back
+    to its pre-existing behaviour. Degrading to "page a death" or "allow a
+    relaunch" is safe; degrading to silence would not be.
+    """
+    if not run_token:
+        return ""
+    s3 = boto3.client("s3", region_name=REGION)
+    candidates = [f"{_RECONCILE_COMPLETED_PREFIX}/{run_token}.json"]
+    candidates += [f"{_RUN_ARTIFACT_PREFIX}/{day}/{run_token}.json" for day in days]
+    for key in candidates:
+        try:
+            s3.head_object(Bucket=_RESEARCH_BUCKET, Key=key)
+            return key
+        except Exception:
+            continue
+    return ""
+
+
+def _scan_days(now: datetime) -> list[str]:
+    """Today and yesterday, UTC — see _reconcile_lane_death for why both."""
+    return [(now - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in (0, 1)]
+
+
+def _latest_ledger_entry_for_lane(tier_tag: str, days: list[str]) -> dict:
+    """The most recent dispatch-ledger entry for one lane, or {}.
+
+    alpha-engine-config-I5914. The SF's relaunch ladder does not know the run
+    token of the attempt that just died — the token is minted inside this Lambda
+    per attempt and only ever travels back through the task-token callback,
+    which by definition did not fire. The ledger is the one durable record that
+    ties a lane to its attempts, so the lane is resolved by tier and the newest
+    entry taken.
+    """
+    if not tier_tag:
+        return {}
+    s3 = boto3.client("s3", region_name=REGION)
+    paginator = s3.get_paginator("list_objects_v2")
+    best: dict = {}
+    best_sort = None
+    for day in days:
+        prefix = f"{_DISPATCH_LEDGER_PREFIX}/{day}/"
+        try:
+            pages = paginator.paginate(Bucket=_RESEARCH_BUCKET, Prefix=prefix)
+            for page in pages:
+                for obj in page.get("Contents", []):
+                    # Recency key: LastModified when S3 supplies it, else the
+                    # day+key ordering. Deliberately `.get` — indexing a field
+                    # that a paginator page happens not to carry raises INSIDE
+                    # the loop and the outer handler then discards the whole
+                    # day's scan, so one missing field silently loses every
+                    # entry rather than one.
+                    sort_key = (obj.get("LastModified"), f"{day}/{obj['Key']}")
+                    try:
+                        raw = s3.get_object(
+                            Bucket=_RESEARCH_BUCKET, Key=obj["Key"])["Body"].read()
+                        entry = json.loads(raw.decode())
+                    except Exception:
+                        continue
+                    if entry.get("tier_tag") != tier_tag:
+                        continue
+                    if best_sort is not None and _le_sort(sort_key, best_sort):
+                        continue
+                    best, best_sort = entry, sort_key
+        except Exception as exc:
+            logger.warning("ledger scan failed for %s/%s: %s", tier_tag, day, exc)
+    return best
+
+
+def _le_sort(a: tuple, b: tuple) -> bool:
+    """`a <= b` for (LastModified|None, key) pairs, None sorting oldest.
+
+    A plain tuple comparison raises when one side's timestamp is None and the
+    other's is a datetime, which would abort the scan it is meant to order.
+    """
+    at, bt = a[0], b[0]
+    if at is not None and bt is not None:
+        return (at, a[1]) <= (bt, b[1])
+    if at is None and bt is None:
+        return a[1] <= b[1]
+    return at is None  # a missing timestamp is treated as older
+
+
+def _handle_retry_marker(event: dict) -> dict:
+    """Answer the SF's ONE question before a relaunch: did this lane finish?
+
+    alpha-engine-config-I5914. The ``CheckCompletionMarkerTaskToken`` state has
+    existed since config#1645 and its result was NEVER READ: it wrote
+    ``$.markerResult`` and handed straight to ``CheckRetryBudget``, a Choice on
+    ``$.retry_count`` vs ``$.max_retries`` alone. The state's NAME asserted a
+    guard the state machine did not have — and the invocation it made was the
+    expensive ``decide_only`` backlog enumeration, whose output was discarded.
+
+    That was harmless only while the ladder was unreachable for reclaimed lanes
+    (the I5919 catch gap). Inverting the catch default made the ladder live for
+    every reclaim, which turns "relaunch without checking completion" into
+    "re-run a lane that already drained its queue" — duplicate spend against
+    the daily dispatch ceiling, on GitHub state a completed run already
+    dispositioned.
+
+    Returns ``{"lane_completed": bool, "run_token": str, "evidence": str}``.
+    Fails SOFT to ``lane_completed: false``: an unreadable ledger must not
+    suppress a legitimate relaunch, and the retry budget still bounds the loop.
+    """
+    now = datetime.now(ZoneInfo("UTC"))
+    days = _scan_days(now)
+    # The lane identity rides `launchDecision` (the Map item), NOT the top level:
+    # the SF passes it as a nested object rather than merging it, so a plain
+    # `event["issue_filter"]` reads empty and every lane would resolve to the
+    # same tier_tag. Top-level is accepted as a fallback for direct invokes.
+    decision = event.get("launchDecision") or {}
+    issue_filter = str(decision.get("issue_filter")
+                       or event.get("issue_filter") or "")
+    run_mode = _resolve_run_mode(
+        {**event, "run_mode": decision.get("run_mode") or event.get("run_mode")}
+        if decision else event)
+    tier_tag = _tier_tag(run_mode, issue_filter) if issue_filter else ""
+    entry = _latest_ledger_entry_for_lane(tier_tag, days)
+    run_token = str(entry.get("run_token") or "")
+    evidence = _lane_run_completed(run_token, days)
+    logger.info(
+        "retry-marker check: lane=%s run_token=%s completed=%s evidence=%s",
+        tier_tag or "?", run_token or "?", bool(evidence), evidence or "-")
+    return {
+        "lane_completed": bool(evidence),
+        "run_token": run_token,
+        "tier_tag": tier_tag,
+        "evidence": evidence,
+    }
+
 
 def _reconcile_lane_death() -> dict:
     """Reconciler entry point — enumerate open expectations, check each one
@@ -1449,7 +1604,8 @@ def _reconcile_lane_death() -> dict:
 
     if not open_expectations:
         return {"reconciled": True, "open_expectations": 0, "deaths": 0,
-                "overdue": 0, "checked_at": now.isoformat()}
+                "overdue": 0, "reclaimed_post_run": 0,
+                "checked_at": now.isoformat()}
 
     # 2. Batch describe-instances for all instance_ids.
     instance_ids = [e["instance_id"] for e in open_expectations
@@ -1466,12 +1622,16 @@ def _reconcile_lane_death() -> dict:
             # Fail-safe: treat ALL as unknown (not dead) — never page on a
             # broken EC2 API. The next reconciler tick retries.
             return {"reconciled": True, "open_expectations": len(open_expectations),
-                    "deaths": 0, "overdue": 0, "describe_error": str(exc),
-                    "checked_at": now.isoformat()}
+                    "deaths": 0, "overdue": 0, "reclaimed_post_run": 0,
+                    "describe_error": str(exc), "checked_at": now.isoformat()}
 
     # 3. Check each expectation.
     deaths = 0
     overdue_count = 0
+    # I5914: counted and returned separately from `deaths`. Folding it into the
+    # death count would keep reporting a successful cycle as a failed one on the
+    # console, which is the surface this whole path feeds.
+    reclaimed_post_run = 0
     sfn = boto3.client("stepfunctions", region_name=REGION)
     for exp in open_expectations:
         instance_id = exp.get("instance_id", "")
@@ -1496,26 +1656,54 @@ def _reconcile_lane_death() -> dict:
         if not page:
             continue
 
-        if state is None or state not in _ALIVE_STATES:
-            deaths += 1
-        else:
-            overdue_count += 1
-
-        # Page via the cycle notification rail (buzzing, #groom thread).
         tier_tag = exp.get("tier_tag", "unknown")
         schedule_label = exp.get("schedule", "unknown")
-        text = (
-            f"🔴 Groom lane DEATH — {reason}\n"
-            f"tier={tier_tag}  schedule={schedule_label}\n"
-            f"run_token={exp.get('run_token')}  instance={instance_id}"
-        )
-        _notify_cycle(
-            text, severity="error",
-            dedup_key=f"{_CYCLE_FLOW_NAME}:lane_death:{exp.get('run_token', '')}",
-            context={"expectation": {k: v for k, v in exp.items()
-                                     if not k.startswith("_")},
-                     "reason": reason, "instance_state": state},
-        )
+        run_token = str(exp.get("run_token") or "")
+
+        # alpha-engine-config-I5914: instance state is not a proxy for run
+        # completion. A lane that finished its work and was reclaimed during
+        # wind-down — before it could write its completion marker — is dead by
+        # EC2 state and successful by every measure that matters. Probing the
+        # run artifact separates the two; without it both render as an
+        # identical 🔴 DEATH and the operator cannot tell loss from noise.
+        gone = state is None or state not in _ALIVE_STATES
+        evidence = _lane_run_completed(run_token, scan_days) if gone else ""
+
+        if gone and evidence:
+            reclaimed_post_run += 1
+            outcome = "lane_reclaimed_post_run"
+            _notify_cycle(
+                f"🟡 Groom lane reclaimed AFTER completing — {reason}\n"
+                f"tier={tier_tag}  schedule={schedule_label}\n"
+                f"run_token={run_token}  instance={instance_id}\n"
+                f"work completed; evidence={evidence}",
+                # WARNING, not error: no work was lost. Paging this at error
+                # severity is what made a successful cycle read as a failed one.
+                severity="warning",
+                dedup_key=f"{_CYCLE_FLOW_NAME}:lane_reclaimed_post_run:{run_token}",
+                context={"expectation": {k: v for k, v in exp.items()
+                                         if not k.startswith("_")},
+                         "reason": reason, "instance_state": state,
+                         "completion_evidence": evidence},
+            )
+        else:
+            if gone:
+                deaths += 1
+                outcome = "lane_died"
+            else:
+                overdue_count += 1
+                outcome = "overdue"
+            # Page via the cycle notification rail (buzzing, #groom thread).
+            _notify_cycle(
+                f"🔴 Groom lane DEATH — {reason}\n"
+                f"tier={tier_tag}  schedule={schedule_label}\n"
+                f"run_token={run_token}  instance={instance_id}",
+                severity="error",
+                dedup_key=f"{_CYCLE_FLOW_NAME}:lane_death:{run_token}",
+                context={"expectation": {k: v for k, v in exp.items()
+                                         if not k.startswith("_")},
+                         "reason": reason, "instance_state": state},
+            )
 
         # Close the expectation BEFORE the send-task-failure below. Ordering is
         # deliberate: if the marker write fails we must not have already paged
@@ -1526,12 +1714,15 @@ def _reconcile_lane_death() -> dict:
         try:
             boto3.client("s3", region_name=REGION).put_object(
                 Bucket=_RESEARCH_BUCKET,
-                Key=f"{_RECONCILE_ACTIONED_PREFIX}/{exp.get('run_token', '')}.json",
+                Key=f"{_RECONCILE_ACTIONED_PREFIX}/{run_token}.json",
                 Body=json.dumps({
-                    "outcome": "lane_died" if state not in _ALIVE_STATES else "overdue",
+                    # I5914: three outcomes, not two. Every consumer of this key
+                    # was previously told `lane_died` for a run that succeeded.
+                    "outcome": outcome,
                     "reason": reason,
                     "instance_id": instance_id,
                     "instance_state": state,
+                    "completion_evidence": evidence,
                     "actioned_at": now.isoformat(),
                 }).encode(),
                 ContentType="application/json")
@@ -1565,6 +1756,7 @@ def _reconcile_lane_death() -> dict:
 
     return {"reconciled": True, "open_expectations": len(open_expectations),
             "deaths": deaths, "overdue": overdue_count,
+            "reclaimed_post_run": reclaimed_post_run,
             "checked_at": now.isoformat()}
 
 
@@ -2587,6 +2779,12 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         # for the same reason — no live schedule or other caller sets a
         # top-level `mode`, so this cannot collide with any shape below.
         return _handle_cycle_complete(event)
+    if event.get("retryMarker"):
+        # alpha-engine-config-I5914: the SF's CheckCompletionMarkerTaskToken
+        # state. Checked BEFORE decide_only below — the SF payload carries both
+        # keys, and until this branch existed the invocation fell through to the
+        # backlog enumeration whose result the state machine then discarded.
+        return _handle_retry_marker(event)
     if event.get("mode") == "reconcile":
         # config-I5229 (lane-death pager): EventBridge Scheduler (~5 min
         # cadence) invokes this mode to screen open expectations against
