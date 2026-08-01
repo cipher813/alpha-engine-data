@@ -56,6 +56,7 @@ import threading
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 import boto3
@@ -903,18 +904,31 @@ _SCOPE_CHANGE_TOLERANCE = 0.30
 # success requirement — without it, a step change followed by N failed runs is
 # a deadlock: the only run that can advance the baseline is a run the guard
 # permits, and the guard permits none (the prior manifest is pre-change).
-_APPROVED_SCOPE_KEY = "market_data/weekly/alternative_approved_scope.json"
+# The approved-scope declaration is a REPO artifact, not an S3 object.
+#
+# It records a human ruling about what the collector's scope may be, and is
+# compared against a scope the run DERIVES from constituents.json — the
+# overseer-policy invariant 18 split: the bound stays declared, the measurement
+# stays derived.
+#
+# It lives in the checkout because an S3 object would have to be written by
+# hand after merge, which is the post-merge operator step
+# pull-request-policy.md §4.2 forbids: nothing about it fails when it never
+# runs, so the guard would silently keep taking its fail-open path while
+# reading green. In the repo the merge button alone deploys it (the collector
+# runs from a `git pull --ff-only` checkout on the spot box), and a change to
+# the approved scope appears in a diff with its ruling attached.
+_APPROVED_SCOPE_PATH = Path(__file__).with_name("alternative_approved_scope.json")
 
 
-def _read_approved_scope(s3, bucket: str) -> dict | None:
-    """Read the operator-declared approved scope baseline if it exists.
+def _read_approved_scope() -> dict | None:
+    """Read the operator-declared approved scope baseline from the checkout.
 
-    Returns None if the key does not exist (first run, or no step-change has
-    been declared), so the caller falls through to the prior-run comparison.
+    Returns None when the file is absent or unreadable — no step-change has
+    been declared — so the caller falls through to the prior-run comparison.
     """
     try:
-        obj = s3.get_object(Bucket=bucket, Key=_APPROVED_SCOPE_KEY)
-        return json.loads(obj["Body"].read())
+        return json.loads(_APPROVED_SCOPE_PATH.read_text())
     except Exception:  # noqa: BLE001 — absence is the fail-open case
         return None
 
@@ -925,10 +939,11 @@ def _assert_scope_stable(
     """Compare this run's ticker count against a declared baseline.
 
     Resolution order (first match wins):
-      1. Operator-approved scope baseline (``alternative_approved_scope.json``).
-         A human ruling — e.g. alpha-engine-config-I5814 — that explicitly
-         blessed a scope change.  If ``n_tickers`` matches the approved bound
-         (± tolerance), the check passes and no prior-run lookup is needed.
+      1. Operator-approved scope baseline — ``collectors/alternative_approved_scope.json``,
+         a REPO artifact so the merge button alone deploys it.  A human ruling
+         — e.g. alpha-engine-config-I5814 — that explicitly blessed a scope
+         change.  If ``n_tickers`` matches the approved bound (± tolerance),
+         the check passes and no prior-run lookup is needed.
       2. Resolution-time scope marker (``scope.json``) in the most recent prior
          run.  Written BEFORE collection, so even a partial/failed run leaves
          a truthful baseline.
@@ -942,7 +957,7 @@ def _assert_scope_stable(
     baseline that exists and disagrees, which is the case this guard is for.
     """
     # ── Tier 0: operator-approved scope baseline ──────────────────────────
-    approved = _read_approved_scope(s3, bucket)
+    approved = _read_approved_scope()
     if approved:
         approved_n = approved.get("approved_n")
         if isinstance(approved_n, (int, float)) and approved_n > 0:
