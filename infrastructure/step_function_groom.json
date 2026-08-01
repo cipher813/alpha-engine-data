@@ -208,6 +208,7 @@
                   "decide_only": true
                 },
                 "schedInput.$": "$.schedInput",
+                "launchDecision.$": "$.launchDecision",
                 "retryMarker": true
               }
             },
@@ -228,6 +229,20 @@
             "Type": "Choice",
             "Comment": "config#1645: marker is absent (box died mid-run) — relaunch if attempts remain, else give up and alert. Bounded to max_retries (3, i.e. up to 4 total launch attempts per iteration) so a genuinely bad AWS day can't spot-cycle indefinitely. alpha-engine-config-I5923 (Brian ruling 2026-07-31): max_retries was 1, which made the SINGLE relaunch also the LAST one, so CheckForceOnDemand forced it to on-demand — the lane went spot -> on-demand with ZERO alternate spot capacity pools tried. During prime time, when reclamation is most likely, that is effectively defaulting to on-demand. At 3 the ladder is attempt 0 spot, retries 1 and 2 spot on DIFFERENT instance types (the dispatcher rotates the pool by $.fod.attempt), retry 3 on-demand.",
             "Choices": [
+              {
+                "And": [
+                  {
+                    "Variable": "$.markerResult.Payload.lane_completed",
+                    "IsPresent": true
+                  },
+                  {
+                    "Variable": "$.markerResult.Payload.lane_completed",
+                    "BooleanEquals": true
+                  }
+                ],
+                "Comment": "alpha-engine-config-I5914: the lane finished its work and was reclaimed during wind-down, before it could write its completion marker. Relaunching it would re-run a queue that is already dispositioned — duplicate spend against the daily dispatch ceiling, on GitHub state a completed run already acted on. This branch is what makes the state ABOVE actually a check: until 2026-07-31 CheckCompletionMarkerTaskToken wrote $.markerResult and NOTHING read it, so the ladder relaunched purely on retry budget. The IsPresent guard is load-bearing and paired deliberately — CheckCompletionMarkerTaskToken's own Catch routes here with $.markerResult ABSENT, and a bare BooleanEquals on a missing path is an evaluation error, not a non-match.",
+                "Next": "GroomSucceeded"
+              },
               {
                 "Variable": "$.retry_count",
                 "NumericLessThanPath": "$.max_retries",
