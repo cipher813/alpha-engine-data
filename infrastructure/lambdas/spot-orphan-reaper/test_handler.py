@@ -75,9 +75,13 @@ def index_module(monkeypatch):
 def _spot(instance_id: str, name: str, age_seconds: int, instance_type: str = "c5.large",
          ci_watch_repo: str | None = None, ci_watch_sha: str | None = None,
          sf_watch_cadence: str | None = None, sf_watch_pipeline: str | None = None,
-         sf_watch_run_date: str | None = None, alert_drain_run_id: str | None = None):
+         sf_watch_run_date: str | None = None, alert_drain_run_id: str | None = None,
+         thinktank_trading_day: str | None = None, thinktank_run_token: str | None = None,
+         watchdog_deadline: str | None = None):
     """Build a mock describe-instances entry."""
     tags = [{"Key": "Name", "Value": name}]
+    if watchdog_deadline is not None:
+        tags.append({"Key": "watchdog-deadline", "Value": watchdog_deadline})
     if ci_watch_repo is not None:
         tags.append({"Key": "ci-watch-repo", "Value": ci_watch_repo})
     if ci_watch_sha is not None:
@@ -90,6 +94,10 @@ def _spot(instance_id: str, name: str, age_seconds: int, instance_type: str = "c
         tags.append({"Key": "sf-watch-run-date", "Value": sf_watch_run_date})
     if alert_drain_run_id is not None:
         tags.append({"Key": "alert-drain-run-id", "Value": alert_drain_run_id})
+    if thinktank_trading_day is not None:
+        tags.append({"Key": "thinktank-trading-day", "Value": thinktank_trading_day})
+    if thinktank_run_token is not None:
+        tags.append({"Key": "thinktank-run-token", "Value": thinktank_run_token})
     return {
         "InstanceId": instance_id,
         "InstanceType": instance_type,
@@ -138,6 +146,100 @@ class TestThresholdConfig:
             del sys.modules["index"]
         mod = importlib.import_module("index")
         assert mod.REAP_AFTER_SECONDS == 30600
+
+
+class TestWatchdogDeadlineTag:
+    """config#5695: per-box watchdog-deadline tag takes precedence over the
+    global cap when present and parseable. Legacy boxes without the tag are
+    still reaped at the global cap (unchanged behavior)."""
+
+    def _deadline_str(self, age_seconds: int) -> str:
+        """Build an ISO8601 UTC deadline string that fired ``age_seconds`` ago
+        (deadline was set ``age_seconds`` in the past from now)."""
+        return (datetime.now(timezone.utc) - timedelta(seconds=age_seconds)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+    def _future_deadline_str(self, offset_seconds: int) -> str:
+        """Build an ISO8601 UTC deadline string in the future."""
+        return (datetime.now(timezone.utc) + timedelta(seconds=offset_seconds)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+    def test_watchdog_deadline_tag_lifts_threshold_above_global_cap(self, index_module):
+        """A box with a past deadline but still within the delta from the
+        deadline to the global cap would have been reaped by the global cap.
+        With a deadline tag that has NOT yet been reached, the box survives."""
+        # Deadline 12h from now; the global cap (6.5h) would have reaped the
+        # box at age 7h, but the deadline tag protects it until 12h + grace.
+        deadline = self._future_deadline_str(12 * 3600)
+        spots = [_spot("i-weekly", "alpha-engine-weekly-freshness-spot",
+                       age_seconds=7 * 3600, watchdog_deadline=deadline)]
+        out, ec2, _cw, _s3 = _run(index_module, spots)
+        assert out["orphans_detected"] == 0
+        ec2.terminate_instances.assert_not_called()
+
+    def test_watchdog_deadline_expired_triggers_reap(self, index_module):
+        """A box whose watchdog-deadline + grace has passed IS reaped."""
+        # Deadline was set to 6h after launch, which is 2h ago (age=8h),
+        # and grace (0.5h) has also passed.
+        deadline = self._deadline_str(2 * 3600)  # deadline 2h in the past
+        spots = [_spot("i-weekly", "alpha-engine-weekly-freshness-spot",
+                       age_seconds=8 * 3600, watchdog_deadline=deadline)]
+        out, ec2, _cw, _s3 = _run(index_module, spots)
+        assert out["orphans_detected"] == 1
+        assert out["terminated"] == ["i-weekly"]
+
+    def test_watchdog_deadline_barely_within_grace_not_reaped(self, index_module):
+        """A box within GRACE_SECONDS of its watchdog deadline is NOT reaped."""
+        # deadline 25min ago (1500s). Launch 7000s ago → deadline set at
+        # 5500s after launch. effective_threshold = 5500 + 1800 (grace) = 7300s.
+        # age = 7000s ≤ 7300s → safe.
+        spots = [_spot("i-weekly", "alpha-engine-weekly-freshness-spot",
+                       age_seconds=7000, watchdog_deadline=self._deadline_str(1500))]
+        out, ec2, _cw, _s3 = _run(index_module, spots)
+        assert out["orphans_detected"] == 0
+        ec2.terminate_instances.assert_not_called()
+
+    def test_watchdog_deadline_just_beyond_grace_is_reaped(self, index_module):
+        deadline = self._deadline_str(2000)  # deadline 33 min ago (>1800 grace)
+        spots = [_spot("i-weekly", "alpha-engine-weekly-freshness-spot",
+                       age_seconds=7500, watchdog_deadline=deadline)]
+        out, ec2, _cw, _s3 = _run(index_module, spots)
+        assert out["orphans_detected"] == 1
+        assert out["terminated"] == ["i-weekly"]
+
+    def test_box_without_tag_still_at_global_cap(self, index_module):
+        """A box WITHOUT a watchdog-deadline tag uses the global cap unchanged."""
+        spots = [_spot("i-groom", "alpha-engine-groom-spot", age_seconds=THRESHOLD + 600)]
+        out, ec2, _cw, _s3 = _run(index_module, spots)
+        assert out["orphans_detected"] == 1
+        assert out["terminated"] == ["i-groom"]
+
+    def test_box_without_tag_below_global_cap_is_safe(self, index_module):
+        spots = [_spot("i-groom", "alpha-engine-groom-spot", age_seconds=THRESHOLD - 60)]
+        out, ec2, _cw, _s3 = _run(index_module, spots)
+        assert out["orphans_detected"] == 0
+        ec2.terminate_instances.assert_not_called()
+
+    def test_malformed_deadline_falls_back_to_global_cap(self, index_module):
+        """A malformed (non-ISO8601) watchdog-deadline tag drops to global cap."""
+        spots = [_spot("i-weekly", "alpha-engine-weekly-freshness-spot",
+                       age_seconds=THRESHOLD + 600,
+                       watchdog_deadline="not-a-valid-date")]
+        out, ec2, _cw, _s3 = _run(index_module, spots)
+        assert out["orphans_detected"] == 1
+        assert out["terminated"] == ["i-weekly"]
+
+    def test_orphan_detail_includes_effective_reap_threshold_and_deadline(self, index_module):
+        deadline = self._future_deadline_str(12 * 3600)
+        spots = [_spot("i-weekly", "alpha-engine-weekly-freshness-spot",
+                       age_seconds=THRESHOLD + 600, watchdog_deadline=deadline)]
+        out, ec2, _cw, _s3 = _run(index_module, spots)
+        assert out["orphans_detected"] == 0
+
+    def test_return_summary_includes_global_fallback_when_no_tag(self, index_module):
+        spots = [_spot("i-groom", "alpha-engine-groom-spot", age_seconds=THRESHOLD + 600)]
+        out, ec2, _cw, _s3 = _run(index_module, spots)
+        assert out["reap_after_seconds"] == THRESHOLD
+        # Each orphan detail shows the global cap as its reap_after
+        assert out["orphan_detail"][0]["reap_after_seconds"] == THRESHOLD
 
 
 class TestHandler:
@@ -410,3 +512,89 @@ class TestAlertDrainIncompleteReapAlert:
         assert out["sf_watch_incomplete_reaps"] == ["i-sfwatch"]
         assert out["alert_drain_incomplete_reaps"] == ["i-drain"]
         assert len(index_module._test_send_message.calls) == 3
+
+
+class TestThinkTankIncompleteReapAlert:
+    """alpha-engine-config-I5752 — Think Tank was the fourth box class and the
+    only one still missing a WATCH_KINDS row, so a box that overran its 2.5h
+    watchdog and reached the 6.5h age cap was terminated with nobody told.
+
+    This row covers the HANG end. The fast-fail end is covered on the box
+    (crucible-research#558: `on_exit` publishes to alpha-engine-alerts on a
+    non-zero rc, the window flow-doctor cannot see). Neither substitutes for
+    the other, which is why both exist.
+    """
+
+    def test_reaped_without_marker_fires_alert(self, index_module):
+        spots = [_spot("i-tt", "alpha-engine-thinktank-spot", age_seconds=THRESHOLD + 600,
+                       thinktank_trading_day="2026-07-30", thinktank_run_token="tok123")]
+        out, ec2, _cw, s3 = _run(index_module, spots, s3_marker_exists=False)
+        assert out["terminated"] == ["i-tt"]
+        assert out["thinktank_incomplete_reaps"] == ["i-tt"]
+        s3.head_object.assert_called_once_with(
+            Bucket="alpha-engine-research",
+            Key="thinktank/_control/completed/2026-07-30-tok123.json",
+        )
+        assert len(index_module._test_send_message.calls) == 1
+        (text,), kwargs = index_module._test_send_message.calls[0]
+        assert "reaped WITHOUT completing" in text
+        assert "tok123" in text
+        assert kwargs["disable_notification"] is False
+
+    def test_reaped_with_marker_present_does_not_alert(self, index_module):
+        spots = [_spot("i-tt", "alpha-engine-thinktank-spot", age_seconds=THRESHOLD + 600,
+                       thinktank_trading_day="2026-07-30", thinktank_run_token="tok123")]
+        out, ec2, _cw, s3 = _run(index_module, spots, s3_marker_exists=True)
+        assert out["terminated"] == ["i-tt"]
+        assert out["thinktank_incomplete_reaps"] == []
+        assert index_module._test_send_message.calls == []
+
+    def test_missing_discriminator_tags_treated_as_incomplete(self, index_module):
+        """A box reaped with either tag absent cannot be looked up either way;
+        since config#2292 tagging is atomic with RunInstances, so this is a
+        genuine anomaly worth the alert rather than the old launch->tag race."""
+        spots = [_spot("i-tt", "alpha-engine-thinktank-spot", age_seconds=THRESHOLD + 600,
+                       thinktank_trading_day="2026-07-30")]
+        out, ec2, _cw, s3 = _run(index_module, spots, s3_marker_exists=True)
+        assert out["thinktank_incomplete_reaps"] == ["i-tt"]
+        s3.head_object.assert_not_called()
+        assert len(index_module._test_send_message.calls) == 1
+
+    def test_the_key_matches_what_the_box_actually_writes(self, index_module):
+        """The contract between two repos, asserted rather than assumed.
+
+        `thinktank_spot_bootstrap.sh` writes
+        thinktank/_control/completed/${TRADING_DAY}-${RUN_TOKEN}.json. If the
+        tuple order in WATCH_KINDS or the prefix ever drifts from that, the
+        reaper looks up a key nothing writes and EVERY reap alerts — noisy
+        rather than silent, but wrong either way.
+        """
+        kind = next(
+            wk for wk in index_module.WATCH_KINDS
+            if wk.tag_name == "alpha-engine-thinktank-spot"
+        )
+        key = index_module._completion_key(
+            kind,
+            {"thinktank-trading-day": "2026-07-30", "thinktank-run-token": "deadbeef"},
+        )
+        assert key == "thinktank/_control/completed/2026-07-30-deadbeef.json"
+
+    def test_all_four_watch_kinds_independently_tracked(self, index_module):
+        spots = [
+            _spot("i-ciwatch", "alpha-engine-ci-watch-spot", age_seconds=THRESHOLD + 600,
+                 ci_watch_repo="nousergon/alpha-engine-config", ci_watch_sha="abc123"),
+            _spot("i-sfwatch", "alpha-engine-sf-watch-spot", age_seconds=THRESHOLD + 600,
+                 sf_watch_cadence="saturday", sf_watch_pipeline="ne-weekly-freshness-pipeline",
+                 sf_watch_run_date="2026-07-11"),
+            _spot("i-drain", "alpha-engine-alert-drain-spot", age_seconds=THRESHOLD + 600,
+                 alert_drain_run_id="drain-2026-07-22T1200Z"),
+            _spot("i-tt", "alpha-engine-thinktank-spot", age_seconds=THRESHOLD + 600,
+                 thinktank_trading_day="2026-07-30", thinktank_run_token="tok123"),
+        ]
+        out, ec2, _cw, s3 = _run(index_module, spots, s3_marker_exists=False)
+        assert set(out["terminated"]) == {"i-ciwatch", "i-sfwatch", "i-drain", "i-tt"}
+        assert out["ci_watch_incomplete_reaps"] == ["i-ciwatch"]
+        assert out["sf_watch_incomplete_reaps"] == ["i-sfwatch"]
+        assert out["alert_drain_incomplete_reaps"] == ["i-drain"]
+        assert out["thinktank_incomplete_reaps"] == ["i-tt"]
+        assert len(index_module._test_send_message.calls) == 4
