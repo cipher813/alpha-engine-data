@@ -98,7 +98,7 @@ def test_no_baseline_fails_open_but_says_so(caplog):
     s3 = ManifestS3({})
     with caplog.at_level("WARNING"):
         _assert_scope_stable(s3, "alpha-engine-research", PREFIX, "2026-07-25", 903)
-    assert "no prior manifest" in caplog.text
+    assert "no prior scope/manifest" in caplog.text
     assert "cannot be detected" in caplog.text
 
 
