@@ -896,45 +896,103 @@ class ScopeChangedUnexpectedly(RuntimeError):
 # scope change, not churn.
 _SCOPE_CHANGE_TOLERANCE = 0.30
 
+# Key for the operator-declared approved-scope baseline.  When a deliberate
+# step-change (universe growth, I5814-style scope swap) is approved by a human
+# ruling, the ruling is recorded here so the scope check has a declared
+# baseline to compare against.  This decouples the guard from the prior-run
+# success requirement — without it, a step change followed by N failed runs is
+# a deadlock: the only run that can advance the baseline is a run the guard
+# permits, and the guard permits none (the prior manifest is pre-change).
+_APPROVED_SCOPE_KEY = "market_data/weekly/alternative_approved_scope.json"
+
+
+def _read_approved_scope(s3, bucket: str) -> dict | None:
+    """Read the operator-declared approved scope baseline if it exists.
+
+    Returns None if the key does not exist (first run, or no step-change has
+    been declared), so the caller falls through to the prior-run comparison.
+    """
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=_APPROVED_SCOPE_KEY)
+        return json.loads(obj["Body"].read())
+    except Exception:  # noqa: BLE001 — absence is the fail-open case
+        return None
+
 
 def _assert_scope_stable(
     s3, bucket: str, s3_prefix: str, run_date: str, n_tickers: int
 ) -> None:
-    """Compare this run's ticker count against the most recent prior manifest.
+    """Compare this run's ticker count against a declared baseline.
 
-    Fail-open on a MISSING baseline (first run ever, or a new partition
-    scheme) — there is nothing to compare against and refusing to collect
-    would be worse than collecting. Fail-CLOSED on a baseline that exists and
-    disagrees, which is the case this guard is for.
+    Resolution order (first match wins):
+      1. Operator-approved scope baseline (``alternative_approved_scope.json``).
+         A human ruling — e.g. alpha-engine-config-I5814 — that explicitly
+         blessed a scope change.  If ``n_tickers`` matches the approved bound
+         (± tolerance), the check passes and no prior-run lookup is needed.
+      2. Resolution-time scope marker (``scope.json``) in the most recent prior
+         run.  Written BEFORE collection, so even a partial/failed run leaves
+         a truthful baseline.
+      3. Collection-completion manifest (``manifest.json``).  Legacy path;
+         only written on success, which is the deadlock this two-tier scheme
+         eliminates.
 
-    The search window is 7 days — a one-week Saturday-to-Saturday gap.
-    A 14-day window crossed the 2026-07-21 I5814 scope-change boundary
-    (alternative went from 27 promoted-only tickers to the full 903-ticker
-    constituent universe), causing a false-positive churn-violation on every
-    run whose only prior manifest was pre-I5814. The tighter window means a
-    missing-manifest week (spot termination between file writes and manifest
-    PUT) fails open rather than falling back to a stale pre-change baseline.
+    Fail-open on a MISSING baseline (no approved scope, no scope.json, no
+    manifest within 14 days) — there is nothing to compare against and
+    refusing to collect would be worse than collecting.  Fail-CLOSED on a
+    baseline that exists and disagrees, which is the case this guard is for.
     """
+    # ── Tier 0: operator-approved scope baseline ──────────────────────────
+    approved = _read_approved_scope(s3, bucket)
+    if approved:
+        approved_n = approved.get("approved_n")
+        if isinstance(approved_n, (int, float)) and approved_n > 0:
+            approved_n = int(approved_n)
+            ratio = n_tickers / approved_n
+            if round(abs(ratio - 1.0), 6) <= _SCOPE_CHANGE_TOLERANCE:
+                logger.info(
+                    "Alternative scope: %d tickers matches approved baseline "
+                    "%d (±%.0f%%) — ruling %s (%s).",
+                    n_tickers, approved_n,
+                    _SCOPE_CHANGE_TOLERANCE * 100,
+                    approved.get("ruling", "unknown"),
+                    approved.get("approved_on", "unknown"),
+                )
+                return
+            # Falls through — approved baseline exists but this run's scope
+            # disagrees.  Still check the prior-run comparison below, but
+            # raise with the approved-baseline context if both disagree.
+            logger.warning(
+                "Alternative scope: %d tickers differs from approved "
+                "baseline %d — falling through to prior-run comparison.",
+                n_tickers, approved_n,
+            )
+
+    # ── Tier 1 & 2: prior-run scope marker, then manifest ─────────────────
     prior_key = None
     prior_n = None
-    for days_back in range(1, 8):
+    for days_back in range(1, 15):
         dt = date.fromisoformat(run_date) - timedelta(days=days_back)
-        key = f"{s3_prefix}weekly/{dt}/alternative/manifest.json"
-        try:
-            obj = s3.get_object(Bucket=bucket, Key=key)
-            manifest = json.loads(obj["Body"].read())
-        except Exception:  # noqa: BLE001 — absence is the fail-open case
-            continue
-        value = manifest.get("tickers_requested")
-        if isinstance(value, (int, float)) and value > 0:
-            prior_key, prior_n = key, int(value)
+        # scope.json (resolution-time) first, then manifest.json (success-only)
+        for suffix in ("alternative/scope.json", "alternative/manifest.json"):
+            key = f"{s3_prefix}weekly/{dt}/{suffix}"
+            try:
+                obj = s3.get_object(Bucket=bucket, Key=key)
+                data = json.loads(obj["Body"].read())
+            except Exception:  # noqa: BLE001 — absence is the fail-open case
+                continue
+            value = data.get("tickers_requested")
+            if isinstance(value, (int, float)) and value > 0:
+                prior_key, prior_n = key, int(value)
+                break
+        if prior_n is not None:
             break
 
     if prior_n is None:
         logger.warning(
-            "Alternative scope: no prior manifest within 7 days of %s — "
-            "collecting %d tickers with no baseline to compare against, so a "
-            "scope change cannot be detected this run.",
+            "Alternative scope: no prior scope/manifest within 14 days of %s "
+            "and no approved baseline — collecting %d tickers with no "
+            "baseline to compare against, so a scope change cannot be "
+            "detected this run.",
             run_date, n_tickers,
         )
         return
