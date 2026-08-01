@@ -200,9 +200,9 @@
     },
     "SetSSMReadyExhaustedError": {
       "Type": "Pass",
-      "Comment": "Normalize SSM-ready exhaustion into $.error so HandleFailure's States.JsonToString($.error) has an object to serialize — the Choice path from SSMReadyChoice does not carry a caught error (the SSM DescribeInstanceInfo calls succeeded; the agent simply never went Online). Without this, HandleFailure itself crashes with States.Runtime on the missing $.error JsonPath, masking the real 'trading instance unreachable' cause behind a broken error-reporting state.",
+      "Comment": "Normalize SSM-ready exhaustion into $.error so HandleFailure's States.JsonToString($.error) has an object to serialize \u2014 the Choice path from SSMReadyChoice does not carry a caught error (the SSM DescribeInstanceInfo calls succeeded; the agent simply never went Online). Without this, HandleFailure itself crashes with States.Runtime on the missing $.error JsonPath, masking the real 'trading instance unreachable' cause behind a broken error-reporting state.",
       "Parameters": {
-        "error": "SSM agent did not come Online within 12 attempts (~3 min) — the trading instance is unreachable. The EOD pipeline cannot proceed without an SSM connection to the box (every work step is SSM:sendCommand)."
+        "error": "SSM agent did not come Online within 12 attempts (~3 min) \u2014 the trading instance is unreachable. The EOD pipeline cannot proceed without an SSM connection to the box (every work step is SSM:sendCommand)."
       },
       "ResultPath": "$.error",
       "Next": "HandleFailure"
@@ -228,7 +228,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.trading_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', 'source .venv/bin/activate', States.Format('python -m krepis.ssm_log_capture run --correlation-id {} --slug snapshot --log /var/log/snapshot.log -- python executor/snapshot_capturer.py --date {}', $$.Execution.Name, $.run_date))",
+          "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', 'source .venv/bin/activate', '.venv/bin/pip install --quiet --no-deps --upgrade \"krepis>=0.18.5\" || true', States.Format('python -m krepis.ssm_log_capture run --correlation-id {} --slug snapshot --log /var/log/snapshot.log -- python executor/snapshot_capturer.py --date {}', $$.Execution.Name, $.run_date))",
           "executionTimeout": [
             "120"
           ]
@@ -359,7 +359,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.trading_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', 'source .venv/bin/activate', States.Format('python -m krepis.ssm_log_capture run --correlation-id {} --slug eod --log /var/log/eod.log -- python executor/eod_reconcile.py --date {}', $$.Execution.Name, $.run_date))",
+          "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', 'source .venv/bin/activate', '.venv/bin/pip install --quiet --no-deps --upgrade \"krepis>=0.18.5\" || true', States.Format('python -m krepis.ssm_log_capture run --correlation-id {} --slug eod --log /var/log/eod.log -- python executor/eod_reconcile.py --date {}', $$.Execution.Name, $.run_date))",
           "executionTimeout": [
             "600"
           ]

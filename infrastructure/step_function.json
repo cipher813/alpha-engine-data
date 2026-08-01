@@ -573,7 +573,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug morning-enrich --log /var/log/morning-enrich.log -- bash infrastructure/spot_data_weekly.sh --morning-enrich-only{}',$$.Execution.Name,$.preflight_args))",
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user', 'sudo -u ec2-user /home/ec2-user/alpha-engine-dashboard/.venv/bin/pip install --quiet --no-deps --upgrade \"krepis>=0.18.5\" || true',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug morning-enrich --log /var/log/morning-enrich.log -- bash infrastructure/spot_data_weekly.sh --morning-enrich-only{}',$$.Execution.Name,$.preflight_args))",
           "executionTimeout": [
             "5400"
           ]
@@ -743,7 +743,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug data-weekly --log /var/log/data-weekly.log -- bash infrastructure/spot_data_weekly.sh --phase1-only{}',$$.Execution.Name,$.preflight_args))",
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user', 'sudo -u ec2-user /home/ec2-user/alpha-engine-dashboard/.venv/bin/pip install --quiet --no-deps --upgrade \"krepis>=0.18.5\" || true',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug data-weekly --log /var/log/data-weekly.log -- bash infrastructure/spot_data_weekly.sh --phase1-only{}',$$.Execution.Name,$.preflight_args))",
           "executionTimeout": [
             "5400"
           ]
@@ -1153,7 +1153,7 @@
                 "DocumentName": "AWS-RunShellScript",
                 "InstanceIds.$": "$.ec2_instance_id",
                 "Parameters": {
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug rag-ingestion --log /var/log/rag-ingestion.log -- bash infrastructure/spot_data_weekly.sh --rag-only{}',$$.Execution.Name,$.preflight_args))",
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user', 'sudo -u ec2-user /home/ec2-user/alpha-engine-dashboard/.venv/bin/pip install --quiet --no-deps --upgrade \"krepis>=0.18.5\" || true',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug rag-ingestion --log /var/log/rag-ingestion.log -- bash infrastructure/spot_data_weekly.sh --rag-only{}',$$.Execution.Name,$.preflight_args))",
                   "executionTimeout": [
                     "21600"
                   ]
@@ -1328,7 +1328,7 @@
             },
             "ThinkTankCoverage": {
               "Type": "Task",
-              "Comment": "Think Tank observe-mode coverage top-up, dispatched to EC2 SPOT (alpha-engine-config-I5758). PREVIOUSLY a direct lambda:invoke against alpha-engine-research-thinktank with TimeoutSeconds 900 — the AWS Lambda MAXIMUM, which this workload cannot fit in: measured 2026-07-30 on watch-rerun-2026-07-29-1, both attempts hit States.Timeout at 900s (11:24:47 and 11:40:48) for 30 min of wall-clock and zero output. alpha-engine-config-I5208 established the same failure on the DAILY cadence and ARCHITECTURE §47 ruled the fix: a long-running agent loop runs on owned compute behind a dispatcher. That fix shipped for the daily path (crucible-research infrastructure/thinktank_box_runner.py + thinktank_spot_bootstrap.sh + this dispatcher) and THIS state was never repointed — the weekly SF kept re-entering the failure the migration already fixed, on the one path inside a decision pipeline. The dispatcher fires an ASYNC detached SSM command and returns immediately, so this state only LAUNCHES; the poll quartet below waits for the box, mirroring the RAGIngestion / WaitForRAGIngestion / CheckRAGIngestionStatus / RAGIngestionWait shape. Budget chain (load-bearing, asserted by the dispatcher's own handler and test_handler.py): THINKTANK_RUN_BUDGET_SECONDS (5400) < THINKTANK_SPOT_RUN_TIMEOUT_SECONDS (7200) < this state's poll bound. If the budget ever meets the SSM timeout, SSM guillotines the run mid-loop and every terminal write is lost — the exact I5208 failure, reintroduced by config drift. config-I2515 Phase B ordering is preserved: this runs AFTER the RAG chain so Think Tank's theses read the FRESH corpus. The daily EventBridge cadence stays the primary coverage-growth mechanism; this state remains the reactive gap_fill top-up.",
+              "Comment": "Think Tank observe-mode coverage top-up, dispatched to EC2 SPOT (alpha-engine-config-I5758). PREVIOUSLY a direct lambda:invoke against alpha-engine-research-thinktank with TimeoutSeconds 900 \u2014 the AWS Lambda MAXIMUM, which this workload cannot fit in: measured 2026-07-30 on watch-rerun-2026-07-29-1, both attempts hit States.Timeout at 900s (11:24:47 and 11:40:48) for 30 min of wall-clock and zero output. alpha-engine-config-I5208 established the same failure on the DAILY cadence and ARCHITECTURE \u00a747 ruled the fix: a long-running agent loop runs on owned compute behind a dispatcher. That fix shipped for the daily path (crucible-research infrastructure/thinktank_box_runner.py + thinktank_spot_bootstrap.sh + this dispatcher) and THIS state was never repointed \u2014 the weekly SF kept re-entering the failure the migration already fixed, on the one path inside a decision pipeline. The dispatcher fires an ASYNC detached SSM command and returns immediately, so this state only LAUNCHES; the poll quartet below waits for the box, mirroring the RAGIngestion / WaitForRAGIngestion / CheckRAGIngestionStatus / RAGIngestionWait shape. Budget chain (load-bearing, asserted by the dispatcher's own handler and test_handler.py): THINKTANK_RUN_BUDGET_SECONDS (5400) < THINKTANK_SPOT_RUN_TIMEOUT_SECONDS (7200) < this state's poll bound. If the budget ever meets the SSM timeout, SSM guillotines the run mid-loop and every terminal write is lost \u2014 the exact I5208 failure, reintroduced by config drift. config-I2515 Phase B ordering is preserved: this runs AFTER the RAG chain so Think Tank's theses read the FRESH corpus. The daily EventBridge cadence stays the primary coverage-growth mechanism; this state remains the reactive gap_fill top-up.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-thinktank-spot-dispatcher",
@@ -1355,7 +1355,7 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Observe-mode non-blocking: a Think Tank failure must NOT halt the pipeline (config-I2515 Phase B). Routes to ThinkTankDegraded, which SETS A VISIBLE FLAG before converging — weekly-sf-policy.md §2.3 permits fail-open ONLY with a flag that propagates to the terminal notification, and champion-challenger-policy.md §3 requires a cycle with no arm output to be recorded as a MISS, never omitted. The flagless fail-open this replaces is why 13 days of silent Lambda timeouts went unnoticed.",
+                  "Comment": "Observe-mode non-blocking: a Think Tank failure must NOT halt the pipeline (config-I2515 Phase B). Routes to ThinkTankDegraded, which SETS A VISIBLE FLAG before converging \u2014 weekly-sf-policy.md \u00a72.3 permits fail-open ONLY with a flag that propagates to the terminal notification, and champion-challenger-policy.md \u00a73 requires a cycle with no arm output to be recorded as a MISS, never omitted. The flagless fail-open this replaces is why 13 days of silent Lambda timeouts went unnoticed.",
                   "Next": "ThinkTankDegraded",
                   "ResultPath": "$.thinktank_error"
                 }
@@ -1370,7 +1370,7 @@
             },
             "CheckThinkTankLaunched": {
               "Type": "Choice",
-              "Comment": "The dispatcher returns launched=false with reason=already_running when a Think Tank box is already up — normally the DAILY cadence's box. That box writes the same terminal artifacts this state wants, so waiting for a command_id we do not have would be wrong; converge with a degraded flag naming the reason instead. Skipping silently would render identically to a genuine zero, which champion-challenger-policy.md §3 forbids.",
+              "Comment": "The dispatcher returns launched=false with reason=already_running when a Think Tank box is already up \u2014 normally the DAILY cadence's box. That box writes the same terminal artifacts this state wants, so waiting for a command_id we do not have would be wrong; converge with a degraded flag naming the reason instead. Skipping silently would render identically to a genuine zero, which champion-challenger-policy.md \u00a73 forbids.",
               "Choices": [
                 {
                   "Variable": "$.thinktank_dispatch.launched",
@@ -1472,7 +1472,7 @@
             },
             "ThinkTankWait": {
               "Type": "Pass",
-              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckThinkTankStatus actually advances — a counter that never increments is an unbounded loop wearing a bound.",
+              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckThinkTankStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
               "Parameters": {
                 "polls.$": "States.MathAdd($.thinktank_polls, 1)"
               },
@@ -1492,7 +1492,7 @@
             },
             "ThinkTankDegraded": {
               "Type": "Pass",
-              "Comment": "THE VISIBLE DEGRADED FLAG (alpha-engine-config-I5758). Every non-Success path converges here — dispatch failure, already_running, poll failure, poll-budget exhaustion, a non-Success SSM status. weekly-sf-policy.md §2.3: a stage may fail-open ONLY if the fail-open sets a visible degraded flag that propagates to the terminal notification, and a pipeline reaching NotifyComplete having degraded a stage must say so BY NAME. champion-challenger-policy.md §3: a cycle where an arm produces no output is recorded as a MISS, not omitted — silent absence and a genuine zero must never render identically. The predecessor of this state had no flag at all, which is exactly why 13 consecutive days of 900s Lambda timeouts (2026-07-17 onward) passed unnoticed while the thinktank_coverage challenger arm was absent from the champion/challenger loop.",
+              "Comment": "THE VISIBLE DEGRADED FLAG (alpha-engine-config-I5758). Every non-Success path converges here \u2014 dispatch failure, already_running, poll failure, poll-budget exhaustion, a non-Success SSM status. weekly-sf-policy.md \u00a72.3: a stage may fail-open ONLY if the fail-open sets a visible degraded flag that propagates to the terminal notification, and a pipeline reaching NotifyComplete having degraded a stage must say so BY NAME. champion-challenger-policy.md \u00a73: a cycle where an arm produces no output is recorded as a MISS, not omitted \u2014 silent absence and a genuine zero must never render identically. The predecessor of this state had no flag at all, which is exactly why 13 consecutive days of 900s Lambda timeouts (2026-07-17 onward) passed unnoticed while the thinktank_coverage challenger arm was absent from the champion/challenger loop.",
               "Result": true,
               "ResultPath": "$.thinktank_degraded",
               "Next": "CheckSkipRegimeRetrospectiveEval"
@@ -1573,13 +1573,13 @@
             },
             "DataPhase2": {
               "Type": "Task",
-              "Comment": "Phase 2: alternative data for the tracked universe, dispatched to EC2 SPOT (alpha-engine-config-I5759). PREVIOUSLY a direct lambda:invoke against alpha-engine-data-collector:live — TimeoutSeconds 600, raised to 900 by alpha-engine-data#1171, which is the Lambda MAXIMUM and still not enough. Measured live 2026-07-30 on execution 1e856026: the Lambda was killed at exactly 900,000 ms having completed 402 of 903 tickers (alphabetically through HON). The rate was 2.16-2.24 s/ticker and FLAT for the whole run — not a degradation curve, a floor. _fetch_all_alternative makes two _finnhub_get calls per ticker and collectors/finnhub_client.py serialises every one of them behind _finnhub_lock with a 1.1s sleep held INSIDE the lock, so 2 x 1.1 = 2.2 s/ticker regardless of how many workers collectors/alternative.py's ThreadPoolExecutor has. 903 x 2.2s = ~2000s, 2.2x a ceiling that cannot be raised. This is the same class as alpha-engine-config-I5208 (daily Think Tank) and alpha-engine-config-I5758 (weekly ThinkTankCoverage): long-running work parked on Lambda, where the ceiling is a hard wall rather than a tunable. UNLIKE the RAG scope fix (alpha-engine-config-I5700), narrowing is NOT the answer here: this stage's per-ticker output feeds seven registered feature-store columns in the `alternative` family (features/registry.py CATALOG, all consumers='predictor') for the WHOLE ArcticDB universe, and a ticker with no alt data gets 0.0 — indistinguishable from a real zero. It legitimately needs the universe; it needed different compute. The dispatcher fires an SSM command that returns as soon as it is accepted, so this state only LAUNCHES; the bounded poll quartet below waits for the box, mirroring DataPhase1 / WaitForDataPhase1 / CheckDataPhase1Status / DataPhase1Wait. Budget chain (load-bearing, asserted by tests/test_data_phase2_spot_budget_wiring.py): the workload run_ssm timeout (3600s) < the spot watchdog MAX_RUNTIME_SECONDS (4200s) < this state's executionTimeout (5400s) < this state's TimeoutSeconds (5460s). If the workload budget ever meets the watchdog, systemd shuts the box down mid-loop and the manifest is never written.",
+              "Comment": "Phase 2: alternative data for the tracked universe, dispatched to EC2 SPOT (alpha-engine-config-I5759). PREVIOUSLY a direct lambda:invoke against alpha-engine-data-collector:live \u2014 TimeoutSeconds 600, raised to 900 by alpha-engine-data#1171, which is the Lambda MAXIMUM and still not enough. Measured live 2026-07-30 on execution 1e856026: the Lambda was killed at exactly 900,000 ms having completed 402 of 903 tickers (alphabetically through HON). The rate was 2.16-2.24 s/ticker and FLAT for the whole run \u2014 not a degradation curve, a floor. _fetch_all_alternative makes two _finnhub_get calls per ticker and collectors/finnhub_client.py serialises every one of them behind _finnhub_lock with a 1.1s sleep held INSIDE the lock, so 2 x 1.1 = 2.2 s/ticker regardless of how many workers collectors/alternative.py's ThreadPoolExecutor has. 903 x 2.2s = ~2000s, 2.2x a ceiling that cannot be raised. This is the same class as alpha-engine-config-I5208 (daily Think Tank) and alpha-engine-config-I5758 (weekly ThinkTankCoverage): long-running work parked on Lambda, where the ceiling is a hard wall rather than a tunable. UNLIKE the RAG scope fix (alpha-engine-config-I5700), narrowing is NOT the answer here: this stage's per-ticker output feeds seven registered feature-store columns in the `alternative` family (features/registry.py CATALOG, all consumers='predictor') for the WHOLE ArcticDB universe, and a ticker with no alt data gets 0.0 \u2014 indistinguishable from a real zero. It legitimately needs the universe; it needed different compute. The dispatcher fires an SSM command that returns as soon as it is accepted, so this state only LAUNCHES; the bounded poll quartet below waits for the box, mirroring DataPhase1 / WaitForDataPhase1 / CheckDataPhase1Status / DataPhase1Wait. Budget chain (load-bearing, asserted by tests/test_data_phase2_spot_budget_wiring.py): the workload run_ssm timeout (3600s) < the spot watchdog MAX_RUNTIME_SECONDS (4200s) < this state's executionTimeout (5400s) < this state's TimeoutSeconds (5460s). If the workload budget ever meets the watchdog, systemd shuts the box down mid-loop and the manifest is never written.",
               "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
               "Parameters": {
                 "DocumentName": "AWS-RunShellScript",
                 "InstanceIds.$": "$.ec2_instance_id",
                 "Parameters": {
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug data-phase2 --log /var/log/data-phase2.log -- bash infrastructure/spot_data_weekly.sh --phase2-only{}',$$.Execution.Name,$.preflight_args))",
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user', 'sudo -u ec2-user /home/ec2-user/alpha-engine-dashboard/.venv/bin/pip install --quiet --no-deps --upgrade \"krepis>=0.18.5\" || true',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug data-phase2 --log /var/log/data-phase2.log -- bash infrastructure/spot_data_weekly.sh --phase2-only{}',$$.Execution.Name,$.preflight_args))",
                   "executionTimeout": [
                     "5400"
                   ]
@@ -1679,7 +1679,7 @@
             },
             "CheckDataPhase2Status": {
               "Type": "Choice",
-              "Comment": "Budget exhaustion falls through to the Default arm, i.e. it is treated as a FAILED poll rather than a silent success — a bound whose exhaustion converges on the happy path is not a bound.",
+              "Comment": "Budget exhaustion falls through to the Default arm, i.e. it is treated as a FAILED poll rather than a silent success \u2014 a bound whose exhaustion converges on the happy path is not a bound.",
               "Choices": [
                 {
                   "Variable": "$.data_phase2_poll.Status",
@@ -1716,7 +1716,7 @@
             },
             "DataPhase2Wait": {
               "Type": "Pass",
-              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckDataPhase2Status actually advances — a counter that never increments is an unbounded loop wearing a bound.",
+              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckDataPhase2Status actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
               "Parameters": {
                 "polls.$": "States.MathAdd($.data_phase2_polls, 1)"
               },
@@ -1756,11 +1756,11 @@
             },
             "SetDataPhase2ExhaustedError": {
               "Type": "Pass",
-              "Comment": "Normalize DataPhase2 retry-gate exhaustion into $.error so PublishResearchFailureImmediate's States.JsonToString($.error) has an object to serialize — the Choice path from DataPhase2RetryGate does not carry a caught error like the Catch paths do. Without this, PublishResearchFailureImmediate's States.Format fails on the missing $.error JsonPath, causing the SF to die with States.Runtime instead of surfacing the actual DataPhase2 failure.",
+              "Comment": "Normalize DataPhase2 retry-gate exhaustion into $.error so PublishResearchFailureImmediate's States.JsonToString($.error) has an object to serialize \u2014 the Choice path from DataPhase2RetryGate does not carry a caught error like the Catch paths do. Without this, PublishResearchFailureImmediate's States.Format fails on the missing $.error JsonPath, causing the SF to die with States.Runtime instead of surfacing the actual DataPhase2 failure.",
               "Parameters": {
                 "phase": "DataPhase2",
                 "source": "DataPhase2RetryGate.exhausted",
-                "error": "DataPhase2 SSM command exhausted its retry budget (1 re-issue) without succeeding — the alternative data collector failed on both attempts."
+                "error": "DataPhase2 SSM command exhausted its retry budget (1 re-issue) without succeeding \u2014 the alternative data collector failed on both attempts."
               },
               "ResultPath": "$.error",
               "Next": "PublishResearchFailureImmediate"
@@ -2510,7 +2510,7 @@
                 "DocumentName": "AWS-RunShellScript",
                 "InstanceIds.$": "$.ec2_instance_id",
                 "Parameters": {
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference','export PREDICTOR_DEFER_TRAINING_EMAIL=1',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-training --log /var/log/predictor-training.log -- bash infrastructure/spot_train.sh --full-only{}',$$.Execution.Name,$.preflight_args))",
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference','export PREDICTOR_DEFER_TRAINING_EMAIL=1', 'sudo -u ec2-user /home/ec2-user/alpha-engine-dashboard/.venv/bin/pip install --quiet --no-deps --upgrade \"krepis>=0.18.5\" || true',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-training --log /var/log/predictor-training.log -- bash infrastructure/spot_train.sh --full-only{}',$$.Execution.Name,$.preflight_args))",
                   "executionTimeout": [
                     "5400"
                   ]
@@ -2834,7 +2834,7 @@
                       "DocumentName": "AWS-RunShellScript",
                       "InstanceIds.$": "$.ec2_instance_id",
                       "Parameters": {
-                        "commands.$": "States.Array('set -eo pipefail','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-model-zoo-spec --log /var/log/predictor-model-zoo-spec.log -- bash infrastructure/spot_train.sh --model-zoo-spec {}{}',$$.Execution.Name,$.spec_id,$.preflight_args))",
+                        "commands.$": "States.Array('set -eo pipefail','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference', 'sudo -u ec2-user /home/ec2-user/alpha-engine-dashboard/.venv/bin/pip install --quiet --no-deps --upgrade \"krepis>=0.18.5\" || true',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-model-zoo-spec --log /var/log/predictor-model-zoo-spec.log -- bash infrastructure/spot_train.sh --model-zoo-spec {}{}',$$.Execution.Name,$.spec_id,$.preflight_args))",
                         "executionTimeout": [
                           "5400"
                         ]
@@ -2995,7 +2995,7 @@
                 "DocumentName": "AWS-RunShellScript",
                 "InstanceIds.$": "$.ec2_instance_id",
                 "Parameters": {
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-model-zoo-select --log /var/log/predictor-model-zoo-select.log -- bash infrastructure/spot_train.sh --model-zoo-select{}',$$.Execution.Name,$.preflight_args))",
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference', 'sudo -u ec2-user /home/ec2-user/alpha-engine-dashboard/.venv/bin/pip install --quiet --no-deps --upgrade \"krepis>=0.18.5\" || true',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-model-zoo-select --log /var/log/predictor-model-zoo-select.log -- bash infrastructure/spot_train.sh --model-zoo-select{}',$$.Execution.Name,$.preflight_args))",
                   "executionTimeout": [
                     "5400"
                   ]
@@ -3287,7 +3287,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug backtester --log /var/log/backtester.log -- bash infrastructure/spot_backtest.sh --mode=param-sweep --no-pit-parity --skip-stages=parity,evaluator{}',$$.Execution.Name,$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date), 'sudo -u ec2-user /home/ec2-user/alpha-engine-dashboard/.venv/bin/pip install --quiet --no-deps --upgrade \"krepis>=0.18.5\" || true',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug backtester --log /var/log/backtester.log -- bash infrastructure/spot_backtest.sh --mode=param-sweep --no-pit-parity --skip-stages=parity,evaluator{}',$$.Execution.Name,$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -3432,7 +3432,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-backtest --log /var/log/predictor-backtest.log -- bash infrastructure/spot_backtest.sh --mode=predictor-backtest --no-pit-parity --skip-stages=parity,evaluator{}',$$.Execution.Name,$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date), 'sudo -u ec2-user /home/ec2-user/alpha-engine-dashboard/.venv/bin/pip install --quiet --no-deps --upgrade \"krepis>=0.18.5\" || true',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-backtest --log /var/log/predictor-backtest.log -- bash infrastructure/spot_backtest.sh --mode=predictor-backtest --no-pit-parity --skip-stages=parity,evaluator{}',$$.Execution.Name,$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -3577,7 +3577,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug portfolio-optimizer --log /var/log/portfolio-optimizer.log -- bash infrastructure/spot_backtest.sh --mode=portfolio-optimizer-backtest --no-pit-parity --skip-stages=parity,evaluator{}',$$.Execution.Name,$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date), 'sudo -u ec2-user /home/ec2-user/alpha-engine-dashboard/.venv/bin/pip install --quiet --no-deps --upgrade \"krepis>=0.18.5\" || true',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug portfolio-optimizer --log /var/log/portfolio-optimizer.log -- bash infrastructure/spot_backtest.sh --mode=portfolio-optimizer-backtest --no-pit-parity --skip-stages=parity,evaluator{}',$$.Execution.Name,$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -3722,7 +3722,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug parity --log /var/log/parity.log -- bash infrastructure/spot_backtest.sh --pit-parity-enabled=1 --skip-stages=backtest,evaluator{}',$$.Execution.Name,$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date), 'sudo -u ec2-user /home/ec2-user/alpha-engine-dashboard/.venv/bin/pip install --quiet --no-deps --upgrade \"krepis>=0.18.5\" || true',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug parity --log /var/log/parity.log -- bash infrastructure/spot_backtest.sh --pit-parity-enabled=1 --skip-stages=backtest,evaluator{}',$$.Execution.Name,$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -3867,7 +3867,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug evaluator --log /var/log/evaluator.log -- bash infrastructure/spot_backtest.sh --no-pit-parity --skip-stages=backtest,parity{}',$$.Execution.Name,$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date), 'sudo -u ec2-user /home/ec2-user/alpha-engine-dashboard/.venv/bin/pip install --quiet --no-deps --upgrade \"krepis>=0.18.5\" || true',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug evaluator --log /var/log/evaluator.log -- bash infrastructure/spot_backtest.sh --no-pit-parity --skip-stages=backtest,parity{}',$$.Execution.Name,$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -4499,7 +4499,7 @@
     },
     "WriteCompletionMarker": {
       "Type": "Task",
-      "Comment": "config#2857: SF-envelope completion marker — an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine: a hung/failed SF must not be indistinguishable from a healthy one just because a prior run already wrote today's downstream artifacts). Converges the 5 real-completion notify paths (NotifyComplete, its degraded-catch fallback, and the 3 gate/health-degraded variants) — deliberately EXCLUDES NotifyShellRunComplete/NotifyShellRunCompleteDegraded (the Friday-PM preflight dry-pass is not a real weekly completion; marking it would let a dry run silently satisfy the SLA). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_weekly_freshness_pipeline (cadence saturday_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable — exactly the ambiguity this feature exists to surface, not mask.",
+      "Comment": "config#2857: SF-envelope completion marker \u2014 an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine: a hung/failed SF must not be indistinguishable from a healthy one just because a prior run already wrote today's downstream artifacts). Converges the 5 real-completion notify paths (NotifyComplete, its degraded-catch fallback, and the 3 gate/health-degraded variants) \u2014 deliberately EXCLUDES NotifyShellRunComplete/NotifyShellRunCompleteDegraded (the Friday-PM preflight dry-pass is not a real weekly completion; marking it would let a dry run silently satisfy the SLA). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_weekly_freshness_pipeline (cadence saturday_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable \u2014 exactly the ambiguity this feature exists to surface, not mask.",
       "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
       "Parameters": {
         "Bucket": "alpha-engine-research",
@@ -4515,7 +4515,7 @@
           "MaxAttempts": 3,
           "IntervalSeconds": 2,
           "BackoffRate": 2.0,
-          "Comment": "Transient S3 fault coverage — mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
+          "Comment": "Transient S3 fault coverage \u2014 mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
         }
       ],
       "End": true
@@ -4726,7 +4726,7 @@
     },
     "EvaluatorDeployDriftCheck": {
       "Type": "Task",
-      "Comment": "config#2348 (2026-07-13 operator ruling): NEW, INDEPENDENT pre-boot Lambda-SHA drift gate for the evaluator's 2 Lambdas, added as a Saturday SF sibling to LibPinDriftCheck/PipelineContractCheck. Deliberately NOT wired through the weekday pipeline's existing DeployDriftCheck/Gate (alpha-engine-predictor Lambda, a separate load-bearing trading invariant covering different Lambdas) — this is a standalone check scoped only to alpha-engine-evaluator + alpha-engine-evaluator-director. Checks the grading Lambda first; EvaluatorDirectorDeployDriftCheck checks the director Lambda second — catches either alias independently stuck on a stale :live version (a failed/skipped post-merge deploy can leave just ONE of the two behind main). FAIL-OPEN like every sibling preflight gate: a GitHub-fetch miss or missing GIT_SHA stamp sets has_drift=false, and the Catch below routes any Lambda failure straight through (degraded + alert) — this checker never blocks the weekly run on its own failure, only on a CONFIRMED sha_mismatch.",
+      "Comment": "config#2348 (2026-07-13 operator ruling): NEW, INDEPENDENT pre-boot Lambda-SHA drift gate for the evaluator's 2 Lambdas, added as a Saturday SF sibling to LibPinDriftCheck/PipelineContractCheck. Deliberately NOT wired through the weekday pipeline's existing DeployDriftCheck/Gate (alpha-engine-predictor Lambda, a separate load-bearing trading invariant covering different Lambdas) \u2014 this is a standalone check scoped only to alpha-engine-evaluator + alpha-engine-evaluator-director. Checks the grading Lambda first; EvaluatorDirectorDeployDriftCheck checks the director Lambda second \u2014 catches either alias independently stuck on a stale :live version (a failed/skipped post-merge deploy can leave just ONE of the two behind main). FAIL-OPEN like every sibling preflight gate: a GitHub-fetch miss or missing GIT_SHA stamp sets has_drift=false, and the Catch below routes any Lambda failure straight through (degraded + alert) \u2014 this checker never blocks the weekly run on its own failure, only on a CONFIRMED sha_mismatch.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-evaluator:live",
@@ -4771,7 +4771,7 @@
     },
     "EvaluatorDeployDriftGate": {
       "Type": "Choice",
-      "Comment": "Hard-fail when the grading Lambda's probe reports has_drift=true (confirmed sha_mismatch). Routes via ExtractEvaluatorDeployDriftError (NOT straight to HandleFailure) — mirrors LibPinDriftGate: a Choice transition does not populate $.error the way a Task Catch does. On a clean pass, proceeds to EvaluatorDirectorDeployDriftCheck (the director Lambda's own check) rather than CheckMutexRole — composing all THREE pre-spend probes (lib-pin, pipeline-contract, evaluator) before any spot spend, per the sibling-gate convention this SF already establishes.",
+      "Comment": "Hard-fail when the grading Lambda's probe reports has_drift=true (confirmed sha_mismatch). Routes via ExtractEvaluatorDeployDriftError (NOT straight to HandleFailure) \u2014 mirrors LibPinDriftGate: a Choice transition does not populate $.error the way a Task Catch does. On a clean pass, proceeds to EvaluatorDirectorDeployDriftCheck (the director Lambda's own check) rather than CheckMutexRole \u2014 composing all THREE pre-spend probes (lib-pin, pipeline-contract, evaluator) before any spot spend, per the sibling-gate convention this SF already establishes.",
       "Choices": [
         {
           "And": [
@@ -4784,7 +4784,7 @@
               "BooleanEquals": true
             }
           ],
-          "Comment": "IsPresent-guarded per config#2275's convention — a partial gate payload must not throw States.Runtime here.",
+          "Comment": "IsPresent-guarded per config#2275's convention \u2014 a partial gate payload must not throw States.Runtime here.",
           "Next": "ExtractEvaluatorDeployDriftError"
         },
         {
@@ -4792,7 +4792,7 @@
             "Variable": "$.evaluator_deploy_drift_result.Payload.has_drift",
             "IsPresent": true
           },
-          "Comment": "A gate payload WITHOUT has_drift means the probe could not check — fail open VISIBLY (degraded flag + SNS alert), mirrors LibPinDriftGate/PipelineContractGate's config#2278 convention.",
+          "Comment": "A gate payload WITHOUT has_drift means the probe could not check \u2014 fail open VISIBLY (degraded flag + SNS alert), mirrors LibPinDriftGate/PipelineContractGate's config#2278 convention.",
           "Next": "EvaluatorGateDegraded"
         }
       ],
@@ -4811,18 +4811,18 @@
     },
     "EvaluatorGateDegraded": {
       "Type": "Pass",
-      "Comment": "The evaluator Lambda-SHA gate could not CHECK (Lambda failure after retries, or a payload without has_drift). Fail-open — availability over gating for a weekly pipeline — but VISIBLE: gate_degraded=true threads into the completion email, and PublishEvaluatorGateDegraded alerts NOW. Mirrors LibPinGateDegraded/PipelineContractGateDegraded.",
+      "Comment": "The evaluator Lambda-SHA gate could not CHECK (Lambda failure after retries, or a payload without has_drift). Fail-open \u2014 availability over gating for a weekly pipeline \u2014 but VISIBLE: gate_degraded=true threads into the completion email, and PublishEvaluatorGateDegraded alerts NOW. Mirrors LibPinGateDegraded/PipelineContractGateDegraded.",
       "Result": true,
       "ResultPath": "$.gate_degraded",
       "Next": "PublishEvaluatorGateDegraded"
     },
     "PublishEvaluatorGateDegraded": {
       "Type": "Task",
-      "Comment": "Fail-open + alert. Subject/Message are hardcoded constants (config#1819 discipline). Best-effort Catch. Proceeds to EvaluatorDirectorDeployDriftCheck (NOT straight to CheckMutexRole) — mirrors PublishLibPinGateDegraded's config#2278 fix: the degraded chain must not silently skip the sibling gate too.",
+      "Comment": "Fail-open + alert. Subject/Message are hardcoded constants (config#1819 discipline). Best-effort Catch. Proceeds to EvaluatorDirectorDeployDriftCheck (NOT straight to CheckMutexRole) \u2014 mirrors PublishLibPinGateDegraded's config#2278 fix: the degraded chain must not silently skip the sibling gate too.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekly Pipeline — Evaluator Deploy-Drift Gate DEGRADED (Proceeding Unchecked)",
+        "Subject": "Alpha Engine Weekly Pipeline \u2014 Evaluator Deploy-Drift Gate DEGRADED (Proceeding Unchecked)",
         "Message": "The evaluator Lambda-SHA drift probe could not verify alpha-engine-evaluator and/or alpha-engine-evaluator-director against origin/main (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN: this run is NOT protected against a stale :live alias this gate exists to catch. The completion email will carry the gates-degraded marker. config#2348."
       },
       "ResultPath": "$.evaluator_gate_degraded_notify",
@@ -4831,7 +4831,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Best-effort alert — a publish failure must not halt the fail-open path.",
+          "Comment": "Best-effort alert \u2014 a publish failure must not halt the fail-open path.",
           "ResultPath": "$.evaluator_gate_degraded_notify_error",
           "Next": "EvaluatorDirectorDeployDriftCheck"
         }
@@ -4840,7 +4840,7 @@
     },
     "EvaluatorDirectorDeployDriftCheck": {
       "Type": "Task",
-      "Comment": "config#2348: second half of the pair — checks alpha-engine-evaluator-director's :live alias independently of the grading Lambda's check above (same image, but the two aliases can drift independently if only one got promoted).",
+      "Comment": "config#2348: second half of the pair \u2014 checks alpha-engine-evaluator-director's :live alias independently of the grading Lambda's check above (same image, but the two aliases can drift independently if only one got promoted).",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-evaluator-director:live",
@@ -4936,7 +4936,7 @@
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekly Pipeline — Evaluator-Director Deploy-Drift Gate DEGRADED (Proceeding Unchecked)",
+        "Subject": "Alpha Engine Weekly Pipeline \u2014 Evaluator-Director Deploy-Drift Gate DEGRADED (Proceeding Unchecked)",
         "Message": "The evaluator-director Lambda-SHA drift probe could not verify alpha-engine-evaluator-director against origin/main (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN. The completion email will carry the gates-degraded marker. config#2348."
       },
       "ResultPath": "$.evaluator_director_gate_degraded_notify",
@@ -4945,7 +4945,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Best-effort alert — a publish failure must not halt the fail-open path.",
+          "Comment": "Best-effort alert \u2014 a publish failure must not halt the fail-open path.",
           "ResultPath": "$.evaluator_director_gate_degraded_notify_error",
           "Next": "CheckMutexRole"
         }
