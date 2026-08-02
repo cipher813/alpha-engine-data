@@ -30,6 +30,12 @@
 # scheduled invocation once this code is deployed — see the PR body for why
 # the code deploy itself is ALSO held pending that same bootstrap pass.
 #
+# I4480 (2026-07-31): added lambda:InvokeFunction for
+# alpha-engine-overseer-backstop-responder to iam-policy.json (the liveness
+# probe can now invoke the backstop responder). Not yet applied to the live
+# role — an operator must run `deploy.sh --apply-iam` or `--bootstrap` to
+# pick it up.
+#
 # alpha-engine-config#4481 (2026-07-31): added ssm:GetParameter for
 # /alpha-engine/saturday_sf_watch/github_pat (Sid: ReadGitHubPatSsm in
 # iam-policy.json) so the ci_watch_invocation_success check can query
