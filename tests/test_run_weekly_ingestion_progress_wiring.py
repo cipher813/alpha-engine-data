@@ -36,7 +36,7 @@ _EXPECTED_STEPS = [
     (2, 10, "8k_events", "rag.pipelines.ingest_8k_filings"),
     (3, 10, "earnings_transcripts", "rag.pipelines.ingest_earnings_finnhub"),
     (4, 10, "thesis_history", "rag.pipelines.ingest_theses"),
-    (5, 10, "news", "rag.pipelines.run_news_pipeline"),
+    (5, 10, "news", "rag.pipelines.assert_corpus_freshness"),
     (6, 10, "form4_insider", "rag.pipelines.ingest_form4"),
     (7, 10, "inst_ownership_13f", "rag.pipelines.ingest_13f"),
     (8, 10, "analyst_pipeline", "rag.pipelines.run_analyst_pipeline"),
