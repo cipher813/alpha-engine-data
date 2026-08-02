@@ -1,0 +1,37 @@
+name: check-workflow-shape
+
+# Structural guard on .github/workflows/*.yml — catches the class of YAML
+# malformation that silently disables a workflow (startup_failure: zero jobs,
+# zero logs, NO check posted). Uses the shared composite action defined in
+# alpha-engine-config so all private repos gate on one implementation.
+#
+# Deliberately no `paths:` filter. A workflow can be broken by a change to
+# ANY workflow file, and the check is sub-second — path-filtering it would
+# trade the whole guarantee for nothing.
+#
+# alpha-engine-config#5816 — first adopter beyond alpha-engine-config itself.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  shape:
+    name: Workflow files are structurally valid
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
+
+      - uses: nousergon/alpha-engine-config/.github/actions/check-workflow-shape@main
+        with:
+          fleet-policy: 'true'
