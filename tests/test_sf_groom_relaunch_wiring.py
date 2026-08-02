@@ -103,7 +103,22 @@ def test_prep_relaunch_carries_the_fields_its_successors_read(states):
     for key in _PRESERVE_PATHS:
         assert key in params, f"PrepRelaunch must carry {key} through relaunch"
     assert params["retry_count.$"] == "States.MathAdd($.retry_count, 1)"
-    assert "fod.$" in params
+    # I5923: `fod` is CONSTRUCTED here rather than passed through verbatim,
+    # because it now carries `attempt` — the instance-type pool offset, which
+    # must advance with retry_count. A Pass cannot read its own output, so the
+    # increment is computed twice from the same input.
+    fod = params["fod"]
+    assert set(fod) == {"force_on_demand.$", "launch_decided", "attempt.$"}, (
+        f"PrepRelaunch's fod keys drifted: {sorted(fod)}"
+    )
+    assert fod["force_on_demand.$"] == "$.fod.force_on_demand", (
+        "PrepRelaunch must preserve the inbound force_on_demand — constructing "
+        "fod from scratch must not silently reset an escalation already made"
+    )
+    assert fod["attempt.$"] == params["retry_count.$"], (
+        "fod.attempt must advance with retry_count or the pool rotation stops "
+        "tracking the ladder position"
+    )
     assert st["Next"] == "CheckForceOnDemand"
 
 
@@ -113,7 +128,13 @@ def test_set_force_on_demand_carries_the_fields_its_successors_read(states):
     for key in _PRESERVE_PATHS:
         assert key in params
     assert st["Next"] == "LaunchGroomSpot"
-    assert params["fod"] == {"force_on_demand": True, "launch_decided": True}
+    assert params["fod"] == {
+        "force_on_demand": True,
+        "launch_decided": True,
+        # I5923: the on-demand rung reports its ladder position too, so the
+        # launch log and the dispatch ledger say WHICH attempt escalated.
+        "attempt.$": "$.retry_count",
+    }
 
 
 def test_no_state_references_a_retired_poll_loop_field(states):
@@ -167,7 +188,7 @@ def test_lane_timeout_is_the_sole_bound_no_unemitted_heartbeat(states):
     heartbeat sat beside a 21600s timeout with no emitter anywhere in the fleet,
     and every lane died at 3606s."""
     launch = states["LaunchGroomSpot"]
-    assert launch["TimeoutSeconds"] == 21600
+    assert launch["TimeoutSeconds"] == 10800
     assert "HeartbeatSeconds" not in launch, (
         "no SendTaskHeartbeat emitter exists on the groom box — a heartbeat here "
         "would become the real lane timeout"
@@ -184,15 +205,46 @@ def test_every_lane_task_declares_a_timeout(states):
     assert not missing, f"Task states with no declared timeout: {missing}"
 
 
+#: The groom dispatch cadence: 04:00, 12:00 and 20:00 UTC (EventBridge Scheduler
+#: `alpha-engine-scheduled-groom-{0400,1200,2000}-daily`, verified live
+#: 2026-07-31). The cycle-singleton guard (alpha-engine-config-I5371) skips a
+#: dispatch while an earlier execution is still RUNNING, so an execution that can
+#: outlive this interval starves the following cycle.
+_CYCLE_CADENCE_SECONDS = 8 * 3600
+
+
 def test_state_machine_declares_a_global_ceiling():
-    """A runaway backstop, not a budget — the per-lane timeout is the budget."""
+    """A runaway backstop, not a budget — the per-lane timeout is the budget.
+
+    alpha-engine-config-I5923 restated this invariant. It previously required
+    ``ceiling > lane_timeout * (max_retries + 1)`` — that every attempt in the
+    ladder could independently burn the FULL lane timeout. That held only while
+    max_retries was 1 (2 x 3h = 6h < the 7h ceiling) and it was never the real
+    requirement: a relaunch is triggered BY a death, so a sequence of N attempts
+    each running the full healthy duration cannot occur — the first such attempt
+    would have succeeded. Requiring headroom for it forced a ceiling of 12h at
+    max_retries=3, which exceeds the 8h cycle cadence and would have let one
+    stuck execution starve the next cycle through the I5371 singleton guard.
+
+    The two bounds that ARE load-bearing:
+
+      * lower — room for one attempt that dies near its own ceiling PLUS one
+        full healthy retry, so recovery is never preempted mid-run;
+      * upper — strictly under the cycle cadence, so a stuck execution can
+        never suppress the following cycle.
+    """
     doc = json.loads(_SF_PATH.read_text())
     ceiling = doc.get("TimeoutSeconds")
     assert ceiling, "the state machine must declare a top-level TimeoutSeconds"
     lane = doc["States"]["MapLaunches"]["ItemProcessor"]["States"]["LaunchGroomSpot"]
-    max_attempts = doc["States"]["MapLaunches"]["ItemSelector"]["max_retries"] + 1
-    assert ceiling > lane["TimeoutSeconds"] * max_attempts, (
-        "the global ceiling must not preempt a legitimate full relaunch sequence"
+    assert ceiling > lane["TimeoutSeconds"] * 2, (
+        "the global ceiling must leave room for one near-ceiling death plus one "
+        "full healthy retry"
+    )
+    assert ceiling < _CYCLE_CADENCE_SECONDS, (
+        "the global ceiling must stay under the 8h cycle cadence — an execution "
+        "that can outlive the interval starves the next cycle via the I5371 "
+        "cycle-singleton guard"
     )
 
 
@@ -232,3 +284,191 @@ def test_task_token_travels_inside_the_lambda_payload(states):
 def test_wait_for_task_token_resource_still_declared(states):
     """The token plumbing above is only meaningful with the callback integration."""
     assert states["LaunchGroomSpot"]["Resource"].endswith(".waitForTaskToken")
+
+
+# ── I5229 regression: fast detection must ACCELERATE recovery, not replace it ──
+
+
+def _lane_state():
+    import json
+    from pathlib import Path
+    d = json.loads((Path(__file__).resolve().parents[1]
+                    / "infrastructure" / "step_function_groom.json").read_text())
+    m = [v for v in d["States"].values() if v.get("Type") == "Map"][0]
+    return ((m.get("ItemProcessor") or m.get("Iterator"))["States"]
+            ["LaunchGroomSpot"])
+
+
+def test_lane_death_routes_to_the_relaunch_path_not_the_terminal_one():
+    """The reconciler must not convert a recoverable death into a dead lane.
+
+    The lane reconciler sends send-task-failure(error="LaneDeath") within ~5
+    minutes of a box dying. Before this Catch entry existed that failure fell
+    through to States.ALL -> HandleFailure, which is TERMINAL — so shipping the
+    reconciler made recovery strictly WORSE: a spot reclaim used to recover via
+    States.Timeout -> CheckCompletionMarkerTaskToken -> relaunch (3 attempts,
+    the last forced to on-demand), and instead failed permanently.
+
+    Measured live, 2026-07-30 20:00 UTC: all three lanes reclaimed for spot
+    capacity, `LaunchGroomSpot` visited exactly 3 times (once per lane), zero
+    visits to CheckCompletionMarkerTaskToken or PrepRelaunch.
+    """
+    catches = _lane_state()["Catch"]
+    routes = {tuple(c["ErrorEquals"]): c["Next"] for c in catches}
+    assert ("LaneDeath",) in routes, (
+        "no Catch for the reconciler's LaneDeath error — a detected lane death "
+        "falls to States.ALL and the lane never relaunches"
+    )
+    timeout_target = routes[("States.Timeout",)]
+    assert routes[("LaneDeath",)] == timeout_target, (
+        "LaneDeath must route to the SAME state as States.Timeout "
+        f"({timeout_target}) — fast detection should accelerate the existing "
+        "recovery, never bypass it"
+    )
+
+
+def test_lane_death_catch_precedes_the_catch_all():
+    """Order matters: States.ALL first would make the LaneDeath entry dead."""
+    catches = _lane_state()["Catch"]
+    order = [tuple(c["ErrorEquals"]) for c in catches]
+    assert order.index(("LaneDeath",)) < order.index(("States.ALL",)), (
+        "the LaneDeath Catch sits after States.ALL and is therefore unreachable"
+    )
+
+
+# ── §2.1: ONE authoritative runtime bound for a lane ─────────────────────────
+
+
+def _dispatcher_max_runtime() -> int:
+    import re
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "infrastructure" / "lambdas"
+           / "scheduled-groom-dispatcher" / "index.py").read_text()
+    m = re.search(r'GROOM_MAX_RUNTIME_SECONDS",\s*"(\d+)"', src)
+    assert m, "could not read MAX_RUNTIME_SECONDS from the dispatcher"
+    return int(m.group(1))
+
+
+def test_runtime_bound_is_single_and_authoritative():
+    """The box must never outlive the lane the SF is waiting on.
+
+    groom-sweep-policy §2.1: "where two mechanisms bound the same thing, the
+    TIGHTER one is the real budget regardless of intent."
+
+    Measured 2026-07-30 — three copies that did not agree:
+
+        SF LaunchGroomSpot TimeoutSeconds   10800s (180 min)  <- real budget
+        dispatcher MAX_RUNTIME_SECONDS      21600s (360 min)
+        bootstrap watchdog default          21600s (360 min)
+
+    The failure is not cosmetic. The SF abandons the lane at 180 min and fires
+    a relaunch while the ORIGINAL box works on for another three hours; the
+    relaunch's concurrent-tier guard then refuses because that box is alive —
+    the alpha-engine-config-I4987 no-op relaunch, manufactured on a timer. The
+    reconciler was mis-armed identically: deadline_utc was now + 360 min, so a
+    lane the SF had already given up on stayed 'not overdue' for three hours.
+    """
+    lane_timeout = _lane_state()["TimeoutSeconds"]
+    box_bound = _dispatcher_max_runtime()
+    assert box_bound <= lane_timeout, (
+        f"the box may run {box_bound}s but the SF abandons the lane at "
+        f"{lane_timeout}s — every timeout leaves an orphan box that blocks its "
+        "own relaunch"
+    )
+
+
+def test_the_runtime_bound_reaches_the_box():
+    """A constant the box never receives is not a bound.
+
+    groom_spot_bootstrap.sh reads `${MAX_RUNTIME_SECONDS:-<default>}`. If the
+    dispatcher does not export it, the box silently uses its own default and
+    the value tested above governs nothing on the machine it is about.
+    """
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "infrastructure" / "lambdas"
+           / "scheduled-groom-dispatcher" / "index.py").read_text()
+    assert "export MAX_RUNTIME_SECONDS=" in src, (
+        "the dispatcher never exports MAX_RUNTIME_SECONDS, so the box falls "
+        "back to its own default and the two can diverge freely"
+    )
+    assert "{runtime_bound_export}" in src, (
+        "the export is built but never interpolated into the bootstrap command"
+    )
+
+
+# ── The completion check actually gates the relaunch (I5914) ──────────────────
+#
+# CheckCompletionMarkerTaskToken has existed since config#1645 writing
+# $.markerResult that NOTHING read: CheckRetryBudget branched on retry_count vs
+# max_retries alone. The state's NAME asserted a guard the state machine did not
+# have, and the invocation it made was the expensive decide_only backlog
+# enumeration whose output was then discarded.
+#
+# That was inert only while the ladder was unreachable for reclaimed lanes (the
+# I5919 catch gap). Inverting the catch default made the ladder live for every
+# reclaim, which turns "relaunch without checking completion" into "re-run a
+# lane that already drained its queue".
+
+def test_retry_budget_checks_completion_before_spending_a_retry(states):
+    """The completion branch must exist AND be evaluated first.
+
+    Choice rules are evaluated in order; a retry-budget rule placed ahead of the
+    completion rule would relaunch a finished lane whenever budget remained.
+    """
+    choices = states["CheckRetryBudget"]["Choices"]
+    blob = json.dumps(choices)
+    assert "lane_completed" in blob, (
+        "CheckRetryBudget never consults the completion result — $.markerResult "
+        "is written by the state above and read by nobody"
+    )
+    first = json.dumps(choices[0])
+    assert "lane_completed" in first, (
+        "the completion check must be the FIRST choice rule, ahead of the "
+        "retry-budget rule"
+    )
+    assert "retry_count" in json.dumps(choices[1:]), (
+        "the retry-budget rule must still exist after the completion rule"
+    )
+
+
+def test_completion_branch_does_not_relaunch(states):
+    """A completed lane must terminate the iteration, not re-enter the ladder."""
+    completed = states["CheckRetryBudget"]["Choices"][0]
+    assert completed["Next"] == "GroomSucceeded", (
+        f"completed lane routes to {completed['Next']!r} — anything that "
+        "reaches LaunchGroomSpot again re-runs a dispositioned queue"
+    )
+    assert states["GroomSucceeded"]["Type"] == "Succeed"
+
+
+def test_completion_branch_guards_against_an_absent_marker_result(states):
+    """CheckCompletionMarkerTaskToken's own Catch routes here WITHOUT the field.
+
+    A bare BooleanEquals on a missing path is an evaluation error, not a
+    non-match, so the IsPresent guard is load-bearing rather than defensive.
+    """
+    completed = states["CheckRetryBudget"]["Choices"][0]
+    assert "And" in completed, "the completion rule must be an And-guarded pair"
+    ops = [set(rule) - {"Variable", "Comment"} for rule in completed["And"]]
+    assert {"IsPresent"} in ops, "no IsPresent guard on $.markerResult"
+    assert {"BooleanEquals"} in ops, "no BooleanEquals on the completion flag"
+    catch_targets = {c["Next"] for c in states["CheckCompletionMarkerTaskToken"]["Catch"]}
+    assert "CheckRetryBudget" in catch_targets, (
+        "this test's premise changed: the marker-check Catch no longer reaches "
+        "CheckRetryBudget, so re-derive whether the IsPresent guard is still "
+        "load-bearing"
+    )
+
+
+def test_marker_check_receives_the_lane_identity(states):
+    """The Lambda cannot resolve WHICH lane to check without launchDecision.
+
+    Without it every lane resolves to the same tier_tag and the three lanes
+    answer for each other.
+    """
+    payload = states["CheckCompletionMarkerTaskToken"]["Parameters"]["Payload"]
+    assert payload.get("launchDecision.$") == "$.launchDecision", (
+        "CheckCompletionMarkerTaskToken must pass launchDecision or the "
+        "completion check cannot identify the lane"
+    )
+    assert payload.get("retryMarker") is True

@@ -5,7 +5,8 @@ Phase 1 (before research): constituents, prices, macro, universe returns.
 Phase 2 (after research): alternative data for promoted tickers.
 
 Phase 1 runs on EC2 via SSM RunCommand (price refresh takes 15-25 min).
-Phase 2 runs as Lambda (< 10 min for ~30 tickers).
+Phase 2 runs as Lambda (concurrent ThreadPoolExecutor, ~3-5 min for
+900+ tickers; timeout=900s).
 
 Usage:
     python weekly_collector.py --phase 1              # Phase 1 only
@@ -74,6 +75,7 @@ from nousergon_lib.phase_registry import PhaseRegistry
 # lift of the five inline _find_config / load_config / config_loader copies into
 # the shared-lib chokepoint. load_config below delegates to it.
 from nousergon_lib.config import resolve_experiment_config
+from nousergon_lib.yfinance_quiet import quiet_yfinance
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = str(Path(__file__).parent / "flow-doctor.yaml")
 setup_logging(
@@ -654,7 +656,7 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
 
 
 def _run_phase2(config: dict, args: argparse.Namespace) -> dict:
-    """Phase 2: alternative data for promoted tickers (after research)."""
+    """Phase 2: alternative data for the constituent universe (after research)."""
     bucket = config["bucket"]
     market_prefix = config.get("market_data", {}).get("s3_prefix", "market_data/")
     run_date = args.date or default_run_date()
@@ -668,13 +670,80 @@ def _run_phase2(config: dict, args: argparse.Namespace) -> dict:
         "collectors": {},
     }
 
+    # Scope resolution (alpha-engine-config-I5814, Brian ruling 2026-07-31).
+    #
+    # Phase 2 resolves its ticker list from constituents.json — the SAME source
+    # phase 1 passes to fundamentals.collect — rather than from
+    # signals/{date}/signals.json's `universe` array.
+    #
+    # Why: the seven `alternative`-family columns in features/registry.py are
+    # written for every ticker in the ArcticDB universe, so this collector's
+    # scope IS the constituent universe. Resolving it from signals.json made
+    # that scope a function of whichever producer happens to be champion:
+    # measured 2026-07-21, the retirement of the multi-agent Research stage
+    # (config-I2515 / config#1580) swapped a 27-name promoted list for a
+    # 902-row board, so this collector's input grew 33x overnight with no
+    # change to its own code. Its Lambda duration went 126-215s -> ~2000s and
+    # it broke through the 600s ceiling on the next weekly run.
+    #
+    # signals.json's `universe` is a SIZING ENVELOPE for the executor, not a
+    # scope (alpha-engine-config-I5809). constituents.json is the universe
+    # definition, and it is what every other universe-wide collector reads.
+    universe_tickers: list[str] = []
+    existing = constituents.load_from_s3(bucket, market_prefix)
+    if existing:
+        universe_tickers = list(existing.get("tickers") or [])
+    if not universe_tickers:
+        # No silent narrowing. A missing constituents artifact used to fall
+        # through to signals.json, which is exactly how the scope moved
+        # without anyone deciding it.
+        raise _CollectorError(
+            "alternative",
+            "constituents.json unreadable or empty at "
+            f"{market_prefix}weekly/<latest>/constituents.json — refusing to "
+            "collect alternative data against an implicit ticker list. Fix the "
+            "constituents artifact rather than falling back to "
+            "signals.json::universe (alpha-engine-config-I5814).",
+        )
+
     logger.info("=" * 60)
     logger.info("COLLECTING: alternative data (Phase 2)")
     logger.info("=" * 60)
+
+    # ── Record resolved scope BEFORE collection ───────────────────────────
+    # The scope guard (_assert_scope_stable) needs a truthful baseline for the
+    # NEXT run.  If this run fails mid-collection (spot termination, provider
+    # outage), the manifest is never written and the prior-run lookup deadlocks:
+    # the only run that can advance the baseline is a run the guard permits,
+    # and the guard permits none (the prior manifest is pre-change).  Writing
+    # scope.json at resolution time — before the first API call — means even a
+    # partial run leaves a truthful baseline.  Read preference is scope.json
+    # first, manifest second (see collectors/alternative.py).
+    scope_key = f"{market_prefix}weekly/{run_date}/alternative/scope.json"
+    try:
+        s3 = boto3.client("s3")
+        s3.put_object(
+            Bucket=bucket,
+            Key=scope_key,
+            Body=json.dumps({
+                "tickers_requested": len(universe_tickers),
+                "resolved_from": "constituents.json",
+                "run_date": run_date,
+                "resolved_at": datetime.now(timezone.utc).isoformat(),
+            }),
+            ContentType="application/json",
+        )
+        logger.info("Wrote scope baseline: s3://%s/%s (%d tickers)",
+                     bucket, scope_key, len(universe_tickers))
+    except Exception:
+        logger.warning("Failed to write scope baseline %s — non-fatal; "
+                        "scope guard will fall back to prior manifest", scope_key)
+
     results["collectors"]["alternative"] = _phase_collect(
         reg, "alternative",
         lambda: alternative.collect(
-            bucket=bucket, s3_prefix=market_prefix, run_date=run_date, dry_run=dry_run,
+            bucket=bucket, s3_prefix=market_prefix, run_date=run_date,
+            tickers=universe_tickers, dry_run=dry_run,
         ),
         artifact_key=f"{market_prefix}weekly/{run_date}/alternative/manifest.json",
     )
@@ -1275,19 +1344,20 @@ def _self_heal_chronic_polygon_gaps(
             )
             end_excl = target_ts + _pd.Timedelta(days=1)
 
-            yf_df = _yf.download(
-                ticker,
-                start=start_ts.strftime("%Y-%m-%d"),
-                end=end_excl.strftime("%Y-%m-%d"),
-                progress=False,
-                auto_adjust=True,
-                # Bound the network call so a hung yfinance fetch can't stall
-                # the heal indefinitely. The 2026-06-11 incident was an
-                # unbounded yf.download here; the SF state isolation is the
-                # primary fix, this is defence-in-depth so a single ticker's
-                # stall is capped rather than eating the whole state timeout.
-                timeout=30,
-            )
+            with quiet_yfinance():
+                yf_df = _yf.download(
+                    ticker,
+                    start=start_ts.strftime("%Y-%m-%d"),
+                    end=end_excl.strftime("%Y-%m-%d"),
+                    progress=False,
+                    auto_adjust=True,
+                    # Bound the network call so a hung yfinance fetch can't stall
+                    # the heal indefinitely. The 2026-06-11 incident was an
+                    # unbounded yf.download here; the SF state isolation is the
+                    # primary fix, this is defence-in-depth so a single ticker's
+                    # stall is capped rather than eating the whole state timeout.
+                    timeout=30,
+                )
             if isinstance(yf_df.columns, _pd.MultiIndex):
                 yf_df.columns = yf_df.columns.get_level_values(0)
 

@@ -132,6 +132,22 @@ def test_list_bucket_grants_stay_prefix_scoped():
 WRITE_SURFACES = {
     "decision_records": "groom/decisions/2026-07-10/trigger-1900.json",
     "queue_manifests": "groom/queues/2026-07-10/trigger-1900-high-only.json",
+    # alpha-engine-config-I5229. This surface existed in index.py from
+    # config#3173 and was never added here, so nothing failed when the grant
+    # was absent. Measured 2026-07-30: EVERY dispatch-ledger PutObject had been
+    # AccessDenied since 2026-07-24, swallowed by a non-fatal warning, leaving
+    # the ledger empty and the lane reconciler reporting a healthy
+    # "open_expectations: 0" because its producer was dead — §2.4's
+    # absence-of-a-signal failure in the component built to detect it.
+    #
+    # It is now load-bearing for availability, not just observability: the
+    # post-launch write is FAIL-LOUD (§2.7 "registration failure is itself a
+    # paging condition") and terminates the just-launched box on failure. A
+    # missing grant here does not degrade the groom, it stops it.
+    "dispatch_ledger": (
+        "groom/_control/dispatch-ledger/2026-07-10/"
+        "9d2004971a8e4b39ad554a47cd80ae39.json"
+    ),
 }
 
 
@@ -152,4 +168,122 @@ def test_every_write_surface_has_put_object_grant():
         f"iam-policy.json grants no s3:PutObject covering: {missing} — "
         "index.py's trigger/manifest writes will AccessDenied at run time "
         "(config#2142/#2152 gap class)."
+    )
+
+
+# ── I5229: the reconciler's own grants must match live ARN shapes ────────────
+
+
+def test_send_task_failure_is_unscoped_because_iam_permits_nothing_narrower():
+    """`states:SendTaskFailure` must be granted on `"*"` — narrower is broken.
+
+    The action takes a task TOKEN, not a resource, and Step Functions supports
+    NO resource-level permissions for it. Measured 2026-07-30 with
+    `iam simulate-custom-policy`:
+
+        Resource "*"                                        -> allowed
+        Resource "execution:alpha-engine-groom-dispatch:*"   -> implicitDeny
+
+    — and the ARN-scoped result is `implicitDeny` even for the *correct* ARN.
+    So an execution-scoped grant does not restrict the action, it silently
+    DISABLES it, and the reconciler would detect a dead lane and then be denied
+    when reporting it: the one thing the feature exists to do.
+
+    This test exists because the grant shipped as
+    `execution:groom-dispatch:*` (also missing the `alpha-engine-` prefix) and
+    a first attempt to fix it merely corrected the prefix — which would still
+    have been implicitDeny, while a naive fnmatch-based test asserting "the
+    grant matches a real execution ARN" would have PASSED. Assert the thing IAM
+    actually evaluates, not the thing that looks tighter.
+
+    The real bound is the token: a caller can only fail a task whose token it
+    holds, and those tokens are minted by this Lambda's own dispatch path.
+    """
+    unscoped = [
+        stmt for stmt in _statements()
+        if stmt.get("Effect") == "Allow"
+        and "states:SendTaskFailure" in _actions(stmt)
+        and "*" in _resources(stmt)
+    ]
+    assert unscoped, (
+        'states:SendTaskFailure must be granted with Resource "*" — Step '
+        "Functions supports no resource-level permissions for it, so any ARN "
+        "scoping evaluates implicitDeny and disables the reconciler's only "
+        "means of reporting a dead lane."
+    )
+
+
+# ── I4989 / I5512: capacity diversification and deploy-trigger coverage ──────
+
+
+def _dispatcher_source() -> str:
+    return (POLICY_FILE.parent / "index.py").read_text(encoding="utf-8")
+
+
+def test_instance_pool_spans_more_than_one_family():
+    """Two types in one family is one capacity pool, not a diversified one.
+
+    Measured 2026-07-30 20:00 UTC: the pool was t4g.medium + t4g.large and all
+    three lanes were reclaimed (`instance-terminated-no-capacity`) at the same
+    second, 6.5 minutes in, taking out the entire cycle.
+    """
+    import re
+    src = _dispatcher_source()
+    m = re.search(r'"GROOM_INSTANCE_TYPES",\s*\n?\s*"([^"]+)"', src)
+    assert m, "could not read the GROOM_INSTANCE_TYPES default"
+    types = [t.strip() for t in m.group(1).split(",") if t.strip()]
+    families = {t.split(".")[0] for t in types}
+    assert len(families) >= 3, (
+        f"instance pool spans only {sorted(families)} — spot capacity is pooled "
+        "per family, so a single-family list gives no real diversification"
+    )
+
+
+def test_instance_pool_is_all_arm64_families():
+    """One AMI serves one architecture; an x86 type here fails at launch.
+
+    GROOM_AMI_ID is Amazon Linux 2023 arm64/Graviton. Adding an x86 type would
+    not diversify anything — it would produce launch failures.
+    """
+    import re
+    src = _dispatcher_source()
+    m = re.search(r'"GROOM_INSTANCE_TYPES",\s*\n?\s*"([^"]+)"', src)
+    types = [t.strip() for t in m.group(1).split(",") if t.strip()]
+    # arm64 families in use are Graviton: t4g / c6g / c7g / m6g / m7g / r6g...
+    for t in types:
+        fam = t.split(".")[0]
+        assert fam.endswith("g"), (
+            f"{t!r} is not an arm64/Graviton type but GROOM_AMI_ID is arm64 — "
+            "this launch would fail the AMI architecture check"
+        )
+
+
+def test_launch_records_the_instance_type_it_actually_got():
+    """A diversified pool is only manageable if usage-by-type is countable."""
+    src = _dispatcher_source()
+    assert "_describe_instance_type" in src, (
+        "nothing records which instance type won the capacity race — reclaim "
+        "rate by type is then unanswerable, which is the question a "
+        "diversified pool creates"
+    )
+    assert '"instance_type"' in src and '"market"' in src, (
+        "the dispatch ledger does not carry instance_type/market — terminated "
+        "instances age out of describe-instances in ~1h, so the ledger is the "
+        "only durable record"
+    )
+
+
+def test_state_machine_definition_is_in_the_deploy_trigger():
+    """A merged definition change that never deploys is the I5512 class.
+
+    deploy.sh deploys the state machine as well as the Lambda, but the trigger
+    only watched the Lambda directory — so definition-only changes reached
+    production by luck. Two did so on 2026-07-30.
+    """
+    from pathlib import Path
+    wf = (Path(__file__).resolve().parents[1] / ".github" / "workflows"
+          / "deploy-scheduled-groom-dispatcher.yml").read_text(encoding="utf-8")
+    assert "infrastructure/step_function_groom.json" in wf, (
+        "the deploy workflow does not trigger on the state-machine definition "
+        "— a definition-only merge will not reach production"
     )
