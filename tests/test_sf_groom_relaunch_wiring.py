@@ -237,9 +237,39 @@ def test_state_machine_declares_a_global_ceiling():
     ceiling = doc.get("TimeoutSeconds")
     assert ceiling, "the state machine must declare a top-level TimeoutSeconds"
     lane = doc["States"]["MapLaunches"]["ItemProcessor"]["States"]["LaunchGroomSpot"]
-    assert ceiling > lane["TimeoutSeconds"] * 2, (
-        "the global ceiling must leave room for one near-ceiling death plus one "
-        "full healthy retry"
+    # REVISED 2026-08-03 (Brian's ruling: max_retries -> 0, "if a spot dies, it
+    # dies"). The old bound was `ceiling > lane * 2` — room for one near-ceiling
+    # death PLUS one full healthy retry. That bound presumed in-cycle recovery.
+    #
+    # It is now unsatisfiable by construction and was never really about the SF:
+    # each relaunch is a NEW BOX with its own 3.5h wall
+    # (alpha-engine-config groom_spot_bootstrap.sh MAX_RUNTIME_SECONDS=12600),
+    # so two attempts is ~7h of wall-clock no matter what the ceiling permits.
+    # Holding both the 3.5h cap and a multi-rung ladder inside one cycle is
+    # arithmetically impossible.
+    #
+    # With max_retries=0 a lane gets exactly one attempt and a death waits for
+    # the next cycle — safe because the reconciler is level-triggered
+    # (groom-sweep-policy.md §5.1): the lane loses latency, never work.
+    #
+    # The bound that remains load-bearing: the ceiling must exceed ONE lane
+    # attempt with enough headroom for the box to wind down, write its final
+    # telemetry record and fire its task-token callback. Timing the SF out at
+    # the same moment the box stops would record a clean wall-hit as an SF
+    # failure with no end_reason — defeating the telemetry that makes this
+    # ruling safe.
+    retries = doc["States"]["MapLaunches"]["ItemSelector"]["max_retries"]
+    assert retries == 0, (
+        f"max_retries is {retries}, expected 0. Brian's ruling 2026-08-03: a "
+        "lane gets one attempt; a dead spot waits for the next cycle. Raising "
+        "it re-opens the conflict with the 3.5h box wall, because each retry is "
+        "a new box with its own full budget."
+    )
+    _WIND_DOWN_HEADROOM_S = 900  # 15 min: telemetry write + task-token callback
+    assert ceiling >= lane["TimeoutSeconds"] + _WIND_DOWN_HEADROOM_S, (
+        f"ceiling {ceiling}s leaves under {_WIND_DOWN_HEADROOM_S}s above the "
+        f"{lane['TimeoutSeconds']}s lane timeout — a box hitting its wall would "
+        "be abandoned mid-wind-down and its end_reason lost"
     )
     assert ceiling < _CYCLE_CADENCE_SECONDS, (
         "the global ceiling must stay under the 8h cycle cadence — an execution "
