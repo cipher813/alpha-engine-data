@@ -137,6 +137,11 @@ _GROOM_LIFECYCLE_TOPICS = (FleetTelegramTopic.GROOM,)
 # the ~18 per-box pings/day is how the 11-day alert-fatigue outage happened.
 # Per-box pings keep their existing silent-in-topic posture untouched.
 #
+# 2026-08-03 notification cleanup: the CYCLE rail buzzes only STARTED /
+# COMPLETE / lane-death / trigger-death (the "started / stopped-early /
+# finished" contract). lane_reclaimed_post_run is silent (no work lost;
+# durably recorded in the reconcile ledger).
+#
 # Distinct flow_name is REQUIRED, not cosmetic: flow_doctor_telegram caches the
 # built config by flow_name, so sharing one with the silent rail would serve
 # whichever posture initialized first.
@@ -255,7 +260,7 @@ INSTANCE_TYPES = [
     t.strip()
     for t in os.environ.get(
         "GROOM_INSTANCE_TYPES",
-        "t4g.medium,c6g.large,c7g.large,m6g.large,m7g.large,t4g.large",
+        "c6g.large,c7g.large,m6g.large,m7g.large,t4g.large",
     ).split(",")
     if t.strip()
 ]
@@ -880,8 +885,16 @@ def _utc_today() -> str:
     return datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
 
 
-def _notify_cycle(text: str, *, severity: str, dedup_key: str, context: dict) -> None:
-    """Send one CYCLE-level lifecycle ping (buzzing) — never raises.
+def _notify_cycle(text: str, *, severity: str, dedup_key: str, context: dict,
+                  silent: bool = False) -> None:
+    """Send one CYCLE-level lifecycle ping (buzzing unless ``silent``) — never raises.
+
+    ``silent=True`` suppresses the Telegram notification (2026-08-03
+    notification cleanup): used for events that are durably recorded elsewhere
+    and would read as confusing noise if they buzzed (e.g.
+    ``lane_reclaimed_post_run`` — no work lost, recorded in the reconcile
+    ledger). Default stays buzzing so STARTED / COMPLETE / lane-death /
+    trigger-death keep their loud posture.
 
     Best-effort per groom-sweep-policy §8 ("a notify hiccup must never block a
     relaunch or a status check"): the dispatch decision and the SF's terminal
@@ -890,7 +903,7 @@ def _notify_cycle(text: str, *, severity: str, dedup_key: str, context: dict) ->
     """
     try:
         notify_via_flow_doctor(
-            text, silent=False, severity=severity, dedup_key=dedup_key,
+            text, silent=silent, severity=severity, dedup_key=dedup_key,
             flow_name=_CYCLE_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
             db_basename=_CYCLE_DB_BASENAME,
             context=context,
@@ -1611,12 +1624,21 @@ def _reconcile_lane_death() -> dict:
     instance_ids = [e["instance_id"] for e in open_expectations
                     if e.get("instance_id")]
     instance_states: dict[str, str] = {}
+    # I6199: the reason THIS dispatcher terminated a box, tagged by
+    # spot_dispatch.terminate_on_failure at teardown. Tags survive on a
+    # terminated instance long enough for this reconciler (5-minute cadence) to
+    # read them. Without this, the page below can only restate EC2 state as if
+    # it were a diagnosis.
+    termination_reasons: dict[str, str] = {}
     if instance_ids:
         try:
             resp = ec2.describe_instances(InstanceIds=instance_ids)
             for reservation in resp.get("Reservations", []):
                 for inst in reservation.get("Instances", []):
                     instance_states[inst["InstanceId"]] = inst["State"]["Name"]
+                    for tag in inst.get("Tags", []):
+                        if tag.get("Key") == spot_dispatch.TERMINATION_REASON_TAG and tag.get("Value"):
+                            termination_reasons[inst["InstanceId"]] = tag["Value"]
         except Exception as exc:
             logger.warning("reconciler: describe-instances failed: %s", exc)
             # Fail-safe: treat ALL as unknown (not dead) — never page on a
@@ -1643,7 +1665,17 @@ def _reconcile_lane_death() -> dict:
             # Instance not found in describe-instances, or is in a terminal
             # state (stopped, terminated, shutting-down).
             page = True
-            reason = f"lane_died: instance {instance_id} is {state or 'absent'} — not in {sorted(_ALIVE_STATES)}"
+            # I6199: prefer the reason THIS dispatcher recorded when it tore the
+            # box down. EC2 state is a proxy — `is shutting-down` is true of a
+            # spot reclaim, a completed run winding down, and a dispatcher
+            # terminate after a failed bootstrap alike, and on 2026-08-03 it
+            # sent two cycles of investigation at the wrong subsystem.
+            dispatcher_reason = termination_reasons.get(instance_id, "")
+            if dispatcher_reason:
+                reason = (f"lane_died: dispatcher terminated instance {instance_id} "
+                          f"before bootstrap — {dispatcher_reason}")
+            else:
+                reason = f"lane_died: instance {instance_id} is {state or 'absent'} — not in {sorted(_ALIVE_STATES)}"
         elif exp.get("deadline_utc"):
             try:
                 deadline = datetime.fromisoformat(exp["deadline_utc"])
@@ -1677,14 +1709,19 @@ def _reconcile_lane_death() -> dict:
                 f"tier={tier_tag}  schedule={schedule_label}\n"
                 f"run_token={run_token}  instance={instance_id}\n"
                 f"work completed; evidence={evidence}",
-                # WARNING, not error: no work was lost. Paging this at error
-                # severity is what made a successful cycle read as a failed one.
+                # 2026-08-03 notification cleanup: SILENT — no work was lost,
+                # it is durably recorded in the reconcile ledger, and a
+                # buzzing "lane reclaimed AFTER completing" ping read as a
+                # confusing incident. (Was warning, not error, for that same
+                # reason: paging this at error severity made a successful
+                # cycle read as a failed one.)
                 severity="warning",
                 dedup_key=f"{_CYCLE_FLOW_NAME}:lane_reclaimed_post_run:{run_token}",
                 context={"expectation": {k: v for k, v in exp.items()
                                          if not k.startswith("_")},
                          "reason": reason, "instance_state": state,
                          "completion_evidence": evidence},
+                silent=True,
             )
         else:
             if gone:
@@ -1917,13 +1954,20 @@ def _notify_dispatch_ceiling_exhausted(prior: int, ceiling: int, tier_tag: str,
         logger.warning("dispatch-ceiling-exhausted Telegram failed (non-fatal): %s", exc)
 
 
-def _terminate_instance(instance_id: str) -> None:
+def _terminate_instance(instance_id: str, reason: str = "") -> None:
     """Best-effort terminate of a just-launched box whose post-launch steps
     failed. Without this the box orphans: it received no bootstrap, so neither
     the in-script watchdog nor the EXIT trap (both armed BY the bootstrap) is
     running to tear it down — it idles until manually killed. Never masks the
-    original error (logged, not raised)."""
-    spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="groom")
+    original error (logged, not raised).
+
+    ``reason`` (I6199) is tagged onto the instance so the lane reconciler can
+    page the cause instead of restating EC2 state. Callers pass the exception
+    that triggered the teardown; omitting it degrades the page to the old
+    state-only wording rather than failing."""
+    spot_dispatch.terminate_on_failure(
+        instance_id, region=REGION, label="groom", reason=reason
+    )
 
 
 def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_filter: str,
@@ -2055,9 +2099,9 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
             task_token=task_token,
             instance_type=_describe_instance_type(instance_id), market=market,
         )
-    except Exception:
+    except Exception as exc:
         logger.exception(_LEDGER_WRITE_FAILED_MSG)
-        _terminate_instance(instance_id)
+        _terminate_instance(instance_id, reason=f"{type(exc).__name__}: {exc}")
         raise
     # Once the box is up, ANY failure before the bootstrap command is delivered
     # would orphan it (no watchdog/trap yet). Terminate-on-error so a slow
@@ -2078,8 +2122,8 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
             instance_id, run_mode, run_url, model, issue_filter, run_token, soft_limit_min, pr_budget,
             queue_manifest_key, backend, task_token,
         )
-    except Exception:
-        _terminate_instance(instance_id)
+    except Exception as exc:
+        _terminate_instance(instance_id, reason=f"{type(exc).__name__}: {exc}")
         raise
     logger.info(
         "groom dispatched: instance=%s market=%s command=%s run_mode=%s model=%s issue_filter=%s "
