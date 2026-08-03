@@ -260,7 +260,7 @@ INSTANCE_TYPES = [
     t.strip()
     for t in os.environ.get(
         "GROOM_INSTANCE_TYPES",
-        "t4g.medium,c6g.large,c7g.large,m6g.large,m7g.large,t4g.large",
+        "c6g.large,c7g.large,m6g.large,m7g.large,t4g.large",
     ).split(",")
     if t.strip()
 ]
