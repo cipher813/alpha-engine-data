@@ -133,12 +133,19 @@ class _FakeWaiter:
 class _FakeEc2:
     def __init__(self, running_tier_instances=None):
         self.terminated = []
+        # `create_tags` appended to this list without it ever being initialised
+        # — an AttributeError waiting for the first test to exercise the tag
+        # path. I6199 is that first test.
+        self.tags_created: list[tuple[list[str], list[dict]]] = []
         # config#1979: (issue_filter -> [instance_ids]) already "live" for the
         # concurrent-tier guard's describe_instances check to find.
         self._running_tier_instances = dict(running_tier_instances or {})
         # config-I5229: instance_id -> state name for the reconciler's
         # InstanceIds-based describe_instances.
         self._instance_states: dict[str, str] = {}
+        # I6199: instance_id -> tags the reconciler reads to recover WHY the
+        # dispatcher tore a box down.
+        self._instance_tags: dict[str, list[dict]] = {}
 
     def get_waiter(self, name):
         return _FakeWaiter()
@@ -160,7 +167,10 @@ class _FakeEc2:
             instances = []
             for iid in InstanceIds:
                 state = self._instance_states.get(iid, "terminated")
-                instances.append({"InstanceId": iid, "State": {"Name": state}})
+                inst = {"InstanceId": iid, "State": {"Name": state}}
+                if iid in self._instance_tags:
+                    inst["Tags"] = self._instance_tags[iid]
+                instances.append(inst)
             return {"Reservations": [{"Instances": instances}]} if instances else {"Reservations": []}
         if Filters:
             by_name = {f["Name"]: f["Values"] for f in Filters}
@@ -3090,3 +3100,89 @@ def test_retry_marker_fails_soft_when_the_ledger_is_unreadable(monkeypatch):
     out = idx.handler({"retryMarker": True, "run_mode": "full",
                        "launchDecision": {"issue_filter": "mid-only"}}, None)
     assert out["lane_completed"] is False
+
+
+# ── The page must name the dispatcher's reason, not the EC2 state (I6199) ─────
+#
+# On 2026-08-03 eleven boxes were terminated by THIS Lambda after
+# `RuntimeError: SSM agent not Online after 180s`, and every page read
+# `instance is shutting-down — not in ('pending', 'running')`. EC2 state is a
+# proxy: `shutting-down` is equally true of a spot reclaim, a completed run
+# winding down, and a dispatcher terminate after a failed bootstrap. Two groom
+# cycles were spent looking for a groom defect that did not exist.
+
+_SSM_TIMEOUT_REASON = "RuntimeError: SSM agent not Online after 180s for i-dead"
+
+
+def _tag_dead_lane(idx, reason: str = _SSM_TIMEOUT_REASON) -> None:
+    idx._test_ec2._instance_tags["i-dead"] = [
+        {"Key": "Name", "Value": "alpha-engine-groom-spot"},
+        {"Key": "termination-reason", "Value": reason},
+        {"Key": "termination-source", "Value": "dispatcher"},
+    ]
+
+
+def test_lane_death_page_names_the_dispatcher_reason_not_the_instance_state(monkeypatch):
+    idx = _load(monkeypatch, s3_objects=_dead_lane_objects("tok-ssm"))
+    _tag_dead_lane(idx)
+    notifications = _spy_notify(monkeypatch, idx)
+
+    out = idx.handler({"mode": "reconcile"}, None)
+
+    assert out["deaths"] == 1
+    text, kw = notifications[0]
+    assert kw["severity"] == "error"
+    assert "SSM agent not Online after 180s" in text, (
+        f"page must carry the reason the dispatcher recorded, got: {text}"
+    )
+    assert "not in ['pending', 'running']" not in text, (
+        "page must not restate the EC2 state as if it were a diagnosis"
+    )
+
+
+def test_lane_death_page_records_the_dispatcher_reason_on_the_actioned_marker(monkeypatch):
+    """Every downstream consumer of the marker reads `reason` too."""
+    idx = _load(monkeypatch, s3_objects=_dead_lane_objects("tok-ssm2"))
+    _tag_dead_lane(idx)
+    _spy_notify(monkeypatch, idx)
+
+    idx.handler({"mode": "reconcile"}, None)
+
+    marker = json.loads(
+        idx._test_s3._objects["groom/_control/reconciled/tok-ssm2.json"].decode()
+    )
+    assert marker["outcome"] == "lane_died"
+    assert "SSM agent not Online" in marker["reason"]
+
+
+def test_lane_death_falls_back_to_instance_state_when_untagged(monkeypatch):
+    """A spot reclaim carries no dispatcher tag — behaviour must be unchanged."""
+    idx = _load(monkeypatch, s3_objects=_dead_lane_objects("tok-reclaim"))
+    notifications = _spy_notify(monkeypatch, idx)
+
+    out = idx.handler({"mode": "reconcile"}, None)
+
+    assert out["deaths"] == 1
+    text, _ = notifications[0]
+    assert "is terminated" in text
+    assert "dispatcher terminated" not in text
+
+
+def test_launch_failure_tags_the_instance_with_the_real_exception(monkeypatch):
+    """The producer half: the reason must reach EC2 before the terminate."""
+    idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
+    monkeypatch.setattr(
+        idx, "_wait_ssm_online",
+        lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("SSM agent not Online after 180s for i-test")
+        ),
+    )
+
+    with pytest.raises(RuntimeError):
+        idx.handler({"run_mode": "full", "schedule": "0 4 * * *"}, None)
+
+    assert idx._test_ec2.terminated, "a box whose bootstrap never landed must be torn down"
+    tagged = {t["Key"]: t["Value"]
+              for _, tags in idx._test_ec2.tags_created for t in tags}
+    assert "SSM agent not Online after 180s" in tagged.get("termination-reason", "")
+    assert tagged.get("termination-source") == "dispatcher"
