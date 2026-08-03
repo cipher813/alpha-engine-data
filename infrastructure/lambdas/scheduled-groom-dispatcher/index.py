@@ -294,6 +294,22 @@ GROOM_GH_PAT_SSM = os.environ.get("GROOM_GH_PAT_SSM", "/alpha-engine/saturday_sf
 #                                                        -> the reconciler's deadline_utc
 #   groom_spot_bootstrap.sh watchdog   21600s (360 min)  -> the box's own kill
 #
+# RE-ALIGNED 2026-08-03, and the same class recurred in the other direction.
+# Brian's 3.5h ruling moved the bootstrap watchdog to 12600 and its dead-man to
+# 13500 (alpha-engine-config-PR6356), leaving this constant and the SF lane at
+# 10800 — so the SSM command and the SF would abandon a lane at 3h while the
+# box worked on until 3.5h and was killed at 3.75h. The invariant's own words,
+# "the box must never outlive the lane the SF is waiting on", were violated by
+# a layer the binding test CANNOT SEE: it reads this constant, and the real box
+# bound lives in another repo.
+#
+# The ladder is now monotonic, each layer above the one it waits on:
+#   box soft budget      10800 (3.0h)   alpha-engine-config groom_run.sh
+#   box watchdog         12600 (3.5h)   alpha-engine-config bootstrap
+#   box dead-man         13500 (3.75h)  alpha-engine-config bootstrap
+#   this constant + lane 13800 (3.83h)  SSM timeout / reconciler / SF lane
+#   SF ceiling           14400 (4.0h)   step_function_groom.json
+#
 # The comment above this line claimed it "matches the bootstrap watchdog" — it
 # did, and both were wrong, because the SF had been tightened to 180 min
 # without them. The consequence is not cosmetic: the SF gives up on the lane at
@@ -309,7 +325,7 @@ GROOM_GH_PAT_SSM = os.environ.get("GROOM_GH_PAT_SSM", "/alpha-engine/saturday_sf
 # 10800 is therefore the value, and it is BOUND to the SF definition by
 # test_runtime_bound_is_single_and_authoritative — both files live in this
 # repo, so the binding is enforceable rather than aspirational.
-MAX_RUNTIME_SECONDS = int(os.environ.get("GROOM_MAX_RUNTIME_SECONDS", "10800"))
+MAX_RUNTIME_SECONDS = int(os.environ.get("GROOM_MAX_RUNTIME_SECONDS", "13800"))
 SSM_ONLINE_BUDGET_SEC = int(os.environ.get("GROOM_SSM_ONLINE_BUDGET_SEC", "180"))
 CW_LOG_GROUP = os.environ.get("GROOM_CW_LOG_GROUP", "/alpha-engine/groom-spot")
 

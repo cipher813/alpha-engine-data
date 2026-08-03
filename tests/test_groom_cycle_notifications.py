@@ -584,10 +584,11 @@ def test_sf_timeout_sits_above_the_box_budget_hierarchy():
     Brian's ruling 2026-08-03 caps the spot box at 3.5h. The layers nest, and
     each must sit above the one it backstops:
 
-        soft budget 180m (3.0h)   alpha-engine-config scripts/groom_run.sh
-        MAX_RUNTIME 12600 (3.5h)  alpha-engine-config groom_spot_bootstrap.sh
-        DEADMAN     13500 (3.75h) alpha-engine-config groom_spot_bootstrap.sh
-        SF timeout  14400 (4.0h)  THIS FILE
+        soft budget 10800 (3.00h)  alpha-engine-config scripts/groom_run.sh
+        box watchdog 12600 (3.50h) alpha-engine-config groom_spot_bootstrap.sh
+        box dead-man 13500 (3.75h) alpha-engine-config groom_spot_bootstrap.sh
+        lane + SSM   13800 (3.83h) step_function_groom.json + dispatcher index.py
+        SF ceiling   15000 (4.17h) THIS FILE
 
     Why 4h and not 3.5h: if the SF timed out at the same instant the box does,
     it would abandon the execution while the box is still writing its final
@@ -603,8 +604,9 @@ def test_sf_timeout_sits_above_the_box_budget_hierarchy():
 
     sf = json.loads((REPO_ROOT / "infrastructure" / "step_function_groom.json").read_text())
     timeout = sf.get("TimeoutSeconds")
-    assert timeout == 14400, (
-        f"SF TimeoutSeconds is {timeout}, expected 14400 (4.0h). It must remain "
-        "ABOVE the box's 3.75h dead-man, or the SF abandons runs that are still "
-        "winding down and records a failure for a clean wall-hit."
+    assert timeout == 15000, (
+        f"SF TimeoutSeconds is {timeout}, expected 15000 (4h10m). It must clear "
+        "the 13800s lane bound by the 900s wind-down headroom, which itself "
+        "clears the box's 3.75h dead-man — otherwise the SF abandons a run that "
+        "is still winding down and records a failure for a clean wall-hit."
     )
