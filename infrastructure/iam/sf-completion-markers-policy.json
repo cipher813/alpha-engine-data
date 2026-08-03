@@ -1,0 +1,15 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "WriteSfCompletionMarkers",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research/_sf_completion/ne-weekly-freshness-pipeline/*",
+        "arn:aws:s3:::alpha-engine-research/_sf_completion/ne-preopen-trading-pipeline/*",
+        "arn:aws:s3:::alpha-engine-research/_sf_completion/ne-postclose-trading-pipeline/*"
+      ]
+    }
+  ]
+}
