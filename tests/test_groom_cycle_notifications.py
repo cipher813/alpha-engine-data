@@ -576,3 +576,35 @@ def test_sweep_schedule_interleaves_with_the_groom():
         assert any((s - g) % 24 == 4 for s in sweep), (
             f"groom at {g:02d}:00 UTC has no sweep 4h later; sweeps={sweep}"
         )
+
+
+def test_sf_timeout_sits_above_the_box_budget_hierarchy():
+    """The SF must outlive the box it is waiting on, or it reports a false failure.
+
+    Brian's ruling 2026-08-03 caps the spot box at 3.5h. The layers nest, and
+    each must sit above the one it backstops:
+
+        soft budget 180m (3.0h)   alpha-engine-config scripts/groom_run.sh
+        MAX_RUNTIME 12600 (3.5h)  alpha-engine-config groom_spot_bootstrap.sh
+        DEADMAN     13500 (3.75h) alpha-engine-config groom_spot_bootstrap.sh
+        SF timeout  14400 (4.0h)  THIS FILE
+
+    Why 4h and not 3.5h: if the SF timed out at the same instant the box does,
+    it would abandon the execution while the box is still writing its final
+    telemetry and firing its task-token callback — turning a clean 3.5h
+    wall-hit into a reported SF failure with no end_reason recorded. The
+    15-minute gap is what lets the box finish saying why it stopped.
+
+    The counterpart values live in another repo and cannot be asserted from
+    here; alpha-engine-config's scripts/test_groom_run_telemetry.py owns them.
+    This test owns the top of the hierarchy.
+    """
+    import json
+
+    sf = json.loads((REPO_ROOT / "infrastructure" / "step_function_groom.json").read_text())
+    timeout = sf.get("TimeoutSeconds")
+    assert timeout == 14400, (
+        f"SF TimeoutSeconds is {timeout}, expected 14400 (4.0h). It must remain "
+        "ABOVE the box's 3.75h dead-man, or the SF abandons runs that are still "
+        "winding down and records a failure for a clean wall-hit."
+    )
