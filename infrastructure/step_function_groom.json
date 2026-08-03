@@ -634,5 +634,5 @@
       "Cause": "Backlog groom dispatch failed during the decide phase — see the SNS alert / Lambda logs for detail."
     }
   },
-  "TimeoutSeconds": 25200
+  "TimeoutSeconds": 14400
 }
