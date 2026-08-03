@@ -1691,6 +1691,33 @@ def _reconcile_lane_death() -> dict:
         tier_tag = exp.get("tier_tag", "unknown")
         schedule_label = exp.get("schedule", "unknown")
         run_token = str(exp.get("run_token") or "")
+        # Human-readable RENDERING of the token, for the notification body only.
+        #
+        # A bare `run_token=<32 lowercase hex>` is, to gitleaks' stock
+        # `generic-api-key` rule, indistinguishable from a leaked credential: the
+        # keyword `token` adjacent to a high-entropy 32-char value is exactly what
+        # that rule looks for. It is not a credential — it is a correlation id this
+        # Lambda mints per lane — but the scanner cannot know that.
+        #
+        # It matters because of where these bodies travel. `_notify_cycle` publishes
+        # onto the Overseer intake bus, alert-drain reads the queue into its LLM
+        # request, and the DLP egress proxy gitleaks-scans that outbound body. A
+        # match returns HTTP 400, the drain agent exits rc=1, and — because nothing
+        # is deleted from the queue without a ledger record (overseer-policy.md
+        # invariant 8) — the same message is re-read by the next run. One lane-death
+        # alert therefore wedges the entire response plane indefinitely.
+        #
+        # Measured 2026-08-03: 12 of 79 sampled intake messages carried this shape,
+        # every one from this emitter and this field; four consecutive drain runs
+        # died on it, and the retry ladder pushed the queue's other messages toward
+        # the DLQ five receives at a time.
+        #
+        # 12 hex chars keeps the prefix long enough to correlate a body against the
+        # dispatch ledger by eye, and short enough that no entropy rule fires. The
+        # FULL token is unchanged everywhere it is machine-read — `dedup_key` below,
+        # the `context` payload, and every log line — so nothing that consumes it
+        # programmatically is affected.
+        run_token_display = f"{run_token[:12]}…" if len(run_token) > 12 else run_token
 
         # alpha-engine-config-I5914: instance state is not a proxy for run
         # completion. A lane that finished its work and was reclaimed during
@@ -1707,7 +1734,7 @@ def _reconcile_lane_death() -> dict:
             _notify_cycle(
                 f"🟡 Groom lane reclaimed AFTER completing — {reason}\n"
                 f"tier={tier_tag}  schedule={schedule_label}\n"
-                f"run_token={run_token}  instance={instance_id}\n"
+                f"run_token={run_token_display}  instance={instance_id}\n"
                 f"work completed; evidence={evidence}",
                 # 2026-08-03 notification cleanup: SILENT — no work was lost,
                 # it is durably recorded in the reconcile ledger, and a
@@ -1734,7 +1761,7 @@ def _reconcile_lane_death() -> dict:
             _notify_cycle(
                 f"🔴 Groom lane DEATH — {reason}\n"
                 f"tier={tier_tag}  schedule={schedule_label}\n"
-                f"run_token={run_token}  instance={instance_id}",
+                f"run_token={run_token_display}  instance={instance_id}",
                 severity="error",
                 dedup_key=f"{_CYCLE_FLOW_NAME}:lane_death:{run_token}",
                 context={"expectation": {k: v for k, v in exp.items()
@@ -1997,8 +2024,41 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
     # concurrent box racing the identical GitHub queue. config#2201: sweep
     # boxes guard on the distinct 'sweep' lane (see _tier_tag) so the
     # end-of-SF sweep never collides with a live mid-only groom box.
+    #
+    # Reclaim-aware bypass (2026-08-02 spot-reclaim race): the guard sees a
+    # spot-reclaimed instance as "live" for ~2 min after the interruption
+    # notice — AWS retains it `running` while the on-box watcher has already
+    # fired send_task_failure(SpotInterrupted) and the SF has already decided
+    # to relaunch. Without this leg the relaunch suppresses itself as a
+    # "duplicate" and the lane dies unworked (measured 2026-08-02 20:00 UTC:
+    # low-only reclaimed, relaunch attempt 1 skipped, lane lost). On a relaunch
+    # (attempt > 0 — ONLY the SF's bounded-retry ladder sets this), re-probe
+    # the "live" instances: any that are termination-imminent (terminal state
+    # OR a spot request marked-for-termination) are the dying prior attempt,
+    # not a competing workload — proceed past the guard for those. A genuinely
+    # healthy prior box (attempt 0, or a real duplicate on attempt > 0) still
+    # suppresses, preserving config#1979's intent. The probe is fail-safe: an
+    # API error returns an empty set and the guard suppresses as before, never
+    # risking a duplicate launch on a broken read.
     tier_tag = _tier_tag(run_mode, issue_filter)
     existing = _running_tier_instance_ids(tier_tag)
+    if existing and attempt > 0:
+        dying = spot_dispatch.termination_imminent(existing, region=REGION)
+        if dying:
+            live = [i for i in existing if i not in dying]
+            if not live:
+                logger.info(
+                    "relaunch attempt %d for lane %s: prior instance(s) %s are "
+                    "termination-imminent (spot reclaim / terminal state) — "
+                    "proceeding with the replacement, NOT a duplicate",
+                    attempt, tier_tag, existing)
+                existing = []  # fall through to launch
+            else:
+                logger.warning(
+                    "relaunch attempt %d for lane %s: mixed live (%s) + dying "
+                    "(%s) prior boxes — suppressing on the genuinely-live one(s)",
+                    attempt, tier_tag, live, [i for i in existing if i in dying])
+                existing = live
     if existing:
         logger.warning(
             "lane %s already has a live groom box (%s) — skipping launch to avoid "
