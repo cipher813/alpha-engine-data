@@ -517,19 +517,65 @@ def _deploy_sh() -> str:
             / "scheduled-groom-dispatcher" / "deploy.sh").read_text(encoding="utf-8")
 
 
-def test_sweep_has_its_own_schedules_not_only_the_groom_tail():
-    """The sweep must not be hostage to groom health.
+def test_every_sf_path_reaches_the_tail_sweep():
+    """The sweep must not be hostage to groom health — asserted DIRECTLY.
 
-    It ran only as DispatchEndOfSfSweep — the last state of the groom cycle —
-    so when two of three cycles ended in `concurrent_cycle_skip` on 2026-07-30,
-    the sweep did not run on either. It has no dependency on groom OUTPUT, so
-    the coupling bought nothing.
+    Was: `test_sweep_has_its_own_schedules_not_only_the_groom_tail`, which
+    asserted three named standalone schedules exist. That was a PROXY for the
+    property, adopted 2026-07-30 after two of three cycles ended in
+    `concurrent_cycle_skip` and the sweep ran on neither.
+
+    config#2201 then fixed the actual defect by rerouting: the zero-launches
+    path is no longer a terminal Succeed. Verified against the state machine
+    2026-08-03 — every route lands on DispatchEndOfSfSweep:
+
+        CheckAnyLaunches   --default-->  AllSkipped --> DispatchEndOfSfSweep
+        CheckMapLaneOutcomes --default-->             DispatchEndOfSfSweep
+        SetMapFailureFromLanes -->                    DispatchEndOfSfSweep
+        RecordMapLaunchFailure -->                    DispatchEndOfSfSweep
+
+    So the standalone schedules were buying coverage the SF already provided,
+    at the price of a second cadence interleaved 4h between the groom slots —
+    a dispatch every four hours around the clock, including 01:00 local. They
+    were emptied 2026-08-03 (Brian: "it seems to launch at all hours of the
+    day... a clear schedule, minimal collisions").
+
+    This test asserts the property the proxy stood for, which also makes it a
+    real regression guard: re-terminating any of those paths breaks it.
     """
-    sh = _deploy_sh()
-    assert "SWEEP_SCHED_NAMES=(" in sh, "no independent sweep schedules defined"
-    for hhmm in ("0000", "0800", "1600"):
-        assert f"alpha-engine-groom-sweep-{hhmm}-daily" in sh, (
-            f"missing the {hhmm} UTC sweep rule")
+    import json
+    sf = json.loads((REPO_ROOT / "infrastructure" / "step_function_groom.json").read_text())
+    states = sf["States"]
+    assert "DispatchEndOfSfSweep" in states, "the tail sweep state is gone"
+
+    def _successors(state):
+        out = []
+        if state.get("Next"):
+            out.append(state["Next"])
+        out += [c["Next"] for c in state.get("Choices", []) if c.get("Next")]
+        if state.get("Default"):
+            out.append(state["Default"])
+        out += [c["Next"] for c in state.get("Catch", []) if c.get("Next")]
+        return out
+
+    # Every terminal-ish route out of the decide/launch phases must funnel to
+    # the sweep. The one legitimate exception is DecideLaunches failing
+    # outright — the dispatcher Lambda is down, and a standalone sweep
+    # invoking that same Lambda would not have run either.
+    for name in (
+        "AllSkipped",
+        "CheckMapLaneOutcomes",
+        "SetMapFailureFromLanes",
+        "RecordMapLaunchFailure",
+    ):
+        assert name in states, f"{name} missing from the state machine"
+        succ = _successors(states[name])
+        assert "DispatchEndOfSfSweep" in succ, (
+            f"{name} no longer routes to DispatchEndOfSfSweep (successors: {succ}). "
+            "The sweep is hostage to groom health again — this is the 2026-07-30 "
+            "failure, and the standalone sweep schedules that used to mask it "
+            "were removed 2026-08-03."
+        )
 
 
 def test_sweep_rules_sit_outside_the_pruned_prefix():
@@ -550,29 +596,51 @@ def test_sweep_rules_sit_outside_the_pruned_prefix():
         )
 
 
-def test_sweep_schedule_interleaves_with_the_groom():
-    """Each sweep must land between grooms, not on top of one.
+def test_no_dispatch_lands_in_the_quiet_hours():
+    """The declared cadence must not fire while nobody is awake to respond.
 
-    groom 04/12/20 UTC daily, sweep 00/08/16 UTC — every daily groom is swept
-    4h later. The Sun 09:00 UTC weekly slot is an extra and is excluded: it is
-    not part of the daily interleave.
+    Was: `test_sweep_schedule_interleaves_with_the_groom`, which asserted the
+    sweep landed exactly 4h AFTER each groom — i.e. it enforced the very
+    interleave that produced a dispatch every four hours around the clock.
+    The standalone sweeps were emptied 2026-08-03 and the interleave with them;
+    what should have been guarded all along is the property below.
+
+    groom-sweep-policy.md §4.8: irreversible work is confined to an attended
+    window, because a merge at 01:00 has the longest possible time-to-human
+    detection and F4 will not surface it for up to seven days.
+
+    Local time is UTC-7 (PDT). The current declared cadence is 04/12/20 UTC =
+    21:00 / 05:00 / 13:00 local. 21:00 and 05:00 are deliberately kept — Brian
+    chose that 3x/day cadence on 2026-07-30 — so the guarded window is the
+    genuinely dead hours, 01:00-04:00 local, which nothing may occupy.
     """
     import re
     sh = _deploy_sh()
 
-    def hours(block_name: str) -> list[int]:
+    def daily_hours(block_name: str) -> list[int]:
+        if block_name not in sh:
+            return []
         block = sh.split(block_name, 1)[1].split(")\n", 1)[0]
-        # Daily rules only: `cron(0 H * * ? *)`. The weekly is `? * SUN *`.
         return sorted(int(h) for h in
                       re.findall(r'cron\(0 (\d+) \* \* \? \*\)', block))
 
-    groom = hours("SCHED_CRONS=(")
-    sweep = hours("SWEEP_SCHED_CRONS=(")
-    assert groom and sweep, f"could not parse schedules: groom={groom} sweep={sweep}"
-    assert not (set(groom) & set(sweep)), (
-        f"a sweep fires at the same hour as a groom: {sorted(set(groom) & set(sweep))}"
-    )
-    for g in groom:
-        assert any((s - g) % 24 == 4 for s in sweep), (
-            f"groom at {g:02d}:00 UTC has no sweep 4h later; sweeps={sweep}"
+    groom = daily_hours("SCHED_CRONS=(")
+    sweep = daily_hours("SWEEP_SCHED_CRONS=(")
+    assert groom, "no daily groom cadence declared"
+
+    UTC_OFFSET = 7  # PDT
+    DEAD_LOCAL = {1, 2, 3}
+    for utc_h in groom + sweep:
+        local = (utc_h - UTC_OFFSET) % 24
+        assert local not in DEAD_LOCAL, (
+            f"cron(0 {utc_h} * * ? *) fires at {local:02d}:00 local, inside the "
+            f"dead window {sorted(DEAD_LOCAL)}. groom-sweep-policy.md §4.8 — a "
+            "dispatch nobody can respond to maximises time-to-detection."
         )
+
+    # And no two declared cadences may fire in the same hour: that is a
+    # collision, not a schedule (§5.9 — one lease per lane).
+    overlap = set(groom) & set(sweep)
+    assert not overlap, f"groom and sweep both fire at {sorted(overlap)} UTC"
+
+

@@ -100,15 +100,29 @@ class TestReconcileBlockIsIamFree:
             "Offending lines:\n  " + "\n  ".join(offenders)
         )
 
-    def test_reconcile_block_still_creates_the_sweep_rules(self):
-        """The three rules I5805 exists because of."""
+    def test_reconcile_block_reconciles_the_sweep_array_including_empty(self):
+        """The reconcile block owns the sweep rules — whatever the array says.
+
+        Was: asserted three specific rule names exist. That pinned a *cadence*
+        rather than the *mechanism*, so emptying the array (2026-08-03, Brian:
+        "it seems to launch at all hours of the day") failed a test that was
+        never about those three names. Same class as a version test asserting a
+        hardcoded literal: the check blocks the change it should have allowed.
+
+        What must hold is that the block both CREATES what is declared and
+        PRUNES what is not — the sweep rules are named outside SCHED_PREFIX, so
+        2f's prune skips them and removal is otherwise silently ineffective.
+        """
         block = _reconcile_block()
-        for name in (
-            "alpha-engine-groom-sweep-0000-daily",
-            "alpha-engine-groom-sweep-0800-daily",
-            "alpha-engine-groom-sweep-1600-daily",
-        ):
-            assert name in block, f"{name} is not created in the reconcile block"
+        assert "SWEEP_SCHED_NAMES" in block, "the sweep array is not reconciled here"
+        assert "SWEEP_SCHED_PREFIX" in block, (
+            "no prune over the sweep prefix — removing an entry from "
+            "SWEEP_SCHED_NAMES would orphan a still-firing live rule, which is "
+            "alpha-engine-config-I5805 in reverse"
+        )
+        assert "aws scheduler delete-schedule" in block, (
+            "the sweep prune must actually delete, not just enumerate"
+        )
 
     def test_bootstrap_still_implies_both_halves(self):
         """`--bootstrap` predates the split and must keep its old meaning."""
@@ -145,23 +159,26 @@ class TestDeployWorkflowRunsIt:
 
 
 class TestDriftCheckerSeesEveryDeclaredRule:
-    def test_discovery_finds_the_sweep_rules(self):
+    def test_discovery_finds_indented_arrays(self):
         """Indented arrays included — they live inside an `if` block.
 
         The first draft of the checker anchored its array regex at column 0 and
-        found 11 of 14 rules, missing exactly the sweep ones. Zero findings on an
-        invisible rule reads as "no drift", which is the same class of bug the
-        checker is for.
+        found 11 of 14 rules, missing exactly the ones nested in the reconcile
+        block. Zero findings on an invisible rule reads as "no drift", which is
+        the same class of bug the checker exists for.
+
+        Named rules here are the ones that must always be discoverable; the
+        standalone sweep cadence was emptied 2026-08-03 and deliberately is not
+        among them (end-of-SF sweep covers it every cycle).
         """
         checker = _load_checker()
         rules, errors, _ = checker.discover_codified_rules()
         assert not errors, f"source errors in deploy scripts: {errors}"
         names = {r["name"] for r in rules}
         for expected in (
-            "alpha-engine-groom-sweep-0000-daily",
-            "alpha-engine-groom-sweep-0800-daily",
-            "alpha-engine-groom-sweep-1600-daily",
             "alpha-engine-scheduled-groom-0400-daily",
+            "alpha-engine-scheduled-groom-1200-daily",
+            "alpha-engine-scheduled-groom-2000-daily",
             "alpha-engine-groom-lane-reconciler-5min",
         ):
             assert expected in names, (
@@ -287,9 +304,14 @@ class TestDeployAssertionIsScopedToItsOwnDispatcher:
             "it owned all of them, scoping would be a no-op and this test would "
             "prove nothing"
         )
-        # 4 groom cadences + 3 sweep cadences + 1 lane reconciler.
-        assert len(scoped) == 8, (
-            f"expected 8 rules for the groom dispatcher, found {len(scoped)}: "
+        # 4 groom cadences (3 daily + 1 weekly) + 1 lane reconciler.
+        # Was 8: the 3 standalone sweep cadences were emptied 2026-08-03 —
+        # DispatchEndOfSfSweep already sweeps at the end of every groom cycle,
+        # so they were a second sweep cadence layered on a design that already
+        # swept, and their 00/08/16 UTC slots interleaved 4h between the groom
+        # slots to produce a dispatch every four hours around the clock.
+        assert len(scoped) == 5, (
+            f"expected 5 rules for the groom dispatcher, found {len(scoped)}: "
             f"{sorted(r['name'] for r in scoped)}"
         )
 

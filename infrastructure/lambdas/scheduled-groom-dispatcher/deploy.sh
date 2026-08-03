@@ -142,6 +142,8 @@ SCHED_INPUTS=(
 )
 # Prefix used to discover live rules for prune reconciliation (see step 2f).
 SCHED_PREFIX="alpha-engine-scheduled-groom-"
+# Sweep rules are named outside SCHED_PREFIX (see 2e); they get their own prune.
+SWEEP_SCHED_PREFIX="alpha-engine-groom-sweep-"
 
 # DRY_RUN honors an ambient env var (true/1/yes) as well as the --dry-run
 # flag below, so DRY_RUN=1/true from a caller's shell actually no-ops
@@ -524,21 +526,42 @@ EOF
   # SCHED_NAMES entries target the STEP FUNCTION (a full groom cycle). These
   # target the LAMBDA with run_mode=sweep, so a shared prefix would have them
   # deleted on the next deploy.
-  SWEEP_SCHED_NAMES=(
-    "alpha-engine-groom-sweep-0000-daily"
-    "alpha-engine-groom-sweep-0800-daily"
-    "alpha-engine-groom-sweep-1600-daily"
-  )
-  SWEEP_SCHED_CRONS=(
-    "cron(0 0 * * ? *)"
-    "cron(0 8 * * ? *)"
-    "cron(0 16 * * ? *)"
-  )
+  # EMPTIED 2026-08-03 (Brian: "it seems to launch at all hours of the day...
+  # a clear schedule, minimal collisions"). These fired at 00/08/16 UTC —
+  # 17:00 / 01:00 / 09:00 local — interleaved exactly 4h between the groom
+  # slots, turning a chosen 3x/day cadence into a dispatch every four hours
+  # around the clock, including one at 01:00 nobody could respond to.
+  #
+  # Nothing is lost, and this is verified against the state machine rather
+  # than assumed. EVERY route through step_function_groom.json lands on
+  # DispatchEndOfSfSweep:
+  #
+  #   CheckAnyLaunches   --default--> AllSkipped             --> DispatchEndOfSfSweep
+  #   CheckMapLaneOutcomes --default-->                          DispatchEndOfSfSweep
+  #   SetMapFailureFromLanes -->                                 DispatchEndOfSfSweep
+  #   RecordMapLaunchFailure -->                                 DispatchEndOfSfSweep
+  #
+  # These rules were added 2026-07-30 because the sweep was then hostage to
+  # groom health — two of three cycles ended in `concurrent_cycle_skip` and
+  # the sweep ran on neither. config#2201 fixed that by rerouting the
+  # zero-launches path (it is no longer a terminal Succeed), so the standalone
+  # cadence has been buying coverage the SF already provides. The only route
+  # that skips the sweep is DecideLaunches failing outright — the dispatcher
+  # Lambda is down, and a standalone sweep invoking that same Lambda would not
+  # have run either.
+  #
+  # Guarded directly now by test_every_sf_path_reaches_the_tail_sweep, which
+  # asserts the routing rather than the existence of three rule names.
+  #
+  # Result: 3 dispatch windows/day (04/12/20 UTC = 21:00/05:00/13:00 local),
+  # each grooming and then sweeping. Same coverage, half the dispatches.
+  SWEEP_SCHED_NAMES=()
+  SWEEP_SCHED_CRONS=()
   # Mirrors the DispatchEndOfSfSweep payload in step_function_groom.json:
   # a literal launch_decided sweep event. `issue_filter` is inert for
   # run_mode=sweep but the launch path validates it, so it is passed
   # explicitly rather than defaulted.
-  for i in "${!SWEEP_SCHED_NAMES[@]}"; do
+  for i in "${!SWEEP_SCHED_NAMES[@]+${!SWEEP_SCHED_NAMES[@]}}"; do
     sname="${SWEEP_SCHED_NAMES[$i]}"
     scron="${SWEEP_SCHED_CRONS[$i]}"
     sweep_target=$(python3 -c 'import json,sys; print(json.dumps({"Arn": sys.argv[1], "RoleArn": sys.argv[2], "Input": json.dumps({"run_mode": "sweep", "launch_decided": True, "model": "deepseek-v4-flash", "issue_filter": "mid-only", "schedule": sys.argv[3]})}))' "${FN_ARN}" "${SCHED_ROLE_ARN}" "${sname}")
@@ -560,6 +583,35 @@ EOF
       aws scheduler get-schedule --name "${sname}" --region "${REGION}" \
         --query 'Name' --output text >/dev/null \
         || { echo "ERROR: sweep rule ${sname} not found after create/update" >&2; exit 1; }
+    fi
+  done
+
+  # --- 2e-prune. Reconcile the SWEEP rules against SWEEP_SCHED_NAMES.
+  #
+  # These are named outside SCHED_PREFIX on purpose (see above), which means
+  # 2f's prune deliberately SKIPS them — so emptying SWEEP_SCHED_NAMES would
+  # otherwise leave three live rules firing forever with nothing in the tree
+  # declaring them. That is alpha-engine-config-I5805 in reverse:
+  # declared-removed, still live, invisible.
+  #
+  # Added 2026-08-03 alongside emptying the array, so the removal takes effect.
+  # Same contract as 2f: the array is the source of truth.
+  echo "  Pruning orphaned Scheduler rules under prefix ${SWEEP_SCHED_PREFIX}..."
+  LIVE_SWEEP=$(aws scheduler list-schedules --name-prefix "${SWEEP_SCHED_PREFIX}" \
+    --region "${REGION}" --query 'Schedules[].Name' --output text 2>/dev/null || echo "")
+  for live in ${LIVE_SWEEP}; do
+    keep=false
+    for want in "${SWEEP_SCHED_NAMES[@]+${SWEEP_SCHED_NAMES[@]}}"; do
+      [ "${live}" = "${want}" ] && { keep=true; break; }
+    done
+    if ! $keep; then
+      echo "    Deleting orphaned sweep Scheduler rule: ${live}"
+      run aws scheduler delete-schedule --name "${live}" --region "${REGION}"
+      if ! $DRY_RUN; then
+        aws scheduler get-schedule --name "${live}" --region "${REGION}" \
+          --query 'Name' --output text >/dev/null 2>&1 \
+          && { echo "ERROR: sweep Scheduler rule ${live} still present after delete" >&2; exit 1; }
+      fi
     fi
   done
 
