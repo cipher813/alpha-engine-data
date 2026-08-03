@@ -188,7 +188,7 @@ def test_lane_timeout_is_the_sole_bound_no_unemitted_heartbeat(states):
     heartbeat sat beside a 21600s timeout with no emitter anywhere in the fleet,
     and every lane died at 3606s."""
     launch = states["LaunchGroomSpot"]
-    assert launch["TimeoutSeconds"] == 10800
+    assert launch["TimeoutSeconds"] == 13800
     assert "HeartbeatSeconds" not in launch, (
         "no SendTaskHeartbeat emitter exists on the groom box — a heartbeat here "
         "would become the real lane timeout"
@@ -398,6 +398,19 @@ def test_runtime_bound_is_single_and_authoritative():
     reconciler was mis-armed identically: deadline_utc was now + 360 min, so a
     lane the SF had already given up on stayed 'not overdue' for three hours.
     """
+    # 2026-08-03: this test reads the DISPATCHER constant, which is the SSM
+    # command timeout — NOT the box's own watchdog, which lives in
+    # alpha-engine-config and is invisible from here. That blind spot let the
+    # same class recur in the opposite direction: Brian's 3.5h ruling moved the
+    # bootstrap watchdog to 12600 while this constant and the lane sat at
+    # 10800, so both would have abandoned a lane at 3h while the box worked to
+    # 3.5h — and this assertion still passed, because the layer that changed
+    # was not one it can see.
+    #
+    # The cross-repo half is asserted from the other side by
+    # alpha-engine-config scripts/test_groom_run_telemetry.py
+    # (test_budget_layers_nest_in_the_right_order). Neither repo can check the
+    # whole ladder alone; both halves are named so a reader knows to look.
     lane_timeout = _lane_state()["TimeoutSeconds"]
     box_bound = _dispatcher_max_runtime()
     assert box_bound <= lane_timeout, (

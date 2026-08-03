@@ -108,7 +108,7 @@
               "FunctionName": "alpha-engine-scheduled-groom-dispatcher",
               "Payload.$": "States.JsonMerge(States.JsonMerge(States.JsonMerge($.schedInput, $.launchDecision, false), $.fod, false), $$.Task, false)"
             },
-            "TimeoutSeconds": 10800,
+            "TimeoutSeconds": 13800,
             "Retry": [
               {
                 "ErrorEquals": [
@@ -634,5 +634,5 @@
       "Cause": "Backlog groom dispatch failed during the decide phase — see the SNS alert / Lambda logs for detail."
     }
   },
-  "TimeoutSeconds": 14400
+  "TimeoutSeconds": 15000
 }
