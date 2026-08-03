@@ -3186,3 +3186,59 @@ def test_launch_failure_tags_the_instance_with_the_real_exception(monkeypatch):
               for _, tags in idx._test_ec2.tags_created for t in tags}
     assert "SSM agent not Online after 180s" in tagged.get("termination-reason", "")
     assert tagged.get("termination-source") == "dispatcher"
+
+
+# ── Alert bodies must not carry a credential-shaped run token ────────────────
+#
+# A bare `run_token=<32 lowercase hex>` matches gitleaks' stock `generic-api-key`
+# rule. These bodies travel onto the Overseer intake bus, alert-drain reads the
+# queue into its LLM request, and the DLP egress proxy scans that outbound body —
+# so one lane-death alert returns HTTP 400, the drain exits rc=1, and because
+# nothing is deleted from the queue without a ledger record the SAME message
+# wedges every subsequent run. Measured 2026-08-03: 12 of 79 sampled intake
+# messages, all this emitter, all this field, four consecutive drain runs dead.
+
+_HEX32_TOKEN = "af87ec3d9b1e4c7a2f60d583be914c02"
+
+
+def _lane_death_body(monkeypatch, token):
+    idx = _load(monkeypatch, s3_objects=_dead_lane_objects(token))
+    _tag_dead_lane(idx)
+    notifications = _spy_notify(monkeypatch, idx)
+    idx.handler({"mode": "reconcile"}, None)
+    return notifications[0]
+
+
+def test_lane_death_body_truncates_the_run_token(monkeypatch):
+    """The rendered body must not contain the full 32-char token."""
+    text, _kw = _lane_death_body(monkeypatch, _HEX32_TOKEN)
+    assert _HEX32_TOKEN not in text, (
+        "the full run_token reached the notification body; gitleaks' "
+        "generic-api-key rule matches `run_token=<32 hex>` and the DLP egress "
+        "proxy will 400 every alert-drain run that reads this message"
+    )
+    assert _HEX32_TOKEN[:12] in text, (
+        "the truncated prefix must survive — it is what correlates a body "
+        "against the dispatch ledger by eye"
+    )
+
+
+def test_lane_death_dedup_key_keeps_the_full_token(monkeypatch):
+    """Truncation is a RENDERING change; machine-read fields are untouched.
+
+    The dedup key is what collapses repeated pages for one dead lane into one
+    alert. Truncating it there would widen the key and could collide two lanes
+    sharing a 12-char prefix.
+    """
+    _text, kw = _lane_death_body(monkeypatch, _HEX32_TOKEN)
+    assert kw["dedup_key"].endswith(_HEX32_TOKEN), (
+        f"dedup_key lost the full token: {kw['dedup_key']}"
+    )
+
+
+def test_short_token_is_rendered_whole(monkeypatch):
+    """No ellipsis on a token that was never long enough to look like a key."""
+    text, _kw = _lane_death_body(monkeypatch, "tok-short")
+    assert "run_token=tok-short " in text or "run_token=tok-short\n" in text, (
+        f"a short token must render verbatim, got: {text}"
+    )
