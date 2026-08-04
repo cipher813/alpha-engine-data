@@ -525,9 +525,25 @@ class TestStrictSuperset:
             "the shell-run chain runs after a successful cadence acquire"
         )
         # CheckSpotDispatchNeeded's own bypass (IsPresent) branch reaches
-        # CheckShellRun directly — an operator input carrying ec2_instance_id
-        # skips the dispatch entirely, preserving the strict-superset property.
-        assert states["CheckSpotDispatchNeeded"]["Choices"][0]["Next"] == "CheckShellRun"
+        # NormalizeEc2InstanceId — the new normalization gate that wraps a
+        # bare-string ec2_instance_id into the [\"i-...\"] array every downstream
+        # sendCommand InstanceIds.$ expects before proceeding to CheckShellRun.
+        assert states["CheckSpotDispatchNeeded"]["Choices"][0]["Next"] == "NormalizeEc2InstanceId"
+        # NormalizeEc2InstanceId inspects the shape: a string routes to
+        # WrapEc2InstanceIdInArray (Pass) which JsonMerge-wraps it; an array
+        # already in the correct shape goes straight to CheckShellRun.
+        norm = states["NormalizeEc2InstanceId"]
+        assert norm["Type"] == "Choice"
+        assert norm["Choices"][0]["Variable"] == "$.ec2_instance_id"
+        assert norm["Choices"][0]["IsString"] is True
+        assert norm["Choices"][0]["Next"] == "WrapEc2InstanceIdInArray"
+        assert norm["Default"] == "CheckShellRun"
+        wrap = states["WrapEc2InstanceIdInArray"]
+        assert wrap["Type"] == "Pass"
+        assert "States.JsonMerge" in wrap["Parameters"]["merged.$"]
+        assert "ec2_instance_id" in wrap["Parameters"]["merged.$"]
+        assert wrap["OutputPath"] == "$.merged"
+        assert wrap["Next"] == "CheckShellRun"
 
     def test_initialize_input_merge_expr_unchanged(self, states):
         # The run_date / sns_topic_arn defaults-under-input merge must be
