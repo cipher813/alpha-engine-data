@@ -1395,6 +1395,18 @@ def _write_dispatch_ledger_entry(run_token: str, tier_tag: str, schedule_label: 
 
 _RECONCILE_COMPLETED_PREFIX = "groom/_control/completed"
 
+# groom-sweep-policy §2.8/F8 (alpha-engine-config-I6325) — the on-box "the
+# charter actually began" marker, written by groom_run.sh (NOT this Lambda)
+# once a decided lane's box reaches its own Start-ping point. Distinct from
+# `_RECONCILE_COMPLETED_PREFIX` (terminal) and from a decision record
+# (proves only that THIS LAMBDA decided to launch, not that the box's agent
+# ever ran) — the gap between "decided" and "started" is exactly the
+# alpha-engine-config-I4987 failure mode (box reclaimed during/before
+# bootstrap). Date-prefixed (`{prefix}/{date}/{run_token}.json`), unlike
+# `_RECONCILE_COMPLETED_PREFIX`, so F8's daily emitter can bucket by day via
+# a plain prefix listing instead of parsing `aws s3 ls` modification times.
+_LANE_STARTED_PREFIX = "groom/_control/started"
+
 # Expectations this reconciler has already ACTIONED (paged + send-task-failure).
 # Without it the reconciler re-detects the same dead lane on every 5-minute
 # tick for as long as the ledger entry is in the scan window, and re-pages —
@@ -1865,6 +1877,15 @@ def _reconcile_trigger_health() -> dict:
 
     Fail-safe: a list-executions error skips the tick (never page on a broken
     SF API); the next 5-min tick retries.
+
+    **F8 side effect (alpha-engine-config-I6325):** every execution this tick
+    examines gets a `groom/_control/scheduled/{date}/{hhmm}.json` record
+    written (idempotent — see `_write_scheduled_cycle_record`), regardless of
+    whether its decision record is present. This is deliverable 1 of F8: "the
+    scheduler emits a scheduled-cycle record independently of the cycle" —
+    sourced from the SF's OWN execution history, which exists the instant
+    EventBridge Scheduler fires it, before any of this Lambda's own code has
+    had a chance to run (let alone fail).
     """
     now = datetime.now(ZoneInfo("UTC"))
     s3 = boto3.client("s3", region_name=REGION)
@@ -1901,6 +1922,13 @@ def _reconcile_trigger_health() -> dict:
         date = started.strftime("%Y-%m-%d")
         hhmm = started.strftime("%H%M")
         slot_id = f"{date}-{hhmm}"
+
+        # F8 deliverable 1 — written for EVERY examined execution, ahead of
+        # the "already actioned" (paging) short-circuit below: the scheduled
+        # record's existence must never depend on whether this slot has
+        # already been paged for a missing decision record.
+        _write_scheduled_cycle_record(s3, date, hhmm, started, ex)
+
         actioned_key = f"groom/_control/reconciled-trigger/{slot_id}.json"
         try:
             s3.head_object(Bucket=_RESEARCH_BUCKET, Key=actioned_key)
@@ -1966,6 +1994,152 @@ def _s3_key_exists(s3, key: str) -> bool:
         return True
     except Exception:  # noqa: BLE001 — any failure reads as "no receipt"
         return False
+
+
+# groom-sweep-policy §2.8/F8 (alpha-engine-config-I6325) ─────────────────────
+_SCHEDULED_CYCLE_PREFIX = "groom/_control/scheduled"
+
+
+def _write_scheduled_cycle_record(s3, date: str, hhmm: str, started, ex: dict) -> None:
+    """F8 deliverable 1 — the scheduled-cycle record, produced by the
+    SCHEDULER (this reconciler tick, reading the dispatch SF's own execution
+    history) independently of the cycle it describes. ``started-versus-
+    scheduled must be computable without trusting the thing that failed to
+    run``: an SF execution exists from the moment EventBridge Scheduler fires
+    it, regardless of whether the Lambda invocation that follows ever
+    completes — so this is strictly upstream of, and independent from, the
+    I4988 decision record and the on-box started marker.
+
+    Idempotent (head_object-gated): re-attempted on every tick that still
+    sees this slot in its lookback window, but only the first successful call
+    actually PUTs — cheap even at the 5-min cadence over a 30h window.
+    Best-effort: a write failure here must never affect trigger-health
+    paging, which reads live SF execution history directly and does not
+    depend on this record existing.
+    """
+    key = f"{_SCHEDULED_CYCLE_PREFIX}/{date}/{hhmm}.json"
+    if _s3_key_exists(s3, key):
+        return
+    try:
+        s3.put_object(
+            Bucket=_RESEARCH_BUCKET,
+            Key=key,
+            Body=json.dumps({
+                "execution_arn": ex.get("executionArn"),
+                "execution_name": ex.get("name"),
+                "started_at": started.isoformat(),
+            }).encode(),
+            ContentType="application/json")
+    except Exception as exc:  # noqa: BLE001 — best-effort, mirrors every other decision-record writer in this file
+        logger.warning("scheduled-cycle record write failed for %s (non-fatal): %s", key, exc)
+
+
+# F8 deliverable 3 — fast paging on "decided but never started" (alpha-
+# engine-config-I6325, I4987's exact failure mode: a box reclaimed during or
+# before bootstrap, so nothing on-box ever runs). Distinct from
+# `_reconcile_trigger_health` (I4988), which pages when the LAMBDA never
+# reached a decision at all — this leg pages when the Lambda DID decide and
+# launch (a dispatch-ledger entry reached EC2, i.e. carries an instance_id),
+# but the CHARTER never wrote its started marker. Mirrors the
+# SF_IS_DRILL/CI_IS_DRILL/DRAIN_IS_DRILL family's own distinction elsewhere in
+# this fleet: being dispatched and reaching the charter are different facts,
+# and only the second is "started" for F8's purposes.
+_LANE_START_MATURITY_MIN = 12  # SSM online budget (180s) + dnf/git-clone (~2-4min) + margin
+
+
+def _reconcile_lane_start_health() -> dict:
+    """Page a decided lane launch that never wrote its on-box started marker
+    within `_LANE_START_MATURITY_MIN` of being dispatched — instead of the 6h
+    SF timeout. Scans today's + yesterday's dispatch ledger (mirrors
+    `_reconcile_lane_death`'s own scan window) so a maturity check straddling
+    UTC midnight still finds its ledger entry.
+
+    A lane that already has a COMPLETED marker is not paged even absent a
+    started marker — it reached a terminal outcome by some other path (e.g. a
+    very fast classified failure) and is not silently stuck; that is a
+    diagnosability gap for a human to read off the two markers directly, not
+    a paging condition.
+
+    Fail-safe: an S3 listing/read error skips that day's scan; the next
+    5-min tick retries.
+    """
+    now = datetime.now(ZoneInfo("UTC"))
+    s3 = boto3.client("s3", region_name=REGION)
+    checked = 0
+    paged = 0
+    for delta_days in range(2):
+        day = (now - timedelta(days=delta_days)).strftime("%Y-%m-%d")
+        prefix = f"{_DISPATCH_LEDGER_PREFIX}/{day}/"
+        try:
+            keys: list[str] = []
+            paginator = s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=_RESEARCH_BUCKET, Prefix=prefix):
+                keys.extend(obj["Key"] for obj in page.get("Contents", []))
+        except Exception as exc:  # noqa: BLE001 — fail-safe, never page on a broken listing
+            logger.warning(
+                "lane-start health: listing %s failed (%s) — skipping this "
+                "day this tick (fail-safe; the next 5-min tick retries)",
+                prefix, exc)
+            continue
+        for key in keys:
+            try:
+                body = json.loads(
+                    s3.get_object(Bucket=_RESEARCH_BUCKET, Key=key)["Body"].read())
+            except Exception as exc:  # noqa: BLE001 — a single unreadable ledger entry must not stall the scan
+                logger.warning("lane-start health: could not read %s (%s) — skipping", key, exc)
+                continue
+            run_token = str(body.get("run_token") or "")
+            instance_id = str(body.get("instance_id") or "")
+            recorded_at = str(body.get("recorded_at") or "")
+            if not run_token or not instance_id or not recorded_at:
+                # The FIRST (pre-launch, config#3173) ledger write for this
+                # token, not yet the post-launch one — no EC2 request exists
+                # yet, so there is nothing to check a "started" marker
+                # against. The post-launch write (same key, overwritten) is
+                # what this leg evaluates.
+                continue
+            try:
+                recorded = datetime.fromisoformat(recorded_at)
+            except ValueError:
+                continue
+            age_min = (now - recorded).total_seconds() / 60.0
+            if age_min < _LANE_START_MATURITY_MIN:
+                continue
+            checked += 1
+            actioned_key = f"groom/_control/reconciled-lane-start/{run_token}.json"
+            if _s3_key_exists(s3, actioned_key):
+                continue  # already paged — one page per never-started lane
+            started_key = f"{_LANE_STARTED_PREFIX}/{day}/{run_token}.json"
+            completed_key = f"{_RECONCILE_COMPLETED_PREFIX}/{run_token}.json"
+            if _s3_key_exists(s3, started_key) or _s3_key_exists(s3, completed_key):
+                continue  # the charter began (or the lane already reached a terminal outcome) — healthy
+            paged += 1
+            _notify_cycle(
+                "🔴 Groom lane NEVER STARTED — dispatch-ledger entry "
+                f"run_token={run_token} instance={instance_id} decided "
+                f"{recorded_at} ({age_min:.0f}m ago), but no "
+                f"groom/_control/started/ or /completed/ marker exists. The "
+                "charter never ran (box likely reclaimed during/before "
+                "bootstrap — alpha-engine-config-I4987). Manual triage "
+                "needed (alpha-engine-config-I6325).",
+                severity="error",
+                dedup_key=f"{_CYCLE_FLOW_NAME}:lane_never_started:{run_token}",
+                context={"run_token": run_token, "instance_id": instance_id,
+                         "recorded_at": recorded_at, "age_min": round(age_min, 1)},
+            )
+            try:
+                s3.put_object(
+                    Bucket=_RESEARCH_BUCKET, Key=actioned_key,
+                    Body=json.dumps({
+                        "outcome": "lane_never_started", "run_token": run_token,
+                        "actioned_at": now.isoformat(),
+                    }).encode(),
+                    ContentType="application/json")
+            except Exception as exc:  # noqa: BLE001 — re-pages next tick, bounded by the flow-doctor dedup key above
+                logger.warning(
+                    "lane-start health: actioned-marker write failed for %s "
+                    "(will re-page next tick): %s", run_token, exc)
+    return {"checked": checked, "paged": paged}
 
 
 def _notify_dispatch_ceiling_exhausted(prior: int, ceiling: int, tier_tag: str,
@@ -2910,12 +3084,15 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         # cadence) invokes this mode to screen open expectations against
         # live EC2 state. config-I4988 (trigger-health leg, added with the
         # run_window retirement): the same tick also screens dispatch-SF
-        # executions for their decision-record receipts. No other caller
-        # sets a top-level `mode`, so this cannot collide with any other
-        # invocation shape.
+        # executions for their decision-record receipts. alpha-engine-
+        # config-I6325 (F8 lane-start-health leg): the same tick also
+        # screens decided lane launches for a charter that never started. No
+        # other caller sets a top-level `mode`, so this cannot collide with
+        # any other invocation shape.
         lane = _reconcile_lane_death()
         trigger = _reconcile_trigger_health()
-        return {**lane, "trigger_health": trigger}
+        lane_start = _reconcile_lane_start_health()
+        return {**lane, "trigger_health": trigger, "lane_start_health": lane_start}
     run_mode = _resolve_run_mode(event)
     model = _resolve_model(event)
     issue_filter = _resolve_issue_filter(event)
