@@ -79,4 +79,4 @@ nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nouse
 # cannot run the commands the SF emits. 0.18.8 is also the version that made
 # the correlation id MANDATORY (`run` exits 2 without it), so this floor pins
 # both halves of the same contract. See tests/test_sf_krepis_correlation_id.py.
-krepis>=0.24.2
+krepis==0.24.2  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
