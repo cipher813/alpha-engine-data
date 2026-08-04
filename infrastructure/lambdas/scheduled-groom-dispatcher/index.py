@@ -2396,6 +2396,7 @@ def _reconcile_lane_start_health() -> dict:
     s3 = boto3.client("s3", region_name=REGION)
     checked = 0
     paged = 0
+    newly_found: list[dict] = []
     for delta_days in range(2):
         day = (now - timedelta(days=delta_days)).strftime("%Y-%m-%d")
         prefix = f"{_DISPATCH_LEDGER_PREFIX}/{day}/"
@@ -2443,19 +2444,10 @@ def _reconcile_lane_start_health() -> dict:
             if _s3_key_exists(s3, started_key) or _s3_key_exists(s3, completed_key):
                 continue  # the charter began (or the lane already reached a terminal outcome) — healthy
             paged += 1
-            _notify_cycle(
-                "🔴 Groom lane NEVER STARTED — dispatch-ledger entry "
-                f"run_token={run_token} instance={instance_id} decided "
-                f"{recorded_at} ({age_min:.0f}m ago), but no "
-                f"groom/_control/started/ or /completed/ marker exists. The "
-                "charter never ran (box likely reclaimed during/before "
-                "bootstrap — alpha-engine-config-I4987). Manual triage "
-                "needed (alpha-engine-config-I6325).",
-                severity="error",
-                dedup_key=f"{_CYCLE_FLOW_NAME}:lane_never_started:{run_token}",
-                context={"run_token": run_token, "instance_id": instance_id,
-                         "recorded_at": recorded_at, "age_min": round(age_min, 1)},
-            )
+            newly_found.append({
+                "run_token": run_token, "instance_id": instance_id,
+                "recorded_at": recorded_at, "age_min": age_min,
+            })
             try:
                 s3.put_object(
                     Bucket=_RESEARCH_BUCKET, Key=actioned_key,
@@ -2468,6 +2460,33 @@ def _reconcile_lane_start_health() -> dict:
                 logger.warning(
                     "lane-start health: actioned-marker write failed for %s "
                     "(will re-page next tick): %s", run_token, exc)
+
+    # ONE aggregate page per cycle, never one per lane (2026-08-04 incident:
+    # this leg's first-ever run discovered a 2-day backlog of 27 pre-existing
+    # I4987 failures — all already the SAME known, tracked gap — and paged
+    # each individually, flooding the operator channel and plausibly tripping
+    # Telegram's own rate limit (flow-doctor's "ALL notifiers failed" alert
+    # fired in the same window). A burst belongs in one digest; the per-token
+    # actioned-key above still gives idempotency across ticks.
+    if newly_found:
+        lines = "\n".join(
+            f"  • run_token={f['run_token']} instance={f['instance_id']} "
+            f"decided {f['recorded_at']} ({f['age_min']:.0f}m ago)"
+            for f in sorted(newly_found, key=lambda f: -f["age_min"])[:20]
+        )
+        more = f"\n  … and {len(newly_found) - 20} more" if len(newly_found) > 20 else ""
+        _notify_cycle(
+            f"🔴 {len(newly_found)} groom lane(s) NEVER STARTED — dispatch-ledger "
+            "entries decided, no groom/_control/started/ or /completed/ marker "
+            "exists. Charter never ran (box likely reclaimed during/before "
+            "bootstrap — alpha-engine-config-I4987, same known cause for all "
+            f"listed below). Manual triage needed (alpha-engine-config-I6325).\n"
+            f"{lines}{more}",
+            severity="error",
+            dedup_key=f"{_CYCLE_FLOW_NAME}:lane_never_started_batch:{now:%Y-%m-%dT%H:%M}",
+            context={"count": len(newly_found),
+                     "run_tokens": [f["run_token"] for f in newly_found]},
+        )
     return {"checked": checked, "paged": paged}
 
 

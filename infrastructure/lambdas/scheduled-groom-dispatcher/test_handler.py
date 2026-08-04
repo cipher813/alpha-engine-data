@@ -2939,6 +2939,31 @@ def test_lane_start_health_listing_error_is_fail_safe(monkeypatch):
     assert result["paged"] == 0
 
 
+def test_lane_start_health_batches_multiple_lanes_into_one_page(monkeypatch):
+    """2026-08-04 incident: this leg's first-ever run found a 2-day backlog of
+    27 never-started lanes and paged each individually, flooding the operator
+    channel and plausibly tripping Telegram's own rate limit. N discoveries in
+    one cycle must produce exactly ONE notify call, not N."""
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key("tok1"): _mature_ledger_entry("tok1"),
+        _ledger_key("tok2"): _mature_ledger_entry("tok2"),
+        _ledger_key("tok3"): _mature_ledger_entry("tok3"),
+    })
+    notified = _spy_notify(monkeypatch, idx)
+    result = idx._reconcile_lane_start_health()
+    assert result["checked"] == 3
+    assert result["paged"] == 3
+    assert len(notified) == 1  # one digest, not three individual pages
+    text, kw = notified[0]
+    assert "3 groom lane(s) NEVER STARTED" in text
+    assert "tok1" in text and "tok2" in text and "tok3" in text
+    assert kw["context"]["count"] == 3
+    # Each lane is still individually actioned, so a later tick doesn't
+    # re-discover (and re-page) any of them.
+    for tok in ("tok1", "tok2", "tok3"):
+        assert f"groom/_control/reconciled-lane-start/{tok}.json" in idx._test_s3._objects
+
+
 def test_reconcile_sends_task_failure_for_dead_lane_with_token(monkeypatch):
     """Lane death with a task_token → send-task-failure collapses the hung SF
     execution immediately instead of waiting for the 6h timeout."""
