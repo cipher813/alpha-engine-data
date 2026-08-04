@@ -126,6 +126,14 @@ _REGISTRY: dict[str, dict[str, list[dict]]] = {
                 "citation": "severity_taxonomy.md row: index.py:418-430",
             },
         ],
+        "_notify_lane_lease_yielded": [
+            {
+                "event_class": "Per-lane dispatch lease yield — atomic lease could not be taken (groom-sweep-policy §5.9)",
+                "severity": "info",
+                "silent": True,
+                "citation": "reconciled from live code 2026-08-04 — pending taxonomy entry; added with alpha-engine-config-I6460",
+            },
+        ],
         "_notify_dispatch_ceiling_exhausted": [
             {
                 "event_class": "Daily dispatch ceiling exhausted",
