@@ -134,6 +134,14 @@ _REGISTRY: dict[str, dict[str, list[dict]]] = {
                 "citation": "reconciled from live code 2026-08-04 — pending taxonomy entry; added with alpha-engine-config-I6460",
             },
         ],
+        "_notify_attended_window_deferred": [
+            {
+                "event_class": "Irreversible-tier PR sweep deferred — outside the declared attended window (groom-sweep-policy §4.8)",
+                "severity": "info",
+                "silent": True,
+                "citation": "reconciled from live code 2026-08-04 — pending taxonomy entry; added with alpha-engine-config-I6461",
+            },
+        ],
         "_notify_dispatch_ceiling_exhausted": [
             {
                 "event_class": "Daily dispatch ceiling exhausted",
