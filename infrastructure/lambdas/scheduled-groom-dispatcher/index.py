@@ -331,6 +331,48 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("GROOM_MAX_RUNTIME_SECONDS", "13800"))
 SSM_ONLINE_BUDGET_SEC = int(os.environ.get("GROOM_SSM_ONLINE_BUDGET_SEC", "180"))
 CW_LOG_GROUP = os.environ.get("GROOM_CW_LOG_GROUP", "/alpha-engine/groom-spot")
 
+# ── Attended-window gate for the irreversible-actuation tier (alpha-engine-
+# config-I6461, groom-sweep-policy §4.8) ────────────────────────────────────
+# The manifest (infrastructure/scheduler/schedule-manifest.json) is the
+# declarative source of BOTH values below — bound to it by
+# test_attended_window_gate.py::test_env_defaults_match_manifest, mirroring
+# the MAX_RUNTIME_SECONDS binding-test pattern this file already uses. A
+# stated assumption (Brian has not ruled on exact hours, see the manifest's
+# _meta.assumption): the daytime complement of the §4.8-measured 21:00-05:00
+# local dead zone. zoneinfo (not a fixed UTC offset) so DST is handled
+# automatically — the fleet spans PST/PDT across the year.
+ATTENDED_WINDOW_TZ = os.environ.get("GROOM_ATTENDED_WINDOW_TZ", "America/Los_Angeles")
+ATTENDED_WINDOW_START_HOUR = int(os.environ.get("GROOM_ATTENDED_WINDOW_START_HOUR", "8"))
+ATTENDED_WINDOW_END_HOUR = int(os.environ.get("GROOM_ATTENDED_WINDOW_END_HOUR", "21"))
+# Which SCHEDULED (EventBridge Scheduler `schedule` label) dispatches carry
+# the irreversible tier (§4.6's "Expensive": merging/closing an issue/
+# deleting a branch) — the PR sweep is the fleet's only merge-capable
+# machinery (standing self-merge exceptions, auto-merge-policy.md), even
+# though the merge call itself happens on-box in a different repo. The three
+# STANDALONE sweep Scheduler rules are gated; the SF's own unconditional
+# end-of-SF tail-catcher (schedule label "end-of-sf-sweep",
+# DispatchEndOfSfSweep in step_function_groom.json) is deliberately NOT a
+# member — gating it would contradict its designed purpose as the drain-the-
+# backlog tail of a cycle that may have started inside the window (see that
+# state's own comment; removing its unconditional posture needs a policy
+# amendment, not a schedule tweak). Bound to the manifest by the same test.
+_IRREVERSIBLE_SCHEDULE_LABELS = frozenset({
+    "alpha-engine-groom-sweep-0000-daily",
+    "alpha-engine-groom-sweep-0800-daily",
+    "alpha-engine-groom-sweep-1600-daily",
+})
+
+
+def _in_attended_window(now: datetime | None = None) -> bool:
+    """True iff `now` (default: the current instant) falls inside the
+    declared attended window, evaluated in ATTENDED_WINDOW_TZ."""
+    moment = (now or datetime.now(ZoneInfo("UTC"))).astimezone(ZoneInfo(ATTENDED_WINDOW_TZ))
+    return ATTENDED_WINDOW_START_HOUR <= moment.hour < ATTENDED_WINDOW_END_HOUR
+
+
+def _is_irreversible_dispatch(schedule_label: str) -> bool:
+    return schedule_label in _IRREVERSIBLE_SCHEDULE_LABELS
+
 _VALID_RUN_MODES = {"full", "sweep"}
 _DEFAULT_RUN_MODE = "full"
 # config#1891: "gated-reverify" is the weekly Sunday stale-gate lane — missing
@@ -1417,6 +1459,34 @@ def _notify_lane_lease_yielded(tier_tag: str, holder_owner_id: str, schedule_lab
         logger.warning("lane-lease-yielded Telegram failed (non-fatal): %s", exc)
 
 
+def _notify_attended_window_deferred(schedule_label: str, window_moment: datetime) -> None:
+    """Best-effort loud ping for an irreversible-tier dispatch deferred outside
+    the attended window (groom-sweep-policy §4.8, alpha-engine-config-I6461).
+    Never raises — the deferral itself (recorded via _write_sweep_decision_
+    record's `reason` field, the same ledger every other named skip reason
+    uses) is the durable count; this is the real-time signal."""
+    text = (
+        "⚪ PR sweep DEFERRED — outside the attended window "
+        f"({ATTENDED_WINDOW_START_HOUR:02d}:00-{ATTENDED_WINDOW_END_HOUR:02d}:00 "
+        f"{ATTENDED_WINDOW_TZ}, groom-sweep-policy §4.8). schedule={schedule_label}, "
+        f"local_time={window_moment.astimezone(ZoneInfo(ATTENDED_WINDOW_TZ)).isoformat()}. "
+        "Zero merge-capable spend this slot; the next attended-window cycle "
+        "covers it."
+    )
+    try:
+        notify_via_flow_doctor(
+            text, silent=True, severity="info",
+            dedup_key=f"{_FLOW_NAME}:attended_window_deferred:{schedule_label}:{window_moment:%Y-%m-%d}",
+            flow_name=_FLOW_NAME, topics=_GROOM_LIFECYCLE_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={"schedule": schedule_label, "reason": "attended_window_deferred"},
+            silent_topic=FleetTelegramTopic.GROOM,
+            source="flow-doctor:scheduled-groom-dispatcher",
+        )
+    except Exception as exc:  # noqa: BLE001 — secondary observability
+        logger.warning("attended-window deferral Telegram failed (non-fatal): %s", exc)
+
+
 # config#3173 — dedicated ceiling ledger, deliberately SEPARATE from the
 # groom/decisions/{date}/ decision-record ecosystem (which has two
 # heterogeneous schemas — schema_version 1's flattened single-slot record and
@@ -2466,6 +2536,27 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
     if not DISPATCH_ENABLED:
         logger.warning("GROOM_DISPATCH_ENABLED=false — groom spot NOT launched")
         return {"launched": False, "reason": "disabled"}
+
+    # groom-sweep-policy §4.8 (alpha-engine-config-I6461): the irreversible
+    # tier (the standalone PR-sweep Scheduler rules — see
+    # _IRREVERSIBLE_SCHEDULE_LABELS) executes only inside the declared
+    # attended window. Checked FIRST — before the concurrency probe or any
+    # AWS call — so a deferred dispatch costs nothing. Reversible dispatches
+    # (every groom rule, the lane reconciler, and the SF's own unconditional
+    # end-of-SF sweep tail) are never gated by the clock (§4.8: "a quiet
+    # night is a night with no merges, not a night with no loop").
+    if _is_irreversible_dispatch(schedule_label):
+        now = datetime.now(ZoneInfo("UTC"))
+        if not _in_attended_window(now):
+            logger.warning(
+                "irreversible-tier dispatch DEFERRED — outside attended window "
+                "(%02d:00-%02d:00 %s): schedule=%s",
+                ATTENDED_WINDOW_START_HOUR, ATTENDED_WINDOW_END_HOUR,
+                ATTENDED_WINDOW_TZ, schedule_label,
+            )
+            _notify_attended_window_deferred(schedule_label, now)
+            return {"launched": False, "reason": "attended_window_deferred",
+                    "issue_filter": issue_filter, "schedule": schedule_label}
 
     # config#1979: skip if a box for THIS SAME lane is already live — a prior
     # trigger's run that's still working its queue (now more likely to run
