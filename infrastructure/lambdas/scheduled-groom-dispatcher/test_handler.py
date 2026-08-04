@@ -2745,6 +2745,194 @@ def test_trigger_health_pages_running_execution_without_record(monkeypatch):
     assert th["missing"][0]["execution_status"] == "RUNNING"
 
 
+# ── F8 scheduled-cycle record (groom-sweep-policy §2.8, alpha-engine-config-
+# I6325) ─────────────────────────────────────────────────────────────────────
+# Deliverable 1: the scheduler emits a scheduled-cycle record independently
+# of the cycle — sourced from the dispatch SF's own execution history, the
+# same source the trigger-health leg already reads.
+
+
+def test_scheduled_cycle_record_written_for_mature_execution(monkeypatch):
+    """A mature execution gets a groom/_control/scheduled/{date}/{hhmm}.json
+    record, regardless of whether its decision record exists."""
+    exec_ = _sfn_exec(hours_ago=3)
+    idx = _load(monkeypatch, sfn_executions=[exec_], s3_objects={})
+    idx.handler({"mode": "reconcile"}, None)
+    from datetime import timezone
+    started = exec_["startDate"].astimezone(timezone.utc)
+    key = f"groom/_control/scheduled/{started:%Y-%m-%d}/{started:%H%M}.json"
+    assert key in idx._test_s3._objects
+    body = json.loads(idx._test_s3._objects[key])
+    assert body["execution_arn"] == exec_["executionArn"]
+
+
+def test_scheduled_cycle_record_written_even_when_decision_record_present(monkeypatch):
+    """A healthy execution (decision record present, no page) still gets its
+    scheduled record — F8's 'scheduled' count must not depend on the cycle's
+    own health."""
+    exec_ = _sfn_exec(hours_ago=3)
+    idx = _load(monkeypatch, sfn_executions=[exec_], s3_objects={
+        _decision_key_for_execution(exec_): b'{"trigger": "demand-all"}',
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    assert result["trigger_health"]["paged"] == 0
+    from datetime import timezone
+    started = exec_["startDate"].astimezone(timezone.utc)
+    key = f"groom/_control/scheduled/{started:%Y-%m-%d}/{started:%H%M}.json"
+    assert key in idx._test_s3._objects
+
+
+def test_scheduled_cycle_record_idempotent_across_ticks(monkeypatch):
+    """A slot already carrying a scheduled record is not overwritten on the
+    next tick — the write is a plain existence check, not a refresh."""
+    exec_ = _sfn_exec(hours_ago=3)
+    from datetime import timezone
+    started = exec_["startDate"].astimezone(timezone.utc)
+    key = f"groom/_control/scheduled/{started:%Y-%m-%d}/{started:%H%M}.json"
+    seeded = json.dumps({"execution_arn": "PRE-EXISTING", "sentinel": True}).encode()
+    idx = _load(monkeypatch, sfn_executions=[exec_], s3_objects={key: seeded})
+    idx.handler({"mode": "reconcile"}, None)
+    assert idx._test_s3._objects[key] == seeded
+
+
+def test_scheduled_cycle_record_not_written_within_maturity_window(monkeypatch):
+    """An execution still within its maturity window is not yet examined at
+    all, so no scheduled record is written for it prematurely — mirrors the
+    trigger-health leg's own 'checked == 0' behavior for the same input."""
+    exec_ = _sfn_exec(hours_ago=0.25)
+    idx = _load(monkeypatch, sfn_executions=[exec_], s3_objects={})
+    idx.handler({"mode": "reconcile"}, None)
+    assert not any(k.startswith("groom/_control/scheduled/") for k in idx._test_s3._objects)
+
+
+# ── F8 lane-start-health reconciler (alpha-engine-config-I6325) ─────────────
+# Deliverable 3 (fast paging leg): a decided lane launch (a dispatch-ledger
+# entry that reached EC2) that never wrote its on-box started marker within
+# the maturity window pages — the I4987 failure mode, caught in ~15 minutes
+# instead of the 6h SF timeout. Distinct population from the trigger-health
+# tests above: those cover "the Lambda never decided"; these cover "the
+# Lambda decided and launched, but the charter never ran."
+
+
+def _mature_ledger_entry(run_token: str = "tok1", *, minutes_ago: float = 20,
+                         schedule: str = "0 4 * * *") -> bytes:
+    from datetime import datetime, timedelta, timezone
+    recorded = (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+    return json.dumps({
+        "run_token": run_token, "tier_tag": "mid-only", "schedule": schedule,
+        "instance_id": "i-launched", "deadline_utc": _future_deadline(),
+        "recorded_at": recorded,
+    }).encode()
+
+
+def _started_key(run_token: str = "tok1", *, days_ago: int = 0) -> str:
+    from datetime import datetime, timedelta, timezone
+    day = (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+    return f"groom/_control/started/{day}/{run_token}.json"
+
+
+def test_lane_start_health_pages_when_never_started(monkeypatch):
+    """A mature, decided, launched lane with no started or completed marker
+    pages — the box never reached its charter."""
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key(): _mature_ledger_entry(),
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    lsh = result["lane_start_health"]
+    assert lsh["checked"] == 1
+    assert lsh["paged"] == 1
+    assert "groom/_control/reconciled-lane-start/tok1.json" in idx._test_s3._objects
+
+
+def test_lane_start_health_quiet_when_started_marker_present(monkeypatch):
+    """A started marker (the charter began) satisfies the check — no page."""
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key(): _mature_ledger_entry(),
+        _started_key(): json.dumps({"mode": "full", "started_at": "2026-08-04T00:00:00Z"}).encode(),
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    lsh = result["lane_start_health"]
+    assert lsh["checked"] == 1
+    assert lsh["paged"] == 0
+
+
+def test_lane_start_health_quiet_when_completed_marker_present(monkeypatch):
+    """A completed marker with no started marker still satisfies the check —
+    the lane reached SOME terminal outcome; it is not silently stuck."""
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key(): _mature_ledger_entry(),
+        "groom/_control/completed/tok1.json": json.dumps({"outcome": "failure", "rc": 1}).encode(),
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    lsh = result["lane_start_health"]
+    assert lsh["checked"] == 1
+    assert lsh["paged"] == 0
+
+
+def test_lane_start_health_not_yet_mature_is_not_checked(monkeypatch):
+    """A lane decided moments ago (well under the maturity window) is not yet
+    a miss — bootstrap (dnf install + git clone) legitimately takes minutes."""
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key(): _mature_ledger_entry(minutes_ago=2),
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    lsh = result["lane_start_health"]
+    assert lsh["checked"] == 0
+    assert lsh["paged"] == 0
+
+
+def test_lane_start_health_actioned_lane_is_not_repaged(monkeypatch):
+    """An already-actioned never-started lane is not re-paged on the next tick."""
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key(): _mature_ledger_entry(),
+        "groom/_control/reconciled-lane-start/tok1.json": json.dumps(
+            {"outcome": "lane_never_started"}).encode(),
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    lsh = result["lane_start_health"]
+    assert lsh["checked"] == 1
+    assert lsh["paged"] == 0
+
+
+def test_lane_start_health_ignores_pre_launch_only_ledger_entry(monkeypatch):
+    """config#3173's FIRST (pre-launch) ledger write carries no instance_id —
+    there is no EC2 request yet to check a started marker against, so it must
+    never be counted or paged."""
+    from datetime import datetime, timezone
+    idx = _load(monkeypatch, s3_objects={
+        _ledger_key(): json.dumps({
+            "run_token": "tok1", "tier_tag": "mid-only", "schedule": "0 4 * * *",
+            "instance_id": "", "deadline_utc": "",
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }).encode(),
+    })
+    result = idx.handler({"mode": "reconcile"}, None)
+    lsh = result["lane_start_health"]
+    assert lsh["checked"] == 0
+    assert lsh["paged"] == 0
+
+
+def test_lane_start_health_listing_error_is_fail_safe(monkeypatch):
+    """A broken S3 listing must never page — the tick is skipped and retried.
+
+    Calls the reconciler leg directly (not through handler({"mode":
+    "reconcile"})) because `_reconcile_lane_death` reads the SAME dispatch-
+    ledger prefix earlier in that dispatch chain and has no fail-safe wrapper
+    of its own around its listing call — patching `get_paginator` globally
+    would fail that unrelated, earlier leg instead of exercising this one.
+    """
+    idx = _load(monkeypatch, s3_objects={_ledger_key(): _mature_ledger_entry()})
+
+    class _RaisingPaginator:
+        def paginate(self, **kw):
+            raise RuntimeError("simulated S3 outage")
+
+    idx._test_s3.get_paginator = lambda name: _RaisingPaginator()
+    result = idx._reconcile_lane_start_health()
+    assert result["checked"] == 0
+    assert result["paged"] == 0
+
+
 def test_reconcile_sends_task_failure_for_dead_lane_with_token(monkeypatch):
     """Lane death with a task_token → send-task-failure collapses the hung SF
     execution immediately instead of waiting for the 6h timeout."""
