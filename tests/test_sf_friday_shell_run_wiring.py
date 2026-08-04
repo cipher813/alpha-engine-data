@@ -532,11 +532,14 @@ class TestStrictSuperset:
         # NormalizeEc2InstanceId inspects the shape: a string routes to
         # WrapEc2InstanceIdInArray (Pass) which JsonMerge-wraps it; an array
         # already in the correct shape goes straight to CheckShellRun.
+        # IsPresent-guarded per config#2275 convention — the And short-circuits
+        # on the IsPresent check, so an absent field safely falls to Default.
         norm = states["NormalizeEc2InstanceId"]
         assert norm["Type"] == "Choice"
-        assert norm["Choices"][0]["Variable"] == "$.ec2_instance_id"
-        assert norm["Choices"][0]["IsString"] is True
-        assert norm["Choices"][0]["Next"] == "WrapEc2InstanceIdInArray"
+        guard = norm["Choices"][0]
+        assert guard["And"][0] == {"Variable": "$.ec2_instance_id", "IsPresent": True}
+        assert guard["And"][1] == {"Variable": "$.ec2_instance_id", "IsString": True}
+        assert guard["Next"] == "WrapEc2InstanceIdInArray"
         assert norm["Default"] == "CheckShellRun"
         wrap = states["WrapEc2InstanceIdInArray"]
         assert wrap["Type"] == "Pass"
