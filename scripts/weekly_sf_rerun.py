@@ -337,10 +337,11 @@ STAGES: tuple[Stage, ...] = (
         "CheckSkipPostEval", "SaturdayHealthCheck",
         frozenset({"CheckShellRunNotify"}),
         # Every degraded route in the tail (config#2276 health checks +
-        # config#2302 ReportCard/Director) — entering ANY of them means the
-        # tail ran but something inside it failed and was absorbed; the
-        # tail must re-run, never be skipped as complete (I6055: the
-        # 2026-08-01 Director hard-fail that the next rerun skipped).
+        # config#2302 ReportCard). Director is NO LONGER in this set
+        # (config#6408: Director failure is now TERMINAL via
+        # NormalizeFailureContext → FailExecution). PublishDirectorDegraded
+        # is RETAINED for backward compatibility with pre-fix execution
+        # histories that still reference it — new executions never enter it.
         degraded_witness=frozenset({
             "SaturdayHealthCheckDegraded", "SubstrateHealthCheckDegraded",
             "PublishReportCardDegraded", "PublishDirectorDegraded",
