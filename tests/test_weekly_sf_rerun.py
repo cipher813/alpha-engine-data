@@ -479,8 +479,11 @@ class TestStageTableLockstep:
         EMAIL surface, not a stage degrading, so it is deliberately
         unmapped."""
         mapped: dict = {}
+        historical = getattr(mod, "HISTORICAL_DEGRADED_WITNESS", frozenset())
         for stage in mod.STAGES:
             for d in stage.degraded_witness:
+                if d in historical:
+                    continue  # retained for backward compat (pre-fix histories)
                 assert d in all_states, (
                     f"{stage.name}: degraded witness {d} is not a state in "
                     f"infrastructure/step_function.json — update STAGES"

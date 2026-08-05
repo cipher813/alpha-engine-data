@@ -142,6 +142,15 @@ class Stage:
     note: str = ""
 
 
+# Degraded states that existed in a prior SF definition but have since been
+# removed. Retained in degraded_witness for backward compatibility with pre-fix
+# execution histories — derive_plan still needs to recognise them as DEGRADED
+# (not completed) so they're re-run, but they're no longer reachable by new
+# executions (config#6408).
+HISTORICAL_DEGRADED_WITNESS: frozenset[str] = frozenset({
+    "PublishDirectorDegraded",
+})
+
 STAGES: tuple[Stage, ...] = (
     Stage(
         "lib_pin_drift_check", "skip_lib_pin_drift_check",
