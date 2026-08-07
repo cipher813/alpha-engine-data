@@ -176,6 +176,45 @@ def test_drift_checker_consults_the_manifest_not_a_hardcoded_list():
     ), "the pause exemption is not scoped to the `disabled` finding"
 
 
+def test_manifest_drift_checker_also_exempts_paused_triggers():
+    """The second live-state assertion. Missing it reddens the daily sweep.
+
+    check-manifest-drift.py --live independently asserts ENABLED for all eight
+    groom/sweep dispatch triggers in schedule-manifest.json — every one of which
+    is paused. Exempting only check-schedule-drift.py would have left the daily
+    sweep red for a state that is correct, which is the same noise this PR
+    exists to prevent.
+    """
+    src = (INFRA / "scheduler" / "check-manifest-drift.py").read_text(encoding="utf-8")
+    assert "automation_pause.paused_names()" in src, (
+        "check-manifest-drift.py --live still asserts ENABLED for paused triggers"
+    )
+    assert 'live_rule["state"] != "ENABLED" and name not in paused' in src, (
+        "the exemption is not scoped to the state half of live-mismatch — cron "
+        "drift must still be reported for a paused entry"
+    )
+
+
+def test_every_groom_dispatch_trigger_is_accounted_for(manifest):
+    """schedule-manifest.json and automation_pause.json must not disagree.
+
+    Both name groom/sweep triggers. If one says a trigger dispatches and the
+    other says it is off, the pair is worse than either alone — so assert the
+    overlap is total rather than partial: every trigger in the groom manifest is
+    paused, or none is.
+    """
+    groom = json.loads(
+        (INFRA / "scheduler" / "schedule-manifest.json").read_text(encoding="utf-8")
+    )
+    names = {t["name"] for t in groom["triggers"]}
+    paused = set(manifest["paused"]["scheduler_schedules"])
+    overlap = names & paused
+    assert overlap == names, (
+        "partially-paused groom dispatch set — these fire while their siblings "
+        f"are off: {sorted(names - paused)}. Either pause all of them or none."
+    )
+
+
 def test_module_exposes_both_directions(module):
     assert hasattr(module, "check"), "no --check implementation"
     assert hasattr(module, "enforce"), "no --enforce implementation"
