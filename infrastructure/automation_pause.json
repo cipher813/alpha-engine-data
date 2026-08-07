@@ -46,7 +46,7 @@
       "alpha-engine-alert-drain-1600utc": "overseer alert drain",
       "alpha-engine-alert-drain-2200utc": "overseer alert drain",
       "alpha-engine-ci-watch-canary-drill-weekly": "ci-watch canary drill",
-      "alpha-engine-config-runner-reconcile": "config-runner reconcile, rate(1 minute). Its target Lambda alpha-engine-config-runner-dispatcher DOES NOT EXIST - this schedule has been failing every minute (see alpha-engine-config issue filed 2026-08-07)",
+      "alpha-engine-config-runner-reconcile": "config-runner reconcile, rate(1 minute). Its target Lambda alpha-engine-config-runner-dispatcher DOES NOT EXIST - this schedule has been failing every minute (~1,440 invocations/day). Root cause + the missing target-existence guard: alpha-engine-config-I6618",
       "alpha-engine-crypto-balances-15min": "crypto balance collector",
       "alpha-engine-expense-collector-twicedaily": "expense collector",
       "alpha-engine-groom-lane-reconciler-5min": "groom lane reconciler",
