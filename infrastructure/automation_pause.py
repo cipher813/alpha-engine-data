@@ -13,10 +13,15 @@ decision anyone can find later, and it does not survive the machinery that
 re-asserts ``ENABLED``:
 
   * ``deploy-infrastructure.yml`` re-applies the CloudFormation stack on EVERY
-    push to main, so the four CFN-owned rules would come back on the next merge.
-    Those four are therefore ALSO pinned ``State: DISABLED`` in
-    ``infrastructure/cloudformation/alpha-engine-orchestration.yaml`` — this
-    manifest records them, the template enforces them.
+    push to main. MEASURED 2026-08-07: a successful run 49 seconds after the
+    live disable did NOT revert the four CFN-owned rules — an unchanged
+    template yields an empty changeset, and CloudFormation touches nothing. The
+    revert risk is the NEXT template edit to those resources, which would
+    rewrite them from a template still claiming ``State: ENABLED``. So the
+    template edit is not urgency, it is truth: those four are pinned
+    ``State: DISABLED`` in
+    ``infrastructure/cloudformation/alpha-engine-orchestration.yaml`` so the
+    source stops asserting something the operator has decided against.
   * ``infrastructure/lambdas/*/deploy.sh --reconcile-schedules`` recreates its
     Scheduler rules with the AWS default state (``ENABLED``) whenever that
     Lambda is redeployed. Those call sites are NOT yet pause-aware (see the
