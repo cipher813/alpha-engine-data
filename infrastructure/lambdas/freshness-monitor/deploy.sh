@@ -30,7 +30,7 @@
 #   bash infrastructure/lambdas/freshness-monitor/deploy.sh             # update code + registry (operator; needs ae-config clone)
 #   bash infrastructure/lambdas/freshness-monitor/deploy.sh --code-only # update code ONLY (CI path; no registry, no ae-config clone)
 #   bash infrastructure/lambdas/freshness-monitor/deploy.sh --bootstrap # first-time create + wire EventBridge
-#   bash infrastructure/lambdas/freshness-monitor/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
+#   bash infrastructure/lambdas/freshness-monitor/deploy.sh --apply-iam # re-apply iam-policy.json and EXIT — no code, no env, no registry (config#2825, config-I6661)
 #   bash infrastructure/lambdas/freshness-monitor/deploy.sh --dry-run   # show actions, do not apply
 #   bash infrastructure/lambdas/freshness-monitor/deploy.sh --smoke     # invoke once after deploy
 
@@ -92,6 +92,27 @@ run() {
     "$@"
   fi
 }
+
+# ----- Apply IAM only, then EXIT (config#2825, config-I6661) ---------------
+# Placed FIRST, before packaging, deliberately. "only" has to mean the whole
+# run, not just the effects at the end: everything below installs pip deps,
+# runs the handler suite and builds a ~29MB zip, none of which an IAM re-apply
+# needs.
+#
+# The exit is the load-bearing line (nous-ergon-ops-I520). Until 2026-08-08
+# this block had none, so --apply-iam applied the policy and then fell through
+# into the code deploy, the environment merge, and the registry upload — and
+# that upload republished ARTIFACT_REGISTRY.yaml from a sibling checkout four
+# commits behind origin/main, silently reverting two rows merged an hour
+# earlier. Every statement below was correct in isolation; the defect was an
+# absent line.
+if $APPLY_IAM; then
+  echo "Applying IAM (role=${ROLE_NAME}, policy=${POLICY_NAME})..."
+  TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
+  echo "  ✓ IAM applied. Nothing else was touched — no code, no env, no registry."
+  exit 0
+fi
 
 # ----- 0a. Syntax-check handler (no imports — works on bare python) --------
 
@@ -159,14 +180,6 @@ ZIP="${PKG}/function.zip"
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
 
 # ----- 2. Bootstrap (first-time only) ---------------------------------------
-
-# ----- Apply IAM only (config#2825, no bootstrap side effects) -------------
-if $APPLY_IAM; then
-  echo "Applying IAM (role=${ROLE_NAME}, policy=${POLICY_NAME})..."
-  TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
-  apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
-  echo "  ✓ IAM applied."
-fi
 
 if $BOOTSTRAP; then
   echo "Bootstrapping ${FUNCTION_NAME}..."
@@ -401,6 +414,23 @@ fi
 # double-write (harmless) but requires the ae-config clone the CI path lacks.
 
 if ! $CODE_ONLY; then
+  # A publish step sourced from a mutable local checkout is a supply chain with
+  # no version in it (nous-ergon-ops-I520). ${CONFIG_REPO} is a SIBLING repo the
+  # operator has no reason to have refreshed, and concurrent sessions routinely
+  # leave it behind. Refuse rather than silently republish an older registry
+  # over a newer one — this upload is a duplicate of alpha-engine-config's own
+  # sync-artifact-registry.yml, so failing closed costs nothing.
+  if git -C "${CONFIG_REPO}" rev-parse --git-dir >/dev/null 2>&1; then
+    git -C "${CONFIG_REPO}" fetch --quiet origin main 2>/dev/null || true
+    BEHIND=$(git -C "${CONFIG_REPO}" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
+    DIRTY=$(git -C "${CONFIG_REPO}" status --porcelain -- private-docs/ARTIFACT_REGISTRY.yaml 2>/dev/null)
+    if [ "${BEHIND}" -gt 0 ] || [ -n "${DIRTY}" ]; then
+      echo "REFUSING to upload the registry: ${CONFIG_REPO} is ${BEHIND} commit(s) behind origin/main${DIRTY:+ and has uncommitted registry changes}." >&2
+      echo "  Publishing from it would revert the live registry to an older state." >&2
+      echo "  Fix: git -C ${CONFIG_REPO} pull --ff-only   (or re-run with --code-only to skip this step)" >&2
+      exit 1
+    fi
+  fi
   echo "Uploading registry: ${REGISTRY_LOCAL} → s3://${REGISTRY_BUCKET}/${REGISTRY_S3_KEY}"
   run aws s3 cp \
     "${REGISTRY_LOCAL}" \
