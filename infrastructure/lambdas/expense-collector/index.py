@@ -216,11 +216,73 @@ def _pace(projected: float | None, limit: float | None) -> str | None:
     return "over" if projected > limit else "under"
 
 
+# config-I6613 — days of runway remaining before a PREPAID account hits zero.
+#
+# Root incident: on 2026-08-05..08 the DeepSeek account ran out and every
+# autonomous lane in the fleet returned `402 Insufficient Balance` for three
+# days, through a live three-day trading outage, while sf-watch dutifully
+# dispatched a diagnose agent each morning that died on the same 402 within 90
+# seconds. The balance was ALREADY BEING COLLECTED here — `credits_remaining`
+# for OpenRouter, `total_balance` for DeepSeek — and buried in a `detail` blob
+# nothing reads. Collected is not observed.
+#
+# Threshold is in DAYS, not dollars, because the useful question is "how long
+# have I got", and a dollar floor means something different at $0.30/month and
+# at $30/month. A 402 is the event where days_to_zero already reached 0, so
+# this has to fire strictly before that.
+BALANCE_ALERT_DAYS = float(os.environ.get("BALANCE_ALERT_DAYS", "7"))
+#: Below this the burn estimate is noise and days_to_zero is not computed —
+#: same reasoning as MIN_PROJECTION_FRAC, applied to the same measurement.
+MIN_BURN_USD_PER_DAY = 1e-6
+
+
+def _days_to_zero(balance_usd: float | None, mtd_cost_usd: float | None,
+                  mw: dict, observed_frac: float | None = None) -> float | None:
+    """Runway in days at the burn actually observed this month, or None.
+
+    None where it cannot be honestly computed — no balance, no spend measured,
+    a burn indistinguishable from zero, or an observation window too short to
+    extrapolate from. None is UNKNOWN; the caller must not read it as safe.
+    """
+    if balance_usd is None or mtd_cost_usd is None:
+        return None
+    obs = mw["elapsed_frac"] if observed_frac is None else observed_frac
+    if obs < MIN_PROJECTION_FRAC:
+        return None
+    observed_days = (mw["total_seconds"] / 86400.0) * obs
+    if observed_days <= 0:
+        return None
+    burn_per_day = mtd_cost_usd / observed_days
+    if burn_per_day < MIN_BURN_USD_PER_DAY:
+        return None
+    # A balance already at or below zero is not "0.0 days of runway left" in a
+    # projection sense — it is an outage in progress. Clamp at 0 so the caller
+    # alerts rather than emitting a negative.
+    return round(max(balance_usd, 0.0) / burn_per_day, 2)
+
+
+def _stamp_funded_balance(row: dict, mw: dict, balance_usd: float | None,
+                          observed_frac: float | None = None) -> dict:
+    """Promote a prepaid balance to a first-class row field and derive its
+    runway. Call AFTER the row's ``mtd_cost_usd`` is final (in place)."""
+    row["funded_balance_usd"] = (
+        None if balance_usd is None else round(balance_usd, 4))
+    row["days_to_zero"] = _days_to_zero(
+        balance_usd, row.get("mtd_cost_usd"), mw, observed_frac)
+    return row
+
+
 def _row(key: str, label: str, **kw) -> dict:
     base = {
         "key": key, "label": label, "status": "ok",
         "mtd_cost_usd": None, "projected_month_end_usd": None,
         "budget_usd": None, "pace": None, "quota": None,
+        # config-I6613 — prepaid depletion. `funded_balance_usd` is what is
+        # LEFT, not what has been spent; `days_to_zero` is when the lights go
+        # out at the observed burn. Both are None for a provider that bills in
+        # arrears (Anthropic, AWS, Neon) and for one whose balance could not
+        # be read — None means UNKNOWN and must never render as healthy.
+        "funded_balance_usd": None, "days_to_zero": None,
         "source": None, "detail": {}, "note": None, "error": None,
     }
     base.update(kw)
@@ -371,6 +433,98 @@ def run_over_budget_alerts(s3, period: str, rows: list[dict]) -> dict:
         return {"alerted": [], "error": str(exc)[:300]}
 
 
+def _alert_balance_depletion(row: dict, period: str) -> bool:
+    """Telegram ping for a prepaid account about to run dry. Delivery-surface
+    failure is logged, never raised — the runway itself is already on the
+    rollup artifact."""
+    bal = row.get("funded_balance_usd")
+    dtz = row.get("days_to_zero")
+    if bal is not None and bal <= 0:
+        headline = (f"*{row['label']}* is at ${bal:,.2f} — **already unfunded**. "
+                    "Every call routed to it is failing with 402.")
+    else:
+        headline = (f"*{row['label']}* has ${bal:,.2f} left, "
+                    f"about **{dtz:.1f} days** at the current burn.")
+    text = (
+        "\U0001f4b3 *Provider balance — running out*\n"
+        + headline
+        + (f"\nMTD spend ${row['mtd_cost_usd']:,.2f} ({period})."
+           if row.get("mtd_cost_usd") is not None else "")
+        + "\n_Top up before it reaches zero — a 402 takes every lane routed "
+          "through this account down at once, and the lanes cannot report it._"
+    )
+    dedup_key = f"{_FLOW_NAME}:balance:{row['key']}:{period}"
+    try:
+        return notify_via_flow_doctor(
+            text, silent=False, severity="critical", dedup_key=dedup_key,
+            flow_name=_FLOW_NAME, topics=_ALERT_TOPICS, db_basename=_DB_BASENAME,
+            context={"provider": row["key"], "period": period,
+                     "funded_balance_usd": bal, "days_to_zero": dtz},
+            source="flow-doctor:expense-collector",
+        )
+    except Exception as exc:  # noqa: BLE001 — delivery surface only
+        logger.warning("balance-depletion alert Telegram send failed (non-fatal): %s", exc)
+        return False
+
+
+def _is_depleting(row: dict) -> bool:
+    """True when a prepaid account is at or below zero, or within
+    ``BALANCE_ALERT_DAYS`` of it at the observed burn.
+
+    A row with no balance (arrears billing) or an unmeasurable burn returns
+    False — this predicate answers "is it running out", and UNKNOWN is not
+    yes. The unknown-ness is visible on the row itself (`days_to_zero: null`),
+    which is where it belongs; an alert that fires on ignorance is noise, and
+    noise is how the last one got ignored.
+    """
+    bal = row.get("funded_balance_usd")
+    if bal is None:
+        return False
+    if bal <= 0:
+        return True
+    dtz = row.get("days_to_zero")
+    return dtz is not None and dtz <= BALANCE_ALERT_DAYS
+
+
+def run_balance_depletion_alerts(s3, period: str, rows: list[dict]) -> dict:
+    """Rising-edge alert pass for prepaid accounts approaching zero
+    (config-I6613, from the 2026-08-05..08 DeepSeek exhaustion).
+
+    Deliberately a MIRROR of :func:`run_over_budget_alerts` — same rising-edge
+    semantics, same per-period state object, same never-raises posture — rather
+    than a second notification mechanism. It differs in exactly two ways, both
+    forced by the failure it exists for:
+
+    * **severity=critical, not warning.** An over-budget month is a number to
+      look at. An unfunded account is every routed lane down at once, and the
+      lanes cannot report it — they die on the 402 before they can.
+    * **A separate state namespace** (``balance:``-prefixed keys), so a
+      provider can be simultaneously over budget and running dry without
+      either flag suppressing the other. They are different questions: one is
+      "spending too fast", the other is "about to stop working".
+
+    Re-arms when the account is topped up, so a second depletion in the same
+    month alerts again.
+    """
+    try:
+        state = _load_alert_state(s3, period)
+        prev = state.get("providers", {})
+        merged = dict(prev)
+        alerted: list[str] = []
+        for row in rows:
+            state_key = f"balance:{row['key']}"
+            depleting = _is_depleting(row)
+            merged[state_key] = depleting
+            if depleting and not prev.get(state_key, False):
+                if _alert_balance_depletion(row, period):
+                    alerted.append(row["key"])
+        _save_alert_state(s3, period, merged)
+        return {"alerted": alerted}
+    except Exception as exc:  # noqa: BLE001 — notification-only; never masks the rollup
+        logger.warning("balance-depletion alert pass failed (non-fatal, rollup unaffected): %s", exc)
+        return {"alerted": [], "error": str(exc)[:300]}
+
+
 def _load_ssm(names: list[str]) -> dict[str, str]:
     """Batch-read SSM params; missing names are simply absent from the result
     (each consumer then reports its own row as not_configured)."""
@@ -514,10 +668,14 @@ def collect_openrouter(mw: dict, budgets: dict, secrets: dict,
         row.update(status="not_configured", error=f"SSM {SSM_OPENROUTER} missing")
         return row
     usage_now = counters["openrouter_total_usage"]
+    remaining = counters["openrouter_credits_remaining"]
     row["detail"] = {"lifetime_usage_usd": round(usage_now, 4),
-                     "credits_remaining_usd": round(counters["openrouter_credits_remaining"], 4)}
-    return _diff_row(row, mw, budgets, "openrouter", usage_now, baseline,
-                     "openrouter_total_usage")
+                     "credits_remaining_usd": round(remaining, 4)}
+    row = _diff_row(row, mw, budgets, "openrouter", usage_now, baseline,
+                    "openrouter_total_usage")
+    # config-I6613 — prepaid credits. Kept in `detail` too for the console's
+    # existing read, but the depletion signal reads the first-class field.
+    return _stamp_funded_balance(row, mw, remaining)
 
 
 def collect_deepseek(mw: dict, budgets: dict, secrets: dict,
@@ -534,7 +692,12 @@ def collect_deepseek(mw: dict, budgets: dict, secrets: dict,
     row = _diff_row(row, mw, budgets, "deepseek", -bal, baseline, "deepseek_neg_balance")
     if row.get("mtd_cost_usd") == 0.0 and row["status"] == "ok":
         row["note"] = (row.get("note") or "") + " (top-ups mid-month can mask spend)"
-    return row
+    # config-I6613. Note the interaction with the clamp above: a mid-month
+    # top-up shows as zero MTD spend, which makes the burn unmeasurable and
+    # days_to_zero None — UNKNOWN, not infinite runway. That is the correct
+    # reading; the balance itself is still reported and a zero balance still
+    # alerts on its own.
+    return _stamp_funded_balance(row, mw, bal)
 
 
 def _diff_row(row: dict, mw: dict, budgets: dict, key: str, counter_now: float,
@@ -1382,6 +1545,10 @@ def _collect(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     # (notification-only enhancement layered on top of an already-successful
     # rollup).
     alert_result = run_over_budget_alerts(s3, mw["period"], rows)
+    # config-I6613 — the depletion pass runs alongside, not instead. Over
+    # budget and out of money are different questions, and the fleet was taken
+    # down by the second one while the first was green.
+    balance_alert_result = run_balance_depletion_alerts(s3, mw["period"], rows)
 
     if err_rows and not ok_rows:
         # Every live adapter failed — systemic (network/creds/deploy) breakage,
@@ -1390,4 +1557,5 @@ def _collect(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                            f"{[(r['key'], r['error']) for r in err_rows]}")
     return {"period": mw["period"], "providers": len(rows),
             "errors": [(r["key"], r["error"]) for r in err_rows],
-            "totals": totals, "alerts": alert_result}
+            "totals": totals, "alerts": alert_result,
+            "balance_alerts": balance_alert_result}
