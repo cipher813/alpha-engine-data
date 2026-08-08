@@ -35,6 +35,50 @@ Usage:
   ./infrastructure/systemd/check-systemd-unit-drift.py --report      # on divergence, also flow-doctor report
 
 Exit codes: 0 clean, 1 drift found, 2 config/source error.
+
+**Scope correction (2026-08-08, alpha-engine-config-I6656).** The above
+describes four units. The dashboard box has **60** locally-installed unit
+files, and this script's closing line read:
+
+    Systemd unit drift check PASSED (installed units match repo).
+
+That is a claim about "installed units" made after comparing four of them —
+and not even the six this repo codifies, since its own
+`systemd-unit-drift-check.{service,timer}` were absent from `ALL_UNITS`.
+From outside, a check with narrow scope and a check with full coverage are
+the same green line. Measured while raising `TimeoutStartSec` on
+`morning-signal.service`: applied to a live box with nothing anywhere that
+would notice it being reverted, hours after this check reported PASSED.
+
+So the scope is now **every regular `.service` / `.timer` file in
+`/etc/systemd/system`**, each classified `clean`, `drift` or `uncodified`.
+Symlinks are skipped — they are systemd's own aliases into `/usr/lib/systemd`
+(`dbus.service` and friends), not units anybody here authored.
+
+Three rules follow:
+
+  * **PASSED is reserved for full coverage.** With 54 of 60 units uncodified,
+    no wording of "passed" is true, so the run states the shortfall instead.
+  * **The known-uncodified set does not fail the run.** There are 54 of them;
+    failing on the backlog would page once per unit on the first run and
+    teach exactly one lesson, which is to disable the check. They live in
+    `UNCODIFIED_BASELINE_FILE` — a work queue that should only shrink — and
+    a unit uncodified but NOT in it is named individually as
+    `uncodified-NEW`, because new is the only kind a given run can act on.
+    `--strict` fails on anything uncodified and is the end state once the
+    baseline is empty.
+  * **The counts are emitted** (`--metric`), including zeros: a number that
+    only appears when something is wrong cannot distinguish healthy from
+    dead (`principles.md` §2.7).
+
+"Codified" means a file of the same name under a `--codified-root` (default:
+this script's directory). Units owned by other repos — `metron-*`,
+`crucible-dash-*`, `nousergon-*`, `vires`, `telos-web`, `mnemon*` — are not
+codified *from here* and sit in the baseline with their owning repo noted.
+Teaching this script to read eight repo trees would move the ownership
+question into a script instead of answering it; `infrastructure-ownership-
+policy` answers it, and the baseline is the register of where that answer has
+not been applied yet.
 """
 
 from __future__ import annotations
@@ -48,15 +92,21 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent.resolve()
 REPO_ROOT = SCRIPT_DIR.parent.parent
 INSTALLED_DIR = Path("/etc/systemd/system")
+UNCODIFIED_BASELINE_FILE = SCRIPT_DIR / "uncodified-units-baseline.txt"
 
-# Which units THIS box is expected to have installed. Both daily-news and
-# metron-intraday units live in the repo, but a given box only ever installs
-# the ones relevant to it (dashboard box: daily-news; trading box:
-# metron-intraday) — install-daily-news.sh / install-metron-intraday.sh are
-# each other's only callers of the corresponding pair. This script probes
-# whichever of the two pairs is ALREADY present on disk (a box that has
-# never installed a unit is not "drifted", it's simply not that unit's
-# host) rather than hardcoding a per-box unit list here.
+UNIT_SUFFIXES = (".service", ".timer")
+
+#: CloudWatch namespace for the coverage counts. Shares the box-health
+#: namespace deliberately — coverage of the unit set is a property of the box,
+#: and a separate namespace is one more place to remember to look.
+METRIC_NAMESPACE = "NousErgon/BoxHealth"
+
+# The units this repo codifies and installs. NO LONGER THE SCOPE OF THE
+# CHECK — scope is now whatever is installed (see the docstring). Kept
+# because install-daily-news.sh / install-metron-intraday.sh still describe
+# which pair belongs on which box (dashboard: daily-news; trading:
+# metron-intraday), and because a codified unit missing from a box is
+# reported rather than silently dropped from the comparison.
 ALL_UNITS: tuple[str, ...] = (
     "daily-news.service",
     "daily-news.timer",
@@ -68,21 +118,91 @@ ALL_UNITS: tuple[str, ...] = (
 def _sha256(path: Path) -> str | None:
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()
-    except FileNotFoundError:
+    except (FileNotFoundError, IsADirectoryError):
         return None
 
 
-def check_unit(name: str) -> tuple[str, str]:
-    """Returns (status, detail). status in {"clean", "drift", "not-installed", "source-error"}."""
-    repo_path = SCRIPT_DIR / name
-    installed_path = INSTALLED_DIR / name
+def installed_units(installed_dir: Path | None = None) -> list[str]:
+    """Every locally-installed unit file, sorted.
 
-    if not repo_path.is_file():
-        return "source-error", f"{name}: no repo copy at {repo_path}"
+    Regular files only. A symlink here is systemd's own alias mechanism
+    pointing into `/usr/lib/systemd`; counting those would put `dbus.service`
+    in our work queue.
+    """
+    d = installed_dir or INSTALLED_DIR
+    if not d.is_dir():
+        return []
+    return sorted(
+        p.name
+        for p in d.iterdir()
+        if p.name.endswith(UNIT_SUFFIXES) and p.is_file() and not p.is_symlink()
+    )
 
-    installed_hash = _sha256(installed_path)
+
+def codified_units(roots: list[Path] | None = None) -> list[str]:
+    """Every unit file present in the codified roots, sorted."""
+    rs = roots or [SCRIPT_DIR]
+    return sorted({
+        p.name for r in rs if r.is_dir()
+        for p in r.iterdir() if p.name.endswith(UNIT_SUFFIXES) and p.is_file()
+    })
+
+
+def load_baseline(path: Path | None = None) -> set[str]:
+    """Unit names already known to be uncodified. Blank lines and `#`
+    comments ignored; the comments carry which repo should own each one."""
+    f = path or UNCODIFIED_BASELINE_FILE
+    if not f.is_file():
+        return set()
+    out = set()
+    for line in f.read_text().splitlines():
+        name = line.split("#", 1)[0].strip()
+        if name:
+            out.add(name)
+    return out
+
+
+def codified_path(name: str, roots: list[Path] | None = None) -> Path | None:
+    for root in (roots or [SCRIPT_DIR]):
+        candidate = root / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def check_unit(
+    name: str,
+    roots: list[Path] | None = None,
+    installed_dir: Path | None = None,
+) -> tuple[str, str]:
+    """Returns (status, detail).
+
+    status in {"clean", "drift", "uncodified", "not-installed"}.
+
+    `SCRIPT_DIR` / `INSTALLED_DIR` are read at CALL time when the arguments
+    are omitted, so a caller (or a test) can repoint the module globals.
+
+    Note the retired status: installed-with-no-repo-copy used to be
+    `source-error`, i.e. a fault in this script's configuration. It is now
+    `uncodified` — a gap in coverage, which is what it always was. 54 of the
+    60 units on the dashboard box are in that state, and calling that a
+    config error made the honest reading unavailable.
+
+    `not-installed` means a codified unit this box does not host. A box
+    legitimately runs a subset (dashboard: daily-news; trading:
+    metron-intraday), so it is informational, never a finding.
+    """
+    d = installed_dir or INSTALLED_DIR
+    installed_hash = _sha256(d / name)
+    repo_path = codified_path(name, roots)
+
     if installed_hash is None:
-        return "not-installed", f"{name}: not present on this box ({installed_path})"
+        if repo_path is None:
+            return "not-installed", f"{name}: neither installed here nor codified"
+        return "not-installed", f"{name}: codified, not present on this box ({d / name})"
+
+    if repo_path is None:
+        return "uncodified", f"{name}: installed here, codified in no known root"
 
     repo_hash = _sha256(repo_path)
     if installed_hash != repo_hash:
@@ -91,47 +211,140 @@ def check_unit(name: str) -> tuple[str, str]:
     return "clean", f"{name}: OK"
 
 
+def _emit_metrics(counts: dict) -> None:
+    """Put the coverage counts to CloudWatch. Best-effort, loudly.
+
+    Every value goes on every run, zeros included: `principles.md` §2.7 — a
+    metric that only appears when something is wrong makes "healthy" and "the
+    emitter is dead" the same shape on the graph.
+    """
+    try:
+        import boto3
+
+        host = socket.gethostname()
+        boto3.client("cloudwatch").put_metric_data(
+            Namespace=METRIC_NAMESPACE,
+            MetricData=[
+                {
+                    "MetricName": f"SystemdUnits{key}",
+                    "Dimensions": [{"Name": "Host", "Value": host}],
+                    "Value": float(value),
+                    "Unit": "Count",
+                }
+                for key, value in counts.items()
+            ],
+        )
+        print(f"[metric] emitted {len(counts)} coverage counts for {host}")
+    except Exception as e:  # noqa: BLE001 - a metric failure must not mask the check
+        # Recorded, never swallowed: this is the surface that says whether the
+        # coverage number is real, so its absence has to be attributable.
+        print(
+            f"[check-systemd-unit-drift] METRIC EMIT FAILED — coverage is "
+            f"UNOBSERVED: {e}",
+            file=sys.stderr,
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--unit", help="check a single unit by filename (e.g. daily-news.timer)")
     parser.add_argument(
         "--report",
         action="store_true",
-        help="on drift, also flow-doctor report (in addition to the exit code + stdout)",
+        help="on a finding, also publish an alert (in addition to the exit code + stdout)",
+    )
+    parser.add_argument("--metric", action="store_true", help="emit the coverage counts to CloudWatch")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="treat ANY uncodified unit as a failure, not only ones outside the baseline",
+    )
+    parser.add_argument(
+        "--codified-root",
+        action="append",
+        default=None,
+        help="directory holding codified unit files (repeatable; default: this script's directory)",
     )
     args = parser.parse_args()
 
-    units = [args.unit] if args.unit else list(ALL_UNITS)
+    roots = [Path(r).resolve() for r in args.codified_root] if args.codified_root else [SCRIPT_DIR]
+    baseline = load_baseline()
 
-    findings = []
-    saw_installed = False
+    if args.unit:
+        names = [args.unit]
+    else:
+        # The union: what is installed, plus anything codified that is not —
+        # so a unit deleted from the box still appears rather than silently
+        # dropping out of the comparison.
+        names = sorted(set(installed_units()) | set(codified_units(roots)))
+
+    buckets: dict[str, list[str]] = {"clean": [], "drift": [], "uncodified": [], "not-installed": []}
+    details: dict[str, str] = {}
+    for name in names:
+        status, detail = check_unit(name, roots)
+        buckets[status].append(name)
+        details[name] = detail
+        label = "uncodified-NEW" if (status == "uncodified" and name not in baseline) else status
+        print(f"[{label}] {detail}")
+
+    uncodified = buckets["uncodified"]
+    uncodified_new = [n for n in uncodified if n not in baseline]
+    installed_count = len(buckets["clean"]) + len(buckets["drift"]) + len(uncodified)
+
+    print(
+        "SUMMARY "
+        f"installed={installed_count} "
+        f"clean={len(buckets['clean'])} "
+        f"drift={len(buckets['drift'])} "
+        f"uncodified={len(uncodified)} "
+        f"uncodified_new={len(uncodified_new)} "
+        f"codified_not_installed={len(buckets['not-installed'])}"
+    )
+
+    if args.metric:
+        _emit_metrics({
+            "Installed": installed_count,
+            "Clean": len(buckets["clean"]),
+            "Drifted": len(buckets["drift"]),
+            "Uncodified": len(uncodified),
+            "UncodifiedNew": len(uncodified_new),
+        })
+
     exit_code = 0
-    for name in units:
-        status, detail = check_unit(name)
-        print(f"[{status}] {detail}")
-        if status == "source-error":
-            exit_code = max(exit_code, 2)
-        elif status == "drift":
-            saw_installed = True
-            findings.append(detail)
+    findings: list[str] = []
+    if buckets["drift"]:
+        findings.extend(details[n] for n in buckets["drift"])
+        exit_code = max(exit_code, 1)
+    if uncodified_new:
+        findings.append(
+            f"{len(uncodified_new)} unit(s) installed but codified nowhere and absent from the "
+            f"baseline: {', '.join(uncodified_new)}"
+        )
+        if args.strict:
             exit_code = max(exit_code, 1)
-        elif status == "clean":
-            saw_installed = True
-
-    if not saw_installed and exit_code == 0:
-        # Every probed unit was "not-installed" — this box hosts neither
-        # pair. Not an error (a box legitimately hosting neither unit
-        # would otherwise always fail); the daily install scripts are the
-        # enforcement point for "should this unit exist here at all".
-        print("No tracked units installed on this box — nothing to compare.")
-        return 0
+    if uncodified and args.strict:
+        exit_code = max(exit_code, 1)
 
     if findings:
-        print(f"DRIFT: {len(findings)} unit(s) diverged from repo.", file=sys.stderr)
+        print(f"FINDINGS: {len(findings)}", file=sys.stderr)
+        for f in findings:
+            print(f"  {f}", file=sys.stderr)
         if args.report:
             _report_drift(findings)
+
+    # PASSED is reserved for a box where every installed unit is codified AND
+    # matches. Anything else states the shortfall: there is no phrasing of
+    # "passed" that is true while 54 units sit outside the comparison.
+    if not installed_count:
+        print("No unit files installed on this box — nothing to compare.")
+    elif not buckets["drift"] and not uncodified:
+        print("Systemd unit coverage PASSED (every installed unit is codified and matches).")
     else:
-        print("Systemd unit drift check PASSED (installed units match repo).")
+        print(
+            f"Systemd unit coverage INCOMPLETE: {len(buckets['clean'])}/{installed_count} "
+            f"installed units are codified and clean; {len(uncodified)} uncodified, "
+            f"{len(buckets['drift'])} drifted. This is not a pass."
+        )
 
     return exit_code
 
