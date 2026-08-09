@@ -965,13 +965,75 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Daemon restart failure is non-fatal \u2014 systemd boot trigger is backup",
-          "Next": "WriteCompletionMarker",
+          "Comment": "alpha-engine-config#6692: daemon restart failure is still non-fatal to the RUN itself \u2014 systemd boot trigger is backup, so control still proceeds (no HandleFailure/abort). What changed is the TERMINAL: this Catch now routes through SetDaemonDegradedFlag -> CheckDegradedOutcome (Option-A parity with step_function_eod.json's RunDaemon-equivalent) instead of straight to WriteCompletionMarker, so a daemon-restart-failure morning ends DEGRADED/FAILED (status-keyed watchers engage) rather than a plain SUCCEEDED execution with a normal marker and only an SNS trace.",
+          "Next": "SetDaemonDegradedFlag",
           "ResultPath": "$.daemon_error"
         }
       ],
       "ResultPath": "$.daemon_result",
-      "Next": "WriteCompletionMarker"
+      "Next": "CheckDegradedOutcome"
+    },
+    "SetDaemonDegradedFlag": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config#6692 (Option-A parity with step_function_eod.json's SetDegradedFlag, Brian's 2026-07-28 ruling): the daemon failed to restart \u2014 systemd boot trigger remains the backup so the run is NOT aborted here, but this execution must not end plain ExecutionSucceeded. Sets a persistent $.degraded_summary, checked once by CheckDegradedOutcome, to route to the DegradedRun terminal (Type: Fail) instead of the normal PipelineComplete path. Does not clobber $.daemon_error (set by RunDaemon's own Catch ResultPath) or any earlier $.degraded_summary from the data-spot fail-open path \u2014 if both stages degraded, this state's write simply wins as the most-recent cause; degraded=true is preserved either way.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "run_daemon_restart_failed",
+        "run_date.$": "$.run_date",
+        "stage_error.$": "$.daemon_error"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "CheckDegradedOutcome"
+    },
+    "CheckDegradedOutcome": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config#6692: Option-A parity with step_function_eod.json's CheckDegradedOutcome (Brian's 2026-07-28 ruling) \u2014 the ONE place that decides which terminal this execution reaches. $.degraded_summary is set either by SetDataSpotDegradedFlag (the data-spot fail-open path, which still lets the run continue to Scanner/PredictorInference/RunMorningPlanner/RunDaemon) or by SetDaemonDegradedFlag (RunDaemon's restart-failure Catch, which still lets systemd's boot trigger be the backup) \u2014 either stage degrading downgrades the whole execution's terminal even though neither path aborts the run mid-pipeline. Reached from RunDaemon's normal Next, RunDaemon's Catch (via SetDaemonDegradedFlag), and CheckSkipRunDaemon's skip-gate edge, so every route to the terminal is covered.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.degraded_summary.degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.degraded_summary.degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config-I2767-style guard (mirrors step_function_eod.json's CheckDegradedOutcome): $.degraded_summary is only assigned on a degraded path \u2014 a fully-green day never sets it, so an unguarded dereference would throw States.Runtime at the last state. Absent flag = never degraded = WriteCompletionMarker via Default, which is the semantically exact reading.",
+          "Next": "WriteCompletionMarkerDegraded"
+        }
+      ],
+      "Default": "WriteCompletionMarker"
+    },
+    "WriteCompletionMarkerDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config#6692: DEGRADED-status parity marker with step_function_eod.json's WriteCompletionMarkerDegraded (Brian's 2026-07-28 Option-A ruling). Written on the degraded outcome (RunDaemon restart failure and/or the data-spot fail-open path), immediately before the DegradedRun Fail terminal. Same S3 bucket/key as the normal marker (registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_preopen_trading_pipeline, cadence weekday_sf \u2014 no new IAM grant needed, the existing marker PutObject grant already covers the _sf_completion/ne-preopen-trading-pipeline/* prefix) \u2014 the marker still fires so the completion artifact exists, but DegradedRun is Type: Fail so status-keyed watchers (sf-watch, EventBridge, sf-telegram-notifier) engage. No swallow-all Catch here (mirrors WriteCompletionMarker's convention): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable.",
+      "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+      "Parameters": {
+        "Bucket": "alpha-engine-research",
+        "Key.$": "States.Format('_sf_completion/ne-preopen-trading-pipeline/{}.json', States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0))",
+        "ContentType": "application/json",
+        "Body.$": "States.Format('\\{\"sf\":\"ne-preopen-trading-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"degraded_summary\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0), States.JsonToString($.degraded_summary))"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 3,
+          "IntervalSeconds": 2,
+          "BackoffRate": 2.0,
+          "Comment": "Transient S3 fault coverage \u2014 mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
+        }
+      ],
+      "Next": "DegradedRun"
+    },
+    "DegradedRun": {
+      "Type": "Fail",
+      "Error": "DegradedRun",
+      "Cause": "Daily preopen pipeline degraded \u2014 see $.degraded_summary in execution input (reason: run_daemon_restart_failed and/or daily_data_spot_fail_open) and the corresponding SNS notification (PublishDataSpotFailureImmediate) in execution history. Per Brian's 2026-07-28 Option-A ruling (alpha-engine-config#2699), ported to this daily SF via alpha-engine-config#6692: a degraded run must FAIL so status-keyed watchers (sf-watch, EventBridge, sf-telegram-notifier) engage with zero new plumbing.",
+      "Comment": "alpha-engine-config#6692: Option-A parity with step_function_eod.json's DegradedRun. The daemon-restart-failure and data-spot fail-open continuation paths remain unconditionally reachable BEFORE this terminal (RunDaemon Catch -> SetDaemonDegradedFlag -> CheckDegradedOutcome; ExtractDataSpotError -> SetDataSpotDegradedFlag -> PublishDataSpotFailureImmediate -> ... -> RunDaemon -> CheckDegradedOutcome) \u2014 the run itself is never aborted mid-pipeline, only the terminal's honesty changes."
     },
     "WriteCompletionMarker": {
       "Type": "Task",
@@ -1124,7 +1186,7 @@
     },
     "CheckSkipRunDaemon": {
       "Type": "Choice",
-      "Comment": "Per-task rerun gate (L4606). Input {\"skip_run_daemon\": true} routes past RunDaemon (the daemon restart) directly to PipelineComplete; missing flag = run as normal. Per feedback_preflight_fast_fail_before_expensive_work.",
+      "Comment": "Per-task rerun gate (L4606). Input {\"skip_run_daemon\": true} routes past RunDaemon (the daemon restart) to CheckDegradedOutcome (alpha-engine-config#6692: routed through the degraded check the same way RunDaemon's own success/Catch edges are, so an earlier data-spot degraded flag is still honored even when the daemon step itself is skipped) rather than straight to WriteCompletionMarker; missing flag = run as normal. Per feedback_preflight_fast_fail_before_expensive_work.",
       "Choices": [
         {
           "And": [
@@ -1137,7 +1199,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "WriteCompletionMarker"
+          "Next": "CheckDegradedOutcome"
         }
       ],
       "Default": "RunDaemon"
@@ -1510,6 +1572,18 @@
         "source": "CheckMorningEnrich/ArcticAppendSpotStatus or launch Catch"
       },
       "ResultPath": "$.data_spot_error",
+      "Next": "SetDataSpotDegradedFlag"
+    },
+    "SetDataSpotDegradedFlag": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config#6692 (Option-A parity with step_function_eod.json's SetDegradedFlag, Brian's 2026-07-28 ruling): threads a $.degraded_summary flag onto the data-spot fail-open path WITHOUT changing its fail-open continuation \u2014 Next still leads to PublishDataSpotFailureImmediate and on to CheckSkipScanner exactly as before, so the run still proceeds to Scanner/PredictorInference/RunMorningPlanner/RunDaemon. The flag is only read much later by CheckDegradedOutcome (via RunDaemon's success Next or CheckSkipRunDaemon's skip edge), which routes the eventual TERMINAL to WriteCompletionMarkerDegraded -> DegradedRun instead of a plain SUCCEEDED execution \u2014 closing the gap where a morning data-spot failure left only an SNS trace and a normal completion marker. Does not clobber $.data_spot_error (set by the preceding ExtractDataSpotError ResultPath).",
+      "Parameters": {
+        "degraded": true,
+        "reason": "daily_data_spot_fail_open",
+        "run_date.$": "$.run_date",
+        "stage_error.$": "$.data_spot_error"
+      },
+      "ResultPath": "$.degraded_summary",
       "Next": "PublishDataSpotFailureImmediate"
     },
     "PublishDataSpotFailureImmediate": {
