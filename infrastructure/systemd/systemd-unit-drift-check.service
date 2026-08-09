@@ -6,7 +6,7 @@ Type=oneshot
 User=ec2-user
 Group=ec2-user
 WorkingDirectory=/home/ec2-user/alpha-engine-data
-ExecStart=/home/ec2-user/alpha-engine-data/.venv/bin/python /home/ec2-user/alpha-engine-data/infrastructure/systemd/check-systemd-unit-drift.py --report
+ExecStart=/home/ec2-user/alpha-engine-data/.venv/bin/python /home/ec2-user/alpha-engine-data/infrastructure/systemd/check-systemd-unit-drift.py --report --metric --codified-root /home/ec2-user/alpha-engine-data/infrastructure/systemd --codified-root /home/ec2-user/alpha-engine-dashboard/infrastructure/systemd --codified-root /home/ec2-user/metron-ops/infrastructure/systemd --codified-root /home/ec2-user/telos-ops/infrastructure/systemd
 # Reads /etc/systemd/system/*, no writes — runs as ec2-user like the units
 # it checks, not root.
 StandardOutput=journal

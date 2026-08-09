@@ -78,14 +78,18 @@ Three rules follow:
     inline), so unreadable means both a convention violation and a hole in
     the coverage claim — it exits 1 until the mode is fixed.
 
-"Codified" means a file of the same name under a `--codified-root` (default:
-this script's directory). Units owned by other repos — `metron-*`,
-`crucible-dash-*`, `nousergon-*`, `vires`, `telos-web`, `mnemon*` — are not
-codified *from here* and sit in the baseline with their owning repo noted.
-Teaching this script to read eight repo trees would move the ownership
-question into a script instead of answering it; `infrastructure-ownership-
-policy` answers it, and the baseline is the register of where that answer has
-not been applied yet.
+"Codified" means a file of the same name under a `--codified-root`
+(repeatable; default: this script's directory). The unit passes one root per
+repo checkout on the box that is today-authoritative for its units per
+`infrastructure-ownership-policy` §5 — measured 2026-08-09, byte-identical
+for every covered unit: `alpha-engine-dashboard` (21 units), `metron-ops`
+(10), `telos-ops` (1), plus this repo's 6. The roots do NOT decide
+ownership — `infrastructure-ownership-policy` does; they verify hashes
+wherever a unit is already codified, and the baseline remains the register
+of units codified NOWHERE (22 as of 2026-08-09). The original 2026-08-08
+baseline mislabeled the 21 dashboard-owned units "codified in no known
+root" because this script only read its own directory — a coverage gap in
+the checker, not in the codification.
 """
 
 from __future__ import annotations
@@ -103,10 +107,15 @@ UNCODIFIED_BASELINE_FILE = SCRIPT_DIR / "uncodified-units-baseline.txt"
 
 UNIT_SUFFIXES = (".service", ".timer")
 
-#: CloudWatch namespace for the coverage counts. Shares the box-health
+#: CloudWatch namespace for the coverage counts. Shares box-health's actual
 #: namespace deliberately — coverage of the unit set is a property of the box,
-#: and a separate namespace is one more place to remember to look.
-METRIC_NAMESPACE = "NousErgon/BoxHealth"
+#: and a separate namespace is one more place to remember to look. This was
+#: born as "NousErgon/BoxHealth", which (a) is NOT what box_health.sh emits
+#: to and (b) the box role's PutMetricData grant is namespace-conditioned to
+#: `AlphaEngine`/`AlphaEngine/*` (alpha-engine-cloudwatch-metrics.json), so
+#: every emit would have been denied — measured live 2026-08-09, before the
+#: first `--metric` run ever fired.
+METRIC_NAMESPACE = "AlphaEngine/Box"
 
 # The units this repo codifies and installs. NO LONGER THE SCOPE OF THE
 # CHECK — scope is now whatever is installed (see the docstring). Kept
