@@ -41,10 +41,23 @@ floor) — the other three states pass --no-pit-parity. It used to run stacked i
 PredictorBacktest, OOM-guard-failing on the 8 GB box (2nd predictor_pipeline
 after the main one held ~3.5 GB).
 
+alpha-engine-config-I4442/I4497 SF cutover (2026-08-09, crucible-backtester
+#631): the --mode/--skip-stages/--pit-parity-enabled flag vocabulary
+described above is HISTORICAL. Each of the five backtest-family states now
+invokes its own dedicated script (spot_backtester.sh / spot_predictor_
+backtest.sh / spot_portfolio_optimizer_backtest.sh / spot_parity.sh /
+spot_evaluator.sh) with no stage-multiplexing flag at all — the flag-based
+mode selection this docstring documents was the DEFECT I4442/I4497 exist to
+remove (one shared launcher script per SF state, not five modes of one
+script). spot_backtest.sh is retained on disk, byte-identical, only as the
+rollback path; no SF state invokes it any longer. The ordering/Catch/
+timeout/ResultPath invariants below are unaffected by the cutover and still
+apply to the per-stage scripts.
+
 This test catches regressions like:
-- Someone reverts Backtester's SSM command back to --skip-stages=evaluator
-  (re-bundles parity into the backtest task) or drops --mode=param-sweep
-  (re-bundles the heavy post-sweep phases back into one SSM command).
+- Someone reverts a backtest-family state's SSM command back to invoking
+  the shared spot_backtest.sh monolith (with any --mode/--skip-stages flag)
+  instead of its own dedicated script.
 - Someone wires Parity BEFORE Backtester, or drops the Parity state.
 - Someone reroutes the backtest-family chain so a phase is skipped or
   re-ordered (e.g. predictor before sim).
@@ -310,34 +323,50 @@ class TestSsmCommandShape:
         return extract_commands(states[name])
 
     def test_backtester_invokes_simulation_stage_only(self, states):
-        """L4472: Backtester runs ONLY the simulation pipeline via
-        --mode=param-sweep, with --no-pit-parity (pit_parity belongs to
-        PredictorBacktest). It must still skip the parity+evaluator stages."""
+        """L4472: Backtester runs ONLY the simulation pipeline. Post
+        alpha-engine-config-I4442/I4497 SF cutover (2026-08-09,
+        crucible-backtester#631), it invokes its own dedicated
+        spot_backtester.sh — the monolith + --mode flag it used to run is
+        retained unchanged only as the rollback path, and the new script
+        carries no stage-multiplexing flag at all (spot_backtester.sh does
+        only the simulation stage; there is nothing left to skip)."""
         joined = " ".join(self._commands(states, "Backtester"))
-        assert "spot_backtest.sh --mode=param-sweep --no-pit-parity --skip-stages=parity,evaluator" in joined, (
-            "Backtester must run --mode=param-sweep (simulation only) with "
-            "--no-pit-parity post-L4472-split — dropping --mode re-bundles the "
-            "heavy predictor/optimizer phases back into one SSM command."
+        assert "spot_backtester.sh" in joined, (
+            "Backtester must run its dedicated per-stage script post-cutover."
         )
-        assert "--skip-stages=evaluator" not in joined
-        assert "--skip-stages=backtest,evaluator" not in joined
+        assert "spot_backtest.sh" not in joined, (
+            "Backtester must not fall back to the shared monolith launcher."
+        )
+        assert "--skip-stages" not in joined
+        assert "--mode=" not in joined
 
     def test_parity_invokes_parity_stage_only(self, states):
         joined = " ".join(self._commands(states, "Parity"))
-        assert "spot_backtest.sh --pit-parity-enabled=1 --skip-stages=backtest,evaluator" in joined, (
-            "Parity must run ONLY the parity stage."
+        assert "spot_parity.sh" in joined, (
+            "Parity must run its dedicated per-stage script post-cutover."
         )
-        assert "--skip-stages=evaluator" not in joined
-        assert "--skip-stages=parity,evaluator" not in joined
+        assert "spot_backtest.sh" not in joined, (
+            "Parity must not fall back to the shared monolith launcher."
+        )
+        assert "--skip-stages" not in joined
+        assert "--pit-parity-enabled" not in joined
 
     def test_no_combined_backtester_skip_stages_anywhere(self, sf):
         """The old single combined-Backtester invocation
         (--skip-stages=evaluator, runs backtest+parity together) must be
-        gone everywhere in the SF."""
+        gone everywhere in the SF — and post-cutover, the monolith
+        spot_backtest.sh is not invoked by any state at all (each backtest-
+        family state runs its own dedicated script; the monolith survives
+        on disk only as the rollback path)."""
         blob = json.dumps(sf)
         assert "spot_backtest.sh --skip-stages=evaluator" not in blob, (
             "The old combined backtest+parity invocation reappeared — a "
             "parity failure would again re-run the 121-min backtest."
+        )
+        assert '"spot_backtest.sh' not in blob, (
+            "No SF state should invoke the shared monolith launcher post "
+            "alpha-engine-config-I4442/I4497 cutover — every backtest-family "
+            "state has its own dedicated script now."
         )
 
     def test_backtester_command_starts_with_pipefail(self, states):
@@ -362,7 +391,8 @@ class TestSsmCommandShape:
         )
         assert "--slug parity" in work
         assert "--log /var/log/parity.log" in work
-        assert "-- bash infrastructure/spot_backtest.sh --pit-parity-enabled=1 --skip-stages=backtest,evaluator" in work
+        # Post I4442/I4497 cutover: dedicated script, no mode flags.
+        assert "-- bash infrastructure/spot_parity.sh" in work
         assert not any(c.startswith("trap ") for c in cmds), (
             "Inline trap must not coexist with the lib CLI — the CLI "
             "internalizes the trap."
@@ -497,40 +527,50 @@ class TestL4472PhaseSplit:
         assert success("CheckPortfolioOptimizerBacktestStatus") == ["CheckSkipParity"]
 
     def test_predictor_backtest_invokes_predictor_mode(self, states):
+        # Post I4442/I4497 cutover (crucible-backtester#631): dedicated
+        # script, no --mode/--skip-stages/--no-pit-parity flags — the new
+        # script's executable code carries no stage-multiplexing flag at all.
         joined = " ".join(self._commands(states, "PredictorBacktest"))
-        assert "spot_backtest.sh --mode=predictor-backtest --no-pit-parity --skip-stages=parity,evaluator" in joined
-        # L4486: pit_parity NO LONGER runs here (it was stacked after the main
-        # predictor_pipeline → 8 GB OOM-guard fail). Relocated to the Parity state.
-        assert "--no-pit-parity" in joined
+        assert "spot_predictor_backtest.sh" in joined
+        assert "spot_backtest.sh" not in joined
+        assert "--skip-stages" not in joined
+        assert "--mode=" not in joined
 
     def test_optimizer_invokes_optimizer_mode_no_pit(self, states):
         joined = " ".join(self._commands(states, "PortfolioOptimizerBacktest"))
-        assert "spot_backtest.sh --mode=portfolio-optimizer-backtest --no-pit-parity --skip-stages=parity,evaluator" in joined
+        assert "spot_portfolio_optimizer_backtest.sh" in joined
+        assert "spot_backtest.sh" not in joined
+        assert "--skip-stages" not in joined
+        assert "--mode=" not in joined
 
     def test_pit_parity_runs_exactly_once_in_parity_state(self, sf):
-        """L4486: pit_parity fires EXACTLY ONCE, in the standalone Parity state
-        (fresh process, ≥8 GB floor via --mode=all). A state runs pit_parity iff
-        it neither passes --no-pit-parity NOR skips the `pit_parity` stage token.
-        Backtester / PredictorBacktest / PortfolioOptimizerBacktest all pass
-        --no-pit-parity; Parity does not, and its --skip-stages=backtest,evaluator
-        does not contain pit_parity."""
-        import re
+        """L4486: pit_parity fires EXACTLY ONCE, in the standalone Parity
+        state. Post I4442/I4497 cutover this is a structural guarantee of
+        WHICH script each backtest-family state invokes, not a --no-pit-parity
+        / --skip-stages flag parse (those flags no longer exist on any of the
+        five new scripts — crucible-backtester#631's PR body: 'No
+        stage-multiplexing flag exists in any new script's executable code').
+        pit_parity is spot_parity.sh's entire job; Backtester/
+        PredictorBacktest/PortfolioOptimizerBacktest/Evaluator each invoke a
+        DIFFERENT dedicated script that is not spot_parity.sh."""
         from tests.sf_command_utils import extract_commands
         states = sf["States"]
 
-        def runs_pit_parity(name):
-            cmd = " ".join(extract_commands(states[name]))
-            # isolate the spot_backtest.sh invocation flags
-            m = re.search(r"spot_backtest\.sh ([^']*)", cmd)
-            flags = m.group(1) if m else ""
-            if "--no-pit-parity" in flags:
-                return False
-            skip = re.search(r"--skip-stages=(\S+)", flags)
-            skipped = skip.group(1).split(",") if skip else []
-            return "pit_parity" not in skipped
+        family_scripts = {
+            "Backtester": "spot_backtester.sh",
+            "PredictorBacktest": "spot_predictor_backtest.sh",
+            "PortfolioOptimizerBacktest": "spot_portfolio_optimizer_backtest.sh",
+            "Parity": "spot_parity.sh",
+        }
+        for name, script in family_scripts.items():
+            joined = " ".join(extract_commands(states[name]))
+            assert script in joined, f"{name} must invoke {script}"
 
-        family = ["Backtester", "PredictorBacktest", "PortfolioOptimizerBacktest", "Parity"]
-        runners = [n for n in family if runs_pit_parity(n)]
+        runners = [
+            name
+            for name, script in family_scripts.items()
+            if script == "spot_parity.sh"
+        ]
         assert runners == ["Parity"], (
             f"pit_parity must fire exactly once, in Parity; got runners={runners}"
         )
