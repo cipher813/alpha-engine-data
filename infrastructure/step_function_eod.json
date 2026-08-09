@@ -1,6 +1,7 @@
 {
   "Comment": "Alpha Engine EOD Pipeline \u2014 post-market data capture, snapshot capture, reconciliation, daily substrate health check, instance shutdown. Triggered by daemon shutdown on trading EC2.",
   "StartAt": "CheckMutexRole",
+  "TimeoutSeconds": 64800,
   "States": {
     "CheckMutexRole": {
       "Type": "Choice",
@@ -67,6 +68,7 @@
         },
         "ConditionExpression": "attribute_not_exists(mutex_key)"
       },
+      "TimeoutSeconds": 60,
       "Catch": [
         {
           "ErrorEquals": [
@@ -100,6 +102,7 @@
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -200,9 +203,9 @@
     },
     "SetSSMReadyExhaustedError": {
       "Type": "Pass",
-      "Comment": "Normalize SSM-ready exhaustion into $.error so HandleFailure's States.JsonToString($.error) has an object to serialize — the Choice path from SSMReadyChoice does not carry a caught error (the SSM DescribeInstanceInfo calls succeeded; the agent simply never went Online). Without this, HandleFailure itself crashes with States.Runtime on the missing $.error JsonPath, masking the real 'trading instance unreachable' cause behind a broken error-reporting state.",
+      "Comment": "Normalize SSM-ready exhaustion into $.error so HandleFailure's States.JsonToString($.error) has an object to serialize \u2014 the Choice path from SSMReadyChoice does not carry a caught error (the SSM DescribeInstanceInfo calls succeeded; the agent simply never went Online). Without this, HandleFailure itself crashes with States.Runtime on the missing $.error JsonPath, masking the real 'trading instance unreachable' cause behind a broken error-reporting state.",
       "Parameters": {
-        "error": "SSM agent did not come Online within 12 attempts (~3 min) — the trading instance is unreachable. The EOD pipeline cannot proceed without an SSM connection to the box (every work step is SSM:sendCommand)."
+        "error": "SSM agent did not come Online within 12 attempts (~3 min) \u2014 the trading instance is unreachable. The EOD pipeline cannot proceed without an SSM connection to the box (every work step is SSM:sendCommand)."
       },
       "ResultPath": "$.error",
       "Next": "HandleFailure"
@@ -266,6 +269,7 @@
         "CommandId.$": "$.snapshot_result.Command.CommandId",
         "InstanceId.$": "$.trading_instance_id[0]"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -396,6 +400,7 @@
         "CommandId.$": "$.eod_result.Command.CommandId",
         "InstanceId.$": "$.trading_instance_id[0]"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -569,6 +574,7 @@
         "CommandId.$": "$.refresh_executor_deploy_result.Command.CommandId",
         "InstanceId.$": "$.trading_instance_id[0]"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -765,6 +771,7 @@
         "CommandId.$": "$.postmarket_launch.Payload.data_spot.command_id",
         "InstanceId.$": "$.postmarket_launch.Payload.data_spot.instance_id"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -940,6 +947,7 @@
         "CommandId.$": "$.postmarket_arctic_launch.Payload.data_spot.command_id",
         "InstanceId.$": "$.postmarket_arctic_launch.Payload.data_spot.instance_id"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -1052,6 +1060,7 @@
         "Message.$": "States.Format('EOD data-spot phase failed but the pipeline continued to reconcile + instance-stop (fail-open, config#1767). Detail: {}', States.JsonToString($.data_spot_error))"
       },
       "ResultPath": "$.data_spot_failure_notify",
+      "TimeoutSeconds": 60,
       "Catch": [
         {
           "ErrorEquals": [
@@ -1177,6 +1186,7 @@
         "Message.$": "States.Format('EOD reconcile SKIPPED for {}: the precondition probe found run_date\\'s SPY close not yet verified-present in ArcticDB. Entering the closed-loop self-heal (dispatch missing workload(s) -> re-probe -> auto-replay) \u2014 no operator action required unless a follow-up DID-NOT-CONVERGE alert fires. Probe detail: {}', $.run_date, States.JsonToString($.precondition_probe))"
       },
       "ResultPath": "$.eod_skip_notify",
+      "TimeoutSeconds": 60,
       "Catch": [
         {
           "ErrorEquals": [
@@ -1324,6 +1334,7 @@
         "CommandId.$": "$.heal_postmarket_launch.Payload.data_spot.command_id",
         "InstanceId.$": "$.heal_postmarket_launch.Payload.data_spot.instance_id"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -1458,6 +1469,7 @@
         "CommandId.$": "$.heal_arctic_launch.Payload.data_spot.command_id",
         "InstanceId.$": "$.heal_arctic_launch.Payload.data_spot.instance_id"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -1635,6 +1647,7 @@
         "Message.$": "States.Format('EOD self-heal for {} converged (SPY close now verified present) but the auto-replay StartExecution call itself failed: {}. Run a manual operator-replay: pipeline_role=operator-replay, skip_post_market_data=true, skip_capture_snapshot=true (I2700 shape).', $.run_date, States.JsonToString($.heal_replay_dispatch_error))"
       },
       "ResultPath": "$.heal_replay_dispatch_failed_notify",
+      "TimeoutSeconds": 60,
       "Catch": [
         {
           "ErrorEquals": [
@@ -1656,6 +1669,7 @@
         "Message.$": "States.Format('EOD self-heal for {} converged after {} attempt(s): the missing data-spot workload(s) were re-dispatched, SPY close is now verified present in ArcticDB, and a reconcile-only replay execution has been started automatically ({}). No operator action required.', $.run_date, States.MathAdd($.heal_loop.attempts, 1), States.JsonToString($.heal_replay_dispatch))"
       },
       "ResultPath": "$.heal_converged_notify",
+      "TimeoutSeconds": 60,
       "Catch": [
         {
           "ErrorEquals": [
@@ -1677,6 +1691,7 @@
         "Message.$": "States.Format('EOD self-heal for {} did NOT converge: the automatic heal loop (dispatch missing data-spot workload(s) -> re-probe) exhausted its attempt budget and/or passed its deadline without SPY close landing in ArcticDB. pipeline_role={}, latest probe: {}. Manual intervention needed \u2014 investigate the data-spot dispatch failures, then run an operator-replay (I2700 shape: skip_post_market_data=true, skip_capture_snapshot=true) once the underlying data issue is fixed.', $.run_date, $.pipeline_role, States.JsonToString($.precondition_probe))"
       },
       "ResultPath": "$.heal_nonconvergent_notify",
+      "TimeoutSeconds": 60,
       "Catch": [
         {
           "ErrorEquals": [
@@ -1695,6 +1710,7 @@
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -1715,7 +1731,128 @@
         }
       ],
       "ResultPath": "$.stop_result",
-      "Next": "LaunchWeeklyExerciseRun"
+      "Next": "ReadExerciseCadence"
+    },
+    "ReadExerciseCadence": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I6689 deliverable 2/3: reads the declared weekly-exercise cadence from SSM Parameter Store (source of truth: infrastructure/weekly_cadence.json, synced here by infrastructure/deploy-infrastructure.sh on every merge deploy) so flipping daily <-> weekly-only <-> off is a one-line manifest diff instead of an SF-topology edit. TimeoutSeconds=30 + Catch(States.ALL): per weekly-sf-policy \u00a75's run-day-gate precedent (WeeklyRunDayGateChoice: 'missing the weekly run is worse than a duplicate'), a read failure (most likely cause until the follow-up nous-ergon-ops IAM PR lands: alpha-engine-step-functions-role has no ssm:GetParameter on this resource yet \u2014 alpha-engine-config#6689 PR body names the exact grant) fails OPEN to the pre-existing 'run it' behavior rather than silently skipping the exercise launch, and pages so the degradation is visible instead of indistinguishable from a deliberate 'off'.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getParameter",
+      "Parameters": {
+        "Name": "/alpha-engine/weekly-sf/exercise-cadence"
+      },
+      "ResultSelector": {
+        "value.$": "$.Parameter.Value"
+      },
+      "ResultPath": "$.exercise_cadence_param",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SetCadenceReadDegraded",
+          "ResultPath": "$.exercise_cadence_read_error"
+        }
+      ],
+      "Next": "CheckExerciseCadence"
+    },
+    "SetCadenceReadDegraded": {
+      "Type": "Pass",
+      "Comment": "ReadExerciseCadence's Catch lands here. Floors $.exercise_cadence_param to a well-formed {'value': 'daily'} so CheckExerciseCadence takes the SAME branch the exercise launch always took before config#6689 \u2014 a missed exercise run is the worse failure mode (weekly-sf-policy \u00a75).",
+      "Result": {
+        "value": "daily"
+      },
+      "ResultPath": "$.exercise_cadence_param",
+      "Next": "PublishCadenceReadDegraded"
+    },
+    "PublishCadenceReadDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I6689: alert that the declared-cadence read degraded, mirroring PublishLibPinGateDegraded's config#2278 shape (config#1819 discipline: hardcoded Subject/Message constants, never States.Format against unbounded input; best-effort Catch so a publish failure can never block the fail-open path this alert decorates). TopicArn is hardcoded, NOT $.sns_topic_arn \u2014 the EOD SF was hardened 2026-05-14 to hardcode the alerts-topic ARN in every Publish state and never bind it from input (test_sf_eod_precondition_probe_wiring.py::TestHandleFailureCostGuardHardening pins the absence of that binding fleet-wide in this file).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine \u2014 weekly exercise-cadence read DEGRADED (defaulted to daily)",
+        "Message": "ReadExerciseCadence could not read /alpha-engine/weekly-sf/exercise-cadence from SSM (permission not yet granted \u2014 see alpha-engine-config#6689 \u2014 throttling, or a transient SSM fault). Proceeding FAIL-OPEN as cadence=daily: the exercise launch is NOT skipped. If the declared cadence is actually weekly-only or off, this run launched the exercise anyway; investigate the SSM read path before trusting any cadence flip. View pipeline status: https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.exercise_cadence_degraded_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert \u2014 a publish failure must not halt the fail-open path.",
+          "ResultPath": "$.exercise_cadence_degraded_notify_error",
+          "Next": "CheckExerciseCadence"
+        }
+      ],
+      "Next": "CheckExerciseCadence",
+      "TimeoutSeconds": 30
+    },
+    "CheckExerciseCadence": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I6689 deliverable 2: gates LaunchWeeklyExerciseRun on the declared cadence. 'daily' preserves the pre-existing every-trading-day behavior exactly. 'weekly-only' / 'off' skip straight to CheckDegradedOutcome \u2014 LaunchWeeklyExerciseRun's OWN Next on ITS success path \u2014 so skipping the exercise launch never touches WeeklyExerciseLaunchFailed's routing (that state alerts only when the LAUNCH ITSELF fails, which cannot happen if it is never attempted). Default (value present but not one of the three declared literals \u2014 a manifest/SSM typo, or a future cadence value this SF has not been taught yet) is NOT a silent skip: it routes through SetCadenceUnknownValueDegraded to alert-then-launch, the same fail-toward-running posture as SetCadenceReadDegraded, rather than the invisible 'silently never ran' outcome. A missing/malformed $.exercise_cadence_param.value (ReadExerciseCadence's ResultSelector always sets it, or SetCadenceReadDegraded floors it) also falls through to Default by Step Functions Choice semantics \u2014 no separate IsPresent guard needed.",
+      "Choices": [
+        {
+          "Variable": "$.exercise_cadence_param.value",
+          "StringEquals": "daily",
+          "Next": "LaunchWeeklyExerciseRun"
+        },
+        {
+          "Variable": "$.exercise_cadence_param.value",
+          "StringEquals": "weekly-only",
+          "Next": "CheckDegradedOutcome"
+        },
+        {
+          "Variable": "$.exercise_cadence_param.value",
+          "StringEquals": "off",
+          "Next": "CheckDegradedOutcome"
+        }
+      ],
+      "Default": "SetCadenceUnknownValueDegraded"
+    },
+    "SetCadenceUnknownValueDegraded": {
+      "Type": "Pass",
+      "Comment": "CheckExerciseCadence's Default: the read succeeded but matched none of daily/weekly-only/off. Decided posture (alpha-engine-config#6689): treat as daily (fail toward running the exercise \u2014 weekly-sf-policy \u00a75, missing a run is worse than an extra one) AND page, so 'ran anyway on an unrecognized value' is never mistaken for 'ran because cadence=daily was correctly read.' Captures the offending raw value under .raw BEFORE overwriting .value, so the alert below can name it.",
+      "Parameters": {
+        "raw.$": "$.exercise_cadence_param.value",
+        "value": "daily"
+      },
+      "ResultPath": "$.exercise_cadence_param",
+      "Next": "PublishCadenceUnknownValueDegraded"
+    },
+    "PublishCadenceUnknownValueDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I6689: alert on an unrecognized cadence value. Subject is a hardcoded constant (config#1819 discipline); the offending value is the one bounded dynamic field, threaded via States.Format \u2014 same pattern WeeklyRunDayGateFailed uses for its single bounded upstream field. TopicArn is hardcoded, NOT $.sns_topic_arn, per the same 2026-05-14 EOD-SF hardening as PublishCadenceReadDegraded above. Best-effort Catch.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine \u2014 weekly exercise-cadence value UNRECOGNIZED (defaulted to daily)",
+        "Message.$": "States.Format('ReadExerciseCadence returned a value CheckExerciseCadence does not recognize: {}. Expected one of daily | weekly-only | off (infrastructure/weekly_cadence.json). Proceeding FAIL-OPEN as cadence=daily: the exercise launch is NOT skipped. Check infrastructure/weekly_cadence.json and the live SSM parameter /alpha-engine/weekly-sf/exercise-cadence for a typo or an undeployed manifest edit.', $.exercise_cadence_param.raw)"
+      },
+      "ResultPath": "$.exercise_cadence_unknown_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert \u2014 a publish failure must not halt the fail-open path.",
+          "ResultPath": "$.exercise_cadence_unknown_notify_error",
+          "Next": "LaunchWeeklyExerciseRun"
+        }
+      ],
+      "Next": "LaunchWeeklyExerciseRun",
+      "TimeoutSeconds": 30
     },
     "LaunchWeeklyExerciseRun": {
       "Type": "Task",
@@ -1729,6 +1866,7 @@
           "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
         }
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -1761,6 +1899,7 @@
         "Message.$": "States.Format('postclose completed but could not start the weekly exercise run. The weekly pipeline will NOT be exercised today. Error: {}', States.JsonToString($.weekly_exercise_launch_error))"
       },
       "ResultPath": "$.weekly_exercise_launch_notify",
+      "TimeoutSeconds": 60,
       "Catch": [
         {
           "ErrorEquals": [
@@ -1787,7 +1926,7 @@
               "BooleanEquals": true
             }
           ],
-          "Comment": "config-I2767 (2026-07-16 incident): $.degraded_summary is only assigned on the degraded path (SetDegradedFlag) — on a fully-green day the path is ABSENT and an unguarded dereference threw States.Runtime, failing the execution at its very last state. Absent flag = never degraded = NormalSucceeded via Default, which is the semantically exact reading, so no separate malformed route is needed here.",
+          "Comment": "config-I2767 (2026-07-16 incident): $.degraded_summary is only assigned on the degraded path (SetDegradedFlag) \u2014 on a fully-green day the path is ABSENT and an unguarded dereference threw States.Runtime, failing the execution at its very last state. Absent flag = never degraded = NormalSucceeded via Default, which is the semantically exact reading, so no separate malformed route is needed here.",
           "Next": "WriteCompletionMarkerDegraded"
         }
       ],
@@ -1795,7 +1934,7 @@
     },
     "WriteCompletionMarkerNormal": {
       "Type": "Task",
-      "Comment": "config#2857: SF-envelope completion marker — an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine). Written on the normal outcome, immediately before the distinct NormalSucceeded terminal (config-I2702 deliverable #4 keeps Normal/Degraded as separate named states for the console/notification signal — this marker preserves that split rather than converging them, since both routes must still each reach their own named Succeed). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_postclose_trading_pipeline (cadence eod_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable — exactly the ambiguity this feature exists to surface, not mask.",
+      "Comment": "config#2857: SF-envelope completion marker \u2014 an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine). Written on the normal outcome, immediately before the distinct NormalSucceeded terminal (config-I2702 deliverable #4 keeps Normal/Degraded as separate named states for the console/notification signal \u2014 this marker preserves that split rather than converging them, since both routes must still each reach their own named Succeed). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_postclose_trading_pipeline (cadence eod_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable \u2014 exactly the ambiguity this feature exists to surface, not mask.",
       "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
       "Parameters": {
         "Bucket": "alpha-engine-research",
@@ -1803,6 +1942,7 @@
         "ContentType": "application/json",
         "Body.$": "States.Format('\\{\"sf\":\"ne-postclose-trading-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\"\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date)"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -1811,7 +1951,7 @@
           "MaxAttempts": 3,
           "IntervalSeconds": 2,
           "BackoffRate": 2.0,
-          "Comment": "Transient S3 fault coverage — mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
+          "Comment": "Transient S3 fault coverage \u2014 mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
         }
       ],
       "Next": "NormalSucceeded"
@@ -1822,7 +1962,7 @@
     },
     "WriteCompletionMarkerDegraded": {
       "Type": "Task",
-      "Comment": "config#2857: SF-envelope completion marker — an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine). Written on the degraded outcome, immediately before the DegradedRun Fail terminal (config-I2702 deliverable #4 + Brian's 2026-07-28 Option-A ruling, alpha-engine-config#2699: the marker still fires so the completion artifact exists, but DegradedRun is Type: Fail so status-keyed watchers engage). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_postclose_trading_pipeline (cadence eod_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable — exactly the ambiguity this feature exists to surface, not mask.",
+      "Comment": "config#2857: SF-envelope completion marker \u2014 an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine). Written on the degraded outcome, immediately before the DegradedRun Fail terminal (config-I2702 deliverable #4 + Brian's 2026-07-28 Option-A ruling, alpha-engine-config#2699: the marker still fires so the completion artifact exists, but DegradedRun is Type: Fail so status-keyed watchers engage). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_postclose_trading_pipeline (cadence eod_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable \u2014 exactly the ambiguity this feature exists to surface, not mask.",
       "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
       "Parameters": {
         "Bucket": "alpha-engine-research",
@@ -1830,6 +1970,7 @@
         "ContentType": "application/json",
         "Body.$": "States.Format('\\{\"sf\":\"ne-postclose-trading-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\"\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date)"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -1838,7 +1979,7 @@
           "MaxAttempts": 3,
           "IntervalSeconds": 2,
           "BackoffRate": 2.0,
-          "Comment": "Transient S3 fault coverage — mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
+          "Comment": "Transient S3 fault coverage \u2014 mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
         }
       ],
       "Next": "DegradedRun"
@@ -1859,6 +2000,7 @@
         "Message.$": "States.Format('EOD pipeline failed. Error: {}. View the failing state + per-state detail at https://console.nousergon.ai/pipeline-status', States.JsonToString($.error))"
       },
       "ResultPath": "$.failure_notify",
+      "TimeoutSeconds": 60,
       "Catch": [
         {
           "ErrorEquals": [
@@ -1878,6 +2020,7 @@
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
       },
+      "TimeoutSeconds": 60,
       "ResultPath": "$.force_stop_result",
       "Next": "FailExecution"
     },

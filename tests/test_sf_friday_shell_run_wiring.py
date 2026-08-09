@@ -146,17 +146,24 @@ _EXPECTED_SKIPS = {
 # commands.$/States.Format($.preflight_args) Option-C mechanism the keystone
 # used for the other 7 spots.
 # Maps state name → (mode token the {} immediately follows, log file).
+#
+# alpha-engine-config-I4442/I4497 SF cutover (2026-08-09, nousergon-data
+# #1122 + crucible-backtester#631): MorningEnrich/DataPhase1/RAGIngestion and
+# the five backtest-family states below now invoke their own dedicated
+# per-stage script instead of a shared monolith + mode flag. The old
+# monolith launchers (spot_data_weekly.sh / spot_backtest.sh) are retained
+# on disk, unchanged, only as the rollback path.
 _SPOT_STATES = {
     "MorningEnrich": (
-        "bash infrastructure/spot_data_weekly.sh --morning-enrich-only",
+        "bash infrastructure/spot_morning_enrich.sh",
         "/var/log/morning-enrich.log",
     ),
     "DataPhase1": (
-        "bash infrastructure/spot_data_weekly.sh --phase1-only",
+        "bash infrastructure/spot_data_phase1.sh",
         "/var/log/data-weekly.log",
     ),
     "RAGIngestion": (
-        "bash infrastructure/spot_data_weekly.sh --rag-only",
+        "bash infrastructure/spot_rag_ingestion.sh",
         "/var/log/rag-ingestion.log",
     ),
     # alpha-engine-config-I5759: DataPhase2 moved OFF lambda:invoke onto spot,
@@ -172,34 +179,46 @@ _SPOT_STATES = {
         "/var/log/data-phase2.log",
     ),
     "PredictorTraining": (
-        "bash infrastructure/spot_train.sh --full-only",
+        "bash infrastructure/spot_predictor_training.sh",
         "/var/log/predictor-training.log",
     ),
     "Backtester": (
-        "bash infrastructure/spot_backtest.sh --mode=param-sweep --no-pit-parity --skip-stages=parity,evaluator",
+        "bash infrastructure/spot_backtester.sh",
         "/var/log/backtester.log",
     ),
     "PredictorBacktest": (
-        "bash infrastructure/spot_backtest.sh --mode=predictor-backtest --no-pit-parity --skip-stages=parity,evaluator",
+        "bash infrastructure/spot_predictor_backtest.sh",
         "/var/log/predictor-backtest.log",
     ),
     "PortfolioOptimizerBacktest": (
-        "bash infrastructure/spot_backtest.sh --mode=portfolio-optimizer-backtest --no-pit-parity --skip-stages=parity,evaluator",
+        "bash infrastructure/spot_portfolio_optimizer_backtest.sh",
         "/var/log/portfolio-optimizer.log",
     ),
     "Parity": (
-        "bash infrastructure/spot_backtest.sh --pit-parity-enabled=1 --skip-stages=backtest,evaluator",
+        "bash infrastructure/spot_parity.sh",
         "/var/log/parity.log",
     ),
     "Evaluator": (
-        "bash infrastructure/spot_backtest.sh --no-pit-parity --skip-stages=backtest,parity",
+        "bash infrastructure/spot_evaluator.sh",
         "/var/log/evaluator.log",
     ),
     # config#902: DriftDetection was collapsed — drift is now bundled onto the
-    # PredictorTraining spot (crucible-predictor spot_train.sh runs
-    # monitoring.drift_detector after training succeeds). Its Friday
-    # --preflight-only dry path folds into spot_train.sh --preflight-only, so
-    # DriftDetection is no longer a standalone spot state here.
+    # PredictorTraining spot (crucible-predictor spot_predictor_training.sh,
+    # pre-cutover spot_train.sh, runs monitoring.drift_detector after
+    # training succeeds). Its Friday --preflight-only dry path folds into
+    # PredictorTraining's own --preflight-only, so DriftDetection is no
+    # longer a standalone spot state here.
+    #
+    # alpha-engine-config-I4442/I4497 predictor-leg cutover (2026-08-09):
+    # PredictorTraining above now invokes spot_predictor_training.sh
+    # (pre-cutover: spot_train.sh --full-only). TrainSpecDispatch and
+    # ModelZooSelect (crucible-predictor spot_train_spec_dispatch.sh /
+    # spot_model_zoo_select.sh --select-only) also honor $.preflight_args
+    # identically but live inside ResearchPredictorParallel's Branch B /
+    # ModelZooTrainMap, outside this table's scope (this table only covers
+    # the SF's single top-level sequential spine) — not a regression, this
+    # gap predates the cutover (spot_train.sh --model-zoo-spec /
+    # --model-zoo-select were never in this table either).
 }
 
 # KEYSTONE + skip-exception rewire: the LAMBDA states routed dry (NOT
@@ -437,6 +456,20 @@ def orig_spot_cmds() -> dict:
       `_eval_expr` learned the `$$.` context-object form; the baseline
       resolves it via `_CONTEXT_OBJECT` so byte-identity stays
       deterministic. See `tests/test_sf_krepis_correlation_id.py`.
+
+    - **Regenerated 2026-08-09** as part of the alpha-engine-config-I4442/
+      I4497 SF cutover (nousergon-data#1122 + crucible-backtester#631):
+      MorningEnrich/DataPhase1/RAGIngestion and the five backtest-family
+      states now resolve to their own dedicated per-stage script
+      (`spot_morning_enrich.sh` / `spot_data_phase1.sh` /
+      `spot_rag_ingestion.sh` / `spot_backtester.sh` /
+      `spot_predictor_backtest.sh` / `spot_portfolio_optimizer_backtest.sh`
+      / `spot_parity.sh` / `spot_evaluator.sh`) with no stage-multiplexing
+      flag, instead of the shared `spot_data_weekly.sh` / `spot_backtest.sh`
+      monolith + mode flag. This is a deliberate, reviewed absent-path
+      change — the whole point of the cutover — so the baseline moves with
+      it. Both monoliths are retained on disk, unchanged, only as the
+      rollback path.
 
     Regenerate ONLY on a deliberate, reviewed change to a spot state's
     absent-path (`preflight_args=""`) command, by re-extracting the
@@ -868,13 +901,15 @@ class TestConsolidatedNotify:
     def test_substrate_check_routes_to_notify_gate(self, states):
         # The substrate check flows into two advisory states (evaluator
         # Report Card v2, then the Director) before the notify gate. ReportCard's
-        # SUCCESS Next feeds the Director; its Catch routes to
+        # SUCCESS Next feeds the Director; its Catch routes to ReportCardDegraded
+        # (config#6685: sets $.report_card_degraded so it threads into the
+        # terminal-notify selection) which then continues, unchanged, to
         # PublishReportCardDegraded (config#2302: a WARNING page — advisory grading
-        # failed silently for 9 days pre-fix) which then continues to
-        # CheckShellRunNotify. The Director's own Next lands on CheckShellRunNotify
-        # on success. config#6408 (Brian's 2026-08-04 operator ruling): Director's
-        # Catch now routes to NormalizeFailureContext — a Director failure
-        # terminates the execution FAILED.
+        # failed silently for 9 days pre-fix) and on to CheckShellRunNotify. The
+        # Director's own Next lands on CheckShellRunNotify on success. config#6408
+        # (Brian's 2026-08-04 operator ruling): Director's Catch now routes to
+        # NormalizeFailureContext — a Director failure terminates the execution
+        # FAILED.
         # The path to the notify gate is preserved when grading succeeds and
         # advisory succeeds. On the Friday preflight the states still RUN (dry,
         # see test_advisory_tail_runs_dry_on_preflight) — they are not skipped —
@@ -893,7 +928,8 @@ class TestConsolidatedNotify:
         assert substrate_success["Next"] == "ReportCard"
         report_card = states["ReportCard"]
         assert report_card["Next"] == "Director"
-        assert all(c["Next"] == "PublishReportCardDegraded" for c in report_card["Catch"])
+        assert all(c["Next"] == "ReportCardDegraded" for c in report_card["Catch"])
+        assert states["ReportCardDegraded"]["Next"] == "PublishReportCardDegraded"
         assert states["PublishReportCardDegraded"]["Next"] == "CheckShellRunNotify"
         director = states["Director"]
         assert director["Next"] == "CheckShellRunNotify"

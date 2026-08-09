@@ -642,13 +642,13 @@
     },
     "MorningEnrich": {
       "Type": "Task",
-      "Comment": "Friday polygon-T+1 daily_closes fill (weekly_collector.py --morning-enrich) on a dedicated spot EC2. Split out of DataPhase1 by the preflight-task-split (2026-05-16): morning-enrich (~28 min) and phase1 are independent preflight-bearing actions, so a phase1 failure must never re-run this completed ~28-min step. Mirrors the RAGIngestion split precedent \u2014 its own spot, watchdog budget, per-state health marker, and a proper UNION entry preflight (preflight.py mode 'morning_enrich': polygon + FRED secrets + reachability + S3 writeable + ArcticDB libraries present; deliberately NO ArcticDB-freshness check \u2014 morning-enrich is part of what makes it fresh). ~7 min extra bootstrap vs the prior bundled design \u2014 accepted in exchange for never re-paying the 28-min morning-enrich on a downstream redrive.",
+      "Comment": "Friday polygon-T+1 daily_closes fill (weekly_collector.py --morning-enrich) on a dedicated spot EC2. Split out of DataPhase1 by the preflight-task-split (2026-05-16): morning-enrich (~28 min) and phase1 are independent preflight-bearing actions, so a phase1 failure must never re-run this completed ~28-min step. Mirrors the RAGIngestion split precedent \u2014 its own spot, watchdog budget, per-state health marker, and a proper UNION entry preflight (preflight.py mode 'morning_enrich': polygon + FRED secrets + reachability + S3 writeable + ArcticDB libraries present; deliberately NO ArcticDB-freshness check \u2014 morning-enrich is part of what makes it fresh). ~7 min extra bootstrap vs the prior bundled design \u2014 accepted in exchange for never re-paying the 28-min morning-enrich on a downstream redrive. alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script \u2014 the monolith is retained unchanged as the rollback path.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug morning-enrich --log /var/log/morning-enrich.log -- bash infrastructure/spot_data_weekly.sh --morning-enrich-only{}',$$.Execution.Name,$.preflight_args))",
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug morning-enrich --log /var/log/morning-enrich.log -- bash infrastructure/spot_morning_enrich.sh{}',$$.Execution.Name,$.preflight_args))",
           "executionTimeout": [
             "5400"
           ]
@@ -812,13 +812,13 @@
     },
     "DataPhase1": {
       "Type": "Task",
-      "Comment": "Weekly Phase 1 data collection + universe-prune (weekly_collector.py --phase 1 then builders.prune_delisted_tickers) on a dedicated spot EC2. MorningEnrich was split into its own preceding SF state by the preflight-task-split (2026-05-16): a failure here no longer re-runs the completed ~28-min morning-enrich. RAG ingestion lives in the separate RAGIngestion state (split 2026-05-06). Entry preflight is preflight.py mode 'phase1' (a strict superset of morning_enrich's dependency set \u2014 phase1 additionally builds the universe).",
+      "Comment": "Weekly Phase 1 data collection + universe-prune (weekly_collector.py --phase 1 then builders.prune_delisted_tickers) on a dedicated spot EC2. MorningEnrich was split into its own preceding SF state by the preflight-task-split (2026-05-16): a failure here no longer re-runs the completed ~28-min morning-enrich. RAG ingestion lives in the separate RAGIngestion state (split 2026-05-06). Entry preflight is preflight.py mode 'phase1' (a strict superset of morning_enrich's dependency set \u2014 phase1 additionally builds the universe). alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script \u2014 the monolith is retained unchanged as the rollback path.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug data-weekly --log /var/log/data-weekly.log -- bash infrastructure/spot_data_weekly.sh --phase1-only{}',$$.Execution.Name,$.preflight_args))",
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug data-weekly --log /var/log/data-weekly.log -- bash infrastructure/spot_data_phase1.sh{}',$$.Execution.Name,$.preflight_args))",
           "executionTimeout": [
             "5400"
           ]
@@ -1222,13 +1222,13 @@
             },
             "RAGIngestion": {
               "Type": "Task",
-              "Comment": "Weekly RAG ingestion (SEC filings, 8-Ks, earnings, theses) on its own spot EC2. Same dispatcher (always-on micro) that ran DataPhase1; a fresh spot instance is launched here so this state has its own watchdog budget and per-state health marker. ~7 min extra bootstrap vs the prior bundled design \u2014 accepted in exchange for failure isolation. Origin of split: 2026-05-06 SF run where alpha-engine-lib v0.3.0 had bare `from rag.X` imports inside retrieval.py that fired during RRC dedup; failure was labeled DataPhase1 even though the data layer was healthy. config#2938 (2026-07-18): executionTimeout raised 3600s\u219221600s (6h; initially 14400s, widened same-day after live measurement showed the SEC-filings phase alone needs \u22651h before the news sweep starts). Step 5/9 of spot_data_weekly.sh --rag-only is the multi-source news sweep whose Polygon leg (5 req/min, account-wide) now covers the FULL ~944-ticker universe (~3.15h) \u2014 the prior 3600s cap SIGKILLed it twice (ExecutionTimedOut/137) after the universe grew ~9x. 6h is the config#2938 ruling-2 hard cap; it must move in LOCKSTEP with the inner run_ssm \"rag-only\" timeout + the rag-only MAX_RUNTIME_SECONDS watchdog in spot_data_weekly.sh and the WEEKLY_RAG_EXECUTION_TIMEOUT_SECONDS constant in collectors/news_sources/fetch_budget.py (guarded by tests/test_rag_ingestion_news_budget_wiring.py). Well under the 43200s global ceiling; runs in Branch A parallel to PredictorTraining.",
+              "Comment": "Weekly RAG ingestion (SEC filings, 8-Ks, earnings, theses) on its own spot EC2. Same dispatcher (always-on micro) that ran DataPhase1; a fresh spot instance is launched here so this state has its own watchdog budget and per-state health marker. ~7 min extra bootstrap vs the prior bundled design \u2014 accepted in exchange for failure isolation. Origin of split: 2026-05-06 SF run where alpha-engine-lib v0.3.0 had bare `from rag.X` imports inside retrieval.py that fired during RRC dedup; failure was labeled DataPhase1 even though the data layer was healthy. config#2938 (2026-07-18): executionTimeout raised 3600s\u219221600s (6h; initially 14400s, widened same-day after live measurement showed the SEC-filings phase alone needs \u22651h before the news sweep starts). The multi-source news sweep (pre-cutover: step 5/9 of spot_data_weekly.sh --rag-only; post I4442/I4497 cutover: spot_rag_ingestion.sh\u2019s run_ssm \"rag-ingestion\" call) whose Polygon leg (5 req/min, account-wide) now covers the FULL ~944-ticker universe (~3.15h) \u2014 the prior 3600s cap SIGKILLed it twice (ExecutionTimedOut/137) after the universe grew ~9x. 6h is the config#2938 ruling-2 hard cap; it must move in LOCKSTEP with the inner run_ssm \"rag-ingestion\" timeout + the MAX_RUNTIME_SECONDS watchdog in spot_rag_ingestion.sh and the WEEKLY_RAG_EXECUTION_TIMEOUT_SECONDS constant in collectors/news_sources/fetch_budget.py (guarded by tests/test_rag_ingestion_news_budget_wiring.py). Well under the 43200s global ceiling; runs in Branch A parallel to PredictorTraining. alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script \u2014 the monolith is retained unchanged as the rollback path.",
               "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
               "Parameters": {
                 "DocumentName": "AWS-RunShellScript",
                 "InstanceIds.$": "$.ec2_instance_id",
                 "Parameters": {
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug rag-ingestion --log /var/log/rag-ingestion.log -- bash infrastructure/spot_data_weekly.sh --rag-only{}',$$.Execution.Name,$.preflight_args))",
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug rag-ingestion --log /var/log/rag-ingestion.log -- bash infrastructure/spot_rag_ingestion.sh{}',$$.Execution.Name,$.preflight_args))",
                   "executionTimeout": [
                     "21600"
                   ]
@@ -2579,13 +2579,13 @@
             },
             "PredictorTraining": {
               "Type": "Task",
-              "Comment": "GBM retrain on spot instance (launched from always-on EC2)",
+              "Comment": "GBM retrain on spot instance (launched from always-on EC2). alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script — the monolith is retained unchanged as the rollback path.",
               "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
               "Parameters": {
                 "DocumentName": "AWS-RunShellScript",
                 "InstanceIds.$": "$.ec2_instance_id",
                 "Parameters": {
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference','export PREDICTOR_DEFER_TRAINING_EMAIL=1',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-training --log /var/log/predictor-training.log -- bash infrastructure/spot_train.sh --full-only{}',$$.Execution.Name,$.preflight_args))",
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference','export PREDICTOR_DEFER_TRAINING_EMAIL=1',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-training --log /var/log/predictor-training.log -- bash infrastructure/spot_predictor_training.sh{}',$$.Execution.Name,$.preflight_args))",
                   "executionTimeout": [
                     "5400"
                   ]
@@ -2903,13 +2903,13 @@
                 "States": {
                   "TrainSpecDispatch": {
                     "Type": "Task",
-                    "Comment": "Launch a dedicated spot for THIS spec via spot_train.sh --model-zoo-spec <id>. Dispatcher SSM on the box (the script launches the actual spot internally). Honors $.preflight_args for shell-run dry mode.",
+                    "Comment": "Launch a dedicated spot for THIS spec via spot_train_spec_dispatch.sh --spec-id <id> (pre-cutover: spot_train.sh --model-zoo-spec <id>). Dispatcher SSM on the box (the script launches the actual spot internally). Honors $.preflight_args for shell-run dry mode. alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script — the monolith is retained unchanged as the rollback path.",
                     "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
                     "Parameters": {
                       "DocumentName": "AWS-RunShellScript",
                       "InstanceIds.$": "$.ec2_instance_id",
                       "Parameters": {
-                        "commands.$": "States.Array('set -eo pipefail','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-model-zoo-spec --log /var/log/predictor-model-zoo-spec.log -- bash infrastructure/spot_train.sh --model-zoo-spec {}{}',$$.Execution.Name,$.spec_id,$.preflight_args))",
+                        "commands.$": "States.Array('set -eo pipefail','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-model-zoo-spec --log /var/log/predictor-model-zoo-spec.log -- bash infrastructure/spot_train_spec_dispatch.sh --spec-id {}{}',$$.Execution.Name,$.spec_id,$.preflight_args))",
                         "executionTimeout": [
                           "5400"
                         ]
@@ -3064,13 +3064,13 @@
             },
             "ModelZooSelect": {
               "Type": "Task",
-              "Comment": "config#1083 PARALLEL fan-out, step 3 (ONE spot, after the Map joins): select over whatever spec-* challengers registered for the date (failed Map iterations are simply absent - tolerated), write the leaderboard to BOTH the dated key AND latest.json, promote the winner if MODEL_ZOO_AUTO_PROMOTE_WINNER, and send the ONE consolidated digest. BEST-EFFORT: every failure path routes to PublishModelZooFailureImmediate then BranchBComplete (the champion already trained+promoted; the rotation must NEVER fail the Saturday SF). The base champion-arch retrain (PredictorTraining) ran first and competes in the same pool.",
+              "Comment": "config#1083 PARALLEL fan-out, step 3 (ONE spot, after the Map joins): select over whatever spec-* challengers registered for the date (failed Map iterations are simply absent - tolerated), write the leaderboard to BOTH the dated key AND latest.json, promote the winner if MODEL_ZOO_AUTO_PROMOTE_WINNER, and send the ONE consolidated digest. BEST-EFFORT: every failure path routes to PublishModelZooFailureImmediate then BranchBComplete (the champion already trained+promoted; the rotation must NEVER fail the Saturday SF). The base champion-arch retrain (PredictorTraining) ran first and competes in the same pool. alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script — the monolith is retained unchanged as the rollback path.",
               "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
               "Parameters": {
                 "DocumentName": "AWS-RunShellScript",
                 "InstanceIds.$": "$.ec2_instance_id",
                 "Parameters": {
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-model-zoo-select --log /var/log/predictor-model-zoo-select.log -- bash infrastructure/spot_train.sh --model-zoo-select{}',$$.Execution.Name,$.preflight_args))",
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-model-zoo-select --log /var/log/predictor-model-zoo-select.log -- bash infrastructure/spot_model_zoo_select.sh --select-only{}',$$.Execution.Name,$.preflight_args))",
                   "executionTimeout": [
                     "5400"
                   ]
@@ -3353,7 +3353,7 @@
     },
     "Backtester": {
       "Type": "Task",
-      "Comment": "Backtest SIMULATION-ONLY stage (10y simulate + param sweep) on spot instance, after predictor training. L4472 phase-split (2026-05-31, ROADMAP L4472): the monolithic Backtester state ran simulate+param_sweep+predictor-backtest+Phase4+optimizer/cov/gamma in ONE SSM command whose SUMMED runtime exceeded the SSM execution timeout on a fresh date (L4470). This state now runs ONLY the simulation pipeline via --mode=param-sweep; the predictor-backtest+Phase4 block runs in the new PredictorBacktest state and the optimizer/cov/gamma block in PortfolioOptimizerBacktest, each with its own SSM timeout + independent redrive. --no-pit-parity here so pit_parity runs exactly once (in PredictorBacktest, where it belongs). State name kept as Backtester (lower-churn \u2014 preserves the skip_backtester gate semantics; skip_backtester still skips the whole backtest-family by routing past CheckSkipParity to CheckSkipEvaluator). config#902 collapsed the standalone DriftDetection state that used to precede this one; entry flows now from CheckSkipBacktester directly. Mirrors the 2026-05-07/05-16 simulate/parity/evaluator split precedent (plans evaluator-split-260507.md + preflight-task-split-260516.md). All states key off the same backtest/{date}/ S3 prefix. If this state fails, PredictorBacktest is NOT entered (preserves the 4/24 anti-auto-promote-garbage rule).",
+      "Comment": "Backtest SIMULATION-ONLY stage (10y simulate + param sweep) on spot instance, after predictor training. L4472 phase-split (2026-05-31, ROADMAP L4472): the monolithic Backtester state ran simulate+param_sweep+predictor-backtest+Phase4+optimizer/cov/gamma in ONE SSM command whose SUMMED runtime exceeded the SSM execution timeout on a fresh date (L4470). This state now runs ONLY the simulation pipeline via --mode=param-sweep; the predictor-backtest+Phase4 block runs in the new PredictorBacktest state and the optimizer/cov/gamma block in PortfolioOptimizerBacktest, each with its own SSM timeout + independent redrive. --no-pit-parity here so pit_parity runs exactly once (in PredictorBacktest, where it belongs). State name kept as Backtester (lower-churn \u2014 preserves the skip_backtester gate semantics; skip_backtester still skips the whole backtest-family by routing past CheckSkipParity to CheckSkipEvaluator). config#902 collapsed the standalone DriftDetection state that used to precede this one; entry flows now from CheckSkipBacktester directly. Mirrors the 2026-05-07/05-16 simulate/parity/evaluator split precedent (plans evaluator-split-260507.md + preflight-task-split-260516.md). All states key off the same backtest/{date}/ S3 prefix. If this state fails, PredictorBacktest is NOT entered (preserves the 4/24 anti-auto-promote-garbage rule). alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script \u2014 the monolith is retained unchanged as the rollback path.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -3362,7 +3362,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug backtester --log /var/log/backtester.log -- bash infrastructure/spot_backtest.sh --mode=param-sweep --no-pit-parity --skip-stages=parity,evaluator{}',$$.Execution.Name,$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug backtester --log /var/log/backtester.log -- bash infrastructure/spot_backtester.sh{}',$$.Execution.Name,$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -3498,7 +3498,7 @@
     },
     "PredictorBacktest": {
       "Type": "Task",
-      "Comment": "Predictor-backtest + Phase 4a/b/c stage on a fresh spot SSM command, after the simulation-only Backtester state. L4472 phase-split (2026-05-31): runs spot_backtest.sh --mode=predictor-backtest, which executes the predictor_pipeline (GBM inference + 10y ArcticDB read + predictor param sweep) and Phase 4a/b/c \u2014 the block that, bundled with simulate + the optimizer sweeps in the old single Backtester state, summed past the SSM execution timeout on a fresh date (L4470). pit_parity runs HERE (default ON; Backtester + PortfolioOptimizerBacktest pass --no-pit-parity) so the observational walk-forward parity fires exactly once. Reads the backtest/{date}/ artifacts the Backtester state just wrote and writes its own predictor_sweep_df.parquet + predictor_stats.json to the same prefix. Per the L4472 executor-apply fix (backtester backtest.py::_run_predictor_pipeline gated on mode==all), this --mode=predictor-backtest run does NOT write the from_executor_optimizer.json recommendation artifact \u2014 the Backtester (param-sweep) state is its sole writer, so the assembler sees sim-based executor params (monolithic semantics preserved). If this state fails, PortfolioOptimizerBacktest is NOT entered (anti-auto-promote-garbage).",
+      "Comment": "Predictor-backtest + Phase 4a/b/c stage on a fresh spot SSM command, after the simulation-only Backtester state. L4472 phase-split (2026-05-31): ran spot_backtest.sh --mode=predictor-backtest pre-cutover, now runs its own spot_predictor_backtest.sh (I4442/I4497), which executes the predictor_pipeline (GBM inference + 10y ArcticDB read + predictor param sweep) and Phase 4a/b/c \u2014 the block that, bundled with simulate + the optimizer sweeps in the old single Backtester state, summed past the SSM execution timeout on a fresh date (L4470). pit_parity runs HERE (default ON; Backtester + PortfolioOptimizerBacktest pass --no-pit-parity) so the observational walk-forward parity fires exactly once. Reads the backtest/{date}/ artifacts the Backtester state just wrote and writes its own predictor_sweep_df.parquet + predictor_stats.json to the same prefix. Per the L4472 executor-apply fix (backtester backtest.py::_run_predictor_pipeline gated on mode==all), this --mode=predictor-backtest run does NOT write the from_executor_optimizer.json recommendation artifact \u2014 the Backtester (param-sweep) state is its sole writer, so the assembler sees sim-based executor params (monolithic semantics preserved). If this state fails, PortfolioOptimizerBacktest is NOT entered (anti-auto-promote-garbage). alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script \u2014 the monolith is retained unchanged as the rollback path.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -3507,7 +3507,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-backtest --log /var/log/predictor-backtest.log -- bash infrastructure/spot_backtest.sh --mode=predictor-backtest --no-pit-parity --skip-stages=parity,evaluator{}',$$.Execution.Name,$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-backtest --log /var/log/predictor-backtest.log -- bash infrastructure/spot_predictor_backtest.sh{}',$$.Execution.Name,$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -3643,7 +3643,7 @@
     },
     "PortfolioOptimizerBacktest": {
       "Type": "Task",
-      "Comment": "Portfolio-optimizer block (portfolio_optimizer_gate + cov_estimator_sweep + gamma_sweep) on a fresh spot SSM command, after PredictorBacktest. L4472 phase-split (2026-05-31): runs spot_backtest.sh --mode=portfolio-optimizer-backtest. Each of these three phases re-runs the predictor pipeline (GBM inference + 10y ArcticDB read) internally; bundled with simulate + predictor-backtest in the old single state their summed runtime blew the SSM execution timeout on a fresh date (L4470). --no-pit-parity (pit_parity already ran in PredictorBacktest). Reads/writes the same backtest/{date}/ prefix. On Success routes to CheckSkipParity so the downstream Parity -> Evaluator chain is unchanged. If this state fails, Parity is NOT entered (anti-auto-promote-garbage).",
+      "Comment": "Portfolio-optimizer block (portfolio_optimizer_gate + cov_estimator_sweep + gamma_sweep) on a fresh spot SSM command, after PredictorBacktest. L4472 phase-split (2026-05-31): ran spot_backtest.sh --mode=portfolio-optimizer-backtest pre-cutover, now runs its own spot_portfolio_optimizer_backtest.sh (I4442/I4497). Each of these three phases re-runs the predictor pipeline (GBM inference + 10y ArcticDB read) internally; bundled with simulate + predictor-backtest in the old single state their summed runtime blew the SSM execution timeout on a fresh date (L4470). --no-pit-parity (pit_parity already ran in PredictorBacktest). Reads/writes the same backtest/{date}/ prefix. On Success routes to CheckSkipParity so the downstream Parity -> Evaluator chain is unchanged. If this state fails, Parity is NOT entered (anti-auto-promote-garbage). alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script \u2014 the monolith is retained unchanged as the rollback path.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -3652,7 +3652,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug portfolio-optimizer --log /var/log/portfolio-optimizer.log -- bash infrastructure/spot_backtest.sh --mode=portfolio-optimizer-backtest --no-pit-parity --skip-stages=parity,evaluator{}',$$.Execution.Name,$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug portfolio-optimizer --log /var/log/portfolio-optimizer.log -- bash infrastructure/spot_portfolio_optimizer_backtest.sh{}',$$.Execution.Name,$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -3788,7 +3788,7 @@
     },
     "Parity": {
       "Type": "Task",
-      "Comment": "Backtester\u2194executor parity check on spot instance, after the backtest stage. Split out of the old combined Backtester state by the preflight-task-split (2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md): backtest (~121 min, 10y simulate + param sweep) and parity are independent preflight-bearing actions, so a parity failure must never re-run the 121-min backtest. spot_backtest.sh is invoked with --skip-stages=backtest,evaluator so this state runs ONLY the parity stage, reading the same backtest/{date}/ S3 prefix the Backtester state just wrote. ~7 min extra spot bootstrap vs the prior bundled design \u2014 accepted in exchange for never re-paying the 121-min backtest on a parity redrive. Timeout/heartbeat budget copied from the old combined Backtester state (not under-sized \u2014 same Retry/Catch/Timeout pattern). If this state fails, Evaluator is NOT entered (preserves the 4/24 anti-auto-promote-garbage rule).",
+      "Comment": "Backtester\u2194executor parity check on spot instance, after the backtest stage. Split out of the old combined Backtester state by the preflight-task-split (2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md): backtest (~121 min, 10y simulate + param sweep) and parity are independent preflight-bearing actions, so a parity failure must never re-run the 121-min backtest. Post I4442/I4497 cutover, this state invokes its own spot_parity.sh (pre-cutover: spot_backtest.sh --skip-stages=backtest,evaluator) so this state runs ONLY the parity stage, reading the same backtest/{date}/ S3 prefix the Backtester state just wrote. ~7 min extra spot bootstrap vs the prior bundled design \u2014 accepted in exchange for never re-paying the 121-min backtest on a parity redrive. Timeout/heartbeat budget copied from the old combined Backtester state (not under-sized \u2014 same Retry/Catch/Timeout pattern). DEGRADE-NOT-FAIL (alpha-engine-config-I6025, Brian ruling 2026-08-01): parity's VERDICT is the future gate (parity_alarms, in OBSERVE), but its EXECUTION is observability \u2014 every downstream consumer of parity artifacts is display or best-effort (evaluate.py::_load_pit_parity_report explicitly excludes them from critical-artifact accounting). So a Parity timeout/crash degrades the run (ParityDegraded \u2192 PublishParityDegraded pages distinctly, SF continues to Evaluator) instead of failing the SF \u2014 the 2026-08-01 failure where a non-gating stage's 2h timeout killed a run that had already cleared Backtester/PredictorBacktest/PortfolioOptimizerBacktest. Absence of a verdict must never read as a clean pass: the page + the completion record carry $.parity_degraded, and ARTIFACT_REGISTRY freshness-monitor SLA still alarms on missing parity artifacts. Per-stage executionTimeout derived via infrastructure/sf_budgets.py (config#3095). alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script \u2014 the monolith is retained unchanged as the rollback path.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -3797,7 +3797,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug parity --log /var/log/parity.log -- bash infrastructure/spot_backtest.sh --pit-parity-enabled=1 --skip-stages=backtest,evaluator{}',$$.Execution.Name,$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug parity --log /var/log/parity.log -- bash infrastructure/spot_parity.sh{}',$$.Execution.Name,$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -3832,8 +3832,8 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "NormalizeFailureContext",
-          "ResultPath": "$.error"
+          "Next": "ParityDegraded",
+          "ResultPath": "$.parity_error"
         }
       ],
       "ResultPath": "$.parity_result",
@@ -3841,7 +3841,7 @@
     },
     "WaitForParity": {
       "Type": "Task",
-      "Comment": "Poll SSM command until parity complete",
+      "Comment": "Poll SSM command until parity complete. Poll/send infra failure degrades (ParityDegraded) rather than failing the SF — same degrade-not-fail posture as the Parity state itself (alpha-engine-config-I6025).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
       "Parameters": {
         "CommandId.$": "$.parity_result.Command.CommandId",
@@ -3872,8 +3872,8 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "NormalizeFailureContext",
-          "ResultPath": "$.error"
+          "Next": "ParityDegraded",
+          "ResultPath": "$.parity_error"
         }
       ],
       "ResultSelector": {
@@ -3887,6 +3887,7 @@
     },
     "CheckParityStatus": {
       "Type": "Choice",
+      "Comment": "Terminal non-Success (TimedOut / Failed / Cancelled) degrades the run via ParityDegraded instead of failing the SF (alpha-engine-config-I6025): parity's verdict is observational today (the parity_alarms gate sits in OBSERVE), and no downstream SF stage consumes its artifacts (evaluate.py::_load_pit_parity_report is best-effort) — so a timeout that kills the stage must not also kill Evaluator/ReportCard/Director. The degradation pages distinctly and lands on the execution record as $.parity_degraded (with specifics at $.parity_poll / $.parity_error).",
       "Choices": [
         {
           "Variable": "$.parity_poll.Status",
@@ -3904,7 +3905,7 @@
           "Next": "ParityWait"
         }
       ],
-      "Default": "ExtractParityError"
+      "Default": "ParityDegraded"
     },
     "ParityWait": {
       "Type": "Wait",
@@ -3933,7 +3934,7 @@
     },
     "Evaluator": {
       "Type": "Task",
-      "Comment": "Evaluator on a separate spot instance (split from Backtester 2026-05-07 \u2014 plan: alpha-engine-docs/private/evaluator-split-260507.md). Reads s3://alpha-engine-research/backtest/{RUN_DATE}/ artifacts produced by the prior Backtester state and runs evaluate.py --mode all --upload, which sends the per-signal grading email and auto-applies optimizer configs. Reuses spot_backtest.sh with --no-pit-parity --skip-stages=backtest,parity; the script is the canonical dispatch surface (existing CSV vocabulary). --no-pit-parity added 2026-07-20 (matching the Backtester/PredictorBacktest/PortfolioOptimizerBacktest convention; Parity is pit_parity's designed owner via --pit-parity-enabled=1): it was the one stage NO SF state's skip-stages excluded, so it free-rode in every state and re-ran inside the Evaluator's budget whenever phase markers did not dedupe it \u2014 the config#2871 pit-parity sweep pass (no marker skip) ran a 2h predictor-sim walkforward inside the Evaluator and blew its ceiling twice (watch-rerun-2026-07-18-10/-11). pit_parity is produced by the earlier backtest-family states; the Evaluator only consumes backtest/{RUN_DATE}/pit_parity.json. Full single-producer decomposition: alpha-engine-config-I3112. Live-apply mode by default; for diagnostic-only off-cycle runs, invoke spot_backtest.sh manually with --freeze-evaluator and --skip-stages=backtest,parity.",
+      "Comment": "Evaluator on a separate spot instance (split from Backtester 2026-05-07 \u2014 plan: alpha-engine-docs/private/evaluator-split-260507.md). Reads s3://alpha-engine-research/backtest/{RUN_DATE}/ artifacts produced by the prior Backtester state and runs evaluate.py --mode all --upload, which sends the per-signal grading email and auto-applies optimizer configs. Post I4442/I4497 cutover, invokes its own spot_evaluator.sh (pre-cutover: reused spot_backtest.sh with --no-pit-parity --skip-stages=backtest,parity); the script is the canonical dispatch surface (existing CSV vocabulary). --no-pit-parity added 2026-07-20 (matching the Backtester/PredictorBacktest/PortfolioOptimizerBacktest convention; Parity is pit_parity's designed owner via --pit-parity-enabled=1): it was the one stage NO SF state's skip-stages excluded, so it free-rode in every state and re-ran inside the Evaluator's budget whenever phase markers did not dedupe it \u2014 the config#2871 pit-parity sweep pass (no marker skip) ran a 2h predictor-sim walkforward inside the Evaluator and blew its ceiling twice (watch-rerun-2026-07-18-10/-11). pit_parity is produced by the earlier backtest-family states; the Evaluator only consumes backtest/{RUN_DATE}/pit_parity.json. Full single-producer decomposition: alpha-engine-config-I3112. Live-apply mode by default; for diagnostic-only off-cycle runs, invoke spot_backtest.sh manually with --freeze-evaluator and --skip-stages=backtest,parity. alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script \u2014 the monolith is retained unchanged as the rollback path.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -3942,7 +3943,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug evaluator --log /var/log/evaluator.log -- bash infrastructure/spot_backtest.sh --no-pit-parity --skip-stages=backtest,parity{}',$$.Execution.Name,$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug evaluator --log /var/log/evaluator.log -- bash infrastructure/spot_evaluator.sh{}',$$.Execution.Name,$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -4344,13 +4345,20 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Advisory grading is non-fatal \u2014 continue to the terminal notify regardless. config#2302: the run must still PAGE on entry (silent for 9 days pre-fix), so route through PublishReportCardDegraded before the terminal notify rather than swallowing the error.",
-          "Next": "PublishReportCardDegraded",
+          "Comment": "Advisory grading is non-fatal \u2014 continue to the terminal notify regardless. config#2302: the run must still PAGE on entry (silent for 9 days pre-fix), so route through ReportCardDegraded (sets the SF-controlled visible flag) then PublishReportCardDegraded before the terminal notify rather than swallowing the error. config#6685: pre-fix this Catch skipped straight to the alert Task with NO flag set, so a clean gate/health run still terminated at plain NotifyComplete (\"All steps completed successfully\") \u2014 weekly-sf-policy.md \u00a72.3 violation; the standalone alert is not the terminal notification.",
+          "Next": "ReportCardDegraded",
           "ResultPath": "$.report_card_error"
         }
       ],
       "ResultPath": "$.report_card_result",
       "Next": "Director"
+    },
+    "ReportCardDegraded": {
+      "Type": "Pass",
+      "Comment": "config#6685: ReportCard's Catch(States.ALL) could not run advisory grading \u2014 set report_card_degraded=true (SF-controlled boolean, IsPresent-guarded per config#2275) so it threads into the completion-email selection (CheckGateDegradedNotify) same as $.gate_degraded / $.health_check_degraded. Mirrors LibPinGateDegraded / SaturdayHealthCheckDegraded shape exactly. Proceeds to PublishReportCardDegraded (the immediate PAGE alert, config#2302) unchanged.",
+      "Result": true,
+      "ResultPath": "$.report_card_degraded",
+      "Next": "PublishReportCardDegraded"
     },
     "PublishReportCardDegraded": {
       "Type": "Task",
@@ -4432,8 +4440,113 @@
     },
     "CheckGateDegradedNotify": {
       "Type": "Choice",
-      "Comment": "config#2278 + config#2276: a green run that could not run its pre-spend gates (gate_degraded \u2014 set ONLY by the LibPinGateDegraded / PipelineContractGateDegraded Pass states) and/or its tail health checks (health_check_degraded \u2014 set ONLY by the SaturdayHealthCheckDegraded / SubstrateHealthCheckDegraded Pass states) must SAY SO in the completion email. Both are SF-controlled booleans, IsPresent-guarded per config#2275. Rules are ordered most-specific-first (both \u2192 gates-only \u2192 health-only); each routes to a SEPARATE hardcoded-constant notifier rather than States.Format-ing flags into NotifyComplete \u2014 preserving config#1819's Subject/Message-are-constants invariant. Composition note (config#2276): the two health checks share ONE flag (which check degraded lives on the execution record), so the enumeration is bounded at 3 degraded notifiers for the 2 flag families; a THIRD flag family should trigger a refactor to a data-driven degraded notifier, not a 7-way enumeration. Name retained from config#2278 (it is the wave-1 chain anchor referenced across tests/comments) \u2014 read it as the degraded-completion selector.",
+      "Comment": "config#2278 + config#2276 + config#6685 + alpha-engine-config-I6025: a green run that could not run its pre-spend gates (gate_degraded \u2014 set ONLY by the LibPinGateDegraded / PipelineContractGateDegraded Pass states), and/or its tail health checks (health_check_degraded \u2014 set ONLY by the SaturdayHealthCheckDegraded / SubstrateHealthCheckDegraded Pass states), and/or ReportCard's advisory grading (report_card_degraded \u2014 set ONLY by ReportCardDegraded, config#6685), and/or the Parity verdict (parity_degraded \u2014 set ONLY by ParityDegraded, alpha-engine-config-I6025/I6044: absence of a parity verdict must never render as a clean pass) must SAY SO in the completion email (weekly-sf-policy.md \u00a72.3 / \u00a72.3a). All four are SF-controlled booleans, IsPresent-guarded per config#2275. Rules are ordered most-specific-first: parity_degraded combined with ANY other family routes to the single generic NotifyCompleteMultipleDegraded first (mirrors the report_card_degraded fold below \u2014 the config#2276 comment's predicted 'third flag family' generalizes to a fourth the same way: fold into the existing generic combined notifier rather than enumerating more per-combination hardcoded Task states); then report_card_degraded combined with EITHER remaining family also routes to NotifyCompleteMultipleDegraded (config#6685); the pre-existing gates+health / gates-only / health-only rules are UNCHANGED (each still implies report_card_degraded and parity_degraded are both absent, since any report_card_degraded-true or parity_degraded-true path is intercepted by the rules ahead of them); report_card_degraded alone gets its own single-flag notifier (NotifyCompleteReportCardDegraded) mirroring NotifyCompleteGatesDegraded/NotifyCompleteHealthDegraded exactly, and parity_degraded alone (all three other flags absent) gets NotifyCompleteParityDegraded (alpha-engine-config-I6025), same shape. Each still routes to a SEPARATE hardcoded-constant notifier rather than States.Format-ing flags into NotifyComplete \u2014 preserving config#1819's Subject/Message-are-constants invariant. Name retained from config#2278 (it is the wave-1 chain anchor referenced across tests/comments) \u2014 read it as the degraded-completion selector.",
       "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.parity_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.parity_degraded",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.report_card_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.report_card_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyCompleteMultipleDegraded"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.parity_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.parity_degraded",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.gate_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.gate_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyCompleteMultipleDegraded"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.parity_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.parity_degraded",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.health_check_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.health_check_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyCompleteMultipleDegraded"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.report_card_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.report_card_degraded",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.gate_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.gate_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyCompleteMultipleDegraded"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.report_card_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.report_card_degraded",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.health_check_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.health_check_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyCompleteMultipleDegraded"
+        },
         {
           "And": [
             {
@@ -4480,6 +4593,32 @@
             }
           ],
           "Next": "NotifyCompleteHealthDegraded"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.report_card_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.report_card_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyCompleteReportCardDegraded"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.parity_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.parity_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyCompleteParityDegraded"
         }
       ],
       "Default": "NotifyComplete"
@@ -4550,9 +4689,75 @@
       ],
       "Next": "WriteCompletionMarker"
     },
+    "NotifyCompleteReportCardDegraded": {
+      "Type": "Task",
+      "Comment": "config#6685: SUCCESS notifier for a run whose ReportCard advisory grading was DEGRADED (Lambda failure — PublishReportCardDegraded already paged on entry; this is the terminal completion notice) and neither pre-spend gates nor tail health checks were. Mirrors NotifyCompleteGatesDegraded/NotifyCompleteHealthDegraded exactly — constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Saturday Pipeline — SUCCESS (report card DEGRADED)",
+        "Message": "All steps completed successfully — BUT ReportCard (the Evaluator Report Card v2 Lambda, advisory grading) failed and did not run; a report-card-degraded alert fired earlier in this run. See $.report_card_error on the execution record for detail. The weekly run's real trading artifacts are unaffected; only the advisory grading layer (report_card.json, and downstream Director) did not run. View pipeline status: https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.notify_result",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#1819 — best-effort: a SUCCESS-path notifier must never fail an otherwise-succeeded pipeline.",
+          "ResultPath": "$.notify_error",
+          "Next": "NotifyCompleteDegraded"
+        }
+      ],
+      "Next": "WriteCompletionMarker"
+    },
+    "NotifyCompleteMultipleDegraded": {
+      "Type": "Task",
+      "Comment": "config#6685 + alpha-engine-config-I6025: SUCCESS notifier for a run where TWO OR MORE of the four degraded-flag families fired together (pre-spend gates, tail health checks, report card advisory grading, parity verdict). Folded (config#2276's own comment predicted a third flag family would need a data-driven notifier rather than a 7-way enumeration, and the same reasoning generalizes to the fourth): a single generic combined-degradation notifier for every 2+-family combination, instead of enumerating every additional per-combination Task state. Deliberately does NOT assert which SPECIFIC families degraded in the constant Subject/Message (config#1819 forbids States.Format-ing the exact set into the text) — names all four categories generically and points at the execution record ($.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded) for the exact combination, which stays truthful regardless of which subset actually fired. Mirrors NotifyCompleteGatesDegraded's shape — constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Saturday Pipeline — SUCCESS (multiple stages DEGRADED)",
+        "Message": "All steps completed successfully — BUT two or more of the following degraded on this run: the pre-spend gates (LibPinDriftCheck/PipelineContractCheck), the tail health checks (SaturdayHealthCheck/WeeklySubstrateHealthCheck), the report card advisory grading (ReportCard Lambda), and/or the Parity verdict (pit_parity/replay — absence of a verdict must NOT be read as a clean pass). Exact combination is on the execution record: $.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded, with detail at $.report_card_error and (if set) $.health_check_error / $.substrate_check_error / $.parity_error. View pipeline status: https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.notify_result",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#1819 — best-effort: a SUCCESS-path notifier must never fail an otherwise-succeeded pipeline.",
+          "ResultPath": "$.notify_error",
+          "Next": "NotifyCompleteDegraded"
+        }
+      ],
+      "Next": "WriteCompletionMarker"
+    },
+    "NotifyCompleteParityDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I6025/I6044: SUCCESS notifier for a run whose Parity stage was DEGRADED (SSM timeout/crash, or send/poll infra failure — PublishParityDegraded already paged on entry; this is the terminal completion notice) and none of the pre-spend gates, tail health checks, or ReportCard's advisory grading were. Absence of a parity verdict must never render identically to a clean pass (weekly-sf-policy.md §2.3a) — this notifier is that guarantee's terminal-email expression. Mirrors NotifyCompleteReportCardDegraded/NotifyCompleteGatesDegraded/NotifyCompleteHealthDegraded exactly — constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Saturday Pipeline — SUCCESS (parity DEGRADED)",
+        "Message": "All steps completed successfully — BUT the Parity stage (pit_parity look-ahead/walk-forward contamination check + backtester↔executor replay) did not complete; a parity-degraded alert fired earlier in this run. This run produced NO parity verdict — absence of a verdict must NOT be read as a clean pass. See $.parity_poll / $.parity_error on the execution record for detail. The weekly run's real trading artifacts are unaffected; only the parity verdict is missing. View pipeline status: https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.notify_result",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#1819 — best-effort: a SUCCESS-path notifier must never fail an otherwise-succeeded pipeline.",
+          "ResultPath": "$.notify_error",
+          "Next": "NotifyCompleteDegraded"
+        }
+      ],
+      "Next": "WriteCompletionMarker"
+    },
     "WriteCompletionMarker": {
       "Type": "Task",
-      "Comment": "config#2857: SF-envelope completion marker — an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine: a hung/failed SF must not be indistinguishable from a healthy one just because a prior run already wrote today's downstream artifacts). Converges the 5 real-completion notify paths (NotifyComplete, its degraded-catch fallback, and the 3 gate/health-degraded variants) — deliberately EXCLUDES NotifyShellRunComplete/NotifyShellRunCompleteDegraded (the Friday-PM preflight dry-pass is not a real weekly completion; marking it would let a dry run silently satisfy the SLA). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_weekly_freshness_pipeline (cadence saturday_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable — exactly the ambiguity this feature exists to surface, not mask.",
+      "Comment": "config#2857: SF-envelope completion marker — an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine: a hung/failed SF must not be indistinguishable from a healthy one just because a prior run already wrote today's downstream artifacts). Converges the 8 real-completion notify paths (NotifyComplete, its degraded-catch fallback, the 3 gate/health-degraded variants, the 2 report-card-degraded variants added config#6685, and NotifyCompleteParityDegraded added alpha-engine-config-I6025) — deliberately EXCLUDES NotifyShellRunComplete/NotifyShellRunCompleteDegraded (the Friday-PM preflight dry-pass is not a real weekly completion; marking it would let a dry run silently satisfy the SLA). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_weekly_freshness_pipeline (cadence saturday_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable — exactly the ambiguity this feature exists to surface, not mask.",
       "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
       "Parameters": {
         "Bucket": "alpha-engine-research",
@@ -4672,16 +4877,34 @@
       "ResultPath": "$.error",
       "Next": "NormalizeFailureContext"
     },
-    "ExtractParityError": {
+    "ParityDegraded": {
       "Type": "Pass",
-      "Comment": "Normalize Parity SSM non-Success poll into $.error. Mirrors ExtractBacktesterError \u2014 the soft-failure path from CheckParityStatus.Default does not populate $.error, only Task Catch blocks do.",
+      "Comment": "THE VISIBLE PARITY DEGRADED FLAG (alpha-engine-config-I6025). Every Parity non-success path converges here \u2014 SSM command timeout/crash (CheckParityStatus.Default), send/poll infra failure (the Parity + WaitForParity Task Catches). Mirrors the SaturdayHealthCheckDegraded / ThinkTankDegraded / LibPinGateDegraded shape (config#2276/config#2278/I5758): an SF-controlled flag that (a) pages distinctly via PublishParityDegraded and (b) lands on the execution record ($.parity_degraded=true, specifics at $.parity_poll / $.parity_error / $.parity_result) so a pipeline-status reader can tell 'parity measured clean' from 'parity not measured' \u2014 absence-of-verdict must never render identically to a clean pass. weekly-sf-policy \u00a72.3 honest-degradation: the run continues to Evaluator/ReportCard/Director (none consume parity artifacts \u2014 verified dependency audit in alpha-engine-config-I6025), and the ARTIFACT_REGISTRY freshness-monitor SLA still alarms on the missing pit_parity.json/parity_report.json.",
+      "Result": true,
+      "ResultPath": "$.parity_degraded",
+      "Next": "PublishParityDegraded"
+    },
+    "PublishParityDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I6025: page the parity degradation NOW, distinctly from a breach. Mirrors PublishDirectorDegraded / PublishLibPinGateDegraded exactly (config#1819 discipline: hardcoded Subject/Message constants, never States.Format against unbounded input; best-effort Catch so a publish failure can never block the non-fatal degrade path this alert decorates). WARNING-severity signal: the weekly run's real trading artifacts are unaffected \u2014 only the parity VERDICT is absent, and it must not be read as clean.",
+      "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
-        "phase": "Parity",
-        "source": "CheckParityStatus.Default",
-        "poll.$": "$.parity_poll"
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline \u2014 Parity DEGRADED (continuing to Evaluator)",
+        "Message": "The Parity stage (pit_parity look-ahead/walk-forward contamination check + backtester\u2194executor replay) did not complete \u2014 SSM timeout, crash, or dispatch/poll failure. NON-FATAL: the weekly run continues to Evaluator/ReportCard/Director, but this run produced NO parity verdict; absence of a verdict must NOT be read as a clean pass. Artifacts backtest/{run_date}/pit_parity.json + parity_report.json + parity_metrics.csv may be absent (the ARTIFACT_REGISTRY freshness-monitor SLA will also flag them). Specifics on the execution record: $.parity_poll / $.parity_error. View pipeline status: https://console.nousergon.ai/pipeline-status"
       },
-      "ResultPath": "$.error",
-      "Next": "NormalizeFailureContext"
+      "ResultPath": "$.parity_degraded_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert \u2014 a publish failure must not block the non-fatal degrade path this alert decorates.",
+          "ResultPath": "$.parity_degraded_notify_error",
+          "Next": "CheckSkipEvaluator"
+        }
+      ],
+      "Next": "CheckSkipEvaluator"
     },
     "ExtractPredictorBacktestError": {
       "Type": "Pass",

@@ -129,10 +129,13 @@ class Stage:
     gate: str                      # the CheckSkip* Choice state
     work: str                      # the stage's first work state
     witness: frozenset             # entered => completed-or-skipped
-    degraded_witness: frozenset = frozenset()   # a *Degraded / Publish*Degraded
-                                    # state entered => the stage RAN BUT FAILED
-                                    # and was absorbed fail-open — it must
-                                    # RE-RUN, overriding witness (I6055)
+    degraded_witness: frozenset = frozenset()
+    # A *Degraded / Publish*Degraded state entered iff the stage RAN BUT
+    # FAILED and was absorbed fail-open (weekly-sf-policy §2.3) so the
+    # pipeline could continue — entering one OVERRIDES witness: the stage
+    # must RE-RUN on a rerun, never be skipped as complete
+    # (alpha-engine-config-I6055 — the 2026-08-01 Director hard-fail that
+    # the next rerun skipped; extended to Parity by alpha-engine-config-I6025).
     emit_skip: bool = True         # False => never emit the flag (see notes)
     detect_failure: bool = True    # False => another Stage row already owns
                                     # this `work` state's failure detection
@@ -339,6 +342,12 @@ STAGES: tuple[Stage, ...] = (
         "parity", "skip_parity",
         "CheckSkipParity", "Parity",
         frozenset({"CheckSkipEvaluator"}),
+        # alpha-engine-config-I6025: Parity now degrades-not-fails — a
+        # timeout/crash routes through ParityDegraded → PublishParityDegraded
+        # and the SF continues. A degraded parity must RE-RUN on a rerun
+        # (it is the exact thing a mechanical rerun exists to retry), never
+        # be skipped as completed.
+        degraded_witness=frozenset({"ParityDegraded", "PublishParityDegraded"}),
     ),
     Stage(
         "evaluator", "skip_evaluator",
@@ -355,9 +364,15 @@ STAGES: tuple[Stage, ...] = (
         # NormalizeFailureContext → FailExecution). PublishDirectorDegraded
         # is RETAINED for backward compatibility with pre-fix execution
         # histories that still reference it — new executions never enter it.
+        # config#6685: ReportCardDegraded is the new Pass state ReportCard's
+        # Catch routes to FIRST (sets $.report_card_degraded before
+        # proceeding, unchanged, to PublishReportCardDegraded) — added
+        # alongside it so a rerun does not treat a ReportCard-degraded
+        # execution as complete.
         degraded_witness=frozenset({
             "SaturdayHealthCheckDegraded", "SubstrateHealthCheckDegraded",
-            "PublishReportCardDegraded", "PublishDirectorDegraded",
+            "ReportCardDegraded", "PublishReportCardDegraded",
+            "PublishDirectorDegraded",
         }),
         note=(
             "skip_post_eval covers the whole health-check/report-card/"

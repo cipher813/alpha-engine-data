@@ -75,9 +75,11 @@ _CHAIN = [
     ("CheckSkipScanner", "Scanner", "skip_scanner", "CheckSkipPredictorInference"),
     ("CheckSkipPredictorInference", "PredictorInference", "skip_predictor_inference", "CheckSkipMorningPlanner"),
     ("CheckSkipMorningPlanner", "RunMorningPlanner", "skip_morning_planner", "CheckSkipRunDaemon"),
-    # config#2857: the skip edge now routes through the SF-envelope
-    # completion marker (still a genuine pipeline SUCCESS) before PipelineComplete.
-    ("CheckSkipRunDaemon", "RunDaemon", "skip_run_daemon", "WriteCompletionMarker"),
+    # config#2857 + alpha-engine-config#6692: the skip edge now routes through
+    # CheckDegradedOutcome (Option-A degraded-terminal parity with the EOD SF)
+    # on its way to the SF-envelope completion marker (still a genuine
+    # pipeline SUCCESS on the Default/non-degraded branch) before PipelineComplete.
+    ("CheckSkipRunDaemon", "RunDaemon", "skip_run_daemon", "CheckDegradedOutcome"),
 ]
 
 
@@ -228,8 +230,13 @@ class TestEntryEdgesRouteThroughGates:
         # daily-news chain now produces the artifact, so the weekday SF ends at
         # the daemon restart instead of routing into a news chain.
         # config#2857: now routes through the SF-envelope completion marker
-        # before PipelineComplete.
-        assert states["RunDaemon"]["Next"] == "WriteCompletionMarker"
+        # before PipelineComplete. alpha-engine-config#6692: an extra
+        # CheckDegradedOutcome hop now sits in between (Option-A parity) so a
+        # data-spot fail-open degraded flag, or the daemon's own restart-
+        # failure Catch, still routes the terminal to WriteCompletionMarkerDegraded
+        # -> DegradedRun instead of a plain SUCCEEDED execution.
+        assert states["RunDaemon"]["Next"] == "CheckDegradedOutcome"
+        assert states["CheckDegradedOutcome"]["Default"] == "WriteCompletionMarker"
         assert states["WriteCompletionMarker"]["Next"] == "PipelineComplete"
 
 
@@ -283,7 +290,11 @@ class TestPaths:
             assert task not in order, f"{task} ran despite its skip flag"
         # config#2857: the skip edge still passes through the SF-envelope
         # completion marker on its way to PipelineComplete.
-        assert order == ["WriteCompletionMarker", "PipelineComplete"]
+        # alpha-engine-config#6692: now via CheckDegradedOutcome first (Option-A
+        # parity) — the walker's generic Choice handling falls through to its
+        # Default (WriteCompletionMarker) since no degraded flag is set on
+        # this all-flags-skipped path.
+        assert order == ["CheckDegradedOutcome", "WriteCompletionMarker", "PipelineComplete"]
 
     def test_skip_data_phase_resumes_at_scanner_then_predictor(self, states):
         """config#1767: skip_morning_enrich skips the ENTIRE spot data phase

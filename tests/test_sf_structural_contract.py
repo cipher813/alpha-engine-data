@@ -8,10 +8,11 @@ stage lands complete") name two clause rows that were, until this module,
   * WSF-4-every-stage-declares-a-timeout
   * WSF-6-new-stage-lands-complete
 
-This module is the enforcing artifact for both, plus a third structural
-guard not named by a clause row but required by the same policy intent (a
-stage that silently points at a deleted/renamed script is exactly the kind
-of "lands complete" gap WSF-6 exists to catch):
+This module is the enforcing artifact for both, plus two structural guards
+not named by a clause row but required by the same policy intent (a stage
+that silently points at a deleted/renamed script, or a definition with no
+whole-execution backstop, are exactly the kind of "lands complete" /
+"declares a timeout" gaps WSF-6 / WSF-4 exist to catch):
 
   1. every ``Task`` state declares ``TimeoutSeconds``, unless the state name
      is in that file's ``_TIMEOUT_EXEMPT`` dict — each entry a one-line
@@ -21,7 +22,12 @@ of "lands complete" gap WSF-6 exists to catch):
      told to run via SSM ``AWS-RunShellScript`` resolves to a file that
      actually exists in the tree (regression guard for the I4442 / I4975
      per-stage ``spot_data_weekly.sh`` splits — a state pointing at a
-     deleted or renamed script fails here, not on Saturday).
+     deleted or renamed script fails here, not on Saturday);
+  4. every definition itself (not a Task state — the top level of the SF
+     document) declares a whole-execution ``TimeoutSeconds``
+     (alpha-engine-config#6693) — a hung execution otherwise runs to the
+     Step Functions 1-year service maximum, invisible to any status-keyed
+     watcher.
 
 New Task states are non-exempt by DEFAULT — the exemption dicts are an
 enumerated allowlist populated from the definitions as measured on
@@ -30,11 +36,21 @@ fix, PR #1233), not a wildcard. A state added later with no timeout/Catch
 fails this suite until it is either fixed or explicitly, individually
 exempted with its own justification.
 
-Per config#6684's constraint: this PR does NOT add timeouts/Catch to any
-state. Every currently-missing declaration is enumerated as an exemption
-below, sourced from that state's own ``Comment`` field where one exists.
-Tightening any individual exemption is separate, reviewable follow-up work
+Per config#6684's original constraint this PR (#1253) did NOT add
+timeouts/Catch to any state, and every then-missing declaration was
+enumerated as an exemption below. alpha-engine-config#6693 (nousergon-data
+PR #1256) subsequently gave every remaining ``_TIMEOUT_EXEMPT`` entry under
+``step_function_daily.json`` and ``step_function_eod.json`` a real 60s
+``TimeoutSeconds`` — both shrink to ``{}`` rather than the entries going
+stale (``_CATCH_EXEMPT`` is untouched: #1256 adds timeouts, not Catches).
+Tightening any individual ``_CATCH_EXEMPT`` entry, or ``step_function.json``'s
+remaining ``_TIMEOUT_EXEMPT`` entries, is separate, reviewable follow-up work
 (alpha-engine-config#6684 remains open as the tracker for that).
+PR #1256 also folded in what was briefly a parallel checker
+(``tests/test_sf_timeout_coverage.py``) covering top-level ``TimeoutSeconds``
+presence — see ``test_definition_declares_top_level_timeout`` below rather
+than maintaining two modules asserting overlapping things over the same
+files.
 
 Cross-repo scope note (deliverable 3): states whose SSM command list ``cd``s
 into a sibling repo's EC2 checkout (``alpha-engine`` == crucible-executor,
@@ -75,9 +91,13 @@ _TIMEOUT_EXEMPT: dict[str, dict[str, str]] = {
         "ResearchPredictorParallel.PublishPredictorFailureImmediate": "sns:publish immediate-failure notifier — SDK call, not a wait",
         "ResearchPredictorParallel.PublishModelZooFailureImmediate": "sns:publish immediate-failure notifier — SDK call, not a wait",
         "PublishReportCardDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait",
+        "PublishParityDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait (alpha-engine-config-I6025)",
         "NotifyCompleteGatesDegraded": "sns:publish completion notifier — SDK call, not a wait",
         "NotifyCompleteHealthDegraded": "sns:publish completion notifier — SDK call, not a wait",
         "NotifyCompleteGatesAndHealthDegraded": "sns:publish completion notifier — SDK call, not a wait",
+        "NotifyCompleteReportCardDegraded": "sns:publish completion notifier — SDK call, not a wait (config#6685)",
+        "NotifyCompleteMultipleDegraded": "sns:publish completion notifier — SDK call, not a wait (config#6685)",
+        "NotifyCompleteParityDegraded": "sns:publish completion notifier — SDK call, not a wait (alpha-engine-config-I6025)",
         "NotifyShellRunComplete": "sns:publish completion notifier — SDK call, not a wait",
         "NotifyComplete": "sns:publish completion notifier — SDK call, not a wait",
         "HandleFailure": "sns:publish failure notifier — SDK call, not a wait",
@@ -112,41 +132,12 @@ _TIMEOUT_EXEMPT: dict[str, dict[str, str]] = {
         "ResearchPredictorParallel.ValidatePredictorSkipWeightsFresh": "s3:headObject freshness check — SDK call, not a wait",
         "WriteCompletionMarker": "s3:putObject completion marker — SDK call, not a wait (config#2857)",
     },
-    "step_function_daily.json": {
-        "AcquireMutex": "dynamodb:putItem mutex acquire — SDK call, not a wait",
-        "TradingDayGate": "lambda:invoke synchronous gate call — SDK call, not a wait",
-        "TradingDayGateFailed": "sns:publish fail-open notifier — SDK call, not a wait",
-        "NotifyHolidaySkip": "sns:publish terminal skip notifier — SDK call, not a wait",
-        "StartExecutorEC2": "ec2:startInstances — SDK call, not a wait",
-        "WriteCompletionMarker": "s3:putObject completion marker — SDK call, not a wait (config#2857)",
-        "HandleFailure": "sns:publish failure notifier — SDK call, not a wait",
-        "PollMorningEnrichSpot": "ssm:getCommandInvocation single poll — bounded by the spot dispatch Lambda's own budget",
-        "PollMorningArcticAppendSpot": "ssm:getCommandInvocation single poll — bounded by the spot dispatch Lambda's own budget",
-        "PublishDataSpotFailureImmediate": "sns:publish immediate-failure notifier — SDK call, not a wait",
-    },
-    "step_function_eod.json": {
-        "AcquireMutex": "dynamodb:putItem mutex acquire — SDK call, not a wait",
-        "StartTradingInstance": "ec2:startInstances — SDK call, not a wait",
-        "WaitForCaptureSnapshot": "ssm:getCommandInvocation single poll — bounded by CaptureSnapshot's own executionTimeout",
-        "WaitForEOD": "ssm:getCommandInvocation single poll — bounded by the EOD daemon's own executionTimeout",
-        "WaitForRefreshExecutorDeploy": "ssm:getCommandInvocation single poll — bounded by RefreshExecutorDeploy's own executionTimeout",
-        "PollPostMarketDataSpot": "ssm:getCommandInvocation single poll — bounded by the spot dispatch Lambda's own budget",
-        "PollPostMarketArcticAppendSpot": "ssm:getCommandInvocation single poll — bounded by the spot dispatch Lambda's own budget",
-        "PublishDataSpotFailureImmediate": "sns:publish immediate-failure notifier — SDK call, not a wait",
-        "SkipEODReconcileDataGap": "sns:publish skip notifier — SDK call, not a wait",
-        "HealPollPostMarketDataSpot": "ssm:getCommandInvocation single poll — bounded by the heal-path spot dispatch's own budget",
-        "HealPollArcticAppendSpot": "ssm:getCommandInvocation single poll — bounded by the heal-path spot dispatch's own budget",
-        "HealReplayDispatchFailed": "sns:publish notifier — SDK call, not a wait",
-        "HealConvergedNotify": "sns:publish notifier — SDK call, not a wait",
-        "HealNonConvergent": "sns:publish notifier — SDK call, not a wait",
-        "StopTradingInstance": "ec2:stopInstances — SDK call, not a wait",
-        "LaunchWeeklyExerciseRun": "states:startExecution (async, not .sync) — fire-and-forget SDK call",
-        "WeeklyExerciseLaunchFailed": "sns:publish notifier — SDK call, not a wait",
-        "WriteCompletionMarkerNormal": "s3:putObject completion marker — SDK call, not a wait (config#2857)",
-        "WriteCompletionMarkerDegraded": "s3:putObject completion marker — SDK call, not a wait (config#2857)",
-        "HandleFailure": "sns:publish failure notifier — SDK call, not a wait",
-        "ForceStopInstance": "ec2:stopInstances fail-safe teardown — SDK call, not a wait",
-    },
+    # alpha-engine-config#6693: every state formerly exempted here now
+    # carries a real TimeoutSeconds (60s — mutex/gate/start/notify/marker/
+    # poll calls are all sub-minute AWS SDK/Lambda calls) — the exemption
+    # registry shrinks to {} rather than the entries going stale.
+    "step_function_daily.json": {},
+    "step_function_eod.json": {},
     "step_function_groom.json": {},
 }
 
@@ -160,6 +151,7 @@ _CATCH_EXEMPT: dict[str, dict[str, str]] = {
         "TradingDayGateFailed": "deliberate fail-open notify+proceed (own Comment); a Catch here would need its own Catch",
         "NotifyHolidaySkip": "terminal skip notifier (End: true) — nothing downstream to route a Catch to",
         "WriteCompletionMarker": "config#2857/config#1724: deliberately UNCAUGHT — a marker write failure must propagate, not be masked",
+        "WriteCompletionMarkerDegraded": "config#2857/config#1724 (DEGRADED twin, config#6692): deliberately UNCAUGHT — a marker write failure must propagate, not be masked",
         "HandleFailure": "terminal failure notifier — routes to FailExecution; the shared failure sink itself, not something to re-catch into",
     },
     "step_function_eod.json": {
@@ -421,6 +413,26 @@ def test_sf_file_set_matches_exemption_registry():
         f"registry covers {_SF_FILE_NAMES} — add/remove a top-level dict "
         f"entry in test_sf_structural_contract.py to match"
     )
+
+
+@pytest.mark.parametrize("sf_file", _SF_FILE_NAMES)
+def test_definition_declares_top_level_timeout(sf_file: str):
+    """alpha-engine-config#6693: a hung execution with no top-level
+    TimeoutSeconds can run to the Step Functions 1-year service maximum,
+    invisible to any status-keyed watcher. Covers every file in the
+    exemption registry above (weekly, daily, eod, groom) — all four
+    currently declare one (weekly=43200, daily=39600, eod=64800,
+    groom=15000); a new step_function_*.json landing without one fails
+    here rather than silently inheriting the 1-year default. (Formerly
+    its own module, tests/test_sf_timeout_coverage.py; folded in here on
+    #1256/config#6693 to avoid two parallel checkers over the same files
+    as config#6684's structural-contract suite.)"""
+    definition = _load(sf_file)
+    assert "TimeoutSeconds" in definition, (
+        f"{sf_file}: no top-level TimeoutSeconds — a hung execution can run "
+        "to the Step Functions 1-year service maximum invisibly"
+    )
+    assert isinstance(definition["TimeoutSeconds"], int) and definition["TimeoutSeconds"] > 0
 
 
 @pytest.mark.parametrize("sf_file", _SF_FILE_NAMES)
