@@ -440,6 +440,19 @@ class TestStageTableLockstep:
                     "ValidatePredictorSkipWeightsFresh",
                 }
                 continue
+            if stage.name == "director":
+                # config#6054: DELIBERATE exception, inverted from the
+                # convention. director's witness is the success-only
+                # DirectorComplete Pass state, and its skip route lands on
+                # CheckShellRunNotify — which every bypass path also enters.
+                # Witnessing on the skip target would mark a bypassed
+                # Director complete and skip it on the rerun (the I6055
+                # trap). Cost of the inversion: an original run that SKIPPED
+                # director yields a rerun that re-runs it — the safe
+                # direction for an advisory stage.
+                assert skip_targets == {"CheckShellRunNotify"}
+                assert "DirectorComplete" not in skip_targets
+                continue
             if stage.name == "backtester_stage_only":
                 # config#2362 Option A additive gate: deliberately empty
                 # witness (it shares Backtester's work state with the
@@ -501,6 +514,24 @@ class TestStageTableLockstep:
                     f"degraded_witness — a degraded {name} stage would be "
                     f"skipped as complete on a rerun; add it to STAGES"
                 )
+
+    def test_parity_degraded_route_is_mapped_in_stages(self, mod, all_states):
+        """alpha-engine-config-I6025: the SF now routes every parity
+        non-success through ParityDegraded → PublishParityDegraded and
+        CONTINUES. A degraded parity must re-run on a mechanical rerun —
+        never be skipped as completed — so the STAGES row must map both
+        degraded-route states. (The full degraded-overrides-witness logic
+        ships with alpha-engine-config-I6055; this pins the mapping so the
+        guard can never miss it.)"""
+        parity = next(s for s in mod.STAGES if s.name == "parity")
+        assert parity.degraded_witness == frozenset(
+            {"ParityDegraded", "PublishParityDegraded"}
+        )
+        for d in parity.degraded_witness:
+            assert d in all_states, (
+                f"parity degraded witness {d} is not a state in "
+                f"infrastructure/step_function.json — update STAGES"
+            )
 
 
 # ---------------------------------------------------------------------------

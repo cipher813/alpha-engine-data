@@ -89,12 +89,18 @@ class TestIndependentBackstopTopic:
 
 
 class TestStateMachineCoverage:
-    """All three canonical orchestration state machines must be alarmed."""
+    """The weekday orchestration state machines must be alarmed.
+
+    ne-weekly-freshness-pipeline is deliberately NOT in this set (config#5599,
+    removed 2026-08-09): AWS/States has no pipeline_role dimension, so the
+    daily exercise cadence keeps ExecutionsSucceeded warm and a weekly deadman
+    here can never fire — false coverage. Its liveness detector is
+    scripts/weekly_sf_silence_deadman.py (sf-pipeline-policy §2.6).
+    """
 
     @pytest.mark.parametrize(
         "sf_name",
         [
-            "ne-weekly-freshness-pipeline",
             "ne-preopen-trading-pipeline",
             "ne-postclose-trading-pipeline",
         ],
@@ -115,13 +121,16 @@ class TestStateMachineCoverage:
         ]
         assert "alpha-engine-groom-pipeline" not in block
 
-    def test_three_state_machines_declared(self, script_text):
+    def test_exactly_the_weekday_state_machines_declared(self, script_text):
         assert re.search(r"declare -A STATE_MACHINES=\(", script_text)
-        # Exactly 3 quoted values assigned in the associative array block.
+        # Exactly 2 quoted values assigned in the associative array block —
+        # the weekly pipeline must not silently reappear here (see class
+        # docstring), and a third pipeline must be added deliberately.
         block = script_text[
             script_text.find("declare -A STATE_MACHINES=(") : script_text.find(")", script_text.find("declare -A STATE_MACHINES=("))
         ]
-        assert block.count('"ne-') == 3
+        assert block.count('"ne-') == 2
+        assert "ne-weekly-freshness-pipeline" not in block
 
 
 class TestAlarmSemantics:

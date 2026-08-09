@@ -81,6 +81,63 @@ doc §3.5). If the operator's regular ``alpha-engine-alerts`` → email
 path silently breaks, this watchdog's separate publish path still
 reaches the operator. The Telegram fan-out via the lib is the
 non-overlapping second channel.
+
+**Preopen schedule-buffer canary** (alpha-engine-config#2412): a 4th check,
+added alongside the 3 liveness checks above. The Weekday SF's trigger
+(``WeekdayPipelineSchedule`` in alpha-engine-orchestration.yaml) has been
+moved earlier TWICE after finishing after the 06:30 PT open —
+06:00→05:45 PT (2026-05-19, 13-min buffer) then 05:45→05:15 PT
+(2026-07-13, ~30-min buffer) — both times the erosion was noticed
+anecdotally, days after it started. This check reads the finish
+(``stopDate``) of the most recent CLOSED trading day's SUCCEEDED Weekday-SF
+execution and alerts before the buffer is fully consumed again, instead of
+after.
+
+Because the watchdog's own cron (14:00 UTC, NOT DST-aware — see deploy.sh)
+fires well before today's session closes (~20:00 UTC) on every date
+regardless of PDT/PST, ``last_closed_trading_day(now_utc)`` at check time
+always resolves to the PRIOR trading day, never today's still-in-flight
+run — see ``_is_trading_day_now`` above for the same reasoning. This is
+deliberate: the canary is a next-morning retrospective on a fully-
+completed session, never a same-day live check, so there is no race with
+whether today's execution has finished yet.
+
+Thresholds (America/Los_Angeles, DST-aware via ``zoneinfo`` — comparisons
+resolve the correct UTC offset per calendar date, no manual DST math):
+market open is a fixed 06:30 PT year-round; ``HARD_ALERT_TIME_PT`` (06:15,
+a 15-min/~25%-of-45-min-runtime buffer floor) fires a severity=error alert;
+``WARN_TREND_TIME_PT`` (06:10) fires a severity=warning early-warning
+alert below the hard floor. A finish at/after 06:30 itself (an actual
+missed-open) gets a distinct "MISSED THE OPEN" message so the alert
+doesn't read the same as a mere late-but-before-open finish. The issue's
+own recommendation (06:20, gated on ``RunDaemon`` state reached) targets a
+different, live/in-flight design point than this retrospective
+finish-time check, so it does not transfer directly — see PR body.
+
+Deliberately does NOT filter by ``input.pipeline_role`` (would require
+``states:DescribeExecution``, which this Lambda's IAM role does not
+currently grant — confirmed live via a real AccessDeniedException the
+Saturday-SF role-filtered path already throws every Sunday since
+config#5597, see PR body / alpha-engine-config-I<N>). Instead takes the
+EARLIEST-started SUCCEEDED execution per PT calendar day as the proxy for
+"the scheduled run" (a same-day manual rerun, if any, would start later,
+in response to a problem with the scheduled one) — mirrors the existing
+unfiltered-count convention this file already uses for the Weekday/EOD
+checks above.
+
+Also computes a rolling-median trend over the last
+``ROLLING_WINDOW_TRADING_DAYS`` (5) trading days with SUCCEEDED data: a
+persistent creep that never individually crosses the hard floor on any
+single day (e.g. 06:08, 06:09, 06:11, 06:09, 06:12) still surfaces as an
+early-warning once the median crosses ``WARN_TREND_TIME_PT``. Requires at
+least 3 of the 5 days present or the trend check is skipped (insufficient
+data), never fabricated from fewer points.
+
+No new SNS topic / Telegram channel — reuses ``WATCHDOG_SNS_TOPIC_ARN`` +
+``notify_via_flow_doctor`` exactly like the 3 existing checks, via a
+shared ``_publish_watchdog_alert`` helper factored out of ``_check_sf``'s
+alert path (config#2412 PR — DRY, no behavior change to the 3 existing
+checks).
 """
 
 from __future__ import annotations
@@ -89,8 +146,9 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import boto3
 
@@ -230,6 +288,40 @@ WEEKLY_CADENCE_ROLES = frozenset({"weekly", "watch-rerun", "recovery"})
 # sees ~5 exercise runs + reruns per 7-day window, so this is ~5x headroom;
 # exceeding it raises rather than returning a truncated count.
 _MAX_ROLE_DESCRIBES = 200
+
+# ── Preopen schedule-buffer canary (alpha-engine-config#2412) ──────────────
+
+PT_ZONE = ZoneInfo("America/Los_Angeles")
+
+# Market open is a fixed local-clock time year-round; zoneinfo resolves the
+# correct UTC offset (PDT/PST) per calendar date when combined with a date,
+# so no manual DST arithmetic is needed anywhere below.
+MARKET_OPEN_TIME_PT = time(6, 30)
+
+# 15-min buffer floor (~25% of the ~46-49 min observed total runtime) —
+# breaching this is a severity=error alert. Issue #2412 recommended 06:20
+# but for a DIFFERENT check shape (gated on the SF reaching RunDaemon state
+# live, same-day); this check is a next-morning retrospective on the
+# finish timestamp, so the two thresholds are not directly comparable —
+# 06:15 is used per the binding design note in the PR, named explicitly
+# here rather than silently inherited.
+HARD_ALERT_TIME_PT = time(6, 15)
+
+# Early-warning floor below the hard buffer-floor breach — severity=warning.
+WARN_TREND_TIME_PT = time(6, 10)
+
+# How many trading days back the median-trend signal looks.
+ROLLING_WINDOW_TRADING_DAYS = 5
+
+# Minimum trading days with SUCCEEDED data required before the trend median
+# is trusted — never compute a "5-day median" off 1-2 points.
+_MIN_TREND_DAYS = 3
+
+# Calendar-day lookback for the ListExecutions walk that builds the
+# per-trading-day SUCCEEDED-finish map. Generous relative to
+# ROLLING_WINDOW_TRADING_DAYS(5) so a holiday week doesn't starve the
+# median of data.
+BUFFER_LOOKBACK_CALENDAR_DAYS = 14
 
 
 @dataclass(frozen=True)
@@ -420,6 +512,61 @@ def _count_executions_in_window(
     return seen
 
 
+def _publish_watchdog_alert(
+    message: str,
+    *,
+    severity: str,
+    dedup_key: str,
+    context: dict,
+    dedup_window_min: int = 12 * 60,
+) -> str:
+    """Publish one watchdog alert via the shared SNS + Telegram fan-out.
+
+    Factored out of ``_check_sf``'s alert path (alpha-engine-config#2412) so
+    the preopen-buffer canary below reuses the exact same channel-
+    independence + dedup wiring rather than duplicating it — no new SNS
+    topic or Telegram channel. Returns a compact ``alert_detail`` string for
+    the caller's ``CheckResult``.
+    """
+    result = alerts.publish(
+        message=message,
+        severity=severity,
+        source="alpha-engine-pipeline-watchdog",
+        sns=True,
+        telegram=False,
+        sns_topic_arn=WATCHDOG_SNS_TOPIC_ARN,
+        dedup_key=dedup_key,
+        dedup_window_min=dedup_window_min,
+    )
+    telegram_ok = notify_via_flow_doctor(
+        message,
+        silent=False,
+        severity=severity,
+        dedup_key=dedup_key,
+        flow_name=_FLOW_NAME,
+        topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
+        db_basename=_DB_BASENAME,
+        context=context,
+        # Must match the SNS/bus alerts.publish() source= above exactly —
+        # both paths alert on the same event, and the registered
+        # `pipeline_watchdog_stuck_sf` class in playbooks.yaml keys on this
+        # string (config-I3513).
+        source="alpha-engine-pipeline-watchdog",
+    )
+    logger.warning(
+        "watchdog ALERT: severity=%s dedup_key=%s sns_ok=%s telegram_ok=%s dedup_skipped=%s",
+        severity,
+        dedup_key,
+        result.sns.ok,
+        telegram_ok,
+        getattr(result, "dedup_skipped", False),
+    )
+    return (
+        f"sns_ok={result.sns.ok} telegram_ok={telegram_ok} "
+        f"dedup_skipped={getattr(result, 'dedup_skipped', False)}"
+    )
+
+
 def _check_sf(
     *,
     sf_label: str,
@@ -473,37 +620,11 @@ def _check_sf(
     dedup_key = (
         f"pipeline-watchdog-{sf_label}-{datetime.now(timezone.utc).date().isoformat()}"
     )
-    result = alerts.publish(
-        message=message,
-        severity="error",
-        source="alpha-engine-pipeline-watchdog",
-        sns=True,
-        telegram=False,
-        sns_topic_arn=WATCHDOG_SNS_TOPIC_ARN,
-        dedup_key=dedup_key,
-        dedup_window_min=12 * 60,
-    )
-    telegram_ok = notify_via_flow_doctor(
+    alert_detail = _publish_watchdog_alert(
         message,
-        silent=False,
         severity="error",
         dedup_key=dedup_key,
-        flow_name=_FLOW_NAME,
-        topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
-        db_basename=_DB_BASENAME,
         context={"sf_label": sf_label, "sf_arn": sf_arn},
-        # Must match the SNS/bus alerts.publish() source= above exactly —
-        # both paths alert on the same event, and the registered
-        # `pipeline_watchdog_stuck_sf` class in playbooks.yaml keys on this
-        # string (config-I3513).
-        source="alpha-engine-pipeline-watchdog",
-    )
-    logger.warning(
-        "watchdog ALERT: sf=%s sns_ok=%s telegram_ok=%s dedup_skipped=%s",
-        sf_label,
-        result.sns.ok,
-        telegram_ok,
-        getattr(result, "dedup_skipped", False),
     )
     return CheckResult(
         sf_label=sf_label,
@@ -511,16 +632,293 @@ def _check_sf(
         checked=True,
         executions_seen=0,
         alert_emitted=True,
-        alert_detail=(
-            f"sns_ok={result.sns.ok} telegram_ok={telegram_ok} "
-            f"dedup_skipped={getattr(result, 'dedup_skipped', False)}"
-        ),
+        alert_detail=alert_detail,
+    )
+
+
+@dataclass(frozen=True)
+class BufferCheckResult:
+    """Outcome of one preopen schedule-buffer canary run."""
+
+    checked: bool
+    skip_reason: Optional[str] = None
+    target_trading_day: Optional[str] = None  # ISO date of the day evaluated
+    finish_pt: Optional[str] = None  # ISO datetime, America/Los_Angeles
+    minutes_before_open: Optional[float] = None  # negative = after open
+    alert_emitted: bool = False
+    alert_severity: Optional[str] = None  # None | "warning" | "error"
+    alert_detail: Optional[str] = None
+    trend_median_minutes_before_open: Optional[float] = None
+    trend_days_used: Optional[int] = None
+    trend_alert_emitted: bool = False
+
+
+def _iter_succeeded_weekday_executions(
+    client: object, lookback_days: int
+) -> "list[tuple[datetime, datetime]]":
+    """Return ``(start_utc, stop_utc)`` for every SUCCEEDED Weekday-SF
+    execution that started within the last ``lookback_days`` calendar days,
+    newest first (as returned by ListExecutions).
+
+    No ``pipeline_role`` filter — that would require ``states:
+    DescribeExecution``, which this Lambda's IAM role does not currently
+    grant (see module docstring: the Saturday-SF role-filtered path
+    already throws a live ``AccessDeniedException`` on this exact call).
+    Filtering on status=SUCCEEDED at the API layer is enough to keep this
+    walk cheap without it.
+    """
+    cutoff_utc = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    rows: list[tuple[datetime, datetime]] = []
+    next_token: Optional[str] = None
+    while True:
+        kwargs = {
+            "stateMachineArn": WEEKDAY_SF_ARN,
+            "statusFilter": "SUCCEEDED",
+            "maxResults": 100,
+        }
+        if next_token:
+            kwargs["nextToken"] = next_token
+        resp = client.list_executions(**kwargs)
+        execs = resp.get("executions") or []
+        stop_paging = False
+        for row in execs:
+            start = row.get("startDate")
+            stop = row.get("stopDate")
+            if start is None or stop is None or not hasattr(start, "astimezone"):
+                continue
+            start_utc = (
+                start.astimezone(timezone.utc)
+                if start.tzinfo
+                else start.replace(tzinfo=timezone.utc)
+            )
+            if start_utc < cutoff_utc:
+                # Newest-first ordering → everything after this is older
+                # still. Stop paging.
+                stop_paging = True
+                break
+            stop_utc = (
+                stop.astimezone(timezone.utc)
+                if stop.tzinfo
+                else stop.replace(tzinfo=timezone.utc)
+            )
+            rows.append((start_utc, stop_utc))
+        if stop_paging:
+            break
+        next_token = resp.get("nextToken")
+        if not next_token:
+            break
+    return rows
+
+
+def _weekday_finish_by_trading_day(
+    client: object, lookback_days: int = BUFFER_LOOKBACK_CALENDAR_DAYS
+) -> "dict[date, datetime]":
+    """Map PT calendar trading-day → finish (``stopDate``, PT-zoned) of that
+    day's EARLIEST-started SUCCEEDED Weekday-SF execution — the proxy for
+    "the scheduled 05:15 AM PT run" (see module docstring for why not
+    role-filtered). A same-day manual rerun, if any, starts later and is
+    ignored in favor of the earlier (scheduled) one.
+    """
+    by_day: "dict[date, tuple[datetime, datetime]]" = {}
+    for start_utc, stop_utc in _iter_succeeded_weekday_executions(client, lookback_days):
+        pt_date = start_utc.astimezone(PT_ZONE).date()
+        existing = by_day.get(pt_date)
+        if existing is None or start_utc < existing[0]:
+            by_day[pt_date] = (start_utc, stop_utc.astimezone(PT_ZONE))
+    return {d: finish_pt for d, (_, finish_pt) in by_day.items()}
+
+
+def _classify_buffer_severity(finish_pt: datetime, target_date: date) -> Optional[str]:
+    """Return ``"error"`` (hard floor breach or missed-open), ``"warning"``
+    (early-warning floor), or ``None`` (quiet) for one day's finish time.
+    ``finish_pt`` must already be zoned to ``PT_ZONE``.
+    """
+    # MARKET_OPEN_TIME_PT (06:30) > HARD_ALERT_TIME_PT (06:15) always, so a
+    # finish at/after open is already caught by the hard-floor comparison —
+    # the "missed the open" distinction is made by the caller (message
+    # wording only), not a separate severity tier.
+    hard_pt = datetime.combine(target_date, HARD_ALERT_TIME_PT, tzinfo=PT_ZONE)
+    warn_pt = datetime.combine(target_date, WARN_TREND_TIME_PT, tzinfo=PT_ZONE)
+    if finish_pt >= hard_pt:
+        return "error"
+    if finish_pt >= warn_pt:
+        return "warning"
+    return None
+
+
+def _minutes_before_open(finish_pt: datetime, target_date: date) -> float:
+    open_pt = datetime.combine(target_date, MARKET_OPEN_TIME_PT, tzinfo=PT_ZONE)
+    return (open_pt - finish_pt).total_seconds() / 60.0
+
+
+def _rolling_trend_median(
+    by_day: "dict[date, datetime]", target_date: date, window: int = ROLLING_WINDOW_TRADING_DAYS
+) -> "Optional[tuple[float, int]]":
+    """Median ``minutes_before_open`` (negative = after open) across the
+    most recent ``window`` trading days with SUCCEEDED data, up to and
+    including ``target_date``. Returns ``(median, days_used)`` or ``None``
+    if fewer than ``_MIN_TREND_DAYS`` days have data — never fabricates a
+    trend from too few points.
+    """
+    days = sorted((d for d in by_day if d <= target_date), reverse=True)[:window]
+    if len(days) < _MIN_TREND_DAYS:
+        return None
+    deltas = sorted(_minutes_before_open(by_day[d], d) for d in days)
+    n = len(deltas)
+    median = (
+        deltas[n // 2]
+        if n % 2 == 1
+        else (deltas[n // 2 - 1] + deltas[n // 2]) / 2.0
+    )
+    return median, n
+
+
+def _check_preopen_buffer(
+    *,
+    now_utc: datetime,
+    is_watch_day: bool,
+    client: Optional[object] = None,
+) -> BufferCheckResult:
+    """Preopen schedule-buffer canary (alpha-engine-config#2412). See module
+    docstring for full design rationale."""
+    if not is_watch_day:
+        logger.info("preopen-buffer skip: today is not a NYSE trading day")
+        return BufferCheckResult(
+            checked=False,
+            skip_reason=(
+                "today is not a NYSE trading day (weekend / holiday) per "
+                "nousergon_lib.trading_calendar"
+            ),
+        )
+
+    if client is None:  # pragma: no cover — production path
+        client = boto3.client("stepfunctions", region_name=REGION)
+
+    target_date = last_closed_trading_day(now_utc)
+    by_day = _weekday_finish_by_trading_day(client)
+    finish_pt = by_day.get(target_date)
+
+    if finish_pt is None:
+        # No SUCCEEDED execution for the target day — either it genuinely
+        # didn't run (the existing Weekday-SF liveness check above already
+        # covers that) or it ran and FAILED (the SF's own HandleFailure
+        # path covers that). Either way, do NOT double-page here.
+        logger.info(
+            "preopen-buffer defer: no SUCCEEDED Weekday-SF execution found for %s "
+            "— deferring to the Weekday-SF liveness check / SF failure alert",
+            target_date,
+        )
+        return BufferCheckResult(
+            checked=True,
+            target_trading_day=target_date.isoformat(),
+            skip_reason=(
+                f"no SUCCEEDED execution for {target_date}; deferred to the "
+                f"Weekday-SF liveness check (0-executions case) or the SF's own "
+                f"failure alert — not double-paged here"
+            ),
+        )
+
+    minutes_before_open = _minutes_before_open(finish_pt, target_date)
+    severity = _classify_buffer_severity(finish_pt, target_date)
+    trend = _rolling_trend_median(by_day, target_date)
+    trend_median, trend_days = trend if trend else (None, None)
+    trend_severity = (
+        "warning"
+        if trend_median is not None
+        and trend_median <= (
+            (MARKET_OPEN_TIME_PT.hour * 60 + MARKET_OPEN_TIME_PT.minute)
+            - (WARN_TREND_TIME_PT.hour * 60 + WARN_TREND_TIME_PT.minute)
+        )
+        else None
+    )
+
+    if severity is None and trend_severity is None:
+        logger.info(
+            "preopen-buffer clear: %s finished %s (%.1fmin before 06:30 PT open)",
+            target_date, finish_pt.isoformat(), minutes_before_open,
+        )
+        return BufferCheckResult(
+            checked=True,
+            target_trading_day=target_date.isoformat(),
+            finish_pt=finish_pt.isoformat(),
+            minutes_before_open=minutes_before_open,
+            trend_median_minutes_before_open=trend_median,
+            trend_days_used=trend_days,
+        )
+
+    context = {"target_trading_day": target_date.isoformat(), "sf_arn": WEEKDAY_SF_ARN}
+    alert_detail = None
+    alert_emitted = False
+    trend_alert_emitted = False
+
+    if severity is not None:
+        missed_open = finish_pt >= datetime.combine(
+            target_date, MARKET_OPEN_TIME_PT, tzinfo=PT_ZONE
+        )
+        if missed_open:
+            headline = (
+                f"ne-preopen-trading-pipeline MISSED THE 06:30 PT OPEN on "
+                f"{target_date}: RunDaemon-ready at {finish_pt.strftime('%H:%M:%S %Z')}, "
+                f"{-minutes_before_open:.1f}min AFTER open."
+            )
+        else:
+            headline = (
+                f"ne-preopen-trading-pipeline schedule-buffer breach on {target_date}: "
+                f"finished {finish_pt.strftime('%H:%M:%S %Z')}, only "
+                f"{minutes_before_open:.1f}min before the 06:30 PT open "
+                f"(hard floor {HARD_ALERT_TIME_PT.strftime('%H:%M')} PT)."
+            )
+        message = (
+            f"{headline} This is the schedule-buffer-erosion canary "
+            f"(alpha-engine-config#2412) — the trigger (WeekdayPipelineSchedule) "
+            f"has already been moved earlier twice for this exact failure mode: "
+            f"06:00→05:45 PT (2026-05-19), 05:45→05:15 PT (2026-07-13). "
+            f"Investigate stage-duration creep (CodeFreshnessGate / predictor "
+            f"health / chronic-gap self-heal) or move the trigger earlier again."
+        )
+        dedup_key = f"pipeline-watchdog-preopen-buffer-{target_date.isoformat()}"
+        alert_detail = _publish_watchdog_alert(
+            message, severity=severity, dedup_key=dedup_key, context=context
+        )
+        alert_emitted = True
+    elif trend_severity is not None:
+        # Single-day reading is quiet but the 5-day median has crossed the
+        # warn floor — a creep no single day's threshold caught.
+        message = (
+            f"ne-preopen-trading-pipeline schedule-buffer TREND warning: median "
+            f"finish over the last {trend_days} trading days is "
+            f"{-trend_median if trend_median < 0 else trend_median:.1f}min "
+            f"{'after' if trend_median < 0 else 'before'} the 06:30 PT open — "
+            f"below the {WARN_TREND_TIME_PT.strftime('%H:%M')} PT early-warning "
+            f"floor even though {target_date} itself finished with buffer to "
+            f"spare. This is the schedule-buffer-erosion canary "
+            f"(alpha-engine-config#2412); the trigger has been moved earlier "
+            f"twice before for this pattern (2026-05-19, 2026-07-13)."
+        )
+        dedup_key = f"pipeline-watchdog-preopen-buffer-trend-{target_date.isoformat()}"
+        alert_detail = _publish_watchdog_alert(
+            message, severity="warning", dedup_key=dedup_key, context=context
+        )
+        trend_alert_emitted = True
+
+    return BufferCheckResult(
+        checked=True,
+        target_trading_day=target_date.isoformat(),
+        finish_pt=finish_pt.isoformat(),
+        minutes_before_open=minutes_before_open,
+        alert_emitted=alert_emitted,
+        alert_severity=severity,
+        alert_detail=alert_detail,
+        trend_median_minutes_before_open=trend_median,
+        trend_days_used=trend_days,
+        trend_alert_emitted=trend_alert_emitted,
     )
 
 
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
-    """EventBridge cron handler. Runs the 3 per-SF checks + returns a
-    structured summary the Lambda console / CW logs can read at a glance."""
+    """EventBridge cron handler. Runs the 3 per-SF liveness checks + the
+    preopen schedule-buffer canary, and returns a structured summary the
+    Lambda console / CW logs can read at a glance."""
     now_utc = datetime.now(timezone.utc)
     is_trading_today = _is_trading_day_now(now_utc)
     is_sunday = now_utc.weekday() == 6  # Mon=0..Sun=6
@@ -565,6 +963,10 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         window_seconds=WINDOW_SECONDS_WEEKLY,
         role_filter=WEEKLY_CADENCE_ROLES,
     )
+    preopen_buffer = _check_preopen_buffer(
+        now_utc=now_utc,
+        is_watch_day=is_trading_today,
+    )
 
     summary = {
         "fired_at_utc": now_utc.isoformat(),
@@ -581,6 +983,19 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             }
             for c in (weekday, eod, saturday)
         ],
+        "preopen_buffer_check": {
+            "checked": preopen_buffer.checked,
+            "skip_reason": preopen_buffer.skip_reason,
+            "target_trading_day": preopen_buffer.target_trading_day,
+            "finish_pt": preopen_buffer.finish_pt,
+            "minutes_before_open": preopen_buffer.minutes_before_open,
+            "alert_emitted": preopen_buffer.alert_emitted,
+            "alert_severity": preopen_buffer.alert_severity,
+            "alert_detail": preopen_buffer.alert_detail,
+            "trend_median_minutes_before_open": preopen_buffer.trend_median_minutes_before_open,
+            "trend_days_used": preopen_buffer.trend_days_used,
+            "trend_alert_emitted": preopen_buffer.trend_alert_emitted,
+        },
     }
     logger.info("watchdog summary: %s", summary)
     return summary

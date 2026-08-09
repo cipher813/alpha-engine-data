@@ -1,0 +1,119 @@
+{
+ "events": [
+  {
+   "type": "ExecutionStarted",
+   "id": 1,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "executionStartedEventDetails": {
+    "input": "{\"sns_topic_arn\": \"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\", \"trading_instance_id\": [\"i-0123456789abcdef0\"], \"pipeline_role\": \"daily\"}"
+   }
+  },
+  {
+   "type": "PassStateEntered",
+   "id": 2,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "InitializeInput",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "PassStateExited",
+   "id": 3,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "InitializeInput",
+    "output": "{\"sns_topic_arn\": \"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\", \"trading_instance_id\": [\"i-0123456789abcdef0\"], \"pipeline_role\": \"daily\", \"run_date\": \"2026-08-07\"}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 4,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "CheckMutexRole",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 5,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "AcquireMutex",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 6,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "AcquireMutex",
+    "output": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 7,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "DeployDriftCheck",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 8,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "DeployDriftCheck",
+    "output": "{\"Payload\": {\"has_drift\": true}}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 9,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "DeployDriftGate",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 10,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "HandleFailure",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 11,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "HandleFailure",
+    "output": "{}"
+   }
+  },
+  {
+   "type": "FailStateEntered",
+   "id": 12,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "FailExecution"
+   }
+  },
+  {
+   "type": "ExecutionFailed",
+   "id": 13,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "executionFailedEventDetails": {
+    "error": "DailyPipelineFailure",
+    "cause": "..."
+   }
+  }
+ ]
+}

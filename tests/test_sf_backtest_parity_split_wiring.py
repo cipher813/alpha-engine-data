@@ -41,10 +41,23 @@ floor) — the other three states pass --no-pit-parity. It used to run stacked i
 PredictorBacktest, OOM-guard-failing on the 8 GB box (2nd predictor_pipeline
 after the main one held ~3.5 GB).
 
+alpha-engine-config-I4442/I4497 SF cutover (2026-08-09, crucible-backtester
+#631): the --mode/--skip-stages/--pit-parity-enabled flag vocabulary
+described above is HISTORICAL. Each of the five backtest-family states now
+invokes its own dedicated script (spot_backtester.sh / spot_predictor_
+backtest.sh / spot_portfolio_optimizer_backtest.sh / spot_parity.sh /
+spot_evaluator.sh) with no stage-multiplexing flag at all — the flag-based
+mode selection this docstring documents was the DEFECT I4442/I4497 exist to
+remove (one shared launcher script per SF state, not five modes of one
+script). spot_backtest.sh is retained on disk, byte-identical, only as the
+rollback path; no SF state invokes it any longer. The ordering/Catch/
+timeout/ResultPath invariants below are unaffected by the cutover and still
+apply to the per-stage scripts.
+
 This test catches regressions like:
-- Someone reverts Backtester's SSM command back to --skip-stages=evaluator
-  (re-bundles parity into the backtest task) or drops --mode=param-sweep
-  (re-bundles the heavy post-sweep phases back into one SSM command).
+- Someone reverts a backtest-family state's SSM command back to invoking
+  the shared spot_backtest.sh monolith (with any --mode/--skip-stages flag)
+  instead of its own dedicated script.
 - Someone wires Parity BEFORE Backtester, or drops the Parity state.
 - Someone reroutes the backtest-family chain so a phase is skipped or
   re-ordered (e.g. predictor before sim).
@@ -96,11 +109,19 @@ class TestQuartetPresence:
             "WaitForParity",
             "CheckParityStatus",
             "ParityWait",
-            "ExtractParityError",
+            # degrade-not-fail route (alpha-engine-config-I6025) — replaces
+            # the retired ExtractParityError → NormalizeFailureContext path
+            "ParityDegraded",
+            "PublishParityDegraded",
         ],
     )
     def test_state_exists(self, states, name):
         assert name in states, f"{name} missing from Saturday SF States"
+
+    def test_extract_parity_error_retired(self, states):
+        """alpha-engine-config-I6025: Parity no longer fails the SF, so its
+        error normalizer is gone — the degrade route owns the failure path."""
+        assert "ExtractParityError" not in states
 
     def test_no_standalone_backtest_state(self, states):
         """Lower-churn option chosen: there is intentionally NO separate
@@ -137,7 +158,12 @@ class TestChainOrdering:
         assert c["Next"] == "CheckSkipEvaluator"
 
     def test_backtester_routes_to_wait_state(self, states):
-        assert states["Backtester"]["Next"] == "WaitForBacktester"
+        # alpha-engine-config-I5687: Backtester dispatches through the
+        # poll-budget seed (InitBacktesterPollCount) before the first poll,
+        # mirroring the DataPhase2/ThinkTank precedent.
+        assert states["Backtester"]["Next"] == "InitBacktesterPollCount"
+        assert states["InitBacktesterPollCount"]["Next"] == "WaitForBacktester"
+        assert states["InitBacktesterPollCount"]["ResultPath"] == "$.backtester_polls"
 
     def test_backtester_wait_routes_to_status_check(self, states):
         assert states["WaitForBacktester"]["Next"] == "CheckBacktesterStatus"
@@ -167,13 +193,21 @@ class TestChainOrdering:
         )
 
     def test_backtester_status_loops_and_default(self, states):
-        nexts = {
-            c["StringEquals"]: c["Next"]
-            for c in states["CheckBacktesterStatus"]["Choices"]
-        }
-        assert nexts["InProgress"] == "BacktesterWait"
-        assert nexts["Pending"] == "BacktesterWait"
-        assert states["BacktesterWait"]["Next"] == "WaitForBacktester"
+        # alpha-engine-config-I5687: the loop-back branch is now a single
+        # bounded And[] (IsPresent + Or[InProgress,Pending] + NumericLessThan
+        # cap) rather than two bare StringEquals branches — the poll budget
+        # bounds the loop, mirroring DataPhase2/ThinkTank.
+        bounded = [
+            c for c in states["CheckBacktesterStatus"]["Choices"]
+            if "And" in c
+        ]
+        assert len(bounded) == 1
+        variables = {cond.get("Variable") for cond in bounded[0]["And"]}
+        assert "$.backtester_polls" in variables
+        assert bounded[0]["Next"] == "BacktesterWait"
+        assert states["BacktesterWait"]["Next"] == "BacktesterPollWait"
+        assert states["BacktesterPollWait"]["Next"] == "MergeBacktesterPollCount"
+        assert states["MergeBacktesterPollCount"]["Next"] == "WaitForBacktester"
         assert (
             states["CheckBacktesterStatus"]["Default"]
             == "ExtractBacktesterError"
@@ -193,7 +227,11 @@ class TestChainOrdering:
         assert c["Next"] == "CheckSkipEvaluator"
 
     def test_parity_routes_to_wait_state(self, states):
-        assert states["Parity"]["Next"] == "WaitForParity"
+        # alpha-engine-config-I5687: Parity dispatches through the
+        # poll-budget seed (InitParityPollCount) before the first poll.
+        assert states["Parity"]["Next"] == "InitParityPollCount"
+        assert states["InitParityPollCount"]["Next"] == "WaitForParity"
+        assert states["InitParityPollCount"]["ResultPath"] == "$.parity_polls"
 
     def test_parity_wait_routes_to_status_check(self, states):
         assert states["WaitForParity"]["Next"] == "CheckParityStatus"
@@ -213,14 +251,23 @@ class TestChainOrdering:
         )
 
     def test_parity_status_loops_and_default(self, states):
-        nexts = {
-            c["StringEquals"]: c["Next"]
-            for c in states["CheckParityStatus"]["Choices"]
-        }
-        assert nexts["InProgress"] == "ParityWait"
-        assert nexts["Pending"] == "ParityWait"
-        assert states["ParityWait"]["Next"] == "WaitForParity"
-        assert states["CheckParityStatus"]["Default"] == "ExtractParityError"
+        # alpha-engine-config-I5687: bounded And[] loop-back, mirrors
+        # DataPhase2/ThinkTank/Backtester.
+        bounded = [
+            c for c in states["CheckParityStatus"]["Choices"]
+            if "And" in c
+        ]
+        assert len(bounded) == 1
+        variables = {cond.get("Variable") for cond in bounded[0]["And"]}
+        assert "$.parity_polls" in variables
+        assert bounded[0]["Next"] == "ParityWait"
+        assert states["ParityWait"]["Next"] == "ParityPollWait"
+        assert states["ParityPollWait"]["Next"] == "MergeParityPollCount"
+        assert states["MergeParityPollCount"]["Next"] == "WaitForParity"
+        # alpha-engine-config-I6025: terminal non-Success DEGRADES the run
+        # (ParityDegraded → PublishParityDegraded → CheckSkipEvaluator)
+        # instead of failing the SF through ExtractParityError.
+        assert states["CheckParityStatus"]["Default"] == "ParityDegraded"
 
     def test_backtest_reachable_strictly_before_parity(self, sf, states):
         """Walk the HAPPY path from StartAt and assert Backtester (backtest
@@ -299,34 +346,50 @@ class TestSsmCommandShape:
         return extract_commands(states[name])
 
     def test_backtester_invokes_simulation_stage_only(self, states):
-        """L4472: Backtester runs ONLY the simulation pipeline via
-        --mode=param-sweep, with --no-pit-parity (pit_parity belongs to
-        PredictorBacktest). It must still skip the parity+evaluator stages."""
+        """L4472: Backtester runs ONLY the simulation pipeline. Post
+        alpha-engine-config-I4442/I4497 SF cutover (2026-08-09,
+        crucible-backtester#631), it invokes its own dedicated
+        spot_backtester.sh — the monolith + --mode flag it used to run is
+        retained unchanged only as the rollback path, and the new script
+        carries no stage-multiplexing flag at all (spot_backtester.sh does
+        only the simulation stage; there is nothing left to skip)."""
         joined = " ".join(self._commands(states, "Backtester"))
-        assert "spot_backtest.sh --mode=param-sweep --no-pit-parity --skip-stages=parity,evaluator" in joined, (
-            "Backtester must run --mode=param-sweep (simulation only) with "
-            "--no-pit-parity post-L4472-split — dropping --mode re-bundles the "
-            "heavy predictor/optimizer phases back into one SSM command."
+        assert "spot_backtester.sh" in joined, (
+            "Backtester must run its dedicated per-stage script post-cutover."
         )
-        assert "--skip-stages=evaluator" not in joined
-        assert "--skip-stages=backtest,evaluator" not in joined
+        assert "spot_backtest.sh" not in joined, (
+            "Backtester must not fall back to the shared monolith launcher."
+        )
+        assert "--skip-stages" not in joined
+        assert "--mode=" not in joined
 
     def test_parity_invokes_parity_stage_only(self, states):
         joined = " ".join(self._commands(states, "Parity"))
-        assert "spot_backtest.sh --pit-parity-enabled=1 --skip-stages=backtest,evaluator" in joined, (
-            "Parity must run ONLY the parity stage."
+        assert "spot_parity.sh" in joined, (
+            "Parity must run its dedicated per-stage script post-cutover."
         )
-        assert "--skip-stages=evaluator" not in joined
-        assert "--skip-stages=parity,evaluator" not in joined
+        assert "spot_backtest.sh" not in joined, (
+            "Parity must not fall back to the shared monolith launcher."
+        )
+        assert "--skip-stages" not in joined
+        assert "--pit-parity-enabled" not in joined
 
     def test_no_combined_backtester_skip_stages_anywhere(self, sf):
         """The old single combined-Backtester invocation
         (--skip-stages=evaluator, runs backtest+parity together) must be
-        gone everywhere in the SF."""
+        gone everywhere in the SF — and post-cutover, the monolith
+        spot_backtest.sh is not invoked by any state at all (each backtest-
+        family state runs its own dedicated script; the monolith survives
+        on disk only as the rollback path)."""
         blob = json.dumps(sf)
         assert "spot_backtest.sh --skip-stages=evaluator" not in blob, (
             "The old combined backtest+parity invocation reappeared — a "
             "parity failure would again re-run the 121-min backtest."
+        )
+        assert '"spot_backtest.sh' not in blob, (
+            "No SF state should invoke the shared monolith launcher post "
+            "alpha-engine-config-I4442/I4497 cutover — every backtest-family "
+            "state has its own dedicated script now."
         )
 
     def test_backtester_command_starts_with_pipefail(self, states):
@@ -351,7 +414,8 @@ class TestSsmCommandShape:
         )
         assert "--slug parity" in work
         assert "--log /var/log/parity.log" in work
-        assert "-- bash infrastructure/spot_backtest.sh --pit-parity-enabled=1 --skip-stages=backtest,evaluator" in work
+        # Post I4442/I4497 cutover: dedicated script, no mode flags.
+        assert "-- bash infrastructure/spot_parity.sh" in work
         assert not any(c.startswith("trap ") for c in cmds), (
             "Inline trap must not coexist with the lib CLI — the CLI "
             "internalizes the trap."
@@ -381,19 +445,27 @@ class TestBudgetParity:
 
 
 class TestCatchSemantics:
-    """Both new Task states must Catch States.ALL → NormalizeFailureContext
-    (config#1819: the single chokepoint in front of HandleFailure, was
-    HandleFailure directly pre-fix) with ResultPath $.error, exactly like the
-    Backtester quartet (the SF halts on infra failure of these states)."""
+    """alpha-engine-config-I6025 degrade-not-fail split:
+
+    * Parity + WaitForParity Catch States.ALL → ParityDegraded (send/poll
+      infra failure degrades the run — parity is observability and must not
+      kill Evaluator/ReportCard/Director);
+    * the kept Backtester state keeps its NormalizeFailureContext Catch
+      (the backtest family still halts the SF on infra failure — the
+      anti-auto-promote-garbage rule).
+    """
 
     @pytest.mark.parametrize("name", ["Parity", "WaitForParity"])
-    def test_catch_routes_to_handle_failure(self, states, name):
+    def test_parity_catches_route_to_parity_degraded(self, states, name):
         catches = states[name]["Catch"]
         assert len(catches) >= 1
         for c in catches:
             assert c["ErrorEquals"] == ["States.ALL"]
-            assert c["Next"] == "NormalizeFailureContext"
-            assert c["ResultPath"] == "$.error"
+            assert c["Next"] == "ParityDegraded", (
+                f"{name}'s Catch must route to ParityDegraded "
+                "(degrade-not-fail, alpha-engine-config-I6025)"
+            )
+            assert c["ResultPath"] == "$.parity_error"
 
     def test_backtester_still_catches_handle_failure(self, states):
         """Regression guard — the kept Backtester state must keep its
@@ -406,12 +478,13 @@ class TestCatchSemantics:
             for c in catches
         )
 
-    def test_parity_extract_error_routes_to_handle_failure(self, states):
-        st = states["ExtractParityError"]
-        assert st["Type"] == "Pass"
-        assert st["ResultPath"] == "$.error"
-        assert st["Next"] == "NormalizeFailureContext"
-        assert st["Parameters"]["phase"] == "Parity"
+    def test_parity_degraded_routes_to_publish_then_evaluator(self, states):
+        """The full degrade chain: ParityDegraded → PublishParityDegraded →
+        CheckSkipEvaluator — the SF CONTINUES (never HandleFailure)."""
+        assert states["ParityDegraded"]["Type"] == "Pass"
+        assert states["ParityDegraded"]["ResultPath"] == "$.parity_degraded"
+        assert states["ParityDegraded"]["Next"] == "PublishParityDegraded"
+        assert states["PublishParityDegraded"]["Next"] == "CheckSkipEvaluator"
 
 
 class TestResultPathIsolation:
@@ -477,40 +550,50 @@ class TestL4472PhaseSplit:
         assert success("CheckPortfolioOptimizerBacktestStatus") == ["CheckSkipParity"]
 
     def test_predictor_backtest_invokes_predictor_mode(self, states):
+        # Post I4442/I4497 cutover (crucible-backtester#631): dedicated
+        # script, no --mode/--skip-stages/--no-pit-parity flags — the new
+        # script's executable code carries no stage-multiplexing flag at all.
         joined = " ".join(self._commands(states, "PredictorBacktest"))
-        assert "spot_backtest.sh --mode=predictor-backtest --no-pit-parity --skip-stages=parity,evaluator" in joined
-        # L4486: pit_parity NO LONGER runs here (it was stacked after the main
-        # predictor_pipeline → 8 GB OOM-guard fail). Relocated to the Parity state.
-        assert "--no-pit-parity" in joined
+        assert "spot_predictor_backtest.sh" in joined
+        assert "spot_backtest.sh" not in joined
+        assert "--skip-stages" not in joined
+        assert "--mode=" not in joined
 
     def test_optimizer_invokes_optimizer_mode_no_pit(self, states):
         joined = " ".join(self._commands(states, "PortfolioOptimizerBacktest"))
-        assert "spot_backtest.sh --mode=portfolio-optimizer-backtest --no-pit-parity --skip-stages=parity,evaluator" in joined
+        assert "spot_portfolio_optimizer_backtest.sh" in joined
+        assert "spot_backtest.sh" not in joined
+        assert "--skip-stages" not in joined
+        assert "--mode=" not in joined
 
     def test_pit_parity_runs_exactly_once_in_parity_state(self, sf):
-        """L4486: pit_parity fires EXACTLY ONCE, in the standalone Parity state
-        (fresh process, ≥8 GB floor via --mode=all). A state runs pit_parity iff
-        it neither passes --no-pit-parity NOR skips the `pit_parity` stage token.
-        Backtester / PredictorBacktest / PortfolioOptimizerBacktest all pass
-        --no-pit-parity; Parity does not, and its --skip-stages=backtest,evaluator
-        does not contain pit_parity."""
-        import re
+        """L4486: pit_parity fires EXACTLY ONCE, in the standalone Parity
+        state. Post I4442/I4497 cutover this is a structural guarantee of
+        WHICH script each backtest-family state invokes, not a --no-pit-parity
+        / --skip-stages flag parse (those flags no longer exist on any of the
+        five new scripts — crucible-backtester#631's PR body: 'No
+        stage-multiplexing flag exists in any new script's executable code').
+        pit_parity is spot_parity.sh's entire job; Backtester/
+        PredictorBacktest/PortfolioOptimizerBacktest/Evaluator each invoke a
+        DIFFERENT dedicated script that is not spot_parity.sh."""
         from tests.sf_command_utils import extract_commands
         states = sf["States"]
 
-        def runs_pit_parity(name):
-            cmd = " ".join(extract_commands(states[name]))
-            # isolate the spot_backtest.sh invocation flags
-            m = re.search(r"spot_backtest\.sh ([^']*)", cmd)
-            flags = m.group(1) if m else ""
-            if "--no-pit-parity" in flags:
-                return False
-            skip = re.search(r"--skip-stages=(\S+)", flags)
-            skipped = skip.group(1).split(",") if skip else []
-            return "pit_parity" not in skipped
+        family_scripts = {
+            "Backtester": "spot_backtester.sh",
+            "PredictorBacktest": "spot_predictor_backtest.sh",
+            "PortfolioOptimizerBacktest": "spot_portfolio_optimizer_backtest.sh",
+            "Parity": "spot_parity.sh",
+        }
+        for name, script in family_scripts.items():
+            joined = " ".join(extract_commands(states[name]))
+            assert script in joined, f"{name} must invoke {script}"
 
-        family = ["Backtester", "PredictorBacktest", "PortfolioOptimizerBacktest", "Parity"]
-        runners = [n for n in family if runs_pit_parity(n)]
+        runners = [
+            name
+            for name, script in family_scripts.items()
+            if script == "spot_parity.sh"
+        ]
         assert runners == ["Parity"], (
             f"pit_parity must fire exactly once, in Parity; got runners={runners}"
         )
@@ -548,9 +631,24 @@ class TestL4472PhaseSplit:
         ],
     )
     def test_new_status_gates_loop_and_error_default(self, states, check, wait):
-        nexts = {c["StringEquals"]: c["Next"] for c in states[check]["Choices"]}
-        assert nexts["InProgress"] == wait
-        assert nexts["Pending"] == wait
+        # alpha-engine-config-I5687: bounded And[] loop-back, mirrors
+        # DataPhase2/ThinkTank/Backtester/Parity.
+        prefix = {
+            "CheckPredictorBacktestStatus": "predictor_backtest",
+            "CheckPortfolioOptimizerBacktestStatus": "portfolio_optimizer",
+        }[check]
+        label = {
+            "CheckPredictorBacktestStatus": "PredictorBacktest",
+            "CheckPortfolioOptimizerBacktestStatus": "PortfolioOptimizerBacktest",
+        }[check]
+        bounded = [c for c in states[check]["Choices"] if "And" in c]
+        assert len(bounded) == 1
+        variables = {cond.get("Variable") for cond in bounded[0]["And"]}
+        assert f"$.{prefix}_polls" in variables
+        assert bounded[0]["Next"] == wait
+        assert states[wait]["Next"] == f"{label}PollWait"
+        assert states[f"{label}PollWait"]["Next"] == f"Merge{label}PollCount"
+        assert states[f"Merge{label}PollCount"]["Next"] == f"WaitFor{label}"
         assert states[check]["Default"].startswith("Extract")
 
     def test_new_states_timeout_matches_backtester(self, states):

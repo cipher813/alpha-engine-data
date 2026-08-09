@@ -355,25 +355,85 @@ class TestCoverageAccounting:
         module, _, _ = cd
         baseline = module.load_baseline(_REPO_ROOT / "infrastructure" / "systemd" / "uncodified-units-baseline.txt")
 
-        assert baseline, "the shipped baseline should not be empty — 54 units are uncodified"
+        assert baseline, "the shipped baseline should not be empty — 22 units are uncodified"
         for name in baseline:
             assert name.endswith((".service", ".timer")), name
             assert " " not in name, name
 
     def test_the_shipped_baseline_covers_the_measured_dashboard_box(self, cd):
-        """Seeded 2026-08-08 from i-09b539c844515d549. Spot-checks the units
-        this session actually touched, so an edit that drops them is caught."""
+        """Re-derived 2026-08-09 from i-09b539c844515d549: every installed unit
+        was hash-compared against every repo checkout on the box; 32 matched a
+        root byte-for-byte and left the baseline, 22 matched nothing. Spot-checks
+        both directions, so an edit that drops a genuinely-uncodified unit — or
+        re-adds a root-covered one — is caught."""
         module, _, _ = cd
         baseline = module.load_baseline(_REPO_ROOT / "infrastructure" / "systemd" / "uncodified-units-baseline.txt")
 
         for name in (
-            "morning-signal.service",
-            "morning-signal.timer",
-            "morning-signal-bakeoff.service",
-            "box-health.timer",
-            "litellm-proxy.service",
+            "mnemon.service",
+            "mnemon-sync.service",
+            "mnemon-sync.timer",
+            "amazon-cloudwatch-agent.service",
         ):
             assert name in baseline, f"{name} missing from the uncodified baseline"
+
+        for name in (
+            "morning-signal.service",      # alpha-engine-dashboard root
+            "box-health.timer",            # alpha-engine-dashboard root
+            "metron-refresh.service",      # metron-ops root
+            "telos-web.service",           # telos-ops root
+            "dashboard.service",           # alpha-engine-dashboard top-level root
+            "nous-ergon-live.service",     # alpha-engine-dashboard live/ root
+            "nousergon-console.service",   # nousergon-console root
+            "signal.service",              # the-cyphering-ops root
+            "vires.service",               # vires root
+            "morning-signal-pull.service", # codified by crucible-dashboard-PR635
+            "litellm-proxy.service",       # nous-ergon-ops live-infrastructure root
+            "llm-egress-proxy.service",    # nous-ergon-ops (ops-PR533)
+            "ibgateway.service",           # nous-ergon-ops (ops-PR534)
+            "certbot-renew.timer",         # nous-ergon-ops
+            "ops-config-drift.service",    # nous-ergon-ops (ops-PR535) — never baselined
+        ):
+            assert name not in baseline, (
+                f"{name} is covered by a --codified-root and must not be baselined "
+                f"— a baselined unit is exempt from drift verification"
+            )
+
+    def test_the_unit_passes_every_measured_codified_root_and_metric(self):
+        """The roots live in the unit's ExecStart, not in the script — dropping
+        one there silently re-baselines that repo's units on the next deploy."""
+        unit = (_REPO_ROOT / "infrastructure" / "systemd" / "systemd-unit-drift-check.service").read_text()
+        exec_lines = [l for l in unit.splitlines() if l.startswith("ExecStart=")]
+        assert len(exec_lines) == 1
+        line = exec_lines[0]
+        assert "--metric" in line, "coverage counts must be emitted every run"
+        for root in (
+            "/home/ec2-user/alpha-engine-data/infrastructure/systemd",
+            "/home/ec2-user/alpha-engine-dashboard/infrastructure/systemd",
+            "/home/ec2-user/metron-ops/infrastructure/systemd",
+            "/home/ec2-user/telos-ops/infrastructure/systemd",
+            "/home/ec2-user/alpha-engine-dashboard/infrastructure",
+            "/home/ec2-user/alpha-engine-dashboard/live/infrastructure",
+            "/home/ec2-user/nousergon-auth/infrastructure",
+            "/home/ec2-user/nousergon-console/infrastructure",
+            "/home/ec2-user/the-cyphering-ops/infrastructure",
+            "/home/ec2-user/vires/infrastructure",
+            "/home/ec2-user/nous-ergon-ops/alpha-engine-dashboard/live/infrastructure/systemd",
+        ):
+            assert f"--codified-root {root}" in line, f"missing codified root {root}"
+        # boto3 does not infer region from IMDS: without these, --metric dies
+        # with "You must specify a region" (seen live 2026-08-09).
+        assert "Environment=AWS_REGION=us-east-1" in unit
+        assert "Environment=AWS_DEFAULT_REGION=us-east-1" in unit
+
+    def test_metric_namespace_is_one_the_box_role_may_put_to(self, cd):
+        """The box role's PutMetricData grant is namespace-conditioned to
+        AlphaEngine/AlphaEngine/* (alpha-engine-cloudwatch-metrics.json in
+        nous-ergon-ops). The original "NousErgon/BoxHealth" value would have
+        been denied on every emit — and it also wasn't box_health.sh's actual
+        namespace, despite the comment saying it shared it."""
+        module, _, _ = cd
+        assert module.METRIC_NAMESPACE == "AlphaEngine/Box"
 
 
 class TestUnreadableUnit:

@@ -462,10 +462,13 @@ def test_handler_on_trading_day_checks_weekday_and_eod_skips_saturday():
     """Wednesday 2026-05-27 14:00 UTC. Both Weekday + EOD checked
     (trading day); Saturday skipped (not Sunday)."""
     # _is_trading_day_now needs 2 calls to last_closed_trading_day per call
-    # → so for the one call inside handler, we set 2 return values
+    # → so for the one call inside handler, we set 2 return values, plus a
+    # 3rd for the preopen-buffer canary's own last_closed_trading_day(now)
+    # call (config#2412) — same pre-open semantics as the 1st call.
     _tc_mod.last_closed_trading_day.side_effect = [
         date(2026, 5, 26),  # pre-open call at now
         date(2026, 5, 27),  # synthetic 22:00 UTC call → returns today
+        date(2026, 5, 26),  # preopen-buffer canary's target-day lookup
     ]
     # EOD window calc: previous_trading_day(2026-05-27) → 2026-05-26 (Tue)
     _tc_mod.previous_trading_day.return_value = date(2026, 5, 26)
@@ -637,10 +640,13 @@ def test_handler_post_holiday_eod_does_not_false_alert():
     trading-day-aware window, the watchdog should NOT alert when Friday's
     EOD execution is visible in the 67h window. Regression guard for the
     2026-05-26 morning false-positive Telegram alert."""
-    # is_trading_day_now: today (Tue 5/26) IS a trading day
+    # is_trading_day_now: today (Tue 5/26) IS a trading day. 3rd value is
+    # the preopen-buffer canary's own last_closed_trading_day(now) call
+    # (config#2412) — same pre-open semantics as the 1st call.
     _tc_mod.last_closed_trading_day.side_effect = [
         date(2026, 5, 22),  # at 14:00 UTC pre-open, last close was Fri (Mon was holiday)
         date(2026, 5, 26),  # synthetic 22:00 UTC post-close, today is the session
+        date(2026, 5, 22),  # preopen-buffer canary's target-day lookup
     ]
     # EOD prev_trading_day → Fri 5/22
     _tc_mod.previous_trading_day.return_value = date(2026, 5, 22)
@@ -683,6 +689,7 @@ def test_handler_post_holiday_eod_alerts_when_friday_eod_missing():
     _tc_mod.last_closed_trading_day.side_effect = [
         date(2026, 5, 22),
         date(2026, 5, 26),
+        date(2026, 5, 22),  # preopen-buffer canary's target-day lookup
     ]
     _tc_mod.previous_trading_day.return_value = date(2026, 5, 22)
     now = _frozen_now(2026, 5, 26, 14, 0)
@@ -708,3 +715,311 @@ def test_handler_post_holiday_eod_alerts_when_friday_eod_missing():
         "the trading-day-aware window must not paper over real outages."
     )
     assert by_label["Weekday SF"]["alert_emitted"] is False
+
+
+# ── Preopen schedule-buffer canary (alpha-engine-config#2412) ──────────────
+#
+# The trigger (WeekdayPipelineSchedule) has been moved earlier twice after
+# finishing after the 06:30 PT open: 06:00→05:45 PT (2026-05-19), then
+# 05:45→05:15 PT (2026-07-13). These tests pin the finish-time thresholds
+# (06:15 hard / 06:10 warn, both America/Los_Angeles) and the deferral rule
+# for a day with no SUCCEEDED execution.
+
+
+def _pt(y, m, d, hh, mm, ss=0):
+    """Build a tz-aware UTC datetime from an America/Los_Angeles wall-clock
+    time — mirrors the tz-aware datetimes boto3's ListExecutions actually
+    returns."""
+    return datetime(y, m, d, hh, mm, ss, tzinfo=index.PT_ZONE).astimezone(timezone.utc)
+
+
+def _make_buffer_client(rows: list) -> MagicMock:
+    """SFN mock for the canary's single ``list_executions(statusFilter=
+    'SUCCEEDED')`` call. ``rows`` is a list of ``{"startDate":..., "stopDate":
+    ...}`` dicts returned verbatim (single page, no pagination)."""
+    client = MagicMock()
+    client.list_executions.return_value = {"executions": rows, "nextToken": None}
+    return client
+
+
+def _check_preopen_buffer_at(now_utc, rows, *, is_watch_day=True):
+    """Run ``_check_preopen_buffer`` with ``index.datetime.now`` pinned to
+    ``now_utc``. Needed because ``_iter_succeeded_weekday_executions``'s
+    lookback cutoff uses ``datetime.now(timezone.utc)`` directly — the same
+    convention this file's pre-existing ``_count_executions_in_window``
+    already uses — so a fixture built around a fixed calendar date (rather
+    than an offset from real wall-clock time) needs ``now()`` mocked, same
+    as every handler-integration test below already does.
+    """
+    client = _make_buffer_client(rows)
+    with patch("index.datetime") as mock_dt:
+        mock_dt.now.return_value = now_utc
+        mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
+        mock_dt.combine = datetime.combine
+        mock_dt.fromtimestamp = datetime.fromtimestamp
+        return index._check_preopen_buffer(
+            now_utc=now_utc, is_watch_day=is_watch_day, client=client
+        )
+
+
+# ── _classify_buffer_severity — per-day threshold classification ──────────
+
+
+def test_classify_buffer_severity_quiet_before_0610():
+    target = date(2026, 6, 3)
+    finish_pt = datetime(2026, 6, 3, 6, 8, tzinfo=index.PT_ZONE)
+    assert index._classify_buffer_severity(finish_pt, target) is None
+
+
+def test_classify_buffer_severity_warn_at_0612():
+    target = date(2026, 6, 3)
+    finish_pt = datetime(2026, 6, 3, 6, 12, tzinfo=index.PT_ZONE)
+    assert index._classify_buffer_severity(finish_pt, target) == "warning"
+
+
+def test_classify_buffer_severity_error_at_0620():
+    target = date(2026, 6, 3)
+    finish_pt = datetime(2026, 6, 3, 6, 20, tzinfo=index.PT_ZONE)
+    assert index._classify_buffer_severity(finish_pt, target) == "error"
+
+
+def test_classify_buffer_severity_error_after_0630_open():
+    target = date(2026, 6, 3)
+    finish_pt = datetime(2026, 6, 3, 6, 34, tzinfo=index.PT_ZONE)
+    assert index._classify_buffer_severity(finish_pt, target) == "error"
+
+
+# ── _check_preopen_buffer — integration ────────────────────────────────────
+
+
+def test_check_preopen_buffer_skips_on_non_watch_day():
+    result = index._check_preopen_buffer(
+        now_utc=datetime(2026, 6, 6, 14, 0, tzinfo=timezone.utc),  # Saturday
+        is_watch_day=False,
+        client=MagicMock(),
+    )
+    assert result.checked is False
+    assert "not a NYSE trading day" in result.skip_reason
+    assert result.alert_emitted is False
+
+
+def test_check_preopen_buffer_quiet_finish_before_0610_no_alert():
+    target = date(2026, 6, 3)
+    _tc_mod.last_closed_trading_day.return_value = target
+    now = datetime(2026, 6, 3, 14, 0, tzinfo=timezone.utc)
+    result = _check_preopen_buffer_at(
+        now,
+        [{"startDate": _pt(2026, 6, 3, 5, 15), "stopDate": _pt(2026, 6, 3, 6, 8)}],
+    )
+    assert result.checked is True
+    assert result.target_trading_day == target.isoformat()
+    assert result.alert_emitted is False
+    assert result.alert_severity is None
+    assert result.minutes_before_open == pytest.approx(22.0, abs=0.01)
+    _alerts_mod.publish.assert_not_called()
+
+
+def test_check_preopen_buffer_warn_at_0612_emits_warning_severity():
+    target = date(2026, 6, 3)
+    _tc_mod.last_closed_trading_day.return_value = target
+    now = datetime(2026, 6, 3, 14, 0, tzinfo=timezone.utc)
+    result = _check_preopen_buffer_at(
+        now,
+        [{"startDate": _pt(2026, 6, 3, 5, 15), "stopDate": _pt(2026, 6, 3, 6, 12)}],
+    )
+    assert result.alert_emitted is True
+    assert result.alert_severity == "warning"
+    _alerts_mod.publish.assert_called_once()
+    assert _alerts_mod.publish.call_args.kwargs["severity"] == "warning"
+    assert "ne-preopen-trading-pipeline" in _alerts_mod.publish.call_args.kwargs["message"]
+
+
+def test_check_preopen_buffer_hard_at_0620_emits_error_before_open():
+    target = date(2026, 6, 3)
+    _tc_mod.last_closed_trading_day.return_value = target
+    now = datetime(2026, 6, 3, 14, 0, tzinfo=timezone.utc)
+    result = _check_preopen_buffer_at(
+        now,
+        [{"startDate": _pt(2026, 6, 3, 5, 15), "stopDate": _pt(2026, 6, 3, 6, 20)}],
+    )
+    assert result.alert_emitted is True
+    assert result.alert_severity == "error"
+    message = _alerts_mod.publish.call_args.kwargs["message"]
+    assert "MISSED" not in message
+    assert "schedule-buffer breach" in message
+
+
+def test_check_preopen_buffer_after_open_emits_distinct_missed_open_message():
+    """Finish AFTER the actual 06:30 PT open gets a message distinct from a
+    mere hard-floor breach before open — the whole point of the canary is
+    to distinguish 'buffer is thin' from 'we actually missed the open'."""
+    target = date(2026, 6, 3)
+    _tc_mod.last_closed_trading_day.return_value = target
+    now = datetime(2026, 6, 3, 14, 0, tzinfo=timezone.utc)
+    result = _check_preopen_buffer_at(
+        now,
+        [{"startDate": _pt(2026, 6, 3, 5, 15), "stopDate": _pt(2026, 6, 3, 6, 34)}],
+    )
+    assert result.alert_emitted is True
+    assert result.alert_severity == "error"
+    assert result.minutes_before_open == pytest.approx(-4.0, abs=0.01)
+    message = _alerts_mod.publish.call_args.kwargs["message"]
+    assert "MISSED THE 06:30 PT OPEN" in message
+    assert "AFTER open" in message
+
+
+def test_check_preopen_buffer_defers_when_no_succeeded_execution():
+    """No SUCCEEDED execution for the target trading day → defer to the
+    existing Weekday-SF liveness check / SF failure alert. Must NOT
+    double-page."""
+    target = date(2026, 6, 3)
+    _tc_mod.last_closed_trading_day.return_value = target
+    now = datetime(2026, 6, 3, 14, 0, tzinfo=timezone.utc)
+    result = _check_preopen_buffer_at(now, [])  # nothing SUCCEEDED
+    assert result.checked is True
+    assert result.alert_emitted is False
+    assert result.trend_alert_emitted is False
+    assert "deferred" in result.skip_reason
+    _alerts_mod.publish.assert_not_called()
+    _fd_mod.notify_via_flow_doctor.assert_not_called()
+
+
+def test_check_preopen_buffer_ignores_a_same_day_manual_rerun_started_later():
+    """Two SUCCEEDED executions on the target day: the 05:15 PT scheduled
+    one (finished quiet, 06:05) and a later manual rerun (09:00 PT, finished
+    well after). The EARLIEST-started one is treated as the scheduled run —
+    no DescribeExecution/pipeline_role dependency (see module docstring for
+    why)."""
+    target = date(2026, 6, 3)
+    _tc_mod.last_closed_trading_day.return_value = target
+    now = datetime(2026, 6, 3, 20, 0, tzinfo=timezone.utc)
+    result = _check_preopen_buffer_at(
+        now,
+        [
+            {"startDate": _pt(2026, 6, 3, 9, 0), "stopDate": _pt(2026, 6, 3, 9, 40)},
+            {"startDate": _pt(2026, 6, 3, 5, 15), "stopDate": _pt(2026, 6, 3, 6, 5)},
+        ],
+    )
+    assert result.alert_emitted is False
+    assert result.finish_pt == datetime(2026, 6, 3, 6, 5, tzinfo=index.PT_ZONE).isoformat()
+
+
+# ── Rolling 5-day median trend (issue's "rolling average" implementer-
+# discretion gotcha) ────────────────────────────────────────────────────
+
+
+def test_rolling_trend_median_warns_on_creep_even_when_today_is_individually_quiet():
+    """None of the 5 days individually crosses the hard OR warn floor on
+    its own reading below, but the median of the last 5 is >= 06:10 PT —
+    the trend signal catches persistent creep no single-day threshold
+    would."""
+    target = date(2026, 6, 5)  # Friday
+    _tc_mod.last_closed_trading_day.return_value = target
+    now = datetime(2026, 6, 5, 14, 0, tzinfo=timezone.utc)
+    rows = [
+        {"startDate": _pt(2026, 6, 5, 5, 15), "stopDate": _pt(2026, 6, 5, 6, 9)},
+        {"startDate": _pt(2026, 6, 4, 5, 15), "stopDate": _pt(2026, 6, 4, 6, 11)},
+        {"startDate": _pt(2026, 6, 3, 5, 15), "stopDate": _pt(2026, 6, 3, 6, 10)},
+        {"startDate": _pt(2026, 6, 2, 5, 15), "stopDate": _pt(2026, 6, 2, 6, 12)},
+        {"startDate": _pt(2026, 6, 1, 5, 15), "stopDate": _pt(2026, 6, 1, 6, 8)},
+    ]
+    result = _check_preopen_buffer_at(now, rows)
+    # Today (6/5) itself finished 06:09 — below the 06:10 warn floor, quiet
+    # on its own.
+    assert result.alert_severity is None
+    assert result.alert_emitted is False
+    # But the 5-day median (06:10) crosses the warn floor → trend alert.
+    assert result.trend_days_used == 5
+    assert result.trend_alert_emitted is True
+    _alerts_mod.publish.assert_called_once()
+    assert _alerts_mod.publish.call_args.kwargs["severity"] == "warning"
+    assert "TREND" in _alerts_mod.publish.call_args.kwargs["message"]
+
+
+def test_rolling_trend_median_skipped_with_fewer_than_3_days_of_data():
+    target = date(2026, 6, 3)
+    _tc_mod.last_closed_trading_day.return_value = target
+    now = datetime(2026, 6, 3, 14, 0, tzinfo=timezone.utc)
+    rows = [
+        {"startDate": _pt(2026, 6, 3, 5, 15), "stopDate": _pt(2026, 6, 3, 6, 9)},
+        {"startDate": _pt(2026, 6, 2, 5, 15), "stopDate": _pt(2026, 6, 2, 6, 12)},
+    ]
+    result = _check_preopen_buffer_at(now, rows)
+    assert result.trend_days_used is None
+    assert result.trend_alert_emitted is False
+
+
+# ── DST boundary — America/Los_Angeles thresholds stay correct year-round ──
+
+
+def test_dst_boundary_thresholds_resolve_correct_utc_offset_pst_vs_pdt():
+    """2026-03-08 is the PT spring-forward date (2am -> 3am). The day
+    before is PST (UTC-8); the day of (post-transition, market opens well
+    after 3am) and after are PDT (UTC-7). 06:30 PT must resolve to the
+    correct UTC instant on both sides — a hardcoded UTC offset would be
+    off by an hour on one side."""
+    pst_day = date(2026, 3, 6)  # Friday, before the Sunday 3/8 transition — PST
+    pdt_day = date(2026, 3, 9)  # Monday, after the transition — PDT
+
+    pst_open_utc = datetime.combine(pst_day, index.MARKET_OPEN_TIME_PT, tzinfo=index.PT_ZONE).astimezone(timezone.utc)
+    pdt_open_utc = datetime.combine(pdt_day, index.MARKET_OPEN_TIME_PT, tzinfo=index.PT_ZONE).astimezone(timezone.utc)
+
+    assert pst_open_utc.hour == 14 and pst_open_utc.minute == 30  # UTC-8
+    assert pdt_open_utc.hour == 13 and pdt_open_utc.minute == 30  # UTC-7
+
+
+def test_check_preopen_buffer_classifies_correctly_across_dst_boundary():
+    """Same 06:20 PT finish, evaluated on a PST date and a PDT date — both
+    must classify as a hard-floor breach (06:20 >= 06:15 regardless of
+    which side of the DST transition the date falls on)."""
+    for target, now_utc_naive_hour in (
+        (date(2026, 1, 15), 14),  # PST — 06:00 PT would be 14:00 UTC
+        (date(2026, 7, 15), 14),  # PDT — 07:00 PT would be 14:00 UTC
+    ):
+        _tc_mod.last_closed_trading_day.return_value = target
+        now = datetime(target.year, target.month, target.day, now_utc_naive_hour, 0, tzinfo=timezone.utc)
+        result = _check_preopen_buffer_at(
+            now,
+            [
+                {
+                    "startDate": datetime(target.year, target.month, target.day, 5, 15, tzinfo=index.PT_ZONE),
+                    "stopDate": datetime(target.year, target.month, target.day, 6, 20, tzinfo=index.PT_ZONE),
+                },
+            ],
+        )
+        assert result.alert_severity == "error", f"failed for {target}"
+
+
+# ── handler wiring ──────────────────────────────────────────────────────
+
+
+def test_handler_includes_preopen_buffer_check_in_summary():
+    _tc_mod.last_closed_trading_day.side_effect = [
+        date(2026, 6, 2),  # pre-open call at now
+        date(2026, 6, 3),  # synthetic 22:00 UTC call → today
+        date(2026, 6, 2),  # preopen-buffer canary's target-day lookup
+    ]
+    _tc_mod.previous_trading_day.return_value = date(2026, 6, 2)
+    now = datetime(2026, 6, 3, 14, 0, tzinfo=timezone.utc)  # Wednesday
+
+    fake_client = _make_sfn_client({
+        WKD_ARN: [{"startDate": now - timedelta(hours=1)}],
+        EOD_ARN: [{"startDate": now - timedelta(hours=1)}],
+    })
+
+    with patch("index.datetime") as mock_dt, patch("index.boto3") as mock_boto3:
+        mock_dt.now.return_value = now
+        mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
+        mock_dt.fromtimestamp = datetime.fromtimestamp
+        mock_dt.combine = datetime.combine
+        mock_boto3.client.return_value = fake_client
+
+        summary = index.handler({}, None)
+
+    assert "preopen_buffer_check" in summary
+    pbc = summary["preopen_buffer_check"]
+    assert pbc["checked"] is True
+    # fake_client's list_executions ignores statusFilter and returns the
+    # same WKD_ARN rows for the canary's SUCCEEDED-only query too, but
+    # those rows have no "stopDate" key → no data → deferred, not alerted.
+    assert pbc["alert_emitted"] is False
