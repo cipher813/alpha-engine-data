@@ -480,6 +480,18 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
         ),
     },
     "step_function_eod.json": {
+        "CaptureSnapshot": (
+            "NOT fail-open (alpha-engine-config#5569): the Catch routes to "
+            "CheckCaptureSnapshotRetryBudget — a bounded single retry that "
+            "pages immediately and, once exhausted, HARD-FAILS via "
+            "HandleFailure. A degraded flag would misstate the contract: "
+            "the run never proceeds past a failed snapshot."
+        ),
+        "WaitForCaptureSnapshot": (
+            "Same route as CaptureSnapshot's Catch (config#5569): poll "
+            "failure enters the same bounded-retry-then-HandleFailure "
+            "path; fail-closed, not fail-open."
+        ),
         "AcquireMutex": (
             "VIOLATION — tracked (alpha-engine-config#6722): same "
             "mutex-acquire-infra-error gap as the sibling files."

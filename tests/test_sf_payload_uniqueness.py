@@ -601,6 +601,18 @@ class TestEODSFTopLevelFieldsClosed:
             "exercise_cadence_degraded_notify_error",
             "exercise_cadence_unknown_notify",
             "exercise_cadence_unknown_notify_error",
+            # alpha-engine-config#5569 (2026-08-09): bounded 1-retry same-day
+            # budget for CaptureSnapshot, the EOD pipeline's only stage with an
+            # irreversible per-day deadline. InitCaptureSnapshotRetryCounter /
+            # IncrementCaptureSnapshotRetry carry the attempts counter;
+            # PageCaptureSnapshotFailureImmediate emits its SNS ResultPath on
+            # the FIRST failure (before the retry runs); PageCaptureSnapshot-
+            # IrreversibleFailure emits its own distinct SNS ResultPath once the
+            # retry budget is exhausted. $.error is reused (already registered
+            # above) by CaptureSnapshotRetryExhausted's normalizer.
+            "capture_snapshot_retry",
+            "capture_snapshot_page_notify",
+            "capture_snapshot_irreversible_notify",
         }
     )
 

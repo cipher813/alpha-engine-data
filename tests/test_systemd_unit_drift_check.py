@@ -363,16 +363,15 @@ class TestCoverageAccounting:
     def test_the_shipped_baseline_covers_the_measured_dashboard_box(self, cd):
         """Re-derived 2026-08-09 from i-09b539c844515d549: every installed unit
         was hash-compared against every repo checkout on the box; 32 matched a
-        root byte-for-byte and left the baseline, 22 matched nothing. Spot-checks
+        root byte-for-byte and left the baseline, 22 matched nothing. The three
+        mnemon units moved to the covered list 2026-08-09: token relocated to an
+        EnvironmentFile, units codified in nous-ergon-ops (ops-PR541). Spot-checks
         both directions, so an edit that drops a genuinely-uncodified unit — or
         re-adds a root-covered one — is caught."""
         module, _, _ = cd
         baseline = module.load_baseline(_REPO_ROOT / "infrastructure" / "systemd" / "uncodified-units-baseline.txt")
 
         for name in (
-            "mnemon.service",
-            "mnemon-sync.service",
-            "mnemon-sync.timer",
             "amazon-cloudwatch-agent.service",
         ):
             assert name in baseline, f"{name} missing from the uncodified baseline"
@@ -393,6 +392,9 @@ class TestCoverageAccounting:
             "ibgateway.service",           # nous-ergon-ops (ops-PR534)
             "certbot-renew.timer",         # nous-ergon-ops
             "ops-config-drift.service",    # nous-ergon-ops (ops-PR535) — never baselined
+            "mnemon.service",              # nous-ergon-ops (ops-PR541) — token relocated to /etc/mnemon/env first (config-I6712)
+            "mnemon-sync.service",         # nous-ergon-ops (ops-PR541)
+            "mnemon-sync.timer",           # nous-ergon-ops (ops-PR541)
         ):
             assert name not in baseline, (
                 f"{name} is covered by a --codified-root and must not be baselined "
