@@ -28,27 +28,6 @@
 # incomplete by construction, and says so rather than implying coverage.
 
 # ── alpha-engine / dashboard box services ──────────────────────────────────
-boot-pull.service              # nous-ergon-ops
-boot-pull.timer                # nous-ergon-ops
-box-health.service             # crucible-dashboard
-box-health.timer               # crucible-dashboard
-box-hygiene.service            # crucible-dashboard
-box-hygiene.timer              # crucible-dashboard
-box-state-backup.service       # crucible-dashboard
-box-state-backup.timer         # crucible-dashboard
-crucible-dash-api.service      # crucible-dashboard
-crucible-dash-web.service      # crucible-dashboard
-dashboard.service              # crucible-dashboard
-emit-oom-metric.service        # crucible-dashboard
-emit-oom-metric.timer          # crucible-dashboard
-nous-ergon-live.service        # UNKNOWN
-nousergon-auth.service         # nousergon-auth
-nousergon-console.service      # nousergon-console
-signal-pull.service            # UNKNOWN
-signal-pull.timer              # UNKNOWN
-signal.service                 # UNKNOWN
-substrate-health-daily.service # nous-ergon-ops
-substrate-health-daily.timer   # nous-ergon-ops
 
 # ── morning-signal ─────────────────────────────────────────────────────────
 # Found live 2026-08-08 (I6567): morning-signal.service took a TimeoutStartSec
@@ -56,33 +35,15 @@ substrate-health-daily.timer   # nous-ergon-ops
 # unit to anything. Its drop-in directory is not covered here either — this
 # checker compares unit FILES; `.d/*.conf` coverage is a separate deliverable
 # on I6656.
-morning-signal.service         # nous-ergon-ops
-morning-signal.timer           # nous-ergon-ops
-morning-signal-bakeoff.service # nous-ergon-ops
-morning-signal-bakeoff.timer   # nous-ergon-ops
-morning-signal-watchdog.service # nous-ergon-ops (repo has infrastructure/ copy, not installed from it)
-morning-signal-watchdog.timer  # nous-ergon-ops (repo has infrastructure/ copy, not installed from it)
 morning-signal-pull.service    # UNKNOWN
 morning-signal-pull.timer      # UNKNOWN
 
 # ── metron ─────────────────────────────────────────────────────────────────
-metron-api.service             # metron-ops
-metron-dash-web.service        # metron-ops
-metron-deploy-drift.service    # metron-ops
-metron-deploy-drift.timer      # metron-ops
-metron-reconcile.service       # metron-ops
-metron-reconcile.timer         # metron-ops
-metron-refresh.service         # metron-ops
-metron-refresh.timer           # metron-ops
-metron-refresh-flex.service    # metron-ops
-metron-refresh-flex.timer      # metron-ops
 
 # ── other products co-tenant on this box ───────────────────────────────────
 mnemon.service                 # mnemon
 mnemon-sync.service            # mnemon
 mnemon-sync.timer              # mnemon
-telos-web.service              # telos-ops
-vires.service                  # vires-ops
 
 # ── shared infrastructure ──────────────────────────────────────────────────
 litellm-proxy.service          # nous-ergon-ops (the model router)
@@ -91,7 +52,4 @@ ibgateway.service              # nous-ergon-ops
 xvfb.service                   # nous-ergon-ops (ibgateway's display)
 certbot-renew.service          # nous-ergon-ops
 certbot-renew.timer            # nous-ergon-ops
-reboot-if-needed.service       # nous-ergon-ops
-reboot-if-needed.timer         # nous-ergon-ops
-alert-on-failure@.service      # nous-ergon-ops (OnFailure= template)
 amazon-cloudwatch-agent.service # vendor-installed; likely never codified here
