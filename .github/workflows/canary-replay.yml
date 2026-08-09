@@ -102,6 +102,19 @@ jobs:
               - 'infrastructure/lambdas/canary-replay-dispatcher/**'
               - 'infrastructure/lambdas/canary-replay-liveness-probe/**'
               - '.github/workflows/canary-replay.yml'
+              # alpha-engine-config-I6688 deliverable 2: the changes most
+              # likely to break a live Saturday (the SF definition itself,
+              # the spot bootstrap scripts, the offcycle rerun path, the
+              # mechanical recovery helper) previously did NOT auto-arm this
+              # canary — the `canary:replay` label was manual for exactly
+              # the PRs where forgetting it mattered most. Kept in lockstep
+              # with scripts/check_rehearsal_path.py's WEEKLY_CRITICAL_GLOBS
+              # and rehearsal-path-guard.yml's own filter by
+              # tests/test_rehearsal_path_guard_lockstep.py.
+              - 'infrastructure/step_function*.json'
+              - 'infrastructure/spot_*.sh'
+              - 'infrastructure/run_weekly_offcycle.sh'
+              - 'scripts/weekly_sf_rerun.py'
       - name: Apply canary:replay label
         if: steps.filter.outputs.weekly_critical == 'true'
         env:
