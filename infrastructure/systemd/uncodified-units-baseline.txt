@@ -39,9 +39,6 @@
 # ── metron ─────────────────────────────────────────────────────────────────
 
 # ── other products co-tenant on this box ───────────────────────────────────
-mnemon.service                 # mnemon — BLOCKED on config#6712: unit embeds the live MNEMON_TOKEN; rotate + EnvironmentFile before codifying
-mnemon-sync.service            # mnemon — codify with mnemon.service after config#6712
-mnemon-sync.timer              # mnemon — codify with mnemon.service after config#6712
 
 # ── shared infrastructure ──────────────────────────────────────────────────
 amazon-cloudwatch-agent.service # vendor-installed; likely never codified here
