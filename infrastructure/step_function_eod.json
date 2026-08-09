@@ -254,8 +254,8 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Hard-fail: EODReconcile depends on this snapshot. No silent fallback to live IB \u2014 that's the whole point of Phase 2.",
-          "Next": "HandleFailure",
+          "Comment": "config#5569: routes into the bounded same-day retry (CheckCaptureSnapshotRetryBudget) instead of straight to HandleFailure. The retry is bounded at 1 and the EVENTUAL failure after it is exhausted still reaches HandleFailure hard \u2014 EODReconcile depends on this snapshot and there is deliberately NO silent fallback to live IB, that's the whole point of Phase 2.",
+          "Next": "CheckCaptureSnapshotRetryBudget",
           "ResultPath": "$.error"
         }
       ],
@@ -295,7 +295,8 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "HandleFailure",
+          "Comment": "config#5569: same bounded same-day retry as CaptureSnapshot's own Catch — a persistent SSM poll failure on this stage is treated as a capture failure, not routed straight to hard-fail.",
+          "Next": "CheckCaptureSnapshotRetryBudget",
           "ResultPath": "$.error"
         }
       ],
@@ -338,7 +339,7 @@
     },
     "SnapshotStatusError": {
       "Type": "Pass",
-      "Comment": "Choice Default path \u2014 synthesize $.error from poll result.",
+      "Comment": "Choice Default path \u2014 synthesize $.error from poll result. config#5569: routes into the bounded same-day retry, not straight to HandleFailure.",
       "Parameters": {
         "source": "snapshot_status",
         "status.$": "$.snapshot_poll.Status",
@@ -348,6 +349,83 @@
         "instance_id.$": "$.snapshot_poll.InstanceId"
       },
       "ResultPath": "$.error",
+      "Next": "CheckCaptureSnapshotRetryBudget"
+    },
+    "CheckCaptureSnapshotRetryBudget": {
+      "Type": "Choice",
+      "Comment": "config#5569 deliverable #1: CaptureSnapshot has an irreversible per-day deadline the generic re-runnable EOD stages do not (alpha-engine-config-I5325 lost 2026-07-27 permanently when this stage failed with no same-day retry). Bounded at exactly 1 retry, mirroring CheckDataSpotRetryBudget's one-retry-then-terminal policy \u2014 the FIRST failure pages immediately (PageCaptureSnapshotFailureImmediate) and retries once; a SECOND consecutive failure is the exhausted/irreversible-deadline path. $.capture_snapshot_retry is always initialized by InitCaptureSnapshotRetryCounter before this state is reachable.",
+      "Choices": [
+        {
+          "Variable": "$.capture_snapshot_retry.attempts",
+          "NumericLessThan": 1,
+          "Next": "PageCaptureSnapshotFailureImmediate"
+        }
+      ],
+      "Default": "CaptureSnapshotRetryExhausted"
+    },
+    "PageCaptureSnapshotFailureImmediate": {
+      "Type": "Task",
+      "Comment": "config#5569 deliverable #2 (immediate half): page SAME-DAY on the FIRST CaptureSnapshot failure, before the bounded retry below even runs \u2014 so an operator has the whole retry window to react instead of learning about it only if the retry also fails. Own Catch (mirrors PublishDataSpotFailureImmediate's SNS-with-own-Catch shape) so an SNS-side failure cannot block the retry path.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD CaptureSnapshot failed \u2014 same-day retry in flight",
+        "Message.$": "States.Format('CaptureSnapshot failed for run_date={}. This stage has NO next-day recovery path: eod_reconcile requires the S3 snapshot to exist and it cannot be reconstructed after midnight (alpha-engine-config-I5325 lost 2026-07-27 this way). One bounded same-day retry is launching now \u2014 if it ALSO fails this pages again as an IRREVERSIBLE-DEADLINE failure requiring action before midnight. Detail: {}', $.run_date, States.JsonToString($.error))"
+      },
+      "ResultPath": "$.capture_snapshot_page_notify",
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "IncrementCaptureSnapshotRetry"
+        }
+      ],
+      "Next": "IncrementCaptureSnapshotRetry"
+    },
+    "IncrementCaptureSnapshotRetry": {
+      "Type": "Pass",
+      "Comment": "config#5569: consume the single same-day retry \u2014 no force_on_demand analog (CaptureSnapshot runs on the already-running trading box via SSM, not a spot dispatcher).",
+      "Parameters": {
+        "attempts.$": "States.MathAdd($.capture_snapshot_retry.attempts, 1)"
+      },
+      "ResultPath": "$.capture_snapshot_retry",
+      "Next": "CaptureSnapshot"
+    },
+    "CaptureSnapshotRetryExhausted": {
+      "Type": "Pass",
+      "Comment": "config#5569: the single same-day retry has now also failed \u2014 this IS the irreversible-deadline moment: trades/snapshots/{run_date}.json will not exist and eod_reconcile can never run for run_date after midnight (alpha-engine-config-I5325 precedent, lost 2026-07-27). Normalize a distinct error payload ahead of the terminal page + HandleFailure.",
+      "Parameters": {
+        "source": "capture_snapshot_retry_exhausted",
+        "run_date.$": "$.run_date",
+        "attempts.$": "$.capture_snapshot_retry.attempts",
+        "last_error.$": "$.error"
+      },
+      "ResultPath": "$.error",
+      "Next": "PageCaptureSnapshotIrreversibleFailure"
+    },
+    "PageCaptureSnapshotIrreversibleFailure": {
+      "Type": "Task",
+      "Comment": "config#5569 deliverable #2 (terminal half): a DISTINCT same-day page from the ordinary EOD-stage HandleFailure notify \u2014 marked IRREVERSIBLE-DEADLINE because the required operator response differs (act before midnight UTC or the day's correction path is permanently gone; there is no tomorrow for this one). Own Catch (mirrors PublishDataSpotFailureImmediate's SNS-with-own-Catch shape) so an SNS-side failure cannot block the hard-fail path into HandleFailure. HandleFailure remains the terminal sink \u2014 this stage still hard-fails with NO silent fallback to live IB, that constraint is deliberate (Phase 2 cutover) and unchanged by this retry.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD CaptureSnapshot IRREVERSIBLE FAILURE \u2014 act before midnight",
+        "Message.$": "States.Format('CaptureSnapshot failed twice for run_date={} (same-day retry budget exhausted). trades/snapshots/{}.json will NOT exist and eod_reconcile CANNOT run for this date after midnight UTC \u2014 the correction path is permanently gone (alpha-engine-config-I5325, lost 2026-07-27 the same way). This needs a same-day operator response now, not next-day reconcile_audit triage. Detail: {}', $.run_date, $.run_date, States.JsonToString($.error))"
+      },
+      "ResultPath": "$.capture_snapshot_irreversible_notify",
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "HandleFailure"
+        }
+      ],
       "Next": "HandleFailure"
     },
     "SnapshotWait": {
@@ -1098,7 +1176,16 @@
           "Next": "ProbeEODReconcilePrecondition"
         }
       ],
-      "Default": "CaptureSnapshot"
+      "Default": "InitCaptureSnapshotRetryCounter"
+    },
+    "InitCaptureSnapshotRetryCounter": {
+      "Type": "Pass",
+      "Comment": "config#5569: retry budget for the same-day bounded CaptureSnapshot retry — mirrors InitDataSpotRetryCounter. CaptureSnapshot is the EOD pipeline's only stage with an irreversible per-day deadline (trades/snapshots/{run_date}.json must exist before midnight or eod_reconcile's correction path is permanently gone — alpha-engine-config-I5325 lost 2026-07-27 this way), so unlike the generic re-runnable stages this counter exists specifically to bound ONE same-day retry before the terminal irreversible-deadline page.",
+      "Result": {
+        "attempts": 0
+      },
+      "ResultPath": "$.capture_snapshot_retry",
+      "Next": "CaptureSnapshot"
     },
     "ProbeEODReconcilePrecondition": {
       "Type": "Task",
