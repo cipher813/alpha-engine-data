@@ -1,0 +1,91 @@
+name: Deploy sf-telegram-notifier
+
+# Auto-deploy the alpha-engine-sf-telegram-notifier Lambda CODE on merge to
+# main.
+#
+# Why this exists (nousergon-data-i5289 / alpha-engine-config#5289): this
+# Lambda's deploy.sh header said "operator-deployed only" and had no deploy
+# workflow — mirrors the exact gap deploy-pipeline-watchdog.yml was created
+# to close (nousergon-data#1148 / alpha-engine-config#5606): a merged fix
+# that never reaches production leaves the tracker saying "fixed" while the
+# live Lambda still runs the old code. Code only: deploy.sh with no flags is
+# its update-code path. --bootstrap/--apply-iam (IAM role/policy, EventBridge
+# rules) stay operator-run, so this workflow cannot create or rewire
+# infrastructure or IAM — only ship code to a function that already exists.
+#
+# IAM: no change needed. github-actions-lambda-deploy's LambdaUpdate
+# statement already grants GetFunction / GetFunctionConfiguration /
+# UpdateFunctionCode / UpdateFunctionConfiguration on
+# arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-*, which covers
+# alpha-engine-sf-telegram-notifier (verified against
+# nous-ergon-ops/infrastructure/iam/github-actions-lambda-deploy/
+# github-actions-lambda-deploy-policy.json, 2026-08-09). This PR's new
+# EodArtifactVerificationRead S3 grant in iam-policy.json is NOT applied by
+# this workflow — it needs an operator `deploy.sh --apply-iam` run.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/lambdas/sf-telegram-notifier/**'
+      - '.github/workflows/deploy-sf-telegram-notifier.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-sf-telegram-notifier-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy sf-telegram-notifier Lambda (code-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: alpha-engine-data
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12 (match Lambda runtime)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Deploy sf-telegram-notifier (code-only)
+        working-directory: alpha-engine-data
+        run: bash infrastructure/lambdas/sf-telegram-notifier/deploy.sh
+
+      - name: Report deployed version
+        working-directory: alpha-engine-data
+        run: |
+          echo "Deployed commit: ${{ github.sha }}"
+          aws lambda get-function \
+            --function-name alpha-engine-sf-telegram-notifier \
+            --query "Configuration.[LastModified,CodeSha256]" \
+            --output text
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@8a904b7a817901f2520dd87131ff307ed97fee02 # main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: deploy-sf-telegram-notifier.yml
+
+  # Alert (Telegram) on genuine post-merge failure on the default branch.
+  # Reusable workflow + transport in nousergon-lib. config#1128.
+  notify-main-failure:
+    needs: [deploy]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit
