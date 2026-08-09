@@ -87,8 +87,17 @@ class TestChainOrdering:
         )
 
     def test_substrate_check_routes_to_wait_state(self, states):
+        # alpha-engine-config-I5687: WeeklySubstrateHealthCheck dispatches
+        # through the poll-budget seed (InitSubstrateHealthCheckPollCount)
+        # before the first poll, mirroring DataPhase2/ThinkTank.
         assert states["WeeklySubstrateHealthCheck"]["Next"] == (
+            "InitSubstrateHealthCheckPollCount"
+        )
+        assert states["InitSubstrateHealthCheckPollCount"]["Next"] == (
             "WaitForWeeklySubstrateHealthCheck"
+        )
+        assert states["InitSubstrateHealthCheckPollCount"]["ResultPath"] == (
+            "$.substrate_check_polls"
         )
 
     def test_wait_for_substrate_routes_to_notify_complete(self, states):
