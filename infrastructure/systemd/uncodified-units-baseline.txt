@@ -1,0 +1,97 @@
+# Units installed on a fleet box that are codified in NO repo tree this
+# checker can see. This is a WORK QUEUE, not a permitted-list: every line is
+# a unit that can be hand-edited on a live box with nothing anywhere
+# noticing, and the file should only ever get shorter.
+#
+# Seeded 2026-08-08 from the dashboard box (i-09b539c844515d549), which had
+# 60 locally-installed unit files against a checker that probed 4 — not even
+# the 6 this repo already codifies, so it did not check its own
+# systemd-unit-drift-check.{service,timer} either.
+# alpha-engine-config-I6656.
+#
+# Why a baseline at all: failing on all 54 at once would page once per unit
+# on the first run and teach the reader to turn the check off. A unit NOT in
+# this file is reported as `uncodified-NEW` and named individually, so a
+# newly hand-installed unit is visible immediately rather than blending into
+# a count. `--strict` fails on anything uncodified and is the end state once
+# this file is empty.
+#
+# The comment after each name is the repo that SHOULD own it per
+# infrastructure-ownership-policy (deploy scripts, systemd units and IAM live
+# in the operated-system assembly, i.e. nous-ergon-ops, unless the owning
+# product repo already carries an infrastructure/ tree). Where it says
+# UNKNOWN, that is itself the finding.
+#
+# NOTE: seeded from ONE box. The trading box runs its own set; its entries
+# are added the first time the checker runs there and names them, which is
+# exactly what the `uncodified-NEW` bucket is for. Until then this file is
+# incomplete by construction, and says so rather than implying coverage.
+
+# ── alpha-engine / dashboard box services ──────────────────────────────────
+boot-pull.service              # nous-ergon-ops
+boot-pull.timer                # nous-ergon-ops
+box-health.service             # crucible-dashboard
+box-health.timer               # crucible-dashboard
+box-hygiene.service            # crucible-dashboard
+box-hygiene.timer              # crucible-dashboard
+box-state-backup.service       # crucible-dashboard
+box-state-backup.timer         # crucible-dashboard
+crucible-dash-api.service      # crucible-dashboard
+crucible-dash-web.service      # crucible-dashboard
+dashboard.service              # crucible-dashboard
+emit-oom-metric.service        # crucible-dashboard
+emit-oom-metric.timer          # crucible-dashboard
+nous-ergon-live.service        # UNKNOWN
+nousergon-auth.service         # nousergon-auth
+nousergon-console.service      # nousergon-console
+signal-pull.service            # UNKNOWN
+signal-pull.timer              # UNKNOWN
+signal.service                 # UNKNOWN
+substrate-health-daily.service # nous-ergon-ops
+substrate-health-daily.timer   # nous-ergon-ops
+
+# ── morning-signal ─────────────────────────────────────────────────────────
+# Found live 2026-08-08 (I6567): morning-signal.service took a TimeoutStartSec
+# and three router env vars via drop-ins, on a box where nothing compares the
+# unit to anything. Its drop-in directory is not covered here either — this
+# checker compares unit FILES; `.d/*.conf` coverage is a separate deliverable
+# on I6656.
+morning-signal.service         # nous-ergon-ops
+morning-signal.timer           # nous-ergon-ops
+morning-signal-bakeoff.service # nous-ergon-ops
+morning-signal-bakeoff.timer   # nous-ergon-ops
+morning-signal-watchdog.service # nous-ergon-ops (repo has infrastructure/ copy, not installed from it)
+morning-signal-watchdog.timer  # nous-ergon-ops (repo has infrastructure/ copy, not installed from it)
+morning-signal-pull.service    # UNKNOWN
+morning-signal-pull.timer      # UNKNOWN
+
+# ── metron ─────────────────────────────────────────────────────────────────
+metron-api.service             # metron-ops
+metron-dash-web.service        # metron-ops
+metron-deploy-drift.service    # metron-ops
+metron-deploy-drift.timer      # metron-ops
+metron-reconcile.service       # metron-ops
+metron-reconcile.timer         # metron-ops
+metron-refresh.service         # metron-ops
+metron-refresh.timer           # metron-ops
+metron-refresh-flex.service    # metron-ops
+metron-refresh-flex.timer      # metron-ops
+
+# ── other products co-tenant on this box ───────────────────────────────────
+mnemon.service                 # mnemon
+mnemon-sync.service            # mnemon
+mnemon-sync.timer              # mnemon
+telos-web.service              # telos-ops
+vires.service                  # vires-ops
+
+# ── shared infrastructure ──────────────────────────────────────────────────
+litellm-proxy.service          # nous-ergon-ops (the model router)
+llm-egress-proxy.service       # nous-ergon-ops (the DLP egress proxy)
+ibgateway.service              # nous-ergon-ops
+xvfb.service                   # nous-ergon-ops (ibgateway's display)
+certbot-renew.service          # nous-ergon-ops
+certbot-renew.timer            # nous-ergon-ops
+reboot-if-needed.service       # nous-ergon-ops
+reboot-if-needed.timer         # nous-ergon-ops
+alert-on-failure@.service      # nous-ergon-ops (OnFailure= template)
+amazon-cloudwatch-agent.service # vendor-installed; likely never codified here

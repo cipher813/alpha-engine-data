@@ -253,6 +253,20 @@ _REGISTRY: dict[str, dict[str, list[dict]]] = {
                 "citation": "reconciled from live code 2026-07-31 — pending taxonomy entry",
             },
         ],
+        # alpha-engine-config-I6613. Deliberately a tier above its sibling
+        # above: over budget is a number to look at, an unfunded account is
+        # every lane routed through it down at once — and the lanes cannot
+        # report it, because they die on the 402 before they can. The
+        # 2026-08-05..08 DeepSeek exhaustion ran three days on exactly that
+        # asymmetry, through a live trading outage.
+        "_alert_balance_depletion": [
+            {
+                "event_class": "Provider prepaid balance depletion",
+                "severity": "critical",
+                "silent": False,
+                "citation": "alpha-engine-config-I6613 (2026-08-08) — pending taxonomy entry",
+            },
+        ],
     },
     "infrastructure/lambdas/ci-watch-liveness-probe/index.py": {
         "_escalate": [
