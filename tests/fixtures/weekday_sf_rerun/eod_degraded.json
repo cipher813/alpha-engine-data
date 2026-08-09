@@ -1,0 +1,740 @@
+{
+ "events": [
+  {
+   "type": "ExecutionStarted",
+   "id": 1,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "executionStartedEventDetails": {
+    "input": "{\"sns_topic_arn\": \"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\", \"trading_instance_id\": [\"i-0123456789abcdef0\"], \"run_date\": \"2026-08-07\", \"pipeline_role\": \"eod\"}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 2,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "CheckMutexRole",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 3,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "AcquireMutex",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 4,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "AcquireMutex",
+    "output": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 5,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "StartTradingInstance",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 6,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "StartTradingInstance",
+    "output": "{}"
+   }
+  },
+  {
+   "type": "WaitStateEntered",
+   "id": 7,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "WaitForInstanceReady",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "WaitStateExited",
+   "id": 8,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "WaitForInstanceReady",
+    "output": "{}"
+   }
+  },
+  {
+   "type": "PassStateEntered",
+   "id": 9,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "InitSSMPollCounter",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "PassStateExited",
+   "id": 10,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "InitSSMPollCounter",
+    "output": "{\"attempts\": 0}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 11,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "DescribeInstanceInfo",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 12,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "DescribeInstanceInfo",
+    "output": "{\"InstanceInformationList\": [{\"PingStatus\": \"Online\"}]}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 13,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "SSMReadyChoice",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 14,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipRefreshExecutorDeploy",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 15,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "RefreshExecutorDeploy",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 16,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "RefreshExecutorDeploy",
+    "output": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 17,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "WaitForRefreshExecutorDeploy",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 18,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "WaitForRefreshExecutorDeploy",
+    "output": "{\"Status\": \"Success\"}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 19,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "CheckRefreshExecutorDeployStatus",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 20,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipPostMarketData",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "PassStateEntered",
+   "id": 21,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "InitDataSpotRetryCounter",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "PassStateExited",
+   "id": 22,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "InitDataSpotRetryCounter",
+    "output": "{\"attempts\": 0, \"force_on_demand\": false}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 23,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "LaunchPostMarketDataSpot",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 24,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "LaunchPostMarketDataSpot",
+    "output": "{\"data_spot\": {\"launched\": true}}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 25,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "CheckPostMarketDataSpotLaunched",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 26,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "PollPostMarketDataSpot",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 27,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "PollPostMarketDataSpot",
+    "output": "{\"Status\": \"Success\"}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 28,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "CheckPostMarketDataSpotStatus",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "PassStateEntered",
+   "id": 29,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "InitDataSpotArcticRetryCounter",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "PassStateExited",
+   "id": 30,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "InitDataSpotArcticRetryCounter",
+    "output": "{\"attempts\": 0, \"force_on_demand\": false}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 31,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "LaunchPostMarketArcticAppendSpot",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 32,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "LaunchPostMarketArcticAppendSpot",
+    "output": "{\"data_spot\": {\"launched\": true}}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 33,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "CheckPostMarketArcticAppendSpotLaunched",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 34,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "PollPostMarketArcticAppendSpot",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 35,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "PollPostMarketArcticAppendSpot",
+    "output": "{\"Status\": \"Success\"}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 36,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "CheckPostMarketArcticAppendSpotStatus",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 37,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipCaptureSnapshot",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 38,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "CaptureSnapshot",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 39,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "CaptureSnapshot",
+    "output": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 40,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "WaitForCaptureSnapshot",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 41,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "WaitForCaptureSnapshot",
+    "output": "{\"Status\": \"Success\"}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 42,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "CheckSnapshotStatus",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 43,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "ProbeEODReconcilePrecondition",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 44,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "ProbeEODReconcilePrecondition",
+    "output": "{\"Payload\": {\"precondition_met\": false}}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 45,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "CheckSkipEODReconcile",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 46,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "SkipEODReconcileDataGap",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 47,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "SkipEODReconcileDataGap",
+    "output": "{}"
+   }
+  },
+  {
+   "type": "PassStateEntered",
+   "id": 48,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "SetDegradedFlag",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "PassStateExited",
+   "id": 49,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "SetDegradedFlag",
+    "output": "{\"degraded\": true, \"reason\": \"eod_reconcile_skipped_data_gap\"}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 50,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "CheckHealLoopEligible",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "PassStateEntered",
+   "id": 51,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "InitHealLoop",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "PassStateExited",
+   "id": 52,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "InitHealLoop",
+    "output": "{\"attempts\": 0}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 53,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "HealLoopGate",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 54,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "HealLaunchPostMarketDataSpot",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 55,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "HealLaunchPostMarketDataSpot",
+    "output": "{\"data_spot\": {\"launched\": true}}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 56,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "HealCheckPostMarketDataSpotLaunched",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 57,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "HealPollPostMarketDataSpot",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 58,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "HealPollPostMarketDataSpot",
+    "output": "{\"Status\": \"Success\"}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 59,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "HealCheckPostMarketDataSpotStatus",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 60,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "HealLaunchArcticAppendSpot",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 61,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "HealLaunchArcticAppendSpot",
+    "output": "{\"data_spot\": {\"launched\": true}}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 62,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "HealCheckArcticAppendSpotLaunched",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 63,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "HealPollArcticAppendSpot",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 64,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "HealPollArcticAppendSpot",
+    "output": "{\"Status\": \"Success\"}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 65,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "HealCheckArcticAppendSpotStatus",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 66,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "HealReProbe",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 67,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "HealReProbe",
+    "output": "{\"Payload\": {\"precondition_met\": false}}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 68,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "HealCheckConverged",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "PassStateEntered",
+   "id": 69,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "HealLoopIncrement",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "PassStateExited",
+   "id": 70,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "HealLoopIncrement",
+    "output": "{\"attempts\": 1}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 71,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "HealLoopGate",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 72,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "HealNonConvergent",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 73,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "HealNonConvergent",
+    "output": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 74,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "StopTradingInstance",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 75,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "StopTradingInstance",
+    "output": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 76,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "LaunchWeeklyExerciseRun",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 77,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "LaunchWeeklyExerciseRun",
+    "output": "{}"
+   }
+  },
+  {
+   "type": "ChoiceStateEntered",
+   "id": 78,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "CheckDegradedOutcome",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateEntered",
+   "id": 79,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "WriteCompletionMarkerDegraded",
+    "input": "{}"
+   }
+  },
+  {
+   "type": "TaskStateExited",
+   "id": 80,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateExitedEventDetails": {
+    "name": "WriteCompletionMarkerDegraded",
+    "output": "{}"
+   }
+  },
+  {
+   "type": "FailStateEntered",
+   "id": 81,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "stateEnteredEventDetails": {
+    "name": "DegradedRun"
+   }
+  },
+  {
+   "type": "ExecutionFailed",
+   "id": 82,
+   "timestamp": "2026-08-07T13:05:00Z",
+   "executionFailedEventDetails": {
+    "error": "DegradedRun",
+    "cause": "..."
+   }
+  }
+ ]
+}
