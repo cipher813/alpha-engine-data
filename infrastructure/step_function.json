@@ -4668,7 +4668,7 @@
           "dry_run.$": "$.research_dry"
         }
       },
-      "TimeoutSeconds": 300,
+      "TimeoutSeconds": 930,
       "Retry": [
         {
           "ErrorEquals": [
