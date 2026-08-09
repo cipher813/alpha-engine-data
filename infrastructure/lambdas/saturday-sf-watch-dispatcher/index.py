@@ -310,10 +310,19 @@ OPERATOR_ABORT_ERRORS = frozenset({"OperatorAbort"})
 # pile-on that motivated the original config#2003 blanket suppression is
 # bounded by the config#2269 per-day dispatch ceiling + the charter's
 # same-error escalation rule for BOTH rerun kinds now, not a name-based guard.
-# Bound the history scan: fetch the newest N events (reverseOrder), reconstruct
-# chronological order locally to find the entered-but-not-exited state. The
+# Bound the history scan: fetch the newest N events per page (reverseOrder),
+# reconstruct chronological order locally to find the culprit state. The
 # failed state's enclosing StateEntered is always in the tail of the history.
 _HISTORY_MAX_EVENTS = 1000
+# alpha-engine-config-I6616: a single reverseOrder page can miss the culprit
+# state on a long-running execution (Map/Parallel fan-out, many retries). Page
+# BACKWARD (reverseOrder=True + nextToken) up to this many pages — never
+# forward-paginate with a fixed page cap, which is the earlier sf-digest bug
+# class (it hit a 20-page cap walking forward and rendered "(no workload
+# states in history)" instead of degrading honestly). 5 * 1000 = 5000 events
+# is a generous bound for a fleet SF execution; still finite, per the issue's
+# "bound the walk sensibly" ask.
+_HISTORY_MAX_PAGES = 5
 
 
 def _sf_client():
@@ -469,41 +478,296 @@ def _is_preflight(describe_resp: dict | None) -> bool:
     return bool(payload.get("shell_run"))
 
 
-def _failed_state_from_history(execution_arn: str) -> str | None:
-    """Return the name of the state that was active (entered, not yet exited)
-    when the execution failed — i.e. the culprit state.
+# alpha-engine-config-I6616 fallback ONLY — used when the watched state
+# machine's own definition cannot be fetched/parsed (permissions, throttling,
+# a malformed ASL doc). The daily pipeline's known names are still correct
+# for 2 of the 3 fleet SFs and strictly better than treating nothing as a
+# funnel state; NEVER the sole/primary mechanism (see
+# ``_failure_handling_states`` — the real derivation reads the definition
+# being watched, so the weekly/postclose pipelines' own terminal-state names
+# are handled without hardcoding them here too).
+_DEFAULT_FAILURE_HANDLING_STATES = frozenset({"HandleFailure", "FailExecution"})
 
-    Fetches the newest ``_HISTORY_MAX_EVENTS`` events (reverseOrder), reverses
-    them to chronological order, and tracks the entered-but-not-exited state via
-    a forward scan. A state that fails enters but never cleanly exits, so it is
-    the one left dangling at the terminal failure event. Best-effort: returns
-    ``None`` on any API error (recorded in the artifact).
-    """
-    if not execution_arn:
+# Minimal ASL Choice-rule comparators (alpha-engine-config-I6616 deliverable
+# 2): every comparator this fleet's SF definitions actually use as of
+# 2026-08. Add more here (not a bespoke parallel evaluator) if a future
+# definition needs one — TimestampEquals/StringLessThan/etc. are NOT
+# implemented; an unrecognized comparator simply fails to match (never raises,
+# never fabricates a match).
+_ASL_COMPARATORS = {
+    "BooleanEquals": lambda a, b: isinstance(a, bool) and a is b,
+    "StringEquals": lambda a, b: a == b,
+    "NumericEquals": lambda a, b: a is not None and a == b,
+    "NumericGreaterThan": lambda a, b: a is not None and a > b,
+    "NumericGreaterThanEquals": lambda a, b: a is not None and a >= b,
+    "NumericLessThan": lambda a, b: a is not None and a < b,
+    "NumericLessThanEquals": lambda a, b: a is not None and a <= b,
+}
+
+
+def _describe_state_machine_states(state_machine_arn: str) -> dict | None:
+    """Best-effort: the ASL ``States`` mapping for ``state_machine_arn``, or
+    ``None`` on any failure. One ``describe_state_machine`` call, reused by
+    both the failure-handling-set derivation and the Choice-detail lookup
+    below — never a per-purpose duplicate call."""
+    if not state_machine_arn:
         return None
     try:
-        resp = _sf_client().get_execution_history(
-            executionArn=execution_arn,
-            maxResults=_HISTORY_MAX_EVENTS,
-            reverseOrder=True,
-            includeExecutionData=False,
+        resp = _sf_client().describe_state_machine(stateMachineArn=state_machine_arn)
+        definition = json.loads(resp.get("definition") or "")
+    except Exception as exc:  # noqa: BLE001 — enrichment, degrades to the default sink
+        logger.warning(
+            "describe_state_machine/definition parse failed for %s: %s — "
+            "falling back to the known daily-pipeline failure-handling names",
+            state_machine_arn, exc,
         )
+        return None
+    states = definition.get("States") if isinstance(definition, dict) else None
+    return states if isinstance(states, dict) else None
+
+
+def _failure_handling_states(states: dict | None) -> frozenset[str]:
+    """The terminal failure-handling state set for a state machine: every
+    ``Type: Fail`` state, plus any state whose ONLY transition is an
+    unconditional ``Next`` DIRECTLY into one of those Fail states — one relay
+    hop, not a transitive closure. A ``Choice`` state is NEVER added — by
+    definition it can route to more than one place, which is exactly why it
+    is a genuine culprit (e.g. ``DeployDriftGate``) rather than a
+    failure-handling relay (e.g. ``HandleFailure``).
+
+    Deliberately non-transitive: measured against all three live fleet
+    definitions (``step_function_daily.json``, ``step_function.json``
+    (saturday/weekly), ``step_function_eod.json``), the funnel is always
+    exactly one relay hop (``HandleFailure``/``ForceStopInstance``/etc. ->
+    their own Fail state) — genuinely diagnostic upstream states
+    (``CodeFreshnessPollTimeout``, ``MorningPlannerPollTimeout``,
+    ``StampMorningPlannerUnresponsive``, ...) ALSO have an unconditional
+    single ``Next`` that eventually reaches the same Fail state, but only
+    via ANOTHER relay (``HandleFailure``) in between. A transitive/fixed-point
+    closure would sweep those genuinely diagnostic states into the funnel too
+    — exactly the loss of discriminating power the issue exists to fix, just
+    one layer further back. Capping at one hop keeps every real upstream
+    diagnostic state reportable as its own culprit.
+
+    Derived from the DEFINITION BEING WATCHED (alpha-engine-config-I6616
+    Gotcha #2) — the weekly and postclose pipelines use their own
+    terminal-state names, never assumed to be ``HandleFailure``/
+    ``FailExecution``. Falls back to ``_DEFAULT_FAILURE_HANDLING_STATES`` only
+    when the definition itself could not be read (see
+    ``_describe_state_machine_states``); an empty-but-real definition (no Fail
+    state at all) resolves to that same default harmlessly, since neither
+    name will match anything in a differently-shaped definition.
+    """
+    if not states:
+        return _DEFAULT_FAILURE_HANDLING_STATES
+    fail_states = {
+        name for name, s in states.items()
+        if isinstance(s, dict) and s.get("Type") == "Fail"
+    }
+    sink = set(fail_states)
+    for name, s in states.items():
+        if name in sink or not isinstance(s, dict):
+            continue
+        nxt = s.get("Next")
+        if nxt and "Choices" not in s and nxt in fail_states:
+            sink.add(name)
+    return frozenset(sink) or _DEFAULT_FAILURE_HANDLING_STATES
+
+
+def _resolve_json_path(data, path: str):
+    """Minimal ``$.a.b.c`` dot-path resolver — every ``Variable`` in this
+    fleet's ASL Choice rules is a plain dot-path (no array/filter syntax).
+    Returns ``None`` on any missing segment or non-dict traversal."""
+    if not isinstance(path, str) or not path.startswith("$"):
+        return None
+    cur = data
+    remainder = path[1:].lstrip(".")
+    for seg in remainder.split(".") if remainder else []:
+        if not isinstance(cur, dict) or seg not in cur:
+            return None
+        cur = cur[seg]
+    return cur
+
+
+def _eval_choice_rule(rule: dict, data) -> bool:
+    """Evaluate one ASL Choice rule (incl. And/Or/Not composites) against the
+    state's captured input. Best-effort within the caller's try/except — an
+    unrecognized comparator (not in ``_ASL_COMPARATORS``) simply fails to
+    match rather than raising."""
+    if "And" in rule:
+        return all(_eval_choice_rule(r, data) for r in rule["And"])
+    if "Or" in rule:
+        return any(_eval_choice_rule(r, data) for r in rule["Or"])
+    if "Not" in rule:
+        return not _eval_choice_rule(rule["Not"], data)
+    path = rule.get("Variable")
+    if path is None:
+        return False
+    value = _resolve_json_path(data, path)
+    if "IsPresent" in rule:
+        return (value is not None) == bool(rule["IsPresent"])
+    for op, comparator in _ASL_COMPARATORS.items():
+        if op in rule:
+            return comparator(value, rule[op])
+    return False
+
+
+def _describe_choice_rule(rule: dict) -> str:
+    """Render a matched Choice rule as the compact ``variable op value``
+    string surfaced in ``failed_state_detail`` (e.g.
+    ``drift_result.Payload.has_drift BooleanEquals True``)."""
+    if "And" in rule:
+        return " AND ".join(_describe_choice_rule(r) for r in rule["And"])
+    if "Or" in rule:
+        return " OR ".join(_describe_choice_rule(r) for r in rule["Or"])
+    if "Not" in rule:
+        return f"NOT ({_describe_choice_rule(rule['Not'])})"
+    path = rule.get("Variable", "?")
+    if "IsPresent" in rule:
+        return f"{path} IsPresent={rule['IsPresent']}"
+    for op in _ASL_COMPARATORS:
+        if op in rule:
+            return f"{path} {op} {rule[op]}"
+    return str(path)
+
+
+def _matched_choice_rule(
+    states: dict | None, culprit: str | None, choice_input, sink: frozenset[str],
+) -> str | None:
+    """For a Choice-type culprit, the specific rule whose ``Next`` routes into
+    the failure-handling set AND evaluates True against the captured input —
+    deliverable 2's "condition that matched and the input field it read".
+    ``None`` (never a guess) when the definition, input, or a matching rule is
+    unavailable."""
+    if not states or not culprit or not isinstance(choice_input, dict):
+        return None
+    state = states.get(culprit) or {}
+    if state.get("Type") != "Choice":
+        return None
+    for choice in state.get("Choices") or []:
+        if choice.get("Next") not in sink:
+            continue
+        try:
+            if _eval_choice_rule(choice, choice_input):
+                return _describe_choice_rule(choice)
+        except Exception:  # noqa: BLE001 — best-effort detail, never blocks the state name
+            continue
+    return None
+
+
+def _failed_state_from_history(
+    execution_arn: str, state_machine_arn: str = "",
+) -> tuple[str | None, str | None]:
+    """Return ``(failed_state, failed_state_detail)`` — the state that
+    ACTUALLY caused the routing into failure, not the terminal ``Fail`` state
+    every routed failure shares (alpha-engine-config-I6616).
+
+    Fetches the execution history newest-first (``reverseOrder=True``),
+    paginated backward up to ``_HISTORY_MAX_PAGES`` (never forward-paginated —
+    see that constant's comment for the bug class this avoids), then walks it
+    chronologically tracking two signals:
+
+    - ``last_seen``: the most recently ENTERED state name, updated on every
+      ``StateEntered`` and never cleared on exit. This is what survives past a
+      clean exit — a ``Choice`` state (e.g. ``DeployDriftGate``) enters AND
+      exits normally before its matched rule's ``Next`` routes to
+      ``HandleFailure``, so a dangling-only search loses it the instant it
+      exits.
+    - ``dangling``: the entered-but-not-yet-exited state at any point — the
+      pre-I6616 signal, still correct for an execution that fails WITHOUT
+      ever entering the failure-handling funnel (an unhandled error
+      propagating straight to ``ExecutionFailed`` — the 2026-08-03
+      ``S3.AccessDeniedException`` shape named in the issue's Gotchas).
+
+    The failure-handling set (``_failure_handling_states``, derived from the
+    watched definition) is checked on every ``StateEntered``. The FIRST time
+    it is entered, the resolved culprit is ``last_seen`` AS OF JUST BEFORE
+    that entry — even when that is ``None`` (a funnel entered with no prior
+    state on record is reported honestly as unknown, never the funnel's own
+    name — the degenerate case named in the issue's Gotchas). When the funnel
+    is never entered at all, the resolved culprit is ``dangling``.
+
+    ``failed_state_detail`` carries whatever discriminating payload is cheaply
+    available for the resolved culprit: a Task failure's ``error``/``cause``
+    (deliverable 2), or — for a Choice-type culprit — the specific rule that
+    matched (via ``_matched_choice_rule``). ``None`` when neither applies.
+
+    Best-effort: returns ``(None, None)`` on any execution-history API error.
+    """
+    if not execution_arn:
+        return None, None
+    states = _describe_state_machine_states(state_machine_arn)
+    sink = _failure_handling_states(states)
+
+    events: list[dict] = []
+    token: str | None = None
+    try:
+        for _ in range(_HISTORY_MAX_PAGES):
+            kwargs = {
+                "executionArn": execution_arn,
+                "maxResults": _HISTORY_MAX_EVENTS,
+                "reverseOrder": True,
+                "includeExecutionData": True,
+            }
+            if token:
+                kwargs["nextToken"] = token
+            resp = _sf_client().get_execution_history(**kwargs)
+            events.extend(resp.get("events", []))
+            token = resp.get("nextToken")
+            if not token:
+                break
     except Exception as exc:  # noqa: BLE001 — enrichment, recorded in artifact
         logger.warning("get_execution_history failed for %s: %s", execution_arn, exc)
-        return None
+        return None, None
 
-    events = list(reversed(resp.get("events", [])))  # → chronological
-    current: str | None = None
-    for ev in events:
+    chronological = list(reversed(events))  # newest-first pages → oldest-first overall
+    last_seen: str | None = None
+    dangling: str | None = None
+    pre_sink: str | None = None
+    entered_sink = False
+    choice_input = None
+    task_failed_detail: str | None = None
+
+    for ev in chronological:
         etype = ev.get("type", "")
         if etype.endswith("StateEntered"):
             det = ev.get("stateEnteredEventDetails") or {}
-            current = det.get("name") or current
+            name = det.get("name")
+            if not name:
+                continue
+            if not entered_sink and name in sink:
+                entered_sink = True
+                pre_sink = last_seen
+            elif not entered_sink:
+                # Still on the candidate-culprit path — remember its input so
+                # a Choice culprit's matched rule can be resolved afterward.
+                try:
+                    choice_input = json.loads(det.get("input") or "null")
+                except (ValueError, TypeError):
+                    choice_input = None
+            last_seen = name
+            dangling = name
         elif etype.endswith("StateExited"):
             det = ev.get("stateExitedEventDetails") or {}
-            if det.get("name") == current:
-                current = None
-    return current
+            if det.get("name") == dangling:
+                dangling = None
+        elif etype == "TaskFailed" and not entered_sink:
+            det = ev.get("taskFailedEventDetails") or {}
+            error = (det.get("error") or "").strip()
+            cause = (det.get("cause") or "").strip()
+            if error or cause:
+                task_failed_detail = f"{error}: {cause}" if (error and cause) else (error or cause)
+
+    culprit = pre_sink if entered_sink else dangling
+    if not culprit:
+        return None, None
+    if task_failed_detail:
+        detail = task_failed_detail
+        if len(detail) > _CAUSE_MAX_CHARS:
+            detail = detail[: _CAUSE_MAX_CHARS - 1] + "…"
+    else:
+        detail = _matched_choice_rule(states, culprit, choice_input, sink)
+    return culprit, detail
 
 
 # --- config#1900: deterministic zero-token fast path -------------------------
@@ -771,7 +1035,9 @@ def _build_event_record(
 ) -> dict:
     now_iso = datetime.now(timezone.utc).isoformat()
     cause = _failure_cause(describe_resp)
-    failed_state = _failed_state_from_history(detail.get("executionArn", ""))
+    failed_state, failed_state_detail = _failed_state_from_history(
+        detail.get("executionArn", ""), detail.get("stateMachineArn", ""),
+    )
     # config#1535: "will an agent actually be dispatched" depends on BOTH the
     # global kill-switch AND this specific pipeline having a wired listener —
     # not the global flag alone (that was the bug: claiming "dispatch" for a
@@ -830,6 +1096,11 @@ def _build_event_record(
         "execution_name": detail.get("name", ""),
         "execution_arn": detail.get("executionArn", ""),
         "failed_state": failed_state,
+        # alpha-engine-config-I6616: the discriminating payload that makes
+        # `failed_state` actionable — a Task failure's error/cause, or a
+        # Choice culprit's matched rule. Additive field (S3 schema contract
+        # allows ADD only); `None` when neither is available.
+        "failed_state_detail": failed_state_detail,
         "cause": cause or None,
         "is_preflight": is_preflight,
         # `lane` is filled by the dispatched agent (null until it classifies).
@@ -970,6 +1241,9 @@ def _notify(record: dict, key: str, pipeline_name: str, dispatch: dict) -> bool:
     ]
     if record.get("failed_state"):
         lines.append(f"Failed state: `{record['failed_state']}`")
+    if record.get("failed_state_detail"):
+        safe_detail = _safe_cause_for_telegram(record["failed_state_detail"])
+        lines.append(f"Detail: `{safe_detail}`")
     if record.get("cause"):
         safe_cause = _safe_cause_for_telegram(record['cause'])
         lines.append(f"Cause: `{safe_cause}`")
@@ -1041,6 +1315,8 @@ def _escalate_budget_exhausted(record: dict, key: str, pipeline_name: str, run_d
         f"{record.get('prior_dispatch_count', '?')} today already hit the "
         f"{record.get('dispatch_ceiling', '?')}-attempt ceiling for run_date {run_date}.",
         f"Failed state: `{record.get('failed_state')}`" if record.get("failed_state") else "",
+        f"Detail: `{_safe_cause_for_telegram(record.get('failed_state_detail'))}`"
+        if record.get("failed_state_detail") else "",
         f"Cause: `{_safe_cause_for_telegram(record.get('cause'))}`" if record.get("cause") else "",
         f"Watch log: `s3://{WATCH_BUCKET}/{key}`",
         "_The watch has GIVEN UP on today for this pipeline — no further agent "
@@ -1145,6 +1421,10 @@ def _maybe_dispatch_agent(
         "state_machine_arn": sm_arn,
         "execution_arn": record.get("execution_arn", ""),
         "failed_state": record.get("failed_state"),
+        # alpha-engine-config-I6616: threaded to the executor lambda/agent so
+        # the diagnose step sees the discriminating payload too, not just the
+        # bare state name.
+        "failed_state_detail": record.get("failed_state_detail"),
         "cause": record.get("cause"),
         "run_date": run_date,
         "status": record.get("status"),
