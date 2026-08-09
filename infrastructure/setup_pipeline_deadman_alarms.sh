@@ -9,7 +9,7 @@
 # fails. They cannot detect the strictly worse case — the state machine never
 # starts at all (EventBridge rule silently disabled/deleted, a CFN stack
 # rollback that drops the rule, an IAM permission regression on the
-# EventBridge→SFN invoke role, etc.). AWS/States ExecutionsStarted is the
+# EventBridge→SFN invoke role, etc.). AWS/States ExecutionsSucceeded is the
 # metric that names that gap: alarm when it drops to zero over a window sized
 # to the pipeline's cadence.
 #
@@ -27,7 +27,7 @@
 # (alpha-engine-alarm-backstop) purely for these three deadman alarms, so a
 # blackout of the primary channel cannot also silence the backstop.
 #
-# Metric semantics: AWS/States does not emit an explicit ExecutionsStarted=0
+# Metric semantics: AWS/States does not emit an explicit ExecutionsSucceeded=0
 # datapoint during a quiet period — it emits NO datapoint at all when a state
 # machine has zero executions. So "zero executions" surfaces as MISSING DATA,
 # not as a real zero-valued point. --treat-missing-data breaching is required
@@ -196,7 +196,7 @@ if ! $DRY_RUN && ! aws sns get-topic-attributes --topic-arn "$BACKSTOP_TOPIC_ARN
   exit 1
 fi
 
-# --- 2. Per-state-machine ExecutionsStarted=0 deadman alarms ----------------
+# --- 2. Per-state-machine ExecutionsSucceeded=0 deadman alarms --------------
 
 echo ""
 echo "==> Creating per-state-machine deadman alarms..."
@@ -209,9 +209,9 @@ for label in "${!STATE_MACHINES[@]}"; do
   run aws cloudwatch put-metric-alarm \
     --region "$REGION" \
     --alarm-name "$alarm_name" \
-    --alarm-description "Dead man's switch: fires when ${sf_name} has zero ExecutionsStarted in the trailing 7 days — the state machine did not even start (EventBridge rule disabled/deleted, IAM regression on the invoke role, CFN drift, ...), a failure class the per-execution HandleFailure SNS alert cannot see because it only runs when an execution exists. Routes to the INDEPENDENT ${BACKSTOP_TOPIC_NAME} topic (not alpha-engine-alerts) so a blackout of the primary alert channel cannot also silence this backstop (config#856 infra item b). TreatMissingData=breaching is required: AWS/States emits no datapoint at all for a quiet state machine, so 'zero executions' IS missing data, not a real zero — notBreaching would make this alarm impossible to fire." \
+    --alarm-description "Dead man's switch: fires when ${sf_name} has zero ExecutionsSucceeded in the trailing 7 days — either it never started (EventBridge rule disabled/deleted, IAM regression on the invoke role, CFN drift, ...) or it started and failed every attempt (an instant-fail loop keeps ExecutionsStarted healthy, measured 2026-08-05..07 when preopen died in 4s daily and the Started-based alarm never left OK — config#6697). A run of DEGRADED terminal states (which end in Fail by the Option-A ruling) also lands here after a week, deliberately: five degraded days in a row deserve this page. Routes to the INDEPENDENT ${BACKSTOP_TOPIC_NAME} topic (not alpha-engine-alerts) so a blackout of the primary alert channel cannot also silence this backstop (config#856 infra item b). TreatMissingData=breaching is required: AWS/States emits no datapoint at all for a quiet state machine, so 'zero executions' IS missing data, not a real zero — notBreaching would make this alarm impossible to fire." \
     --namespace "AWS/States" \
-    --metric-name "ExecutionsStarted" \
+    --metric-name "ExecutionsSucceeded" \
     --dimensions "Name=StateMachineArn,Value=${sf_arn}" \
     --statistic "Sum" \
     --period 604800 \
