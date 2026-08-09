@@ -95,7 +95,23 @@ import json
 import re
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
+from pathlib import Path
+
+# sys.path insertion (not a package import) so this resolves identically
+# whether run directly (`python scripts/weekly_sf_rerun.py`) or loaded by
+# spec_from_file_location the way tests/test_weekly_sf_rerun.py does.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sf_rerun_common import (  # noqa: E402 — see sys.path insertion above
+    derive_run_date,
+    effective_run_date_of,
+    entered_states,
+    execution_input,
+    fetch_history,
+    list_all_executions,
+    verify_skip_flags_live,
+    _walk_states,  # noqa: F401 — re-exported: tests/test_weekly_sf_rerun.py calls mod._walk_states directly
+)
 
 DEFAULT_STATE_MACHINE_ARN = (
     "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline"
@@ -399,61 +415,6 @@ BRANCH_A_STAGES = frozenset({
 BACKTESTER_OVERSHADOWED = ("predictor_backtest", "portfolio_optimizer_backtest", "parity")
 
 
-# ---------------------------------------------------------------------------
-# Execution-history parsing (pure functions — unit-tested over fixtures)
-# ---------------------------------------------------------------------------
-
-def entered_states(events: list[dict]) -> set:
-    return {
-        e["stateEnteredEventDetails"]["name"]
-        for e in events
-        if "stateEnteredEventDetails" in e
-    }
-
-
-def execution_input(events: list[dict]) -> dict:
-    for e in events:
-        d = e.get("executionStartedEventDetails")
-        if d is not None:
-            return json.loads(d.get("input") or "{}")
-    raise SystemExit("FATAL: history carries no ExecutionStarted event — cannot recover the original input.")
-
-
-def initialize_input_output(events: list[dict]) -> dict | None:
-    """The merged object InitializeInput emitted — the authoritative source
-    of the run_date every subsequent stage actually keyed its artifacts on."""
-    for e in events:
-        d = e.get("stateExitedEventDetails")
-        if d is not None and d.get("name") == "InitializeInput":
-            try:
-                return json.loads(d.get("output") or "null")
-            except json.JSONDecodeError:
-                return None
-    return None
-
-
-def derive_run_date(events: list[dict], start_time: datetime | None) -> tuple[str, str]:
-    """Return (run_date, provenance). Precedence: explicit input run_date >
-    InitializeInput's merged output > date(Execution start time)."""
-    orig = execution_input(events)
-    if isinstance(orig.get("run_date"), str) and orig["run_date"]:
-        return orig["run_date"], "explicit run_date in the failed execution's input"
-    init = initialize_input_output(events)
-    if isinstance(init, dict) and isinstance(init.get("run_date"), str) and init["run_date"]:
-        return init["run_date"], "InitializeInput merged output of the failed execution"
-    if start_time is not None:
-        rd = start_time.astimezone(timezone.utc).date().isoformat()
-        return rd, (
-            "FALLBACK: UTC date of the failed execution's start time"
-            " (InitializeInput never exited — pre-workload failure)"
-        )
-    raise SystemExit(
-        "FATAL: cannot derive run_date — no explicit input run_date, no "
-        "InitializeInput output in history, and no execution start time "
-        "was supplied."
-    )
-
-
 @dataclass
 class RerunPlan:
     run_date: str
@@ -601,63 +562,9 @@ def derive_plan(events: list[dict], start_time: datetime | None = None) -> Rerun
 # ---------------------------------------------------------------------------
 # Role-gating verification against the live definition (config#2277 D2)
 # ---------------------------------------------------------------------------
-
-def _walk_states(states: dict):
-    for name, state in states.items():
-        yield name, state
-        if state.get("Type") == "Parallel":
-            for branch in state.get("Branches", []):
-                yield from _walk_states(branch.get("States", {}))
-        if state.get("Type") == "Map":
-            it = state.get("Iterator") or state.get("ItemProcessor") or {}
-            yield from _walk_states(it.get("States", {}))
-
-
-def _rule_role_values(rule: dict) -> tuple[bool, set]:
-    """Return (references_pipeline_role, {StringEquals values on it})."""
-    refs = False
-    values: set = set()
-
-    def rec(node):
-        nonlocal refs
-        if isinstance(node, dict):
-            if node.get("Variable") == "$.pipeline_role":
-                refs = True
-                if "StringEquals" in node:
-                    values.add(node["StringEquals"])
-            for key in ("And", "Or"):
-                for sub in node.get(key, []) or []:
-                    rec(sub)
-            if "Not" in node:
-                rec(node["Not"])
-
-    rec(rule)
-    return refs, values
-
-
-def verify_skip_flags_live(definition: dict, role: str) -> None:
-    """Fail LOUDLY if any CheckSkip* gate structurally conjuncts
-    pipeline_role in a way that would render our skip flags inert under
-    `role` (the EOD SF's config#1614 pattern). A helper that silently emits
-    inert skip flags re-burns every completed spot stage."""
-    offenders = []
-    for name, state in _walk_states(definition.get("States", {})):
-        if not name.startswith("CheckSkip") or state.get("Type") != "Choice":
-            continue
-        for rule in state.get("Choices", []):
-            refs, values = _rule_role_values(rule)
-            if refs and role not in values:
-                offenders.append((name, sorted(values)))
-    if offenders:
-        raise SystemExit(
-            "FATAL (role gating): the weekly SF now conjuncts pipeline_role "
-            f"inside skip gates {offenders}, and role {role!r} is not in the "
-            "live set — the skip flags this helper emits would be silently "
-            "IGNORED and every completed spot stage would re-burn. Update "
-            "scripts/weekly_sf_rerun.py's EMITTED_ROLE / derivation to match "
-            "the SF's new role-gate semantics before rerunning."
-        )
-
+# _walk_states / _rule_role_values / verify_skip_flags_live now live in
+# sf_rerun_common.py (imported above) — lifted unchanged on the weekday_sf_
+# rerun.py second adoption (alpha-engine-config#6694, shared-code-policy).
 
 # ---------------------------------------------------------------------------
 # Mutex-steal decision matrix (config#2280 contract)
@@ -754,35 +661,9 @@ def decide_mutex_action(
 # ---------------------------------------------------------------------------
 # AWS plumbing (thin, injectable)
 # ---------------------------------------------------------------------------
-
-def fetch_history(sf, execution_arn: str) -> list[dict]:
-    events, token = [], None
-    while True:
-        kwargs = {"executionArn": execution_arn, "maxResults": 1000}
-        if token:
-            kwargs["nextToken"] = token
-        resp = sf.get_execution_history(**kwargs)
-        events.extend(resp["events"])
-        token = resp.get("nextToken")
-        if not token:
-            return events
-
-
-def list_all_executions(sf, sm_arn: str, status_filter: str | None = None, cap: int = 1000) -> list[dict]:
-    out, token = [], None
-    while len(out) < cap:
-        kwargs = {"stateMachineArn": sm_arn, "maxResults": 200}
-        if status_filter:
-            kwargs["statusFilter"] = status_filter
-        if token:
-            kwargs["nextToken"] = token
-        resp = sf.list_executions(**kwargs)
-        out.extend(resp["executions"])
-        token = resp.get("nextToken")
-        if not token:
-            break
-    return out[:cap]
-
+# fetch_history / list_all_executions now live in sf_rerun_common.py
+# (imported above) — lifted unchanged on the weekday_sf_rerun.py second
+# adoption (alpha-engine-config#6694, shared-code-policy).
 
 def resolve_default_execution(sf, sm_arn: str) -> dict:
     """Latest terminal-failed (FAILED or TIMED_OUT) execution."""
@@ -806,15 +687,9 @@ def next_rerun_name(sf, sm_arn: str, run_date: str) -> str:
     return f"{prefix}{(max(ns) if ns else 0) + 1}"
 
 
-def effective_run_date_of(sf, execution: dict) -> str:
-    try:
-        desc = sf.describe_execution(executionArn=execution["executionArn"])
-        inp = json.loads(desc.get("input") or "{}")
-        if isinstance(inp.get("run_date"), str) and inp["run_date"]:
-            return inp["run_date"]
-    except Exception as exc:  # noqa: BLE001 — guard is best-effort per-exec; date fallback below is conservative
-        print(f"WARN: could not read input of {execution['executionArn']}: {exc}", file=sys.stderr)
-    return execution["startDate"].astimezone(timezone.utc).date().isoformat()
+# effective_run_date_of now lives in sf_rerun_common.py (imported above) —
+# lifted unchanged on the weekday_sf_rerun.py second adoption
+# (alpha-engine-config#6694, shared-code-policy).
 
 
 # ---------------------------------------------------------------------------
