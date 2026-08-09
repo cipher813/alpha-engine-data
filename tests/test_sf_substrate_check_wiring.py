@@ -120,13 +120,18 @@ class TestChainOrdering:
         # Director's Catch now routes to NormalizeFailureContext — a
         # Director failure terminates the execution FAILED rather than
         # reporting degraded success.
-        assert states["ReportCard"]["Next"] == "Director"
+        # config#6054: ReportCard's success edge lands on the Director's
+        # per-stage skip gate (Default: Director); Director's success edge
+        # lands on the DirectorComplete rerun witness before the notify gate.
+        assert states["ReportCard"]["Next"] == "CheckSkipDirector"
+        assert states["CheckSkipDirector"]["Default"] == "Director"
         assert all(
             c["Next"] == "ReportCardDegraded" for c in states["ReportCard"]["Catch"]
         )
         assert states["ReportCardDegraded"]["Next"] == "PublishReportCardDegraded"
         assert states["PublishReportCardDegraded"]["Next"] == "CheckShellRunNotify"
-        assert states["Director"]["Next"] == "CheckShellRunNotify"
+        assert states["Director"]["Next"] == "DirectorComplete"
+        assert states["DirectorComplete"]["Next"] == "CheckShellRunNotify"
         assert all(
             c["Next"] == "NormalizeFailureContext" for c in states["Director"]["Catch"]
         )
@@ -149,7 +154,9 @@ class TestChainOrdering:
         success = next(
             r for r in choice["Choices"] if r.get("StringEquals") == "Success"
         )
-        assert success["Next"] == "ReportCard"
+        # config#6054: success lands on the per-stage gate (Default: ReportCard).
+        assert success["Next"] == "CheckSkipReportCard"
+        assert states["CheckSkipReportCard"]["Default"] == "ReportCard"
 
 
 class TestCatchSemantics:
@@ -181,10 +188,12 @@ class TestCatchSemantics:
     def test_substrate_degraded_continues_to_advisory_tail(self, states):
         degraded = states["SubstrateHealthCheckDegraded"]
         assert degraded["Type"] == "Pass"
-        assert degraded["Next"] == "ReportCard", (
+        assert degraded["Next"] == "CheckSkipReportCard", (
             "A degraded substrate check must not skip the ReportCard/Director "
-            "Lambda tail — it is independent of the dashboard box."
+            "Lambda tail — it is independent of the dashboard box. "
+            "(config#6054: the tail entry is the skip gate, Default: ReportCard.)"
         )
+        assert states["CheckSkipReportCard"]["Default"] == "ReportCard"
 
 
 class TestCommandShape:
