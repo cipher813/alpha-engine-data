@@ -1715,6 +1715,125 @@
         }
       ],
       "ResultPath": "$.stop_result",
+      "Next": "ReadExerciseCadence"
+    },
+    "ReadExerciseCadence": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I6689 deliverable 2/3: reads the declared weekly-exercise cadence from SSM Parameter Store (source of truth: infrastructure/weekly_cadence.json, synced here by infrastructure/deploy-infrastructure.sh on every merge deploy) so flipping daily <-> weekly-only <-> off is a one-line manifest diff instead of an SF-topology edit. TimeoutSeconds=30 + Catch(States.ALL): per weekly-sf-policy §5's run-day-gate precedent (WeeklyRunDayGateChoice: 'missing the weekly run is worse than a duplicate'), a read failure (most likely cause until the follow-up nous-ergon-ops IAM PR lands: alpha-engine-step-functions-role has no ssm:GetParameter on this resource yet — alpha-engine-config#6689 PR body names the exact grant) fails OPEN to the pre-existing 'run it' behavior rather than silently skipping the exercise launch, and pages so the degradation is visible instead of indistinguishable from a deliberate 'off'.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getParameter",
+      "Parameters": {
+        "Name": "/alpha-engine/weekly-sf/exercise-cadence"
+      },
+      "ResultSelector": {
+        "value.$": "$.Parameter.Value"
+      },
+      "ResultPath": "$.exercise_cadence_param",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SetCadenceReadDegraded",
+          "ResultPath": "$.exercise_cadence_read_error"
+        }
+      ],
+      "Next": "CheckExerciseCadence"
+    },
+    "SetCadenceReadDegraded": {
+      "Type": "Pass",
+      "Comment": "ReadExerciseCadence's Catch lands here. Floors $.exercise_cadence_param to a well-formed {'value': 'daily'} so CheckExerciseCadence takes the SAME branch the exercise launch always took before config#6689 — a missed exercise run is the worse failure mode (weekly-sf-policy §5).",
+      "Result": {
+        "value": "daily"
+      },
+      "ResultPath": "$.exercise_cadence_param",
+      "Next": "PublishCadenceReadDegraded"
+    },
+    "PublishCadenceReadDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I6689: alert that the declared-cadence read degraded, mirroring PublishLibPinGateDegraded's config#2278 shape (config#1819 discipline: hardcoded Subject/Message constants, never States.Format against unbounded input; best-effort Catch so a publish failure can never block the fail-open path this alert decorates). TopicArn is hardcoded, NOT $.sns_topic_arn — the EOD SF was hardened 2026-05-14 to hardcode the alerts-topic ARN in every Publish state and never bind it from input (test_sf_eod_precondition_probe_wiring.py::TestHandleFailureCostGuardHardening pins the absence of that binding fleet-wide in this file).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine — weekly exercise-cadence read DEGRADED (defaulted to daily)",
+        "Message": "ReadExerciseCadence could not read /alpha-engine/weekly-sf/exercise-cadence from SSM (permission not yet granted — see alpha-engine-config#6689 — throttling, or a transient SSM fault). Proceeding FAIL-OPEN as cadence=daily: the exercise launch is NOT skipped. If the declared cadence is actually weekly-only or off, this run launched the exercise anyway; investigate the SSM read path before trusting any cadence flip. View pipeline status: https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.exercise_cadence_degraded_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert — a publish failure must not halt the fail-open path.",
+          "ResultPath": "$.exercise_cadence_degraded_notify_error",
+          "Next": "CheckExerciseCadence"
+        }
+      ],
+      "Next": "CheckExerciseCadence"
+    },
+    "CheckExerciseCadence": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I6689 deliverable 2: gates LaunchWeeklyExerciseRun on the declared cadence. 'daily' preserves the pre-existing every-trading-day behavior exactly. 'weekly-only' / 'off' skip straight to CheckDegradedOutcome — LaunchWeeklyExerciseRun's OWN Next on ITS success path — so skipping the exercise launch never touches WeeklyExerciseLaunchFailed's routing (that state alerts only when the LAUNCH ITSELF fails, which cannot happen if it is never attempted). Default (value present but not one of the three declared literals — a manifest/SSM typo, or a future cadence value this SF has not been taught yet) is NOT a silent skip: it routes through SetCadenceUnknownValueDegraded to alert-then-launch, the same fail-toward-running posture as SetCadenceReadDegraded, rather than the invisible 'silently never ran' outcome. A missing/malformed $.exercise_cadence_param.value (ReadExerciseCadence's ResultSelector always sets it, or SetCadenceReadDegraded floors it) also falls through to Default by Step Functions Choice semantics — no separate IsPresent guard needed.",
+      "Choices": [
+        {
+          "Variable": "$.exercise_cadence_param.value",
+          "StringEquals": "daily",
+          "Next": "LaunchWeeklyExerciseRun"
+        },
+        {
+          "Variable": "$.exercise_cadence_param.value",
+          "StringEquals": "weekly-only",
+          "Next": "CheckDegradedOutcome"
+        },
+        {
+          "Variable": "$.exercise_cadence_param.value",
+          "StringEquals": "off",
+          "Next": "CheckDegradedOutcome"
+        }
+      ],
+      "Default": "SetCadenceUnknownValueDegraded"
+    },
+    "SetCadenceUnknownValueDegraded": {
+      "Type": "Pass",
+      "Comment": "CheckExerciseCadence's Default: the read succeeded but matched none of daily/weekly-only/off. Decided posture (alpha-engine-config#6689): treat as daily (fail toward running the exercise — weekly-sf-policy §5, missing a run is worse than an extra one) AND page, so 'ran anyway on an unrecognized value' is never mistaken for 'ran because cadence=daily was correctly read.' Captures the offending raw value under .raw BEFORE overwriting .value, so the alert below can name it.",
+      "Parameters": {
+        "raw.$": "$.exercise_cadence_param.value",
+        "value": "daily"
+      },
+      "ResultPath": "$.exercise_cadence_param",
+      "Next": "PublishCadenceUnknownValueDegraded"
+    },
+    "PublishCadenceUnknownValueDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I6689: alert on an unrecognized cadence value. Subject is a hardcoded constant (config#1819 discipline); the offending value is the one bounded dynamic field, threaded via States.Format — same pattern WeeklyRunDayGateFailed uses for its single bounded upstream field. TopicArn is hardcoded, NOT $.sns_topic_arn, per the same 2026-05-14 EOD-SF hardening as PublishCadenceReadDegraded above. Best-effort Catch.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine — weekly exercise-cadence value UNRECOGNIZED (defaulted to daily)",
+        "Message.$": "States.Format('ReadExerciseCadence returned a value CheckExerciseCadence does not recognize: {}. Expected one of daily | weekly-only | off (infrastructure/weekly_cadence.json). Proceeding FAIL-OPEN as cadence=daily: the exercise launch is NOT skipped. Check infrastructure/weekly_cadence.json and the live SSM parameter /alpha-engine/weekly-sf/exercise-cadence for a typo or an undeployed manifest edit.', $.exercise_cadence_param.raw)"
+      },
+      "ResultPath": "$.exercise_cadence_unknown_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert — a publish failure must not halt the fail-open path.",
+          "ResultPath": "$.exercise_cadence_unknown_notify_error",
+          "Next": "LaunchWeeklyExerciseRun"
+        }
+      ],
       "Next": "LaunchWeeklyExerciseRun"
     },
     "LaunchWeeklyExerciseRun": {
