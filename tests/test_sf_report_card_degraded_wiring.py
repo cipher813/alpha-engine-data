@@ -206,6 +206,16 @@ def test_report_card_only_subject_names_report_card(states):
     assert "report card" in subject.lower()
 
 
-def test_multiple_degraded_subject_names_report_card(states):
-    subject = states["NotifyCompleteMultipleDegraded"]["Parameters"]["Subject"]
-    assert "report card" in subject.lower()
+def test_multiple_degraded_names_report_card(states):
+    """alpha-engine-config-I6025: NotifyCompleteMultipleDegraded is now also
+    reachable via parity+gate / parity+health combos that do NOT involve
+    report_card_degraded at all, so the Subject can no longer hardcode
+    "report card" as though it were always the trigger (that claim would be
+    false on those combos). The generalized notifier still names report
+    card, generically, in its Message body — subject-or-message is the
+    invariant asserted here and throughout this module and
+    test_sf_parity_gate_notify_wiring.py."""
+    st = states["NotifyCompleteMultipleDegraded"]
+    subject = st["Parameters"]["Subject"]
+    message = st["Parameters"]["Message"]
+    assert "report card" in subject.lower() or "report card" in message.lower()
