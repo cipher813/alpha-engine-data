@@ -179,7 +179,7 @@ _SPOT_STATES = {
         "/var/log/data-phase2.log",
     ),
     "PredictorTraining": (
-        "bash infrastructure/spot_train.sh --full-only",
+        "bash infrastructure/spot_predictor_training.sh",
         "/var/log/predictor-training.log",
     ),
     "Backtester": (
@@ -203,10 +203,22 @@ _SPOT_STATES = {
         "/var/log/evaluator.log",
     ),
     # config#902: DriftDetection was collapsed — drift is now bundled onto the
-    # PredictorTraining spot (crucible-predictor spot_train.sh runs
-    # monitoring.drift_detector after training succeeds). Its Friday
-    # --preflight-only dry path folds into spot_train.sh --preflight-only, so
-    # DriftDetection is no longer a standalone spot state here.
+    # PredictorTraining spot (crucible-predictor spot_predictor_training.sh,
+    # pre-cutover spot_train.sh, runs monitoring.drift_detector after
+    # training succeeds). Its Friday --preflight-only dry path folds into
+    # PredictorTraining's own --preflight-only, so DriftDetection is no
+    # longer a standalone spot state here.
+    #
+    # alpha-engine-config-I4442/I4497 predictor-leg cutover (2026-08-09):
+    # PredictorTraining above now invokes spot_predictor_training.sh
+    # (pre-cutover: spot_train.sh --full-only). TrainSpecDispatch and
+    # ModelZooSelect (crucible-predictor spot_train_spec_dispatch.sh /
+    # spot_model_zoo_select.sh --select-only) also honor $.preflight_args
+    # identically but live inside ResearchPredictorParallel's Branch B /
+    # ModelZooTrainMap, outside this table's scope (this table only covers
+    # the SF's single top-level sequential spine) — not a regression, this
+    # gap predates the cutover (spot_train.sh --model-zoo-spec /
+    # --model-zoo-select were never in this table either).
 }
 
 # KEYSTONE + skip-exception rewire: the LAMBDA states routed dry (NOT

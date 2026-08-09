@@ -2504,13 +2504,13 @@
             },
             "PredictorTraining": {
               "Type": "Task",
-              "Comment": "GBM retrain on spot instance (launched from always-on EC2)",
+              "Comment": "GBM retrain on spot instance (launched from always-on EC2). alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script — the monolith is retained unchanged as the rollback path.",
               "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
               "Parameters": {
                 "DocumentName": "AWS-RunShellScript",
                 "InstanceIds.$": "$.ec2_instance_id",
                 "Parameters": {
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference','export PREDICTOR_DEFER_TRAINING_EMAIL=1',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-training --log /var/log/predictor-training.log -- bash infrastructure/spot_train.sh --full-only{}',$$.Execution.Name,$.preflight_args))",
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference','export PREDICTOR_DEFER_TRAINING_EMAIL=1',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-training --log /var/log/predictor-training.log -- bash infrastructure/spot_predictor_training.sh{}',$$.Execution.Name,$.preflight_args))",
                   "executionTimeout": [
                     "5400"
                   ]
@@ -2828,13 +2828,13 @@
                 "States": {
                   "TrainSpecDispatch": {
                     "Type": "Task",
-                    "Comment": "Launch a dedicated spot for THIS spec via spot_train.sh --model-zoo-spec <id>. Dispatcher SSM on the box (the script launches the actual spot internally). Honors $.preflight_args for shell-run dry mode.",
+                    "Comment": "Launch a dedicated spot for THIS spec via spot_train_spec_dispatch.sh --spec-id <id> (pre-cutover: spot_train.sh --model-zoo-spec <id>). Dispatcher SSM on the box (the script launches the actual spot internally). Honors $.preflight_args for shell-run dry mode. alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script — the monolith is retained unchanged as the rollback path.",
                     "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
                     "Parameters": {
                       "DocumentName": "AWS-RunShellScript",
                       "InstanceIds.$": "$.ec2_instance_id",
                       "Parameters": {
-                        "commands.$": "States.Array('set -eo pipefail','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-model-zoo-spec --log /var/log/predictor-model-zoo-spec.log -- bash infrastructure/spot_train.sh --model-zoo-spec {}{}',$$.Execution.Name,$.spec_id,$.preflight_args))",
+                        "commands.$": "States.Array('set -eo pipefail','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-model-zoo-spec --log /var/log/predictor-model-zoo-spec.log -- bash infrastructure/spot_train_spec_dispatch.sh --spec-id {}{}',$$.Execution.Name,$.spec_id,$.preflight_args))",
                         "executionTimeout": [
                           "5400"
                         ]
@@ -2989,13 +2989,13 @@
             },
             "ModelZooSelect": {
               "Type": "Task",
-              "Comment": "config#1083 PARALLEL fan-out, step 3 (ONE spot, after the Map joins): select over whatever spec-* challengers registered for the date (failed Map iterations are simply absent - tolerated), write the leaderboard to BOTH the dated key AND latest.json, promote the winner if MODEL_ZOO_AUTO_PROMOTE_WINNER, and send the ONE consolidated digest. BEST-EFFORT: every failure path routes to PublishModelZooFailureImmediate then BranchBComplete (the champion already trained+promoted; the rotation must NEVER fail the Saturday SF). The base champion-arch retrain (PredictorTraining) ran first and competes in the same pool.",
+              "Comment": "config#1083 PARALLEL fan-out, step 3 (ONE spot, after the Map joins): select over whatever spec-* challengers registered for the date (failed Map iterations are simply absent - tolerated), write the leaderboard to BOTH the dated key AND latest.json, promote the winner if MODEL_ZOO_AUTO_PROMOTE_WINNER, and send the ONE consolidated digest. BEST-EFFORT: every failure path routes to PublishModelZooFailureImmediate then BranchBComplete (the champion already trained+promoted; the rotation must NEVER fail the Saturday SF). The base champion-arch retrain (PredictorTraining) ran first and competes in the same pool. alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script — the monolith is retained unchanged as the rollback path.",
               "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
               "Parameters": {
                 "DocumentName": "AWS-RunShellScript",
                 "InstanceIds.$": "$.ec2_instance_id",
                 "Parameters": {
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-model-zoo-select --log /var/log/predictor-model-zoo-select.log -- bash infrastructure/spot_train.sh --model-zoo-select{}',$$.Execution.Name,$.preflight_args))",
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-model-zoo-select --log /var/log/predictor-model-zoo-select.log -- bash infrastructure/spot_model_zoo_select.sh --select-only{}',$$.Execution.Name,$.preflight_args))",
                   "executionTimeout": [
                     "5400"
                   ]

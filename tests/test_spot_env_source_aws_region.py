@@ -212,6 +212,14 @@ def test_step_function_blocks_export_region(sf: Path):
             or "infrastructure/spot_portfolio_optimizer_backtest.sh" in joined
             or "infrastructure/spot_parity.sh" in joined
             or "infrastructure/spot_evaluator.sh" in joined
+            # alpha-engine-config-I4442/I4497 predictor-leg cutover
+            # (2026-08-09, crucible-predictor#436+#458): PredictorTraining/
+            # TrainSpecDispatch/ModelZooSelect moved off spot_train.sh onto
+            # these three dedicated scripts, which carry the same inline
+            # AWS_REGION/AWS_DEFAULT_REGION export.
+            or "infrastructure/spot_predictor_training.sh" in joined
+            or "infrastructure/spot_train_spec_dispatch.sh" in joined
+            or "infrastructure/spot_model_zoo_select.sh" in joined
             or "training.model_zoo" in joined
         )
         if not touched:

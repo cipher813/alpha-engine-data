@@ -85,7 +85,7 @@
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
     "export ALPHA_ENGINE_EXPERIMENT_ID=reference",
     "export PREDICTOR_DEFER_TRAINING_EMAIL=1",
-    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug predictor-training --log /var/log/predictor-training.log -- bash infrastructure/spot_train.sh --full-only"
+    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug predictor-training --log /var/log/predictor-training.log -- bash infrastructure/spot_predictor_training.sh"
   ],
   "RAGIngestion": [
     "set -eo pipefail",
