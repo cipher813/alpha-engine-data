@@ -374,3 +374,46 @@ class TestCoverageAccounting:
             "litellm-proxy.service",
         ):
             assert name in baseline, f"{name} missing from the uncodified baseline"
+
+
+class TestUnreadableUnit:
+    """A unit file the check cannot read (2026-08-09: nousergon-console.service
+    was installed root-owned 0600) must be a classified, failing finding — the
+    PermissionError previously escaped `_sha256`'s except clause and killed the
+    whole sweep, taking coverage of the other 59 units with it."""
+
+    @pytest.fixture(autouse=True)
+    def _not_root(self):
+        import os
+        if os.geteuid() == 0:
+            pytest.skip("file modes cannot deny root; unreadable is untestable as uid 0")
+
+    def test_unreadable_installed_unit_is_classified_not_a_crash(self, cd):
+        module, script_dir, installed_dir = cd
+        path = installed_dir / "nousergon-console.service"
+        path.write_text("UNIT SECRETIVE\n")
+        path.chmod(0o000)
+
+        status, detail = module.check_unit("nousergon-console.service")
+
+        assert status == "unreadable"
+        assert "0644" in detail
+
+    def test_main_survives_the_unreadable_unit_and_fails_loud(self, cd, monkeypatch, capsys):
+        """The other units must still be swept — the crash mode reported on
+        NONE of them."""
+        module, script_dir, installed_dir = cd
+        blocked = installed_dir / "nousergon-console.service"
+        blocked.write_text("UNIT SECRETIVE\n")
+        blocked.chmod(0o000)
+        (script_dir / "daily-news.timer").write_text("UNIT A\n")
+        (installed_dir / "daily-news.timer").write_text("UNIT A\n")
+
+        monkeypatch.setattr("sys.argv", ["check-systemd-unit-drift.py"])
+        code = module.main()
+        cap = capsys.readouterr()
+
+        assert code == 1
+        assert "unreadable=1" in cap.out
+        assert "[clean] daily-news.timer" in cap.out
+        assert "nousergon-console.service" in cap.err
