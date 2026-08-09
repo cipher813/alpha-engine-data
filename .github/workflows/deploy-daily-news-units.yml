@@ -37,6 +37,10 @@ on:
       # self-refresh runs at most once a day, so a merged checker fix could
       # otherwise sit inert past the next 06:18 UTC sweep).
       - 'infrastructure/systemd/check-systemd-unit-drift.py'
+      # The checker's own unit pair is installed by the same script; a
+      # merged ExecStart change must redeploy, not wait for a hand-run.
+      - 'infrastructure/systemd/systemd-unit-drift-check.service'
+      - 'infrastructure/systemd/systemd-unit-drift-check.timer'
       - 'infrastructure/systemd/uncodified-units-baseline.txt'
       - '.github/workflows/deploy-daily-news-units.yml'
   workflow_dispatch:
