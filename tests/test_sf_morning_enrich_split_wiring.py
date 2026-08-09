@@ -168,7 +168,12 @@ class TestChainOrdering:
         assert c["Next"] == "CheckSkipDataPhase1"
 
     def test_morning_enrich_routes_to_wait_state(self, states):
-        assert states["MorningEnrich"]["Next"] == "WaitForMorningEnrich"
+        # alpha-engine-config-I5687: MorningEnrich dispatches through the
+        # poll-budget seed (InitMorningEnrichPollCount) before the first
+        # poll, mirroring the DataPhase2/ThinkTank precedent.
+        assert states["MorningEnrich"]["Next"] == "InitMorningEnrichPollCount"
+        assert states["InitMorningEnrichPollCount"]["Next"] == "WaitForMorningEnrich"
+        assert states["InitMorningEnrichPollCount"]["ResultPath"] == "$.morning_enrich_polls"
 
     def test_wait_routes_to_status_check(self, states):
         assert states["WaitForMorningEnrich"]["Next"] == "CheckMorningEnrichStatus"
@@ -185,13 +190,20 @@ class TestChainOrdering:
         )
 
     def test_status_inprogress_and_pending_loop_via_wait(self, states):
-        nexts = {
-            c["StringEquals"]: c["Next"]
-            for c in states["CheckMorningEnrichStatus"]["Choices"]
-        }
-        assert nexts["InProgress"] == "MorningEnrichWait"
-        assert nexts["Pending"] == "MorningEnrichWait"
-        assert states["MorningEnrichWait"]["Next"] == "WaitForMorningEnrich"
+        # alpha-engine-config-I5687: bounded And[] loop-back branch, not a
+        # bare pair of StringEquals branches — mirrors DataPhase2/ThinkTank.
+        bounded = next(
+            c for c in states["CheckMorningEnrichStatus"]["Choices"] if "And" in c
+        )
+        variables = {cond.get("Variable") for cond in bounded["And"]}
+        assert "$.morning_enrich_polls" in variables
+        or_block = next(cond["Or"] for cond in bounded["And"] if "Or" in cond)
+        statuses = {c["StringEquals"] for c in or_block}
+        assert statuses == {"InProgress", "Pending"}
+        assert bounded["Next"] == "MorningEnrichWait"
+        assert states["MorningEnrichWait"]["Next"] == "MorningEnrichPollWait"
+        assert states["MorningEnrichPollWait"]["Next"] == "MergeMorningEnrichPollCount"
+        assert states["MergeMorningEnrichPollCount"]["Next"] == "WaitForMorningEnrich"
 
     def test_status_default_routes_through_bounded_retry_to_error(self, states):
         """A non-Success poll status now routes through the bounded

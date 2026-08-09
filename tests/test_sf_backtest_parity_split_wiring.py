@@ -158,7 +158,12 @@ class TestChainOrdering:
         assert c["Next"] == "CheckSkipEvaluator"
 
     def test_backtester_routes_to_wait_state(self, states):
-        assert states["Backtester"]["Next"] == "WaitForBacktester"
+        # alpha-engine-config-I5687: Backtester dispatches through the
+        # poll-budget seed (InitBacktesterPollCount) before the first poll,
+        # mirroring the DataPhase2/ThinkTank precedent.
+        assert states["Backtester"]["Next"] == "InitBacktesterPollCount"
+        assert states["InitBacktesterPollCount"]["Next"] == "WaitForBacktester"
+        assert states["InitBacktesterPollCount"]["ResultPath"] == "$.backtester_polls"
 
     def test_backtester_wait_routes_to_status_check(self, states):
         assert states["WaitForBacktester"]["Next"] == "CheckBacktesterStatus"
@@ -188,13 +193,21 @@ class TestChainOrdering:
         )
 
     def test_backtester_status_loops_and_default(self, states):
-        nexts = {
-            c["StringEquals"]: c["Next"]
-            for c in states["CheckBacktesterStatus"]["Choices"]
-        }
-        assert nexts["InProgress"] == "BacktesterWait"
-        assert nexts["Pending"] == "BacktesterWait"
-        assert states["BacktesterWait"]["Next"] == "WaitForBacktester"
+        # alpha-engine-config-I5687: the loop-back branch is now a single
+        # bounded And[] (IsPresent + Or[InProgress,Pending] + NumericLessThan
+        # cap) rather than two bare StringEquals branches — the poll budget
+        # bounds the loop, mirroring DataPhase2/ThinkTank.
+        bounded = [
+            c for c in states["CheckBacktesterStatus"]["Choices"]
+            if "And" in c
+        ]
+        assert len(bounded) == 1
+        variables = {cond.get("Variable") for cond in bounded[0]["And"]}
+        assert "$.backtester_polls" in variables
+        assert bounded[0]["Next"] == "BacktesterWait"
+        assert states["BacktesterWait"]["Next"] == "BacktesterPollWait"
+        assert states["BacktesterPollWait"]["Next"] == "MergeBacktesterPollCount"
+        assert states["MergeBacktesterPollCount"]["Next"] == "WaitForBacktester"
         assert (
             states["CheckBacktesterStatus"]["Default"]
             == "ExtractBacktesterError"
@@ -214,7 +227,11 @@ class TestChainOrdering:
         assert c["Next"] == "CheckSkipEvaluator"
 
     def test_parity_routes_to_wait_state(self, states):
-        assert states["Parity"]["Next"] == "WaitForParity"
+        # alpha-engine-config-I5687: Parity dispatches through the
+        # poll-budget seed (InitParityPollCount) before the first poll.
+        assert states["Parity"]["Next"] == "InitParityPollCount"
+        assert states["InitParityPollCount"]["Next"] == "WaitForParity"
+        assert states["InitParityPollCount"]["ResultPath"] == "$.parity_polls"
 
     def test_parity_wait_routes_to_status_check(self, states):
         assert states["WaitForParity"]["Next"] == "CheckParityStatus"
@@ -234,13 +251,19 @@ class TestChainOrdering:
         )
 
     def test_parity_status_loops_and_default(self, states):
-        nexts = {
-            c["StringEquals"]: c["Next"]
-            for c in states["CheckParityStatus"]["Choices"]
-        }
-        assert nexts["InProgress"] == "ParityWait"
-        assert nexts["Pending"] == "ParityWait"
-        assert states["ParityWait"]["Next"] == "WaitForParity"
+        # alpha-engine-config-I5687: bounded And[] loop-back, mirrors
+        # DataPhase2/ThinkTank/Backtester.
+        bounded = [
+            c for c in states["CheckParityStatus"]["Choices"]
+            if "And" in c
+        ]
+        assert len(bounded) == 1
+        variables = {cond.get("Variable") for cond in bounded[0]["And"]}
+        assert "$.parity_polls" in variables
+        assert bounded[0]["Next"] == "ParityWait"
+        assert states["ParityWait"]["Next"] == "ParityPollWait"
+        assert states["ParityPollWait"]["Next"] == "MergeParityPollCount"
+        assert states["MergeParityPollCount"]["Next"] == "WaitForParity"
         # alpha-engine-config-I6025: terminal non-Success DEGRADES the run
         # (ParityDegraded → PublishParityDegraded → CheckSkipEvaluator)
         # instead of failing the SF through ExtractParityError.
@@ -608,9 +631,24 @@ class TestL4472PhaseSplit:
         ],
     )
     def test_new_status_gates_loop_and_error_default(self, states, check, wait):
-        nexts = {c["StringEquals"]: c["Next"] for c in states[check]["Choices"]}
-        assert nexts["InProgress"] == wait
-        assert nexts["Pending"] == wait
+        # alpha-engine-config-I5687: bounded And[] loop-back, mirrors
+        # DataPhase2/ThinkTank/Backtester/Parity.
+        prefix = {
+            "CheckPredictorBacktestStatus": "predictor_backtest",
+            "CheckPortfolioOptimizerBacktestStatus": "portfolio_optimizer",
+        }[check]
+        label = {
+            "CheckPredictorBacktestStatus": "PredictorBacktest",
+            "CheckPortfolioOptimizerBacktestStatus": "PortfolioOptimizerBacktest",
+        }[check]
+        bounded = [c for c in states[check]["Choices"] if "And" in c]
+        assert len(bounded) == 1
+        variables = {cond.get("Variable") for cond in bounded[0]["And"]}
+        assert f"$.{prefix}_polls" in variables
+        assert bounded[0]["Next"] == wait
+        assert states[wait]["Next"] == f"{label}PollWait"
+        assert states[f"{label}PollWait"]["Next"] == f"Merge{label}PollCount"
+        assert states[f"Merge{label}PollCount"]["Next"] == f"WaitFor{label}"
         assert states[check]["Default"].startswith("Extract")
 
     def test_new_states_timeout_matches_backtester(self, states):
