@@ -4365,8 +4365,71 @@
     },
     "CheckGateDegradedNotify": {
       "Type": "Choice",
-      "Comment": "config#2278 + config#2276 + config#6685: a green run that could not run its pre-spend gates (gate_degraded \u2014 set ONLY by the LibPinGateDegraded / PipelineContractGateDegraded Pass states), and/or its tail health checks (health_check_degraded \u2014 set ONLY by the SaturdayHealthCheckDegraded / SubstrateHealthCheckDegraded Pass states), and/or ReportCard's advisory grading (report_card_degraded \u2014 set ONLY by ReportCardDegraded, config#6685) must SAY SO in the completion email (weekly-sf-policy.md \u00a72.3). All three are SF-controlled booleans, IsPresent-guarded per config#2275. Rules are ordered most-specific-first: report_card_degraded combined with EITHER other family routes to the single generic NotifyCompleteMultipleDegraded (config#6685 \u2014 this is the config#2276 comment's predicted 'third flag family': rather than the 7-way enumeration a naive 3-flag cross-product would need, any report_card_degraded+other combination folds into ONE combined notifier whose Message names report card explicitly and points at the execution record for which other family also degraded, instead of enumerating all 4 additional combinations as separate hardcoded Task states); the pre-existing gates+health / gates-only / health-only rules are UNCHANGED (each still implies report_card_degraded is absent, since any report_card_degraded-true path is intercepted by the two rules ahead of them); report_card_degraded alone (gate/health both absent) gets its own single-flag notifier (NotifyCompleteReportCardDegraded) mirroring NotifyCompleteGatesDegraded/NotifyCompleteHealthDegraded exactly. Each still routes to a SEPARATE hardcoded-constant notifier rather than States.Format-ing flags into NotifyComplete \u2014 preserving config#1819's Subject/Message-are-constants invariant. Name retained from config#2278 (it is the wave-1 chain anchor referenced across tests/comments) \u2014 read it as the degraded-completion selector.",
+      "Comment": "config#2278 + config#2276 + config#6685 + alpha-engine-config-I6025: a green run that could not run its pre-spend gates (gate_degraded \u2014 set ONLY by the LibPinGateDegraded / PipelineContractGateDegraded Pass states), and/or its tail health checks (health_check_degraded \u2014 set ONLY by the SaturdayHealthCheckDegraded / SubstrateHealthCheckDegraded Pass states), and/or ReportCard's advisory grading (report_card_degraded \u2014 set ONLY by ReportCardDegraded, config#6685), and/or the Parity verdict (parity_degraded \u2014 set ONLY by ParityDegraded, alpha-engine-config-I6025/I6044: absence of a parity verdict must never render as a clean pass) must SAY SO in the completion email (weekly-sf-policy.md \u00a72.3 / \u00a72.3a). All four are SF-controlled booleans, IsPresent-guarded per config#2275. Rules are ordered most-specific-first: parity_degraded combined with ANY other family routes to the single generic NotifyCompleteMultipleDegraded first (mirrors the report_card_degraded fold below \u2014 the config#2276 comment's predicted 'third flag family' generalizes to a fourth the same way: fold into the existing generic combined notifier rather than enumerating more per-combination hardcoded Task states); then report_card_degraded combined with EITHER remaining family also routes to NotifyCompleteMultipleDegraded (config#6685); the pre-existing gates+health / gates-only / health-only rules are UNCHANGED (each still implies report_card_degraded and parity_degraded are both absent, since any report_card_degraded-true or parity_degraded-true path is intercepted by the rules ahead of them); report_card_degraded alone gets its own single-flag notifier (NotifyCompleteReportCardDegraded) mirroring NotifyCompleteGatesDegraded/NotifyCompleteHealthDegraded exactly, and parity_degraded alone (all three other flags absent) gets NotifyCompleteParityDegraded (alpha-engine-config-I6025), same shape. Each still routes to a SEPARATE hardcoded-constant notifier rather than States.Format-ing flags into NotifyComplete \u2014 preserving config#1819's Subject/Message-are-constants invariant. Name retained from config#2278 (it is the wave-1 chain anchor referenced across tests/comments) \u2014 read it as the degraded-completion selector.",
       "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.parity_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.parity_degraded",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.report_card_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.report_card_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyCompleteMultipleDegraded"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.parity_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.parity_degraded",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.gate_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.gate_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyCompleteMultipleDegraded"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.parity_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.parity_degraded",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.health_check_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.health_check_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyCompleteMultipleDegraded"
+        },
         {
           "And": [
             {
@@ -4468,6 +4531,19 @@
             }
           ],
           "Next": "NotifyCompleteReportCardDegraded"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.parity_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.parity_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyCompleteParityDegraded"
         }
       ],
       "Default": "NotifyComplete"
@@ -4562,12 +4638,34 @@
     },
     "NotifyCompleteMultipleDegraded": {
       "Type": "Task",
-      "Comment": "config#6685: SUCCESS notifier for a run where ReportCard's advisory grading was DEGRADED TOGETHER WITH one or both of the pre-spend gates and/or the tail health checks. Folded (config#2276's own comment predicted a third flag family would need a data-driven notifier rather than a 7-way enumeration): a single generic combined-degradation notifier for every report_card_degraded+other combination, instead of 4 additional hardcoded per-combination Task states. Names report card explicitly (weekly-sf-policy.md §2.3 requires naming), points at the execution record for which OTHER family also degraded rather than enumerating every combination in prose. Mirrors NotifyCompleteGatesDegraded's shape — constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819).",
+      "Comment": "config#6685 + alpha-engine-config-I6025: SUCCESS notifier for a run where TWO OR MORE of the four degraded-flag families fired together (pre-spend gates, tail health checks, report card advisory grading, parity verdict). Folded (config#2276's own comment predicted a third flag family would need a data-driven notifier rather than a 7-way enumeration, and the same reasoning generalizes to the fourth): a single generic combined-degradation notifier for every 2+-family combination, instead of enumerating every additional per-combination Task state. Deliberately does NOT assert which SPECIFIC families degraded in the constant Subject/Message (config#1819 forbids States.Format-ing the exact set into the text) — names all four categories generically and points at the execution record ($.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded) for the exact combination, which stays truthful regardless of which subset actually fired. Mirrors NotifyCompleteGatesDegraded's shape — constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819).",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Saturday Pipeline — SUCCESS (multiple stages DEGRADED, incl. report card)",
-        "Message": "All steps completed successfully — BUT ReportCard (advisory grading) was DEGRADED on this run, ALONG WITH one or more pre-spend gates and/or tail health checks. Exact combination is on the execution record: $.gate_degraded / $.health_check_degraded / $.report_card_degraded, with detail at $.report_card_error and (if set) $.health_check_error / $.substrate_check_error. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Subject": "Alpha Engine Saturday Pipeline — SUCCESS (multiple stages DEGRADED)",
+        "Message": "All steps completed successfully — BUT two or more of the following degraded on this run: the pre-spend gates (LibPinDriftCheck/PipelineContractCheck), the tail health checks (SaturdayHealthCheck/WeeklySubstrateHealthCheck), the report card advisory grading (ReportCard Lambda), and/or the Parity verdict (pit_parity/replay — absence of a verdict must NOT be read as a clean pass). Exact combination is on the execution record: $.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded, with detail at $.report_card_error and (if set) $.health_check_error / $.substrate_check_error / $.parity_error. View pipeline status: https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.notify_result",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#1819 — best-effort: a SUCCESS-path notifier must never fail an otherwise-succeeded pipeline.",
+          "ResultPath": "$.notify_error",
+          "Next": "NotifyCompleteDegraded"
+        }
+      ],
+      "Next": "WriteCompletionMarker"
+    },
+    "NotifyCompleteParityDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I6025/I6044: SUCCESS notifier for a run whose Parity stage was DEGRADED (SSM timeout/crash, or send/poll infra failure — PublishParityDegraded already paged on entry; this is the terminal completion notice) and none of the pre-spend gates, tail health checks, or ReportCard's advisory grading were. Absence of a parity verdict must never render identically to a clean pass (weekly-sf-policy.md §2.3a) — this notifier is that guarantee's terminal-email expression. Mirrors NotifyCompleteReportCardDegraded/NotifyCompleteGatesDegraded/NotifyCompleteHealthDegraded exactly — constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Saturday Pipeline — SUCCESS (parity DEGRADED)",
+        "Message": "All steps completed successfully — BUT the Parity stage (pit_parity look-ahead/walk-forward contamination check + backtester↔executor replay) did not complete; a parity-degraded alert fired earlier in this run. This run produced NO parity verdict — absence of a verdict must NOT be read as a clean pass. See $.parity_poll / $.parity_error on the execution record for detail. The weekly run's real trading artifacts are unaffected; only the parity verdict is missing. View pipeline status: https://console.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -4584,7 +4682,7 @@
     },
     "WriteCompletionMarker": {
       "Type": "Task",
-      "Comment": "config#2857: SF-envelope completion marker — an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine: a hung/failed SF must not be indistinguishable from a healthy one just because a prior run already wrote today's downstream artifacts). Converges the 7 real-completion notify paths (NotifyComplete, its degraded-catch fallback, the 3 gate/health-degraded variants, and the 2 report-card-degraded variants added config#6685) — deliberately EXCLUDES NotifyShellRunComplete/NotifyShellRunCompleteDegraded (the Friday-PM preflight dry-pass is not a real weekly completion; marking it would let a dry run silently satisfy the SLA). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_weekly_freshness_pipeline (cadence saturday_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable — exactly the ambiguity this feature exists to surface, not mask.",
+      "Comment": "config#2857: SF-envelope completion marker — an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine: a hung/failed SF must not be indistinguishable from a healthy one just because a prior run already wrote today's downstream artifacts). Converges the 8 real-completion notify paths (NotifyComplete, its degraded-catch fallback, the 3 gate/health-degraded variants, the 2 report-card-degraded variants added config#6685, and NotifyCompleteParityDegraded added alpha-engine-config-I6025) — deliberately EXCLUDES NotifyShellRunComplete/NotifyShellRunCompleteDegraded (the Friday-PM preflight dry-pass is not a real weekly completion; marking it would let a dry run silently satisfy the SLA). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_weekly_freshness_pipeline (cadence saturday_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable — exactly the ambiguity this feature exists to surface, not mask.",
       "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
       "Parameters": {
         "Bucket": "alpha-engine-research",
@@ -4718,8 +4816,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekly Pipeline \u2014 Parity DEGRADED (continuing to Evaluator)",
-        "Message": "The Parity stage (pit_parity look-ahead/walk-forward contamination check + backtester\u2194executor replay) did not complete \u2014 SSM timeout, crash, or dispatch/poll failure. NON-FATAL: the weekly run continues to Evaluator/ReportCard/Director, but this run produced NO parity verdict; absence of a verdict must NOT be read as a clean pass. Artifacts backtest/{run_date}/pit_parity.json + parity_report.json + parity_metrics.csv may be absent (the ARTIFACT_REGISTRY freshness-monitor SLA will also flag them). Specifics on the execution record: $.parity_poll / $.parity_error. View pipeline status: https://console.nousergon.ai/pipeline-status",
-        "TimeoutSeconds": 60
+        "Message": "The Parity stage (pit_parity look-ahead/walk-forward contamination check + backtester\u2194executor replay) did not complete \u2014 SSM timeout, crash, or dispatch/poll failure. NON-FATAL: the weekly run continues to Evaluator/ReportCard/Director, but this run produced NO parity verdict; absence of a verdict must NOT be read as a clean pass. Artifacts backtest/{run_date}/pit_parity.json + parity_report.json + parity_metrics.csv may be absent (the ARTIFACT_REGISTRY freshness-monitor SLA will also flag them). Specifics on the execution record: $.parity_poll / $.parity_error. View pipeline status: https://console.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.parity_degraded_notify",
       "Catch": [
