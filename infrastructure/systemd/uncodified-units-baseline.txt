@@ -35,8 +35,6 @@
 # unit to anything. Its drop-in directory is not covered here either — this
 # checker compares unit FILES; `.d/*.conf` coverage is a separate deliverable
 # on I6656.
-morning-signal-pull.service    # UNKNOWN
-morning-signal-pull.timer      # UNKNOWN
 
 # ── metron ─────────────────────────────────────────────────────────────────
 
