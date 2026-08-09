@@ -42,6 +42,16 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Default-init: SF-driven invocations pass zero flags, so the loop body
+# above never runs and these would otherwise be unbound under `set -u`
+# (config#2949, PR936/PR937 bug class). _spot_common.sh already sets safe
+# defaults before this loop runs, but the guard in
+# tests/test_shell_arg_parse_default_init.py is branch-path-sensitive per
+# file and does not see across the `source` — restate the defaults here,
+# matching the ID_ARTIFACT_KEY pattern in spot_data_weekly.sh.
+BRANCH="${BRANCH:-main}"
+INSTANCE_TYPE="${INSTANCE_TYPE:-}"
+
 [ -n "$INSTANCE_TYPE" ] && INSTANCE_TYPES="$INSTANCE_TYPE"
 
 _CONFIG_SRC="/home/ec2-user/alpha-engine-config/data/config.yaml"
