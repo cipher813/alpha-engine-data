@@ -9,12 +9,16 @@
 # sessions (the 2026-06-24 → RGEN +14.92% class; config#1228/#1229).
 #
 # Fires ~22:30 UTC MON-FRI (well after the daemon's ~20:15 UTC EOD). Starts the
-# EOD SF IFF the trading box is still running AND no EOD started today. See
-# index.py for the full guard rationale.
+# EOD SF IFF it is a trading day AND no EOD started today — regardless of
+# trading-box state (config-I6690, 2026-08-09: widened from the original
+# box-must-be-running gate, which made a box-never-started day a silent
+# no-op). See index.py for the full guard rationale.
 #
-# Managed outside CloudFormation — same rationale as pipeline-watchdog /
-# sf-telegram-notifier / eod-success-friday-shell-trigger (operator-deployed
-# only, narrow OIDC blast radius).
+# Code-only auto-deploy on merge to main: .github/workflows/deploy-eod-
+# backstop.yml (config-I6690). Infra (IAM/EventBridge rule) stays operator-run
+# via --bootstrap/--apply-iam below — same narrow-OIDC-blast-radius rationale
+# pipeline-watchdog / sf-telegram-notifier / eod-success-friday-shell-trigger
+# use for their own bootstrap paths.
 #
 # SAFE ROLLOUT: --bootstrap creates the EventBridge rule DISABLED. Soak the
 # Lambda via --smoke on a non-trading-day / box-down state (guaranteed no-op),
@@ -168,7 +172,7 @@ if $BOOTSTRAP; then
     --name "${RULE_NAME}" \
     --schedule-expression 'cron(30 22 ? * MON-FRI *)' \
     --state "$(pause_state "${RULE_NAME}")" \
-    --description "EOD-pipeline backstop fire at 22:30 UTC MON-FRI (Lambda gates on trading-day + box-running + no-EOD-today). State is derived from infrastructure/automation_pause.json, not pinned here (I6619); the soak this text referred to completed and the rule has been ENABLED since." \
+    --description "EOD-pipeline backstop fire at 22:30 UTC MON-FRI (Lambda gates on trading-day + no-EOD-today; config-I6690 dropped the box-running requirement). State is derived from infrastructure/automation_pause.json, not pinned here (I6619); the soak this text referred to completed and the rule has been ENABLED since." \
     --region "${REGION}" \
     --query 'RuleArn' --output text
 
@@ -211,11 +215,11 @@ echo "✓ Code deployed."
 
 if $SMOKE; then
   echo ""
-  echo "WARNING: --smoke runs the REAL handler. If today is a trading day AND the"
-  echo "         trading box is running AND no EOD started today, it WILL start the"
-  echo "         EOD Step Function. Run it only when you expect a no-op (non-trading"
-  echo "         day, or box already stopped), or when you genuinely want to recover"
-  echo "         today's missing EOD."
+  echo "WARNING: --smoke runs the REAL handler. If today is a trading day AND no EOD"
+  echo "         started today, it WILL start the EOD Step Function — REGARDLESS of"
+  echo "         trading-box state (config-I6690 dropped the box-running gate). Run"
+  echo "         it only when you expect a no-op (non-trading day, or an EOD already"
+  echo "         ran today), or when you genuinely want to recover today's missing EOD."
   RESP=$(mktemp)
   aws lambda invoke \
     --function-name "${FUNCTION_NAME}" \
