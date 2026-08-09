@@ -43,6 +43,15 @@
       ]
     },
     {
+      "Sid": "EodArtifactVerificationRead",
+      "Effect": "Allow",
+      "Action": ["s3:HeadObject", "s3:GetObject"],
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research/_sf_completion/ne-postclose-trading-pipeline/*",
+        "arn:aws:s3:::alpha-engine-research/trades/eod_pnl.csv"
+      ]
+    },
+    {
       "Sid": "FlowDoctorDedupStore",
       "Effect": "Allow",
       "Action": [
