@@ -119,28 +119,20 @@ class TestEvaluatorTask:
             == "arn:aws:states:::aws-sdk:ssm:sendCommand"
         )
 
-    def test_command_passes_skip_stages_backtest_parity(self, states):
-        # The Evaluator state reuses spot_backtest.sh — the canonical
-        # dispatch surface — and skips the backtest + parity stages so
-        # only evaluate.py runs. If a future operator drops --skip-stages
-        # the spot will re-run the full 121-min backtest and the split
-        # collapses silently.
+    def test_command_invokes_dedicated_evaluator_script(self, states):
+        # alpha-engine-config-I4442/I4497 SF cutover (2026-08-09,
+        # crucible-backtester#631): the Evaluator state no longer reuses
+        # spot_backtest.sh with --skip-stages=backtest,parity — it invokes
+        # its own dedicated spot_evaluator.sh, which runs only evaluate.py
+        # and carries no stage-multiplexing flag. The monolith is retained
+        # unchanged as the rollback path only.
         from tests.sf_command_utils import extract_commands
         cmds = extract_commands(states["Evaluator"])
-        spot_cmd = next(c for c in cmds if "spot_backtest.sh" in c)
-        assert "--skip-stages=backtest,parity" in spot_cmd
-        # 2026-07-20: pit_parity was the ONE stage no SF state's flags
-        # excluded here — the three backtest states pass --no-pit-parity and
-        # Parity owns it via --pit-parity-enabled=1, but the Evaluator was
-        # forgotten, so the config#2871 pit-parity sweep (which does not
-        # marker-skip) re-ran a 2h predictor-sim walkforward inside the
-        # Evaluator's budget and SIGKILLed it twice
-        # (watch-rerun-2026-07-18-10/-11). Single-producer decomposition:
-        # alpha-engine-config-I3112.
-        assert "--no-pit-parity" in spot_cmd, (
-            "Evaluator must pass --no-pit-parity (Parity owns pit_parity); "
-            "without it the pit-parity sweep free-rides in the Evaluator's "
-            "timeout budget"
+        spot_cmd = next(c for c in cmds if "spot_evaluator.sh" in c)
+        assert "--skip-stages" not in spot_cmd
+        assert "--no-pit-parity" not in spot_cmd
+        assert not any("spot_backtest.sh" in c for c in cmds), (
+            "Evaluator must not fall back to the shared monolith launcher."
         )
 
     def test_writes_to_evaluator_log(self, states):
@@ -148,7 +140,7 @@ class TestEvaluatorTask:
         # from /var/log/backtester.log on the spot host.
         from tests.sf_command_utils import extract_commands
         cmds = extract_commands(states["Evaluator"])
-        spot_cmd = next(c for c in cmds if "spot_backtest.sh" in c)
+        spot_cmd = next(c for c in cmds if "spot_evaluator.sh" in c)
         assert "/var/log/evaluator.log" in spot_cmd
 
     def test_timeout_is_120_min_sibling_parity(self, states):
