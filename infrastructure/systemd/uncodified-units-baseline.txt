@@ -44,10 +44,4 @@ mnemon-sync.service            # mnemon — codify with mnemon.service after con
 mnemon-sync.timer              # mnemon — codify with mnemon.service after config#6712
 
 # ── shared infrastructure ──────────────────────────────────────────────────
-litellm-proxy.service          # CODIFIED nous-ergon-ops alpha-engine-dashboard/live/infrastructure/systemd/, byte-identical 2026-08-09 — leaves this file when the checker gains a root for that repo (deploy-path ruling on config#6337)
-llm-egress-proxy.service       # CODIFIED nous-ergon-ops (ops-PR533), byte-identical 2026-08-09 — same root gap as litellm-proxy
-ibgateway.service              # CODIFIED nous-ergon-ops (ops-PR534), byte-identical 2026-08-09 — same root gap
-xvfb.service                   # CODIFIED nous-ergon-ops (ops-PR534, ibgateway's display), byte-identical 2026-08-09 — same root gap
-certbot-renew.service          # CODIFIED nous-ergon-ops (8/8 arc), byte-identical 2026-08-09 — same root gap
-certbot-renew.timer            # CODIFIED nous-ergon-ops (8/8 arc), byte-identical 2026-08-09 — same root gap
 amazon-cloudwatch-agent.service # vendor-installed; likely never codified here
