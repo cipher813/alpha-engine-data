@@ -198,7 +198,16 @@ class TestPaths:
                     [c["Next"] for c in st.get("Choices", []) if _ops(c).get("BooleanEquals") is True]
                     if cur.endswith("SpotLaunched") else []
                 )
-                cur = (succ or launched or [st.get("Default")])[0]
+                # alpha-engine-config-I6689: CheckExerciseCadence branches on
+                # StringEquals "daily"/"weekly-only"/"off", not "Success" or a
+                # *SpotLaunched BooleanEquals — the happy-path simulation here
+                # always takes the "daily" branch (LaunchWeeklyExerciseRun),
+                # matching this SF's actual pre-config#6689 default behavior.
+                cadence_daily = (
+                    [c["Next"] for c in st.get("Choices", []) if c.get("StringEquals") == "daily"]
+                    if cur == "CheckExerciseCadence" else []
+                )
+                cur = (succ or launched or cadence_daily or [st.get("Default")])[0]
             else:
                 cur = st.get("Next")
         return order
@@ -212,7 +221,7 @@ class TestPaths:
         # terminates the execution directly — a fully-green run (no gap ever
         # detected, $.degraded_summary never set) routes through
         # CheckDegradedOutcome to the ordinary NormalSucceeded terminal.
-        assert order[-5:] == ["StopTradingInstance", "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
+        assert order[-7:] == ["StopTradingInstance", "ReadExerciseCadence", "CheckExerciseCadence", "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
 
     def test_full_skip_still_stops_the_instance(self, states):
         order = self._walk(states, skip_flags={c[2] for c in _CHAIN})
@@ -225,6 +234,7 @@ class TestPaths:
         # test_operator_replay_still_honors_skips below.
         assert order == [
             "ProbeEODReconcilePrecondition", "StopTradingInstance",
+            "ReadExerciseCadence", "CheckExerciseCadence",
             "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded",
         ]
 
@@ -237,7 +247,7 @@ class TestPaths:
         assert "RefreshExecutorDeploy" not in order
         assert order[0] == "InitDataSpotRetryCounter"
         assert order[1] == "LaunchPostMarketDataSpot"
-        assert order[-5:] == ["StopTradingInstance", "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
+        assert order[-7:] == ["StopTradingInstance", "ReadExerciseCadence", "CheckExerciseCadence", "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
 
     def test_skip_data_phase_resumes_at_snapshot(self, states):
         # config#1767: skip_post_market_data now skips the ENTIRE spot data phase
@@ -247,7 +257,7 @@ class TestPaths:
         assert "LaunchPostMarketDataSpot" not in order
         assert "LaunchPostMarketArcticAppendSpot" not in order
         assert order[0] == "CaptureSnapshot"
-        assert order[-5:] == ["StopTradingInstance", "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
+        assert order[-7:] == ["StopTradingInstance", "ReadExerciseCadence", "CheckExerciseCadence", "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
 
     def test_happy_path_runs_data_phase_on_spot(self, states):
         # config#1767: the EOD data phase runs as spot-launch states, in order,
@@ -268,7 +278,7 @@ class TestSkipFlagsInertOutsideOperatorReplay:
         order = self._walk(states, skip_flags={c[2] for c in _CHAIN}, pipeline_role="eod")
         for task in (c[1] for c in _CHAIN):
             assert task in order, f"{task} was skipped despite non-replay role"
-        assert order[-5:] == ["StopTradingInstance", "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
+        assert order[-7:] == ["StopTradingInstance", "ReadExerciseCadence", "CheckExerciseCadence", "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
 
     def test_all_skips_inert_when_role_absent(self, states):
         order = self._walk(states, skip_flags={c[2] for c in _CHAIN}, pipeline_role=None)
@@ -287,6 +297,7 @@ class TestSkipFlagsInertOutsideOperatorReplay:
         # unconditionally) before its own skip_eod_reconcile flag takes over.
         assert order == [
             "ProbeEODReconcilePrecondition", "StopTradingInstance",
+            "ReadExerciseCadence", "CheckExerciseCadence",
             "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded",
         ]
 
