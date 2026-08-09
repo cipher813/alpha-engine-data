@@ -6,7 +6,11 @@ Type=oneshot
 User=ec2-user
 Group=ec2-user
 WorkingDirectory=/home/ec2-user/alpha-engine-data
-ExecStart=/home/ec2-user/alpha-engine-data/.venv/bin/python /home/ec2-user/alpha-engine-data/infrastructure/systemd/check-systemd-unit-drift.py --report
+# boto3 does not infer the region from IMDS; without this every --metric
+# emit dies with "You must specify a region" (seen live 2026-08-09).
+Environment=AWS_REGION=us-east-1
+Environment=AWS_DEFAULT_REGION=us-east-1
+ExecStart=/home/ec2-user/alpha-engine-data/.venv/bin/python /home/ec2-user/alpha-engine-data/infrastructure/systemd/check-systemd-unit-drift.py --report --metric --codified-root /home/ec2-user/alpha-engine-data/infrastructure/systemd --codified-root /home/ec2-user/alpha-engine-dashboard/infrastructure/systemd --codified-root /home/ec2-user/metron-ops/infrastructure/systemd --codified-root /home/ec2-user/telos-ops/infrastructure/systemd --codified-root /home/ec2-user/alpha-engine-dashboard/infrastructure --codified-root /home/ec2-user/alpha-engine-dashboard/live/infrastructure --codified-root /home/ec2-user/nousergon-auth/infrastructure --codified-root /home/ec2-user/nousergon-console/infrastructure --codified-root /home/ec2-user/the-cyphering-ops/infrastructure --codified-root /home/ec2-user/vires/infrastructure
 # Reads /etc/systemd/system/*, no writes — runs as ec2-user like the units
 # it checks, not root.
 StandardOutput=journal
