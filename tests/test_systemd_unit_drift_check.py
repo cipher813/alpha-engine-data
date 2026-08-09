@@ -373,7 +373,6 @@ class TestCoverageAccounting:
             "litellm-proxy.service",
             "llm-egress-proxy.service",
             "mnemon.service",
-            "morning-signal-pull.service",
             "certbot-renew.timer",
             "ibgateway.service",
         ):
@@ -389,6 +388,7 @@ class TestCoverageAccounting:
             "nousergon-console.service",   # nousergon-console root
             "signal.service",              # the-cyphering-ops root
             "vires.service",               # vires root
+            "morning-signal-pull.service", # codified by crucible-dashboard-PR635
         ):
             assert name not in baseline, (
                 f"{name} is covered by a --codified-root and must not be baselined "
