@@ -59,7 +59,9 @@ CHECKS = [
     ("WeeklySubstrateHealthCheck", "WaitForWeeklySubstrateHealthCheck",
      "CheckSubstrateHealthCheckStatus", "SubstrateHealthCheckPollWait",
      "SubstrateHealthCheckDegraded", "$.substrate_check_poll",
-     "ReportCard", 240),
+     # config#6054: the tail entry is now the per-stage skip gate; its
+     # Default is ReportCard, so the degrade-then-proceed property holds.
+     "CheckSkipReportCard", 240),
 ]
 _IDS = [c[0] for c in CHECKS]
 
