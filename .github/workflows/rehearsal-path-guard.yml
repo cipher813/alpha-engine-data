@@ -16,7 +16,7 @@ name: Rehearsal Path Guard
 # Two-job shape mirrors canary-replay.yml: `label` runs dorny/paths-filter
 # to decide whether this PR touches a weekly-critical path at all (a PR
 # that doesn't is unconstrained by §7 and the check passes trivially);
-# `check` runs only when it does, and calls the body-parsing logic in
+# `rehearsal-path-guard` runs only when it does, and calls the body-parsing logic in
 # scripts/check_rehearsal_path.py (kept in a script, not inline bash, so
 # tests/test_check_rehearsal_path.py can exercise every branch directly).
 #
@@ -61,7 +61,7 @@ jobs:
               - 'infrastructure/run_weekly_offcycle.sh'
               - 'scripts/weekly_sf_rerun.py'
 
-  check:
+  rehearsal-path-guard:
     needs: label
     if: needs.label.outputs.weekly_critical == 'true'
     runs-on: ubuntu-latest
