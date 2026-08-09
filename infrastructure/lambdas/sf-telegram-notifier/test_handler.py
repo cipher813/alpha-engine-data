@@ -7,6 +7,7 @@ the handler hands to the primitive, plus the return value shape.
 
 from __future__ import annotations
 
+import io
 import json
 import sys
 import types
@@ -81,6 +82,45 @@ def _fake_sf_client(describe_return=None):
     }
     client.get_execution_history.return_value = {"events": []}
     return client
+
+
+class _NotFoundS3Error(Exception):
+    def __init__(self):
+        self.response = {
+            "Error": {"Code": "404"},
+            "ResponseMetadata": {"HTTPStatusCode": 404},
+        }
+
+
+def _eod_client_stubs(
+    monkeypatch,
+    *,
+    describe_return=None,
+    marker_present=True,
+    csv_body=b"date,nav\n",
+):
+    """Wire index.boto3.client to a fresh (sf, s3) mock pair, overriding the
+    autouse reset_send_message fixture's own client() closure for this test
+    only (nousergon-data-i5289: the autouse fixture's `sf` yield has no `s3`
+    handle, so EOD-artifact tests need their own client factory rather than
+    widening that fixture's signature and touching every existing caller)."""
+    sf = _fake_sf_client(describe_return)
+    s3 = MagicMock()
+    if marker_present:
+        s3.head_object.return_value = {}
+    else:
+        s3.head_object.side_effect = _NotFoundS3Error()
+    s3.get_object.return_value = {"Body": io.BytesIO(csv_body)}
+
+    def client(name, region_name=None):
+        if name == "stepfunctions":
+            return sf
+        if name == "s3":
+            return s3
+        return MagicMock()
+
+    monkeypatch.setattr(index.boto3, "client", client)
+    return sf, s3
 
 
 @pytest.fixture(autouse=True)
@@ -438,3 +478,213 @@ class TestPartialRunsDoNotPageAsCadenceFailures:
         )
         assert is_partial is False
         assert silent is False, "an unreadable input must fail toward paging"
+
+
+class TestDegradedRunMapping:
+    """alpha-engine-config#5289 scope item 4: the eod SF's deliberate
+    `Error: "DegradedRun"` Fail terminal must render as DEGRADED — distinct
+    from both a clean SUCCEEDED and a genuine crash FAILED."""
+
+    def test_degraded_renders_distinct_label_and_emoji(self, monkeypatch):
+        _sf, _s3 = _eod_client_stubs(
+            monkeypatch,
+            describe_return={
+                "input": '{"run_date": "2026-08-08"}',
+                "error": "DegradedRun",
+                "cause": "EOD pipeline skipped EODReconcile (data gap).",
+            },
+            marker_present=True,
+            csv_body=b"date,nav\n2026-08-08,100000\n",
+        )
+        event = _event("FAILED", sm_arn=EOD_ARN)
+        result = index.handler(event, None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        kwargs = _telegram_mod.send_message.call_args.kwargs
+
+        assert "Post-close Trading SF — DEGRADED" in text
+        assert "Post-close Trading SF — FAILED" not in text
+        assert "\U0001f7e0" in text  # 🟠
+        assert "Cause: DegradedRun: EOD pipeline skipped EODReconcile" in text
+        assert kwargs["disable_notification"] is False
+        # The RAW AWS status is unchanged in the return contract — only the
+        # rendered text distinguishes DEGRADED.
+        assert result["status"] == "FAILED"
+
+    def test_genuine_crash_failed_is_unaffected(self, monkeypatch):
+        _sf, _s3 = _eod_client_stubs(
+            monkeypatch,
+            describe_return={
+                "input": '{"run_date": "2026-08-08"}',
+                "error": "States.TaskFailed",
+                "cause": "CaptureSnapshot state failed",
+            },
+        )
+        event = _event("FAILED", sm_arn=EOD_ARN)
+        index.handler(event, None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "Post-close Trading SF — FAILED" in text
+        assert "DEGRADED" not in text
+        assert "🟠" not in text
+
+    def test_degraded_with_missing_pnl_row_renders_loud_artifact_block(self, monkeypatch):
+        """The realistic combo: DegradedRun means EODReconcile (which writes
+        eod_pnl.csv) was skipped — the artifact check must say so."""
+        _sf, _s3 = _eod_client_stubs(
+            monkeypatch,
+            describe_return={
+                "input": '{"run_date": "2026-08-08"}',
+                "error": "DegradedRun",
+                "cause": "EOD pipeline skipped EODReconcile (data gap).",
+            },
+            marker_present=True,
+            csv_body=b"date,nav\n2026-08-07,100000\n",  # no 2026-08-08 row
+        )
+        event = _event("FAILED", sm_arn=EOD_ARN)
+        index.handler(event, None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "Post-close Trading SF — DEGRADED" in text
+        assert "⚠️ *ARTIFACT(S) MISSING*" in text
+        assert "eod_pnl.csv row for 2026-08-08" in text
+        assert "_sf_completion marker" not in text  # marker WAS written
+
+
+class TestRunDateRendering:
+    """alpha-engine-config#5289 scope item 4: run_date, from execution input
+    or (fallback) execution name."""
+
+    def test_run_date_rendered_from_execution_input(self, monkeypatch):
+        _sf, _s3 = _eod_client_stubs(
+            monkeypatch,
+            describe_return={"input": '{"run_date": "2026-08-08"}', "error": "", "cause": ""},
+            csv_body=b"date,nav\n2026-08-08,100000\n",
+        )
+        event = _event("SUCCEEDED", sm_arn=EOD_ARN)
+        index.handler(event, None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "Run date: 2026-08-08" in text
+
+    def test_run_date_falls_back_to_execution_name(self, monkeypatch):
+        _sf, _s3 = _eod_client_stubs(
+            monkeypatch,
+            describe_return={"input": "{}", "error": "", "cause": ""},
+            csv_body=b"date,nav\n2026-08-08,100000\n",
+        )
+        event = _event(
+            "SUCCEEDED", sm_arn=EOD_ARN, name="eod-2026-08-08-1754678901"
+        )
+        index.handler(event, None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "Run date: 2026-08-08" in text
+
+    def test_run_date_absent_when_unresolvable(self, monkeypatch):
+        _sf, _s3 = _eod_client_stubs(
+            monkeypatch,
+            describe_return={"input": "{}", "error": "", "cause": ""},
+        )
+        event = _event("SUCCEEDED", sm_arn=WEEKDAY_ARN)  # exec-001, no date
+        index.handler(event, None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "Run date:" not in text
+
+
+class TestEodArtifactVerification:
+    """alpha-engine-config#5289 scope item 4: postclose SUCCEEDED/DEGRADED
+    terminals get the day's artifacts verified against S3. Only the EOD
+    pipeline triggers this — preopen/weekly are unaffected."""
+
+    def test_succeeded_with_both_artifacts_present_stays_one_extra_line(self, monkeypatch):
+        _sf, _s3 = _eod_client_stubs(
+            monkeypatch,
+            describe_return={"input": '{"run_date": "2026-08-08"}', "error": "", "cause": ""},
+            marker_present=True,
+            csv_body=b"date,nav\n2026-08-08,100000\n",
+        )
+        event = _event("SUCCEEDED", sm_arn=EOD_ARN)
+        index.handler(event, None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "Artifacts: ✓ completion marker + eod_pnl row (2026-08-08)" in text
+        assert "MISSING" not in text
+
+    def test_succeeded_with_missing_pnl_row_renders_loud(self, monkeypatch):
+        """The issue's core failure mode: a SUCCEEDED terminal whose eod_pnl
+        row was never written must not read clean."""
+        _sf, _s3 = _eod_client_stubs(
+            monkeypatch,
+            describe_return={"input": '{"run_date": "2026-08-08"}', "error": "", "cause": ""},
+            marker_present=True,
+            csv_body=b"date,nav\n2026-08-07,100000\n",  # no row for run_date
+        )
+        event = _event("SUCCEEDED", sm_arn=EOD_ARN)
+        result = index.handler(event, None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "Post-close Trading SF — SUCCEEDED" in text
+        assert "⚠️ *ARTIFACT(S) MISSING*" in text
+        assert "eod_pnl.csv row for 2026-08-08" in text
+        assert "_sf_completion marker" not in text
+        assert result["telegram_sent"] is True
+
+    def test_succeeded_with_missing_completion_marker_renders_loud(self, monkeypatch):
+        _sf, _s3 = _eod_client_stubs(
+            monkeypatch,
+            describe_return={"input": '{"run_date": "2026-08-08"}', "error": "", "cause": ""},
+            marker_present=False,
+            csv_body=b"date,nav\n2026-08-08,100000\n",
+        )
+        event = _event("SUCCEEDED", sm_arn=EOD_ARN)
+        index.handler(event, None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "⚠️ *ARTIFACT(S) MISSING*" in text
+        assert "_sf_completion marker for 2026-08-08" in text
+        assert "eod_pnl.csv row" not in text
+
+    def test_succeeded_with_both_artifacts_missing_names_both(self, monkeypatch):
+        _sf, _s3 = _eod_client_stubs(
+            monkeypatch,
+            describe_return={"input": '{"run_date": "2026-08-08"}', "error": "", "cause": ""},
+            marker_present=False,
+            csv_body=b"date,nav\n2026-08-07,100000\n",
+        )
+        event = _event("SUCCEEDED", sm_arn=EOD_ARN)
+        index.handler(event, None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "_sf_completion marker for 2026-08-08" in text
+        assert "eod_pnl.csv row for 2026-08-08" in text
+
+    def test_succeeded_with_unresolvable_run_date_reports_unverified(self, monkeypatch):
+        _sf, _s3 = _eod_client_stubs(
+            monkeypatch,
+            describe_return={"input": "{}", "error": "", "cause": ""},
+        )
+        event = _event("SUCCEEDED", sm_arn=EOD_ARN, name="exec-001")
+        index.handler(event, None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "⚠️ *ARTIFACTS UNVERIFIED*" in text
+
+    def test_non_eod_pipeline_succeeded_skips_artifact_check(self, monkeypatch):
+        _sf, _s3 = _eod_client_stubs(
+            monkeypatch,
+            describe_return={"input": '{"run_date": "2026-08-08"}', "error": "", "cause": ""},
+        )
+        event = _event("SUCCEEDED", sm_arn=WEEKDAY_ARN)
+        index.handler(event, None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "Artifacts:" not in text
+        assert "ARTIFACT(S) MISSING" not in text
+        assert "ARTIFACTS UNVERIFIED" not in text
+
+    def test_failed_non_degraded_eod_skips_artifact_check(self, monkeypatch):
+        """A genuine crash FAILED (not DegradedRun) does not trigger the
+        artifact check — that check exists for SUCCEEDED/DEGRADED only."""
+        _sf, _s3 = _eod_client_stubs(
+            monkeypatch,
+            describe_return={
+                "input": '{"run_date": "2026-08-08"}',
+                "error": "States.TaskFailed",
+                "cause": "CaptureSnapshot state failed",
+            },
+        )
+        event = _event("FAILED", sm_arn=EOD_ARN)
+        index.handler(event, None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "Artifacts:" not in text
+        assert "ARTIFACT(S) MISSING" not in text

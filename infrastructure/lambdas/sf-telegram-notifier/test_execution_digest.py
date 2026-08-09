@@ -12,6 +12,7 @@ from execution_digest import (
     build_execution_digest,
     build_state_durations,
     format_digest_lines,
+    parse_run_date_from_execution_name,
     parse_task_state_durations,
     StateDuration,
 )
@@ -103,6 +104,28 @@ def test_build_execution_digest_hollow_on_fast_predictor():
     assert hollow is True
     assert any("PredictorTraining" in line for line in lines)
     assert STATE_DURATION_FLOORS_SEC["PredictorTraining"] == 20 * 60
+
+
+def test_parse_run_date_from_execution_name_extracts_iso_date():
+    # daemon.py's _trigger_eod_pipeline: name=f"eod-{run_date}-{epoch}"
+    assert parse_run_date_from_execution_name("eod-2026-08-08-1754678901") == "2026-08-08"
+
+
+def test_parse_run_date_from_execution_name_handles_backstop_prefix():
+    # eod-backstop/index.py: name=f"eod-backstop-{trading_day}-{epoch}"
+    assert (
+        parse_run_date_from_execution_name("eod-backstop-2026-08-08-1700000000")
+        == "2026-08-08"
+    )
+
+
+def test_parse_run_date_from_execution_name_returns_none_without_a_date():
+    assert parse_run_date_from_execution_name("exec-001") is None
+
+
+def test_parse_run_date_from_execution_name_returns_none_for_empty_input():
+    assert parse_run_date_from_execution_name(None) is None
+    assert parse_run_date_from_execution_name("") is None
 
 
 def test_history_fetch_failure_surfaces_marker():
