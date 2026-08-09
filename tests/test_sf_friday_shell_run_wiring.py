@@ -1224,7 +1224,9 @@ class TestHappyPathTraversal:
         # -> CheckWeeklyFreshnessSpotBootstrapStatus (a green-trace Success ->
         # CheckShellRun, same "resolves to Success" convention this helper
         # already applies to every other WaitFor*/Check*Status poll loop) —
-        # five extra states in the visited order before CheckShellRun.
+        # five extra states in the visited order before CheckShellRun (now six
+        # per alpha-engine-config-I5687's InitWeeklyFreshnessSpotBootstrapPollCount
+        # poll-budget seed).
         assert order[: order.index("CheckSkipMorningEnrich") + 4] == [
             "InitializeInput",
             "CheckWeeklyRunDayGate",
@@ -1242,6 +1244,9 @@ class TestHappyPathTraversal:
             "CheckSpotDispatchNeeded",
             "DispatchWeeklyFreshnessSpot",
             "MergeWeeklyFreshnessSpotInstanceId",
+            # alpha-engine-config-I5687: the poll-budget seed now sits
+            # between the instance-id merge and the first poll.
+            "InitWeeklyFreshnessSpotBootstrapPollCount",
             "WaitForWeeklyFreshnessSpotBootstrap",
             "CheckWeeklyFreshnessSpotBootstrapStatus",
             "CheckShellRun",
