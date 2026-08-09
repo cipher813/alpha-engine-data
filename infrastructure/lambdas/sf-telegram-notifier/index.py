@@ -20,7 +20,16 @@ import os
 
 import boto3
 
-from execution_digest import build_execution_digest, parse_run_date_from_input
+from execution_digest import (
+    build_execution_digest,
+    parse_run_date_from_execution_name,
+    parse_run_date_from_input,
+)
+from eod_artifact_verification import (
+    EOD_PIPELINE_NAME,
+    format_eod_artifact_lines,
+    verify_eod_artifacts,
+)
 from flow_doctor_telegram import build_flow_doctor_config, notify_via_flow_doctor
 from nousergon_lib.flow_doctor_fleet import (
     FleetTelegramTopic,
@@ -58,6 +67,14 @@ _STATUS_EMOJI: dict[str, str] = {
     "TIMED_OUT": "⏰",
     "ABORTED": "⛔",
 }
+
+# The eod SF's deliberate `Error: "DegradedRun"` Fail terminal (config-I2702
+# deliverable #4 / Brian's 2026-07-28 Option-A ruling, alpha-engine-
+# config#2699) is a raw Step Functions FAILED status — it must not render
+# identically to a genuine crash-FAILED (nousergon-data-i5289: the issue's
+# "a degraded EOD must not read as a clean one" requirement, inverted — it
+# must also not read as a generic failure). Distinct emoji, distinct label.
+_DEGRADED_EMOJI = "\U0001f7e0"  # 🟠
 
 _CAUSE_MAX_CHARS = 280
 _TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"})
@@ -178,6 +195,18 @@ def _is_partial_execution(sm_arn: str, describe_resp: dict | None) -> tuple[bool
     return skipped > 0, skipped
 
 
+def _is_degraded_run(describe_resp: dict | None) -> bool:
+    """True when a FAILED execution is the deliberate ``DegradedRun`` Fail
+    terminal, not a genuine crash. Reads the SAME ``Error`` field the SF
+    definition itself stamps (``step_function_eod.json``'s ``DegradedRun``
+    Fail state, ``"Error": "DegradedRun"``) rather than re-deriving the
+    distinction from cause text — one source of truth, mirrored, not
+    reinvented."""
+    if not describe_resp:
+        return False
+    return (describe_resp.get("error") or "") == "DegradedRun"
+
+
 def _failure_cause_from(describe_resp: dict | None) -> str:
     if not describe_resp:
         return ""
@@ -199,7 +228,13 @@ def _build_message(
     sf_client=None,
     s3_client=None,
 ) -> tuple[str, bool, bool]:
-    """Return ``(text, silent, hollow_suspect, is_partial)``."""
+    """Return ``(text, silent, hollow_suspect, is_partial)``.
+
+    ``text`` may render the raw AWS ``FAILED`` status as ``DEGRADED`` (the
+    eod SF's deliberate ``DegradedRun`` Fail terminal) — the returned tuple's
+    ``status``-shaped values stay keyed on the raw AWS status throughout;
+    only the rendered label/emoji distinguish it.
+    """
     status = detail.get("status", "UNKNOWN")
     execution_arn = detail.get("executionArn", "")
     if describe_resp is None:
@@ -212,11 +247,14 @@ def _build_message(
         # Say what it actually was. A reader must not have to open the console
         # to learn that "Weekly Freshness SF — FAILED" meant one stage of it.
         label = f"{label} (partial run — {skipped_stages} stage(s) skipped)"
-    emoji = _STATUS_EMOJI.get(status, "\U0001f4e8")
+    sm_name = sm_arn.rsplit(":", 1)[-1] if sm_arn else ""
+    is_degraded = status == "FAILED" and _is_degraded_run(describe_resp)
+    display_status = "DEGRADED" if is_degraded else status
+    emoji = _DEGRADED_EMOJI if is_degraded else _STATUS_EMOJI.get(status, "\U0001f4e8")
     exec_name = detail.get("name", "") or "(unknown execution)"
     hollow_suspect = False
 
-    lines = [f"{emoji} *{label} — {status}*"]
+    lines = [f"{emoji} *{label} — {display_status}*"]
 
     if status == "RUNNING":
         lines.append(f"Execution: {exec_name}")
@@ -232,6 +270,13 @@ def _build_message(
         if s3_client is None and not is_preflight:
             s3_client = boto3.client("s3", region_name=REGION)
         run_date = parse_run_date_from_input((describe_resp or {}).get("input"))
+        if not run_date:
+            # config#5289: manual re-triggers / input-parse failures carry no
+            # `run_date` key — fall back to the ISO date embedded in every
+            # scheduled trigger's execution name rather than losing it.
+            run_date = parse_run_date_from_execution_name(exec_name)
+        if run_date:
+            lines.append(f"Run date: {run_date}")
         digest_lines, hollow_suspect = build_execution_digest(
             execution_arn=execution_arn,
             is_preflight=is_preflight,
@@ -244,6 +289,16 @@ def _build_message(
             lines.append("⚠️ *HOLLOW-SUSPECT* — workload state(s) completed implausibly fast")
         lines.append("*States:*")
         lines.extend(digest_lines)
+
+        # nousergon-data-i5289 (alpha-engine-config#5289 scope item 4): a
+        # postclose SUCCEEDED/DEGRADED terminal additionally gets its day's
+        # artifacts verified — a "SUCCESS" that did not write eod_pnl.csv is
+        # the failure mode this issue exists to catch. s3_client is already a
+        # real client here (eod is never preflight, so the block above always
+        # provisions one).
+        if sm_name == EOD_PIPELINE_NAME and (status == "SUCCEEDED" or is_degraded):
+            artifact_status = verify_eod_artifacts(s3_client, run_date)
+            lines.extend(format_eod_artifact_lines(artifact_status))
 
     if status == "FAILED":
         cause = _failure_cause_from(describe_resp)
