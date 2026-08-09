@@ -407,6 +407,7 @@
       "Type": "Task",
       "Comment": "I4494: pre-spend gate — runs sf_preflight.py checks against live AWS state before the pipeline spends on any spot or mutex acquisition. Checks: IAM reachability, tool contracts, definition input coherence, Lambda memory headroom. Fail-hard on assertion failure (preflight is cheaper than a Saturday spot run that would die for the same reason). Routes failures through ExtractWeeklyPreflightError → NormalizeFailureContext (the same chokepoint all pre-spend gate failures use), NOT directly to HandleFailure. Reads-only: no writes, no cost, no side effects. <60s target.",
       "Resource": "arn:aws:states:::lambda:invoke",
+      "TimeoutSeconds": 60,
       "Parameters": {
         "FunctionName": "alpha-engine-weekly-preflight:live"
       },
