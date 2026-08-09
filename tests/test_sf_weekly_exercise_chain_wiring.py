@@ -33,8 +33,18 @@ def weekly() -> dict:
 
 def test_postclose_tail_routes_through_the_exercise_launch(eod):
     """StopTradingInstance is the cost guard and always runs — chaining after
-    it means the exercise run fires on both the green and degraded paths."""
-    assert eod["StopTradingInstance"]["Next"] == "LaunchWeeklyExerciseRun"
+    it means the exercise run fires on both the green and degraded paths.
+    alpha-engine-config-I6689 inserted the declared-cadence read + gate
+    (ReadExerciseCadence -> CheckExerciseCadence) ahead of the launch itself,
+    so this is now a three-hop path on the cadence=daily branch — pinned in
+    full (including the fail-open routes) by
+    tests/test_sf_weekly_cadence_wiring.py."""
+    assert eod["StopTradingInstance"]["Next"] == "ReadExerciseCadence"
+    assert eod["ReadExerciseCadence"]["Next"] == "CheckExerciseCadence"
+    daily_choice = next(
+        c for c in eod["CheckExerciseCadence"]["Choices"] if c.get("StringEquals") == "daily"
+    )
+    assert daily_choice["Next"] == "LaunchWeeklyExerciseRun"
     assert eod["LaunchWeeklyExerciseRun"]["Next"] == "CheckDegradedOutcome"
 
 
