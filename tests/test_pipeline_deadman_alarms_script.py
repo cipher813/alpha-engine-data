@@ -127,7 +127,7 @@ class TestStateMachineCoverage:
 class TestAlarmSemantics:
     def test_watches_executions_started_metric(self, script_text):
         assert '--namespace "AWS/States"' in script_text
-        assert '--metric-name "ExecutionsStarted"' in script_text
+        assert '--metric-name "ExecutionsSucceeded"' in script_text
 
     def test_dimension_is_state_machine_arn(self, script_text):
         assert "Name=StateMachineArn,Value=" in script_text

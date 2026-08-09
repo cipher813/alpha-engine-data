@@ -4269,13 +4269,20 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Advisory grading is non-fatal \u2014 continue to the terminal notify regardless. config#2302: the run must still PAGE on entry (silent for 9 days pre-fix), so route through PublishReportCardDegraded before the terminal notify rather than swallowing the error.",
-          "Next": "PublishReportCardDegraded",
+          "Comment": "Advisory grading is non-fatal \u2014 continue to the terminal notify regardless. config#2302: the run must still PAGE on entry (silent for 9 days pre-fix), so route through ReportCardDegraded (sets the SF-controlled visible flag) then PublishReportCardDegraded before the terminal notify rather than swallowing the error. config#6685: pre-fix this Catch skipped straight to the alert Task with NO flag set, so a clean gate/health run still terminated at plain NotifyComplete (\"All steps completed successfully\") \u2014 weekly-sf-policy.md \u00a72.3 violation; the standalone alert is not the terminal notification.",
+          "Next": "ReportCardDegraded",
           "ResultPath": "$.report_card_error"
         }
       ],
       "ResultPath": "$.report_card_result",
       "Next": "Director"
+    },
+    "ReportCardDegraded": {
+      "Type": "Pass",
+      "Comment": "config#6685: ReportCard's Catch(States.ALL) could not run advisory grading \u2014 set report_card_degraded=true (SF-controlled boolean, IsPresent-guarded per config#2275) so it threads into the completion-email selection (CheckGateDegradedNotify) same as $.gate_degraded / $.health_check_degraded. Mirrors LibPinGateDegraded / SaturdayHealthCheckDegraded shape exactly. Proceeds to PublishReportCardDegraded (the immediate PAGE alert, config#2302) unchanged.",
+      "Result": true,
+      "ResultPath": "$.report_card_degraded",
+      "Next": "PublishReportCardDegraded"
     },
     "PublishReportCardDegraded": {
       "Type": "Task",
@@ -4357,8 +4364,50 @@
     },
     "CheckGateDegradedNotify": {
       "Type": "Choice",
-      "Comment": "config#2278 + config#2276: a green run that could not run its pre-spend gates (gate_degraded \u2014 set ONLY by the LibPinGateDegraded / PipelineContractGateDegraded Pass states) and/or its tail health checks (health_check_degraded \u2014 set ONLY by the SaturdayHealthCheckDegraded / SubstrateHealthCheckDegraded Pass states) must SAY SO in the completion email. Both are SF-controlled booleans, IsPresent-guarded per config#2275. Rules are ordered most-specific-first (both \u2192 gates-only \u2192 health-only); each routes to a SEPARATE hardcoded-constant notifier rather than States.Format-ing flags into NotifyComplete \u2014 preserving config#1819's Subject/Message-are-constants invariant. Composition note (config#2276): the two health checks share ONE flag (which check degraded lives on the execution record), so the enumeration is bounded at 3 degraded notifiers for the 2 flag families; a THIRD flag family should trigger a refactor to a data-driven degraded notifier, not a 7-way enumeration. Name retained from config#2278 (it is the wave-1 chain anchor referenced across tests/comments) \u2014 read it as the degraded-completion selector.",
+      "Comment": "config#2278 + config#2276 + config#6685: a green run that could not run its pre-spend gates (gate_degraded \u2014 set ONLY by the LibPinGateDegraded / PipelineContractGateDegraded Pass states), and/or its tail health checks (health_check_degraded \u2014 set ONLY by the SaturdayHealthCheckDegraded / SubstrateHealthCheckDegraded Pass states), and/or ReportCard's advisory grading (report_card_degraded \u2014 set ONLY by ReportCardDegraded, config#6685) must SAY SO in the completion email (weekly-sf-policy.md \u00a72.3). All three are SF-controlled booleans, IsPresent-guarded per config#2275. Rules are ordered most-specific-first: report_card_degraded combined with EITHER other family routes to the single generic NotifyCompleteMultipleDegraded (config#6685 \u2014 this is the config#2276 comment's predicted 'third flag family': rather than the 7-way enumeration a naive 3-flag cross-product would need, any report_card_degraded+other combination folds into ONE combined notifier whose Message names report card explicitly and points at the execution record for which other family also degraded, instead of enumerating all 4 additional combinations as separate hardcoded Task states); the pre-existing gates+health / gates-only / health-only rules are UNCHANGED (each still implies report_card_degraded is absent, since any report_card_degraded-true path is intercepted by the two rules ahead of them); report_card_degraded alone (gate/health both absent) gets its own single-flag notifier (NotifyCompleteReportCardDegraded) mirroring NotifyCompleteGatesDegraded/NotifyCompleteHealthDegraded exactly. Each still routes to a SEPARATE hardcoded-constant notifier rather than States.Format-ing flags into NotifyComplete \u2014 preserving config#1819's Subject/Message-are-constants invariant. Name retained from config#2278 (it is the wave-1 chain anchor referenced across tests/comments) \u2014 read it as the degraded-completion selector.",
       "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.report_card_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.report_card_degraded",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.gate_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.gate_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyCompleteMultipleDegraded"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.report_card_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.report_card_degraded",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.health_check_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.health_check_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyCompleteMultipleDegraded"
+        },
         {
           "And": [
             {
@@ -4405,6 +4454,19 @@
             }
           ],
           "Next": "NotifyCompleteHealthDegraded"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.report_card_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.report_card_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyCompleteReportCardDegraded"
         }
       ],
       "Default": "NotifyComplete"
@@ -4475,9 +4537,53 @@
       ],
       "Next": "WriteCompletionMarker"
     },
+    "NotifyCompleteReportCardDegraded": {
+      "Type": "Task",
+      "Comment": "config#6685: SUCCESS notifier for a run whose ReportCard advisory grading was DEGRADED (Lambda failure — PublishReportCardDegraded already paged on entry; this is the terminal completion notice) and neither pre-spend gates nor tail health checks were. Mirrors NotifyCompleteGatesDegraded/NotifyCompleteHealthDegraded exactly — constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Saturday Pipeline — SUCCESS (report card DEGRADED)",
+        "Message": "All steps completed successfully — BUT ReportCard (the Evaluator Report Card v2 Lambda, advisory grading) failed and did not run; a report-card-degraded alert fired earlier in this run. See $.report_card_error on the execution record for detail. The weekly run's real trading artifacts are unaffected; only the advisory grading layer (report_card.json, and downstream Director) did not run. View pipeline status: https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.notify_result",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#1819 — best-effort: a SUCCESS-path notifier must never fail an otherwise-succeeded pipeline.",
+          "ResultPath": "$.notify_error",
+          "Next": "NotifyCompleteDegraded"
+        }
+      ],
+      "Next": "WriteCompletionMarker"
+    },
+    "NotifyCompleteMultipleDegraded": {
+      "Type": "Task",
+      "Comment": "config#6685: SUCCESS notifier for a run where ReportCard's advisory grading was DEGRADED TOGETHER WITH one or both of the pre-spend gates and/or the tail health checks. Folded (config#2276's own comment predicted a third flag family would need a data-driven notifier rather than a 7-way enumeration): a single generic combined-degradation notifier for every report_card_degraded+other combination, instead of 4 additional hardcoded per-combination Task states. Names report card explicitly (weekly-sf-policy.md §2.3 requires naming), points at the execution record for which OTHER family also degraded rather than enumerating every combination in prose. Mirrors NotifyCompleteGatesDegraded's shape — constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Saturday Pipeline — SUCCESS (multiple stages DEGRADED, incl. report card)",
+        "Message": "All steps completed successfully — BUT ReportCard (advisory grading) was DEGRADED on this run, ALONG WITH one or more pre-spend gates and/or tail health checks. Exact combination is on the execution record: $.gate_degraded / $.health_check_degraded / $.report_card_degraded, with detail at $.report_card_error and (if set) $.health_check_error / $.substrate_check_error. View pipeline status: https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.notify_result",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#1819 — best-effort: a SUCCESS-path notifier must never fail an otherwise-succeeded pipeline.",
+          "ResultPath": "$.notify_error",
+          "Next": "NotifyCompleteDegraded"
+        }
+      ],
+      "Next": "WriteCompletionMarker"
+    },
     "WriteCompletionMarker": {
       "Type": "Task",
-      "Comment": "config#2857: SF-envelope completion marker — an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine: a hung/failed SF must not be indistinguishable from a healthy one just because a prior run already wrote today's downstream artifacts). Converges the 5 real-completion notify paths (NotifyComplete, its degraded-catch fallback, and the 3 gate/health-degraded variants) — deliberately EXCLUDES NotifyShellRunComplete/NotifyShellRunCompleteDegraded (the Friday-PM preflight dry-pass is not a real weekly completion; marking it would let a dry run silently satisfy the SLA). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_weekly_freshness_pipeline (cadence saturday_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable — exactly the ambiguity this feature exists to surface, not mask.",
+      "Comment": "config#2857: SF-envelope completion marker — an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine: a hung/failed SF must not be indistinguishable from a healthy one just because a prior run already wrote today's downstream artifacts). Converges the 7 real-completion notify paths (NotifyComplete, its degraded-catch fallback, the 3 gate/health-degraded variants, and the 2 report-card-degraded variants added config#6685) — deliberately EXCLUDES NotifyShellRunComplete/NotifyShellRunCompleteDegraded (the Friday-PM preflight dry-pass is not a real weekly completion; marking it would let a dry run silently satisfy the SLA). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_weekly_freshness_pipeline (cadence saturday_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable — exactly the ambiguity this feature exists to surface, not mask.",
       "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
       "Parameters": {
         "Bucket": "alpha-engine-research",
