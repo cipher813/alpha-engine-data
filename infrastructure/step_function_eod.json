@@ -1048,6 +1048,18 @@
         "source": "CheckPostMarket*SpotStatus or launch Catch"
       },
       "ResultPath": "$.data_spot_error",
+      "Next": "SetDataSpotDegradedFlag"
+    },
+    "SetDataSpotDegradedFlag": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config#6715: EOD parity with step_function_daily.json's SetDataSpotDegradedFlag (config#6692 Option-A) and this file's own SetDegradedFlag (config-I2702) \u2014 the EOD post-market data-spot fail-open path (ExtractDataSpotError) recorded the failure as DATA ($.data_spot_error) and fired a best-effort SNS alert (PublishDataSpotFailureImmediate) but never threaded a $.degraded_summary flag, so a data-spot failure completed with a plain SUCCEEDED marker despite failing open \u2014 the exact asymmetry with the daily SF's already-fixed equivalent that tests/test_sf_structural_contract.py::test_every_fail_open_catch_route_sets_the_degraded_flag_or_is_exempt (alpha-engine-config#6715) exists to catch. Mirrors step_function_daily.json's SetDataSpotDegradedFlag exactly: threads $.degraded_summary onto the data-spot fail-open path WITHOUT changing its fail-open continuation \u2014 Next still leads to PublishDataSpotFailureImmediate and on to CheckSkipCaptureSnapshot exactly as before, so the run still proceeds to snapshot/reconcile/instance-stop. The flag is only read later by CheckDegradedOutcome (reached via StopTradingInstance's Next at the tail of every path), which routes the eventual TERMINAL to WriteCompletionMarkerDegraded -> DegradedRun instead of a plain SUCCEEDED execution. Does not clobber $.data_spot_error (set by the preceding ExtractDataSpotError ResultPath) or any earlier $.degraded_summary from SetDegradedFlag (the EOD-reconcile-skip path, config-I2702) \u2014 if both stages degraded, this state's write simply wins as the most-recent cause; degraded=true is preserved either way.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "eod_data_spot_fail_open",
+        "run_date.$": "$.run_date",
+        "stage_error.$": "$.data_spot_error"
+      },
+      "ResultPath": "$.degraded_summary",
       "Next": "PublishDataSpotFailureImmediate"
     },
     "PublishDataSpotFailureImmediate": {

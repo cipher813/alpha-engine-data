@@ -60,6 +60,27 @@ and cannot verify without a network clone — out of scope by the "pure file
 read, no network" constraint in config#6684's deliverables. Only scripts
 invoked after ``cd /home/ec2-user/alpha-engine-data`` (this repo's own EC2
 deploy target, confirmed in OVERVIEW.md) are checked for existence.
+
+alpha-engine-config#6715 (WSF-2.3-degradation-is-visible /
+WSF-5-carve-outs-set-a-degraded-flag chokepoint) adds a fifth guard in the
+same suite: every fail-open Catch route (a Catch whose target is NOT a
+failure-family state — derived structurally, not from a hand-list) must
+pass through a state that writes the degraded-flag JSONPath the terminal
+notifier/marker-selector actually reads (``$.gate_degraded`` /
+``$.health_check_degraded`` / ``$.report_card_degraded`` /
+``$.parity_degraded`` for weekly's ``CheckGateDegradedNotify``;
+``$.degraded_summary`` for daily/eod's ``CheckDegradedOutcome``), or carry
+an explicit, reasoned ``_DEGRADED_FLAG_EXEMPT`` entry. Scoped to the three
+SCHEDULED pipelines only (``step_function_groom.json`` has no such
+concept — see ``_DEGRADED_FLAG_SF_FILES``). Running the walker against the
+definitions as measured on this branch surfaced 25 pre-existing gaps
+(tracked, not fixed, at alpha-engine-config#6722 — including a NAMED §5
+carve-out non-compliance on ``AggregateCosts`` and a dead flag on
+``ThinkTankDegraded`` that is set but never read) and one genuinely
+mechanical fix applied directly in this PR: ``step_function_eod.json``'s
+post-market data-spot fail-open path was missing the
+``SetDataSpotDegradedFlag`` state its sibling ``step_function_daily.json``
+already has (config#6692) — added verbatim, mirroring the daily pattern.
 """
 from __future__ import annotations
 
@@ -173,6 +194,363 @@ _SF_FILE_NAMES = sorted(_TIMEOUT_EXEMPT)
 
 
 # ---------------------------------------------------------------------------
+# alpha-engine-config#6715 — WSF-2.3-degradation-is-visible /
+# WSF-5-carve-outs-set-a-degraded-flag chokepoint: every fail-open Catch
+# route (a Catch whose target is NOT a failure-family state — i.e. the
+# execution proceeds toward a normal SUCCESS terminal rather than the
+# shared hard-fail sink) must pass through a state that writes the
+# degraded-flag JSONPath the terminal notifier/marker-selector ACTUALLY
+# dereferences. "Actually dereferences" is load-bearing (config#6715
+# gotcha): ResearchPredictorParallel.ThinkTankDegraded below sets
+# $.thinktank_degraded and its own Comment calls it "THE VISIBLE DEGRADED
+# FLAG" — but nothing downstream ever reads that path, so a naive "any
+# degraded-named key" check would pass a dead flag. The real consumers are
+# the two Choice states below, whose exact Variable set is independently
+# verified against these constants by
+# test_degraded_flag_jsonpaths_match_the_actual_terminal_choice.
+# ---------------------------------------------------------------------------
+
+# sf-pipeline-policy.md §1.1 scopes to exactly the three SCHEDULED
+# pipelines (weekly freshness, weekday preopen, weekday postclose/EOD).
+# step_function_groom.json is a maintenance/backlog-groom dispatcher with
+# no degraded-flag concept at all (no WriteCompletionMarker, no
+# CheckGateDegradedNotify/CheckDegradedOutcome equivalent — see
+# test_degraded_flag_scope_is_the_three_scheduled_pipelines below) and is
+# deliberately OUT of this test family's scope, unlike the shared
+# _SF_FILE_NAMES parametrization above.
+_DEGRADED_FLAG_SF_FILES = [
+    name for name in _SF_FILE_NAMES if name != "step_function_groom.json"
+]
+
+# The Choice state that is the SOLE router into the degraded-vs-clean
+# terminal for each file — the thing this whole test exists to protect.
+_TERMINAL_DEGRADED_CHOICE: dict[str, str] = {
+    "step_function.json": "CheckGateDegradedNotify",
+    "step_function_daily.json": "CheckDegradedOutcome",
+    "step_function_eod.json": "CheckDegradedOutcome",
+}
+
+# The degraded-flag SETTER paths (the ResultPath a flag-writing Pass state
+# uses) for each file. Weekly sets four independent top-level booleans,
+# each read verbatim by CheckGateDegradedNotify. Daily/eod set ONE
+# composite object ($.degraded_summary, config#6692/config-I2702's
+# Option-A shape); CheckDegradedOutcome reads a nested field of it
+# ($.degraded_summary.degraded) — see _is_prefix_path below, which treats
+# a setter path as satisfying any reader path nested under it.
+_DEGRADED_FLAG_JSONPATHS: dict[str, frozenset[str]] = {
+    "step_function.json": frozenset(
+        {
+            "$.gate_degraded",
+            "$.health_check_degraded",
+            "$.report_card_degraded",
+            "$.parity_degraded",
+        }
+    ),
+    "step_function_daily.json": frozenset({"$.degraded_summary"}),
+    "step_function_eod.json": frozenset({"$.degraded_summary"}),
+}
+
+# States whose Catch is the shared hard-fail sink — reaching one of these
+# means the execution eventually fails LOUD (a real Fail-type terminal:
+# FailExecution/MutexConflict), so the route is NOT "fail-open to a silent
+# SUCCESS" and needs no degraded flag. Weekly funnels every hard failure
+# through NormalizeFailureContext(Repin) -> HandleFailure -> FailExecution
+# (config#1819, the notifier-totality fix); daily/eod funnel straight to
+# HandleFailure -> FailExecution (no repin stage — config#1819 is
+# weekly-only). MutexConflict is a direct Fail-type Catch target in all
+# three (config#2280/L274).
+_FAILURE_FAMILY: dict[str, frozenset[str]] = {
+    "step_function.json": frozenset(
+        {
+            "NormalizeFailureContext",
+            "NormalizeFailureContextRepin",
+            "HandleFailure",
+            "FailExecution",
+            "MutexConflict",
+        }
+    ),
+    "step_function_daily.json": frozenset(
+        {"HandleFailure", "FailExecution", "MutexConflict"}
+    ),
+    "step_function_eod.json": frozenset(
+        {"HandleFailure", "FailExecution", "MutexConflict"}
+    ),
+}
+
+# Weekly-only: ResearchPredictorParallel's two branch terminals
+# (BranchAFailed/BranchBFailed) record branch_a_status/branch_b_status =
+# "FAILED" as DATA and End:true — the BRANCH itself must SUCCEED so the
+# sibling branch is never cancelled (Parallel's cancel-siblings-on-throw
+# default) — but AggregateBranchOutcomes/CheckBranchOutcomes (structurally
+# verified by test_check_branch_outcomes_routes_failed_branches_to_hard_fail
+# below, not just asserted here) re-fails the WHOLE SF for either FAILED
+# status via ExtractParallelBranchError -> NormalizeFailureContext. A Catch
+# landing on BranchAFailed/BranchBFailed is therefore a DELAYED hard-fail,
+# not a fail-open-to-success path: it never reaches NotifyComplete /
+# WriteCompletionMarker at all on the FAILED branch, so no degraded flag is
+# needed.
+_BRANCH_JOIN_HARD_FAIL: dict[str, frozenset[str]] = {
+    "step_function.json": frozenset(
+        {
+            "ResearchPredictorParallel.BranchAFailed",
+            "ResearchPredictorParallel.BranchBFailed",
+        }
+    ),
+    "step_function_daily.json": frozenset(),
+    "step_function_eod.json": frozenset(),
+}
+
+# A Catch OWNED by an sns:publish notifier Task is the config#1819
+# "notifier-totality" pattern: a best-effort alert about an ALREADY-
+# DETERMINED outcome (clean, degraded, or failed) whose OWN delivery
+# failure must never block the pipeline (e.g. PublishLibPinGateDegraded's
+# Catch fires only if the SNS publish itself throws — by the time it runs,
+# its predecessor LibPinGateDegraded has already set $.gate_degraded).
+# That is a different, pre-existing axis from "did the STAGE fail open
+# silently" (config#6715's scope) — excluded here by construction (any
+# Task whose Resource is sns:publish), not by name, so a new notify Task
+# inherits the exclusion automatically instead of needing a registry entry.
+_NOTIFY_RESOURCE = "arn:aws:states:::sns:publish"
+
+# Explicit, reasoned exemption registry — one entry per fail-open Catch
+# route (keyed by the CATCHING state's path; verified unique per state by
+# test_meta_at_most_one_fail_open_catch_per_state below, since AcquireMutex
+# is the only state in any of the three files with two Catch clauses and
+# its OTHER clause — MutexConflict — is already excluded as
+# failure-family). Every entry is either:
+#   * a genuine sf-pipeline-policy.md §5 carve-out (no flag required by
+#     policy, cites the clause);
+#   * a structurally-verifiable "the flag is already set by an ancestor
+#     that unconditionally precedes this state" claim (cites the ancestor);
+#   * a deliberate documented SWALLOW that fails SAFE toward the primary
+#     path rather than toward silent success (cites the state's own
+#     inline rationale); or
+#   * "VIOLATION — tracked (alpha-engine-config#6722)" — a genuine,
+#     un-fixed policy gap this PR did NOT silently paper over. #6722 is the
+#     tracker; alpha-engine-config#6715 built this test and fixed the one
+#     instance (EOD's data-spot path) mechanical enough to fix in place —
+#     see infrastructure/step_function_eod.json's new
+#     SetDataSpotDegradedFlag state.
+_DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
+    "step_function.json": {
+        "WeeklyRunDayGate": (
+            "sf-pipeline-policy.md §5 carve-out: 'The weekly run-day gate "
+            "fails open — missing a weekly run is worse than a duplicate; "
+            "the mutex handles duplicates.' No degraded flag required by "
+            "design, unlike the other three named §5 families."
+        ),
+        "AcquireMutex": (
+            "VIOLATION — tracked (alpha-engine-config#6722): the "
+            "mutex-acquire infra-error Catch clause (DynamoDB failure "
+            "other than ConditionalCheckFailedException, which the "
+            "SEPARATE MutexConflict Catch/Fail already handles) proceeds "
+            "silently with no degraded flag."
+        ),
+        "ResearchPredictorParallel.Scanner": (
+            "VIOLATION — tracked (alpha-engine-config#6722): research-"
+            "substep fail-open group (Scanner/RegimeSubstrate/"
+            "ChallengerShadow/RegimeRetrospectiveEval) with no degraded flag."
+        ),
+        "ResearchPredictorParallel.RegimeSubstrate": (
+            "VIOLATION — tracked (alpha-engine-config#6722): same "
+            "research-substep group as Scanner."
+        ),
+        "ResearchPredictorParallel.ChallengerShadow": (
+            "VIOLATION — tracked (alpha-engine-config#6722): same "
+            "research-substep group as Scanner."
+        ),
+        "ResearchPredictorParallel.ThinkTankCoverage": (
+            "VIOLATION — tracked (alpha-engine-config#6722): "
+            "ThinkTankDegraded DOES set a flag ($.thinktank_degraded=true) "
+            "but it is DEAD — never read by CheckGateDegradedNotify or "
+            "anywhere else in this file. The exact 'follow the actual "
+            "JSONPath, not any degraded-named key' trap config#6715 was "
+            "built to catch."
+        ),
+        "ResearchPredictorParallel.WaitForThinkTank": (
+            "VIOLATION — tracked (alpha-engine-config#6722): same dead-"
+            "flag finding as ThinkTankCoverage."
+        ),
+        "ResearchPredictorParallel.RegimeRetrospectiveEval": (
+            "VIOLATION — tracked (alpha-engine-config#6722): same "
+            "research-substep group as Scanner."
+        ),
+        "ResearchPredictorParallel.EvalJudgeSubmitFirstSaturday": (
+            "VIOLATION — tracked (alpha-engine-config#6722): eval-judge "
+            "chain fail-open group (EvalJudgeSubmit*/EvalJudgePoll/"
+            "EvalJudgeProcess/EvalRollingMean/RationaleClustering/"
+            "ReplayConcordance/Counterfactual) with no degraded flag."
+        ),
+        "ResearchPredictorParallel.EvalJudgeSubmitWeekly": (
+            "VIOLATION — tracked (alpha-engine-config#6722): same "
+            "eval-judge chain group as EvalJudgeSubmitFirstSaturday."
+        ),
+        "ResearchPredictorParallel.EvalJudgePoll": (
+            "VIOLATION — tracked (alpha-engine-config#6722): same "
+            "eval-judge chain group as EvalJudgeSubmitFirstSaturday."
+        ),
+        "ResearchPredictorParallel.EvalJudgeProcess": (
+            "VIOLATION — tracked (alpha-engine-config#6722): same "
+            "eval-judge chain group as EvalJudgeSubmitFirstSaturday."
+        ),
+        "ResearchPredictorParallel.EvalRollingMean": (
+            "VIOLATION — tracked (alpha-engine-config#6722): same "
+            "eval-judge chain group as EvalJudgeSubmitFirstSaturday."
+        ),
+        "ResearchPredictorParallel.RationaleClustering": (
+            "VIOLATION — tracked (alpha-engine-config#6722): same "
+            "eval-judge chain group as EvalJudgeSubmitFirstSaturday."
+        ),
+        "ResearchPredictorParallel.ReplayConcordance": (
+            "VIOLATION — tracked (alpha-engine-config#6722): same "
+            "eval-judge chain group as EvalJudgeSubmitFirstSaturday."
+        ),
+        "ResearchPredictorParallel.Counterfactual": (
+            "VIOLATION — tracked (alpha-engine-config#6722): same "
+            "eval-judge chain group as EvalJudgeSubmitFirstSaturday."
+        ),
+        "ResearchPredictorParallel.AggregateCosts": (
+            "VIOLATION — tracked (alpha-engine-config#6722): matches "
+            "sf-pipeline-policy.md §5's NAMED cost-aggregation carve-out "
+            "verbatim ('Health-check and cost-aggregation stages may "
+            "fail-open ... They must still set a degraded flag.') — "
+            "Catch routes straight to BranchAComplete with zero flag. "
+            "Policy non-compliance on an explicit clause."
+        ),
+        "ResearchPredictorParallel.ResolveZooSpecs": (
+            "VIOLATION — tracked (alpha-engine-config#6722): model-zoo "
+            "rotation fail-open group (ResolveZooSpecs/WaitResolveZoo/"
+            "ModelZooTrainMap/ModelZooSelect/WaitForModelZoo) with no "
+            "degraded flag — the champion is already trained+promoted so "
+            "the rotation is advisory, but policy still requires a "
+            "visible flag for any fail-open stage."
+        ),
+        "ResearchPredictorParallel.WaitResolveZoo": (
+            "VIOLATION — tracked (alpha-engine-config#6722): same "
+            "model-zoo rotation group as ResolveZooSpecs."
+        ),
+        "ResearchPredictorParallel.ModelZooTrainMap": (
+            "VIOLATION — tracked (alpha-engine-config#6722): same "
+            "model-zoo rotation group as ResolveZooSpecs (the Map state's "
+            "OWN Catch — a genuine Map-engine error, not a per-iteration "
+            "one; see TrainSpecDispatch/WaitTrainSpec below for the "
+            "per-iteration case)."
+        ),
+        "ResearchPredictorParallel.ModelZooSelect": (
+            "VIOLATION — tracked (alpha-engine-config#6722): same "
+            "model-zoo rotation group as ResolveZooSpecs."
+        ),
+        "ResearchPredictorParallel.WaitForModelZoo": (
+            "VIOLATION — tracked (alpha-engine-config#6722): same "
+            "model-zoo rotation group as ResolveZooSpecs."
+        ),
+        "ResearchPredictorParallel.ModelZooTrainMap.TrainSpecDispatch": (
+            "Map ITERATION-level failure, tolerated by design per this "
+            "state's own Comment ('siblings proceed, ModelZooSelect "
+            "simply finds this spec challenger absent from the "
+            "registry') — isolated to one candidate spec, not a "
+            "pipeline-outcome signal; a pipeline-wide degraded flag per "
+            "failed spec would be noise on expected per-rotation churn."
+        ),
+        "ResearchPredictorParallel.ModelZooTrainMap.WaitTrainSpec": (
+            "Same per-iteration tolerated-by-design reasoning as "
+            "TrainSpecDispatch."
+        ),
+    },
+    "step_function_daily.json": {
+        "AcquireMutex": (
+            "VIOLATION — tracked (alpha-engine-config#6722): same "
+            "mutex-acquire-infra-error gap as step_function.json's / "
+            "step_function_eod.json's AcquireMutex."
+        ),
+        "TradingDayGate": (
+            "Same design intent as the NAMED weekly run-day-gate §5 "
+            "carve-out (missing a trading day is worse than a duplicate; "
+            "StartExecutorEC2 proceeds, and downstream predictor/"
+            "enrichment stages remain independently gated on their own "
+            "success) — sf-pipeline-policy.md §5 does not name the daily "
+            "gate by file, and this test suite's own pre-existing "
+            "_CATCH_EXEMPT['step_function_daily.json']['TradingDayGateFailed'] "
+            "entry already treats it as the same accepted pattern. Stated "
+            "assumption (alpha-engine-config#6715 session) — a §5 wording "
+            "PR to name it explicitly is a cheap follow-up."
+        ),
+        "Scanner": (
+            "VIOLATION — tracked (alpha-engine-config#6722): daily "
+            "Scanner fail-open (mirrors weekly's identical pattern) sets "
+            "no degraded flag; PredictorInference's own downstream "
+            "freshness/age gate mitigates the trading-safety risk but the "
+            "terminal notify still says nothing about the miss."
+        ),
+    },
+    "step_function_eod.json": {
+        "AcquireMutex": (
+            "VIOLATION — tracked (alpha-engine-config#6722): same "
+            "mutex-acquire-infra-error gap as the sibling files."
+        ),
+        "ProbeEODReconcilePrecondition": (
+            "Deliberate documented SWALLOW — this state's own Comment "
+            "names the failure mode swallowed (the probe Lambda itself "
+            "erroring, not a data-gap signal) and the recording surface "
+            "($.precondition_probe left absent), per feedback_no_silent_"
+            "fails. A probe-Lambda infra failure falls through to "
+            "CheckSkipEODReconcile's Default (EODReconcile) — fail-SAFE-"
+            "toward-attempting-the-real-reconcile, not fail-open-to-"
+            "silent-success. EODReconcile's own Catch is the "
+            "failure-family route if the real reconcile then cannot "
+            "complete."
+        ),
+        "HealLaunchPostMarketDataSpot": (
+            "Heal-loop state, only reachable after SkipEODReconcileDataGap "
+            "-> SetDegradedFlag has ALREADY set $.degraded_summary "
+            "unconditionally (both SkipEODReconcileDataGap's normal Next "
+            "and its own Catch converge on SetDegradedFlag) — the flag is "
+            "already true before this state ever runs."
+        ),
+        "HealPollPostMarketDataSpot": (
+            "Same ancestor-already-flagged reasoning as "
+            "HealLaunchPostMarketDataSpot."
+        ),
+        "HealLaunchArcticAppendSpot": (
+            "Same ancestor-already-flagged reasoning as "
+            "HealLaunchPostMarketDataSpot."
+        ),
+        "HealPollArcticAppendSpot": (
+            "Same ancestor-already-flagged reasoning as "
+            "HealLaunchPostMarketDataSpot."
+        ),
+        "HealReProbe": (
+            "Same ancestor-already-flagged reasoning as "
+            "HealLaunchPostMarketDataSpot."
+        ),
+        "HealDispatchReplay": (
+            "Same ancestor-already-flagged reasoning as "
+            "HealLaunchPostMarketDataSpot (heal-loop state)."
+        ),
+        "ReadExerciseCadence": (
+            "Deliberate fail-toward-running default: SetCadenceReadDegraded "
+            "floors $.exercise_cadence_param to {'value': 'daily'} rather "
+            "than skip — this state's own Comment explicitly cites "
+            "weekly-sf-policy §5's 'missed exercise run is the worse "
+            "failure mode' reasoning, the same intent as the named "
+            "run-day-gate carve-out."
+        ),
+        "LaunchWeeklyExerciseRun": (
+            "VIOLATION — tracked (alpha-engine-config#6722): the "
+            "weekly-exercise sub-pipeline launch failure alerts via SNS "
+            "(WeeklyExerciseLaunchFailed) but is never threaded into "
+            "$.degraded_summary."
+        ),
+    },
+}
+
+assert set(_DEGRADED_FLAG_EXEMPT) == set(_DEGRADED_FLAG_SF_FILES), (
+    "degraded-flag exemption registry must enumerate exactly the three "
+    "scheduled-pipeline files (not step_function_groom.json)"
+)
+
+
+# ---------------------------------------------------------------------------
 # Definition-walking primitives — mirrors the Task-state discovery already
 # used informally by test_sf_global_timeout.py / test_deploy_infrastructure_
 # sf_coverage.py, but recurses into Parallel branches and Map
@@ -223,6 +601,143 @@ def _missing_catch(definition: dict, exempt: dict[str, str]) -> list[str]:
 def _stale_exemptions(definition: dict, exempt: dict[str, str]) -> list[str]:
     present = {name for name, _ in _iter_task_states(definition)}
     return sorted(name for name in exempt if name not in present)
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config#6715 walking/matching primitives. Reuses the same
+# nested-Parallel/Map recursion as _iter_task_states above but yields EVERY
+# state regardless of Type — a fail-open route can originate on a Parallel
+# or Map's OWN Catch (ResearchPredictorParallel, ModelZooTrainMap), not
+# only a Task's.
+# ---------------------------------------------------------------------------
+
+
+def _iter_all_states(definition: dict) -> Iterator[tuple[str, dict]]:
+    def _walk(states: dict, prefix: str) -> Iterator[tuple[str, dict]]:
+        for name, state in states.items():
+            path = f"{prefix}{name}"
+            yield path, state
+            if "States" in state:
+                yield from _walk(state["States"], f"{path}.")
+            if state.get("Type") == "Parallel":
+                for branch in state.get("Branches", []):
+                    yield from _walk(branch.get("States", {}), f"{path}.")
+            if state.get("Type") == "Map":
+                sub = (state.get("ItemProcessor") or state.get("Iterator") or {}).get(
+                    "States"
+                )
+                if sub:
+                    yield from _walk(sub, f"{path}.")
+
+    yield from _walk(definition.get("States", {}), "")
+
+
+def _flat_index(definition: dict) -> dict[str, dict]:
+    return dict(_iter_all_states(definition))
+
+
+def _resolve_next(
+    owner_path: str, flat: dict[str, dict], next_name: str | None
+) -> str | None:
+    """A Catch/Next targets a state name scoped to the SAME States dict as
+    the owner (a Parallel branch's Next never crosses into a sibling
+    branch or the top level by name collision) — try the owner's scope
+    prefix first, then fall back to top-level (the common case: most
+    Catches point at a top-level state from a top-level owner)."""
+    if next_name is None:
+        return None
+    scope_prefix = owner_path.rsplit(".", 1)[0] + "." if "." in owner_path else ""
+    scoped = f"{scope_prefix}{next_name}"
+    if scoped in flat:
+        return scoped
+    if next_name in flat:
+        return next_name
+    return None
+
+
+def _route_is_visible(
+    start_path: str,
+    flat: dict[str, dict],
+    flag_paths: frozenset[str],
+    failure_family: frozenset[str],
+    branch_join: frozenset[str],
+    max_depth: int = 15,
+) -> bool:
+    """Forward-walks a Pass/Task-only deterministic chain from start_path,
+    returning True the moment it finds EITHER (a) a state whose ResultPath
+    IS one of this file's real degraded-flag setter paths, or (b) a state
+    that is itself part of the hard-fail family / branch-join convergence
+    (the route ends in a LOUD Fail, not a silent SUCCESS, so no flag is
+    needed). Stops (False) at the first Choice/Parallel/Map/Wait/Succeed/
+    Fail/End — a fail-open route that has not set the flag by then never
+    will on THIS path (nothing past a branch point is guaranteed to run)."""
+    seen: set[str] = set()
+    cur: str | None = start_path
+    depth = 0
+    while cur and depth < max_depth and cur not in seen:
+        seen.add(cur)
+        state = flat.get(cur)
+        if state is None:
+            return False
+        name = cur.rsplit(".", 1)[-1]
+        if name in failure_family or cur in branch_join:
+            return True
+        if state.get("ResultPath") in flag_paths:
+            return True
+        if state.get("Type") not in ("Pass", "Task") or state.get("End"):
+            return False
+        cur = _resolve_next(cur, flat, state.get("Next"))
+        depth += 1
+    return False
+
+
+def _iter_fail_open_catch_routes(
+    flat: dict[str, dict],
+    failure_family: frozenset[str],
+    branch_join: frozenset[str],
+) -> Iterator[tuple[str, str]]:
+    """(owner_path, target_path) for every Catch clause that is
+    structurally fail-open: the owning state is not itself an sns:publish
+    notifier (the config#1819 notifier-totality axis, out of scope — see
+    _NOTIFY_RESOURCE above), and the Catch's Next does not land immediately
+    on a failure-family / branch-join state."""
+    for path, state in flat.items():
+        if state.get("Resource") == _NOTIFY_RESOURCE:
+            continue
+        for catch in state.get("Catch", []):
+            target = _resolve_next(path, flat, catch.get("Next"))
+            target_name = target.rsplit(".", 1)[-1] if target else catch.get("Next")
+            if target_name in failure_family or target in branch_join:
+                continue
+            yield path, target if target else catch.get("Next")
+
+
+def _choice_variables(choice_state: dict) -> set[str]:
+    """Every JSONPath a Choice state's condition tree dereferences,
+    recursing through And/Or/Not nesting — used to verify
+    _DEGRADED_FLAG_JSONPATHS against the terminal Choice's ACTUAL Variable
+    set rather than trusting a hand-typed constant (config#6715 gotcha)."""
+    variables: set[str] = set()
+
+    def _walk(rule: dict) -> None:
+        if "Variable" in rule:
+            variables.add(rule["Variable"])
+        for key in ("And", "Or"):
+            for sub in rule.get(key, []):
+                _walk(sub)
+        if "Not" in rule:
+            _walk(rule["Not"])
+
+    for choice in choice_state.get("Choices", []):
+        _walk(choice)
+    return variables
+
+
+def _is_prefix_path(setter: str, reader: str) -> bool:
+    """True if `reader` IS `setter`, or a dotted sub-field of it — daily/
+    eod set the composite $.degraded_summary but the terminal Choice reads
+    the nested $.degraded_summary.degraded."""
+    return reader == setter or reader.startswith(setter + ".")
 
 
 def _load(sf_file: str) -> dict:
@@ -402,6 +917,133 @@ def test_meta_missing_data_repo_script_is_flagged():
 
 
 # ---------------------------------------------------------------------------
+# alpha-engine-config#6715 meta-tests — all synthetic, proving the
+# fail-open/degraded-flag classifier itself catches a bad definition before
+# trusting it against the real files below.
+# ---------------------------------------------------------------------------
+
+_META_FLAG_PATHS = frozenset({"$.thing_degraded"})
+_META_FAILURE_FAMILY = frozenset({"HandleFailure", "FailExecution"})
+_META_BRANCH_JOIN: frozenset[str] = frozenset()
+
+
+def test_meta_route_is_visible_credits_a_flag_write():
+    synthetic = {
+        "States": {
+            "Stage": {
+                "Type": "Task",
+                "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "SetFlag"}],
+                "End": True,
+            },
+            "SetFlag": {
+                "Type": "Pass",
+                "ResultPath": "$.thing_degraded",
+                "Next": "Continue",
+            },
+            "Continue": {"Type": "Choice", "Choices": [], "Default": "Stage"},
+        }
+    }
+    flat = _flat_index(synthetic)
+    assert _route_is_visible(
+        "SetFlag", flat, _META_FLAG_PATHS, _META_FAILURE_FAMILY, _META_BRANCH_JOIN
+    )
+
+
+def test_meta_route_is_visible_credits_hard_fail_family():
+    synthetic = {
+        "States": {
+            "Stage": {"Type": "Task", "End": True},
+            "Normalize": {"Type": "Pass", "Next": "HandleFailure"},
+            "HandleFailure": {"Type": "Task", "Next": "FailExecution"},
+            "FailExecution": {"Type": "Fail"},
+        }
+    }
+    flat = _flat_index(synthetic)
+    assert _route_is_visible(
+        "Normalize", flat, _META_FLAG_PATHS, _META_FAILURE_FAMILY, _META_BRANCH_JOIN
+    )
+
+
+def test_meta_route_is_visible_stops_at_a_choice_with_nothing_found():
+    synthetic = {
+        "States": {
+            "Stage": {"Type": "Task", "End": True},
+            "Unflagged": {"Type": "Pass", "Next": "SomeChoice"},
+            "SomeChoice": {"Type": "Choice", "Choices": [], "Default": "Stage"},
+        }
+    }
+    flat = _flat_index(synthetic)
+    assert not _route_is_visible(
+        "Unflagged", flat, _META_FLAG_PATHS, _META_FAILURE_FAMILY, _META_BRANCH_JOIN
+    )
+
+
+def test_meta_iter_fail_open_catch_routes_excludes_notify_and_hard_fail():
+    synthetic = {
+        "States": {
+            "RealStage": {
+                "Type": "Task",
+                "Catch": [
+                    {"ErrorEquals": ["States.ALL"], "Next": "HandleFailure"},
+                ],
+                "End": True,
+            },
+            "OpenStage": {
+                "Type": "Task",
+                "Catch": [
+                    {"ErrorEquals": ["States.ALL"], "Next": "ContinueUnflagged"},
+                ],
+                "End": True,
+            },
+            "Notifier": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sns:publish",
+                "Catch": [
+                    {"ErrorEquals": ["States.ALL"], "Next": "ContinueUnflagged"},
+                ],
+                "End": True,
+            },
+            "ContinueUnflagged": {"Type": "Pass", "End": True},
+            "HandleFailure": {"Type": "Task", "End": True},
+        }
+    }
+    flat = _flat_index(synthetic)
+    routes = list(
+        _iter_fail_open_catch_routes(flat, _META_FAILURE_FAMILY, _META_BRANCH_JOIN)
+    )
+    assert routes == [("OpenStage", "ContinueUnflagged")]
+
+
+def test_meta_choice_variables_recurses_and_or_not():
+    choice_state = {
+        "Type": "Choice",
+        "Choices": [
+            {
+                "Or": [
+                    {"Variable": "$.a", "BooleanEquals": True},
+                    {
+                        "And": [
+                            {"Variable": "$.b", "IsPresent": True},
+                            {"Not": {"Variable": "$.c", "BooleanEquals": False}},
+                        ]
+                    },
+                ],
+                "Next": "X",
+            }
+        ],
+        "Default": "Y",
+    }
+    assert _choice_variables(choice_state) == {"$.a", "$.b", "$.c"}
+
+
+def test_meta_is_prefix_path():
+    assert _is_prefix_path("$.gate_degraded", "$.gate_degraded")
+    assert _is_prefix_path("$.degraded_summary", "$.degraded_summary.degraded")
+    assert not _is_prefix_path("$.degraded_summary", "$.degraded_summaryx")
+    assert not _is_prefix_path("$.gate_degraded", "$.health_check_degraded")
+
+
+# ---------------------------------------------------------------------------
 # Real-definition tests.
 # ---------------------------------------------------------------------------
 
@@ -494,4 +1136,166 @@ def test_data_repo_launcher_scripts_exist(sf_file: str):
         f"checkout (alpha-engine-data) that does not exist in the tree: "
         f"{missing} — I4442/I4975-class regression: a deleted/renamed "
         f"launcher script must fail here, not on Saturday"
+    )
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config#6715 — WSF-2.3/WSF-5 chokepoint: real-definition
+# tests.
+# ---------------------------------------------------------------------------
+
+
+def test_degraded_flag_scope_is_the_three_scheduled_pipelines():
+    """Guards the _DEGRADED_FLAG_SF_FILES carve-out from this module's
+    broader _SF_FILE_NAMES: sf-pipeline-policy.md §1.1 governs exactly
+    weekly/daily/eod, not step_function_groom.json, which has no
+    WriteCompletionMarker/degraded-selector concept at all today. Fails
+    loud if groom.json ever gains a WriteCompletionMarker state (scope
+    should widen to include it) or if the scheduled-pipeline set silently
+    shrinks."""
+    assert _DEGRADED_FLAG_SF_FILES == [
+        "step_function.json",
+        "step_function_daily.json",
+        "step_function_eod.json",
+    ]
+    groom = _load("step_function_groom.json")
+    assert "WriteCompletionMarker" not in groom["States"], (
+        "step_function_groom.json now has a WriteCompletionMarker state — "
+        "re-evaluate whether it needs _DEGRADED_FLAG_SF_FILES coverage "
+        "(alpha-engine-config#6715)"
+    )
+
+
+@pytest.mark.parametrize("sf_file", _DEGRADED_FLAG_SF_FILES)
+def test_degraded_flag_jsonpaths_match_the_actual_terminal_choice(sf_file: str):
+    """config#6715 gotcha: assert against the JSONPath the notifier/
+    marker-selector ACTUALLY dereferences, not a hand-typed guess. Extracts
+    every Variable the terminal degraded-routing Choice state's condition
+    tree reads and cross-checks it against _DEGRADED_FLAG_JSONPATHS in
+    BOTH directions — so a rename of the Choice's Variable, or an added/
+    removed flag family, fails HERE first, before the fail-open-route test
+    below could go stale silently and give every route a false pass."""
+    definition = _load(sf_file)
+    choice_name = _TERMINAL_DEGRADED_CHOICE[sf_file]
+    choice_state = definition["States"][choice_name]
+    assert choice_state["Type"] == "Choice", (
+        f"{sf_file}: {choice_name} is no longer a Choice state — "
+        f"_TERMINAL_DEGRADED_CHOICE is stale"
+    )
+    actual = _choice_variables(choice_state)
+    declared = _DEGRADED_FLAG_JSONPATHS[sf_file]
+
+    undeclared = sorted(
+        v for v in actual if not any(_is_prefix_path(d, v) for d in declared)
+    )
+    assert not undeclared, (
+        f"{sf_file}: {choice_name} reads {undeclared}, not declared in "
+        f"_DEGRADED_FLAG_JSONPATHS['{sf_file}'] — a new/renamed degraded "
+        f"flag family landed without updating this constant"
+    )
+
+    unread = sorted(
+        d for d in declared if not any(_is_prefix_path(d, v) for v in actual)
+    )
+    assert not unread, (
+        f"{sf_file}: _DEGRADED_FLAG_JSONPATHS['{sf_file}'] declares "
+        f"{unread} but {choice_name} never reads it — a dead constant that "
+        f"would silently pass every fail-open route checked against it"
+    )
+
+
+def test_check_branch_outcomes_routes_failed_branches_to_hard_fail():
+    """Structurally verifies the _BRANCH_JOIN_HARD_FAIL claim rather than
+    just asserting it: CheckBranchOutcomes must route EITHER branch's
+    FAILED status to the same hard-fail chain every other Catch converges
+    on (NormalizeFailureContext -> ... -> HandleFailure -> FailExecution),
+    not a silent-success path — this is what makes excluding
+    BranchAFailed/BranchBFailed from the degraded-flag requirement correct
+    rather than a bare hand-list exemption."""
+    definition = _load("step_function.json")
+    states = definition["States"]
+    choice = states["CheckBranchOutcomes"]
+    assert choice["Type"] == "Choice"
+    assert _choice_variables(choice) == {
+        "$.branch_outcomes.branch_a_status",
+        "$.branch_outcomes.branch_b_status",
+    }, "CheckBranchOutcomes no longer gates on both branch statuses"
+
+    fail_rule = choice["Choices"][0]
+    assert fail_rule.get("Or") and all(
+        cond.get("StringEquals") == "FAILED" for cond in fail_rule["Or"]
+    ), "CheckBranchOutcomes' fail-routing Choice no longer tests FAILED"
+    fail_next = fail_rule["Next"]
+
+    # Walk the top-level Pass/Task chain from the FAILED-branch target to
+    # confirm it lands in the real failure family within a bounded number
+    # of hops (mirrors _route_is_visible's own stopping rules).
+    seen: list[str] = []
+    cur: str | None = fail_next
+    depth = 0
+    while cur and cur in states and depth < 10:
+        seen.append(cur)
+        state = states[cur]
+        if cur in _FAILURE_FAMILY["step_function.json"]:
+            break
+        if state.get("Type") not in ("Pass", "Task"):
+            cur = None
+            break
+        cur = state.get("Next")
+        depth += 1
+    assert seen and seen[-1] in _FAILURE_FAMILY["step_function.json"], (
+        f"CheckBranchOutcomes' FAILED route ({fail_next}) does not reach "
+        f"the hard-fail family within 10 hops (chain: {seen}) — "
+        f"BranchAFailed/BranchBFailed's exclusion from the degraded-flag "
+        f"requirement is no longer justified"
+    )
+
+
+@pytest.mark.parametrize("sf_file", _DEGRADED_FLAG_SF_FILES)
+def test_every_fail_open_catch_route_sets_the_degraded_flag_or_is_exempt(
+    sf_file: str,
+):
+    """alpha-engine-config#6715 / sf-pipeline-policy.md §2.3 + §5: every
+    fail-open Catch route (derived structurally — Catch target NOT a
+    failure-family state, per _iter_fail_open_catch_routes) must pass
+    through a state that writes the degraded-flag JSONPath the terminal
+    notifier/marker-selector actually reads, or carry a reasoned
+    _DEGRADED_FLAG_EXEMPT entry."""
+    definition = _load(sf_file)
+    flat = _flat_index(definition)
+    flag_paths = _DEGRADED_FLAG_JSONPATHS[sf_file]
+    failure_family = _FAILURE_FAMILY[sf_file]
+    branch_join = _BRANCH_JOIN_HARD_FAIL[sf_file]
+    exempt = _DEGRADED_FLAG_EXEMPT[sf_file]
+
+    missing = []
+    for owner_path, target_path in _iter_fail_open_catch_routes(
+        flat, failure_family, branch_join
+    ):
+        if owner_path in exempt:
+            continue
+        if not _route_is_visible(
+            target_path, flat, flag_paths, failure_family, branch_join
+        ):
+            missing.append(f"{owner_path} -> {target_path}")
+
+    assert not missing, (
+        f"{sf_file}: fail-open Catch route(s) that never write "
+        f"{sorted(flag_paths)} and carry no _DEGRADED_FLAG_EXEMPT entry: "
+        f"{missing} — either wire the route to the real degraded-flag "
+        f"JSONPath, or add a one-line-justified entry to "
+        f"_DEGRADED_FLAG_EXEMPT['{sf_file}'] in this file "
+        f"(alpha-engine-config#6715)"
+    )
+
+
+@pytest.mark.parametrize("sf_file", _DEGRADED_FLAG_SF_FILES)
+def test_no_stale_degraded_flag_exemptions(sf_file: str):
+    definition = _load(sf_file)
+    flat = _flat_index(definition)
+    stale = sorted(name for name in _DEGRADED_FLAG_EXEMPT[sf_file] if name not in flat)
+    assert not stale, (
+        f"{sf_file}: _DEGRADED_FLAG_EXEMPT names state(s) no longer "
+        f"present in the definition: {stale} — remove the stale entry "
+        f"(alpha-engine-config#6715)"
     )
