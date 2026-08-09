@@ -4620,7 +4620,7 @@
         {
           "Variable": "$.substrate_check_poll.Status",
           "StringEquals": "Success",
-          "Next": "ReportCard"
+          "Next": "CheckSkipReportCard"
         },
         {
           "And": [
@@ -4664,7 +4664,7 @@
       "Comment": "config#2276: the substrate health check (or its constituents-drift sub-step) could not run to Success. Mirrors SaturdayHealthCheckDegraded / the LibPinGateDegraded shape (config#2278) \u2014 SF-controlled boolean into the completion-email selection. Shares $.health_check_degraded with the freshness twin DELIBERATELY (one flag family, one degraded Subject \u2014 which check degraded lives on the execution record: $.substrate_check_error / $.substrate_check_poll vs $.health_check_error / $.health_check_poll \u2014 avoiding a per-check combinatorial notifier explosion). Continues to ReportCard: the advisory Lambda tail is independent of the dashboard box and must not be skipped because an EC2 health command failed.",
       "Result": true,
       "ResultPath": "$.health_check_degraded",
-      "Next": "ReportCard"
+      "Next": "CheckSkipReportCard"
     },
     "ReportCard": {
       "Type": "Task",
@@ -4701,7 +4701,7 @@
         }
       ],
       "ResultPath": "$.report_card_result",
-      "Next": "Director"
+      "Next": "CheckSkipDirector"
     },
     "ReportCardDegraded": {
       "Type": "Pass",
@@ -4766,7 +4766,7 @@
         }
       ],
       "ResultPath": "$.director_result",
-      "Next": "CheckShellRunNotify"
+      "Next": "DirectorComplete"
     },
     "CheckShellRunNotify": {
       "Type": "Choice",
@@ -6050,6 +6050,51 @@
       "InputPath": "$.weekly_freshness_spot_poll_count.polls",
       "ResultPath": "$.weekly_freshness_spot_polls",
       "Next": "WaitForWeeklyFreshnessSpotBootstrap"
+    },
+    "CheckSkipReportCard": {
+      "Type": "Choice",
+      "Comment": "config#6054: per-stage skip gate splitting the coarse skip_post_eval (which still bypasses the WHOLE tail at CheckSkipPostEval and is retained as a deprecated alias \u2014 remove once a full cycle passes with the split flags). {\"skip_report_card\": true} bypasses only ReportCard, landing on CheckSkipDirector so Director remains independently controllable \u2014 the 2026-08-01 incident this fixes: rerun -5 silently skipped Director behind the shared flag, rerun -6 re-ran an already-green ReportCard as a toll to reach it (weekly-sf-policy \u00a72.1 applied to control, not just failure).",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_report_card",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_report_card",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckSkipDirector"
+        }
+      ],
+      "Default": "ReportCard"
+    },
+    "CheckSkipDirector": {
+      "Type": "Choice",
+      "Comment": "config#6054: {\"skip_director\": true} bypasses only the Director advisory. Sibling of CheckSkipReportCard; see its comment for the split rationale.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_director",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_director",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckShellRunNotify"
+        }
+      ],
+      "Default": "Director"
+    },
+    "DirectorComplete": {
+      "Type": "Pass",
+      "Comment": "config#6054: success-only witness for the rerun deriver (scripts/weekly_sf_rerun.py). Director's success and every bypass path previously converged on CheckShellRunNotify, so no state uniquely witnessed 'Director actually completed' \u2014 the I6055-class trap: a rerun could mark a bypassed Director complete and skip it. Entered ONLY via Director's success edge.",
+      "Next": "CheckShellRunNotify"
     }
   }
 }

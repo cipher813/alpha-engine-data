@@ -440,6 +440,19 @@ class TestStageTableLockstep:
                     "ValidatePredictorSkipWeightsFresh",
                 }
                 continue
+            if stage.name == "director":
+                # config#6054: DELIBERATE exception, inverted from the
+                # convention. director's witness is the success-only
+                # DirectorComplete Pass state, and its skip route lands on
+                # CheckShellRunNotify — which every bypass path also enters.
+                # Witnessing on the skip target would mark a bypassed
+                # Director complete and skip it on the rerun (the I6055
+                # trap). Cost of the inversion: an original run that SKIPPED
+                # director yields a rerun that re-runs it — the safe
+                # direction for an advisory stage.
+                assert skip_targets == {"CheckShellRunNotify"}
+                assert "DirectorComplete" not in skip_targets
+                continue
             if stage.name == "backtester_stage_only":
                 # config#2362 Option A additive gate: deliberately empty
                 # witness (it shares Backtester's work state with the

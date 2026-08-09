@@ -370,31 +370,67 @@ STAGES: tuple[Stage, ...] = (
         "CheckSkipEvaluator", "Evaluator",
         frozenset({"CheckSkipPostEval"}),
     ),
+    # config#6054: the coarse post_eval span is SPLIT. The two health checks
+    # keep no flag of their own — they are advisory, idempotent, and cheap,
+    # so a tail rerun simply re-runs them (their degraded markers are carried
+    # by the post_eval alias row below, informationally; a health-check
+    # degradation alone never forces a ReportCard re-run, which is why they
+    # are NOT in report_card's degraded_witness). skip_post_eval survives in
+    # the DEFINITION as a deprecated whole-tail alias (CheckSkipPostEval)
+    # for in-flight inputs; the deriver no longer emits it — it emits the
+    # per-stage flags below.
     Stage(
         "post_eval", "skip_post_eval",
         "CheckSkipPostEval", "SaturdayHealthCheck",
         frozenset({"CheckShellRunNotify"}),
-        # Every degraded route in the tail (config#2276 health checks +
-        # config#2302 ReportCard). Director is NO LONGER in this set
-        # (config#6408: Director failure is now TERMINAL via
-        # NormalizeFailureContext → FailExecution). PublishDirectorDegraded
-        # is RETAINED for backward compatibility with pre-fix execution
-        # histories that still reference it — new executions never enter it.
-        # config#6685: ReportCardDegraded is the new Pass state ReportCard's
-        # Catch routes to FIRST (sets $.report_card_degraded before
-        # proceeding, unchanged, to PublishReportCardDegraded) — added
-        # alongside it so a rerun does not treat a ReportCard-degraded
-        # execution as complete.
+        # Health-check degraded routes only (config#2276) — ReportCard's
+        # and Director's moved to their own rows below (config#6054).
         degraded_witness=frozenset({
             "SaturdayHealthCheckDegraded", "SubstrateHealthCheckDegraded",
-            "ReportCardDegraded", "PublishReportCardDegraded",
-            "PublishDirectorDegraded",
         }),
+        emit_skip=False,
         note=(
-            "skip_post_eval covers the whole health-check/report-card/"
-            "director tail; a failure inside it re-runs the whole tail"
-            " (no finer-grained flags exist)."
+            "skip_post_eval is a DEPRECATED whole-tail alias (config#6054): "
+            "the deriver emits skip_report_card / skip_director instead; the "
+            "health checks re-run on any tail rerun (advisory + idempotent). "
+            "Remove the alias once a full cycle has passed on the split "
+            "flags."
         ),
+    ),
+    Stage(
+        "report_card", "skip_report_card",
+        "CheckSkipReportCard", "ReportCard",
+        # Success-only witness: ReportCard's success edge now lands on
+        # CheckSkipDirector (config#6054). Pre-split histories entered
+        # "Director" directly on ReportCard success. A skipped ReportCard
+        # ALSO enters CheckSkipDirector — same convention as evaluator's
+        # CheckSkipPostEval witness: a skip in the original run implies a
+        # completion the earlier run derived.
+        frozenset({"CheckSkipDirector", "Director"}),
+        # config#6685: ReportCardDegraded is the Pass state ReportCard's
+        # Catch routes to FIRST (sets $.report_card_degraded), then
+        # PublishReportCardDegraded — degraded overrides witness (I6055).
+        degraded_witness=frozenset({
+            "ReportCardDegraded", "PublishReportCardDegraded",
+        }),
+    ),
+    Stage(
+        "director", "skip_director",
+        "CheckSkipDirector", "Director",
+        # DirectorComplete is entered ONLY via Director's success edge
+        # (config#6054) — deliberately NOT CheckShellRunNotify, which every
+        # bypass path also enters: witnessing on it would mark a bypassed
+        # Director complete and skip it on the rerun (the I6055 trap, and
+        # the exact 2026-08-01 incident). Pre-split histories have no
+        # success-only witness, so the deriver conservatively RE-RUNS
+        # Director for them — re-running the advisory is the safe
+        # direction.
+        frozenset({"DirectorComplete"}),
+        # config#6408: Director failure is TERMINAL (NormalizeFailureContext
+        # → FailExecution) — no witness is entered, so the stage re-runs.
+        # PublishDirectorDegraded is RETAINED for pre-fix execution
+        # histories only; new executions never enter it.
+        degraded_witness=frozenset({"PublishDirectorDegraded"}),
     ),
 )
 
@@ -465,7 +501,7 @@ def _simulate_reachable_works(flags: dict, original_input: dict) -> set:
         run_linear(["predictor_backtest", "portfolio_optimizer_backtest", "parity"])
     else:
         run_linear(["backtester", "predictor_backtest", "portfolio_optimizer_backtest", "parity"])
-    run_linear(["evaluator", "post_eval"])
+    run_linear(["evaluator", "report_card", "director"])
     return ran
 
 

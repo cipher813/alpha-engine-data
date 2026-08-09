@@ -140,32 +140,88 @@
     },
     "DeployDriftGate": {
       "Type": "Choice",
-      "Comment": "Hard-fail when the drift probe reports has_drift=true. Surfaces deploy lag loudly instead of silently running new SF definitions against stale Lambda images (or vice versa).",
+      "Comment": "alpha-engine-config#6615 (sf-pipeline-policy \u00a73, Brian's 2026-08-09 ruling): the drift probe's has_drift was a single union of sf_drift (a drifted SF definition \u2014 trading-correctness-critical, per deploy_drift.py's own docstring) and cf_drift (CloudFormation stack terminal-state/template drift \u2014 orchestration metadata). Treating both as one signal fail-closed the whole pipeline on 2026-08-05/06/07 when alpha-engine-orchestration sat in UPDATE_ROLLBACK_FAILED with sf_drift=false throughout \u2014 3 lost trading days on a condition that never touched the deployed SF definition. This Choice now evaluates the two families separately: sf_drift=true (or either field missing \u2014 fail CLOSED on unknown, unchanged from the has_drift convention) still halts via HandleFailure; cf_drift=true alone routes to SetDeployDriftDegradedFlag, which threads a $.degraded_summary (PR1251/config#6692 Option-A shape) through the unmodified happy path to TradingDayGate so CheckDegradedOutcome later marks the run DEGRADED instead of a plain SUCCEEDED completion.",
       "Choices": [
         {
           "And": [
             {
-              "Variable": "$.drift_result.Payload.has_drift",
+              "Variable": "$.drift_result.Payload.sf_drift",
               "IsPresent": true
             },
             {
-              "Variable": "$.drift_result.Payload.has_drift",
+              "Variable": "$.drift_result.Payload.sf_drift",
               "BooleanEquals": true
             }
           ],
-          "Comment": "config-I2767: IsPresent-guarded \u2014 an unguarded dereference of an absent has_drift threw States.Runtime, ending the run FAILED without HandleFailure context (config#2275 incident class).",
+          "Comment": "sf_drift=true is a drifted SF definition \u2014 the deployed state machine no longer matches alpha-engine-data@main HEAD. Trading-correctness-critical per sf-pipeline-policy \u00a73: halts, never degrades, regardless of cf_drift.",
           "Next": "HandleFailure"
         },
         {
           "Not": {
-            "Variable": "$.drift_result.Payload.has_drift",
+            "Variable": "$.drift_result.Payload.sf_drift",
             "IsPresent": true
           },
-          "Comment": "config-I2767: a drift-check payload WITHOUT has_drift means the gate could not check \u2014 fail CLOSED and loud (HandleFailure) rather than trading on unverifiable deploy freshness.",
+          "Comment": "config-I2767, preserved post-split: sf_drift missing means the gate cannot verify SF-definition freshness \u2014 fail CLOSED and loud (HandleFailure) rather than trading on unverifiable deploy freshness.",
           "Next": "HandleFailure"
+        },
+        {
+          "Not": {
+            "Variable": "$.drift_result.Payload.cf_drift",
+            "IsPresent": true
+          },
+          "Comment": "config-I2767, preserved post-split: cf_drift missing means the gate cannot classify a drift signal as halt-vs-degrade \u2014 fail CLOSED rather than silently defaulting to either a pass or a degrade.",
+          "Next": "HandleFailure"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.drift_result.Payload.cf_drift",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.drift_result.Payload.cf_drift",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "alpha-engine-config#6615: cf_drift=true without sf_drift=true is CloudFormation stack-state/template drift only \u2014 orchestration metadata, not a trading-correctness failure. sf-pipeline-policy \u00a73 degrades loudly instead of halting: trade on the last verified frozen SHA with a degraded flag + page.",
+          "Next": "SetDeployDriftDegradedFlag"
         }
       ],
       "Default": "TradingDayGate"
+    },
+    "SetDeployDriftDegradedFlag": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config#6615 (sf-pipeline-policy \u00a73, Brian's 2026-08-09 ruling): DeployDriftGate found cf_drift=true (CloudFormation stack terminal-state or template drift) WITHOUT sf_drift=true \u2014 orchestration metadata, not a trading-correctness failure. Sets $.degraded_summary the same way SetDaemonDegradedFlag/SetDataSpotDegradedFlag do (alpha-engine-config#6692 Option-A parity) so CheckDegradedOutcome later routes this execution's terminal to WriteCompletionMarkerDegraded/DegradedRun instead of a plain SUCCEEDED marker. Does NOT change the run's continuation \u2014 Next is PublishDeployDriftDegraded then straight on to TradingDayGate, exactly the path a clean drift check would take. If a later stage (data-spot fail-open, daemon restart failure) also degrades, that state's write to $.degraded_summary simply wins as the most-recent cause \u2014 degraded=true is preserved either way (same last-write-wins convention SetDaemonDegradedFlag documents).",
+      "Parameters": {
+        "degraded": true,
+        "reason": "deploy_drift_metadata",
+        "run_date.$": "$.run_date",
+        "stage_error.$": "$.drift_result.Payload"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishDeployDriftDegraded"
+    },
+    "PublishDeployDriftDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config#6615: best-effort SNS alert that DeployDriftGate found CloudFormation/stack-state drift (cf_drift=true) WITHOUT an SF-definition drift (sf_drift=false) \u2014 per sf-pipeline-policy \u00a73 this is orchestration metadata, so the pipeline degrades loudly and proceeds to TradingDayGate on the last verified frozen SHA rather than halting. Its own Catch also routes to TradingDayGate so even an SNS failure cannot halt the run (mirrors PublishDataSpotFailureImmediate's fail-open-on-notify-failure convention \u2014 config#1767).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekday Pipeline \u2014 DEGRADED (CloudFormation/stack drift, trading proceeds on frozen SHA)",
+        "Message.$": "States.Format('DeployDriftGate found CloudFormation/stack-state drift (cf_drift=true) WITHOUT an SF-definition drift (sf_drift=false) \u2014 orchestration metadata only, per sf-pipeline-policy \u00a73 (alpha-engine-config#6615). Trading proceeds on the last verified frozen SHA; this execution will complete DEGRADED, not SUCCEEDED. Detail: {}', States.JsonToString($.drift_result.Payload))"
+      },
+      "ResultPath": "$.deploy_drift_degraded_notify",
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "TradingDayGate"
+        }
+      ],
+      "Next": "TradingDayGate"
     },
     "TradingDayGate": {
       "Type": "Task",
