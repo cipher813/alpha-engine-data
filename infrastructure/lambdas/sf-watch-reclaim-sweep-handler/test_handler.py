@@ -250,6 +250,7 @@ def _dispatch_log_event(**overrides):
         "status": "FAILED",
         "execution_arn": EXEC_ARN,
         "failed_state": "RAGIngestion",
+        "failed_state_detail": "States.TaskFailed: RAGIngestion failed",
         "cause": "States.TaskFailed: RAGIngestion failed",
         "is_preflight": False,
     }
@@ -316,6 +317,9 @@ def test_reclaim_without_marker_relaunches_on_demand_once_with_record_and_note()
         "state_machine_arn": ("arn:aws:states:us-east-1:711398986525:"
                               "stateMachine:ne-weekly-freshness-pipeline"),
         "failed_state": "RAGIngestion",
+        # alpha-engine-config-I6616: pure passthrough of the source watch-log
+        # event's already-derived detail — this handler never re-derives it.
+        "failed_state_detail": "States.TaskFailed: RAGIngestion failed",
         "cause": "States.TaskFailed: RAGIngestion failed",
         "watch_log_key": WATCH_LOG_KEY,
         "is_preflight": "false",
