@@ -467,19 +467,31 @@ class TestBranchBContents:
     # infra/drop-iam-moved-to-ops cleanup.
 
     def test_predictor_status_poll_quartet_preserved(self, branch_b):
+        # alpha-engine-config-I5687: PredictorTraining dispatches through the
+        # poll-budget seed (InitPredictorPollCount) before the first poll,
+        # and the loop-back branch is a bounded And[], mirroring the
+        # DataPhase2/ThinkTank precedent.
         assert branch_b["PredictorTraining"]["Next"] == (
+            "InitPredictorPollCount"
+        )
+        assert branch_b["InitPredictorPollCount"]["Next"] == (
             "WaitForPredictorTraining"
         )
         assert branch_b["WaitForPredictorTraining"]["Next"] == (
             "CheckPredictorStatus"
         )
-        nexts = {
-            c["StringEquals"]: c["Next"]
-            for c in branch_b["CheckPredictorStatus"]["Choices"]
-        }
-        assert nexts["InProgress"] == "PredictorWait"
-        assert nexts["Pending"] == "PredictorWait"
-        assert branch_b["PredictorWait"]["Next"] == (
+        bounded = next(
+            c for c in branch_b["CheckPredictorStatus"]["Choices"] if "And" in c
+        )
+        variables = {cond.get("Variable") for cond in bounded["And"]}
+        assert "$.predictor_polls" in variables
+        or_block = next(cond["Or"] for cond in bounded["And"] if "Or" in cond)
+        statuses = {c["StringEquals"] for c in or_block}
+        assert statuses == {"InProgress", "Pending"}
+        assert bounded["Next"] == "PredictorWait"
+        assert branch_b["PredictorWait"]["Next"] == "PredictorPollWait"
+        assert branch_b["PredictorPollWait"]["Next"] == "MergePredictorPollCount"
+        assert branch_b["MergePredictorPollCount"]["Next"] == (
             "WaitForPredictorTraining"
         )
 
@@ -504,11 +516,25 @@ class TestBranchBContents:
         rcmd = resolve["Parameters"]["Parameters"]["commands.$"]
         assert "list-rotation-specs" in rcmd
         assert all(c["Next"] != "BranchBFailed" for c in resolve["Catch"])
-        assert resolve["Next"] == "WaitResolveZoo"
+        # alpha-engine-config-I5687: ResolveZooSpecs dispatches through the
+        # poll-budget seed (InitResolveZooPollCount) before the first poll.
+        assert resolve["Next"] == "InitResolveZooPollCount"
+        assert branch_b["InitResolveZooPollCount"]["Next"] == "WaitResolveZoo"
         # Resolve poll → CheckResolveZooStatus: Success → ParseZooSpecs.
         check_resolve = branch_b["CheckResolveZooStatus"]
-        rnexts = {c["StringEquals"]: c["Next"] for c in check_resolve["Choices"]}
+        rnexts = {
+            c["StringEquals"]: c["Next"]
+            for c in check_resolve["Choices"] if "StringEquals" in c
+        }
         assert rnexts["Success"] == "ParseZooSpecs"
+        # The bounded And[] loop-back branch, mirroring DataPhase2/ThinkTank.
+        bounded = next(c for c in check_resolve["Choices"] if "And" in c)
+        variables = {cond.get("Variable") for cond in bounded["And"]}
+        assert "$.resolve_zoo_polls" in variables
+        assert bounded["Next"] == "ResolveZooWait"
+        assert branch_b["ResolveZooWait"]["Next"] == "ResolveZooPollWait"
+        assert branch_b["ResolveZooPollWait"]["Next"] == "MergeResolveZooPollCount"
+        assert branch_b["MergeResolveZooPollCount"]["Next"] == "WaitResolveZoo"
         # Default routes through ExtractModelZooResolveError (mirrors
         # ExtractPredictorError/ExtractSignalsEnvelopeError/ExtractRAGIngestionError)
         # — a Choice.Default transition does not populate $.model_zoo_error the
@@ -587,7 +613,10 @@ class TestBranchBContents:
             for c in sel["Catch"]
         )
         assert all(c["Next"] != "BranchBFailed" for c in sel["Catch"])
-        assert sel["Next"] == "WaitForModelZoo"
+        # alpha-engine-config-I5687: ModelZooSelect dispatches through the
+        # poll-budget seed (InitModelZooPollCount) before the first poll.
+        assert sel["Next"] == "InitModelZooPollCount"
+        assert branch_b["InitModelZooPollCount"]["Next"] == "WaitForModelZoo"
         # Select poll Catch is best-effort; routes via the alert, never BranchBFailed.
         wait = branch_b["WaitForModelZoo"]
         assert all(c["Next"] != "BranchBFailed" for c in wait["Catch"])
@@ -603,11 +632,22 @@ class TestBranchBContents:
         assert extract_select["ResultPath"] == "$.model_zoo_error"
         assert extract_select["Parameters"]["poll.$"] == "$.model_zoo_poll"
         assert extract_select["Next"] == "PublishModelZooFailureImmediate"
-        nexts = {c["StringEquals"]: c["Next"] for c in check["Choices"]}
-        assert nexts["InProgress"] == "ModelZooWait"
-        assert nexts["Pending"] == "ModelZooWait"
+        nexts = {
+            c["StringEquals"]: c["Next"] for c in check["Choices"] if "StringEquals" in c
+        }
         assert nexts["Success"] == "BranchBComplete"
-        assert branch_b["ModelZooWait"]["Next"] == "WaitForModelZoo"
+        # alpha-engine-config-I5687: bounded And[] loop-back, mirroring
+        # DataPhase2/ThinkTank.
+        bounded = next(c for c in check["Choices"] if "And" in c)
+        variables = {cond.get("Variable") for cond in bounded["And"]}
+        assert "$.model_zoo_polls" in variables
+        or_block = next(cond["Or"] for cond in bounded["And"] if "Or" in cond)
+        statuses = {c["StringEquals"] for c in or_block}
+        assert statuses == {"InProgress", "Pending"}
+        assert bounded["Next"] == "ModelZooWait"
+        assert branch_b["ModelZooWait"]["Next"] == "ModelZooPollWait"
+        assert branch_b["ModelZooPollWait"]["Next"] == "MergeModelZooPollCount"
+        assert branch_b["MergeModelZooPollCount"]["Next"] == "WaitForModelZoo"
         # The alert state is itself best-effort.
         alert = branch_b["PublishModelZooFailureImmediate"]
         assert alert["Resource"] == "arn:aws:states:::sns:publish"
