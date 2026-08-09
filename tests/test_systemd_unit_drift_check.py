@@ -372,10 +372,9 @@ class TestCoverageAccounting:
         for name in (
             "litellm-proxy.service",
             "llm-egress-proxy.service",
-            "nousergon-auth.service",
-            "nousergon-console.service",
-            "dashboard.service",
-            "crucible-dash-api.service",
+            "mnemon.service",
+            "certbot-renew.timer",
+            "ibgateway.service",
         ):
             assert name in baseline, f"{name} missing from the uncodified baseline"
 
@@ -384,6 +383,12 @@ class TestCoverageAccounting:
             "box-health.timer",            # alpha-engine-dashboard root
             "metron-refresh.service",      # metron-ops root
             "telos-web.service",           # telos-ops root
+            "dashboard.service",           # alpha-engine-dashboard top-level root
+            "nous-ergon-live.service",     # alpha-engine-dashboard live/ root
+            "nousergon-console.service",   # nousergon-console root
+            "signal.service",              # the-cyphering-ops root
+            "vires.service",               # vires root
+            "morning-signal-pull.service", # codified by crucible-dashboard-PR635
         ):
             assert name not in baseline, (
                 f"{name} is covered by a --codified-root and must not be baselined "
@@ -403,8 +408,18 @@ class TestCoverageAccounting:
             "/home/ec2-user/alpha-engine-dashboard/infrastructure/systemd",
             "/home/ec2-user/metron-ops/infrastructure/systemd",
             "/home/ec2-user/telos-ops/infrastructure/systemd",
+            "/home/ec2-user/alpha-engine-dashboard/infrastructure",
+            "/home/ec2-user/alpha-engine-dashboard/live/infrastructure",
+            "/home/ec2-user/nousergon-auth/infrastructure",
+            "/home/ec2-user/nousergon-console/infrastructure",
+            "/home/ec2-user/the-cyphering-ops/infrastructure",
+            "/home/ec2-user/vires/infrastructure",
         ):
             assert f"--codified-root {root}" in line, f"missing codified root {root}"
+        # boto3 does not infer region from IMDS: without these, --metric dies
+        # with "You must specify a region" (seen live 2026-08-09).
+        assert "Environment=AWS_REGION=us-east-1" in unit
+        assert "Environment=AWS_DEFAULT_REGION=us-east-1" in unit
 
     def test_metric_namespace_is_one_the_box_role_may_put_to(self, cd):
         """The box role's PutMetricData grant is namespace-conditioned to

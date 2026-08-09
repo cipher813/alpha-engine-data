@@ -28,15 +28,6 @@
 # incomplete by construction, and says so rather than implying coverage.
 
 # ── alpha-engine / dashboard box services ──────────────────────────────────
-crucible-dash-api.service      # crucible-dashboard
-crucible-dash-web.service      # crucible-dashboard
-dashboard.service              # crucible-dashboard
-nous-ergon-live.service        # UNKNOWN
-nousergon-auth.service         # nousergon-auth
-nousergon-console.service      # nousergon-console
-signal-pull.service            # UNKNOWN
-signal-pull.timer              # UNKNOWN
-signal.service                 # UNKNOWN
 
 # ── morning-signal ─────────────────────────────────────────────────────────
 # Found live 2026-08-08 (I6567): morning-signal.service took a TimeoutStartSec
@@ -44,22 +35,19 @@ signal.service                 # UNKNOWN
 # unit to anything. Its drop-in directory is not covered here either — this
 # checker compares unit FILES; `.d/*.conf` coverage is a separate deliverable
 # on I6656.
-morning-signal-pull.service    # UNKNOWN
-morning-signal-pull.timer      # UNKNOWN
 
 # ── metron ─────────────────────────────────────────────────────────────────
 
 # ── other products co-tenant on this box ───────────────────────────────────
-mnemon.service                 # mnemon
-mnemon-sync.service            # mnemon
-mnemon-sync.timer              # mnemon
-vires.service                  # vires-ops
+mnemon.service                 # mnemon — BLOCKED on config#6712: unit embeds the live MNEMON_TOKEN; rotate + EnvironmentFile before codifying
+mnemon-sync.service            # mnemon — codify with mnemon.service after config#6712
+mnemon-sync.timer              # mnemon — codify with mnemon.service after config#6712
 
 # ── shared infrastructure ──────────────────────────────────────────────────
-litellm-proxy.service          # nous-ergon-ops (the model router)
-llm-egress-proxy.service       # nous-ergon-ops (the DLP egress proxy)
-ibgateway.service              # nous-ergon-ops
-xvfb.service                   # nous-ergon-ops (ibgateway's display)
-certbot-renew.service          # nous-ergon-ops
-certbot-renew.timer            # nous-ergon-ops
+litellm-proxy.service          # CODIFIED nous-ergon-ops alpha-engine-dashboard/live/infrastructure/systemd/, byte-identical 2026-08-09 — leaves this file when the checker gains a root for that repo (deploy-path ruling on config#6337)
+llm-egress-proxy.service       # CODIFIED nous-ergon-ops (ops-PR533), byte-identical 2026-08-09 — same root gap as litellm-proxy
+ibgateway.service              # CODIFIED nous-ergon-ops (ops-PR534), byte-identical 2026-08-09 — same root gap
+xvfb.service                   # CODIFIED nous-ergon-ops (ops-PR534, ibgateway's display), byte-identical 2026-08-09 — same root gap
+certbot-renew.service          # CODIFIED nous-ergon-ops (8/8 arc), byte-identical 2026-08-09 — same root gap
+certbot-renew.timer            # CODIFIED nous-ergon-ops (8/8 arc), byte-identical 2026-08-09 — same root gap
 amazon-cloudwatch-agent.service # vendor-installed; likely never codified here
