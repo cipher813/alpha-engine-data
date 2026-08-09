@@ -1,7 +1,8 @@
 # alpha-engine-pipeline-watchdog
 
 Phase 4 of the pipeline-reporting-revamp arc (ROADMAP L3050). Daily
-NYSE-trading-day-aware watchdog for the 3 Alpha Engine Step Functions.
+NYSE-trading-day-aware watchdog for the 3 Alpha Engine Step Functions, plus
+(alpha-engine-config#2412) a preopen schedule-buffer canary.
 
 ## What it does
 
@@ -17,6 +18,39 @@ in parallel — channel independence preserved per plan doc §3.5.
 | Weekday SF | 24h | TODAY is a NYSE trading day (via `nousergon_lib.trading_calendar`) |
 | EOD SF     | 24h | TODAY is a NYSE trading day |
 | Saturday SF | 7d  | TODAY is Sunday (Saturday SF fires Sat 09:00 UTC; by Sun 14:00 UTC any missed firing is 24+h overdue) |
+
+## Preopen schedule-buffer canary (alpha-engine-config#2412)
+
+A 4th check, run alongside the 3 above whenever today is a NYSE trading day.
+`WeekdayPipelineSchedule`'s trigger has been moved earlier twice after
+finishing after the 06:30 AM PT market open — 06:00→05:45 PT (2026-05-19),
+then 05:45→05:15 PT (2026-07-13) — both times the buffer erosion was
+noticed anecdotally, days after it started. This check reads the finish
+(`stopDate`) of the most recently CLOSED trading day's SUCCEEDED Weekday-SF
+execution and alerts BEFORE the buffer is consumed again:
+
+- **Hard floor** (severity=error): finish at/after **06:15 PT** (15-min
+  buffer floor). A finish at/after the actual **06:30 PT** open gets a
+  distinct "MISSED THE OPEN" message.
+- **Early warning** (severity=warning): finish at/after **06:10 PT** but
+  before the hard floor.
+- **5-day trend** (severity=warning): even when today's own reading is
+  quiet, a **median** over the last 5 trading days' SUCCEEDED finishes at/
+  past the 06:10 PT floor fires a distinct trend alert — catches a creep
+  that never individually crosses either threshold on a single day.
+- **No SUCCEEDED execution** for the target day → deferred silently to the
+  existing Weekday-SF liveness check (0-executions case) or the SF's own
+  failure alert — never double-paged.
+
+All thresholds are evaluated in `America/Los_Angeles` via `zoneinfo`
+(DST-correct year-round; market open is a fixed 06:30 PT local-clock time).
+Reuses the same `WATCHDOG_SNS_TOPIC_ARN` + Telegram fan-out as the 3 checks
+above — no new channel. Deliberately does NOT filter by `pipeline_role`
+(would need `states:DescribeExecution`, which this Lambda's IAM role does
+not currently grant — see the PR body for the live AccessDeniedException
+this already causes on the Saturday-SF role-filtered path); instead uses
+the earliest-started SUCCEEDED execution per PT calendar day as the proxy
+for "the scheduled run".
 
 ## Why this exists (vs. a dumb CW alarm)
 

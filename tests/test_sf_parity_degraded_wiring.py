@@ -144,7 +144,12 @@ def test_no_parity_state_catch_targets_notify_or_handle_directly(states):
 
 
 def test_poll_resolves_to_terminal_status(states):
-    assert states["Parity"]["Next"] == "WaitForParity"
+    # alpha-engine-config-I5687: Parity dispatches through the poll-budget
+    # seed (InitParityPollCount) before the first poll, and the loop-back
+    # branch is a bounded And[], mirroring the DataPhase2/ThinkTank
+    # precedent.
+    assert states["Parity"]["Next"] == "InitParityPollCount"
+    assert states["InitParityPollCount"]["Next"] == "WaitForParity"
     assert states["WaitForParity"]["Next"] == "CheckParityStatus"
 
     choice = states["CheckParityStatus"]
@@ -153,10 +158,16 @@ def test_poll_resolves_to_terminal_status(states):
     assert success["Variable"] == "$.parity_poll.Status"
     assert success["Next"] == "CheckSkipEvaluator"
 
-    in_flight = {r["StringEquals"]: r["Next"] for r in rules
-                 if r.get("StringEquals") in ("InProgress", "Pending")}
-    assert in_flight == {"InProgress": "ParityWait", "Pending": "ParityWait"}
-    assert states["ParityWait"]["Next"] == "WaitForParity"
+    bounded = next(r for r in rules if "And" in r)
+    variables = {cond.get("Variable") for cond in bounded["And"]}
+    assert "$.parity_polls" in variables
+    or_block = next(cond["Or"] for cond in bounded["And"] if "Or" in cond)
+    in_flight = {c["StringEquals"] for c in or_block}
+    assert in_flight == {"InProgress", "Pending"}
+    assert bounded["Next"] == "ParityWait"
+    assert states["ParityWait"]["Next"] == "ParityPollWait"
+    assert states["ParityPollWait"]["Next"] == "MergeParityPollCount"
+    assert states["MergeParityPollCount"]["Next"] == "WaitForParity"
 
     # THE pin: terminal non-Success (TimedOut / Failed / Cancelled) degrades
     # instead of failing the SF.
