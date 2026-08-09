@@ -20,13 +20,32 @@ SF JSON definitions.
 | Status | Emoji | Push? | Extra detail |
 | --- | --- | --- | --- |
 | `RUNNING`   | 🚀 | silent | execution name only |
-| `SUCCEEDED` | ✅ | loud   | duration |
-| `FAILED`    | 🔴 | loud   | duration + `error: cause` via `DescribeExecution` (best-effort, truncated at 280 chars) |
-| `TIMED_OUT` | ⏰ | loud   | duration |
-| `ABORTED`   | ⛔ | loud   | duration |
+| `SUCCEEDED` | ✅ | loud   | run_date, duration, digest |
+| `FAILED`    | 🔴 | loud   | run_date, duration, `error: cause` via `DescribeExecution` (best-effort, truncated at 280 chars) |
+| `TIMED_OUT` | ⏰ | loud   | run_date, duration |
+| `ABORTED`   | ⛔ | loud   | run_date, duration |
+| `FAILED` + `Error=DegradedRun` | 🟠 rendered as **DEGRADED** | loud | same as FAILED — distinct label/emoji so a degraded EOD run does not read as either a clean SUCCEEDED or a generic crash FAILED (alpha-engine-config#5289) |
 
 `RUNNING` is delivered silently (in-channel awareness, no phone buzz) so the
 weekday SF's daily 5:45 AM PT start does not page on every trading day.
+
+`run_date` is parsed from the execution's `input.run_date`, falling back to
+the first ISO-8601 date substring in the execution name.
+
+### EOD artifact verification (alpha-engine-config#5289)
+
+A `ne-postclose-trading-pipeline` terminal rendering as SUCCEEDED or DEGRADED
+additionally verifies, via two read-only S3 checks against
+`alpha-engine-research`:
+
+1. the SF-envelope completion marker
+   (`_sf_completion/ne-postclose-trading-pipeline/{run_date}.json`), and
+2. a `trades/eod_pnl.csv` row for `run_date`.
+
+Both present → one terse line (`Artifacts: ✓ …`). Either missing → an
+expanded, loud block naming what's missing — deliberately NOT one line, since
+a "SUCCESS" that did not write its ledger row reading as clean is the failure
+mode this check exists to catch. See `eod_artifact_verification.py`.
 
 ## Architecture
 
@@ -67,14 +86,21 @@ bash infrastructure/lambdas/sf-telegram-notifier/deploy.sh --dry-run
 bash infrastructure/lambdas/sf-telegram-notifier/deploy.sh --smoke
 ```
 
-Auth: uses active AWS CLI creds. Personal IAM user has enough perms;
-deliberately not wired into CI to keep the OIDC role's blast radius narrow,
-matching the spot-orphan-reaper / changelog-cloudwatch-mirror convention.
+Auth (bootstrap / `--apply-iam` / `--smoke`): uses active AWS CLI creds —
+IAM role/policy changes stay operator-run, matching the spot-orphan-reaper /
+changelog-cloudwatch-mirror convention. Code-only updates additionally ship
+via `.github/workflows/deploy-sf-telegram-notifier.yml` on merge to `main`
+(mirrors `deploy-pipeline-watchdog.yml` — code only, no `--bootstrap`/
+`--apply-iam` side effects from CI).
 
 ## IAM (inline policy)
 
 - `logs:CreateLogGroup/Stream + PutLogEvents` on the Lambda's own log group
 - `ssm:GetParameter` on `/alpha-engine/TELEGRAM_BOT_TOKEN` +
   `/alpha-engine/TELEGRAM_CHAT_ID` (no other parameters)
-- `states:DescribeExecution` on `arn:aws:states:…:execution:alpha-engine-*:*`
-  — only used to enrich `FAILED` events with the error+cause snippet
+- `states:DescribeExecution` + `states:GetExecutionHistory` on
+  `arn:aws:states:…:execution:{alpha-engine-*,ne-*}:*`
+- `s3:HeadObject`/`s3:GetObject` on
+  `alpha-engine-research/_sf_completion/ne-postclose-trading-pipeline/*` +
+  `alpha-engine-research/trades/eod_pnl.csv` (EOD artifact verification,
+  alpha-engine-config#5289)

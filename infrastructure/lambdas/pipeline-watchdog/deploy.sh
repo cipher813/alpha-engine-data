@@ -28,6 +28,7 @@
 #   bash infrastructure/lambdas/pipeline-watchdog/deploy.sh             # update code only
 #   bash infrastructure/lambdas/pipeline-watchdog/deploy.sh --bootstrap # first-time create + wire SNS + EventBridge
 #   bash infrastructure/lambdas/pipeline-watchdog/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
+#   bash infrastructure/lambdas/pipeline-watchdog/deploy.sh --apply-alarms # upsert the Errors->watchdog-alerts CW alarm (config#6709)
 #   bash infrastructure/lambdas/pipeline-watchdog/deploy.sh --dry-run   # show actions, do not apply
 #   bash infrastructure/lambdas/pipeline-watchdog/deploy.sh --smoke     # invoke once with no event payload
 
@@ -59,12 +60,14 @@ case "${DRY_RUN:-false}" in
 esac
 BOOTSTRAP=false
 APPLY_IAM=false
+APPLY_ALARMS=false
 SMOKE=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
     --bootstrap) BOOTSTRAP=true ;;
     --apply-iam) APPLY_IAM=true ;;
+    --apply-alarms) APPLY_ALARMS=true ;;
     --smoke) SMOKE=true ;;
     -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
   esac
@@ -117,6 +120,32 @@ if $APPLY_IAM; then
   TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
   apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
   echo "  ✓ IAM applied."
+fi
+
+# ----- Apply alarms only (config#6709) -------------------------------------
+# The module docstring long claimed "CW alarm on Lambda errors pages the
+# operator"; measured 2026-08-09 there were ZERO alarms on this function, so a
+# fail-loud handler crash (e.g. the Sunday DescribeExecution AccessDenied,
+# config#6709) was silently un-paged. This upserts the alarm the docstring
+# assumes. TreatMissingData=notBreaching: no invocations -> the deadman/pause
+# posture owns that axis, not this alarm.
+if $APPLY_ALARMS; then
+  echo "Upserting ${FUNCTION_NAME}-errors alarm..."
+  aws cloudwatch put-metric-alarm \
+    --region "${REGION}" \
+    --alarm-name "${FUNCTION_NAME}-errors" \
+    --alarm-description "pipeline-watchdog Lambda raised (fail-loud handler): the fleet's same-day pipeline-liveness detector is itself failing - see /aws/lambda/${FUNCTION_NAME} logs (config#6709)" \
+    --namespace "AWS/Lambda" \
+    --metric-name "Errors" \
+    --dimensions "Name=FunctionName,Value=${FUNCTION_NAME}" \
+    --statistic "Sum" \
+    --period 86400 \
+    --evaluation-periods 1 \
+    --threshold 1 \
+    --comparison-operator "GreaterThanOrEqualToThreshold" \
+    --treat-missing-data "notBreaching" \
+    --alarm-actions "arn:aws:sns:us-east-1:711398986525:alpha-engine-watchdog-alerts" >/dev/null
+  echo "  ✓ Alarm ${FUNCTION_NAME}-errors upserted."
 fi
 
 if $BOOTSTRAP; then
