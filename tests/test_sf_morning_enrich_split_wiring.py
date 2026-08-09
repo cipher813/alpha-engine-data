@@ -266,8 +266,11 @@ class TestChainOrdering:
 
 
 class TestSsmCommandShape:
-    """MorningEnrich invokes --morning-enrich-only; DataPhase1 switched
-    from --data-only to --phase1-only."""
+    """MorningEnrich invokes spot_morning_enrich.sh; DataPhase1 invokes
+    spot_data_phase1.sh (alpha-engine-config-I4442/I4497 SF cutover,
+    2026-08-09, nousergon-data#1122). Neither invokes the shared
+    spot_data_weekly.sh monolith any longer — it is retained, unchanged,
+    only as the rollback path."""
 
     def _commands(self, states, name):
         # commands.$ States.Array (keystone routed the final launch through
@@ -276,18 +279,28 @@ class TestSsmCommandShape:
         return extract_commands(states[name])
 
     def test_morning_enrich_invokes_morning_enrich_only(self, states):
+        # alpha-engine-config-I4442/I4497 SF cutover (2026-08-09, nousergon-data
+        # #1122): MorningEnrich now invokes its own dedicated script rather than
+        # the monolith + a mode flag. The monolith is retained unchanged as the
+        # rollback path (test_sf_structural_contract.py pins the new script's
+        # on-disk existence).
         joined = " ".join(self._commands(states, "MorningEnrich"))
-        assert "spot_data_weekly.sh --morning-enrich-only" in joined
+        assert "spot_morning_enrich.sh" in joined
+        assert "spot_data_weekly.sh" not in joined
         assert "--data-only" not in joined
         assert "--phase1-only" not in joined
+        assert "--morning-enrich-only" not in joined
 
     def test_data_phase1_invokes_phase1_only(self, states):
+        # alpha-engine-config-I4442/I4497 SF cutover: DataPhase1 now invokes
+        # its own dedicated script.
         joined = " ".join(self._commands(states, "DataPhase1"))
-        assert "spot_data_weekly.sh --phase1-only" in joined, (
-            "DataPhase1 must run --phase1-only post-split — --data-only "
-            "re-bundles the 28-min morning-enrich into the phase1 task."
+        assert "spot_data_phase1.sh" in joined, (
+            "DataPhase1 must run its dedicated per-stage script post-cutover."
         )
+        assert "spot_data_weekly.sh" not in joined
         assert "--data-only" not in joined
+        assert "--phase1-only" not in joined
 
     def test_morning_enrich_command_starts_with_pipefail(self, states):
         # Same invariant test_sf_ssm_pipefail_wiring.py pins globally;
@@ -317,8 +330,9 @@ class TestSsmCommandShape:
         # Right slug and log path
         assert "--slug morning-enrich" in work
         assert "--log /var/log/morning-enrich.log" in work
-        # Inner command is the morning-enrich launcher
-        assert "-- bash infrastructure/spot_data_weekly.sh --morning-enrich-only" in work
+        # Inner command is the dedicated morning-enrich launcher (post
+        # I4442/I4497 SF cutover, not the monolith + mode flag)
+        assert "-- bash infrastructure/spot_morning_enrich.sh" in work
         # No inline trap survives anywhere in this state
         assert not any(c.startswith("trap ") for c in cmds), (
             "Inline `trap 'aws s3 cp ...' EXIT` line must not coexist "

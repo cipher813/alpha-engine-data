@@ -146,17 +146,24 @@ _EXPECTED_SKIPS = {
 # commands.$/States.Format($.preflight_args) Option-C mechanism the keystone
 # used for the other 7 spots.
 # Maps state name → (mode token the {} immediately follows, log file).
+#
+# alpha-engine-config-I4442/I4497 SF cutover (2026-08-09, nousergon-data
+# #1122 + crucible-backtester#631): MorningEnrich/DataPhase1/RAGIngestion and
+# the five backtest-family states below now invoke their own dedicated
+# per-stage script instead of a shared monolith + mode flag. The old
+# monolith launchers (spot_data_weekly.sh / spot_backtest.sh) are retained
+# on disk, unchanged, only as the rollback path.
 _SPOT_STATES = {
     "MorningEnrich": (
-        "bash infrastructure/spot_data_weekly.sh --morning-enrich-only",
+        "bash infrastructure/spot_morning_enrich.sh",
         "/var/log/morning-enrich.log",
     ),
     "DataPhase1": (
-        "bash infrastructure/spot_data_weekly.sh --phase1-only",
+        "bash infrastructure/spot_data_phase1.sh",
         "/var/log/data-weekly.log",
     ),
     "RAGIngestion": (
-        "bash infrastructure/spot_data_weekly.sh --rag-only",
+        "bash infrastructure/spot_rag_ingestion.sh",
         "/var/log/rag-ingestion.log",
     ),
     # alpha-engine-config-I5759: DataPhase2 moved OFF lambda:invoke onto spot,
@@ -176,23 +183,23 @@ _SPOT_STATES = {
         "/var/log/predictor-training.log",
     ),
     "Backtester": (
-        "bash infrastructure/spot_backtest.sh --mode=param-sweep --no-pit-parity --skip-stages=parity,evaluator",
+        "bash infrastructure/spot_backtester.sh",
         "/var/log/backtester.log",
     ),
     "PredictorBacktest": (
-        "bash infrastructure/spot_backtest.sh --mode=predictor-backtest --no-pit-parity --skip-stages=parity,evaluator",
+        "bash infrastructure/spot_predictor_backtest.sh",
         "/var/log/predictor-backtest.log",
     ),
     "PortfolioOptimizerBacktest": (
-        "bash infrastructure/spot_backtest.sh --mode=portfolio-optimizer-backtest --no-pit-parity --skip-stages=parity,evaluator",
+        "bash infrastructure/spot_portfolio_optimizer_backtest.sh",
         "/var/log/portfolio-optimizer.log",
     ),
     "Parity": (
-        "bash infrastructure/spot_backtest.sh --pit-parity-enabled=1 --skip-stages=backtest,evaluator",
+        "bash infrastructure/spot_parity.sh",
         "/var/log/parity.log",
     ),
     "Evaluator": (
-        "bash infrastructure/spot_backtest.sh --no-pit-parity --skip-stages=backtest,parity",
+        "bash infrastructure/spot_evaluator.sh",
         "/var/log/evaluator.log",
     ),
     # config#902: DriftDetection was collapsed — drift is now bundled onto the
@@ -437,6 +444,20 @@ def orig_spot_cmds() -> dict:
       `_eval_expr` learned the `$$.` context-object form; the baseline
       resolves it via `_CONTEXT_OBJECT` so byte-identity stays
       deterministic. See `tests/test_sf_krepis_correlation_id.py`.
+
+    - **Regenerated 2026-08-09** as part of the alpha-engine-config-I4442/
+      I4497 SF cutover (nousergon-data#1122 + crucible-backtester#631):
+      MorningEnrich/DataPhase1/RAGIngestion and the five backtest-family
+      states now resolve to their own dedicated per-stage script
+      (`spot_morning_enrich.sh` / `spot_data_phase1.sh` /
+      `spot_rag_ingestion.sh` / `spot_backtester.sh` /
+      `spot_predictor_backtest.sh` / `spot_portfolio_optimizer_backtest.sh`
+      / `spot_parity.sh` / `spot_evaluator.sh`) with no stage-multiplexing
+      flag, instead of the shared `spot_data_weekly.sh` / `spot_backtest.sh`
+      monolith + mode flag. This is a deliberate, reviewed absent-path
+      change — the whole point of the cutover — so the baseline moves with
+      it. Both monoliths are retained on disk, unchanged, only as the
+      rollback path.
 
     Regenerate ONLY on a deliberate, reviewed change to a spot state's
     absent-path (`preflight_args=""`) command, by re-extracting the

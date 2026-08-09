@@ -44,10 +44,13 @@ _SCRIPTS = [
 # step_function.json (the WEEKLY SF) added 2026-07-10: its predictor-
 # training/model-zoo/backtester command blocks sourced .env the same way the
 # daily/eod trading-box blocks did. Its MorningEnrich/DataPhase1/RAGIngestion
-# states are NOT part of that population — they invoke spot_data_weekly.sh,
-# which self-exports the region via its own ENV_SOURCE heredoc (see
-# test_env_source_exports_region above) and never sourced .env directly. The
-# two dashboard health-check states likewise never sourced .env.
+# states are NOT part of that population — pre alpha-engine-config-I4442/
+# I4497 cutover (2026-08-09) they invoked spot_data_weekly.sh; post-cutover
+# they invoke their own dedicated spot_morning_enrich.sh/spot_data_phase1.sh/
+# spot_rag_ingestion.sh. Every one of those scripts self-exports the region
+# via its own ENV_SOURCE heredoc (see test_env_source_exports_region above)
+# and never sourced .env directly. The two dashboard health-check states
+# likewise never sourced .env.
 #
 # Rebased 2026-07-15 onto the config#832/I2515 weekly-SF reshape: of the
 # original 9 sourcing sites, 6 (PredictorTraining, Backtester,
@@ -198,6 +201,17 @@ def test_step_function_blocks_export_region(sf: Path):
         ) or (
             "infrastructure/spot_train.sh" in joined
             or "infrastructure/spot_backtest.sh" in joined
+            # alpha-engine-config-I4442/I4497 SF cutover (2026-08-09,
+            # crucible-backtester#631): the backtest-family states moved off
+            # the shared spot_backtest.sh monolith onto these five dedicated
+            # scripts, which carry the same inline AWS_REGION/
+            # AWS_DEFAULT_REGION export — without adding them here this
+            # guard would silently stop checking all five states.
+            or "infrastructure/spot_backtester.sh" in joined
+            or "infrastructure/spot_predictor_backtest.sh" in joined
+            or "infrastructure/spot_portfolio_optimizer_backtest.sh" in joined
+            or "infrastructure/spot_parity.sh" in joined
+            or "infrastructure/spot_evaluator.sh" in joined
             or "training.model_zoo" in joined
         )
         if not touched:
