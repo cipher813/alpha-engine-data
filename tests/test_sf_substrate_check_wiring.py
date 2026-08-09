@@ -101,17 +101,21 @@ class TestChainOrdering:
         # Two advisory states (evaluator Report Card v2, then the Director)
         # sit between the substrate poll and the notify gate. ReportCard's
         # SUCCESS edge feeds the Director (which weighs the fresh card);
-        # ReportCard's Catch routes to PublishReportCardDegraded (config#2302:
-        # a WARNING alert — advisory grading failed silently for 9 days pre-fix)
-        # which then continues to notify (no card to weigh). The Director's own
-        # Next lands on CheckShellRunNotify on success. config#6408 (Brian's
-        # 2026-08-04 operator ruling): Director's Catch now routes to
-        # NormalizeFailureContext — a Director failure terminates the execution
-        # FAILED rather than reporting degraded success.
+        # ReportCard's Catch routes to ReportCardDegraded (config#6685: sets
+        # $.report_card_degraded so it threads into the terminal-notify
+        # selection) which then continues, unchanged, to
+        # PublishReportCardDegraded (config#2302: a WARNING alert — advisory
+        # grading failed silently for 9 days pre-fix) and on to notify (no
+        # card to weigh). The Director's own Next lands on CheckShellRunNotify
+        # on success. config#6408 (Brian's 2026-08-04 operator ruling):
+        # Director's Catch now routes to NormalizeFailureContext — a
+        # Director failure terminates the execution FAILED rather than
+        # reporting degraded success.
         assert states["ReportCard"]["Next"] == "Director"
         assert all(
-            c["Next"] == "PublishReportCardDegraded" for c in states["ReportCard"]["Catch"]
+            c["Next"] == "ReportCardDegraded" for c in states["ReportCard"]["Catch"]
         )
+        assert states["ReportCardDegraded"]["Next"] == "PublishReportCardDegraded"
         assert states["PublishReportCardDegraded"]["Next"] == "CheckShellRunNotify"
         assert states["Director"]["Next"] == "CheckShellRunNotify"
         assert all(

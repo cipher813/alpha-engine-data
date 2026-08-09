@@ -868,13 +868,15 @@ class TestConsolidatedNotify:
     def test_substrate_check_routes_to_notify_gate(self, states):
         # The substrate check flows into two advisory states (evaluator
         # Report Card v2, then the Director) before the notify gate. ReportCard's
-        # SUCCESS Next feeds the Director; its Catch routes to
+        # SUCCESS Next feeds the Director; its Catch routes to ReportCardDegraded
+        # (config#6685: sets $.report_card_degraded so it threads into the
+        # terminal-notify selection) which then continues, unchanged, to
         # PublishReportCardDegraded (config#2302: a WARNING page — advisory grading
-        # failed silently for 9 days pre-fix) which then continues to
-        # CheckShellRunNotify. The Director's own Next lands on CheckShellRunNotify
-        # on success. config#6408 (Brian's 2026-08-04 operator ruling): Director's
-        # Catch now routes to NormalizeFailureContext — a Director failure
-        # terminates the execution FAILED.
+        # failed silently for 9 days pre-fix) and on to CheckShellRunNotify. The
+        # Director's own Next lands on CheckShellRunNotify on success. config#6408
+        # (Brian's 2026-08-04 operator ruling): Director's Catch now routes to
+        # NormalizeFailureContext — a Director failure terminates the execution
+        # FAILED.
         # The path to the notify gate is preserved when grading succeeds and
         # advisory succeeds. On the Friday preflight the states still RUN (dry,
         # see test_advisory_tail_runs_dry_on_preflight) — they are not skipped —
@@ -893,7 +895,8 @@ class TestConsolidatedNotify:
         assert substrate_success["Next"] == "ReportCard"
         report_card = states["ReportCard"]
         assert report_card["Next"] == "Director"
-        assert all(c["Next"] == "PublishReportCardDegraded" for c in report_card["Catch"])
+        assert all(c["Next"] == "ReportCardDegraded" for c in report_card["Catch"])
+        assert states["ReportCardDegraded"]["Next"] == "PublishReportCardDegraded"
         assert states["PublishReportCardDegraded"]["Next"] == "CheckShellRunNotify"
         director = states["Director"]
         assert director["Next"] == "CheckShellRunNotify"
