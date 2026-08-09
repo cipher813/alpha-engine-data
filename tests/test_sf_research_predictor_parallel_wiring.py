@@ -543,9 +543,13 @@ class TestBranchBContents:
         assert m["ItemSelector"]["spec_id.$"] == "$$.Map.Item.Value"
         assert m["ItemSelector"]["ec2_instance_id.$"] == "$.ec2_instance_id"
         proc = m["ItemProcessor"]["States"]
-        # The dispatch invokes the per-spec spot mode with the item's spec id.
+        # The dispatch invokes the per-spec spot script with the item's spec
+        # id. alpha-engine-config-I4442/I4497 predictor-leg cutover
+        # (2026-08-09, crucible-predictor#436+#458): spot_train.sh
+        # --model-zoo-spec <id> -> spot_train_spec_dispatch.sh --spec-id <id>.
         dcmd = proc["TrainSpecDispatch"]["Parameters"]["Parameters"]["commands.$"]
-        assert "--model-zoo-spec" in dcmd
+        assert "infrastructure/spot_train_spec_dispatch.sh" in dcmd
+        assert "--spec-id" in dcmd
         assert "$.spec_id" in dcmd
         assert "$.preflight_args" in dcmd
         # PER-ITERATION ISOLATION: both terminals are End:true Pass states
@@ -572,7 +576,11 @@ class TestBranchBContents:
         sel = branch_b["ModelZooSelect"]
         assert sel["Parameters"]["InstanceIds.$"] == "$.ec2_instance_id"
         scmd = sel["Parameters"]["Parameters"]["commands.$"]
-        assert "--model-zoo-select" in scmd
+        # alpha-engine-config-I4442/I4497 predictor-leg cutover (2026-08-09,
+        # crucible-predictor#436+#458): spot_train.sh --model-zoo-select ->
+        # spot_model_zoo_select.sh --select-only.
+        assert "infrastructure/spot_model_zoo_select.sh" in scmd
+        assert "--select-only" in scmd
         assert "$.preflight_args" in scmd
         assert any(
             c["Next"] == "PublishModelZooFailureImmediate" and "States.ALL" in c["ErrorEquals"]
