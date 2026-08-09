@@ -57,15 +57,45 @@ _DEFAULT_HISTORY = [
 ]
 
 
-def _make_clients(*, describe=None, history=None, existing=None, put=None):
-    """Return (factory, sf_mock, s3_mock). ``existing`` None → get_object 404."""
+def _make_clients(*, describe=None, history=None, existing=None, put=None,
+                   sf_definition=None, history_pages=None):
+    """Return (factory, sf_mock, s3_mock). ``existing`` None → get_object 404.
+
+    ``sf_definition`` (dict): when given, wires ``describe_state_machine`` to
+    return it as the ASL definition — the alpha-engine-config-I6616
+    failure-handling-state derivation reads this. Left unset, the mocked
+    ``describe_state_machine`` call returns an unconfigured MagicMock, whose
+    ``json.loads`` fails and falls back to the daily-pipeline default names
+    (``HandleFailure``/``FailExecution``) — correct for every pre-I6616 fixture
+    in this file, none of which name a different pipeline's terminal states.
+
+    ``history_pages`` (list[list[dict]]): when given, each inner list is one
+    page's events in CHRONOLOGICAL order, listed in FETCH order — page 0 is
+    the NEWEST events (what the first, token-less call returns under the real
+    API's ``reverseOrder=True``), page 1 is the next-older batch, etc.
+    ``get_execution_history`` is wired to return them in that order via
+    ``side_effect`` (each reversed to the API's newest-first shape), with a
+    ``nextToken`` on every page but the last — exercises the I6616 pagination
+    walk. Mutually exclusive with ``history``.
+    """
     sf = MagicMock()
     sf.describe_execution.return_value = describe if describe is not None else {
         "input": "{}", "error": "States.TaskFailed", "cause": "RAGIngestion failed",
     }
-    sf.get_execution_history.return_value = _history_chrono_to_resp(
-        history if history is not None else _DEFAULT_HISTORY
-    )
+    if sf_definition is not None:
+        sf.describe_state_machine.return_value = {"definition": json.dumps(sf_definition)}
+    if history_pages is not None:
+        resps = []
+        for i, page in enumerate(history_pages):
+            resp = _history_chrono_to_resp(page)
+            if i < len(history_pages) - 1:
+                resp["nextToken"] = f"token-{i}"
+            resps.append(resp)
+        sf.get_execution_history.side_effect = resps
+    else:
+        sf.get_execution_history.return_value = _history_chrono_to_resp(
+            history if history is not None else _DEFAULT_HISTORY
+        )
     s3 = MagicMock()
     if existing is None:
         s3.get_object.side_effect = FakeClientError("404")
@@ -342,6 +372,232 @@ def test_failed_state_none_when_state_exited_cleanly():
     with patch("index.boto3.client", side_effect=factory):
         result = index.handler(_event("FAILED"), None)
     assert result["failed_state"] is None
+
+
+# ── alpha-engine-config-I6616: failed_state must name the ROUTING state, ────
+# never the shared HandleFailure/FailExecution terminal every failure funnels
+# through (the constant the issue was filed against). Mirrors the definition
+# shape in infrastructure/step_function_daily.json's DeployDriftGate ->
+# HandleFailure -> FailExecution funnel — the exact reference incident cited
+# in the issue (config-I6610/I6588/I6571, three FAILED weekday executions
+# that all reported `failed_state=FailExecution`, all three actually failed
+# at `DeployDriftGate`).
+_DAILY_LIKE_DEFINITION = {
+    "States": {
+        "DeployDriftGate": {
+            "Type": "Choice",
+            "Choices": [
+                {
+                    "And": [
+                        {"Variable": "$.drift_result.Payload.has_drift", "IsPresent": True},
+                        {"Variable": "$.drift_result.Payload.has_drift", "BooleanEquals": True},
+                    ],
+                    "Next": "HandleFailure",
+                },
+                {
+                    "Not": {"Variable": "$.drift_result.Payload.has_drift", "IsPresent": True},
+                    "Next": "HandleFailure",
+                },
+            ],
+            "Default": "TradingDayGate",
+        },
+        # A genuine Choice (mirrors the real TradingDayGate) — one branch
+        # routes to HandleFailure, the Default continues the real success
+        # path. A Choice state is NEVER added to the failure-handling sink
+        # (see `_failure_handling_states`'s docstring), which is what stops
+        # the sink-derivation closure from sweeping the ENTIRE upstream
+        # success chain (LaunchMorningEnrichSpot -> PollMorningArcticAppendSpot
+        # -> TradingDayGate) into the funnel just because one of TradingDayGate's
+        # branches eventually reaches Fail.
+        "TradingDayGate": {
+            "Type": "Choice",
+            "Choices": [{"Variable": "$.is_trading_day", "IsPresent": False, "Next": "HandleFailure"}],
+            "Default": "PipelineSuccess",
+        },
+        "PipelineSuccess": {"Type": "Succeed"},
+        "LaunchMorningEnrichSpot": {
+            "Type": "Task", "Next": "PollMorningArcticAppendSpot",
+            "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "HandleFailure"}],
+        },
+        "PollMorningArcticAppendSpot": {"Type": "Task", "Next": "TradingDayGate"},
+        "HandleFailure": {"Type": "Task", "Next": "FailExecution"},
+        "FailExecution": {"Type": "Fail", "Error": "DailyPipelineFailure",
+                           "Cause": "One or more weekday pipeline steps failed."},
+    },
+}
+
+
+def test_failed_state_resolves_choice_routing_state_not_fail_execution():
+    """The exact I6616 reference shape: a Choice state (DeployDriftGate)
+    evaluates has_drift=true, exits CLEANLY, and routes to HandleFailure ->
+    FailExecution. The pre-fix algorithm reported `failed_state=FailExecution`
+    for this shape (a dangling-only search loses the Choice state the instant
+    it exits) — the exact bug the issue was filed against."""
+    history = [
+        {"type": "ExecutionStarted"},
+        {"type": "ChoiceStateEntered", "stateEnteredEventDetails": {
+            "name": "DeployDriftGate",
+            "input": json.dumps({
+                "drift_result": {"Payload": {"has_drift": True}},
+                "cf_drift_reason": "stack_in_terminal_state",
+            }),
+        }},
+        {"type": "ChoiceStateExited", "stateExitedEventDetails": {"name": "DeployDriftGate"}},
+        {"type": "TaskStateEntered", "stateEnteredEventDetails": {"name": "HandleFailure"}},
+        {"type": "TaskStateExited", "stateExitedEventDetails": {"name": "HandleFailure"}},
+        {"type": "FailStateEntered", "stateEnteredEventDetails": {"name": "FailExecution"}},
+        {"type": "ExecutionFailed"},
+    ]
+    factory, sf, s3 = _make_clients(history=history, sf_definition=_DAILY_LIKE_DEFINITION)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+    assert result["failed_state"] == "DeployDriftGate"
+    assert result["failed_state"] != "FailExecution"
+    assert result["failed_state"] != "HandleFailure"
+    written = json.loads(s3.put_object.call_args.kwargs["Body"])
+    detail = written["events"][0]["failed_state_detail"]
+    assert detail is not None
+    assert "drift_result.Payload.has_drift" in detail
+    assert "BooleanEquals" in detail
+
+
+def test_failed_state_task_failure_with_multiple_retries_reports_last_task():
+    """A Task state that fails, retries twice more (three TaskFailed events
+    under the SAME StateEntered — SF never re-emits StateEntered per retry),
+    then exhausts its retry budget and routes to HandleFailure -> FailExecution.
+    The culprit is the retried task, not FailExecution; the detail carries the
+    final attempt's error/cause (deliverable 2, Task-failure case)."""
+    history = [
+        {"type": "ExecutionStarted"},
+        {"type": "TaskStateEntered", "stateEnteredEventDetails": {"name": "LaunchMorningEnrichSpot"}},
+        {"type": "TaskFailed", "taskFailedEventDetails": {
+            "error": "Lambda.Unknown", "cause": "attempt 1: transient"}},
+        {"type": "TaskFailed", "taskFailedEventDetails": {
+            "error": "Lambda.Unknown", "cause": "attempt 2: transient"}},
+        {"type": "TaskFailed", "taskFailedEventDetails": {
+            "error": "States.TaskFailed", "cause": "attempt 3: SpotCapacityNotAvailable"}},
+        {"type": "TaskStateEntered", "stateEnteredEventDetails": {"name": "HandleFailure"}},
+        {"type": "TaskStateExited", "stateExitedEventDetails": {"name": "HandleFailure"}},
+        {"type": "FailStateEntered", "stateEnteredEventDetails": {"name": "FailExecution"}},
+        {"type": "ExecutionFailed"},
+    ]
+    factory, sf, s3 = _make_clients(history=history, sf_definition=_DAILY_LIKE_DEFINITION)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+    assert result["failed_state"] == "LaunchMorningEnrichSpot"
+    written = json.loads(s3.put_object.call_args.kwargs["Body"])
+    detail = written["events"][0]["failed_state_detail"]
+    assert detail is not None
+    assert "SpotCapacityNotAvailable" in detail  # the FINAL retry's cause
+
+
+def test_failed_state_resolves_across_paginated_history():
+    """The execution history spans more than one ``get_execution_history``
+    page — the culprit's StateEntered lands in the OLDER (second-fetched)
+    page. Regression guard for the pagination bug class named in the issue:
+    an earlier sf-digest paginated FORWARD with a fixed page cap and silently
+    truncated; this walks BACKWARD (reverseOrder=True) across
+    ``_HISTORY_MAX_PAGES`` instead of stopping at page 1."""
+    older_page = [  # fetched SECOND (further into the past)
+        {"type": "ExecutionStarted"},
+        {"type": "ChoiceStateEntered", "stateEnteredEventDetails": {
+            "name": "DeployDriftGate",
+            "input": json.dumps({"drift_result": {"Payload": {"has_drift": True}}}),
+        }},
+        {"type": "ChoiceStateExited", "stateExitedEventDetails": {"name": "DeployDriftGate"}},
+    ]
+    newer_page = [  # fetched FIRST (newest events)
+        {"type": "TaskStateEntered", "stateEnteredEventDetails": {"name": "HandleFailure"}},
+        {"type": "TaskStateExited", "stateExitedEventDetails": {"name": "HandleFailure"}},
+        {"type": "FailStateEntered", "stateEnteredEventDetails": {"name": "FailExecution"}},
+        {"type": "ExecutionFailed"},
+    ]
+    factory, sf, s3 = _make_clients(
+        history_pages=[newer_page, older_page], sf_definition=_DAILY_LIKE_DEFINITION,
+    )
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+    assert result["failed_state"] == "DeployDriftGate"
+    assert sf.get_execution_history.call_count == 2
+    second_call_kwargs = sf.get_execution_history.call_args_list[1].kwargs
+    assert second_call_kwargs["nextToken"] == "token-0"
+    assert second_call_kwargs["reverseOrder"] is True
+
+
+def test_failed_state_degenerate_funnel_entry_reports_unknown_never_constant():
+    """The funnel is entered with NO prior recorded state (e.g. a MutexConflict
+    Choice at the very top of the definition, before this bounded history
+    window). The pre-fix bug reported the constant `FailExecution` in this
+    shape too; the fix must report unknown (None) rather than ever
+    substituting the funnel's own name — the issue's Gotcha #4."""
+    history = [
+        {"type": "ExecutionStarted"},
+        {"type": "TaskStateEntered", "stateEnteredEventDetails": {"name": "HandleFailure"}},
+        {"type": "TaskStateExited", "stateExitedEventDetails": {"name": "HandleFailure"}},
+        {"type": "FailStateEntered", "stateEnteredEventDetails": {"name": "FailExecution"}},
+        {"type": "ExecutionFailed"},
+    ]
+    factory, sf, s3 = _make_clients(history=history, sf_definition=_DAILY_LIKE_DEFINITION)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+    assert result["failed_state"] is None
+    assert result["failed_state"] != "FailExecution"
+    assert result["failed_state"] != "HandleFailure"
+
+
+def test_failed_state_unfunneled_unhandled_error_unchanged_behavior():
+    """The 2026-08-03 shape named in the issue's Gotchas: an execution that
+    fails WITHOUT ever entering HandleFailure (an unhandled error propagates
+    straight to ExecutionFailed). Must resolve via the legacy dangling signal,
+    unaffected by the funnel-skip logic — a definition IS supplied here (so
+    the failure-handling-state derivation runs for real) to prove it correctly
+    finds no funnel entry and falls through cleanly."""
+    history = [
+        {"type": "ExecutionStarted"},
+        {"type": "TaskStateEntered", "stateEnteredEventDetails": {"name": "SomeS3Write"}},
+        {"type": "TaskFailed", "taskFailedEventDetails": {
+            "error": "S3.AccessDeniedException", "cause": "Access Denied"}},
+        {"type": "ExecutionFailed"},
+    ]
+    factory, sf, s3 = _make_clients(history=history, sf_definition=_DAILY_LIKE_DEFINITION)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED", sm_arn=WEEKDAY_ARN), None)
+    assert result["failed_state"] == "SomeS3Write"
+    written = json.loads(s3.put_object.call_args.kwargs["Body"])
+    assert written["events"][0]["failed_state_detail"] == "S3.AccessDeniedException: Access Denied"
+
+
+def test_failure_handling_states_derived_per_definition_not_hardcoded():
+    """Gotcha #2: the weekly/postclose pipelines use their OWN terminal-state
+    names, not `HandleFailure`/`FailExecution`. A definition naming its Fail
+    funnel differently must still be resolved correctly — proves the sink set
+    is read from the definition being watched, not a hardcoded pair."""
+    saturday_definition = {
+        "States": {
+            "RationaleClustering": {
+                "Type": "Task", "Next": "Persist",
+                "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "AlertAndFail"}],
+            },
+            "Persist": {"Type": "Task", "Next": "AlertAndFail"},
+            "AlertAndFail": {"Type": "Task", "Next": "TerminalFail"},
+            "TerminalFail": {"Type": "Fail", "Error": "WeeklyPipelineFailure"},
+        },
+    }
+    history = [
+        {"type": "ExecutionStarted"},
+        {"type": "TaskStateEntered", "stateEnteredEventDetails": {"name": "RationaleClustering"}},
+        {"type": "TaskFailed", "taskFailedEventDetails": {
+            "error": "States.Timeout", "cause": "clustering exceeded 900s"}},
+        {"type": "TaskStateEntered", "stateEnteredEventDetails": {"name": "AlertAndFail"}},
+        {"type": "TaskStateExited", "stateExitedEventDetails": {"name": "AlertAndFail"}},
+        {"type": "FailStateEntered", "stateEnteredEventDetails": {"name": "TerminalFail"}},
+        {"type": "ExecutionFailed"},
+    ]
+    factory, sf, s3 = _make_clients(history=history, sf_definition=saturday_definition)
+    with patch("index.boto3.client", side_effect=factory):
+        result = index.handler(_event("FAILED"), None)  # SATURDAY_ARN default
+    assert result["failed_state"] == "RationaleClustering"
+    assert result["failed_state"] not in ("AlertAndFail", "TerminalFail")
 
 
 # ── M2: repository_dispatch to the autonomous agent ─────────────────────────
