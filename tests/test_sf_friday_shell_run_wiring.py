@@ -134,6 +134,11 @@ _EXPECTED_SKIPS = {
     "skip_parity",
     "skip_evaluator",
     "skip_post_eval",
+    # config#6054: per-stage split of the post-eval tail — skip_post_eval
+    # stays as the deprecated whole-tail alias; these two gate ReportCard
+    # and Director independently.
+    "skip_report_card",
+    "skip_director",
 }
 
 # KEYSTONE + skip-exception rewire: the 8 SPOT workload states. Under
@@ -925,14 +930,21 @@ class TestConsolidatedNotify:
             for r in states["CheckSubstrateHealthCheckStatus"]["Choices"]
             if r.get("StringEquals") == "Success"
         )
-        assert substrate_success["Next"] == "ReportCard"
+        # config#6054: the substrate check now lands on the per-stage skip
+        # gates rather than directly on ReportCard; the success chain is
+        # CheckSkipReportCard → ReportCard → CheckSkipDirector → Director →
+        # DirectorComplete (success-only rerun witness) → CheckShellRunNotify.
+        assert substrate_success["Next"] == "CheckSkipReportCard"
+        assert states["CheckSkipReportCard"]["Default"] == "ReportCard"
         report_card = states["ReportCard"]
-        assert report_card["Next"] == "Director"
+        assert report_card["Next"] == "CheckSkipDirector"
         assert all(c["Next"] == "ReportCardDegraded" for c in report_card["Catch"])
         assert states["ReportCardDegraded"]["Next"] == "PublishReportCardDegraded"
         assert states["PublishReportCardDegraded"]["Next"] == "CheckShellRunNotify"
+        assert states["CheckSkipDirector"]["Default"] == "Director"
         director = states["Director"]
-        assert director["Next"] == "CheckShellRunNotify"
+        assert director["Next"] == "DirectorComplete"
+        assert states["DirectorComplete"]["Next"] == "CheckShellRunNotify"
         assert all(c["Next"] == "NormalizeFailureContext" for c in director["Catch"])
         assert all(c["ResultPath"] == "$.error" for c in director["Catch"])
 
