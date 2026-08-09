@@ -1,7 +1,9 @@
-"""Unit tests for the alpha-engine-eod-backstop Lambda (config#1229).
+"""Unit tests for the alpha-engine-eod-backstop Lambda (config#1229, widened
+config-I6690).
 
-The backstop starts the EOD SF IFF the trading box is still running AND no
-EOD ran today; it is a no-op otherwise and fail-loud on AWS errors.
+The backstop starts the EOD SF IFF it is a trading day AND no EOD execution
+has started today — regardless of trading-box state (StartTradingInstance
+boots it either way); it is a no-op otherwise and fail-loud on AWS errors.
 """
 
 from __future__ import annotations
@@ -91,17 +93,32 @@ class TestHandler:
         return result, start
 
     def test_starts_eod_when_box_up_and_no_eod_today(self):
+        # box running + no execution + trading day -> dispatch (existing
+        # behavior preserved), tagged triggered_by="backstop".
         result, start = self._run(box="running", eod_started=None)
         assert result["action"] == "started_eod"
         assert result["execution_arn"] == "arn:exec:backstop"
-        start.assert_called_once()
+        assert result["box_was_running"] is True
+        start.assert_called_once_with(self.TRADING_NOW.date().isoformat(), "backstop")
 
-    def test_noop_when_box_stopped(self):
-        result, start = self._run(box="stopped")
-        assert result["action"] == "noop" and result["reason"] == "trading_box_not_running"
+    def test_starts_eod_when_box_stopped_and_no_eod_today(self):
+        # config-I6690: box stopped + no execution + trading day -> dispatch
+        # (the widened case — a box-never-started day must not be a silent
+        # no-op), tagged triggered_by="backstop-box-stopped".
+        result, start = self._run(box="stopped", eod_started=None)
+        assert result["action"] == "started_eod"
+        assert result["execution_arn"] == "arn:exec:backstop"
+        assert result["box_was_running"] is False
+        start.assert_called_once_with(self.TRADING_NOW.date().isoformat(), "backstop-box-stopped")
+
+    def test_noop_when_box_stopped_and_execution_exists(self):
+        # box stopped + execution exists -> no dispatch, regardless of box
+        # state (the eod_ran_today guard alone decides this).
+        result, start = self._run(box="stopped", eod_started=self.TRADING_NOW)
+        assert result["action"] == "noop" and result["reason"] == "eod_already_ran_today"
         start.assert_not_called()
 
-    def test_noop_when_eod_already_ran(self):
+    def test_noop_when_box_running_and_eod_already_ran(self):
         result, start = self._run(box="running", eod_started=self.TRADING_NOW)
         assert result["action"] == "noop" and result["reason"] == "eod_already_ran_today"
         start.assert_not_called()
@@ -111,11 +128,26 @@ class TestHandler:
         assert result["action"] == "noop" and result["reason"] == "not_a_trading_day"
         start.assert_not_called()
 
+    def test_eod_ran_today_checked_before_box_state(self):
+        # eod_ran_today is decisive on its own — box state must not even be
+        # consulted once an execution is already found for today (avoids an
+        # unnecessary EC2 describe_instances call on the common no-op path).
+        with patch("index.datetime") as dt, \
+             patch("index.is_trading_day", return_value=True), \
+             patch("index.last_closed_trading_day", return_value=self.TRADING_NOW.date()), \
+             patch("index._trading_box_running") as box_running, \
+             patch("index._eod_ran_today", return_value=True), \
+             patch("index._start_eod") as start:
+            dt.now.return_value = self.TRADING_NOW
+            index.handler({}, None)
+        box_running.assert_not_called()
+        start.assert_not_called()
+
 
 class TestStartEodInput:
     def test_start_execution_mirrors_daemon_input(self):
         sf = _sf(None)
-        index._start_eod("2026-06-25", sf)
+        index._start_eod("2026-06-25", "backstop", sf)
         kwargs = sf.start_execution.call_args.kwargs
         assert kwargs["stateMachineArn"].endswith("ne-postclose-trading-pipeline")
         assert kwargs["name"].startswith("eod-backstop-2026-06-25-")
@@ -125,6 +157,22 @@ class TestStartEodInput:
         assert payload["pipeline_role"] == "eod"
         assert payload["run_date"] == "2026-06-25"
         assert payload["trading_instance_id"] == [index.TRADING_INSTANCE_ID]
+
+    def test_start_execution_input_identical_when_box_was_stopped(self):
+        # config-I6690: the ONLY difference in the box-stopped case is the
+        # triggered_by tag — CaptureSnapshot has comfortable timing margin
+        # on a freshly-booted box (see module docstring evidence), so the
+        # SF input is otherwise identical to the box-was-running dispatch.
+        sf = _sf(None)
+        index._start_eod("2026-06-25", "backstop-box-stopped", sf)
+        import json
+        payload = json.loads(sf.start_execution.call_args.kwargs["input"])
+        assert payload["triggered_by"] == "backstop-box-stopped"
+        assert payload["pipeline_role"] == "eod"
+        assert payload["run_date"] == "2026-06-25"
+        assert payload["trading_instance_id"] == [index.TRADING_INSTANCE_ID]
+        assert payload["ec2_instance_id"] == [index.DASHBOARD_INSTANCE_ID]
+        assert payload["sns_topic_arn"] == index.SNS_TOPIC_ARN
 
 
 # ── Fail-loud ─────────────────────────────────────────────────────────────────
