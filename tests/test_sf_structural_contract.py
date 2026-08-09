@@ -123,6 +123,7 @@ _TIMEOUT_EXEMPT: dict[str, dict[str, str]] = {
         "NotifyHolidaySkip": "sns:publish terminal skip notifier — SDK call, not a wait",
         "StartExecutorEC2": "ec2:startInstances — SDK call, not a wait",
         "WriteCompletionMarker": "s3:putObject completion marker — SDK call, not a wait (config#2857)",
+        "WriteCompletionMarkerDegraded": "s3:putObject completion marker (DEGRADED twin, config#6692) — SDK call, not a wait",
         "HandleFailure": "sns:publish failure notifier — SDK call, not a wait",
         "PollMorningEnrichSpot": "ssm:getCommandInvocation single poll — bounded by the spot dispatch Lambda's own budget",
         "PollMorningArcticAppendSpot": "ssm:getCommandInvocation single poll — bounded by the spot dispatch Lambda's own budget",
@@ -164,6 +165,7 @@ _CATCH_EXEMPT: dict[str, dict[str, str]] = {
         "TradingDayGateFailed": "deliberate fail-open notify+proceed (own Comment); a Catch here would need its own Catch",
         "NotifyHolidaySkip": "terminal skip notifier (End: true) — nothing downstream to route a Catch to",
         "WriteCompletionMarker": "config#2857/config#1724: deliberately UNCAUGHT — a marker write failure must propagate, not be masked",
+        "WriteCompletionMarkerDegraded": "config#2857/config#1724 (DEGRADED twin, config#6692): deliberately UNCAUGHT — a marker write failure must propagate, not be masked",
         "HandleFailure": "terminal failure notifier — routes to FailExecution; the shared failure sink itself, not something to re-catch into",
     },
     "step_function_eod.json": {
