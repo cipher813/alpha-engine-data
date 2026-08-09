@@ -538,7 +538,7 @@
     },
     "ApplyShellRunDefaults": {
       "Type": "Pass",
-      "Comment": "shell_run=true ONLY (keystone + skip-exception rewire \u2014 every substantive workload now boots + runs DRY; ZERO skip-exceptions remain). Merges the dry-path control blob OVER the current state (States.JsonMerge($, shellDefaults, false) \u2014 second arg wins, so shellDefaults wins over $) so shell_run=true ACTUALLY enforces dry mode for every keystone control var. The prior arg order (States.JsonMerge(shellDefaults, $, false)) silently fell back to non-dry because InitializeInput unconditionally seeds preflight_args=\"\" + research_dry=false + data_phase2_dry=false + regime_action=\"produce\" into $ \u2014 so $ wins meant the seeded non-dry identities won over the dry shellDefaults, and the 2026-05-22 Friday-PM shell-run dry-pass (first execution past the prior trap break) ran full-fat instead of --preflight-only. Skip flags are unaffected (they're not in shellDefaults; the #258 Choice-gated skip_* mechanism handles {\"shell_run\": true, \"skip_backtester\": true} downstream regardless of merge order). The previously-documented user-override-from-input case ({\"shell_run\": true, \"preflight_args\": \"\"} runs spots full-fat) is now intentionally LOST: in practice nobody passes both flags together \u2014 passing shell_run=true means you want dry mode for ALL keystone control vars; the comment line saying otherwise was a footgun masking the actual semantic intent. SPOT states (MorningEnrich, DataPhase1, RAGIngestion, PredictorTraining, Backtester, Parity, Evaluator) boot + run dry via preflight_args=\" --preflight-only\" (LEADING space inside the var; the spot states' final command is a States.Format whose {} is placed immediately after the mode token with NO literal space, so preflight_args=\"\" on the real run yields a byte-identical command \u2014 data #259 + #261 + predictor #175 + backtester #224 all expose --preflight-only verbatim, an orthogonal MODIFIER). LAMBDA states with a verified clean no-write dry path are routed dry, NOT skipped, via $.research_dry (the canonical shell-run LLM-dry signal, true here / false on the real run): the EvalJudge chain (EvalJudgeSubmit{FirstSaturday,Weekly}/Poll/Process \u2014 dry_run_llm via research #202) + RationaleClustering (research #202) + ReplayConcordance + Counterfactual (backtester #225) all take dry_run_llm.$=$.research_dry; DataPhase2 (dry_run=true \u2014 alternative.collect returns ok_dry_run BEFORE any fetch/S3 write), RegimeSubstrate + RegimeRetrospectiveEval (action=dry_run \u2014 produce_*(write=False) returns payload before any put_object). alpha-engine-config-I2515 Phase B removed the multi-agent Research state entirely (it was also routed dry via this same $.research_dry signal); its replacements SignalsEnvelope/ChallengerShadow run for-real on the Friday preflight (they are cheap/idempotent and date-keyed on $.run_date, which differs Friday-vs-Saturday, so the dated artifact does not collide with the real Saturday one) \u2014 ChallengerShadow still carries no dry signal (mirroring ThinkTankCoverage). SignalsEnvelope, however, threads preflight.$=$.research_dry (config-I2916): NOT a full dry short-circuit (that is dry_run_llm/is_dry) but a distinct signal that keeps its read/build/write path LIVE for transport smoke and only downgrades its I2880 universe-board fallback-staleness guard to a WARN \u2014 because the dry Scanner leaves this cycle's dated board intentionally absent every Friday, so the ~5-trading-day-stale prior-Saturday latest.json fallback is EXPECTED on the preflight, not a real scanner miss. On the real Saturday run research_dry=false so the guard is fully in force. The skip-exception rewire flipped the prior 5 skip\u2192dry via the commands.$/States.Format($.preflight_args) Option-C mechanism (config#902 later collapsed the standalone DriftDetection spot state \u2014 drift is now bundled onto the PredictorTraining spot, so its Friday --preflight-only dry path folds into spot_train.sh --preflight-only rather than a separate drift state); the eval-judge / rationale-clustering / replay-concordance / counterfactual Lambdas now route dry via dry_run_llm.$=$.research_dry instead of being hard-skipped. ZERO skip-exceptions are force-set here. The #258 Choice-gated skip_* gates are LEFT INTACT and remain valid for targeted operator skips. The two health-check states have NO skip gate by design and run under shell_run (the bootstrap smoke) \u2014 their non-blocking Catch absorbs a stale-data sys.exit(1) so a missing-Friday-bar produces only a clearly-Friday-timestamped alert email, NOT a SF-fatal failure (ROADMAP owed-work item 5: a --shell-run-aware staleness tolerance in alpha-engine-dashboard/health_checker.py is a scoped cross-repo follow-on; not a SF-fatal spurious-fail, so deliberately out of this single-file SF PR).",
+      "Comment": "shell_run=true ONLY (keystone + skip-exception rewire \u2014 every substantive workload now boots + runs DRY; ZERO skip-exceptions remain). Merges the dry-path control blob OVER the current state (States.JsonMerge($, shellDefaults, false) \u2014 second arg wins, so shellDefaults wins over $) so shell_run=true ACTUALLY enforces dry mode for every keystone control var. The prior arg order (States.JsonMerge(shellDefaults, $, false)) silently fell back to non-dry because InitializeInput unconditionally seeds preflight_args=\"\" + research_dry=false + data_phase2_dry=false + regime_action=\"produce\" into $ \u2014 so $ wins meant the seeded non-dry identities won over the dry shellDefaults, and the 2026-05-22 Friday-PM shell-run dry-pass (first execution past the prior trap break) ran full-fat instead of --preflight-only. Skip flags are unaffected (they're not in shellDefaults; the #258 Choice-gated skip_* mechanism handles {\"shell_run\": true, \"skip_backtester\": true} downstream regardless of merge order). The previously-documented user-override-from-input case ({\"shell_run\": true, \"preflight_args\": \"\"} runs spots full-fat) is now intentionally LOST: in practice nobody passes both flags together \u2014 passing shell_run=true means you want dry mode for ALL keystone control vars; the comment line saying otherwise was a footgun masking the actual semantic intent. SPOT states (MorningEnrich, DataPhase1, RAGIngestion, PredictorTraining, Backtester, the ParityParallel branches (PitParityLookahead/PitParityWalkforward/ParityReplay), PitParityCompare, Evaluator) boot + run dry via preflight_args=\" --preflight-only\" (LEADING space inside the var; the spot states' final command is a States.Format whose {} is placed immediately after the mode token with NO literal space, so preflight_args=\"\" on the real run yields a byte-identical command \u2014 data #259 + #261 + predictor #175 + backtester #224 all expose --preflight-only verbatim, an orthogonal MODIFIER). LAMBDA states with a verified clean no-write dry path are routed dry, NOT skipped, via $.research_dry (the canonical shell-run LLM-dry signal, true here / false on the real run): the EvalJudge chain (EvalJudgeSubmit{FirstSaturday,Weekly}/Poll/Process \u2014 dry_run_llm via research #202) + RationaleClustering (research #202) + ReplayConcordance + Counterfactual (backtester #225) all take dry_run_llm.$=$.research_dry; DataPhase2 (dry_run=true \u2014 alternative.collect returns ok_dry_run BEFORE any fetch/S3 write), RegimeSubstrate + RegimeRetrospectiveEval (action=dry_run \u2014 produce_*(write=False) returns payload before any put_object). alpha-engine-config-I2515 Phase B removed the multi-agent Research state entirely (it was also routed dry via this same $.research_dry signal); its replacements SignalsEnvelope/ChallengerShadow run for-real on the Friday preflight (they are cheap/idempotent and date-keyed on $.run_date, which differs Friday-vs-Saturday, so the dated artifact does not collide with the real Saturday one) \u2014 ChallengerShadow still carries no dry signal (mirroring ThinkTankCoverage). SignalsEnvelope, however, threads preflight.$=$.research_dry (config-I2916): NOT a full dry short-circuit (that is dry_run_llm/is_dry) but a distinct signal that keeps its read/build/write path LIVE for transport smoke and only downgrades its I2880 universe-board fallback-staleness guard to a WARN \u2014 because the dry Scanner leaves this cycle's dated board intentionally absent every Friday, so the ~5-trading-day-stale prior-Saturday latest.json fallback is EXPECTED on the preflight, not a real scanner miss. On the real Saturday run research_dry=false so the guard is fully in force. The skip-exception rewire flipped the prior 5 skip\u2192dry via the commands.$/States.Format($.preflight_args) Option-C mechanism (config#902 later collapsed the standalone DriftDetection spot state \u2014 drift is now bundled onto the PredictorTraining spot, so its Friday --preflight-only dry path folds into spot_train.sh --preflight-only rather than a separate drift state); the eval-judge / rationale-clustering / replay-concordance / counterfactual Lambdas now route dry via dry_run_llm.$=$.research_dry instead of being hard-skipped. ZERO skip-exceptions are force-set here. The #258 Choice-gated skip_* gates are LEFT INTACT and remain valid for targeted operator skips. The two health-check states have NO skip gate by design and run under shell_run (the bootstrap smoke) \u2014 their non-blocking Catch absorbs a stale-data sys.exit(1) so a missing-Friday-bar produces only a clearly-Friday-timestamped alert email, NOT a SF-fatal failure (ROADMAP owed-work item 5: a --shell-run-aware staleness tolerance in alpha-engine-dashboard/health_checker.py is a scoped cross-repo follow-on; not a SF-fatal spurious-fail, so deliberately out of this single-file SF PR).",
       "Parameters": {
         "merged.$": "States.JsonMerge($,States.StringToJson('{\"preflight_args\":\" --preflight-only\",\"research_dry\":true,\"data_phase2_dry\":true,\"regime_action\":\"dry_run\",\"pipeline_label\":\" Preflight\"}'),false)"
       },
@@ -3980,7 +3980,7 @@
     },
     "CheckSkipParity": {
       "Type": "Choice",
-      "Comment": "Skip-gate. {\"skip_parity\": true} bypasses ONLY the Parity state (backtester\u2194executor parity check) and routes to CheckSkipEvaluator \u2014 the completed backtest artifacts stay intact and Evaluator still runs against them. Missing flag = run as normal. Parity was split out of the old combined Backtester state by the preflight-task-split (2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md): backtest (~121 min) and parity are independent preflight-bearing actions, so a parity failure must never re-run the 121-min backtest. To skip the whole backtest+parity pair, use {\"skip_backtester\": true} on CheckSkipBacktester instead. Mirrors the skip_backtester / skip_evaluator shape.",
+      "Comment": "Family skip-gate (alpha-engine-config#6030). {\"skip_parity\": true} bypasses the WHOLE parity family \u2014 the ParityParallel (PitParityLookahead / PitParityWalkforward / ParityReplay) AND the PitParityCompare join \u2014 routing to CheckSkipEvaluator; completed backtest artifacts stay intact and Evaluator still runs. Missing flag = run as normal. Retains the pre-split whole-stage semantics (preset mode=backtest-eval seeds it; operator muscle memory). Fine-grained per-branch skips: skip_pit_parity_lookahead / skip_pit_parity_walkforward / skip_parity_replay (inside the branches) and skip_pit_parity_compare \u2014 emitted mechanically by scripts/weekly_sf_rerun.py so a single failed branch reruns ALONE (the alpha-engine-config#6030 closes-when). To skip the whole backtest+parity pair, use {\"skip_backtester\": true} on CheckSkipBacktester instead.",
       "Choices": [
         {
           "And": [
@@ -3996,24 +3996,745 @@
           "Next": "CheckSkipEvaluator"
         }
       ],
-      "Default": "Parity"
+      "Default": "ParityParallel"
     },
-    "Parity": {
+    "ParityParallel": {
+      "Type": "Parallel",
+      "Comment": "alpha-engine-config#6030 (Brian ruling 2026-08-01; sf-pipeline-policy \u00a72.1 atomic): the old Parity state bundled THREE logical stages (pit_parity lookahead pass ~13 min, pit_parity walkforward pass ~10 min, parity replay ~2.5 min) behind one spot_parity.sh invocation with internal skip flags \u2014 the prohibited pattern verbatim. None consumes another's output, yet all three died together (2026-08-01: SIGKILLed at the 2h bound with zero partial artifacts). Now each is an independent branch: its own spot instance, script, timeout, failure route and skip flag \u2014 one branch's failure never aborts its siblings (every branch converges on its own *Degraded terminal; the Parallel's Catch below is ONLY the backstop for a genuine SF-engine error, mirroring ResearchPredictorParallel's). The join (PitParityCompare) runs after ALL branches settle and emits the verdict \u2014 UNKNOWN when a pass artifact is missing (\u00a72.3a). The memory constraint that shaped the old design (two ~3 GB passes on one box, I6026) disappears: each pass gets its own instance.",
+      "Branches": [
+        {
+          "StartAt": "CheckSkipPitParityLookahead",
+          "States": {
+            "CheckSkipPitParityLookahead": {
+              "Type": "Choice",
+              "Comment": "Per-branch skip-gate (alpha-engine-config#6030). {\"skip_pit_parity_lookahead\": true} bypasses ONLY this branch \u2014 the sibling parity branches and the PitParityCompare join still run (the compare emits verdict UNKNOWN when a pass artifact is consequently absent, \u00a72.3a). Set mechanically by scripts/weekly_sf_rerun.py when this branch completed in a failed run. To skip the WHOLE parity family use {\"skip_parity\": true} on CheckSkipParity.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_pit_parity_lookahead",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_pit_parity_lookahead",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "PitParityLookaheadSkipped"
+                }
+              ],
+              "Default": "PitParityLookahead"
+            },
+            "PitParityLookahead": {
+              "Type": "Task",
+              "Comment": "pit_parity LOOKAHEAD predictor pass (legacy single-pass comparator) \u2014 publishes parity/{run_date}/pit_stats_lookahead.json (contracts/pit_stats_pass.schema.json in crucible-backtester) on its OWN spot instance via crucible-backtester infrastructure/spot_pit_lookahead.sh (alpha-engine-config#6030: the bundled Parity state violated sf-pipeline-policy \u00a72.1 \u2014 three logical stages behind one launcher died together; each is now its own SF branch with its own script, timeout and failure route). Healthy runtime ~12.5-13 min + ~15 min spot boot/deps measured (infrastructure/sf_budgets.py calibration block); executionTimeout 5400s per the budget table, state TimeoutSeconds 5460s. Branch-level FAIL-OPEN: every failure path converges on PitParityLookaheadDegraded inside this branch, so a failure here NEVER aborts the sibling branches (SF Parallel kills siblings on an uncaught branch failure \u2014 the \u00a74 blast-radius rule this Catch exists for). shell_run dry path: preflight_args threads ' --preflight-only' exactly like the sibling spot states.",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+              "Parameters": {
+                "DocumentName": "AWS-RunShellScript",
+                "InstanceIds.$": "$.ec2_instance_id",
+                "Parameters": {
+                  "executionTimeout": [
+                    "5400"
+                  ],
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug pit-lookahead --log /var/log/pit-lookahead.log -- bash infrastructure/spot_pit_lookahead.sh{}',$$.Execution.Name,$.preflight_args))"
+                },
+                "TimeoutSeconds": 5400
+              },
+              "TimeoutSeconds": 5460,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed",
+                    "States.Timeout"
+                  ],
+                  "Comment": "config#2279: declared spot-stage sendCommand convention \u2014 the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) \u2014 BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+                  "MaxAttempts": 4,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                },
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "config#2279: catch-all transient tier \u2014 same idempotency argument as the tier above.",
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "PitParityLookaheadDegraded",
+                  "ResultPath": "$.pit_parity_lookahead_error"
+                }
+              ],
+              "ResultPath": "$.pit_parity_lookahead_result",
+              "Next": "InitPitParityLookaheadPollCount"
+            },
+            "InitPitParityLookaheadPollCount": {
+              "Type": "Pass",
+              "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687 \u2014 this quartet ships bounded rather than adding another unbounded, instance-liveness-blind poll loop). Bound derived: executionTimeout (5400s) / the 30s poll interval = 180 polls, +20% slack = 216.",
+              "Result": 0,
+              "ResultPath": "$.pit_parity_lookahead_polls",
+              "Next": "WaitForPitParityLookahead"
+            },
+            "WaitForPitParityLookahead": {
+              "Type": "Task",
+              "Comment": "Poll the PitParityLookahead SSM command until it reaches a terminal status. Poll/send infra failure degrades (PitParityLookaheadDegraded) rather than failing the SF \u2014 branch-level fail-open (alpha-engine-config#6030, sf-pipeline-policy \u00a74 blast radius).",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+              "Parameters": {
+                "CommandId.$": "$.pit_parity_lookahead_result.Command.CommandId",
+                "InstanceId.$": "$.ec2_instance_id[0]"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Ssm.InvocationDoesNotExistException",
+                    "Ssm.InvocationDoesNotExist"
+                  ],
+                  "Comment": "sendCommand returns as soon as the command is accepted, so the invocation record can lag the returned CommandId by a beat.",
+                  "MaxAttempts": 10,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 1.5
+                },
+                {
+                  "ErrorEquals": [
+                    "Ssm.SdkClientException",
+                    "States.Timeout"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 5,
+                  "BackoffRate": 1.5
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "PitParityLookaheadDegraded",
+                  "ResultPath": "$.pit_parity_lookahead_error"
+                }
+              ],
+              "ResultSelector": {
+                "Status.$": "$.Status",
+                "ResponseCode.$": "$.ResponseCode",
+                "StatusDetails.$": "$.StatusDetails",
+                "StandardErrorContent.$": "$.StandardErrorContent"
+              },
+              "ResultPath": "$.pit_parity_lookahead_poll",
+              "Next": "CheckPitParityLookaheadStatus"
+            },
+            "CheckPitParityLookaheadStatus": {
+              "Type": "Choice",
+              "Comment": "Budget exhaustion falls through to the Default arm, i.e. it is treated as a FAILED poll rather than a silent success \u2014 a bound whose exhaustion converges on the happy path is not a bound (I5687). Terminal non-Success degrades fail-open (alpha-engine-config#6030) \u2014 it never fails the SF and never aborts sibling branches.",
+              "Choices": [
+                {
+                  "Variable": "$.pit_parity_lookahead_poll.Status",
+                  "StringEquals": "Success",
+                  "Next": "PitParityLookaheadComplete"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.pit_parity_lookahead_polls",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.pit_parity_lookahead_poll.Status",
+                          "StringEquals": "InProgress"
+                        },
+                        {
+                          "Variable": "$.pit_parity_lookahead_poll.Status",
+                          "StringEquals": "Pending"
+                        }
+                      ]
+                    },
+                    {
+                      "Variable": "$.pit_parity_lookahead_polls",
+                      "NumericLessThan": 216
+                    }
+                  ],
+                  "Next": "PitParityLookaheadWait"
+                }
+              ],
+              "Default": "PitParityLookaheadDegraded"
+            },
+            "PitParityLookaheadWait": {
+              "Type": "Pass",
+              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound (I5687).",
+              "Parameters": {
+                "polls.$": "States.MathAdd($.pit_parity_lookahead_polls, 1)"
+              },
+              "ResultPath": "$.pit_parity_lookahead_poll_count",
+              "Next": "PitParityLookaheadPollWait"
+            },
+            "PitParityLookaheadPollWait": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "MergePitParityLookaheadPollCount"
+            },
+            "MergePitParityLookaheadPollCount": {
+              "Type": "Pass",
+              "InputPath": "$.pit_parity_lookahead_poll_count.polls",
+              "ResultPath": "$.pit_parity_lookahead_polls",
+              "Next": "WaitForPitParityLookahead"
+            },
+            "PitParityLookaheadComplete": {
+              "Type": "Pass",
+              "Comment": "Branch success terminal \u2014 the witness state scripts/weekly_sf_rerun.py keys on ('entered => completed'). Writes the branch status under $.branch_pit_lookahead for AggregateParityBranchOutcomes.",
+              "Parameters": {
+                "status": "OK"
+              },
+              "ResultPath": "$.branch_pit_lookahead",
+              "End": true
+            },
+            "PitParityLookaheadSkipped": {
+              "Type": "Pass",
+              "Comment": "Branch skip terminal ({\"skip_pit_parity_lookahead\": true}) \u2014 recorded distinctly from OK/DEGRADED so the aggregate and the rerun helper can tell 'ran clean' from 'operator skipped'.",
+              "Parameters": {
+                "status": "SKIPPED"
+              },
+              "ResultPath": "$.branch_pit_lookahead",
+              "End": true
+            },
+            "PitParityLookaheadDegraded": {
+              "Type": "Pass",
+              "Comment": "THE BRANCH-LEVEL FAIL-OPEN MARKER (alpha-engine-config#6030). Every non-success path of this branch converges here \u2014 send/poll Catch, terminal non-Success command status, poll-budget exhaustion \u2014 and the branch ENDS SUCCESS with status DEGRADED so the SF Parallel never kills the sibling branches (\u00a74 blast radius; mirrors ThinkTankDegraded's fail-open shape). The degradation is NOT silent: CheckParityBranchOutcomes folds any DEGRADED branch into the existing $.parity_degraded flag family (ParityDegraded \u2192 PublishParityDegraded pages immediately; CheckGateDegradedNotify carries it to the terminal notification per \u00a72.3), and the PitParityCompare join emits the parity verdict as UNKNOWN when this branch's artifact is consequently absent (\u00a72.3a \u2014 absence of a verdict is never a pass). Specifics on the execution record: $.pit_parity_lookahead_poll / $.pit_parity_lookahead_error.",
+              "Parameters": {
+                "status": "DEGRADED"
+              },
+              "ResultPath": "$.branch_pit_lookahead",
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "CheckSkipPitParityWalkforward",
+          "States": {
+            "CheckSkipPitParityWalkforward": {
+              "Type": "Choice",
+              "Comment": "Per-branch skip-gate (alpha-engine-config#6030). {\"skip_pit_parity_walkforward\": true} bypasses ONLY this branch \u2014 the sibling parity branches and the PitParityCompare join still run (the compare emits verdict UNKNOWN when a pass artifact is consequently absent, \u00a72.3a). Set mechanically by scripts/weekly_sf_rerun.py when this branch completed in a failed run. To skip the WHOLE parity family use {\"skip_parity\": true} on CheckSkipParity.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_pit_parity_walkforward",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_pit_parity_walkforward",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "PitParityWalkforwardSkipped"
+                }
+              ],
+              "Default": "PitParityWalkforward"
+            },
+            "PitParityWalkforward": {
+              "Type": "Task",
+              "Comment": "pit_parity WALKFORWARD (point-in-time) predictor pass \u2014 publishes parity/{run_date}/pit_stats_walkforward.json (contracts/pit_stats_pass.schema.json in crucible-backtester) on its OWN spot instance via crucible-backtester infrastructure/spot_pit_walkforward.sh (alpha-engine-config#6030: the bundled Parity state violated sf-pipeline-policy \u00a72.1 \u2014 three logical stages behind one launcher died together; each is now its own SF branch with its own script, timeout and failure route). Healthy runtime ~10 min + ~15 min spot boot/deps measured (infrastructure/sf_budgets.py calibration block); executionTimeout 5400s per the budget table, state TimeoutSeconds 5460s. Branch-level FAIL-OPEN: every failure path converges on PitParityWalkforwardDegraded inside this branch, so a failure here NEVER aborts the sibling branches (SF Parallel kills siblings on an uncaught branch failure \u2014 the \u00a74 blast-radius rule this Catch exists for). shell_run dry path: preflight_args threads ' --preflight-only' exactly like the sibling spot states.",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+              "Parameters": {
+                "DocumentName": "AWS-RunShellScript",
+                "InstanceIds.$": "$.ec2_instance_id",
+                "Parameters": {
+                  "executionTimeout": [
+                    "5400"
+                  ],
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug pit-walkforward --log /var/log/pit-walkforward.log -- bash infrastructure/spot_pit_walkforward.sh{}',$$.Execution.Name,$.preflight_args))"
+                },
+                "TimeoutSeconds": 5400
+              },
+              "TimeoutSeconds": 5460,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed",
+                    "States.Timeout"
+                  ],
+                  "Comment": "config#2279: declared spot-stage sendCommand convention \u2014 the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) \u2014 BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+                  "MaxAttempts": 4,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                },
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "config#2279: catch-all transient tier \u2014 same idempotency argument as the tier above.",
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "PitParityWalkforwardDegraded",
+                  "ResultPath": "$.pit_parity_walkforward_error"
+                }
+              ],
+              "ResultPath": "$.pit_parity_walkforward_result",
+              "Next": "InitPitParityWalkforwardPollCount"
+            },
+            "InitPitParityWalkforwardPollCount": {
+              "Type": "Pass",
+              "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687 \u2014 this quartet ships bounded rather than adding another unbounded, instance-liveness-blind poll loop). Bound derived: executionTimeout (5400s) / the 30s poll interval = 180 polls, +20% slack = 216.",
+              "Result": 0,
+              "ResultPath": "$.pit_parity_walkforward_polls",
+              "Next": "WaitForPitParityWalkforward"
+            },
+            "WaitForPitParityWalkforward": {
+              "Type": "Task",
+              "Comment": "Poll the PitParityWalkforward SSM command until it reaches a terminal status. Poll/send infra failure degrades (PitParityWalkforwardDegraded) rather than failing the SF \u2014 branch-level fail-open (alpha-engine-config#6030, sf-pipeline-policy \u00a74 blast radius).",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+              "Parameters": {
+                "CommandId.$": "$.pit_parity_walkforward_result.Command.CommandId",
+                "InstanceId.$": "$.ec2_instance_id[0]"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Ssm.InvocationDoesNotExistException",
+                    "Ssm.InvocationDoesNotExist"
+                  ],
+                  "Comment": "sendCommand returns as soon as the command is accepted, so the invocation record can lag the returned CommandId by a beat.",
+                  "MaxAttempts": 10,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 1.5
+                },
+                {
+                  "ErrorEquals": [
+                    "Ssm.SdkClientException",
+                    "States.Timeout"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 5,
+                  "BackoffRate": 1.5
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "PitParityWalkforwardDegraded",
+                  "ResultPath": "$.pit_parity_walkforward_error"
+                }
+              ],
+              "ResultSelector": {
+                "Status.$": "$.Status",
+                "ResponseCode.$": "$.ResponseCode",
+                "StatusDetails.$": "$.StatusDetails",
+                "StandardErrorContent.$": "$.StandardErrorContent"
+              },
+              "ResultPath": "$.pit_parity_walkforward_poll",
+              "Next": "CheckPitParityWalkforwardStatus"
+            },
+            "CheckPitParityWalkforwardStatus": {
+              "Type": "Choice",
+              "Comment": "Budget exhaustion falls through to the Default arm, i.e. it is treated as a FAILED poll rather than a silent success \u2014 a bound whose exhaustion converges on the happy path is not a bound (I5687). Terminal non-Success degrades fail-open (alpha-engine-config#6030) \u2014 it never fails the SF and never aborts sibling branches.",
+              "Choices": [
+                {
+                  "Variable": "$.pit_parity_walkforward_poll.Status",
+                  "StringEquals": "Success",
+                  "Next": "PitParityWalkforwardComplete"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.pit_parity_walkforward_polls",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.pit_parity_walkforward_poll.Status",
+                          "StringEquals": "InProgress"
+                        },
+                        {
+                          "Variable": "$.pit_parity_walkforward_poll.Status",
+                          "StringEquals": "Pending"
+                        }
+                      ]
+                    },
+                    {
+                      "Variable": "$.pit_parity_walkforward_polls",
+                      "NumericLessThan": 216
+                    }
+                  ],
+                  "Next": "PitParityWalkforwardWait"
+                }
+              ],
+              "Default": "PitParityWalkforwardDegraded"
+            },
+            "PitParityWalkforwardWait": {
+              "Type": "Pass",
+              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound (I5687).",
+              "Parameters": {
+                "polls.$": "States.MathAdd($.pit_parity_walkforward_polls, 1)"
+              },
+              "ResultPath": "$.pit_parity_walkforward_poll_count",
+              "Next": "PitParityWalkforwardPollWait"
+            },
+            "PitParityWalkforwardPollWait": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "MergePitParityWalkforwardPollCount"
+            },
+            "MergePitParityWalkforwardPollCount": {
+              "Type": "Pass",
+              "InputPath": "$.pit_parity_walkforward_poll_count.polls",
+              "ResultPath": "$.pit_parity_walkforward_polls",
+              "Next": "WaitForPitParityWalkforward"
+            },
+            "PitParityWalkforwardComplete": {
+              "Type": "Pass",
+              "Comment": "Branch success terminal \u2014 the witness state scripts/weekly_sf_rerun.py keys on ('entered => completed'). Writes the branch status under $.branch_pit_walkforward for AggregateParityBranchOutcomes.",
+              "Parameters": {
+                "status": "OK"
+              },
+              "ResultPath": "$.branch_pit_walkforward",
+              "End": true
+            },
+            "PitParityWalkforwardSkipped": {
+              "Type": "Pass",
+              "Comment": "Branch skip terminal ({\"skip_pit_parity_walkforward\": true}) \u2014 recorded distinctly from OK/DEGRADED so the aggregate and the rerun helper can tell 'ran clean' from 'operator skipped'.",
+              "Parameters": {
+                "status": "SKIPPED"
+              },
+              "ResultPath": "$.branch_pit_walkforward",
+              "End": true
+            },
+            "PitParityWalkforwardDegraded": {
+              "Type": "Pass",
+              "Comment": "THE BRANCH-LEVEL FAIL-OPEN MARKER (alpha-engine-config#6030). Every non-success path of this branch converges here \u2014 send/poll Catch, terminal non-Success command status, poll-budget exhaustion \u2014 and the branch ENDS SUCCESS with status DEGRADED so the SF Parallel never kills the sibling branches (\u00a74 blast radius; mirrors ThinkTankDegraded's fail-open shape). The degradation is NOT silent: CheckParityBranchOutcomes folds any DEGRADED branch into the existing $.parity_degraded flag family (ParityDegraded \u2192 PublishParityDegraded pages immediately; CheckGateDegradedNotify carries it to the terminal notification per \u00a72.3), and the PitParityCompare join emits the parity verdict as UNKNOWN when this branch's artifact is consequently absent (\u00a72.3a \u2014 absence of a verdict is never a pass). Specifics on the execution record: $.pit_parity_walkforward_poll / $.pit_parity_walkforward_error.",
+              "Parameters": {
+                "status": "DEGRADED"
+              },
+              "ResultPath": "$.branch_pit_walkforward",
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "CheckSkipParityReplay",
+          "States": {
+            "CheckSkipParityReplay": {
+              "Type": "Choice",
+              "Comment": "Per-branch skip-gate (alpha-engine-config#6030). {\"skip_parity_replay\": true} bypasses ONLY this branch \u2014 the sibling parity branches and the PitParityCompare join still run (the compare emits verdict UNKNOWN when a pass artifact is consequently absent, \u00a72.3a). Set mechanically by scripts/weekly_sf_rerun.py when this branch completed in a failed run. To skip the WHOLE parity family use {\"skip_parity\": true} on CheckSkipParity.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_parity_replay",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_parity_replay",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "ParityReplaySkipped"
+                }
+              ],
+              "Default": "ParityReplay"
+            },
+            "ParityReplay": {
+              "Type": "Task",
+              "Comment": "Backtester\u2194executor parity REPLAY (10-day-window integration test against live trades_latest.db) \u2014 writes backtest/{run_date}/parity_report.json + appends parity_metrics.csv; consumes NEITHER pit_parity pass's output on its OWN spot instance via crucible-backtester infrastructure/spot_parity_replay.sh (alpha-engine-config#6030: the bundled Parity state violated sf-pipeline-policy \u00a72.1 \u2014 three logical stages behind one launcher died together; each is now its own SF branch with its own script, timeout and failure route). Healthy runtime ~2.5 min + ~15 min spot boot/deps measured (infrastructure/sf_budgets.py calibration block); executionTimeout 2700s per the budget table, state TimeoutSeconds 2760s. Branch-level FAIL-OPEN: every failure path converges on ParityReplayDegraded inside this branch, so a failure here NEVER aborts the sibling branches (SF Parallel kills siblings on an uncaught branch failure \u2014 the \u00a74 blast-radius rule this Catch exists for). shell_run dry path: preflight_args threads ' --preflight-only' exactly like the sibling spot states.",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+              "Parameters": {
+                "DocumentName": "AWS-RunShellScript",
+                "InstanceIds.$": "$.ec2_instance_id",
+                "Parameters": {
+                  "executionTimeout": [
+                    "2700"
+                  ],
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug parity-replay --log /var/log/parity-replay.log -- bash infrastructure/spot_parity_replay.sh{}',$$.Execution.Name,$.preflight_args))"
+                },
+                "TimeoutSeconds": 2700
+              },
+              "TimeoutSeconds": 2760,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed",
+                    "States.Timeout"
+                  ],
+                  "Comment": "config#2279: declared spot-stage sendCommand convention \u2014 the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) \u2014 BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+                  "MaxAttempts": 4,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                },
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "config#2279: catch-all transient tier \u2014 same idempotency argument as the tier above.",
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "ParityReplayDegraded",
+                  "ResultPath": "$.parity_replay_error"
+                }
+              ],
+              "ResultPath": "$.parity_replay_result",
+              "Next": "InitParityReplayPollCount"
+            },
+            "InitParityReplayPollCount": {
+              "Type": "Pass",
+              "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687 \u2014 this quartet ships bounded rather than adding another unbounded, instance-liveness-blind poll loop). Bound derived: executionTimeout (2700s) / the 30s poll interval = 90 polls, +20% slack = 108.",
+              "Result": 0,
+              "ResultPath": "$.parity_replay_polls",
+              "Next": "WaitForParityReplay"
+            },
+            "WaitForParityReplay": {
+              "Type": "Task",
+              "Comment": "Poll the ParityReplay SSM command until it reaches a terminal status. Poll/send infra failure degrades (ParityReplayDegraded) rather than failing the SF \u2014 branch-level fail-open (alpha-engine-config#6030, sf-pipeline-policy \u00a74 blast radius).",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+              "Parameters": {
+                "CommandId.$": "$.parity_replay_result.Command.CommandId",
+                "InstanceId.$": "$.ec2_instance_id[0]"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Ssm.InvocationDoesNotExistException",
+                    "Ssm.InvocationDoesNotExist"
+                  ],
+                  "Comment": "sendCommand returns as soon as the command is accepted, so the invocation record can lag the returned CommandId by a beat.",
+                  "MaxAttempts": 10,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 1.5
+                },
+                {
+                  "ErrorEquals": [
+                    "Ssm.SdkClientException",
+                    "States.Timeout"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 5,
+                  "BackoffRate": 1.5
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "ParityReplayDegraded",
+                  "ResultPath": "$.parity_replay_error"
+                }
+              ],
+              "ResultSelector": {
+                "Status.$": "$.Status",
+                "ResponseCode.$": "$.ResponseCode",
+                "StatusDetails.$": "$.StatusDetails",
+                "StandardErrorContent.$": "$.StandardErrorContent"
+              },
+              "ResultPath": "$.parity_replay_poll",
+              "Next": "CheckParityReplayStatus"
+            },
+            "CheckParityReplayStatus": {
+              "Type": "Choice",
+              "Comment": "Budget exhaustion falls through to the Default arm, i.e. it is treated as a FAILED poll rather than a silent success \u2014 a bound whose exhaustion converges on the happy path is not a bound (I5687). Terminal non-Success degrades fail-open (alpha-engine-config#6030) \u2014 it never fails the SF and never aborts sibling branches.",
+              "Choices": [
+                {
+                  "Variable": "$.parity_replay_poll.Status",
+                  "StringEquals": "Success",
+                  "Next": "ParityReplayComplete"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.parity_replay_polls",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.parity_replay_poll.Status",
+                          "StringEquals": "InProgress"
+                        },
+                        {
+                          "Variable": "$.parity_replay_poll.Status",
+                          "StringEquals": "Pending"
+                        }
+                      ]
+                    },
+                    {
+                      "Variable": "$.parity_replay_polls",
+                      "NumericLessThan": 108
+                    }
+                  ],
+                  "Next": "ParityReplayWait"
+                }
+              ],
+              "Default": "ParityReplayDegraded"
+            },
+            "ParityReplayWait": {
+              "Type": "Pass",
+              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound (I5687).",
+              "Parameters": {
+                "polls.$": "States.MathAdd($.parity_replay_polls, 1)"
+              },
+              "ResultPath": "$.parity_replay_poll_count",
+              "Next": "ParityReplayPollWait"
+            },
+            "ParityReplayPollWait": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "MergeParityReplayPollCount"
+            },
+            "MergeParityReplayPollCount": {
+              "Type": "Pass",
+              "InputPath": "$.parity_replay_poll_count.polls",
+              "ResultPath": "$.parity_replay_polls",
+              "Next": "WaitForParityReplay"
+            },
+            "ParityReplayComplete": {
+              "Type": "Pass",
+              "Comment": "Branch success terminal \u2014 the witness state scripts/weekly_sf_rerun.py keys on ('entered => completed'). Writes the branch status under $.branch_parity_replay for AggregateParityBranchOutcomes.",
+              "Parameters": {
+                "status": "OK"
+              },
+              "ResultPath": "$.branch_parity_replay",
+              "End": true
+            },
+            "ParityReplaySkipped": {
+              "Type": "Pass",
+              "Comment": "Branch skip terminal ({\"skip_parity_replay\": true}) \u2014 recorded distinctly from OK/DEGRADED so the aggregate and the rerun helper can tell 'ran clean' from 'operator skipped'.",
+              "Parameters": {
+                "status": "SKIPPED"
+              },
+              "ResultPath": "$.branch_parity_replay",
+              "End": true
+            },
+            "ParityReplayDegraded": {
+              "Type": "Pass",
+              "Comment": "THE BRANCH-LEVEL FAIL-OPEN MARKER (alpha-engine-config#6030). Every non-success path of this branch converges here \u2014 send/poll Catch, terminal non-Success command status, poll-budget exhaustion \u2014 and the branch ENDS SUCCESS with status DEGRADED so the SF Parallel never kills the sibling branches (\u00a74 blast radius; mirrors ThinkTankDegraded's fail-open shape). The degradation is NOT silent: CheckParityBranchOutcomes folds any DEGRADED branch into the existing $.parity_degraded flag family (ParityDegraded \u2192 PublishParityDegraded pages immediately; CheckGateDegradedNotify carries it to the terminal notification per \u00a72.3), and the PitParityCompare join emits the parity verdict as UNKNOWN when this branch's artifact is consequently absent (\u00a72.3a \u2014 absence of a verdict is never a pass). Specifics on the execution record: $.parity_replay_poll / $.parity_replay_error.",
+              "Parameters": {
+                "status": "DEGRADED"
+              },
+              "ResultPath": "$.branch_parity_replay",
+              "End": true
+            }
+          }
+        }
+      ],
+      "ResultPath": "$.parity_parallel_result",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Backstop ONLY for a genuine SF-engine Parallel error (branches never throw \u2014 every branch failure path ends success with status DEGRADED). Degrades fail-open through the existing parity_degraded family rather than failing the run, matching the branch posture.",
+          "Next": "ParityDegraded",
+          "ResultPath": "$.parity_error"
+        }
+      ],
+      "Next": "AggregateParityBranchOutcomes"
+    },
+    "AggregateParityBranchOutcomes": {
+      "Type": "Pass",
+      "Comment": "Parallel join sync point (mirrors AggregateBranchOutcomes). $.parity_parallel_result is the 3-element array of each branch's final effective input (branch order matches the Branches array: [0]=PitParityLookahead, [1]=PitParityWalkforward, [2]=ParityReplay). Each branch terminal wrote its status (OK | DEGRADED | SKIPPED) under $.branch_pit_lookahead / $.branch_pit_walkforward / $.branch_parity_replay \u2014 hoist all three to a flat path for the Choice.",
+      "Parameters": {
+        "pit_lookahead_status.$": "$.parity_parallel_result[0].branch_pit_lookahead.status",
+        "pit_walkforward_status.$": "$.parity_parallel_result[1].branch_pit_walkforward.status",
+        "parity_replay_status.$": "$.parity_parallel_result[2].branch_parity_replay.status"
+      },
+      "ResultPath": "$.parity_branch_outcomes",
+      "Next": "CheckParityBranchOutcomes"
+    },
+    "CheckParityBranchOutcomes": {
+      "Type": "Choice",
+      "Comment": "Any DEGRADED branch folds into the existing $.parity_degraded flag family (ParityDegraded \u2192 PublishParityDegraded pages immediately; CheckGateDegradedNotify carries it to the terminal notification and the Option-A degraded completion, \u00a72.3) \u2014 then the run CONTINUES to the compare either way: \u00a72.3a requires the compare to run and emit verdict UNKNOWN when a pass artifact is absent, never to be skipped because a producer died. Per-branch specifics stay on $.parity_branch_outcomes.",
+      "Choices": [
+        {
+          "Or": [
+            {
+              "Variable": "$.parity_branch_outcomes.pit_lookahead_status",
+              "StringEquals": "DEGRADED"
+            },
+            {
+              "Variable": "$.parity_branch_outcomes.pit_walkforward_status",
+              "StringEquals": "DEGRADED"
+            },
+            {
+              "Variable": "$.parity_branch_outcomes.parity_replay_status",
+              "StringEquals": "DEGRADED"
+            }
+          ],
+          "Next": "ParityDegraded"
+        }
+      ],
+      "Default": "CheckSkipPitParityCompare"
+    },
+    "CheckSkipPitParityCompare": {
+      "Type": "Choice",
+      "Comment": "Skip-gate for the compare/join stage (alpha-engine-config#6030). {\"skip_pit_parity_compare\": true} bypasses ONLY PitParityCompare and routes to CheckSkipEvaluator \u2014 used by the mechanical rerun when the compare already completed for this run_date. To skip the whole parity family use {\"skip_parity\": true} on CheckSkipParity.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_pit_parity_compare",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_pit_parity_compare",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckSkipEvaluator"
+        }
+      ],
+      "Default": "PitParityCompare"
+    },
+    "PitParityCompare": {
       "Type": "Task",
-      "Comment": "Backtester\u2194executor parity check on spot instance, after the backtest stage. Split out of the old combined Backtester state by the preflight-task-split (2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md): backtest (~121 min, 10y simulate + param sweep) and parity are independent preflight-bearing actions, so a parity failure must never re-run the 121-min backtest. Post I4442/I4497 cutover, this state invokes its own spot_parity.sh (pre-cutover: spot_backtest.sh --skip-stages=backtest,evaluator) so this state runs ONLY the parity stage, reading the same backtest/{date}/ S3 prefix the Backtester state just wrote. ~7 min extra spot bootstrap vs the prior bundled design \u2014 accepted in exchange for never re-paying the 121-min backtest on a parity redrive. Timeout/heartbeat budget copied from the old combined Backtester state (not under-sized \u2014 same Retry/Catch/Timeout pattern). DEGRADE-NOT-FAIL (alpha-engine-config-I6025, Brian ruling 2026-08-01): parity's VERDICT is the future gate (parity_alarms, in OBSERVE), but its EXECUTION is observability \u2014 every downstream consumer of parity artifacts is display or best-effort (evaluate.py::_load_pit_parity_report explicitly excludes them from critical-artifact accounting). So a Parity timeout/crash degrades the run (ParityDegraded \u2192 PublishParityDegraded pages distinctly, SF continues to Evaluator) instead of failing the SF \u2014 the 2026-08-01 failure where a non-gating stage's 2h timeout killed a run that had already cleared Backtester/PredictorBacktest/PortfolioOptimizerBacktest. Absence of a verdict must never read as a clean pass: the page + the completion record carry $.parity_degraded, and ARTIFACT_REGISTRY freshness-monitor SLA still alarms on missing parity artifacts. Per-stage executionTimeout derived via infrastructure/sf_budgets.py (config#3095). alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script \u2014 the monolith is retained unchanged as the rollback path.",
+      "Comment": "PitParityCompare \u2014 the JOIN of the split pit_parity passes (alpha-engine-config#6030), on its own spot quartet via crucible-backtester infrastructure/spot_parity_compare.sh (uniform architecture \u2014 no new Lambda). Reads parity/{run_date}/pit_stats_{lookahead,walkforward}.json, computes delta_pit_minus_current (\u0394Sortino/\u0394PSR/\u0394CVaR/\u0394max-DD/PBO) + materiality + analysis/parity_alarms.py, and writes backtest/{run_date}/pit_parity.json where today's consumers (evaluate.py Report Card pipeline_health, the freshness monitor) already read it. \u00a72.3a JOIN SEMANTICS: this state runs even when a branch degraded \u2014 a missing/unparseable/non-ok pass artifact makes the compare emit the parity verdict as UNKNOWN (status:'unknown'), never a pass, and the compare stage itself still SUCCEEDS (withholding the guarantee is not the same as failing the pipeline). Its OWN failure (SSM timeout/crash/poll exhaustion) degrades fail-open via ParityCompareDegraded \u2192 $.parity_degraded. The compare's compute is seconds; the spot boot/deps (~15 min) dominates \u2014 executionTimeout 2700s per infrastructure/sf_budgets.py.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
           "executionTimeout": [
-            "7200"
+            "2700"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug parity --log /var/log/parity.log -- bash infrastructure/spot_parity.sh{}',$$.Execution.Name,$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug parity-compare --log /var/log/parity-compare.log -- bash infrastructure/spot_parity_compare.sh{}',$$.Execution.Name,$.preflight_args))"
         },
-        "TimeoutSeconds": 7200
+        "TimeoutSeconds": 2700
       },
-      "TimeoutSeconds": 7260,
+      "TimeoutSeconds": 2760,
       "Retry": [
         {
           "ErrorEquals": [
@@ -4044,19 +4765,26 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "ParityDegraded",
-          "ResultPath": "$.parity_error"
+          "Next": "ParityCompareDegraded",
+          "ResultPath": "$.pit_parity_compare_error"
         }
       ],
-      "ResultPath": "$.parity_result",
-      "Next": "InitParityPollCount"
+      "ResultPath": "$.pit_parity_compare_result",
+      "Next": "InitPitParityComparePollCount"
     },
-    "WaitForParity": {
+    "InitPitParityComparePollCount": {
+      "Type": "Pass",
+      "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687 \u2014 this quartet ships bounded rather than adding another unbounded, instance-liveness-blind poll loop). Bound derived: executionTimeout (2700s) / the 30s poll interval = 90 polls, +20% slack = 108.",
+      "Result": 0,
+      "ResultPath": "$.pit_parity_compare_polls",
+      "Next": "WaitForPitParityCompare"
+    },
+    "WaitForPitParityCompare": {
       "Type": "Task",
-      "Comment": "Poll SSM command until parity complete. Poll/send infra failure degrades (ParityDegraded) rather than failing the SF \u2014 same degrade-not-fail posture as the Parity state itself (alpha-engine-config-I6025).",
+      "Comment": "Poll the PitParityCompare SSM command until it reaches a terminal status. Poll/send infra failure degrades (ParityCompareDegraded) rather than failing the SF \u2014 branch-level fail-open (alpha-engine-config#6030, sf-pipeline-policy \u00a74 blast radius).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
       "Parameters": {
-        "CommandId.$": "$.parity_result.Command.CommandId",
+        "CommandId.$": "$.pit_parity_compare_result.Command.CommandId",
         "InstanceId.$": "$.ec2_instance_id[0]"
       },
       "Retry": [
@@ -4065,6 +4793,7 @@
             "Ssm.InvocationDoesNotExistException",
             "Ssm.InvocationDoesNotExist"
           ],
+          "Comment": "sendCommand returns as soon as the command is accepted, so the invocation record can lag the returned CommandId by a beat.",
           "MaxAttempts": 10,
           "IntervalSeconds": 30,
           "BackoffRate": 1.5
@@ -4084,8 +4813,8 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "ParityDegraded",
-          "ResultPath": "$.parity_error"
+          "Next": "ParityCompareDegraded",
+          "ResultPath": "$.pit_parity_compare_error"
         }
       ],
       "ResultSelector": {
@@ -4094,54 +4823,99 @@
         "StatusDetails.$": "$.StatusDetails",
         "StandardErrorContent.$": "$.StandardErrorContent"
       },
-      "ResultPath": "$.parity_poll",
-      "Next": "CheckParityStatus"
+      "ResultPath": "$.pit_parity_compare_poll",
+      "Next": "CheckPitParityCompareStatus"
     },
-    "CheckParityStatus": {
+    "CheckPitParityCompareStatus": {
       "Type": "Choice",
-      "Comment": "Terminal non-Success (TimedOut / Failed / Cancelled) degrades the run via ParityDegraded instead of failing the SF (alpha-engine-config-I6025): parity's verdict is observational today (the parity_alarms gate sits in OBSERVE), and no downstream SF stage consumes its artifacts (evaluate.py::_load_pit_parity_report is best-effort) \u2014 so a timeout that kills the stage must not also kill Evaluator/ReportCard/Director. The degradation pages distinctly and lands on the execution record as $.parity_degraded (with specifics at $.parity_poll / $.parity_error). [I5687: poll budget cap=144 via $.parity_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]",
+      "Comment": "Budget exhaustion falls through to the Default arm, i.e. it is treated as a FAILED poll rather than a silent success \u2014 a bound whose exhaustion converges on the happy path is not a bound (I5687). Terminal non-Success degrades fail-open (alpha-engine-config#6030) \u2014 it never fails the SF and never aborts sibling branches.",
       "Choices": [
         {
-          "Variable": "$.parity_poll.Status",
+          "Variable": "$.pit_parity_compare_poll.Status",
           "StringEquals": "Success",
-          "Next": "CheckSkipEvaluator"
+          "Next": "PitParityCompareComplete"
         },
         {
           "And": [
             {
-              "Variable": "$.parity_polls",
+              "Variable": "$.pit_parity_compare_polls",
               "IsPresent": true
             },
             {
               "Or": [
                 {
-                  "Variable": "$.parity_poll.Status",
+                  "Variable": "$.pit_parity_compare_poll.Status",
                   "StringEquals": "InProgress"
                 },
                 {
-                  "Variable": "$.parity_poll.Status",
+                  "Variable": "$.pit_parity_compare_poll.Status",
                   "StringEquals": "Pending"
                 }
               ]
             },
             {
-              "Variable": "$.parity_polls",
-              "NumericLessThan": 144
+              "Variable": "$.pit_parity_compare_polls",
+              "NumericLessThan": 108
             }
           ],
-          "Next": "ParityWait"
+          "Next": "PitParityCompareWait"
         }
       ],
-      "Default": "ParityDegraded"
+      "Default": "ParityCompareDegraded"
     },
-    "ParityWait": {
+    "PitParityCompareWait": {
       "Type": "Pass",
-      "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckParityStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
+      "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound (I5687).",
       "Parameters": {
-        "polls.$": "States.MathAdd($.parity_polls, 1)"
+        "polls.$": "States.MathAdd($.pit_parity_compare_polls, 1)"
       },
-      "ResultPath": "$.parity_poll_count",
-      "Next": "ParityPollWait"
+      "ResultPath": "$.pit_parity_compare_poll_count",
+      "Next": "PitParityComparePollWait"
+    },
+    "PitParityComparePollWait": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "MergePitParityComparePollCount"
+    },
+    "MergePitParityComparePollCount": {
+      "Type": "Pass",
+      "InputPath": "$.pit_parity_compare_poll_count.polls",
+      "ResultPath": "$.pit_parity_compare_polls",
+      "Next": "WaitForPitParityCompare"
+    },
+    "PitParityCompareComplete": {
+      "Type": "Pass",
+      "Comment": "Compare success terminal \u2014 the witness state scripts/weekly_sf_rerun.py keys on. NOTE: 'compare succeeded' includes the verdict-UNKNOWN outcome (\u00a72.3a) \u2014 the verdict itself lives in backtest/{run_date}/pit_parity.json.status, and a degraded BRANCH already set $.parity_degraded before this state.",
+      "Next": "CheckSkipEvaluator"
+    },
+    "ParityCompareDegraded": {
+      "Type": "Pass",
+      "Comment": "Fail-open marker for the compare stage itself (alpha-engine-config#6030) \u2014 SSM timeout/crash, send/poll infra failure, or poll-budget exhaustion. Sets the SAME $.parity_degraded flag family as ParityDegraded (the second and last legal writer \u2014 pinned by tests/test_sf_parity_degraded_wiring.py): no pit_parity.json verdict was produced for this run, and absence of a verdict must never render as a clean pass (\u00a72.3a; the ARTIFACT_REGISTRY freshness-monitor SLA also alarms on the missing artifact). The run CONTINUES to Evaluator \u2014 no downstream SF stage consumes parity artifacts (verified dependency audit, alpha-engine-config-I6025).",
+      "Result": true,
+      "ResultPath": "$.parity_degraded",
+      "Next": "PublishParityCompareDegraded"
+    },
+    "PublishParityCompareDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config#6030: page the compare-stage degradation NOW, distinctly. Mirrors PublishParityDegraded exactly (config#1819 discipline: hardcoded Subject/Message constants; best-effort Catch so a publish failure can never block the non-fatal degrade path it decorates).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline \u2014 PitParityCompare DEGRADED (continuing to Evaluator)",
+        "Message": "The PitParityCompare stage (join of the split pit_parity passes \u2014 computes delta_pit_minus_current and writes backtest/{run_date}/pit_parity.json) did not complete \u2014 SSM timeout, crash, or dispatch/poll failure. NON-FATAL: the weekly run continues to Evaluator/ReportCard/Director, but this run produced NO parity verdict; absence of a verdict must NOT be read as a clean pass (sf-pipeline-policy \u00a72.3a). The per-pass artifacts parity/{run_date}/pit_stats_*.json may exist and can be compared on a rerun without re-running the passes (skip_pit_parity_lookahead/skip_pit_parity_walkforward + skip_parity_replay, or scripts/weekly_sf_rerun.py --dry-run). Specifics on the execution record: $.pit_parity_compare_poll / $.pit_parity_compare_error. View pipeline status: https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.parity_compare_degraded_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert \u2014 a publish failure must not block the non-fatal degrade path this alert decorates.",
+          "ResultPath": "$.parity_compare_degraded_notify_error",
+          "Next": "CheckSkipEvaluator"
+        }
+      ],
+      "Next": "CheckSkipEvaluator"
     },
     "CheckSkipEvaluator": {
       "Type": "Choice",
@@ -5154,19 +5928,19 @@
     },
     "ParityDegraded": {
       "Type": "Pass",
-      "Comment": "THE VISIBLE PARITY DEGRADED FLAG (alpha-engine-config-I6025). Every Parity non-success path converges here \u2014 SSM command timeout/crash (CheckParityStatus.Default), send/poll infra failure (the Parity + WaitForParity Task Catches). Mirrors the SaturdayHealthCheckDegraded / ThinkTankDegraded / LibPinGateDegraded shape (config#2276/config#2278/I5758): an SF-controlled flag that (a) pages distinctly via PublishParityDegraded and (b) lands on the execution record ($.parity_degraded=true, specifics at $.parity_poll / $.parity_error / $.parity_result) so a pipeline-status reader can tell 'parity measured clean' from 'parity not measured' \u2014 absence-of-verdict must never render identically to a clean pass. weekly-sf-policy \u00a72.3 honest-degradation: the run continues to Evaluator/ReportCard/Director (none consume parity artifacts \u2014 verified dependency audit in alpha-engine-config-I6025), and the ARTIFACT_REGISTRY freshness-monitor SLA still alarms on the missing pit_parity.json/parity_report.json.",
+      "Comment": "THE VISIBLE PARITY DEGRADED FLAG (alpha-engine-config-I6025, restructured by alpha-engine-config#6030). Reached when ANY parity branch recorded DEGRADED (CheckParityBranchOutcomes) or the ParityParallel hit a genuine SF-engine error (its backstop Catch). An SF-controlled flag that (a) pages distinctly via PublishParityDegraded and (b) lands on the execution record ($.parity_degraded=true, per-branch specifics at $.parity_branch_outcomes and the per-branch $.*_poll/$.*_error paths) so a pipeline-status reader can tell 'parity measured clean' from 'parity not fully measured'. One of exactly TWO legal writers of $.parity_degraded (the other: ParityCompareDegraded) \u2014 pinned by tests/test_sf_parity_degraded_wiring.py. weekly-sf-policy \u00a72.3 honest-degradation: the run CONTINUES \u2014 to the PitParityCompare join (which emits verdict UNKNOWN for missing pass artifacts, \u00a72.3a), then Evaluator/ReportCard/Director.",
       "Result": true,
       "ResultPath": "$.parity_degraded",
       "Next": "PublishParityDegraded"
     },
     "PublishParityDegraded": {
       "Type": "Task",
-      "Comment": "alpha-engine-config-I6025: page the parity degradation NOW, distinctly from a breach. Mirrors PublishDirectorDegraded / PublishLibPinGateDegraded exactly (config#1819 discipline: hardcoded Subject/Message constants, never States.Format against unbounded input; best-effort Catch so a publish failure can never block the non-fatal degrade path this alert decorates). WARNING-severity signal: the weekly run's real trading artifacts are unaffected \u2014 only the parity VERDICT is absent, and it must not be read as clean.",
+      "Comment": "alpha-engine-config-I6025 (updated by alpha-engine-config#6030): page the parity degradation NOW, distinctly from a breach. Mirrors PublishDirectorDegraded / PublishLibPinGateDegraded exactly (config#1819 discipline: hardcoded Subject/Message constants, never States.Format against unbounded input; best-effort Catch so a publish failure can never block the non-fatal degrade path this alert decorates). WARNING-severity: only the parity verdict inputs are affected \u2014 and the run proceeds to the PitParityCompare join, which will emit the verdict as UNKNOWN for whatever is missing (\u00a72.3a).",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekly Pipeline \u2014 Parity DEGRADED (continuing to Evaluator)",
-        "Message": "The Parity stage (pit_parity look-ahead/walk-forward contamination check + backtester\u2194executor replay) did not complete \u2014 SSM timeout, crash, or dispatch/poll failure. NON-FATAL: the weekly run continues to Evaluator/ReportCard/Director, but this run produced NO parity verdict; absence of a verdict must NOT be read as a clean pass. Artifacts backtest/{run_date}/pit_parity.json + parity_report.json + parity_metrics.csv may be absent (the ARTIFACT_REGISTRY freshness-monitor SLA will also flag them). Specifics on the execution record: $.parity_poll / $.parity_error. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Subject": "Alpha Engine Weekly Pipeline \u2014 Parity branch DEGRADED (compare will emit UNKNOWN)",
+        "Message": "One or more parity branches (PitParityLookahead / PitParityWalkforward / ParityReplay) did not complete \u2014 SSM timeout, crash, dispatch/poll failure, or poll-budget exhaustion. NON-FATAL and sibling-isolated: the other branches finished independently, and the weekly run continues to PitParityCompare \u2192 Evaluator/ReportCard/Director. The compare will emit the parity verdict as UNKNOWN for any missing pass artifact \u2014 absence of a verdict must NOT be read as a clean pass (sf-pipeline-policy \u00a72.3a). Which branch: $.parity_branch_outcomes on the execution record (per-branch specifics at $.pit_parity_lookahead_poll / $.pit_parity_walkforward_poll / $.parity_replay_poll and *_error). Rerun ONLY the failed branch via scripts/weekly_sf_rerun.py --dry-run (it derives skip flags for the completed branches). View pipeline status: https://console.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.parity_degraded_notify",
       "Catch": [
@@ -5176,10 +5950,10 @@
           ],
           "Comment": "Best-effort alert \u2014 a publish failure must not block the non-fatal degrade path this alert decorates.",
           "ResultPath": "$.parity_degraded_notify_error",
-          "Next": "CheckSkipEvaluator"
+          "Next": "CheckSkipPitParityCompare"
         }
       ],
-      "Next": "CheckSkipEvaluator"
+      "Next": "CheckSkipPitParityCompare"
     },
     "ExtractPredictorBacktestError": {
       "Type": "Pass",
@@ -5877,24 +6651,6 @@
       "InputPath": "$.portfolio_optimizer_poll_count.polls",
       "ResultPath": "$.portfolio_optimizer_polls",
       "Next": "WaitForPortfolioOptimizerBacktest"
-    },
-    "InitParityPollCount": {
-      "Type": "Pass",
-      "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=144 = ceil(7200s timeout / 60s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
-      "Result": 0,
-      "ResultPath": "$.parity_polls",
-      "Next": "WaitForParity"
-    },
-    "ParityPollWait": {
-      "Type": "Wait",
-      "Seconds": 60,
-      "Next": "MergeParityPollCount"
-    },
-    "MergeParityPollCount": {
-      "Type": "Pass",
-      "InputPath": "$.parity_poll_count.polls",
-      "ResultPath": "$.parity_polls",
-      "Next": "WaitForParity"
     },
     "InitEvaluatorPollCount": {
       "Type": "Pass",

@@ -7,9 +7,12 @@ history's event vocabulary):
 
 - ``parallel_branch_failure``: branch A dies at RAGIngestion, branch B
   completes through the model zoo (the actual 2026-07-11 shape);
-- ``tail_stage_failure``: Parity fails with everything through the
-  portfolio-optimizer backtest completed — exercises the skip_backtester
-  OVERSHOOT drop (its skip route jumps the failed stage's gate);
+- ``tail_stage_failure``: rebuilt for the alpha-engine-config#6030 parity
+  split — the PitParityWalkforward branch DEGRADES fail-open (its siblings
+  and the compare complete; the compare emits verdict UNKNOWN), and the run
+  then fails terminally at Evaluator. Exercises the skip_backtester
+  OVERSHOOT drop (its skip route jumps a degraded parity-family stage's
+  gate) and per-branch skip emission;
 - ``early_failure``: DataPhase1 fails with only MorningEnrich completed;
 - ``director_degraded``: the REAL watch-rerun-2026-08-01-4 history (the
   "permanent fixture" for alpha-engine-config-I6055 — see its test) — the
@@ -86,11 +89,25 @@ class TestDerivePlan:
 
     def test_tail_stage_failure_drops_backtester_overshoot(self, mod):
         plan = mod.derive_plan(_events("tail_stage_failure"))
-        assert plan.failed == ["parity"]
-        # skip_backtester completed but its skip route would bypass the
-        # failed parity gate — replaced with skip_backtester_stage_only
-        # (config#2362 Option A) so Backtester's SSM task isn't re-run
-        # while the tail gates still compose orthogonally.
+        # alpha-engine-config#6030 shape: the walkforward BRANCH degraded
+        # fail-open (the run continued), and the run failed terminally at
+        # Evaluator.
+        assert plan.failed == ["evaluator"]
+        assert "pit_parity_walkforward" in plan.degraded
+        assert "parity" in plan.degraded  # the post-join family fold
+        # completed branches + the compare emit their fine-grained flags —
+        # ONLY the degraded branch reruns (the #6030 closes-when)
+        assert plan.skip_flags.get("skip_pit_parity_lookahead") is True
+        assert plan.skip_flags.get("skip_parity_replay") is True
+        assert plan.skip_flags.get("skip_pit_parity_compare") is True
+        assert "skip_pit_parity_walkforward" not in plan.skip_flags
+        # the family flag is never auto-emitted (it would bypass the
+        # degraded branch)
+        assert "skip_parity" not in plan.skip_flags
+        # skip_backtester completed but its whole-pair skip route would
+        # bypass the degraded parity-family gate — replaced with
+        # skip_backtester_stage_only (config#2362 Option A) so Backtester's
+        # SSM task isn't re-run while the tail gates still compose.
         assert "skip_backtester" not in plan.skip_flags
         assert plan.skip_flags.get("skip_backtester_stage_only") is True
         assert any("skip_backtester_stage_only" in n for n in plan.notes)
@@ -116,9 +133,12 @@ class TestDerivePlan:
             "skip_backtester_stage_only",
             "skip_predictor_backtest",
             "skip_portfolio_optimizer_backtest",
+            "skip_pit_parity_lookahead",
+            "skip_parity_replay",
+            "skip_pit_parity_compare",
         }
         # the failed stage must never carry its own skip flag
-        assert "skip_parity" not in plan.skip_flags
+        assert "skip_evaluator" not in plan.skip_flags
 
     def test_early_failure(self, mod):
         plan = mod.derive_plan(_events("early_failure"))
@@ -193,7 +213,7 @@ class TestDerivePlan:
         events = _events("tail_stage_failure")
         started = next(e for e in events if "executionStartedEventDetails" in e)
         inp = json.loads(started["executionStartedEventDetails"]["input"])
-        inp["skip_backtester"] = True  # would jump the failed parity gate
+        inp["skip_backtester"] = True  # would jump the degraded branch's gate
         started["executionStartedEventDetails"]["input"] = json.dumps(inp)
         with pytest.raises(SystemExit, match="unreachable"):
             mod.derive_plan(events)
@@ -221,9 +241,14 @@ class TestDerivePlan:
         # (PublishDirectorDegraded retained in degraded_witness for backward compat)
         assert any("DEGRADED" in n and "PublishDirectorDegraded" in n for n in plan.notes)
         # stages that genuinely completed cleanly keep their skip flags
-        # (evaluator and parity really ran to completion on this execution)
+        # (evaluator really ran to completion on this execution). The parity
+        # FAMILY reads completed (pre-#6030 history, witness
+        # CheckSkipEvaluator) but skip_parity is deliberately never
+        # auto-emitted post-#6030 — a rerun of an old history re-runs the
+        # parity family conservatively (the old bundled artifacts cannot
+        # witness the new per-stage set).
         assert plan.skip_flags.get("skip_evaluator") is True
-        assert plan.skip_flags.get("skip_parity") is True
+        assert "skip_parity" not in plan.skip_flags
         assert "evaluator" in plan.completed and "parity" in plan.completed
         # and the rerun input must not bypass the tail
         assert "skip_post_eval" not in plan.rerun_input()
@@ -451,6 +476,16 @@ class TestStageTableLockstep:
                     "update the config#2362 Option A additive gate"
                 )
                 continue
+            if stage.name == "pit_parity_compare":
+                # the compare's skip route overshoots its witness to the
+                # evaluator gate — like backtester_stage_only, checked
+                # structurally: a skipped compare emits nothing and the
+                # original input's flag carries over.
+                assert skip_targets == {"CheckSkipEvaluator"}, (
+                    "CheckSkipPitParityCompare's skip route changed — "
+                    "update STAGES (alpha-engine-config#6030)"
+                )
+                continue
             assert skip_targets & stage.witness, (
                 f"{stage.name}: skip route {skip_targets} no longer lands in "
                 f"witness {set(stage.witness)} — update STAGES"
@@ -462,7 +497,10 @@ class TestStageTableLockstep:
         assert mod.BACKTESTER_OVERSHADOWED == (
             "predictor_backtest",
             "portfolio_optimizer_backtest",
-            "parity",
+            "pit_parity_lookahead",
+            "pit_parity_walkforward",
+            "parity_replay",
+            "pit_parity_compare",
         )
         # config#2362 Option A: CheckSkipBacktester's Default now falls
         # through the additive CheckSkipBacktesterStageOnly gate before
