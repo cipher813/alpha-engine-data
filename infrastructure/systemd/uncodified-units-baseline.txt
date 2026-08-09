@@ -28,15 +28,6 @@
 # incomplete by construction, and says so rather than implying coverage.
 
 # ── alpha-engine / dashboard box services ──────────────────────────────────
-crucible-dash-api.service      # crucible-dashboard
-crucible-dash-web.service      # crucible-dashboard
-dashboard.service              # crucible-dashboard
-nous-ergon-live.service        # UNKNOWN
-nousergon-auth.service         # nousergon-auth
-nousergon-console.service      # nousergon-console
-signal-pull.service            # UNKNOWN
-signal-pull.timer              # UNKNOWN
-signal.service                 # UNKNOWN
 
 # ── morning-signal ─────────────────────────────────────────────────────────
 # Found live 2026-08-08 (I6567): morning-signal.service took a TimeoutStartSec
@@ -53,7 +44,6 @@ morning-signal-pull.timer      # UNKNOWN
 mnemon.service                 # mnemon
 mnemon-sync.service            # mnemon
 mnemon-sync.timer              # mnemon
-vires.service                  # vires-ops
 
 # ── shared infrastructure ──────────────────────────────────────────────────
 litellm-proxy.service          # nous-ergon-ops (the model router)
