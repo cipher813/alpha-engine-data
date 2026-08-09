@@ -367,9 +367,15 @@ STAGES: tuple[Stage, ...] = (
         # NormalizeFailureContext → FailExecution). PublishDirectorDegraded
         # is RETAINED for backward compatibility with pre-fix execution
         # histories that still reference it — new executions never enter it.
+        # config#6685: ReportCardDegraded is the new Pass state ReportCard's
+        # Catch routes to FIRST (sets $.report_card_degraded before
+        # proceeding, unchanged, to PublishReportCardDegraded) — added
+        # alongside it so a rerun does not treat a ReportCard-degraded
+        # execution as complete.
         degraded_witness=frozenset({
             "SaturdayHealthCheckDegraded", "SubstrateHealthCheckDegraded",
-            "PublishReportCardDegraded", "PublishDirectorDegraded",
+            "ReportCardDegraded", "PublishReportCardDegraded",
+            "PublishDirectorDegraded",
         }),
         note=(
             "skip_post_eval covers the whole health-check/report-card/"
