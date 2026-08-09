@@ -10,6 +10,11 @@
 #   - Weekday SF: 24h window, watch-day = today is a NYSE trading day
 #   - EOD SF:     24h window, watch-day = today is a NYSE trading day
 #   - Saturday SF: 7d window, watch-day = today is Sunday
+# Plus (config#2412) a preopen schedule-buffer canary: reads the finish
+# time of the most recently CLOSED trading day's SUCCEEDED Weekday-SF
+# execution against the fixed 06:30 AM PT market open (hard floor 06:15 PT,
+# early-warning 06:10 PT, plus a 5-day median trend signal) — same
+# watch-day gate as the Weekday SF check above.
 # Alerts fire via nousergon_lib.alerts.publish to a DISTINCT SNS topic
 # (alpha-engine-watchdog-alerts) + flow-doctor forum topics for Telegram
 # (config#1742 T2) — channel independence preserved per plan doc §3.5.
