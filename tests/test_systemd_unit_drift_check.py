@@ -370,11 +370,10 @@ class TestCoverageAccounting:
         baseline = module.load_baseline(_REPO_ROOT / "infrastructure" / "systemd" / "uncodified-units-baseline.txt")
 
         for name in (
-            "litellm-proxy.service",
-            "llm-egress-proxy.service",
             "mnemon.service",
-            "certbot-renew.timer",
-            "ibgateway.service",
+            "mnemon-sync.service",
+            "mnemon-sync.timer",
+            "amazon-cloudwatch-agent.service",
         ):
             assert name in baseline, f"{name} missing from the uncodified baseline"
 
@@ -389,6 +388,11 @@ class TestCoverageAccounting:
             "signal.service",              # the-cyphering-ops root
             "vires.service",               # vires root
             "morning-signal-pull.service", # codified by crucible-dashboard-PR635
+            "litellm-proxy.service",       # nous-ergon-ops live-infrastructure root
+            "llm-egress-proxy.service",    # nous-ergon-ops (ops-PR533)
+            "ibgateway.service",           # nous-ergon-ops (ops-PR534)
+            "certbot-renew.timer",         # nous-ergon-ops
+            "ops-config-drift.service",    # nous-ergon-ops (ops-PR535) — never baselined
         ):
             assert name not in baseline, (
                 f"{name} is covered by a --codified-root and must not be baselined "
@@ -414,6 +418,7 @@ class TestCoverageAccounting:
             "/home/ec2-user/nousergon-console/infrastructure",
             "/home/ec2-user/the-cyphering-ops/infrastructure",
             "/home/ec2-user/vires/infrastructure",
+            "/home/ec2-user/nous-ergon-ops/alpha-engine-dashboard/live/infrastructure/systemd",
         ):
             assert f"--codified-root {root}" in line, f"missing codified root {root}"
         # boto3 does not infer region from IMDS: without these, --metric dies
