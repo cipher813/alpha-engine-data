@@ -1,0 +1,9 @@
+# nousergon-lib provides:
+#   - nousergon_lib.trading_calendar.is_trading_day for NYSE-holiday-aware
+#     trading-day gating
+#   - nousergon_lib.alerts.publish (re-exports krepis.alerts; krepis is an
+#     unconditional dependency of nousergon-lib, no extra needed) for the
+#     SNS fan-out to alpha-engine-watchdog-alerts
+# Pinned to match the current sibling-Lambda pin (config#1787-adjacent
+# lockstep discipline — keep sibling Lambdas' lib pin coherent).
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.42
