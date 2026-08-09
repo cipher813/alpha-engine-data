@@ -176,6 +176,18 @@ _CATCH_EXEMPT: dict[str, dict[str, str]] = {
         "HandleFailure": "terminal failure notifier — routes to FailExecution; the shared failure sink itself, not something to re-catch into",
     },
     "step_function_eod.json": {
+        "CaptureSnapshot": (
+            "NOT fail-open (alpha-engine-config#5569): the Catch routes to "
+            "CheckCaptureSnapshotRetryBudget — a bounded single retry that "
+            "pages immediately and, once exhausted, HARD-FAILS via "
+            "HandleFailure. A degraded flag would misstate the contract: "
+            "the run never proceeds past a failed snapshot."
+        ),
+        "WaitForCaptureSnapshot": (
+            "Same route as CaptureSnapshot's Catch (config#5569): poll "
+            "failure enters the same bounded-retry-then-HandleFailure "
+            "path; fail-closed, not fail-open."
+        ),
         "WriteCompletionMarkerNormal": "config#2857/config#1724: deliberately UNCAUGHT — a marker write failure must propagate, not be masked",
         "WriteCompletionMarkerDegraded": "config#2857/config#1724: deliberately UNCAUGHT — a marker write failure must propagate, not be masked",
         "ForceStopInstance": "fail-safe teardown reached FROM the failure path (own Comment: 'always stop... even on failure') — a Catch here risks looping back into the failure path it is cleaning up after",
