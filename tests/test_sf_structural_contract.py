@@ -78,6 +78,8 @@ _TIMEOUT_EXEMPT: dict[str, dict[str, str]] = {
         "NotifyCompleteGatesDegraded": "sns:publish completion notifier — SDK call, not a wait",
         "NotifyCompleteHealthDegraded": "sns:publish completion notifier — SDK call, not a wait",
         "NotifyCompleteGatesAndHealthDegraded": "sns:publish completion notifier — SDK call, not a wait",
+        "NotifyCompleteReportCardDegraded": "sns:publish completion notifier — SDK call, not a wait (config#6685)",
+        "NotifyCompleteMultipleDegraded": "sns:publish completion notifier — SDK call, not a wait (config#6685)",
         "NotifyShellRunComplete": "sns:publish completion notifier — SDK call, not a wait",
         "NotifyComplete": "sns:publish completion notifier — SDK call, not a wait",
         "HandleFailure": "sns:publish failure notifier — SDK call, not a wait",
