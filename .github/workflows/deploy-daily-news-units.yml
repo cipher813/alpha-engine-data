@@ -31,6 +31,13 @@ on:
       - 'infrastructure/systemd/daily-news.service'
       - 'infrastructure/systemd/daily-news.timer'
       - 'infrastructure/install-daily-news.sh'
+      # The unit-coverage check and its baseline deploy the same way: the
+      # box runs them from this checkout, and the `git reset --hard` below
+      # is the only merge-time path that refreshes it (daily-news's own
+      # self-refresh runs at most once a day, so a merged checker fix could
+      # otherwise sit inert past the next 06:18 UTC sweep).
+      - 'infrastructure/systemd/check-systemd-unit-drift.py'
+      - 'infrastructure/systemd/uncodified-units-baseline.txt'
       - '.github/workflows/deploy-daily-news-units.yml'
   workflow_dispatch:
 
