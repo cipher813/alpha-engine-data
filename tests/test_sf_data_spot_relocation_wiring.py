@@ -180,9 +180,18 @@ class TestWeekdayFailureIsolation:
             assert daily[name]["Default"] not in _HALT
 
     def test_error_normalizer_continues_not_halts(self, daily):
-        # ExtractDataSpotError -> PublishDataSpotFailureImmediate -> CONTINUE.
+        # alpha-engine-config#6692: ExtractDataSpotError -> SetDataSpotDegradedFlag
+        # (threads $.degraded_summary, read much later by CheckDegradedOutcome)
+        # -> PublishDataSpotFailureImmediate -> CONTINUE. The fail-open
+        # continuation itself is unchanged by the degraded-flag insertion.
         assert daily["ExtractDataSpotError"]["Type"] == "Pass"
-        assert daily["ExtractDataSpotError"]["Next"] == "PublishDataSpotFailureImmediate"
+        assert daily["ExtractDataSpotError"]["Next"] == "SetDataSpotDegradedFlag"
+        flag = daily["SetDataSpotDegradedFlag"]
+        assert flag["Type"] == "Pass"
+        assert flag["Parameters"]["degraded"] is True
+        assert flag["ResultPath"] == "$.degraded_summary"
+        assert flag["Next"] == "PublishDataSpotFailureImmediate"
+        assert flag["Next"] not in _HALT
         pub = daily["PublishDataSpotFailureImmediate"]
         assert pub["Next"] == self._CONTINUE
         # Even the SNS publish's own Catch is fail-open.
@@ -203,7 +212,7 @@ class TestWeekdayFailureIsolation:
             "PollMorningArcticAppendSpot", "CheckMorningArcticAppendSpotStatus",
             "MorningArcticAppendSpotWait",
             "CheckMorningArcticAppendRetryBudget", "IncrementMorningArcticAppendRetry",
-            "ExtractDataSpotError", "PublishDataSpotFailureImmediate",
+            "ExtractDataSpotError", "SetDataSpotDegradedFlag", "PublishDataSpotFailureImmediate",
         ]
         for name in data_states:
             for tgt in _all_targets(daily[name]):
