@@ -586,6 +586,21 @@ class TestEODSFTopLevelFieldsClosed:
             "weekly_exercise_launch_error",
             "weekly_exercise_launch_notify",
             "weekly_exercise_launch_notify_error",
+            # alpha-engine-config-I6689: ReadExerciseCadence reads the
+            # declared cadence from SSM (source: infrastructure/
+            # weekly_cadence.json) and gates LaunchWeeklyExerciseRun via
+            # CheckExerciseCadence, so daily<->weekly-only<->off is a
+            # one-line manifest diff instead of an SF-topology edit.
+            # $.exercise_cadence_param is both the Task's ResultPath AND
+            # the value SetCadenceReadDegraded / SetCadenceUnknownValueDegraded
+            # float, so all three fail-open paths (read failure, unrecognized
+            # value) agree on one field name for CheckExerciseCadence to read.
+            "exercise_cadence_param",
+            "exercise_cadence_read_error",
+            "exercise_cadence_degraded_notify",
+            "exercise_cadence_degraded_notify_error",
+            "exercise_cadence_unknown_notify",
+            "exercise_cadence_unknown_notify_error",
         }
     )
 

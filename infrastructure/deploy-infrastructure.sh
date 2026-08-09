@@ -306,6 +306,30 @@ update_or_create "$EOD_ARN" "$EOD_STAMPED" "ne-postclose-trading-pipeline" "Post
 # why PRs #761 and #763's SF definition fixes had zero live effect on actual groom runs.
 update_or_create "$GROOM_ARN" "$GROOM_STAMPED" "alpha-engine-groom-dispatch" "Backlog groom dispatch" "$GROOM_LOGGING_CONFIG"
 
+# ── 3a. Sync the declared weekly exercise-cadence to SSM (config#6689) ───────
+# infrastructure/weekly_cadence.json is the single declared source for whether
+# infrastructure/step_function_eod.json's ReadExerciseCadence/CheckExerciseCadence
+# states launch the weekly pipeline after every trading day's postclose
+# (exercise_cadence="daily", alpha-engine-config#5489), gate it to the Saturday
+# cron only ("weekly-only"), or treat no exercise launch as expected at all
+# ("off"). Writing it here — in the SAME step that just updated the EOD SF
+# definition above — keeps the manifest and the live parameter the SF task
+# actually reads from drifting apart by more than one deploy cycle. Flipping
+# the cadence is therefore a one-line diff to weekly_cadence.json's
+# exercise_cadence field + merge; no SF-topology edit.
+#
+# NOT YET GRANTED (measured 2026-08-09, recorded in this change's PR body): the
+# github-actions-lambda-deploy role (this script's CI identity) has no
+# ssm:PutParameter on this resource, so this step fails loud on AccessDenied
+# until a nous-ergon-ops IAM PR lands the grant. Failing loud here is
+# deliberate — a swallowed AccessDenied would leave the manifest and SSM
+# silently out of sync, which is exactly the two-surface bug config#6689 was
+# filed to close. weekly_cadence_drift.py --check catches the same gap
+# out-of-band once IAM exists.
+echo ""
+echo "==> Syncing declared weekly exercise-cadence to SSM (config#6689)..."
+python3 "$SCRIPT_DIR/weekly_cadence_drift.py" --enforce
+
 # ── 3b. Ensure EventBridge Scheduler trust on the SF-target role (config#2413) ─
 # The CFN template's WeekdayPipelineSchedule (AWS::Scheduler::Schedule, migrated
 # from AWS::Events::Rule in #816) is fired by EventBridge Scheduler, which — at
