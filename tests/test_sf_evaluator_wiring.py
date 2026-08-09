@@ -190,7 +190,12 @@ class TestEvaluatorTask:
 
 class TestEvaluatorPollLoop:
     def test_evaluator_routes_to_wait_state(self, states):
-        assert states["Evaluator"]["Next"] == "WaitForEvaluator"
+        # alpha-engine-config-I5687: Evaluator dispatches through the
+        # poll-budget seed (InitEvaluatorPollCount) before the first poll,
+        # mirroring the DataPhase2/ThinkTank precedent.
+        assert states["Evaluator"]["Next"] == "InitEvaluatorPollCount"
+        assert states["InitEvaluatorPollCount"]["Next"] == "WaitForEvaluator"
+        assert states["InitEvaluatorPollCount"]["ResultPath"] == "$.evaluator_polls"
 
     def test_wait_for_evaluator_polls_evaluator_command(self, states):
         params = states["WaitForEvaluator"]["Parameters"]
@@ -213,17 +218,25 @@ class TestEvaluatorPollLoop:
         assert states["CheckSkipPostEval"]["Default"] == "SaturdayHealthCheck"
 
     def test_check_status_in_progress_loops_to_wait(self, states):
+        # alpha-engine-config-I5687: InProgress/Pending live inside a
+        # bounded And[] branch now, not a bare StringEquals branch.
         bt = states["CheckEvaluatorStatus"]
-        ip_choice = next(
-            c for c in bt["Choices"] if c.get("StringEquals") == "InProgress"
-        )
-        assert ip_choice["Next"] == "EvaluatorWait"
+        bounded = next(c for c in bt["Choices"] if "And" in c)
+        or_block = next(cond["Or"] for cond in bounded["And"] if "Or" in cond)
+        statuses = {c["StringEquals"] for c in or_block}
+        assert statuses == {"InProgress", "Pending"}
+        assert bounded["Next"] == "EvaluatorWait"
 
     def test_check_status_default_extracts_error(self, states):
         assert states["CheckEvaluatorStatus"]["Default"] == "ExtractEvaluatorError"
 
     def test_evaluator_wait_loops_back_to_poll(self, states):
-        assert states["EvaluatorWait"]["Next"] == "WaitForEvaluator"
+        # alpha-engine-config-I5687: EvaluatorWait now increments the poll
+        # counter (Pass), then sleeps in EvaluatorPollWait, then merges the
+        # counter back before returning to WaitForEvaluator.
+        assert states["EvaluatorWait"]["Next"] == "EvaluatorPollWait"
+        assert states["EvaluatorPollWait"]["Next"] == "MergeEvaluatorPollCount"
+        assert states["MergeEvaluatorPollCount"]["Next"] == "WaitForEvaluator"
 
 
 # ── Failure normalization ────────────────────────────────────────────────

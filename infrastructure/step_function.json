@@ -614,7 +614,7 @@
         }
       ],
       "ResultPath": "$.morning_enrich_result",
-      "Next": "WaitForMorningEnrich"
+      "Next": "InitMorningEnrichPollCount"
     },
     "WaitForMorningEnrich": {
       "Type": "Task",
@@ -671,22 +671,42 @@
           "Next": "CheckSkipDataPhase1"
         },
         {
-          "Variable": "$.morning_enrich_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "MorningEnrichWait"
-        },
-        {
-          "Variable": "$.morning_enrich_poll.Status",
-          "StringEquals": "Pending",
+          "And": [
+            {
+              "Variable": "$.morning_enrich_polls",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.morning_enrich_poll.Status",
+                  "StringEquals": "InProgress"
+                },
+                {
+                  "Variable": "$.morning_enrich_poll.Status",
+                  "StringEquals": "Pending"
+                }
+              ]
+            },
+            {
+              "Variable": "$.morning_enrich_polls",
+              "NumericLessThan": 216
+            }
+          ],
           "Next": "MorningEnrichWait"
         }
       ],
-      "Default": "MorningEnrichRetryGate"
+      "Default": "MorningEnrichRetryGate",
+      "Comment": "[I5687: poll budget cap=216 via $.morning_enrich_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
     },
     "MorningEnrichWait": {
-      "Type": "Wait",
-      "Seconds": 30,
-      "Next": "WaitForMorningEnrich"
+      "Type": "Pass",
+      "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckMorningEnrichStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
+      "Parameters": {
+        "polls.$": "States.MathAdd($.morning_enrich_polls, 1)"
+      },
+      "ResultPath": "$.morning_enrich_poll_count",
+      "Next": "MorningEnrichPollWait"
     },
     "MorningEnrichRetryGate": {
       "Type": "Choice",
@@ -784,7 +804,7 @@
         }
       ],
       "ResultPath": "$.data_phase1_result",
-      "Next": "WaitForDataPhase1"
+      "Next": "InitDataPhase1PollCount"
     },
     "WaitForDataPhase1": {
       "Type": "Task",
@@ -841,22 +861,42 @@
           "Next": "ResearchPredictorParallel"
         },
         {
-          "Variable": "$.data_phase1_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "DataPhase1Wait"
-        },
-        {
-          "Variable": "$.data_phase1_poll.Status",
-          "StringEquals": "Pending",
+          "And": [
+            {
+              "Variable": "$.data_phase1_polls",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.data_phase1_poll.Status",
+                  "StringEquals": "InProgress"
+                },
+                {
+                  "Variable": "$.data_phase1_poll.Status",
+                  "StringEquals": "Pending"
+                }
+              ]
+            },
+            {
+              "Variable": "$.data_phase1_polls",
+              "NumericLessThan": 216
+            }
+          ],
           "Next": "DataPhase1Wait"
         }
       ],
-      "Default": "DataPhase1RetryGate"
+      "Default": "DataPhase1RetryGate",
+      "Comment": "[I5687: poll budget cap=216 via $.data_phase1_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
     },
     "DataPhase1Wait": {
-      "Type": "Wait",
-      "Seconds": 30,
-      "Next": "WaitForDataPhase1"
+      "Type": "Pass",
+      "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckDataPhase1Status actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
+      "Parameters": {
+        "polls.$": "States.MathAdd($.data_phase1_polls, 1)"
+      },
+      "ResultPath": "$.data_phase1_poll_count",
+      "Next": "DataPhase1PollWait"
     },
     "DataPhase1RetryGate": {
       "Type": "Choice",
@@ -1194,7 +1234,7 @@
                 }
               ],
               "ResultPath": "$.rag_ingestion_result",
-              "Next": "WaitForRAGIngestion"
+              "Next": "InitRAGIngestionPollCount"
             },
             "WaitForRAGIngestion": {
               "Type": "Task",
@@ -1251,22 +1291,42 @@
                   "Next": "CheckSkipThinkTankCoverage"
                 },
                 {
-                  "Variable": "$.rag_ingestion_poll.Status",
-                  "StringEquals": "InProgress",
-                  "Next": "RAGIngestionWait"
-                },
-                {
-                  "Variable": "$.rag_ingestion_poll.Status",
-                  "StringEquals": "Pending",
+                  "And": [
+                    {
+                      "Variable": "$.rag_ingestion_polls",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.rag_ingestion_poll.Status",
+                          "StringEquals": "InProgress"
+                        },
+                        {
+                          "Variable": "$.rag_ingestion_poll.Status",
+                          "StringEquals": "Pending"
+                        }
+                      ]
+                    },
+                    {
+                      "Variable": "$.rag_ingestion_polls",
+                      "NumericLessThan": 864
+                    }
+                  ],
                   "Next": "RAGIngestionWait"
                 }
               ],
-              "Default": "RAGIngestionRetryGate"
+              "Default": "RAGIngestionRetryGate",
+              "Comment": "[I5687: poll budget cap=864 via $.rag_ingestion_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
             },
             "RAGIngestionWait": {
-              "Type": "Wait",
-              "Seconds": 30,
-              "Next": "WaitForRAGIngestion"
+              "Type": "Pass",
+              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckRAGIngestionStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
+              "Parameters": {
+                "polls.$": "States.MathAdd($.rag_ingestion_polls, 1)"
+              },
+              "ResultPath": "$.rag_ingestion_poll_count",
+              "Next": "RAGIngestionPollWait"
             },
             "RAGIngestionRetryGate": {
               "Type": "Choice",
@@ -1328,7 +1388,7 @@
             },
             "ThinkTankCoverage": {
               "Type": "Task",
-              "Comment": "Think Tank observe-mode coverage top-up, dispatched to EC2 SPOT (alpha-engine-config-I5758). PREVIOUSLY a direct lambda:invoke against alpha-engine-research-thinktank with TimeoutSeconds 900 — the AWS Lambda MAXIMUM, which this workload cannot fit in: measured 2026-07-30 on watch-rerun-2026-07-29-1, both attempts hit States.Timeout at 900s (11:24:47 and 11:40:48) for 30 min of wall-clock and zero output. alpha-engine-config-I5208 established the same failure on the DAILY cadence and ARCHITECTURE §47 ruled the fix: a long-running agent loop runs on owned compute behind a dispatcher. That fix shipped for the daily path (crucible-research infrastructure/thinktank_box_runner.py + thinktank_spot_bootstrap.sh + this dispatcher) and THIS state was never repointed — the weekly SF kept re-entering the failure the migration already fixed, on the one path inside a decision pipeline. The dispatcher fires an ASYNC detached SSM command and returns immediately, so this state only LAUNCHES; the poll quartet below waits for the box, mirroring the RAGIngestion / WaitForRAGIngestion / CheckRAGIngestionStatus / RAGIngestionWait shape. Budget chain (load-bearing, asserted by the dispatcher's own handler and test_handler.py): THINKTANK_RUN_BUDGET_SECONDS (5400) < THINKTANK_SPOT_RUN_TIMEOUT_SECONDS (7200) < this state's poll bound. If the budget ever meets the SSM timeout, SSM guillotines the run mid-loop and every terminal write is lost — the exact I5208 failure, reintroduced by config drift. config-I2515 Phase B ordering is preserved: this runs AFTER the RAG chain so Think Tank's theses read the FRESH corpus. The daily EventBridge cadence stays the primary coverage-growth mechanism; this state remains the reactive gap_fill top-up.",
+              "Comment": "Think Tank observe-mode coverage top-up, dispatched to EC2 SPOT (alpha-engine-config-I5758). PREVIOUSLY a direct lambda:invoke against alpha-engine-research-thinktank with TimeoutSeconds 900 \u2014 the AWS Lambda MAXIMUM, which this workload cannot fit in: measured 2026-07-30 on watch-rerun-2026-07-29-1, both attempts hit States.Timeout at 900s (11:24:47 and 11:40:48) for 30 min of wall-clock and zero output. alpha-engine-config-I5208 established the same failure on the DAILY cadence and ARCHITECTURE \u00a747 ruled the fix: a long-running agent loop runs on owned compute behind a dispatcher. That fix shipped for the daily path (crucible-research infrastructure/thinktank_box_runner.py + thinktank_spot_bootstrap.sh + this dispatcher) and THIS state was never repointed \u2014 the weekly SF kept re-entering the failure the migration already fixed, on the one path inside a decision pipeline. The dispatcher fires an ASYNC detached SSM command and returns immediately, so this state only LAUNCHES; the poll quartet below waits for the box, mirroring the RAGIngestion / WaitForRAGIngestion / CheckRAGIngestionStatus / RAGIngestionWait shape. Budget chain (load-bearing, asserted by the dispatcher's own handler and test_handler.py): THINKTANK_RUN_BUDGET_SECONDS (5400) < THINKTANK_SPOT_RUN_TIMEOUT_SECONDS (7200) < this state's poll bound. If the budget ever meets the SSM timeout, SSM guillotines the run mid-loop and every terminal write is lost \u2014 the exact I5208 failure, reintroduced by config drift. config-I2515 Phase B ordering is preserved: this runs AFTER the RAG chain so Think Tank's theses read the FRESH corpus. The daily EventBridge cadence stays the primary coverage-growth mechanism; this state remains the reactive gap_fill top-up.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-thinktank-spot-dispatcher",
@@ -1355,7 +1415,7 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Observe-mode non-blocking: a Think Tank failure must NOT halt the pipeline (config-I2515 Phase B). Routes to ThinkTankDegraded, which SETS A VISIBLE FLAG before converging — weekly-sf-policy.md §2.3 permits fail-open ONLY with a flag that propagates to the terminal notification, and champion-challenger-policy.md §3 requires a cycle with no arm output to be recorded as a MISS, never omitted. The flagless fail-open this replaces is why 13 days of silent Lambda timeouts went unnoticed.",
+                  "Comment": "Observe-mode non-blocking: a Think Tank failure must NOT halt the pipeline (config-I2515 Phase B). Routes to ThinkTankDegraded, which SETS A VISIBLE FLAG before converging \u2014 weekly-sf-policy.md \u00a72.3 permits fail-open ONLY with a flag that propagates to the terminal notification, and champion-challenger-policy.md \u00a73 requires a cycle with no arm output to be recorded as a MISS, never omitted. The flagless fail-open this replaces is why 13 days of silent Lambda timeouts went unnoticed.",
                   "Next": "ThinkTankDegraded",
                   "ResultPath": "$.thinktank_error"
                 }
@@ -1370,7 +1430,7 @@
             },
             "CheckThinkTankLaunched": {
               "Type": "Choice",
-              "Comment": "The dispatcher returns launched=false with reason=already_running when a Think Tank box is already up — normally the DAILY cadence's box. That box writes the same terminal artifacts this state wants, so waiting for a command_id we do not have would be wrong; converge with a degraded flag naming the reason instead. Skipping silently would render identically to a genuine zero, which champion-challenger-policy.md §3 forbids.",
+              "Comment": "The dispatcher returns launched=false with reason=already_running when a Think Tank box is already up \u2014 normally the DAILY cadence's box. That box writes the same terminal artifacts this state wants, so waiting for a command_id we do not have would be wrong; converge with a degraded flag naming the reason instead. Skipping silently would render identically to a genuine zero, which champion-challenger-policy.md \u00a73 forbids.",
               "Choices": [
                 {
                   "Variable": "$.thinktank_dispatch.launched",
@@ -1472,7 +1532,7 @@
             },
             "ThinkTankWait": {
               "Type": "Pass",
-              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckThinkTankStatus actually advances — a counter that never increments is an unbounded loop wearing a bound.",
+              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckThinkTankStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
               "Parameters": {
                 "polls.$": "States.MathAdd($.thinktank_polls, 1)"
               },
@@ -1492,7 +1552,7 @@
             },
             "ThinkTankDegraded": {
               "Type": "Pass",
-              "Comment": "THE VISIBLE DEGRADED FLAG (alpha-engine-config-I5758). Every non-Success path converges here — dispatch failure, already_running, poll failure, poll-budget exhaustion, a non-Success SSM status. weekly-sf-policy.md §2.3: a stage may fail-open ONLY if the fail-open sets a visible degraded flag that propagates to the terminal notification, and a pipeline reaching NotifyComplete having degraded a stage must say so BY NAME. champion-challenger-policy.md §3: a cycle where an arm produces no output is recorded as a MISS, not omitted — silent absence and a genuine zero must never render identically. The predecessor of this state had no flag at all, which is exactly why 13 consecutive days of 900s Lambda timeouts (2026-07-17 onward) passed unnoticed while the thinktank_coverage challenger arm was absent from the champion/challenger loop.",
+              "Comment": "THE VISIBLE DEGRADED FLAG (alpha-engine-config-I5758). Every non-Success path converges here \u2014 dispatch failure, already_running, poll failure, poll-budget exhaustion, a non-Success SSM status. weekly-sf-policy.md \u00a72.3: a stage may fail-open ONLY if the fail-open sets a visible degraded flag that propagates to the terminal notification, and a pipeline reaching NotifyComplete having degraded a stage must say so BY NAME. champion-challenger-policy.md \u00a73: a cycle where an arm produces no output is recorded as a MISS, not omitted \u2014 silent absence and a genuine zero must never render identically. The predecessor of this state had no flag at all, which is exactly why 13 consecutive days of 900s Lambda timeouts (2026-07-17 onward) passed unnoticed while the thinktank_coverage challenger arm was absent from the champion/challenger loop.",
               "Result": true,
               "ResultPath": "$.thinktank_degraded",
               "Next": "CheckSkipRegimeRetrospectiveEval"
@@ -1573,7 +1633,7 @@
             },
             "DataPhase2": {
               "Type": "Task",
-              "Comment": "Phase 2: alternative data for the tracked universe, dispatched to EC2 SPOT (alpha-engine-config-I5759). PREVIOUSLY a direct lambda:invoke against alpha-engine-data-collector:live — TimeoutSeconds 600, raised to 900 by alpha-engine-data#1171, which is the Lambda MAXIMUM and still not enough. Measured live 2026-07-30 on execution 1e856026: the Lambda was killed at exactly 900,000 ms having completed 402 of 903 tickers (alphabetically through HON). The rate was 2.16-2.24 s/ticker and FLAT for the whole run — not a degradation curve, a floor. _fetch_all_alternative makes two _finnhub_get calls per ticker and collectors/finnhub_client.py serialises every one of them behind _finnhub_lock with a 1.1s sleep held INSIDE the lock, so 2 x 1.1 = 2.2 s/ticker regardless of how many workers collectors/alternative.py's ThreadPoolExecutor has. 903 x 2.2s = ~2000s, 2.2x a ceiling that cannot be raised. This is the same class as alpha-engine-config-I5208 (daily Think Tank) and alpha-engine-config-I5758 (weekly ThinkTankCoverage): long-running work parked on Lambda, where the ceiling is a hard wall rather than a tunable. UNLIKE the RAG scope fix (alpha-engine-config-I5700), narrowing is NOT the answer here: this stage's per-ticker output feeds seven registered feature-store columns in the `alternative` family (features/registry.py CATALOG, all consumers='predictor') for the WHOLE ArcticDB universe, and a ticker with no alt data gets 0.0 — indistinguishable from a real zero. It legitimately needs the universe; it needed different compute. The dispatcher fires an SSM command that returns as soon as it is accepted, so this state only LAUNCHES; the bounded poll quartet below waits for the box, mirroring DataPhase1 / WaitForDataPhase1 / CheckDataPhase1Status / DataPhase1Wait. Budget chain (load-bearing, asserted by tests/test_data_phase2_spot_budget_wiring.py): the workload run_ssm timeout (3600s) < the spot watchdog MAX_RUNTIME_SECONDS (4200s) < this state's executionTimeout (5400s) < this state's TimeoutSeconds (5460s). If the workload budget ever meets the watchdog, systemd shuts the box down mid-loop and the manifest is never written.",
+              "Comment": "Phase 2: alternative data for the tracked universe, dispatched to EC2 SPOT (alpha-engine-config-I5759). PREVIOUSLY a direct lambda:invoke against alpha-engine-data-collector:live \u2014 TimeoutSeconds 600, raised to 900 by alpha-engine-data#1171, which is the Lambda MAXIMUM and still not enough. Measured live 2026-07-30 on execution 1e856026: the Lambda was killed at exactly 900,000 ms having completed 402 of 903 tickers (alphabetically through HON). The rate was 2.16-2.24 s/ticker and FLAT for the whole run \u2014 not a degradation curve, a floor. _fetch_all_alternative makes two _finnhub_get calls per ticker and collectors/finnhub_client.py serialises every one of them behind _finnhub_lock with a 1.1s sleep held INSIDE the lock, so 2 x 1.1 = 2.2 s/ticker regardless of how many workers collectors/alternative.py's ThreadPoolExecutor has. 903 x 2.2s = ~2000s, 2.2x a ceiling that cannot be raised. This is the same class as alpha-engine-config-I5208 (daily Think Tank) and alpha-engine-config-I5758 (weekly ThinkTankCoverage): long-running work parked on Lambda, where the ceiling is a hard wall rather than a tunable. UNLIKE the RAG scope fix (alpha-engine-config-I5700), narrowing is NOT the answer here: this stage's per-ticker output feeds seven registered feature-store columns in the `alternative` family (features/registry.py CATALOG, all consumers='predictor') for the WHOLE ArcticDB universe, and a ticker with no alt data gets 0.0 \u2014 indistinguishable from a real zero. It legitimately needs the universe; it needed different compute. The dispatcher fires an SSM command that returns as soon as it is accepted, so this state only LAUNCHES; the bounded poll quartet below waits for the box, mirroring DataPhase1 / WaitForDataPhase1 / CheckDataPhase1Status / DataPhase1Wait. Budget chain (load-bearing, asserted by tests/test_data_phase2_spot_budget_wiring.py): the workload run_ssm timeout (3600s) < the spot watchdog MAX_RUNTIME_SECONDS (4200s) < this state's executionTimeout (5400s) < this state's TimeoutSeconds (5460s). If the workload budget ever meets the watchdog, systemd shuts the box down mid-loop and the manifest is never written.",
               "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
               "Parameters": {
                 "DocumentName": "AWS-RunShellScript",
@@ -1679,7 +1739,7 @@
             },
             "CheckDataPhase2Status": {
               "Type": "Choice",
-              "Comment": "Budget exhaustion falls through to the Default arm, i.e. it is treated as a FAILED poll rather than a silent success — a bound whose exhaustion converges on the happy path is not a bound.",
+              "Comment": "Budget exhaustion falls through to the Default arm, i.e. it is treated as a FAILED poll rather than a silent success \u2014 a bound whose exhaustion converges on the happy path is not a bound.",
               "Choices": [
                 {
                   "Variable": "$.data_phase2_poll.Status",
@@ -1716,7 +1776,7 @@
             },
             "DataPhase2Wait": {
               "Type": "Pass",
-              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckDataPhase2Status actually advances — a counter that never increments is an unbounded loop wearing a bound.",
+              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckDataPhase2Status actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
               "Parameters": {
                 "polls.$": "States.MathAdd($.data_phase2_polls, 1)"
               },
@@ -1756,11 +1816,11 @@
             },
             "SetDataPhase2ExhaustedError": {
               "Type": "Pass",
-              "Comment": "Normalize DataPhase2 retry-gate exhaustion into $.error so PublishResearchFailureImmediate's States.JsonToString($.error) has an object to serialize — the Choice path from DataPhase2RetryGate does not carry a caught error like the Catch paths do. Without this, PublishResearchFailureImmediate's States.Format fails on the missing $.error JsonPath, causing the SF to die with States.Runtime instead of surfacing the actual DataPhase2 failure.",
+              "Comment": "Normalize DataPhase2 retry-gate exhaustion into $.error so PublishResearchFailureImmediate's States.JsonToString($.error) has an object to serialize \u2014 the Choice path from DataPhase2RetryGate does not carry a caught error like the Catch paths do. Without this, PublishResearchFailureImmediate's States.Format fails on the missing $.error JsonPath, causing the SF to die with States.Runtime instead of surfacing the actual DataPhase2 failure.",
               "Parameters": {
                 "phase": "DataPhase2",
                 "source": "DataPhase2RetryGate.exhausted",
-                "error": "DataPhase2 SSM command exhausted its retry budget (1 re-issue) without succeeding — the alternative data collector failed on both attempts."
+                "error": "DataPhase2 SSM command exhausted its retry budget (1 re-issue) without succeeding \u2014 the alternative data collector failed on both attempts."
               },
               "ResultPath": "$.error",
               "Next": "PublishResearchFailureImmediate"
@@ -2381,6 +2441,24 @@
               },
               "ResultPath": "$.branch_a",
               "End": true
+            },
+            "InitRAGIngestionPollCount": {
+              "Type": "Pass",
+              "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=864 = ceil(21600s timeout / 30s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
+              "Result": 0,
+              "ResultPath": "$.rag_ingestion_polls",
+              "Next": "WaitForRAGIngestion"
+            },
+            "RAGIngestionPollWait": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "MergeRAGIngestionPollCount"
+            },
+            "MergeRAGIngestionPollCount": {
+              "Type": "Pass",
+              "InputPath": "$.rag_ingestion_poll_count.polls",
+              "ResultPath": "$.rag_ingestion_polls",
+              "Next": "WaitForRAGIngestion"
             }
           }
         },
@@ -2504,7 +2582,7 @@
             },
             "PredictorTraining": {
               "Type": "Task",
-              "Comment": "GBM retrain on spot instance (launched from always-on EC2). alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script — the monolith is retained unchanged as the rollback path.",
+              "Comment": "GBM retrain on spot instance (launched from always-on EC2). alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script \u2014 the monolith is retained unchanged as the rollback path.",
               "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
               "Parameters": {
                 "DocumentName": "AWS-RunShellScript",
@@ -2553,7 +2631,7 @@
                 }
               ],
               "ResultPath": "$.predictor_result",
-              "Next": "WaitForPredictorTraining"
+              "Next": "InitPredictorPollCount"
             },
             "WaitForPredictorTraining": {
               "Type": "Task",
@@ -2610,22 +2688,42 @@
                   "Next": "ResolveZooSpecs"
                 },
                 {
-                  "Variable": "$.predictor_poll.Status",
-                  "StringEquals": "InProgress",
-                  "Next": "PredictorWait"
-                },
-                {
-                  "Variable": "$.predictor_poll.Status",
-                  "StringEquals": "Pending",
+                  "And": [
+                    {
+                      "Variable": "$.predictor_polls",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.predictor_poll.Status",
+                          "StringEquals": "InProgress"
+                        },
+                        {
+                          "Variable": "$.predictor_poll.Status",
+                          "StringEquals": "Pending"
+                        }
+                      ]
+                    },
+                    {
+                      "Variable": "$.predictor_polls",
+                      "NumericLessThan": 108
+                    }
+                  ],
                   "Next": "PredictorWait"
                 }
               ],
-              "Default": "ExtractPredictorError"
+              "Default": "ExtractPredictorError",
+              "Comment": "[I5687: poll budget cap=108 via $.predictor_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
             },
             "PredictorWait": {
-              "Type": "Wait",
-              "Seconds": 60,
-              "Next": "WaitForPredictorTraining"
+              "Type": "Pass",
+              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckPredictorStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
+              "Parameters": {
+                "polls.$": "States.MathAdd($.predictor_polls, 1)"
+              },
+              "ResultPath": "$.predictor_poll_count",
+              "Next": "PredictorPollWait"
             },
             "ExtractPredictorError": {
               "Type": "Pass",
@@ -2712,7 +2810,7 @@
                 }
               ],
               "ResultPath": "$.resolve_zoo_result",
-              "Next": "WaitResolveZoo"
+              "Next": "InitResolveZooPollCount"
             },
             "WaitResolveZoo": {
               "Type": "Task",
@@ -2764,16 +2862,31 @@
             },
             "CheckResolveZooStatus": {
               "Type": "Choice",
-              "Comment": "Success leads to ParseZooSpecs (lift the JSON array); InProgress/Pending wait; anything else alerts then BranchBComplete (best-effort).",
+              "Comment": "Success leads to ParseZooSpecs (lift the JSON array); InProgress/Pending wait; anything else alerts then BranchBComplete (best-effort). [I5687: poll budget cap=48 via $.resolve_zoo_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]",
               "Choices": [
                 {
-                  "Variable": "$.resolve_zoo_poll.Status",
-                  "StringEquals": "InProgress",
-                  "Next": "ResolveZooWait"
-                },
-                {
-                  "Variable": "$.resolve_zoo_poll.Status",
-                  "StringEquals": "Pending",
+                  "And": [
+                    {
+                      "Variable": "$.resolve_zoo_polls",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.resolve_zoo_poll.Status",
+                          "StringEquals": "InProgress"
+                        },
+                        {
+                          "Variable": "$.resolve_zoo_poll.Status",
+                          "StringEquals": "Pending"
+                        }
+                      ]
+                    },
+                    {
+                      "Variable": "$.resolve_zoo_polls",
+                      "NumericLessThan": 48
+                    }
+                  ],
                   "Next": "ResolveZooWait"
                 },
                 {
@@ -2796,9 +2909,13 @@
               "Next": "PublishModelZooFailureImmediate"
             },
             "ResolveZooWait": {
-              "Type": "Wait",
-              "Seconds": 15,
-              "Next": "WaitResolveZoo"
+              "Type": "Pass",
+              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckResolveZooStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
+              "Parameters": {
+                "polls.$": "States.MathAdd($.resolve_zoo_polls, 1)"
+              },
+              "ResultPath": "$.resolve_zoo_poll_count",
+              "Next": "ResolveZooPollWait"
             },
             "ParseZooSpecs": {
               "Type": "Pass",
@@ -2828,7 +2945,7 @@
                 "States": {
                   "TrainSpecDispatch": {
                     "Type": "Task",
-                    "Comment": "Launch a dedicated spot for THIS spec via spot_train_spec_dispatch.sh --spec-id <id> (pre-cutover: spot_train.sh --model-zoo-spec <id>). Dispatcher SSM on the box (the script launches the actual spot internally). Honors $.preflight_args for shell-run dry mode. alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script — the monolith is retained unchanged as the rollback path.",
+                    "Comment": "Launch a dedicated spot for THIS spec via spot_train_spec_dispatch.sh --spec-id <id> (pre-cutover: spot_train.sh --model-zoo-spec <id>). Dispatcher SSM on the box (the script launches the actual spot internally). Honors $.preflight_args for shell-run dry mode. alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script \u2014 the monolith is retained unchanged as the rollback path.",
                     "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
                     "Parameters": {
                       "DocumentName": "AWS-RunShellScript",
@@ -2878,7 +2995,7 @@
                       }
                     ],
                     "ResultPath": "$.train_spec_result",
-                    "Next": "WaitTrainSpec"
+                    "Next": "InitTrainSpecPollCount"
                   },
                   "WaitTrainSpec": {
                     "Type": "Task",
@@ -2929,16 +3046,31 @@
                   },
                   "CheckTrainSpecStatus": {
                     "Type": "Choice",
-                    "Comment": "Success leads to TrainSpecOK; InProgress/Pending wait; anything else (this spec spot OOM/errored) leads to TrainSpecFailed (recorded as data, NOT a throw, so siblings proceed - the per-spec isolation win).",
+                    "Comment": "Success leads to TrainSpecOK; InProgress/Pending wait; anything else (this spec spot OOM/errored) leads to TrainSpecFailed (recorded as data, NOT a throw, so siblings proceed - the per-spec isolation win). [I5687: poll budget cap=108 via $.train_spec_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]",
                     "Choices": [
                       {
-                        "Variable": "$.train_spec_poll.Status",
-                        "StringEquals": "InProgress",
-                        "Next": "TrainSpecWait"
-                      },
-                      {
-                        "Variable": "$.train_spec_poll.Status",
-                        "StringEquals": "Pending",
+                        "And": [
+                          {
+                            "Variable": "$.train_spec_polls",
+                            "IsPresent": true
+                          },
+                          {
+                            "Or": [
+                              {
+                                "Variable": "$.train_spec_poll.Status",
+                                "StringEquals": "InProgress"
+                              },
+                              {
+                                "Variable": "$.train_spec_poll.Status",
+                                "StringEquals": "Pending"
+                              }
+                            ]
+                          },
+                          {
+                            "Variable": "$.train_spec_polls",
+                            "NumericLessThan": 108
+                          }
+                        ],
                         "Next": "TrainSpecWait"
                       },
                       {
@@ -2950,9 +3082,13 @@
                     "Default": "TrainSpecFailed"
                   },
                   "TrainSpecWait": {
-                    "Type": "Wait",
-                    "Seconds": 60,
-                    "Next": "WaitTrainSpec"
+                    "Type": "Pass",
+                    "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckTrainSpecStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
+                    "Parameters": {
+                      "polls.$": "States.MathAdd($.train_spec_polls, 1)"
+                    },
+                    "ResultPath": "$.train_spec_poll_count",
+                    "Next": "TrainSpecPollWait"
                   },
                   "TrainSpecOK": {
                     "Type": "Pass",
@@ -2971,6 +3107,24 @@
                       "spec_id.$": "$.spec_id"
                     },
                     "End": true
+                  },
+                  "InitTrainSpecPollCount": {
+                    "Type": "Pass",
+                    "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=108 = ceil(5400s timeout / 60s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
+                    "Result": 0,
+                    "ResultPath": "$.train_spec_polls",
+                    "Next": "WaitTrainSpec"
+                  },
+                  "TrainSpecPollWait": {
+                    "Type": "Wait",
+                    "Seconds": 60,
+                    "Next": "MergeTrainSpecPollCount"
+                  },
+                  "MergeTrainSpecPollCount": {
+                    "Type": "Pass",
+                    "InputPath": "$.train_spec_poll_count.polls",
+                    "ResultPath": "$.train_spec_polls",
+                    "Next": "WaitTrainSpec"
                   }
                 }
               },
@@ -2989,7 +3143,7 @@
             },
             "ModelZooSelect": {
               "Type": "Task",
-              "Comment": "config#1083 PARALLEL fan-out, step 3 (ONE spot, after the Map joins): select over whatever spec-* challengers registered for the date (failed Map iterations are simply absent - tolerated), write the leaderboard to BOTH the dated key AND latest.json, promote the winner if MODEL_ZOO_AUTO_PROMOTE_WINNER, and send the ONE consolidated digest. BEST-EFFORT: every failure path routes to PublishModelZooFailureImmediate then BranchBComplete (the champion already trained+promoted; the rotation must NEVER fail the Saturday SF). The base champion-arch retrain (PredictorTraining) ran first and competes in the same pool. alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script — the monolith is retained unchanged as the rollback path.",
+              "Comment": "config#1083 PARALLEL fan-out, step 3 (ONE spot, after the Map joins): select over whatever spec-* challengers registered for the date (failed Map iterations are simply absent - tolerated), write the leaderboard to BOTH the dated key AND latest.json, promote the winner if MODEL_ZOO_AUTO_PROMOTE_WINNER, and send the ONE consolidated digest. BEST-EFFORT: every failure path routes to PublishModelZooFailureImmediate then BranchBComplete (the champion already trained+promoted; the rotation must NEVER fail the Saturday SF). The base champion-arch retrain (PredictorTraining) ran first and competes in the same pool. alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script \u2014 the monolith is retained unchanged as the rollback path.",
               "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
               "Parameters": {
                 "DocumentName": "AWS-RunShellScript",
@@ -3039,7 +3193,7 @@
                 }
               ],
               "ResultPath": "$.model_zoo_result",
-              "Next": "WaitForModelZoo"
+              "Next": "InitModelZooPollCount"
             },
             "WaitForModelZoo": {
               "Type": "Task",
@@ -3090,16 +3244,31 @@
             },
             "CheckModelZooStatus": {
               "Type": "Choice",
-              "Comment": "Any non-success routes to PublishModelZooFailureImmediate (SNS alert) then BranchBComplete - selection is best-effort and its failure is logged on the box (predictor-model-zoo-select.log); the champion is already live. The alert is required because PREDICTOR_DEFER_TRAINING_EMAIL=1 deferred the base retrain email to the zoo digest, so a silent zoo failure would otherwise mean zero email for the run.",
+              "Comment": "Any non-success routes to PublishModelZooFailureImmediate (SNS alert) then BranchBComplete - selection is best-effort and its failure is logged on the box (predictor-model-zoo-select.log); the champion is already live. The alert is required because PREDICTOR_DEFER_TRAINING_EMAIL=1 deferred the base retrain email to the zoo digest, so a silent zoo failure would otherwise mean zero email for the run. [I5687: poll budget cap=108 via $.model_zoo_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]",
               "Choices": [
                 {
-                  "Variable": "$.model_zoo_poll.Status",
-                  "StringEquals": "InProgress",
-                  "Next": "ModelZooWait"
-                },
-                {
-                  "Variable": "$.model_zoo_poll.Status",
-                  "StringEquals": "Pending",
+                  "And": [
+                    {
+                      "Variable": "$.model_zoo_polls",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.model_zoo_poll.Status",
+                          "StringEquals": "InProgress"
+                        },
+                        {
+                          "Variable": "$.model_zoo_poll.Status",
+                          "StringEquals": "Pending"
+                        }
+                      ]
+                    },
+                    {
+                      "Variable": "$.model_zoo_polls",
+                      "NumericLessThan": 108
+                    }
+                  ],
                   "Next": "ModelZooWait"
                 },
                 {
@@ -3144,9 +3313,13 @@
               ]
             },
             "ModelZooWait": {
-              "Type": "Wait",
-              "Seconds": 60,
-              "Next": "WaitForModelZoo"
+              "Type": "Pass",
+              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckModelZooStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
+              "Parameters": {
+                "polls.$": "States.MathAdd($.model_zoo_polls, 1)"
+              },
+              "ResultPath": "$.model_zoo_poll_count",
+              "Next": "ModelZooPollWait"
             },
             "BranchBComplete": {
               "Type": "Pass",
@@ -3166,6 +3339,60 @@
               },
               "ResultPath": "$.branch_b",
               "End": true
+            },
+            "InitPredictorPollCount": {
+              "Type": "Pass",
+              "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=108 = ceil(5400s timeout / 60s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
+              "Result": 0,
+              "ResultPath": "$.predictor_polls",
+              "Next": "WaitForPredictorTraining"
+            },
+            "PredictorPollWait": {
+              "Type": "Wait",
+              "Seconds": 60,
+              "Next": "MergePredictorPollCount"
+            },
+            "MergePredictorPollCount": {
+              "Type": "Pass",
+              "InputPath": "$.predictor_poll_count.polls",
+              "ResultPath": "$.predictor_polls",
+              "Next": "WaitForPredictorTraining"
+            },
+            "InitResolveZooPollCount": {
+              "Type": "Pass",
+              "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=48 = ceil(600s timeout / 15s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
+              "Result": 0,
+              "ResultPath": "$.resolve_zoo_polls",
+              "Next": "WaitResolveZoo"
+            },
+            "ResolveZooPollWait": {
+              "Type": "Wait",
+              "Seconds": 15,
+              "Next": "MergeResolveZooPollCount"
+            },
+            "MergeResolveZooPollCount": {
+              "Type": "Pass",
+              "InputPath": "$.resolve_zoo_poll_count.polls",
+              "ResultPath": "$.resolve_zoo_polls",
+              "Next": "WaitResolveZoo"
+            },
+            "InitModelZooPollCount": {
+              "Type": "Pass",
+              "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=108 = ceil(5400s timeout / 60s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
+              "Result": 0,
+              "ResultPath": "$.model_zoo_polls",
+              "Next": "WaitForModelZoo"
+            },
+            "ModelZooPollWait": {
+              "Type": "Wait",
+              "Seconds": 60,
+              "Next": "MergeModelZooPollCount"
+            },
+            "MergeModelZooPollCount": {
+              "Type": "Pass",
+              "InputPath": "$.model_zoo_poll_count.polls",
+              "ResultPath": "$.model_zoo_polls",
+              "Next": "WaitForModelZoo"
             }
           }
         }
@@ -3327,7 +3554,7 @@
         }
       ],
       "ResultPath": "$.backtester_result",
-      "Next": "WaitForBacktester"
+      "Next": "InitBacktesterPollCount"
     },
     "WaitForBacktester": {
       "Type": "Task",
@@ -3384,22 +3611,42 @@
           "Next": "CheckSkipPredictorBacktest"
         },
         {
-          "Variable": "$.backtester_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "BacktesterWait"
-        },
-        {
-          "Variable": "$.backtester_poll.Status",
-          "StringEquals": "Pending",
+          "And": [
+            {
+              "Variable": "$.backtester_polls",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.backtester_poll.Status",
+                  "StringEquals": "InProgress"
+                },
+                {
+                  "Variable": "$.backtester_poll.Status",
+                  "StringEquals": "Pending"
+                }
+              ]
+            },
+            {
+              "Variable": "$.backtester_polls",
+              "NumericLessThan": 144
+            }
+          ],
           "Next": "BacktesterWait"
         }
       ],
-      "Default": "ExtractBacktesterError"
+      "Default": "ExtractBacktesterError",
+      "Comment": "[I5687: poll budget cap=144 via $.backtester_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
     },
     "BacktesterWait": {
-      "Type": "Wait",
-      "Seconds": 60,
-      "Next": "WaitForBacktester"
+      "Type": "Pass",
+      "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckBacktesterStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
+      "Parameters": {
+        "polls.$": "States.MathAdd($.backtester_polls, 1)"
+      },
+      "ResultPath": "$.backtester_poll_count",
+      "Next": "BacktesterPollWait"
     },
     "CheckSkipPredictorBacktest": {
       "Type": "Choice",
@@ -3472,7 +3719,7 @@
         }
       ],
       "ResultPath": "$.predictor_backtest_result",
-      "Next": "WaitForPredictorBacktest"
+      "Next": "InitPredictorBacktestPollCount"
     },
     "WaitForPredictorBacktest": {
       "Type": "Task",
@@ -3529,22 +3776,42 @@
           "Next": "CheckSkipPortfolioOptimizerBacktest"
         },
         {
-          "Variable": "$.predictor_backtest_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "PredictorBacktestWait"
-        },
-        {
-          "Variable": "$.predictor_backtest_poll.Status",
-          "StringEquals": "Pending",
+          "And": [
+            {
+              "Variable": "$.predictor_backtest_polls",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.predictor_backtest_poll.Status",
+                  "StringEquals": "InProgress"
+                },
+                {
+                  "Variable": "$.predictor_backtest_poll.Status",
+                  "StringEquals": "Pending"
+                }
+              ]
+            },
+            {
+              "Variable": "$.predictor_backtest_polls",
+              "NumericLessThan": 144
+            }
+          ],
           "Next": "PredictorBacktestWait"
         }
       ],
-      "Default": "ExtractPredictorBacktestError"
+      "Default": "ExtractPredictorBacktestError",
+      "Comment": "[I5687: poll budget cap=144 via $.predictor_backtest_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
     },
     "PredictorBacktestWait": {
-      "Type": "Wait",
-      "Seconds": 60,
-      "Next": "WaitForPredictorBacktest"
+      "Type": "Pass",
+      "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckPredictorBacktestStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
+      "Parameters": {
+        "polls.$": "States.MathAdd($.predictor_backtest_polls, 1)"
+      },
+      "ResultPath": "$.predictor_backtest_poll_count",
+      "Next": "PredictorBacktestPollWait"
     },
     "CheckSkipPortfolioOptimizerBacktest": {
       "Type": "Choice",
@@ -3617,7 +3884,7 @@
         }
       ],
       "ResultPath": "$.portfolio_optimizer_result",
-      "Next": "WaitForPortfolioOptimizerBacktest"
+      "Next": "InitPortfolioOptimizerBacktestPollCount"
     },
     "WaitForPortfolioOptimizerBacktest": {
       "Type": "Task",
@@ -3674,22 +3941,42 @@
           "Next": "CheckSkipParity"
         },
         {
-          "Variable": "$.portfolio_optimizer_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "PortfolioOptimizerBacktestWait"
-        },
-        {
-          "Variable": "$.portfolio_optimizer_poll.Status",
-          "StringEquals": "Pending",
+          "And": [
+            {
+              "Variable": "$.portfolio_optimizer_polls",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.portfolio_optimizer_poll.Status",
+                  "StringEquals": "InProgress"
+                },
+                {
+                  "Variable": "$.portfolio_optimizer_poll.Status",
+                  "StringEquals": "Pending"
+                }
+              ]
+            },
+            {
+              "Variable": "$.portfolio_optimizer_polls",
+              "NumericLessThan": 144
+            }
+          ],
           "Next": "PortfolioOptimizerBacktestWait"
         }
       ],
-      "Default": "ExtractPortfolioOptimizerBacktestError"
+      "Default": "ExtractPortfolioOptimizerBacktestError",
+      "Comment": "[I5687: poll budget cap=144 via $.portfolio_optimizer_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
     },
     "PortfolioOptimizerBacktestWait": {
-      "Type": "Wait",
-      "Seconds": 60,
-      "Next": "WaitForPortfolioOptimizerBacktest"
+      "Type": "Pass",
+      "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckPortfolioOptimizerBacktestStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
+      "Parameters": {
+        "polls.$": "States.MathAdd($.portfolio_optimizer_polls, 1)"
+      },
+      "ResultPath": "$.portfolio_optimizer_poll_count",
+      "Next": "PortfolioOptimizerBacktestPollWait"
     },
     "CheckSkipParity": {
       "Type": "Choice",
@@ -3762,11 +4049,11 @@
         }
       ],
       "ResultPath": "$.parity_result",
-      "Next": "WaitForParity"
+      "Next": "InitParityPollCount"
     },
     "WaitForParity": {
       "Type": "Task",
-      "Comment": "Poll SSM command until parity complete. Poll/send infra failure degrades (ParityDegraded) rather than failing the SF — same degrade-not-fail posture as the Parity state itself (alpha-engine-config-I6025).",
+      "Comment": "Poll SSM command until parity complete. Poll/send infra failure degrades (ParityDegraded) rather than failing the SF \u2014 same degrade-not-fail posture as the Parity state itself (alpha-engine-config-I6025).",
       "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
       "Parameters": {
         "CommandId.$": "$.parity_result.Command.CommandId",
@@ -3812,7 +4099,7 @@
     },
     "CheckParityStatus": {
       "Type": "Choice",
-      "Comment": "Terminal non-Success (TimedOut / Failed / Cancelled) degrades the run via ParityDegraded instead of failing the SF (alpha-engine-config-I6025): parity's verdict is observational today (the parity_alarms gate sits in OBSERVE), and no downstream SF stage consumes its artifacts (evaluate.py::_load_pit_parity_report is best-effort) — so a timeout that kills the stage must not also kill Evaluator/ReportCard/Director. The degradation pages distinctly and lands on the execution record as $.parity_degraded (with specifics at $.parity_poll / $.parity_error).",
+      "Comment": "Terminal non-Success (TimedOut / Failed / Cancelled) degrades the run via ParityDegraded instead of failing the SF (alpha-engine-config-I6025): parity's verdict is observational today (the parity_alarms gate sits in OBSERVE), and no downstream SF stage consumes its artifacts (evaluate.py::_load_pit_parity_report is best-effort) \u2014 so a timeout that kills the stage must not also kill Evaluator/ReportCard/Director. The degradation pages distinctly and lands on the execution record as $.parity_degraded (with specifics at $.parity_poll / $.parity_error). [I5687: poll budget cap=144 via $.parity_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]",
       "Choices": [
         {
           "Variable": "$.parity_poll.Status",
@@ -3820,22 +4107,41 @@
           "Next": "CheckSkipEvaluator"
         },
         {
-          "Variable": "$.parity_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "ParityWait"
-        },
-        {
-          "Variable": "$.parity_poll.Status",
-          "StringEquals": "Pending",
+          "And": [
+            {
+              "Variable": "$.parity_polls",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.parity_poll.Status",
+                  "StringEquals": "InProgress"
+                },
+                {
+                  "Variable": "$.parity_poll.Status",
+                  "StringEquals": "Pending"
+                }
+              ]
+            },
+            {
+              "Variable": "$.parity_polls",
+              "NumericLessThan": 144
+            }
+          ],
           "Next": "ParityWait"
         }
       ],
       "Default": "ParityDegraded"
     },
     "ParityWait": {
-      "Type": "Wait",
-      "Seconds": 60,
-      "Next": "WaitForParity"
+      "Type": "Pass",
+      "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckParityStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
+      "Parameters": {
+        "polls.$": "States.MathAdd($.parity_polls, 1)"
+      },
+      "ResultPath": "$.parity_poll_count",
+      "Next": "ParityPollWait"
     },
     "CheckSkipEvaluator": {
       "Type": "Choice",
@@ -3908,7 +4214,7 @@
         }
       ],
       "ResultPath": "$.evaluator_result",
-      "Next": "WaitForEvaluator"
+      "Next": "InitEvaluatorPollCount"
     },
     "WaitForEvaluator": {
       "Type": "Task",
@@ -3965,22 +4271,42 @@
           "Next": "CheckSkipPostEval"
         },
         {
-          "Variable": "$.evaluator_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "EvaluatorWait"
-        },
-        {
-          "Variable": "$.evaluator_poll.Status",
-          "StringEquals": "Pending",
+          "And": [
+            {
+              "Variable": "$.evaluator_polls",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.evaluator_poll.Status",
+                  "StringEquals": "InProgress"
+                },
+                {
+                  "Variable": "$.evaluator_poll.Status",
+                  "StringEquals": "Pending"
+                }
+              ]
+            },
+            {
+              "Variable": "$.evaluator_polls",
+              "NumericLessThan": 144
+            }
+          ],
           "Next": "EvaluatorWait"
         }
       ],
-      "Default": "ExtractEvaluatorError"
+      "Default": "ExtractEvaluatorError",
+      "Comment": "[I5687: poll budget cap=144 via $.evaluator_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
     },
     "EvaluatorWait": {
-      "Type": "Wait",
-      "Seconds": 60,
-      "Next": "WaitForEvaluator"
+      "Type": "Pass",
+      "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckEvaluatorStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
+      "Parameters": {
+        "polls.$": "States.MathAdd($.evaluator_polls, 1)"
+      },
+      "ResultPath": "$.evaluator_poll_count",
+      "Next": "EvaluatorPollWait"
     },
     "CheckSkipPostEval": {
       "Type": "Choice",
@@ -4036,7 +4362,7 @@
         }
       ],
       "ResultPath": "$.health_check_result",
-      "Next": "WaitForSaturdayHealthCheck"
+      "Next": "InitSaturdayHealthCheckPollCount"
     },
     "WaitForSaturdayHealthCheck": {
       "Type": "Task",
@@ -4086,7 +4412,7 @@
     },
     "CheckSaturdayHealthCheckStatus": {
       "Type": "Choice",
-      "Comment": "config#2276: poll the freshness check to a TERMINAL status (mirrors the CheckMorningEnrichStatus wait-loop idiom, minus the re-issue gate \u2014 observe-only, one attempt). Pre-fix this stage was check-once: the single getCommandInvocation usually returned InProgress and the SF moved on, so (a) a hung/failing health_checker.py was invisible (green email regardless \u2014 verified live: most 30-day invocations FAILED sub-second and every run still emailed plain SUCCESS), and (b) WeeklySubstrateHealthCheck was dispatched while this command's git pull still held the dashboard repo's ref lock \u2014 the two concurrent `git pull`s produced the recurring 'Cannot fast-forward to multiple branches' / 'cannot lock ref' failures observed 2026-06-19\u219207-11. Sequential-to-terminal polling fixes both structurally. Terminal non-Success (Failed / TimedOut / Cancelled \u2014 incl. executionTimeout expiry and delivery timeout) \u2192 health_check_degraded. Loop bound: delivery TimeoutSeconds terminates a never-picked-up command and executionTimeout terminates a hung script, so the loop always reaches a terminal status; the SF top-level TimeoutSeconds (config#2274) backstops SSM control-plane pathology. $.health_check_poll.Status is safe to dereference un-guarded: the sole predecessor WaitForSaturdayHealthCheck pins Status via its ResultSelector (config#2275 rule 3b).",
+      "Comment": "config#2276: poll the freshness check to a TERMINAL status (mirrors the CheckMorningEnrichStatus wait-loop idiom, minus the re-issue gate \u2014 observe-only, one attempt). Pre-fix this stage was check-once: the single getCommandInvocation usually returned InProgress and the SF moved on, so (a) a hung/failing health_checker.py was invisible (green email regardless \u2014 verified live: most 30-day invocations FAILED sub-second and every run still emailed plain SUCCESS), and (b) WeeklySubstrateHealthCheck was dispatched while this command's git pull still held the dashboard repo's ref lock \u2014 the two concurrent `git pull`s produced the recurring 'Cannot fast-forward to multiple branches' / 'cannot lock ref' failures observed 2026-06-19\u219207-11. Sequential-to-terminal polling fixes both structurally. Terminal non-Success (Failed / TimedOut / Cancelled \u2014 incl. executionTimeout expiry and delivery timeout) \u2192 health_check_degraded. Loop bound: delivery TimeoutSeconds terminates a never-picked-up command and executionTimeout terminates a hung script, so the loop always reaches a terminal status; the SF top-level TimeoutSeconds (config#2274) backstops SSM control-plane pathology. $.health_check_poll.Status is safe to dereference un-guarded: the sole predecessor WaitForSaturdayHealthCheck pins Status via its ResultSelector (config#2275 rule 3b). [I5687: poll budget cap=12 via $.health_check_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]",
       "Choices": [
         {
           "Variable": "$.health_check_poll.Status",
@@ -4094,21 +4420,33 @@
           "Next": "WeeklySubstrateHealthCheck"
         },
         {
-          "Or": [
+          "And": [
             {
-              "Variable": "$.health_check_poll.Status",
-              "StringEquals": "InProgress"
+              "Variable": "$.health_check_polls",
+              "IsPresent": true
             },
             {
-              "Variable": "$.health_check_poll.Status",
-              "StringEquals": "Pending"
+              "Or": [
+                {
+                  "Variable": "$.health_check_poll.Status",
+                  "StringEquals": "InProgress"
+                },
+                {
+                  "Variable": "$.health_check_poll.Status",
+                  "StringEquals": "Pending"
+                },
+                {
+                  "Variable": "$.health_check_poll.Status",
+                  "StringEquals": "Delayed"
+                }
+              ]
             },
             {
-              "Variable": "$.health_check_poll.Status",
-              "StringEquals": "Delayed"
+              "Variable": "$.health_check_polls",
+              "NumericLessThan": 12
             }
           ],
-          "Next": "SaturdayHealthCheckPollWait"
+          "Next": "SaturdayHealthCheckWait"
         }
       ],
       "Default": "SaturdayHealthCheckDegraded"
@@ -4116,7 +4454,7 @@
     "SaturdayHealthCheckPollWait": {
       "Type": "Wait",
       "Seconds": 30,
-      "Next": "WaitForSaturdayHealthCheck"
+      "Next": "MergeSaturdayHealthCheckPollCount"
     },
     "SaturdayHealthCheckDegraded": {
       "Type": "Pass",
@@ -4152,7 +4490,7 @@
         }
       ],
       "ResultPath": "$.substrate_check_result",
-      "Next": "WaitForWeeklySubstrateHealthCheck"
+      "Next": "InitSubstrateHealthCheckPollCount"
     },
     "WaitForWeeklySubstrateHealthCheck": {
       "Type": "Task",
@@ -4202,7 +4540,7 @@
     },
     "CheckSubstrateHealthCheckStatus": {
       "Type": "Choice",
-      "Comment": "config#2276: poll the substrate check to a TERMINAL status \u2014 same shape and rationale as CheckSaturdayHealthCheckStatus (check-once masked a failing/hung checker AND raced the next consumer; see that state's Comment). A terminal non-Success lands on SubstrateHealthCheckDegraded. This is also where the constituents-drift sub-step became fail-VISIBLE (config#2276): its former `|| true` swallowed exit-1 (= alert-worthy Wikipedia-vs-ArcticDB drift, the exact 2026-05-23 BNY/P/SN incident surface) with no recording surface in the SF; now drift exit-1 fails the command \u2192 Status Failed \u2192 health_check_degraded \u2192 'SUCCESS (health checks DEGRADED)' email, alongside the validator's own alerts.publish. $.substrate_check_poll.Status is safe un-guarded: sole predecessor WaitForWeeklySubstrateHealthCheck pins Status via ResultSelector (config#2275 rule 3b).",
+      "Comment": "config#2276: poll the substrate check to a TERMINAL status \u2014 same shape and rationale as CheckSaturdayHealthCheckStatus (check-once masked a failing/hung checker AND raced the next consumer; see that state's Comment). A terminal non-Success lands on SubstrateHealthCheckDegraded. This is also where the constituents-drift sub-step became fail-VISIBLE (config#2276): its former `|| true` swallowed exit-1 (= alert-worthy Wikipedia-vs-ArcticDB drift, the exact 2026-05-23 BNY/P/SN incident surface) with no recording surface in the SF; now drift exit-1 fails the command \u2192 Status Failed \u2192 health_check_degraded \u2192 'SUCCESS (health checks DEGRADED)' email, alongside the validator's own alerts.publish. $.substrate_check_poll.Status is safe un-guarded: sole predecessor WaitForWeeklySubstrateHealthCheck pins Status via ResultSelector (config#2275 rule 3b). [I5687: poll budget cap=10 via $.substrate_check_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]",
       "Choices": [
         {
           "Variable": "$.substrate_check_poll.Status",
@@ -4210,21 +4548,33 @@
           "Next": "ReportCard"
         },
         {
-          "Or": [
+          "And": [
             {
-              "Variable": "$.substrate_check_poll.Status",
-              "StringEquals": "InProgress"
+              "Variable": "$.substrate_check_polls",
+              "IsPresent": true
             },
             {
-              "Variable": "$.substrate_check_poll.Status",
-              "StringEquals": "Pending"
+              "Or": [
+                {
+                  "Variable": "$.substrate_check_poll.Status",
+                  "StringEquals": "InProgress"
+                },
+                {
+                  "Variable": "$.substrate_check_poll.Status",
+                  "StringEquals": "Pending"
+                },
+                {
+                  "Variable": "$.substrate_check_poll.Status",
+                  "StringEquals": "Delayed"
+                }
+              ]
             },
             {
-              "Variable": "$.substrate_check_poll.Status",
-              "StringEquals": "Delayed"
+              "Variable": "$.substrate_check_polls",
+              "NumericLessThan": 10
             }
           ],
-          "Next": "SubstrateHealthCheckPollWait"
+          "Next": "SubstrateHealthCheckWait"
         }
       ],
       "Default": "SubstrateHealthCheckDegraded"
@@ -4232,7 +4582,7 @@
     "SubstrateHealthCheckPollWait": {
       "Type": "Wait",
       "Seconds": 30,
-      "Next": "WaitForWeeklySubstrateHealthCheck"
+      "Next": "MergeSubstrateHealthCheckPollCount"
     },
     "SubstrateHealthCheckDegraded": {
       "Type": "Pass",
@@ -4318,7 +4668,7 @@
           "dry_run.$": "$.research_dry"
         }
       },
-      "TimeoutSeconds": 300,
+      "TimeoutSeconds": 930,
       "Retry": [
         {
           "ErrorEquals": [
@@ -4616,12 +4966,12 @@
     },
     "NotifyCompleteReportCardDegraded": {
       "Type": "Task",
-      "Comment": "config#6685: SUCCESS notifier for a run whose ReportCard advisory grading was DEGRADED (Lambda failure — PublishReportCardDegraded already paged on entry; this is the terminal completion notice) and neither pre-spend gates nor tail health checks were. Mirrors NotifyCompleteGatesDegraded/NotifyCompleteHealthDegraded exactly — constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819).",
+      "Comment": "config#6685: SUCCESS notifier for a run whose ReportCard advisory grading was DEGRADED (Lambda failure \u2014 PublishReportCardDegraded already paged on entry; this is the terminal completion notice) and neither pre-spend gates nor tail health checks were. Mirrors NotifyCompleteGatesDegraded/NotifyCompleteHealthDegraded exactly \u2014 constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819).",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Saturday Pipeline — SUCCESS (report card DEGRADED)",
-        "Message": "All steps completed successfully — BUT ReportCard (the Evaluator Report Card v2 Lambda, advisory grading) failed and did not run; a report-card-degraded alert fired earlier in this run. See $.report_card_error on the execution record for detail. The weekly run's real trading artifacts are unaffected; only the advisory grading layer (report_card.json, and downstream Director) did not run. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (report card DEGRADED)",
+        "Message": "All steps completed successfully \u2014 BUT ReportCard (the Evaluator Report Card v2 Lambda, advisory grading) failed and did not run; a report-card-degraded alert fired earlier in this run. See $.report_card_error on the execution record for detail. The weekly run's real trading artifacts are unaffected; only the advisory grading layer (report_card.json, and downstream Director) did not run. View pipeline status: https://console.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -4629,7 +4979,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "config#1819 — best-effort: a SUCCESS-path notifier must never fail an otherwise-succeeded pipeline.",
+          "Comment": "config#1819 \u2014 best-effort: a SUCCESS-path notifier must never fail an otherwise-succeeded pipeline.",
           "ResultPath": "$.notify_error",
           "Next": "NotifyCompleteDegraded"
         }
@@ -4638,12 +4988,12 @@
     },
     "NotifyCompleteMultipleDegraded": {
       "Type": "Task",
-      "Comment": "config#6685 + alpha-engine-config-I6025: SUCCESS notifier for a run where TWO OR MORE of the four degraded-flag families fired together (pre-spend gates, tail health checks, report card advisory grading, parity verdict). Folded (config#2276's own comment predicted a third flag family would need a data-driven notifier rather than a 7-way enumeration, and the same reasoning generalizes to the fourth): a single generic combined-degradation notifier for every 2+-family combination, instead of enumerating every additional per-combination Task state. Deliberately does NOT assert which SPECIFIC families degraded in the constant Subject/Message (config#1819 forbids States.Format-ing the exact set into the text) — names all four categories generically and points at the execution record ($.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded) for the exact combination, which stays truthful regardless of which subset actually fired. Mirrors NotifyCompleteGatesDegraded's shape — constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819).",
+      "Comment": "config#6685 + alpha-engine-config-I6025: SUCCESS notifier for a run where TWO OR MORE of the four degraded-flag families fired together (pre-spend gates, tail health checks, report card advisory grading, parity verdict). Folded (config#2276's own comment predicted a third flag family would need a data-driven notifier rather than a 7-way enumeration, and the same reasoning generalizes to the fourth): a single generic combined-degradation notifier for every 2+-family combination, instead of enumerating every additional per-combination Task state. Deliberately does NOT assert which SPECIFIC families degraded in the constant Subject/Message (config#1819 forbids States.Format-ing the exact set into the text) \u2014 names all four categories generically and points at the execution record ($.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded) for the exact combination, which stays truthful regardless of which subset actually fired. Mirrors NotifyCompleteGatesDegraded's shape \u2014 constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819).",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Saturday Pipeline — SUCCESS (multiple stages DEGRADED)",
-        "Message": "All steps completed successfully — BUT two or more of the following degraded on this run: the pre-spend gates (LibPinDriftCheck/PipelineContractCheck), the tail health checks (SaturdayHealthCheck/WeeklySubstrateHealthCheck), the report card advisory grading (ReportCard Lambda), and/or the Parity verdict (pit_parity/replay — absence of a verdict must NOT be read as a clean pass). Exact combination is on the execution record: $.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded, with detail at $.report_card_error and (if set) $.health_check_error / $.substrate_check_error / $.parity_error. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (multiple stages DEGRADED)",
+        "Message": "All steps completed successfully \u2014 BUT two or more of the following degraded on this run: the pre-spend gates (LibPinDriftCheck/PipelineContractCheck), the tail health checks (SaturdayHealthCheck/WeeklySubstrateHealthCheck), the report card advisory grading (ReportCard Lambda), and/or the Parity verdict (pit_parity/replay \u2014 absence of a verdict must NOT be read as a clean pass). Exact combination is on the execution record: $.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded, with detail at $.report_card_error and (if set) $.health_check_error / $.substrate_check_error / $.parity_error. View pipeline status: https://console.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -4651,7 +5001,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "config#1819 — best-effort: a SUCCESS-path notifier must never fail an otherwise-succeeded pipeline.",
+          "Comment": "config#1819 \u2014 best-effort: a SUCCESS-path notifier must never fail an otherwise-succeeded pipeline.",
           "ResultPath": "$.notify_error",
           "Next": "NotifyCompleteDegraded"
         }
@@ -4660,12 +5010,12 @@
     },
     "NotifyCompleteParityDegraded": {
       "Type": "Task",
-      "Comment": "alpha-engine-config-I6025/I6044: SUCCESS notifier for a run whose Parity stage was DEGRADED (SSM timeout/crash, or send/poll infra failure — PublishParityDegraded already paged on entry; this is the terminal completion notice) and none of the pre-spend gates, tail health checks, or ReportCard's advisory grading were. Absence of a parity verdict must never render identically to a clean pass (weekly-sf-policy.md §2.3a) — this notifier is that guarantee's terminal-email expression. Mirrors NotifyCompleteReportCardDegraded/NotifyCompleteGatesDegraded/NotifyCompleteHealthDegraded exactly — constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819).",
+      "Comment": "alpha-engine-config-I6025/I6044: SUCCESS notifier for a run whose Parity stage was DEGRADED (SSM timeout/crash, or send/poll infra failure \u2014 PublishParityDegraded already paged on entry; this is the terminal completion notice) and none of the pre-spend gates, tail health checks, or ReportCard's advisory grading were. Absence of a parity verdict must never render identically to a clean pass (weekly-sf-policy.md \u00a72.3a) \u2014 this notifier is that guarantee's terminal-email expression. Mirrors NotifyCompleteReportCardDegraded/NotifyCompleteGatesDegraded/NotifyCompleteHealthDegraded exactly \u2014 constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819).",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Saturday Pipeline — SUCCESS (parity DEGRADED)",
-        "Message": "All steps completed successfully — BUT the Parity stage (pit_parity look-ahead/walk-forward contamination check + backtester↔executor replay) did not complete; a parity-degraded alert fired earlier in this run. This run produced NO parity verdict — absence of a verdict must NOT be read as a clean pass. See $.parity_poll / $.parity_error on the execution record for detail. The weekly run's real trading artifacts are unaffected; only the parity verdict is missing. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (parity DEGRADED)",
+        "Message": "All steps completed successfully \u2014 BUT the Parity stage (pit_parity look-ahead/walk-forward contamination check + backtester\u2194executor replay) did not complete; a parity-degraded alert fired earlier in this run. This run produced NO parity verdict \u2014 absence of a verdict must NOT be read as a clean pass. See $.parity_poll / $.parity_error on the execution record for detail. The weekly run's real trading artifacts are unaffected; only the parity verdict is missing. View pipeline status: https://console.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -4673,7 +5023,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "config#1819 — best-effort: a SUCCESS-path notifier must never fail an otherwise-succeeded pipeline.",
+          "Comment": "config#1819 \u2014 best-effort: a SUCCESS-path notifier must never fail an otherwise-succeeded pipeline.",
           "ResultPath": "$.notify_error",
           "Next": "NotifyCompleteDegraded"
         }
@@ -4682,7 +5032,7 @@
     },
     "WriteCompletionMarker": {
       "Type": "Task",
-      "Comment": "config#2857: SF-envelope completion marker — an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine: a hung/failed SF must not be indistinguishable from a healthy one just because a prior run already wrote today's downstream artifacts). Converges the 8 real-completion notify paths (NotifyComplete, its degraded-catch fallback, the 3 gate/health-degraded variants, the 2 report-card-degraded variants added config#6685, and NotifyCompleteParityDegraded added alpha-engine-config-I6025) — deliberately EXCLUDES NotifyShellRunComplete/NotifyShellRunCompleteDegraded (the Friday-PM preflight dry-pass is not a real weekly completion; marking it would let a dry run silently satisfy the SLA). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_weekly_freshness_pipeline (cadence saturday_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable — exactly the ambiguity this feature exists to surface, not mask.",
+      "Comment": "config#2857: SF-envelope completion marker \u2014 an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine: a hung/failed SF must not be indistinguishable from a healthy one just because a prior run already wrote today's downstream artifacts). Converges the 8 real-completion notify paths (NotifyComplete, its degraded-catch fallback, the 3 gate/health-degraded variants, the 2 report-card-degraded variants added config#6685, and NotifyCompleteParityDegraded added alpha-engine-config-I6025) \u2014 deliberately EXCLUDES NotifyShellRunComplete/NotifyShellRunCompleteDegraded (the Friday-PM preflight dry-pass is not a real weekly completion; marking it would let a dry run silently satisfy the SLA). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_weekly_freshness_pipeline (cadence saturday_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable \u2014 exactly the ambiguity this feature exists to surface, not mask.",
       "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
       "Parameters": {
         "Bucket": "alpha-engine-research",
@@ -4698,7 +5048,7 @@
           "MaxAttempts": 3,
           "IntervalSeconds": 2,
           "BackoffRate": 2.0,
-          "Comment": "Transient S3 fault coverage — mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
+          "Comment": "Transient S3 fault coverage \u2014 mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
         }
       ],
       "End": true
@@ -4927,7 +5277,7 @@
     },
     "EvaluatorDeployDriftCheck": {
       "Type": "Task",
-      "Comment": "config#2348 (2026-07-13 operator ruling): NEW, INDEPENDENT pre-boot Lambda-SHA drift gate for the evaluator's 2 Lambdas, added as a Saturday SF sibling to LibPinDriftCheck/PipelineContractCheck. Deliberately NOT wired through the weekday pipeline's existing DeployDriftCheck/Gate (alpha-engine-predictor Lambda, a separate load-bearing trading invariant covering different Lambdas) — this is a standalone check scoped only to alpha-engine-evaluator + alpha-engine-evaluator-director. Checks the grading Lambda first; EvaluatorDirectorDeployDriftCheck checks the director Lambda second — catches either alias independently stuck on a stale :live version (a failed/skipped post-merge deploy can leave just ONE of the two behind main). FAIL-OPEN like every sibling preflight gate: a GitHub-fetch miss or missing GIT_SHA stamp sets has_drift=false, and the Catch below routes any Lambda failure straight through (degraded + alert) — this checker never blocks the weekly run on its own failure, only on a CONFIRMED sha_mismatch.",
+      "Comment": "config#2348 (2026-07-13 operator ruling): NEW, INDEPENDENT pre-boot Lambda-SHA drift gate for the evaluator's 2 Lambdas, added as a Saturday SF sibling to LibPinDriftCheck/PipelineContractCheck. Deliberately NOT wired through the weekday pipeline's existing DeployDriftCheck/Gate (alpha-engine-predictor Lambda, a separate load-bearing trading invariant covering different Lambdas) \u2014 this is a standalone check scoped only to alpha-engine-evaluator + alpha-engine-evaluator-director. Checks the grading Lambda first; EvaluatorDirectorDeployDriftCheck checks the director Lambda second \u2014 catches either alias independently stuck on a stale :live version (a failed/skipped post-merge deploy can leave just ONE of the two behind main). FAIL-OPEN like every sibling preflight gate: a GitHub-fetch miss or missing GIT_SHA stamp sets has_drift=false, and the Catch below routes any Lambda failure straight through (degraded + alert) \u2014 this checker never blocks the weekly run on its own failure, only on a CONFIRMED sha_mismatch.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-evaluator:live",
@@ -4972,7 +5322,7 @@
     },
     "EvaluatorDeployDriftGate": {
       "Type": "Choice",
-      "Comment": "Hard-fail when the grading Lambda's probe reports has_drift=true (confirmed sha_mismatch). Routes via ExtractEvaluatorDeployDriftError (NOT straight to HandleFailure) — mirrors LibPinDriftGate: a Choice transition does not populate $.error the way a Task Catch does. On a clean pass, proceeds to EvaluatorDirectorDeployDriftCheck (the director Lambda's own check) rather than CheckMutexRole — composing all THREE pre-spend probes (lib-pin, pipeline-contract, evaluator) before any spot spend, per the sibling-gate convention this SF already establishes.",
+      "Comment": "Hard-fail when the grading Lambda's probe reports has_drift=true (confirmed sha_mismatch). Routes via ExtractEvaluatorDeployDriftError (NOT straight to HandleFailure) \u2014 mirrors LibPinDriftGate: a Choice transition does not populate $.error the way a Task Catch does. On a clean pass, proceeds to EvaluatorDirectorDeployDriftCheck (the director Lambda's own check) rather than CheckMutexRole \u2014 composing all THREE pre-spend probes (lib-pin, pipeline-contract, evaluator) before any spot spend, per the sibling-gate convention this SF already establishes.",
       "Choices": [
         {
           "And": [
@@ -4985,7 +5335,7 @@
               "BooleanEquals": true
             }
           ],
-          "Comment": "IsPresent-guarded per config#2275's convention — a partial gate payload must not throw States.Runtime here.",
+          "Comment": "IsPresent-guarded per config#2275's convention \u2014 a partial gate payload must not throw States.Runtime here.",
           "Next": "ExtractEvaluatorDeployDriftError"
         },
         {
@@ -4993,7 +5343,7 @@
             "Variable": "$.evaluator_deploy_drift_result.Payload.has_drift",
             "IsPresent": true
           },
-          "Comment": "A gate payload WITHOUT has_drift means the probe could not check — fail open VISIBLY (degraded flag + SNS alert), mirrors LibPinDriftGate/PipelineContractGate's config#2278 convention.",
+          "Comment": "A gate payload WITHOUT has_drift means the probe could not check \u2014 fail open VISIBLY (degraded flag + SNS alert), mirrors LibPinDriftGate/PipelineContractGate's config#2278 convention.",
           "Next": "EvaluatorGateDegraded"
         }
       ],
@@ -5012,18 +5362,18 @@
     },
     "EvaluatorGateDegraded": {
       "Type": "Pass",
-      "Comment": "The evaluator Lambda-SHA gate could not CHECK (Lambda failure after retries, or a payload without has_drift). Fail-open — availability over gating for a weekly pipeline — but VISIBLE: gate_degraded=true threads into the completion email, and PublishEvaluatorGateDegraded alerts NOW. Mirrors LibPinGateDegraded/PipelineContractGateDegraded.",
+      "Comment": "The evaluator Lambda-SHA gate could not CHECK (Lambda failure after retries, or a payload without has_drift). Fail-open \u2014 availability over gating for a weekly pipeline \u2014 but VISIBLE: gate_degraded=true threads into the completion email, and PublishEvaluatorGateDegraded alerts NOW. Mirrors LibPinGateDegraded/PipelineContractGateDegraded.",
       "Result": true,
       "ResultPath": "$.gate_degraded",
       "Next": "PublishEvaluatorGateDegraded"
     },
     "PublishEvaluatorGateDegraded": {
       "Type": "Task",
-      "Comment": "Fail-open + alert. Subject/Message are hardcoded constants (config#1819 discipline). Best-effort Catch. Proceeds to EvaluatorDirectorDeployDriftCheck (NOT straight to CheckMutexRole) — mirrors PublishLibPinGateDegraded's config#2278 fix: the degraded chain must not silently skip the sibling gate too.",
+      "Comment": "Fail-open + alert. Subject/Message are hardcoded constants (config#1819 discipline). Best-effort Catch. Proceeds to EvaluatorDirectorDeployDriftCheck (NOT straight to CheckMutexRole) \u2014 mirrors PublishLibPinGateDegraded's config#2278 fix: the degraded chain must not silently skip the sibling gate too.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekly Pipeline — Evaluator Deploy-Drift Gate DEGRADED (Proceeding Unchecked)",
+        "Subject": "Alpha Engine Weekly Pipeline \u2014 Evaluator Deploy-Drift Gate DEGRADED (Proceeding Unchecked)",
         "Message": "The evaluator Lambda-SHA drift probe could not verify alpha-engine-evaluator and/or alpha-engine-evaluator-director against origin/main (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN: this run is NOT protected against a stale :live alias this gate exists to catch. The completion email will carry the gates-degraded marker. config#2348."
       },
       "ResultPath": "$.evaluator_gate_degraded_notify",
@@ -5032,7 +5382,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Best-effort alert — a publish failure must not halt the fail-open path.",
+          "Comment": "Best-effort alert \u2014 a publish failure must not halt the fail-open path.",
           "ResultPath": "$.evaluator_gate_degraded_notify_error",
           "Next": "EvaluatorDirectorDeployDriftCheck"
         }
@@ -5041,7 +5391,7 @@
     },
     "EvaluatorDirectorDeployDriftCheck": {
       "Type": "Task",
-      "Comment": "config#2348: second half of the pair — checks alpha-engine-evaluator-director's :live alias independently of the grading Lambda's check above (same image, but the two aliases can drift independently if only one got promoted).",
+      "Comment": "config#2348: second half of the pair \u2014 checks alpha-engine-evaluator-director's :live alias independently of the grading Lambda's check above (same image, but the two aliases can drift independently if only one got promoted).",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-evaluator-director:live",
@@ -5137,7 +5487,7 @@
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekly Pipeline — Evaluator-Director Deploy-Drift Gate DEGRADED (Proceeding Unchecked)",
+        "Subject": "Alpha Engine Weekly Pipeline \u2014 Evaluator-Director Deploy-Drift Gate DEGRADED (Proceeding Unchecked)",
         "Message": "The evaluator-director Lambda-SHA drift probe could not verify alpha-engine-evaluator-director against origin/main (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN. The completion email will carry the gates-degraded marker. config#2348."
       },
       "ResultPath": "$.evaluator_director_gate_degraded_notify",
@@ -5146,7 +5496,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Best-effort alert — a publish failure must not halt the fail-open path.",
+          "Comment": "Best-effort alert \u2014 a publish failure must not halt the fail-open path.",
           "ResultPath": "$.evaluator_director_gate_degraded_notify_error",
           "Next": "CheckMutexRole"
         }
@@ -5239,7 +5589,7 @@
     },
     "NormalizeEc2InstanceId": {
       "Type": "Choice",
-      "Comment": "config#2248 normalization guard: the CheckSpotDispatchNeeded escape hatch (ec2_instance_id already present on the execution input) passes the value through verbatim — but some callers (e.g. certain director-verify input shapes) supply it as a plain string instead of the [\"i-...\"] array every downstream sendCommand InstanceIds.$ expects. This gate inspects the shape: a string gets wrapped into a one-element array by WrapEc2InstanceIdInArray; an array passes straight through to CheckShellRun. The dispatch path (Default → DispatchWeeklyFreshnessSpot → MergeWeeklyFreshnessSpotInstanceId) already guarantees array shape, so this gate is only reached via the escape hatch. IsPresent-guarded (per config#2275 Choice guard convention) — though the upstream CheckSpotDispatchNeeded.IsPresent already guarantees the field exists by the time we reach this gate, the guard is defensive against future topology changes.",
+      "Comment": "config#2248 normalization guard: the CheckSpotDispatchNeeded escape hatch (ec2_instance_id already present on the execution input) passes the value through verbatim \u2014 but some callers (e.g. certain director-verify input shapes) supply it as a plain string instead of the [\"i-...\"] array every downstream sendCommand InstanceIds.$ expects. This gate inspects the shape: a string gets wrapped into a one-element array by WrapEc2InstanceIdInArray; an array passes straight through to CheckShellRun. The dispatch path (Default \u2192 DispatchWeeklyFreshnessSpot \u2192 MergeWeeklyFreshnessSpotInstanceId) already guarantees array shape, so this gate is only reached via the escape hatch. IsPresent-guarded (per config#2275 Choice guard convention) \u2014 though the upstream CheckSpotDispatchNeeded.IsPresent already guarantees the field exists by the time we reach this gate, the guard is defensive against future topology changes.",
       "Choices": [
         {
           "And": [
@@ -5259,7 +5609,7 @@
     },
     "WrapEc2InstanceIdInArray": {
       "Type": "Pass",
-      "Comment": "config#2248: wrap a bare-string $.ec2_instance_id (from the CheckSpotDispatchNeeded escape hatch) into the one-element array [\"i-...\"] that every downstream sendCommand InstanceIds.$ expects. Mirrors MergeWeeklyFreshnessSpotInstanceId's JsonMerge pattern exactly — the only difference is the source field ($.ec2_instance_id instead of $.weekly_freshness_spot_result.instance_id).",
+      "Comment": "config#2248: wrap a bare-string $.ec2_instance_id (from the CheckSpotDispatchNeeded escape hatch) into the one-element array [\"i-...\"] that every downstream sendCommand InstanceIds.$ expects. Mirrors MergeWeeklyFreshnessSpotInstanceId's JsonMerge pattern exactly \u2014 the only difference is the source field ($.ec2_instance_id instead of $.weekly_freshness_spot_result.instance_id).",
       "Parameters": {
         "merged.$": "States.JsonMerge($, States.StringToJson(States.Format('\\{\"ec2_instance_id\":[\"{}\"]\\}', $.ec2_instance_id)), false)"
       },
@@ -5322,7 +5672,7 @@
         "merged.$": "States.JsonMerge($, States.StringToJson(States.Format('\\{\"ec2_instance_id\":[\"{}\"]\\}', $.weekly_freshness_spot_result.instance_id)), false)"
       },
       "OutputPath": "$.merged",
-      "Next": "WaitForWeeklyFreshnessSpotBootstrap"
+      "Next": "InitWeeklyFreshnessSpotBootstrapPollCount"
     },
     "WaitForWeeklyFreshnessSpotBootstrap": {
       "Type": "Task",
@@ -5372,7 +5722,7 @@
     },
     "CheckWeeklyFreshnessSpotBootstrapStatus": {
       "Type": "Choice",
-      "Comment": "Bootstrap-complete gate: only once the clone+venv SSM command reaches Success may the SF proceed into CheckShellRun / any of the 14 consumer states -- otherwise MorningEnrich's git pull / venv python invocation would race an incomplete bootstrap.",
+      "Comment": "Bootstrap-complete gate: only once the clone+venv SSM command reaches Success may the SF proceed into CheckShellRun / any of the 14 consumer states -- otherwise MorningEnrich's git pull / venv python invocation would race an incomplete bootstrap. [I5687: poll budget cap=48 via $.weekly_freshness_spot_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]",
       "Choices": [
         {
           "Variable": "$.weekly_freshness_spot_poll.Status",
@@ -5380,22 +5730,41 @@
           "Next": "CheckShellRun"
         },
         {
-          "Variable": "$.weekly_freshness_spot_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "WeeklyFreshnessSpotBootstrapWait"
-        },
-        {
-          "Variable": "$.weekly_freshness_spot_poll.Status",
-          "StringEquals": "Pending",
+          "And": [
+            {
+              "Variable": "$.weekly_freshness_spot_polls",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.weekly_freshness_spot_poll.Status",
+                  "StringEquals": "InProgress"
+                },
+                {
+                  "Variable": "$.weekly_freshness_spot_poll.Status",
+                  "StringEquals": "Pending"
+                }
+              ]
+            },
+            {
+              "Variable": "$.weekly_freshness_spot_polls",
+              "NumericLessThan": 48
+            }
+          ],
           "Next": "WeeklyFreshnessSpotBootstrapWait"
         }
       ],
       "Default": "ExtractWeeklyFreshnessSpotBootstrapError"
     },
     "WeeklyFreshnessSpotBootstrapWait": {
-      "Type": "Wait",
-      "Seconds": 30,
-      "Next": "WaitForWeeklyFreshnessSpotBootstrap"
+      "Type": "Pass",
+      "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckWeeklyFreshnessSpotBootstrapStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
+      "Parameters": {
+        "polls.$": "States.MathAdd($.weekly_freshness_spot_polls, 1)"
+      },
+      "ResultPath": "$.weekly_freshness_spot_poll_count",
+      "Next": "WeeklyFreshnessSpotBootstrapPollWait"
     },
     "ExtractWeeklyFreshnessSpotBootstrapError": {
       "Type": "Pass",
@@ -5418,6 +5787,194 @@
       },
       "ResultPath": "$.error",
       "Next": "NormalizeFailureContext"
+    },
+    "InitMorningEnrichPollCount": {
+      "Type": "Pass",
+      "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=216 = ceil(5400s timeout / 30s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
+      "Result": 0,
+      "ResultPath": "$.morning_enrich_polls",
+      "Next": "WaitForMorningEnrich"
+    },
+    "MorningEnrichPollWait": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "MergeMorningEnrichPollCount"
+    },
+    "MergeMorningEnrichPollCount": {
+      "Type": "Pass",
+      "InputPath": "$.morning_enrich_poll_count.polls",
+      "ResultPath": "$.morning_enrich_polls",
+      "Next": "WaitForMorningEnrich"
+    },
+    "InitDataPhase1PollCount": {
+      "Type": "Pass",
+      "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=216 = ceil(5400s timeout / 30s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
+      "Result": 0,
+      "ResultPath": "$.data_phase1_polls",
+      "Next": "WaitForDataPhase1"
+    },
+    "DataPhase1PollWait": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "MergeDataPhase1PollCount"
+    },
+    "MergeDataPhase1PollCount": {
+      "Type": "Pass",
+      "InputPath": "$.data_phase1_poll_count.polls",
+      "ResultPath": "$.data_phase1_polls",
+      "Next": "WaitForDataPhase1"
+    },
+    "InitBacktesterPollCount": {
+      "Type": "Pass",
+      "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=144 = ceil(7200s timeout / 60s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
+      "Result": 0,
+      "ResultPath": "$.backtester_polls",
+      "Next": "WaitForBacktester"
+    },
+    "BacktesterPollWait": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "MergeBacktesterPollCount"
+    },
+    "MergeBacktesterPollCount": {
+      "Type": "Pass",
+      "InputPath": "$.backtester_poll_count.polls",
+      "ResultPath": "$.backtester_polls",
+      "Next": "WaitForBacktester"
+    },
+    "InitPredictorBacktestPollCount": {
+      "Type": "Pass",
+      "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=144 = ceil(7200s timeout / 60s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
+      "Result": 0,
+      "ResultPath": "$.predictor_backtest_polls",
+      "Next": "WaitForPredictorBacktest"
+    },
+    "PredictorBacktestPollWait": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "MergePredictorBacktestPollCount"
+    },
+    "MergePredictorBacktestPollCount": {
+      "Type": "Pass",
+      "InputPath": "$.predictor_backtest_poll_count.polls",
+      "ResultPath": "$.predictor_backtest_polls",
+      "Next": "WaitForPredictorBacktest"
+    },
+    "InitPortfolioOptimizerBacktestPollCount": {
+      "Type": "Pass",
+      "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=144 = ceil(7200s timeout / 60s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
+      "Result": 0,
+      "ResultPath": "$.portfolio_optimizer_polls",
+      "Next": "WaitForPortfolioOptimizerBacktest"
+    },
+    "PortfolioOptimizerBacktestPollWait": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "MergePortfolioOptimizerBacktestPollCount"
+    },
+    "MergePortfolioOptimizerBacktestPollCount": {
+      "Type": "Pass",
+      "InputPath": "$.portfolio_optimizer_poll_count.polls",
+      "ResultPath": "$.portfolio_optimizer_polls",
+      "Next": "WaitForPortfolioOptimizerBacktest"
+    },
+    "InitParityPollCount": {
+      "Type": "Pass",
+      "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=144 = ceil(7200s timeout / 60s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
+      "Result": 0,
+      "ResultPath": "$.parity_polls",
+      "Next": "WaitForParity"
+    },
+    "ParityPollWait": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "MergeParityPollCount"
+    },
+    "MergeParityPollCount": {
+      "Type": "Pass",
+      "InputPath": "$.parity_poll_count.polls",
+      "ResultPath": "$.parity_polls",
+      "Next": "WaitForParity"
+    },
+    "InitEvaluatorPollCount": {
+      "Type": "Pass",
+      "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=144 = ceil(7200s timeout / 60s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
+      "Result": 0,
+      "ResultPath": "$.evaluator_polls",
+      "Next": "WaitForEvaluator"
+    },
+    "EvaluatorPollWait": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "MergeEvaluatorPollCount"
+    },
+    "MergeEvaluatorPollCount": {
+      "Type": "Pass",
+      "InputPath": "$.evaluator_poll_count.polls",
+      "ResultPath": "$.evaluator_polls",
+      "Next": "WaitForEvaluator"
+    },
+    "InitSaturdayHealthCheckPollCount": {
+      "Type": "Pass",
+      "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=12 = ceil(300s timeout / 30s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
+      "Result": 0,
+      "ResultPath": "$.health_check_polls",
+      "Next": "WaitForSaturdayHealthCheck"
+    },
+    "SaturdayHealthCheckWait": {
+      "Type": "Pass",
+      "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckSaturdayHealthCheckStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
+      "Parameters": {
+        "polls.$": "States.MathAdd($.health_check_polls, 1)"
+      },
+      "ResultPath": "$.health_check_poll_count",
+      "Next": "SaturdayHealthCheckPollWait"
+    },
+    "MergeSaturdayHealthCheckPollCount": {
+      "Type": "Pass",
+      "InputPath": "$.health_check_poll_count.polls",
+      "ResultPath": "$.health_check_polls",
+      "Next": "WaitForSaturdayHealthCheck"
+    },
+    "InitSubstrateHealthCheckPollCount": {
+      "Type": "Pass",
+      "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=10 = ceil(240s timeout / 30s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
+      "Result": 0,
+      "ResultPath": "$.substrate_check_polls",
+      "Next": "WaitForWeeklySubstrateHealthCheck"
+    },
+    "SubstrateHealthCheckWait": {
+      "Type": "Pass",
+      "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckSubstrateHealthCheckStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
+      "Parameters": {
+        "polls.$": "States.MathAdd($.substrate_check_polls, 1)"
+      },
+      "ResultPath": "$.substrate_check_poll_count",
+      "Next": "SubstrateHealthCheckPollWait"
+    },
+    "MergeSubstrateHealthCheckPollCount": {
+      "Type": "Pass",
+      "InputPath": "$.substrate_check_poll_count.polls",
+      "ResultPath": "$.substrate_check_polls",
+      "Next": "WaitForWeeklySubstrateHealthCheck"
+    },
+    "InitWeeklyFreshnessSpotBootstrapPollCount": {
+      "Type": "Pass",
+      "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=48 = ceil(1200s timeout / 30s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
+      "Result": 0,
+      "ResultPath": "$.weekly_freshness_spot_polls",
+      "Next": "WaitForWeeklyFreshnessSpotBootstrap"
+    },
+    "WeeklyFreshnessSpotBootstrapPollWait": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "MergeWeeklyFreshnessSpotBootstrapPollCount"
+    },
+    "MergeWeeklyFreshnessSpotBootstrapPollCount": {
+      "Type": "Pass",
+      "InputPath": "$.weekly_freshness_spot_poll_count.polls",
+      "ResultPath": "$.weekly_freshness_spot_polls",
+      "Next": "WaitForWeeklyFreshnessSpotBootstrap"
     }
   }
 }
