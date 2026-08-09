@@ -235,12 +235,17 @@ _REGISTRY: dict[str, dict[str, list[dict]]] = {
         ],
     },
     "infrastructure/lambdas/pipeline-watchdog/index.py": {
-        "_check_sf": [
+        # config-I2412: the preopen buffer canary routes every watchdog alert
+        # (stuck-SF, buffer warn/alert, missed-open) through this factored-out
+        # helper; severity is chosen per call (warning for the 06:10 early-warn
+        # and trend creep, error for the 06:15 floor and missed-open) — same
+        # channel and taxonomy rows as _check_sf's original inline call.
+        "_publish_watchdog_alert": [
             {
-                "event_class": "Pipeline watchdog — stuck SF alert",
-                "severity": "error",
+                "event_class": "Pipeline watchdog — liveness / preopen-buffer alert",
+                "severity": "warning or error, chosen per call site (buffer early-warn + trend = warning; buffer floor, missed open, stuck SF = error)",
                 "silent": False,
-                "citation": "reconciled from live code 2026-07-31 — pending taxonomy entry",
+                "citation": "reconciled from live code 2026-08-09 (config-I2412, data-PR1263) — pending taxonomy entry",
             },
         ],
     },
