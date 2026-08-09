@@ -159,7 +159,13 @@ DAILY_STAGES: tuple[Stage, ...] = (
           frozenset({"CheckSkipRunDaemon"})),
     Stage("run_daemon", "skip_run_daemon",
           "CheckSkipRunDaemon", "RunDaemon",
-          frozenset({"WriteCompletionMarker"})),
+          # config#6692 Option-A parity cutover: CheckSkipRunDaemon's skip
+          # edge now routes through CheckDegradedOutcome (the shared
+          # terminal-decision node, also reached from RunDaemon's own
+          # normal Next and its Catch) rather than straight to
+          # WriteCompletionMarker, so an earlier data-spot degraded flag is
+          # still honored even when this stage itself is skipped.
+          frozenset({"CheckDegradedOutcome"})),
 )
 
 EOD_STAGES: tuple[Stage, ...] = (
