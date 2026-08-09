@@ -35,6 +35,8 @@ on:
       - 'infrastructure/scheduler/**'
       - 'infrastructure/automation_pause.json'
       - 'infrastructure/automation_pause.py'
+      - 'infrastructure/weekly_cadence.json'
+      - 'infrastructure/weekly_cadence_drift.py'
       - '.github/workflows/sf-arn-drift-check.yml'
   schedule:
     - cron: '30 9 * * *'   # daily, alongside the IAM sweep
@@ -68,6 +70,14 @@ jobs:
       # scheduler:GetSchedule this role already holds.
       - name: Scheduled-automation pause still holds (live)
         run: python3 infrastructure/automation_pause.py --check
+
+      # config#6701 deliverable 3-wiring: the declared weekly exercise-cadence
+      # manifest vs the live SSM parameter, out-of-band of deploys (the deploy
+      # path runs --enforce; this catches drift BETWEEN deploys). AccessDenied
+      # here means ops-PR538's grant has not been applied yet — that red is the
+      # form-3 detector for the operator-gated apply, not a bug in this step.
+      - name: Weekly exercise-cadence drift (manifest vs live SSM)
+        run: python3 infrastructure/weekly_cadence_drift.py --check
 
       - name: EventBridge SF-ARN drift (codified vs live)
         run: python3 infrastructure/eventbridge/check-drift.py

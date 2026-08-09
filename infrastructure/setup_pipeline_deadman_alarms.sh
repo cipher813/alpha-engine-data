@@ -80,12 +80,20 @@ BACKSTOP_ALERT_EMAIL="${BACKSTOP_ALERT_EMAIL:-cipher813@gmail.com}"
 FORWARDER_FUNCTION_NAME="alpha-engine-backstop-telegram-notifier"
 FORWARDER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FORWARDER_FUNCTION_NAME}"
 
-# The three canonical Alpha Engine orchestration state machines (per the
+# The weekday Alpha Engine orchestration state machines (per the
 # pipeline-reporting-revamp scope / crucible-dashboard views/25_Pipeline_Status.py
 # _SF_ORDER). alpha-engine-groom-pipeline is intentionally excluded — it is
 # not part of the reporting-revamp's operator-facing pipeline set.
+# ne-weekly-freshness-pipeline is intentionally excluded (removed 2026-08-09,
+# config#5599/#6701): a CloudWatch ExecutionsSucceeded deadman cannot carry the
+# weekly pipeline's cadence semantics — AWS/States has no pipeline_role
+# dimension, so daily exercise runs keep the metric warm and a missed Saturday
+# production run can never breach. Its liveness detector is
+# scripts/weekly_sf_silence_deadman.py (sf-pipeline-policy §2.6), which derives
+# per-role expectation from the declared cadence; scheduling rides the
+# config#6617 automation-pause lift. A can-never-fire alarm is worse than no
+# alarm — it renders as coverage while providing none.
 declare -A STATE_MACHINES=(
-  ["weekly-freshness"]="ne-weekly-freshness-pipeline"
   ["preopen-trading"]="ne-preopen-trading-pipeline"
   ["postclose-trading"]="ne-postclose-trading-pipeline"
 )
