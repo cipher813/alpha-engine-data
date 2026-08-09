@@ -74,9 +74,14 @@ jobs:
       # config#6701 deliverable 3-wiring: the declared weekly exercise-cadence
       # manifest vs the live SSM parameter, out-of-band of deploys (the deploy
       # path runs --enforce; this catches drift BETWEEN deploys). AccessDenied
-      # here means ops-PR538's grant has not been applied yet — that red is the
-      # form-3 detector for the operator-gated apply, not a bug in this step.
+      # here means ops-PR538's grant has not been applied yet — the DAILY
+      # scheduled run staying red is the form-3 detector for that
+      # operator-gated apply. Schedule/dispatch only: `drift-check` is a
+      # REQUIRED PR check, so running this on the pull_request path before the
+      # grant exists would block every PR on a red only an operator can clear
+      # (the gate-only-the-blocked-actor-can-clear trap).
       - name: Weekly exercise-cadence drift (manifest vs live SSM)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: python3 infrastructure/weekly_cadence_drift.py --check
 
       - name: EventBridge SF-ARN drift (codified vs live)
