@@ -65,7 +65,12 @@ _CHAIN = [
     # ProbeEODReconcilePrecondition (the new verify-by-artifact precondition
     # probe), not directly on CheckSkipEODReconcile — every path into the
     # reconcile gate, skip or not, must probe fresh.
-    ("CheckSkipCaptureSnapshot", "CaptureSnapshot", "skip_capture_snapshot", "ProbeEODReconcilePrecondition"),
+    # alpha-engine-config#5569 (2026-08-09): the Default now runs through
+    # InitCaptureSnapshotRetryCounter (the new same-day bounded-retry budget
+    # init for CaptureSnapshot's irreversible per-day deadline) before
+    # CaptureSnapshot itself — pinned separately in
+    # test_sf_capture_snapshot_retry_wiring.py.
+    ("CheckSkipCaptureSnapshot", "InitCaptureSnapshotRetryCounter", "skip_capture_snapshot", "ProbeEODReconcilePrecondition"),
     # alpha-engine-config-I2722 (2026-07-16): the skip edge used to land on
     # CheckSkipDailySubstrateHealthCheck; that gate + the whole
     # DailySubstrateHealthCheck chain were removed (spun out to a dashboard-box
@@ -253,10 +258,13 @@ class TestPaths:
         # config#1767: skip_post_market_data now skips the ENTIRE spot data phase
         # (fetch + append both on spot) and resumes at the snapshot gate — the
         # old separate skip_post_market_arctic_append gate is gone.
+        # alpha-engine-config#5569: resumes at the new retry-counter init, then
+        # CaptureSnapshot itself (mirrors InitDataSpotRetryCounter above).
         order = self._walk(states, skip_flags={"skip_refresh_executor_deploy", "skip_post_market_data"})
         assert "LaunchPostMarketDataSpot" not in order
         assert "LaunchPostMarketArcticAppendSpot" not in order
-        assert order[0] == "CaptureSnapshot"
+        assert order[0] == "InitCaptureSnapshotRetryCounter"
+        assert order[1] == "CaptureSnapshot"
         assert order[-7:] == ["StopTradingInstance", "ReadExerciseCadence", "CheckExerciseCadence", "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
 
     def test_happy_path_runs_data_phase_on_spot(self, states):
