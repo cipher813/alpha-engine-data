@@ -1,6 +1,7 @@
 {
   "Comment": "Alpha Engine EOD Pipeline \u2014 post-market data capture, snapshot capture, reconciliation, daily substrate health check, instance shutdown. Triggered by daemon shutdown on trading EC2.",
   "StartAt": "CheckMutexRole",
+  "TimeoutSeconds": 64800,
   "States": {
     "CheckMutexRole": {
       "Type": "Choice",
@@ -67,6 +68,7 @@
         },
         "ConditionExpression": "attribute_not_exists(mutex_key)"
       },
+      "TimeoutSeconds": 60,
       "Catch": [
         {
           "ErrorEquals": [
@@ -100,6 +102,7 @@
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -266,6 +269,7 @@
         "CommandId.$": "$.snapshot_result.Command.CommandId",
         "InstanceId.$": "$.trading_instance_id[0]"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -396,6 +400,7 @@
         "CommandId.$": "$.eod_result.Command.CommandId",
         "InstanceId.$": "$.trading_instance_id[0]"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -569,6 +574,7 @@
         "CommandId.$": "$.refresh_executor_deploy_result.Command.CommandId",
         "InstanceId.$": "$.trading_instance_id[0]"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -765,6 +771,7 @@
         "CommandId.$": "$.postmarket_launch.Payload.data_spot.command_id",
         "InstanceId.$": "$.postmarket_launch.Payload.data_spot.instance_id"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -940,6 +947,7 @@
         "CommandId.$": "$.postmarket_arctic_launch.Payload.data_spot.command_id",
         "InstanceId.$": "$.postmarket_arctic_launch.Payload.data_spot.instance_id"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -1052,6 +1060,7 @@
         "Message.$": "States.Format('EOD data-spot phase failed but the pipeline continued to reconcile + instance-stop (fail-open, config#1767). Detail: {}', States.JsonToString($.data_spot_error))"
       },
       "ResultPath": "$.data_spot_failure_notify",
+      "TimeoutSeconds": 60,
       "Catch": [
         {
           "ErrorEquals": [
@@ -1177,6 +1186,7 @@
         "Message.$": "States.Format('EOD reconcile SKIPPED for {}: the precondition probe found run_date\\'s SPY close not yet verified-present in ArcticDB. Entering the closed-loop self-heal (dispatch missing workload(s) -> re-probe -> auto-replay) \u2014 no operator action required unless a follow-up DID-NOT-CONVERGE alert fires. Probe detail: {}', $.run_date, States.JsonToString($.precondition_probe))"
       },
       "ResultPath": "$.eod_skip_notify",
+      "TimeoutSeconds": 60,
       "Catch": [
         {
           "ErrorEquals": [
@@ -1324,6 +1334,7 @@
         "CommandId.$": "$.heal_postmarket_launch.Payload.data_spot.command_id",
         "InstanceId.$": "$.heal_postmarket_launch.Payload.data_spot.instance_id"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -1458,6 +1469,7 @@
         "CommandId.$": "$.heal_arctic_launch.Payload.data_spot.command_id",
         "InstanceId.$": "$.heal_arctic_launch.Payload.data_spot.instance_id"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -1635,6 +1647,7 @@
         "Message.$": "States.Format('EOD self-heal for {} converged (SPY close now verified present) but the auto-replay StartExecution call itself failed: {}. Run a manual operator-replay: pipeline_role=operator-replay, skip_post_market_data=true, skip_capture_snapshot=true (I2700 shape).', $.run_date, States.JsonToString($.heal_replay_dispatch_error))"
       },
       "ResultPath": "$.heal_replay_dispatch_failed_notify",
+      "TimeoutSeconds": 60,
       "Catch": [
         {
           "ErrorEquals": [
@@ -1656,6 +1669,7 @@
         "Message.$": "States.Format('EOD self-heal for {} converged after {} attempt(s): the missing data-spot workload(s) were re-dispatched, SPY close is now verified present in ArcticDB, and a reconcile-only replay execution has been started automatically ({}). No operator action required.', $.run_date, States.MathAdd($.heal_loop.attempts, 1), States.JsonToString($.heal_replay_dispatch))"
       },
       "ResultPath": "$.heal_converged_notify",
+      "TimeoutSeconds": 60,
       "Catch": [
         {
           "ErrorEquals": [
@@ -1677,6 +1691,7 @@
         "Message.$": "States.Format('EOD self-heal for {} did NOT converge: the automatic heal loop (dispatch missing data-spot workload(s) -> re-probe) exhausted its attempt budget and/or passed its deadline without SPY close landing in ArcticDB. pipeline_role={}, latest probe: {}. Manual intervention needed \u2014 investigate the data-spot dispatch failures, then run an operator-replay (I2700 shape: skip_post_market_data=true, skip_capture_snapshot=true) once the underlying data issue is fixed.', $.run_date, $.pipeline_role, States.JsonToString($.precondition_probe))"
       },
       "ResultPath": "$.heal_nonconvergent_notify",
+      "TimeoutSeconds": 60,
       "Catch": [
         {
           "ErrorEquals": [
@@ -1695,6 +1710,7 @@
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -1850,6 +1866,7 @@
           "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
         }
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -1882,6 +1899,7 @@
         "Message.$": "States.Format('postclose completed but could not start the weekly exercise run. The weekly pipeline will NOT be exercised today. Error: {}', States.JsonToString($.weekly_exercise_launch_error))"
       },
       "ResultPath": "$.weekly_exercise_launch_notify",
+      "TimeoutSeconds": 60,
       "Catch": [
         {
           "ErrorEquals": [
@@ -1924,6 +1942,7 @@
         "ContentType": "application/json",
         "Body.$": "States.Format('\\{\"sf\":\"ne-postclose-trading-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\"\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date)"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -1951,6 +1970,7 @@
         "ContentType": "application/json",
         "Body.$": "States.Format('\\{\"sf\":\"ne-postclose-trading-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\"\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date)"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -1980,6 +2000,7 @@
         "Message.$": "States.Format('EOD pipeline failed. Error: {}. View the failing state + per-state detail at https://console.nousergon.ai/pipeline-status', States.JsonToString($.error))"
       },
       "ResultPath": "$.failure_notify",
+      "TimeoutSeconds": 60,
       "Catch": [
         {
           "ErrorEquals": [
@@ -1999,6 +2020,7 @@
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
       },
+      "TimeoutSeconds": 60,
       "ResultPath": "$.force_stop_result",
       "Next": "FailExecution"
     },
