@@ -464,6 +464,11 @@ def _handle_reclaim_event(event: dict) -> dict:
         "execution_arn": source_ev.get("execution_arn", ""),
         "state_machine_arn": f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:{pipeline}",
         "failed_state": source_ev.get("failed_state") or "",
+        # alpha-engine-config-I6616: passthrough only — this handler never
+        # derives failed_state itself, it relays the ORIGINAL dispatcher's
+        # (saturday-sf-watch-dispatcher) already-derived value, same as
+        # `failed_state` above.
+        "failed_state_detail": source_ev.get("failed_state_detail") or "",
         "cause": source_ev.get("cause") or "",
         "watch_log_key": watch_log_key,
         "is_preflight": "true" if source_ev.get("is_preflight") else "false",
