@@ -105,7 +105,7 @@ _UNIVERSE_SAMPLE_SIZE = 20
 @dataclass
 class CheckResult:
     name: str
-    status: str  # "ok" | "warn" | "fail"
+    status: str  # "ok" | "warn" | "fail" | "skip" (capability absent — see CHECK_CAPABILITIES)
     message: str
     details: dict = field(default_factory=dict)
     elapsed_seconds: float = 0.0
@@ -1037,6 +1037,73 @@ def _collect_jsonpath_refs(node, path: str = "") -> list[tuple[str, str]]:
     return refs
 
 
+def _collect_produced_roots(node) -> "set[str]":
+    """Top-level keys the definition WRITES somewhere, from three shapes.
+
+    A ref rooted in one of these does not resolve against the execution
+    input by design — the value appears mid-flow — so it is undecidable for
+    ``check_definition_input_coherence`` rather than a violation.
+
+      * ``ResultPath: "$.foo"``            → ``foo``
+      * a state's ``Parameters`` keys      → ``foo`` (``foo.$`` stripped)
+      * JSON object literals built inside intrinsic functions, e.g.
+        ``States.JsonMerge($, States.StringToJson(States.Format(
+        '{"ec2_instance_id":["{}"]}', ...)), false)`` → ``ec2_instance_id``.
+        WrapEc2InstanceIdInArray writes the field this way and NO key walk
+        can see it — the field name lives inside a format string. Missing it
+        is what made ``$.ec2_instance_id[0]`` look like a violation.
+
+    Deliberately over-collects: a spurious entry only narrows coverage (the
+    check reports how much), while a miss produces a false gate failure.
+    """
+    import re as _re
+
+    roots: set[str] = set()
+    if isinstance(node, dict):
+        for key, val in node.items():
+            if key == "ResultPath" and isinstance(val, str) and val.startswith("$."):
+                roots.add(val[2:].split(".")[0].split("[")[0])
+            if key == "Parameters" and isinstance(val, dict):
+                for pkey in val:
+                    roots.add(pkey[:-2] if pkey.endswith(".$") else pkey)
+            if isinstance(val, str):
+                roots.update(
+                    _re.findall(r'\{\s*\\?"([A-Za-z_][A-Za-z0-9_]*)\\?"\s*:', val)
+                )
+            roots.update(_collect_produced_roots(val))
+    elif isinstance(node, list):
+        for item in node:
+            roots.update(_collect_produced_roots(item))
+    return roots
+
+
+def _has_output_replacing_state(node) -> bool:
+    """True if any state REPLACES its output with something the definition
+    does not name — an AWS API response.
+
+    ``Type: Task`` with no ``ResultPath`` (or ``ResultPath: "$"``) discards
+    the state's input and emits the raw service response: SSM
+    GetCommandInvocation is where ``$.Status`` / ``$.ResponseCode`` /
+    ``$.StandardErrorContent`` come from. Those roots are named nowhere in
+    the definition, so in a definition containing such a state an unknown
+    root is UNDECIDABLE, not a violation.
+
+    In a definition WITHOUT one, every root is accounted for — the
+    execution input or a written key — so an unknown root is a genuine
+    unresolvable reference and is reported as a failure.
+    """
+    if isinstance(node, dict):
+        stype = node.get("Type")
+        replaces_by_default = stype in ("Task", "Map", "Parallel")
+        pass_replaces = stype == "Pass" and ("Result" in node or "Parameters" in node)
+        if (replaces_by_default or pass_replaces) and node.get("ResultPath", "$") == "$":
+            return True
+        return any(_has_output_replacing_state(v) for v in node.values())
+    if isinstance(node, list):
+        return any(_has_output_replacing_state(v) for v in node)
+    return False
+
+
 def _build_proposed_input(skip_flags: dict[str, bool] | None = None) -> dict:
     """Build a proposed execution input that exercises all code paths.
 
@@ -1087,14 +1154,33 @@ def _build_proposed_input(skip_flags: dict[str, bool] | None = None) -> dict:
 
 
 def check_definition_input_coherence(ctx: PreflightContext) -> CheckResult:
-    """Every JSONPath referenced by a SF state resolves against a proposed
-    execution input, including under each skip_* combination.
+    """Every JSONPath rooted in the EXECUTION INPUT resolves against a
+    proposed input, including under each skip_* combination.
 
     Walks the live SF definition, collects every ``.$``-suffixed JSONPath
-    reference, and validates each against the proposed input using jmespath.
-    Also tests each individual skip_* flag set to True (the input shape
-    changes under skip gates — a path that resolves with skip=false may not
-    resolve with skip=true if a prior state was bypassed).
+    reference, and validates the decidable subset against the proposed input
+    using jmespath. Also tests each individual skip_* flag set to True (the
+    input shape changes under skip gates — a path that resolves with
+    skip=false may not resolve with skip=true if a prior state was bypassed).
+
+    Scope, and why it is narrower than "every reference" (2026-08-10)
+    ----------------------------------------------------------------
+    A state's JSONPaths resolve against THAT STATE's effective input, which
+    for most states is a prior state's output, not the execution input. The
+    original implementation resolved all ~80 refs against the execution
+    input and reported 177 "unresolvable" — every one of them a false
+    positive (``$.libpin_drift_result.Payload``, ``$.Status``,
+    ``$.ec2_instance_id[0]``: values produced mid-flow, by construction
+    absent from the execution input). A check whose every finding is noise
+    fails the gate permanently and teaches operators to ignore it; the check
+    had never run against the live definition, only against mocks.
+
+    So this validates only the DECIDABLE subset — refs whose root key the
+    execution input owns and no state overwrites — and REPORTS the
+    undecidable remainder as a coverage number rather than passing silently
+    over it. Modelling mid-flow state (ResultPath/ResultSelector/InputPath
+    through Parallel and Map branches) is real dataflow analysis; until that
+    exists, this check must not claim it.
 
     Static analysis — zero network calls, runs in <1s.
     """
@@ -1134,11 +1220,34 @@ def check_definition_input_coherence(ctx: PreflightContext) -> CheckResult:
     # Build the base proposed input (all skip flags false).
     base_input = _build_proposed_input()
 
-    failures: list[str] = []
+    # Partition the refs: only those rooted in an execution-input key that no
+    # state overwrites are decidable from the input model alone.
+    produced_roots = _collect_produced_roots(live)
+    input_roots = set(base_input)
+    # Only where NO state emits an unnamed API response is an unknown root
+    # provably unresolvable rather than merely unmodelled.
+    unknown_root_is_a_violation = not _has_output_replacing_state(live)
+    decidable_refs = []
+    undecidable_roots: set[str] = set()
+    unresolvable_roots: list[str] = []
+    for ref in input_refs:
+        root = ref[2:].split(".")[0].split("[")[0]
+        if root in input_roots and root not in produced_roots:
+            decidable_refs.append(ref)
+        elif root not in input_roots and root not in produced_roots and unknown_root_is_a_violation:
+            unresolvable_roots.append(ref)
+        else:
+            undecidable_roots.add(root)
+
+    failures: list[str] = [
+        f"{ref}: root key is neither an execution-input field nor written by "
+        f"any state — unresolvable at run time"
+        for ref in unresolvable_roots
+    ]
     checked = 0
 
-    # Resolve each JSONPath against the base input.
-    for ref in input_refs:
+    # Resolve each decidable JSONPath against the base input.
+    for ref in decidable_refs:
         checked += 1
         # Strip the leading "$" for jmespath (it uses bare paths)
         jmes_expr = ref.lstrip("$").lstrip(".")
@@ -1160,7 +1269,7 @@ def check_definition_input_coherence(ctx: PreflightContext) -> CheckResult:
     skip_flags = [k for k in base_input if k.startswith("skip_")]
     for skip_flag in skip_flags:
         skip_input = _build_proposed_input({skip_flag: True})
-        for ref in input_refs:
+        for ref in decidable_refs:
             jmes_expr = ref.lstrip("$").lstrip(".")
             try:
                 result = jmespath.search(jmes_expr, skip_input)
@@ -1182,6 +1291,8 @@ def check_definition_input_coherence(ctx: PreflightContext) -> CheckResult:
                 "failures": failures,
                 "checked": checked,
                 "skip_combinations_tested": len(skip_flags),
+                "undecidable_refs": len(input_refs) - len(decidable_refs),
+                "undecidable_roots": sorted(undecidable_roots),
             },
             elapsed_seconds=elapsed,
         )
@@ -1189,10 +1300,17 @@ def check_definition_input_coherence(ctx: PreflightContext) -> CheckResult:
         name="definition_input_coherence",
         status="ok",
         message=(
-            f"All {checked} input JSONPath reference(s) resolve against base input "
-            f"and {len(skip_flags)} individual skip-flag combinations"
+            f"All {checked} execution-input JSONPath reference(s) resolve against "
+            f"base input and {len(skip_flags)} individual skip-flag combinations "
+            f"({len(input_refs) - len(decidable_refs)} mid-flow ref(s) not covered — "
+            f"they resolve against prior-state output, not the execution input)"
         ),
-        details={"checked": checked, "skip_flags_tested": len(skip_flags)},
+        details={
+            "checked": checked,
+            "skip_flags_tested": len(skip_flags),
+            "undecidable_refs": len(input_refs) - len(decidable_refs),
+            "undecidable_roots": sorted(undecidable_roots),
+        },
         elapsed_seconds=elapsed,
     )
 
@@ -1798,6 +1916,59 @@ CHECKS = [
 ]
 
 
+# ── Environment capabilities ──────────────────────────────────────────────────
+#
+# sf_preflight.py was written for a host that HAS the data plane and the
+# sibling checkouts: the laptop and the weekly spot box. The WeeklyPreflight
+# Lambda (I4494) has neither — no arcticdb wheel, no ``collectors``/
+# ``features``/``builders`` repo modules, no ``~/Development/alpha-engine-*``
+# checkouts, no Polygon key. Running the full CHECKS list there does not
+# "gracefully skip": ``check_arctic_connectivity`` returns status="fail" on
+# ``ModuleNotFoundError``, ``check_tool_contracts`` returns status="fail" on
+# "not checked out as sibling", and every downstream check that reads
+# ``ctx.universe_lib`` fails on the unpopulated context — so the gate returns
+# has_violation=true and halts the Saturday pipeline by construction, no
+# matter how healthy the system is.
+#
+# Fix: each check declares what its ENVIRONMENT must provide. A caller passes
+# the capability set its environment actually has; checks that need more are
+# reported status="skip" (never "fail" — an unavailable capability is not a
+# violation) and excluded from the failure count.
+CAP_AWS = "aws"                    # AWS control-plane APIs (always available)
+CAP_ARCTIC = "arctic"              # arcticdb wheel + ArcticDB data plane
+CAP_REPO_MODULES = "repo_modules"  # collectors/ features/ builders/ polygon_client
+CAP_CHECKOUT = "checkout"          # sibling alpha-engine-* checkouts on local disk
+CAP_POLYGON = "polygon"            # POLYGON_API_KEY resolvable
+
+# Every environment has the AWS control plane; the Lambda has nothing else.
+LAMBDA_CAPABILITIES = frozenset({CAP_AWS})
+# The laptop and the weekly spot box carry the full set.
+FULL_CAPABILITIES = frozenset({
+    CAP_AWS, CAP_ARCTIC, CAP_REPO_MODULES, CAP_CHECKOUT, CAP_POLYGON,
+})
+
+# Every entry in CHECKS MUST appear here — tests/test_sf_preflight.py pins
+# it, so a new check cannot silently inherit (or silently lose) Lambda
+# eligibility. State what the check's ENVIRONMENT must provide, not what it
+# happens to import today.
+CHECK_CAPABILITIES: "dict[str, frozenset[str]]" = {
+    "check_sf_iam_reachability": frozenset({CAP_AWS}),
+    "check_arctic_connectivity": frozenset({CAP_AWS, CAP_ARCTIC}),
+    "check_constituents_fetch": frozenset({CAP_REPO_MODULES}),
+    "check_universe_drift": frozenset({CAP_AWS, CAP_ARCTIC, CAP_REPO_MODULES}),
+    "check_universe_sample_freshness": frozenset({CAP_AWS, CAP_ARCTIC}),
+    "check_polygon_grouped_coverage": frozenset({CAP_REPO_MODULES, CAP_POLYGON}),
+    "check_predicted_missing_from_closes": frozenset({CAP_AWS, CAP_ARCTIC, CAP_POLYGON}),
+    "check_backfill_source_freshness": frozenset({CAP_AWS, CAP_REPO_MODULES}),
+    "check_postflight_contracts": frozenset({CAP_AWS}),
+    "check_price_cards_cover_all_models": frozenset({CAP_CHECKOUT}),
+    "check_recursion_budget_for_response_format": frozenset({CAP_CHECKOUT}),
+    "check_tool_contracts": frozenset({CAP_AWS, CAP_CHECKOUT}),
+    "check_definition_input_coherence": frozenset({CAP_AWS}),
+    "check_lambda_memory_headroom": frozenset({CAP_AWS}),
+}
+
+
 def _previous_trading_day_str() -> str:
     """Resolve the prior trading day. Avoids importing weekly_collector
     (which transitively imports boto3 + every collector module) so
@@ -1815,18 +1986,46 @@ def _previous_trading_day_str() -> str:
     raise RuntimeError("Could not find a trading day within the last 10 days")
 
 
-def run_preflight(bucket: str = DEFAULT_BUCKET) -> tuple[int, list[CheckResult]]:
-    """Execute all checks against real state. Returns (n_failures, results).
+def run_preflight(
+    bucket: str = DEFAULT_BUCKET,
+    capabilities: "frozenset[str] | set[str] | None" = None,
+) -> tuple[int, list[CheckResult]]:
+    """Execute the checks this environment can run. Returns (n_failures, results).
+
+    ``capabilities`` declares what the HOST provides (see CHECK_CAPABILITIES).
+    Checks needing a capability the host lacks are reported status="skip" and
+    are not counted as failures — the WeeklyPreflight Lambda has only
+    ``LAMBDA_CAPABILITIES``, the laptop and spot box have FULL_CAPABILITIES
+    (the default, so the CLI and every existing caller are unchanged).
 
     Each check runs in its own try/except — a single check raising must
     not abort the others (we want the full picture, not first-fail-bail).
     """
+    caps = frozenset(capabilities) if capabilities is not None else FULL_CAPABILITIES
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     prior = _previous_trading_day_str()
     ctx = PreflightContext(bucket=bucket, today=today, prior_trading_day=prior)
 
     results: list[CheckResult] = []
     for check_fn in CHECKS:
+        # An undeclared check defaults to the FULL set: it can never silently
+        # gain Lambda eligibility, and an undeclared check can never abort the
+        # run (raising here would re-create the prologue-abort failure mode
+        # this profile exists to fix). CI pins the declaration —
+        # tests/test_sf_preflight.py::test_every_check_declares_its_capabilities.
+        required = CHECK_CAPABILITIES.get(check_fn.__name__, FULL_CAPABILITIES)
+        missing = required - caps
+        if missing:
+            results.append(CheckResult(
+                name=check_fn.__name__.replace("check_", ""),
+                status="skip",
+                message=(
+                    "Not run: this environment does not provide "
+                    f"{', '.join(sorted(missing))}"
+                ),
+                details={"required": sorted(required), "missing": sorted(missing)},
+            ))
+            continue
         try:
             results.append(check_fn(ctx))
         except Exception as exc:
@@ -1844,7 +2043,7 @@ def run_preflight(bucket: str = DEFAULT_BUCKET) -> tuple[int, list[CheckResult]]
 
 def _format_human(results: list[CheckResult]) -> str:
     lines = ["", "=" * 70, " Saturday SF Preflight ", "=" * 70, ""]
-    icons = {"ok": "[OK]  ", "warn": "[WARN]", "fail": "[FAIL]"}
+    icons = {"ok": "[OK]  ", "warn": "[WARN]", "fail": "[FAIL]", "skip": "[SKIP]"}
     for r in results:
         lines.append(f"{icons.get(r.status, '[?]   ')} {r.name:<32} {r.message}")
         if r.status == "fail" and r.details:

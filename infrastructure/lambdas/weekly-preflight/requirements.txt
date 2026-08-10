@@ -1,6 +1,19 @@
 # Lambda deps for weekly-preflight — minimal set.
 # boto3 and jmespath are available in the Lambda runtime.
 # sf_preflight.py is copied from the repo root during deploy.
-# ArcticDB/polygon/secrets deps are NOT needed: checks that require
-# them gracefully skip/fail with an explanatory message.
+#
+# nousergon-lib is NOT optional: sf_preflight.run_preflight() resolves the
+# prior trading day via nousergon_lib.trading_calendar in its PROLOGUE —
+# before the per-check try/except exists — so a missing pin is not a degraded
+# check, it is the whole gate returning status=ERROR. That is exactly what
+# halted ne-weekly-freshness-pipeline on 2026-08-10, the first Saturday the
+# I4494 gate actually fired (`ModuleNotFoundError: No module named
+# 'nousergon_lib'` out of _previous_trading_day_str). The earlier comment here
+# claimed the nousergon_lib-dependent checks "gracefully skip/fail" — true of
+# the four in-check imports, false of the prologue.
+#
+# ArcticDB/polygon/collectors deps remain absent BY DESIGN: the Lambda runs
+# only the LAMBDA_CAPABILITIES profile (AWS control plane), and every check
+# needing more is reported status="skip" rather than executed.
 aws-assume-role-lib
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.44
