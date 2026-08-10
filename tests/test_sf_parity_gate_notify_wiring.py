@@ -56,13 +56,17 @@ def test_parity_degraded_pass_shape_and_proceeds_to_publish(states):
     assert st["Next"] == "PublishParityDegraded"
 
 
-def test_only_parity_degraded_pass_sets_the_flag(states):
-    """SF-controlled: exactly one Pass state may write $.parity_degraded."""
-    writers = [
+def test_only_parity_degraded_passes_set_the_flag(states):
+    """SF-controlled: exactly TWO Pass states may write $.parity_degraded —
+    ParityDegraded (the post-join branch-degraded fold) and
+    ParityCompareDegraded (the compare stage's own failure), both added/
+    restructured by alpha-engine-config#6030. Anything else writing the flag
+    fails here."""
+    writers = sorted(
         name for name, st in states.items()
         if st.get("ResultPath") == "$.parity_degraded"
-    ]
-    assert writers == ["ParityDegraded"]
+    )
+    assert writers == ["ParityCompareDegraded", "ParityDegraded"]
 
 
 def test_publish_parity_degraded_has_no_stray_parameters_timeout(states):
@@ -76,8 +80,16 @@ def test_publish_parity_degraded_has_no_stray_parameters_timeout(states):
     assert "TimeoutSeconds" not in states["PublishParityDegraded"]["Parameters"]
 
 
-def test_publish_parity_degraded_proceeds_to_evaluator(states):
+def test_publish_parity_degraded_proceeds_to_compare_gate(states):
+    """alpha-engine-config#6030: the branch-degraded page proceeds to the
+    COMPARE gate (§2.3a — the join still runs and emits verdict UNKNOWN),
+    while the compare-degraded page proceeds to the Evaluator gate."""
     st = states["PublishParityDegraded"]
+    assert st["Next"] == "CheckSkipPitParityCompare"
+    (catch,) = st["Catch"]
+    assert catch["Next"] == "CheckSkipPitParityCompare"
+
+    st = states["PublishParityCompareDegraded"]
     assert st["Next"] == "CheckSkipEvaluator"
     (catch,) = st["Catch"]
     assert catch["Next"] == "CheckSkipEvaluator"

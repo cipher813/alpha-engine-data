@@ -941,61 +941,313 @@
         "name": "CheckSkipParity",
         "input": "{}"
       },
-      "id": 101,
+      "id": 472,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "TaskStateEntered",
+      "type": "ParallelStateEntered",
       "stateEnteredEventDetails": {
-        "name": "Parity",
+        "name": "ParityParallel",
         "input": "{}"
       },
-      "id": 102,
-      "timestamp": "2026-07-11T09:00:00Z"
-    },
-    {
-      "type": "TaskStateExited",
-      "stateExitedEventDetails": {
-        "name": "Parity",
-        "output": "{}"
-      },
-      "id": 103,
-      "timestamp": "2026-07-11T09:00:00Z"
-    },
-    {
-      "type": "TaskStateEntered",
-      "stateEnteredEventDetails": {
-        "name": "WaitForParity",
-        "input": "{}"
-      },
-      "id": 104,
-      "timestamp": "2026-07-11T09:00:00Z"
-    },
-    {
-      "type": "TaskStateExited",
-      "stateExitedEventDetails": {
-        "name": "WaitForParity",
-        "output": "{}"
-      },
-      "id": 105,
+      "id": 473,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
       "type": "ChoiceStateEntered",
       "stateEnteredEventDetails": {
-        "name": "CheckParityStatus",
+        "name": "CheckSkipPitParityLookahead",
         "input": "{}"
       },
-      "id": 106,
+      "id": 474,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "PitParityLookahead",
+        "input": "{}"
+      },
+      "id": 475,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
       "type": "PassStateEntered",
       "stateEnteredEventDetails": {
-        "name": "ExtractParityError",
+        "name": "InitPitParityLookaheadPollCount",
         "input": "{}"
       },
-      "id": 107,
+      "id": 476,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "WaitForPitParityLookahead",
+        "input": "{}"
+      },
+      "id": 477,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckPitParityLookaheadStatus",
+        "input": "{}"
+      },
+      "id": 478,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "PitParityLookaheadComplete",
+        "input": "{}"
+      },
+      "id": 479,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipPitParityWalkforward",
+        "input": "{}"
+      },
+      "id": 480,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "PitParityWalkforward",
+        "input": "{}"
+      },
+      "id": 481,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "InitPitParityWalkforwardPollCount",
+        "input": "{}"
+      },
+      "id": 482,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "WaitForPitParityWalkforward",
+        "input": "{}"
+      },
+      "id": 483,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckPitParityWalkforwardStatus",
+        "input": "{}"
+      },
+      "id": 484,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "PitParityWalkforwardDegraded",
+        "input": "{}"
+      },
+      "id": 485,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipParityReplay",
+        "input": "{}"
+      },
+      "id": 486,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "ParityReplay",
+        "input": "{}"
+      },
+      "id": 487,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "InitParityReplayPollCount",
+        "input": "{}"
+      },
+      "id": 488,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "WaitForParityReplay",
+        "input": "{}"
+      },
+      "id": 489,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckParityReplayStatus",
+        "input": "{}"
+      },
+      "id": 490,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "ParityReplayComplete",
+        "input": "{}"
+      },
+      "id": 491,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "AggregateParityBranchOutcomes",
+        "input": "{}"
+      },
+      "id": 492,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckParityBranchOutcomes",
+        "input": "{}"
+      },
+      "id": 493,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "ParityDegraded",
+        "input": "{}"
+      },
+      "id": 494,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "PublishParityDegraded",
+        "input": "{}"
+      },
+      "id": 495,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipPitParityCompare",
+        "input": "{}"
+      },
+      "id": 496,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "PitParityCompare",
+        "input": "{}"
+      },
+      "id": 497,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "InitPitParityComparePollCount",
+        "input": "{}"
+      },
+      "id": 498,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "WaitForPitParityCompare",
+        "input": "{}"
+      },
+      "id": 499,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckPitParityCompareStatus",
+        "input": "{}"
+      },
+      "id": 500,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "PitParityCompareComplete",
+        "input": "{}"
+      },
+      "id": 501,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckSkipEvaluator",
+        "input": "{}"
+      },
+      "id": 502,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "Evaluator",
+        "input": "{}"
+      },
+      "id": 503,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "TaskStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "WaitForEvaluator",
+        "input": "{}"
+      },
+      "id": 504,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "ChoiceStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "CheckEvaluatorStatus",
+        "input": "{}"
+      },
+      "id": 505,
+      "timestamp": "2026-07-11T09:00:00Z"
+    },
+    {
+      "type": "PassStateEntered",
+      "stateEnteredEventDetails": {
+        "name": "ExtractEvaluatorError",
+        "input": "{}"
+      },
+      "id": 506,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
@@ -1004,7 +1256,7 @@
         "name": "NormalizeFailureContext",
         "input": "{}"
       },
-      "id": 108,
+      "id": 507,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
@@ -1013,7 +1265,7 @@
         "name": "NormalizeFailureContextRepin",
         "input": "{}"
       },
-      "id": 109,
+      "id": 508,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
@@ -1022,7 +1274,7 @@
         "name": "NormalizeFailureContextRealLabel",
         "input": "{}"
       },
-      "id": 110,
+      "id": 509,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
@@ -1031,16 +1283,7 @@
         "name": "HandleFailure",
         "input": "{}"
       },
-      "id": 111,
-      "timestamp": "2026-07-11T09:00:00Z"
-    },
-    {
-      "type": "TaskStateExited",
-      "stateExitedEventDetails": {
-        "name": "HandleFailure",
-        "output": "{}"
-      },
-      "id": 112,
+      "id": 510,
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
@@ -1049,16 +1292,7 @@
         "name": "FailExecution",
         "input": "{}"
       },
-      "id": 113,
-      "timestamp": "2026-07-11T09:00:00Z"
-    },
-    {
-      "type": "ExecutionFailed",
-      "executionFailedEventDetails": {
-        "error": "PipelineFailure",
-        "cause": "..."
-      },
-      "id": 114,
+      "id": 511,
       "timestamp": "2026-07-11T09:00:00Z"
     }
   ]
