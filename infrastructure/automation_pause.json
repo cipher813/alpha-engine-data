@@ -16,7 +16,10 @@
     "DO-NOT-DELETE-AmazonInspectorEcrManagedRule": "AWS-managed",
     "non-eventbridge": "DLM policy-0047cfbfb7070a3b7 (nightly dashboard-box snapshot, 14d) and the two SSM associations (ae-patch-scan-only, ae-software-inventory, rate(1 day)) are kept: they are read-only or protective hygiene for the 24/7 box, not autonomous processes.",
     "alpha-engine-pipeline-watchdog-daily": "pipeline watchdog - un-paused per Brian ruling 2026-08-09 (config#6697): the only same-day trading-calendar-aware liveness detector for the three KEPT pipelines; the 8/5-8/6 postclose never-fired silence had no other automatic signal. Pages the independent watchdog-alerts topic. ALSO carries the weekly-SF silence deadman since config#6738 - that check was given THIS trigger rather than a new one of its own, so it needed no `pending` entry: a second schedule would have had to be born DISABLED under this ruling and then hand-enabled at the lift, leaving the 8/5-8/6 detection gap open for exactly as long as the outage that motivated it. One liveness surface, already un-paused.",
-    "alpha-engine-eod-snapshot-existence-check": "data-safety backstop for the kept postclose pipeline - same family as the kept eod-backstop/stop-trading entries; landing enabled per the 2026-08-09 continuous-work authorization, one-command reversible"
+    "alpha-engine-eod-snapshot-existence-check": "data-safety backstop for the kept postclose pipeline - same family as the kept eod-backstop/stop-trading entries; landing enabled per the 2026-08-09 continuous-work authorization, one-command reversible",
+    "alpha-engine-freshness-monitor-cron": "artifact freshness monitor - daily. Un-paused live 2026-08-10 as part of the scanner-cut turnover arc (freshness crons required to verify the top-20 cutover); `automation_pause.py --check` had been flagging this as unexpectedly-enabled since the live re-enable, because the manifest was never updated in the same session - alpha-engine-config-I6796",
+    "alpha-engine-freshness-monitor-historical-cron": "artifact freshness monitor - historical. Un-paused live 2026-08-10, same arc as the daily cron above - alpha-engine-config-I6796",
+    "alpha-engine-freshness-monitor-intraday-cron": "artifact freshness monitor - intraday. Un-paused live 2026-08-10, same arc as the daily cron above - alpha-engine-config-I6796"
   },
   "pending": {
     "_why": "Triggers that do not exist live yet but MUST be created DISABLED when they first appear. Brian's ruling covers 'everything else', which includes automation that lands after 2026-08-07 — but automation_pause.py --check requires every `paused` entry to exist live, so a not-yet-created name cannot go there without turning the check red. pause_state() reads BOTH blocks; --check requires existence only for `paused`. Move an entry up to `paused` once it exists live. Found by alpha-engine-config-I6620: nousergon-data#1207 declares three schedules that its (currently broken) deploy would have created ENABLED mid-pause.",
@@ -30,9 +33,6 @@
       "alpha-engine-canary-replay-thursday": "canary-replay drill dispatcher (spawns work)",
       "alpha-engine-daily-heal": "data-spot heal dispatcher (launches spot). CloudFormation-managed - State: DISABLED in alpha-engine-orchestration.yaml",
       "alpha-engine-eod-success-friday-shell-trigger": "Friday shell-run trigger (spawns work)",
-      "alpha-engine-freshness-monitor-cron": "artifact freshness monitor - daily",
-      "alpha-engine-freshness-monitor-historical-cron": "artifact freshness monitor - historical",
-      "alpha-engine-freshness-monitor-intraday-cron": "artifact freshness monitor - intraday",
       "alpha-engine-friday-shell-run-report": "Friday shell-run report",
       "alpha-engine-predictor-drift-check": "predictor drift check. CloudFormation-managed - State: DISABLED in alpha-engine-orchestration.yaml",
       "alpha-engine-predictor-health-check": "predictor health check. CloudFormation-managed - State: DISABLED in alpha-engine-orchestration.yaml",
