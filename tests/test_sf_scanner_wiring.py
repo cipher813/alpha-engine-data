@@ -130,13 +130,17 @@ class TestFailureIsolation:
         # (CheckSkipRegimeSubstrate), since RegimeSubstrate has no
         # scanner-board dependency; genuine downstream impact of a missing
         # board surfaces at SignalsEnvelope's own (blocking) Catch instead.
+        # alpha-engine-config#6722: the Catch now routes through
+        # MarkScannerDegraded before converging on CheckSkipRegimeSubstrate
+        # exactly as before.
         catches = states["Scanner"]["Catch"]
         assert len(catches) >= 1
         assert any(
-            c["Next"] == "CheckSkipRegimeSubstrate"
+            c["Next"] == "MarkScannerDegraded"
             and "States.ALL" in c["ErrorEquals"]
             for c in catches
         )
+        assert states["MarkScannerDegraded"]["Next"] == "CheckSkipRegimeSubstrate"
 
     def test_retry_only_on_lambda_service_errors(self, states):
         # Same shape as rationale-clustering / aggregate_costs —
@@ -175,7 +179,14 @@ class TestEdges:
         # Scanner remains the head of Branch A (config#3134: now reached
         # via its own CheckSkipScanner gate, which defaults to running it).
         par = sf["States"]["ResearchPredictorParallel"]
-        assert par["Branches"][0]["StartAt"] == "CheckSkipScanner"
+        # alpha-engine-config#6722: Branch A's StartAt is now
+        # InitResearchDegradedFlag (seeds $.research_degraded_local), which
+        # falls through to CheckSkipScanner unconditionally.
+        assert par["Branches"][0]["StartAt"] == "InitResearchDegradedFlag"
+        assert (
+            par["Branches"][0]["States"]["InitResearchDegradedFlag"]["Next"]
+            == "CheckSkipScanner"
+        )
 
     def test_data_phase1_success_path_routes_to_parallel(self, sf):
         status = sf["States"]["CheckDataPhase1Status"]
@@ -189,7 +200,14 @@ class TestEdges:
             "chain into Branch A so it runs parallel to PredictorTraining."
         )
         par = sf["States"]["ResearchPredictorParallel"]
-        assert par["Branches"][0]["StartAt"] == "CheckSkipScanner"
+        # alpha-engine-config#6722: Branch A's StartAt is now
+        # InitResearchDegradedFlag (seeds $.research_degraded_local), which
+        # falls through to CheckSkipScanner unconditionally.
+        assert par["Branches"][0]["StartAt"] == "InitResearchDegradedFlag"
+        assert (
+            par["Branches"][0]["States"]["InitResearchDegradedFlag"]["Next"]
+            == "CheckSkipScanner"
+        )
 
     def test_scanner_success_routes_to_regime_substrate_skip_gate(self, states):
         # config-I2515 Phase B: ThinkTankCoverage moved to run AFTER the RAG

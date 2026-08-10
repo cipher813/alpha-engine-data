@@ -232,6 +232,9 @@ def test_resultpath_threading_survives_to_check_degraded_outcome(sf, states):
     # The only states permitted to overwrite $.degraded_summary itself are
     # the OTHER degraded-flag setters (last-write-wins is the documented,
     # intentional convention — see SetDaemonDegradedFlag's own Comment).
+    # alpha-engine-config#6722 added SetMutexAcquireDegradedFlag (mutex
+    # acquire infra-error fail-open) and SetScannerDegradedFlag (weekday
+    # Scanner fail-open) as two more Option-A-shaped setters.
     overwriters = {
         name
         for name, st in states.items()
@@ -241,6 +244,8 @@ def test_resultpath_threading_survives_to_check_degraded_outcome(sf, states):
         "SetDeployDriftDegradedFlag",
         "SetDaemonDegradedFlag",
         "SetDataSpotDegradedFlag",
+        "SetMutexAcquireDegradedFlag",
+        "SetScannerDegradedFlag",
     }
 
 
