@@ -320,6 +320,7 @@ def test_handler_passes_the_cadence_role_filter_for_the_saturday_check():
     _tc_mod.last_closed_trading_day.side_effect = [
         date(2026, 5, 29),
         date(2026, 5, 29),
+        date(2026, 5, 29),  # failed-day checks' target lookup (config#6732)
     ]
     # _eod_window_seconds runs even on a skipped EOD check (the window is an
     # argument), and the autouse fixture resets side_effect but not
@@ -469,6 +470,7 @@ def test_handler_on_trading_day_checks_weekday_and_eod_skips_saturday():
         date(2026, 5, 26),  # pre-open call at now
         date(2026, 5, 27),  # synthetic 22:00 UTC call → returns today
         date(2026, 5, 26),  # preopen-buffer canary's target-day lookup
+        date(2026, 5, 26),  # failed-day checks' target lookup (config#6732)
     ]
     # EOD window calc: previous_trading_day(2026-05-27) → 2026-05-26 (Tue)
     _tc_mod.previous_trading_day.return_value = date(2026, 5, 26)
@@ -503,6 +505,7 @@ def test_handler_on_saturday_skips_weekday_and_eod():
     _tc_mod.last_closed_trading_day.side_effect = [
         date(2026, 5, 29),  # Friday close
         date(2026, 5, 29),  # synthetic post-close still Friday
+        date(2026, 5, 29),  # failed-day checks' target lookup (config#6732)
     ]
     now = _frozen_now(2026, 5, 30, 14, 0)
     fake_client = _make_sfn_client({})
@@ -528,6 +531,7 @@ def test_handler_on_sunday_checks_saturday_sf_alone():
     _tc_mod.last_closed_trading_day.side_effect = [
         date(2026, 5, 29),  # Friday close
         date(2026, 5, 29),  # synthetic post-close still Friday (Sunday is not a session)
+        date(2026, 5, 29),  # failed-day checks' target lookup (config#6732)
     ]
     now = _frozen_now(2026, 5, 31, 14, 0)
     fake_client = _make_sfn_client({})  # no Saturday SF executions in last 7d → alert
@@ -647,6 +651,7 @@ def test_handler_post_holiday_eod_does_not_false_alert():
         date(2026, 5, 22),  # at 14:00 UTC pre-open, last close was Fri (Mon was holiday)
         date(2026, 5, 26),  # synthetic 22:00 UTC post-close, today is the session
         date(2026, 5, 22),  # preopen-buffer canary's target-day lookup
+        date(2026, 5, 22),  # failed-day checks' target lookup (config#6732)
     ]
     # EOD prev_trading_day → Fri 5/22
     _tc_mod.previous_trading_day.return_value = date(2026, 5, 22)
@@ -690,6 +695,7 @@ def test_handler_post_holiday_eod_alerts_when_friday_eod_missing():
         date(2026, 5, 22),
         date(2026, 5, 26),
         date(2026, 5, 22),  # preopen-buffer canary's target-day lookup
+        date(2026, 5, 22),  # failed-day checks' target lookup (config#6732)
     ]
     _tc_mod.previous_trading_day.return_value = date(2026, 5, 22)
     now = _frozen_now(2026, 5, 26, 14, 0)
@@ -998,6 +1004,7 @@ def test_handler_includes_preopen_buffer_check_in_summary():
         date(2026, 6, 2),  # pre-open call at now
         date(2026, 6, 3),  # synthetic 22:00 UTC call → today
         date(2026, 6, 2),  # preopen-buffer canary's target-day lookup
+        date(2026, 6, 2),  # failed-day checks' target lookup (config#6732)
     ]
     _tc_mod.previous_trading_day.return_value = date(2026, 6, 2)
     now = datetime(2026, 6, 3, 14, 0, tzinfo=timezone.utc)  # Wednesday
@@ -1023,3 +1030,170 @@ def test_handler_includes_preopen_buffer_check_in_summary():
     # same WKD_ARN rows for the canary's SUCCEEDED-only query too, but
     # those rows have no "stopDate" key → no data → deferred, not alerted.
     assert pbc["alert_emitted"] is False
+
+
+# ── _check_failed_day — prior-day failed-run check (config#6732) ─────────
+#
+# sf-pipeline-policy §4.1: independent of the SF's own notifier, sensitive
+# to started-but-never-succeeded. Zero-execution days belong to the
+# liveness checks; DEGRADED-marker days are Option-A visible degrades and
+# must not double-page; everything else without a SUCCEEDED execution
+# pages at severity=error (marker UNKNOWN ≠ pass).
+
+import json as _json
+
+
+class _FakeNoSuchKey(Exception):
+    def __init__(self):
+        super().__init__("NoSuchKey")
+        self.response = {"Error": {"Code": "NoSuchKey"}}
+
+
+def _make_status_aware_sfn_client(rows_by_status: dict) -> MagicMock:
+    """Unlike _make_sfn_client, honors statusFilter — required here because
+    _statuses_for_day's SUCCEEDED/FAILED distinction IS the check."""
+    client = MagicMock()
+
+    def _list_executions(**kwargs):
+        rows = rows_by_status.get(kwargs.get("statusFilter"), [])
+        return {"executions": rows, "nextToken": None}
+
+    client.list_executions.side_effect = _list_executions
+    return client
+
+
+def _make_s3_marker_client(*, marker: dict | None = None, error: Exception | None = None) -> MagicMock:
+    s3 = MagicMock()
+    if error is not None:
+        s3.get_object.side_effect = error
+    else:
+        body = MagicMock()
+        body.read.return_value = _json.dumps(marker).encode()
+        s3.get_object.return_value = {"Body": body}
+    return s3
+
+
+_TARGET = date(2026, 8, 5)
+_TARGET_START = datetime(2026, 8, 5, 12, 20, tzinfo=timezone.utc)  # 05:20 PT
+
+
+def test_failed_day_pages_when_all_executions_failed_and_no_marker():
+    client = _make_status_aware_sfn_client({"FAILED": [{"startDate": _TARGET_START}]})
+    s3 = _make_s3_marker_client(error=_FakeNoSuchKey())
+    result = index._check_failed_day(
+        sf_label="Weekday SF", sf_arn=WKD_ARN,
+        pipeline_name="ne-preopen-trading-pipeline",
+        target_date=_TARGET, client=client, s3_client=s3,
+    )
+    assert result.alert_emitted is True
+    assert result.succeeded_on_day == 0
+    assert result.marker_status == "ABSENT"
+    assert _alerts_mod.publish.call_args.kwargs["severity"] == "error"
+    msg = _alerts_mod.publish.call_args.kwargs["message"]
+    assert "none SUCCEEDED" in msg
+    assert "no completion marker" in msg
+
+
+def test_failed_day_quiet_on_degraded_marker_option_a():
+    """Option-A (config#6692): a deliberate degraded terminal ends FAILED
+    with a DEGRADED marker — status-keyed watchers engaged; no double-page."""
+    client = _make_status_aware_sfn_client({"FAILED": [{"startDate": _TARGET_START}]})
+    s3 = _make_s3_marker_client(marker={"status": "DEGRADED"})
+    result = index._check_failed_day(
+        sf_label="Weekday SF", sf_arn=WKD_ARN,
+        pipeline_name="ne-preopen-trading-pipeline",
+        target_date=_TARGET, client=client, s3_client=s3,
+    )
+    assert result.alert_emitted is False
+    assert result.marker_status == "DEGRADED"
+    _alerts_mod.publish.assert_not_called()
+
+
+def test_failed_day_quiet_when_day_succeeded_and_never_reads_marker():
+    client = _make_status_aware_sfn_client({
+        "SUCCEEDED": [{"startDate": _TARGET_START}],
+        "FAILED": [{"startDate": _TARGET_START + timedelta(minutes=5)}],
+    })
+    s3 = MagicMock()
+    result = index._check_failed_day(
+        sf_label="Weekday SF", sf_arn=WKD_ARN,
+        pipeline_name="ne-preopen-trading-pipeline",
+        target_date=_TARGET, client=client, s3_client=s3,
+    )
+    assert result.alert_emitted is False
+    assert result.succeeded_on_day == 1
+    s3.get_object.assert_not_called()
+    _alerts_mod.publish.assert_not_called()
+
+
+def test_failed_day_skips_zero_execution_day_never_fired_is_livenesss_case():
+    client = _make_status_aware_sfn_client({})
+    result = index._check_failed_day(
+        sf_label="EOD SF", sf_arn=EOD_ARN,
+        pipeline_name="ne-postclose-trading-pipeline",
+        target_date=_TARGET, client=client, s3_client=MagicMock(),
+    )
+    assert result.alert_emitted is False
+    assert result.executions_on_day == 0
+    assert "liveness" in result.skip_reason
+    _alerts_mod.publish.assert_not_called()
+
+
+def test_failed_day_unreadable_marker_pages_unknown_is_not_pass():
+    client = _make_status_aware_sfn_client({"TIMED_OUT": [{"startDate": _TARGET_START}]})
+    s3 = _make_s3_marker_client(error=RuntimeError("s3 5xx"))
+    result = index._check_failed_day(
+        sf_label="EOD SF", sf_arn=EOD_ARN,
+        pipeline_name="ne-postclose-trading-pipeline",
+        target_date=_TARGET, client=client, s3_client=s3,
+    )
+    assert result.alert_emitted is True
+    assert result.marker_status == "UNREADABLE"
+    assert _alerts_mod.publish.call_args.kwargs["severity"] == "error"
+
+
+def test_failed_day_non_degraded_marker_status_still_pages():
+    """A marker whose status is not DEGRADED on a day with zero SUCCEEDED
+    executions is contradictory state — page, do not trust it."""
+    client = _make_status_aware_sfn_client({"ABORTED": [{"startDate": _TARGET_START}]})
+    s3 = _make_s3_marker_client(marker={"status": "SUCCESS"})
+    result = index._check_failed_day(
+        sf_label="Weekday SF", sf_arn=WKD_ARN,
+        pipeline_name="ne-preopen-trading-pipeline",
+        target_date=_TARGET, client=client, s3_client=s3,
+    )
+    assert result.alert_emitted is True
+    assert result.marker_status == "SUCCESS"
+
+
+def test_failed_day_running_execution_warns_not_errors():
+    client = _make_status_aware_sfn_client({
+        "RUNNING": [{"startDate": _TARGET_START}],
+        "FAILED": [{"startDate": _TARGET_START}],
+    })
+    result = index._check_failed_day(
+        sf_label="EOD SF", sf_arn=EOD_ARN,
+        pipeline_name="ne-postclose-trading-pipeline",
+        target_date=_TARGET, client=client, s3_client=MagicMock(),
+    )
+    assert result.alert_emitted is True
+    assert _alerts_mod.publish.call_args.kwargs["severity"] == "warning"
+
+
+def test_failed_day_ignores_executions_from_other_days():
+    """A FAILED execution from the day AFTER the target (e.g. today's
+    in-flight morning) must not condemn the target day."""
+    next_day_start = datetime(2026, 8, 6, 12, 20, tzinfo=timezone.utc)
+    client = _make_status_aware_sfn_client({
+        "FAILED": [{"startDate": next_day_start}, {"startDate": _TARGET_START}],
+        "SUCCEEDED": [{"startDate": _TARGET_START + timedelta(minutes=40)}],
+    })
+    s3 = MagicMock()
+    result = index._check_failed_day(
+        sf_label="Weekday SF", sf_arn=WKD_ARN,
+        pipeline_name="ne-preopen-trading-pipeline",
+        target_date=_TARGET, client=client, s3_client=s3,
+    )
+    assert result.alert_emitted is False
+    assert result.succeeded_on_day == 1
+    assert result.executions_on_day == 2  # target-day rows only
