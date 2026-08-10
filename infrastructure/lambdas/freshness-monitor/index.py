@@ -485,6 +485,20 @@ PRODUCER_SUPPRESSION_MAX_DAYS = int(
     os.environ.get("PRODUCER_SUPPRESSION_MAX_DAYS", "14")
 )
 PRODUCER_DISABLED_SINCE_KEY = "_freshness_monitor/producer_disabled_since.json"
+# alpha-engine-config-I6817 D4. The suppression path above answers "is THIS
+# artifact's producer off?" — it can only see triggers some registry row names.
+# The class defect is wider: a schedule switched off under a pause has no
+# release path, and NOTHING in the fleet enumerates what is currently off. The
+# 2026-08-07 pause disabled 23 rules; `alpha-research-thinktank-daily` stayed
+# off for three days after the condition that justified it was resolved,
+# because its tracking issue was CLOSED and no surface listed the rule.
+#
+# So this key is the inventory, written every daily sweep: every disabled
+# trigger in the account, whether or not any artifact row references it, with
+# how long it has been off. It is deliberately DATA and not an alert — deciding
+# whether a given pause has a release item needs the backlog, which this Lambda
+# has no credential for and should not. The join is a separate sweep's job.
+DISABLED_PRODUCER_INVENTORY_KEY = "_freshness_monitor/disabled_producers.json"
 
 _PRODUCER_SURFACES = ("events", "scheduler")
 
@@ -637,6 +651,130 @@ def apply_producer_suppression(
             "suppressed": suppressed,
         }
     return out
+
+
+def enumerate_disabled_schedules(
+    events_client: Any = None,
+    scheduler_client: Any = None,
+) -> list[dict[str, str]]:
+    """Every DISABLED EventBridge rule and EventBridge Scheduler schedule.
+
+    Unlike :func:`resolve_disabled_producers`, this takes no trigger set — it
+    walks the account. That is the point: a rule nothing in ARTIFACT_REGISTRY
+    references is exactly the one no surface can currently see, and the two
+    probes paused on 2026-08-07 (`alpha-engine-router-exposure-probe-15min`,
+    `alpha-engine-ssm-reachability-probe-5min`) are both in that class.
+
+    A surface that cannot be enumerated is reported as an ERROR row rather
+    than omitted. Silence here would reproduce the defect this exists to
+    close — an empty inventory must mean "nothing is disabled", never
+    "the walk failed".
+    """
+    out: list[dict[str, str]] = []
+    try:
+        client = events_client or boto3.client("events")
+        paginator = client.get_paginator("list_rules")
+        for page in paginator.paginate():
+            for rule in page.get("Rules", []):
+                if rule.get("State") == "DISABLED":
+                    out.append({
+                        "trigger": f"events:{rule['Name']}",
+                        "name": rule["Name"],
+                        "surface": "events",
+                        "schedule": rule.get("ScheduleExpression", ""),
+                    })
+    except Exception as exc:  # noqa: BLE001 — recorded, never silently empty
+        logger.error(
+            "DISABLED_INVENTORY_ENUMERATION_FAILED for events (%s: %s) — the "
+            "inventory is INCOMPLETE and says so", type(exc).__name__, exc,
+        )
+        out.append({"trigger": "", "name": "", "surface": "events",
+                    "schedule": "", "error": f"{type(exc).__name__}: {exc}"})
+    try:
+        client = scheduler_client or boto3.client("scheduler")
+        paginator = client.get_paginator("list_schedules")
+        for page in paginator.paginate():
+            for sch in page.get("Schedules", []):
+                if sch.get("State") == "DISABLED":
+                    out.append({
+                        "trigger": f"scheduler:{sch['Name']}",
+                        "name": sch["Name"],
+                        "surface": "scheduler",
+                        "schedule": sch.get("ScheduleExpression", ""),
+                    })
+    except Exception as exc:  # noqa: BLE001 — recorded, never silently empty
+        logger.error(
+            "DISABLED_INVENTORY_ENUMERATION_FAILED for scheduler (%s: %s) — "
+            "the inventory is INCOMPLETE and says so", type(exc).__name__, exc,
+        )
+        out.append({"trigger": "", "name": "", "surface": "scheduler",
+                    "schedule": "", "error": f"{type(exc).__name__}: {exc}"})
+    return out
+
+
+def write_disabled_producer_inventory(
+    s3_client: Any,
+    now: datetime,
+    referenced_triggers: set[str],
+    events_client: Any = None,
+    scheduler_client: Any = None,
+) -> dict[str, Any]:
+    """Write the account-wide disabled-schedule inventory (config-I6817 D4).
+
+    Reuses ``producer_disabled_since`` for the age of triggers the suppression
+    path already tracks, and stamps today for the rest. ``referenced`` says
+    whether ANY artifact row names the trigger — an unreferenced disabled rule
+    is invisible to every other surface in the fleet, which is why the flag is
+    on the row rather than left to the consumer to derive.
+
+    Returns the payload. Never raises: this is an observability side effect and
+    must not take down a sweep whose alerting already ran.
+    """
+    today = now.date().isoformat()
+    rows = enumerate_disabled_schedules(events_client, scheduler_client)
+    since = _load_producer_disabled_since(s3_client)
+    incomplete = any(r.get("error") for r in rows)
+    for row in rows:
+        if row.get("error"):
+            continue
+        first_seen = since.get(row["trigger"], today)
+        row["disabled_since"] = first_seen
+        try:
+            row["days_disabled"] = (
+                now.date() - date.fromisoformat(first_seen)
+            ).days
+        except ValueError:
+            row["days_disabled"] = 0
+        row["referenced_by_registry"] = row["trigger"] in referenced_triggers
+    payload = {
+        "generated_at": now.isoformat(),
+        "complete": not incomplete,
+        "disabled_count": len([r for r in rows if not r.get("error")]),
+        "unreferenced_count": len(
+            [r for r in rows
+             if not r.get("error") and not r.get("referenced_by_registry")]
+        ),
+        "rows": rows,
+    }
+    try:
+        s3_client.put_object(
+            Bucket=REGISTRY_BUCKET,
+            Key=DISABLED_PRODUCER_INVENTORY_KEY,
+            Body=json.dumps(payload, indent=2).encode(),
+            ContentType="application/json",
+        )
+        logger.info(
+            "disabled-producer inventory: %d disabled (%d unreferenced by any "
+            "artifact row), complete=%s",
+            payload["disabled_count"], payload["unreferenced_count"],
+            payload["complete"],
+        )
+    except Exception as exc:  # noqa: BLE001 — see docstring; the ERROR is the surface
+        logger.error(
+            "DISABLED_INVENTORY_WRITE_FAILED (non-fatal, the sweep's alerting "
+            "already ran): %s: %s", type(exc).__name__, exc,
+        )
+    return payload
 
 
 def _load_prev_miss_counts(s3_client: Any) -> dict[str, int]:
@@ -2093,6 +2231,15 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 for a, v in suppression_by_id.items()
             ),
         )
+
+    # config-I6817 D4 — the account-wide inventory, written every daily sweep.
+    # Distinct from suppression above: that answers "is this row's producer
+    # off?", this answers "what is off at all?", including schedules no
+    # artifact row names. Written before the probe pass so a pass that raises
+    # still leaves the inventory current.
+    write_disabled_producer_inventory(
+        s3, now, set(producer_trigger_by_id.values())
+    )
 
     pairs, alerted, dispatched, per_spec_exceptions, miss_counts = _run_probe_pass(
         s3, specs, recovery_by_id, now, prev_miss_counts,

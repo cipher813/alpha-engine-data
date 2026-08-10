@@ -2705,3 +2705,141 @@ def test_check_results_row_defaults_are_inert_without_suppression(fixed_now):
     assert row["alert_suppressed"] is False
     assert row["producer_trigger"] is None
     assert row["producer_disabled_since"] is None
+
+
+# ── config-I6817 D4: the account-wide disabled-schedule inventory ───────────
+#
+# The 2026-08-07 pause disabled 23 EventBridge rules. `alpha-research-thinktank
+# -daily` then stayed off for three days after the provider-balance condition
+# that justified it was resolved, because I6617 was CLOSED and NO SURFACE
+# ANYWHERE listed which rules were off. The suppression path could not have
+# caught it: it only walks triggers some ARTIFACT_REGISTRY row names.
+
+
+class _FakeEventsPaginator:
+    def __init__(self, pages):
+        self._pages = pages
+
+    def paginate(self):
+        return iter(self._pages)
+
+
+class _FakeEvents:
+    def __init__(self, rules, raises=False):
+        self._rules = rules
+        self._raises = raises
+
+    def get_paginator(self, _name):
+        if self._raises:
+            raise RuntimeError("AccessDenied enumerating rules")
+        return _FakeEventsPaginator([{"Rules": self._rules}])
+
+
+class _FakeScheduler:
+    def __init__(self, schedules=None):
+        self._schedules = schedules or []
+
+    def get_paginator(self, _name):
+        return _FakeEventsPaginator([{"Schedules": self._schedules}])
+
+
+def test_inventory_enumerates_disabled_rules_no_registry_row_names():
+    """The load-bearing case. A disabled rule that no artifact row references
+    is invisible to every other surface in the fleet — both probes paused on
+    2026-08-07 are in that class."""
+    import importlib
+    import index
+    importlib.reload(index)
+    events = _FakeEvents([
+        {"Name": "alpha-research-thinktank-daily", "State": "DISABLED",
+         "ScheduleExpression": "cron(30 14 * * ? *)"},
+        {"Name": "alpha-engine-ssm-reachability-probe-5min", "State": "DISABLED",
+         "ScheduleExpression": "rate(5 minutes)"},
+        {"Name": "alpha-engine-saturday", "State": "ENABLED",
+         "ScheduleExpression": "cron(0 9 * * 6 *)"},
+    ])
+    rows = index.enumerate_disabled_schedules(events, _FakeScheduler())
+    names = {r["name"] for r in rows}
+    assert names == {
+        "alpha-research-thinktank-daily",
+        "alpha-engine-ssm-reachability-probe-5min",
+    }, "ENABLED rules must not appear; both DISABLED ones must"
+
+
+def test_an_unenumerable_surface_is_an_error_row_never_an_empty_inventory():
+    """An empty inventory must mean 'nothing is disabled', never 'the walk
+    failed' — that conflation is the defect this whole feature exists to
+    close, reproduced one level up."""
+    import importlib
+    import index
+    importlib.reload(index)
+    rows = index.enumerate_disabled_schedules(
+        _FakeEvents([], raises=True), _FakeScheduler()
+    )
+    errs = [r for r in rows if r.get("error")]
+    assert errs, "a failed enumeration produced no error row — silent empty"
+    assert "AccessDenied" in errs[0]["error"]
+
+
+def test_the_payload_flags_rows_no_artifact_row_references(monkeypatch):
+    import importlib
+    import index
+    importlib.reload(index)
+    events = _FakeEvents([
+        {"Name": "alpha-research-thinktank-daily", "State": "DISABLED",
+         "ScheduleExpression": "cron(30 14 * * ? *)"},
+        {"Name": "alpha-engine-router-exposure-probe-15min", "State": "DISABLED",
+         "ScheduleExpression": "rate(15 minutes)"},
+    ])
+    monkeypatch.setattr(
+        index, "_load_producer_disabled_since",
+        lambda _s: {"events:alpha-research-thinktank-daily": "2026-08-07"},
+    )
+
+    class _S3:
+        def __init__(self):
+            self.put = None
+
+        def put_object(self, **kw):
+            self.put = kw
+
+    s3 = _S3()
+    now = datetime(2026, 8, 10, tzinfo=timezone.utc)
+    payload = index.write_disabled_producer_inventory(
+        s3, now, {"events:alpha-research-thinktank-daily"}, events, _FakeScheduler()
+    )
+
+    assert payload["complete"] is True
+    assert payload["disabled_count"] == 2
+    assert payload["unreferenced_count"] == 1, (
+        "the router-exposure probe is named by no artifact row and must be "
+        "counted as unreferenced — that is the class the thinktank rule's "
+        "three-day overrun belongs to"
+    )
+    by_name = {r["name"]: r for r in payload["rows"]}
+    tt = by_name["alpha-research-thinktank-daily"]
+    assert tt["disabled_since"] == "2026-08-07"
+    assert tt["days_disabled"] == 3, "age must come from producer_disabled_since"
+    assert tt["referenced_by_registry"] is True
+    assert by_name["alpha-engine-router-exposure-probe-15min"][
+        "referenced_by_registry"] is False
+    assert s3.put is not None, "the inventory was not written"
+    assert s3.put["Key"] == index.DISABLED_PRODUCER_INVENTORY_KEY
+
+
+def test_a_failed_write_does_not_take_down_the_sweep():
+    """This is an observability side effect. The sweep's alerting has already
+    run by the time it is called; raising here would trade a real page for a
+    bookkeeping failure."""
+    import importlib
+    import index
+    importlib.reload(index)
+    class _S3:
+        def put_object(self, **kw):
+            raise RuntimeError("s3 down")
+
+    payload = index.write_disabled_producer_inventory(
+        _S3(), datetime(2026, 8, 10, tzinfo=timezone.utc), set(),
+        _FakeEvents([]), _FakeScheduler(),
+    )
+    assert payload["disabled_count"] == 0
