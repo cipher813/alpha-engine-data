@@ -8,8 +8,16 @@ launch.
 
 The Lambda runs read-only API calls (IAM SimulatePrincipalPolicy, Lambda
 GetFunctionConfiguration, CloudWatch GetMetricStatistics, Step Functions
-DescribeStateMachine) and zero-cost static analysis. ArcticDB/Polygon
-checks gracefully skip (no VPC/database access from this Lambda).
+DescribeStateMachine) and zero-cost static analysis.
+
+Check selection is by CAPABILITY, not by hope. This Lambda declares
+``sf_preflight.LAMBDA_CAPABILITIES`` (the AWS control plane and nothing
+else); checks needing ArcticDB, the repo's collector modules, a Polygon key,
+or sibling checkouts on local disk are reported status="skip" and excluded
+from the failure count. Before 2026-08-10 this docstring claimed those checks
+"gracefully skip" while the handler in fact ran the FULL profile — they
+returned status="fail" (ModuleNotFoundError / "not checked out as sibling"),
+which would have halted the Saturday pipeline by construction.
 
 Usage:
     Invoked by Step Functions. Returns:
@@ -60,7 +68,9 @@ def handler(event: dict, context) -> dict:
         }
 
     try:
-        n_fail, results = sfp.run_preflight(bucket=bucket)
+        n_fail, results = sfp.run_preflight(
+            bucket=bucket, capabilities=sfp.LAMBDA_CAPABILITIES
+        )
     except Exception as exc:
         return {
             "status": "ERROR",
@@ -72,6 +82,8 @@ def handler(event: dict, context) -> dict:
     result_dicts = [asdict(r) for r in results]
     fail_results = [r for r in result_dicts if r.get("status") == "fail"]
     warn_results = [r for r in result_dicts if r.get("status") == "warn"]
+    skip_results = [r for r in result_dicts if r.get("status") == "skip"]
+    ran_count = len(result_dicts) - len(skip_results)
 
     if n_fail > 0:
         return {
@@ -79,7 +91,25 @@ def handler(event: dict, context) -> dict:
             "has_violation": True,
             "fail_count": n_fail,
             "warn_count": len(warn_results),
+            "skip_count": len(skip_results),
+            "ran_count": ran_count,
             "failures": [r["name"] for r in fail_results],
+            "results": result_dicts,
+        }
+
+    # A gate that ran ZERO checks is not a pass — it is an unobserved
+    # system reporting green (principles.md §2.7). Fail closed: this can
+    # only happen if CHECKS or CHECK_CAPABILITIES drifted such that no
+    # check is eligible under LAMBDA_CAPABILITIES.
+    if ran_count == 0:
+        return {
+            "status": "ERROR",
+            "has_violation": True,
+            "error": (
+                "preflight ran 0 checks — every check was skipped for missing "
+                "capabilities; the gate observed nothing"
+            ),
+            "skip_count": len(skip_results),
             "results": result_dicts,
         }
 
@@ -87,5 +117,7 @@ def handler(event: dict, context) -> dict:
         "status": "OK",
         "has_violation": False,
         "warn_count": len(warn_results),
+        "skip_count": len(skip_results),
+        "ran_count": ran_count,
         "results": result_dicts,
     }

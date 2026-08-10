@@ -54,6 +54,10 @@ python3 -c "import ast; ast.parse(open('${REPO_ROOT}/sf_preflight.py').read()); 
 # ----- Handler unit tests (shared gate) -------------------------------------
 source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
 run_handler_tests "${SCRIPT_DIR}" boto3
+# NOTE: run_handler_tests returns 0 when the lambda has no test_handler.py.
+# This lambda had none until 2026-08-10, so this gate reported green on a
+# function that could not execute a line of its own handler. Keep
+# test_handler.py present; deleting it silently disables this gate.
 
 # ----- 1. Package: copy sf_preflight.py + handler + deps --------------------
 
@@ -171,6 +175,50 @@ if ! $DRY_RUN; then
   fi
 else
   echo "DRY: publish-version + ensure 'live' alias for ${FUNCTION_NAME}"
+fi
+
+# ----- 6. Post-deploy smoke invoke (BLOCKING) --------------------------------
+# The gate's whole job is to run BEFORE the pipeline spends money, once a week.
+# Nothing else executes this code, so a packaging defect stays invisible from
+# the merge until the following Saturday — which is exactly what happened on
+# 2026-08-10 (`No module named 'nousergon_lib'`: sf_preflight.py was copied
+# into the zip but nousergon-lib was never in requirements.txt). Unit tests
+# cannot see it: they stub sf_preflight and run against the repo venv, where
+# every import resolves.
+#
+# So invoke the alias we just published, against the REAL runtime, and fail
+# the deploy on status=ERROR (handler could not execute — packaging, IAM, or
+# import defect). status=FAIL is a genuine preflight violation about system
+# state, not about this code: report it loudly and let the deploy succeed,
+# since blocking the deploy would block the fix for the very violation.
+# The handler is strictly read-only (Describe/Get/Simulate), so invoking it
+# on every deploy has no side effects and costs a sub-second Lambda run.
+if ! $DRY_RUN; then
+  echo "Smoke-invoking ${FUNCTION_NAME}:live..."
+  RESP=$(mktemp)
+  aws lambda invoke --function-name "${FUNCTION_NAME}:live" \
+    --cli-binary-format raw-in-base64-out --payload '{}' \
+    --region "${REGION}" "${RESP}" >/dev/null
+  SMOKE_STATUS=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('status','MALFORMED'))" "${RESP}")
+  echo "  smoke status: ${SMOKE_STATUS}"
+  case "${SMOKE_STATUS}" in
+    OK)
+      python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(f\"  ran {d.get('ran_count')} check(s), {d.get('skip_count')} skipped, {d.get('warn_count')} warning(s)\")" "${RESP}"
+      ;;
+    FAIL)
+      echo "  ⚠ preflight reports a genuine violation (system state, not this deploy):"
+      python3 -c "import json,sys; print('   ', json.load(open(sys.argv[1])).get('failures'))" "${RESP}"
+      ;;
+    *)
+      echo "  ✗ handler could not execute — the deployed gate is broken:"
+      cat "${RESP}"; echo ""
+      rm -f "${RESP}"
+      exit 1
+      ;;
+  esac
+  rm -f "${RESP}"
+else
+  echo "DRY: smoke-invoke ${FUNCTION_NAME}:live and fail on status=ERROR"
 fi
 
 echo "✓ ${FUNCTION_NAME} deployed."
