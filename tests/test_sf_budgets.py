@@ -100,7 +100,10 @@ SSM_STAGE_NAMES = [
     "Backtester",
     "PredictorBacktest",
     "PortfolioOptimizerBacktest",
-    "Parity",
+    "PitParityLookahead",
+    "PitParityWalkforward",
+    "ParityReplay",
+    "PitParityCompare",
     "Evaluator",
     "SaturdayHealthCheck",
     "WeeklySubstrateHealthCheck",
@@ -151,8 +154,17 @@ class TestSsmExecutionTimeoutPins:
     def test_portfolio_optimizer_backtest(self):
         self._check("PortfolioOptimizerBacktest")
 
-    def test_parity(self):
-        self._check("Parity")
+    def test_pit_parity_lookahead(self):
+        self._check("PitParityLookahead")
+
+    def test_pit_parity_walkforward(self):
+        self._check("PitParityWalkforward")
+
+    def test_parity_replay(self):
+        self._check("ParityReplay")
+
+    def test_pit_parity_compare(self):
+        self._check("PitParityCompare")
 
     def test_evaluator(self):
         self._check("Evaluator")

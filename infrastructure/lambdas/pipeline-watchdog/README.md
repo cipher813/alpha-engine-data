@@ -2,7 +2,8 @@
 
 Phase 4 of the pipeline-reporting-revamp arc (ROADMAP L3050). Daily
 NYSE-trading-day-aware watchdog for the 3 Alpha Engine Step Functions, plus
-(alpha-engine-config#2412) a preopen schedule-buffer canary.
+(alpha-engine-config#2412) a preopen schedule-buffer canary and
+(alpha-engine-config#6738) the weekly-SF silence deadman.
 
 ## What it does
 
@@ -45,12 +46,56 @@ execution and alerts BEFORE the buffer is consumed again:
 All thresholds are evaluated in `America/Los_Angeles` via `zoneinfo`
 (DST-correct year-round; market open is a fixed 06:30 PT local-clock time).
 Reuses the same `WATCHDOG_SNS_TOPIC_ARN` + Telegram fan-out as the 3 checks
-above — no new channel. Deliberately does NOT filter by `pipeline_role`
-(would need `states:DescribeExecution`, which this Lambda's IAM role does
-not currently grant — see the PR body for the live AccessDeniedException
-this already causes on the Saturday-SF role-filtered path); instead uses
-the earliest-started SUCCEEDED execution per PT calendar day as the proxy
-for "the scheduled run".
+above — no new channel. Does NOT filter by `pipeline_role`; it uses the
+earliest-started SUCCEEDED execution per PT calendar day as the proxy for
+"the scheduled run".
+
+> **Corrected 2026-08-09 (config#6738).** This paragraph used to say the
+> role filter was impossible because the exec role lacked
+> `states:DescribeExecution`. That is no longer true: `iam-policy.json`
+> carries a `DescribeSFExecutions` statement and the **live** role was
+> measured to carry it too. Not filtering here is now a cost choice (one
+> `DescribeExecution` per row of a 14-day walk), not a permission
+> constraint — revisit under `alpha-engine-config-I6748`.
+
+## Weekly-SF silence deadman (alpha-engine-config#6738)
+
+A 5th check, run on **every** calendar day. The Saturday-SF check above asks
+"did the weekly cron fire at all in 7 days". This asks the per-day question
+that went unanswered on 2026-08-05/06: for **every run-slot the declaration
+expects**, does a matching execution exist?
+
+- Reads the declared cadence from SSM
+  `/alpha-engine/weekly-sf/exercise-cadence` — the same parameter
+  `step_function_eod.json`'s `ReadExerciseCadence` task reads at execution
+  time, so the detector's expectation is provably the launcher's behaviour.
+- Derives every expected slot over a trailing 5 days and classifies each:
+  `OK` · `GATED_OFF` (the declaration does not expect this slot — reported,
+  never conflated with silence) · `CRITICAL` (expected, absent → pages).
+- **Evaluates through YESTERDAY, not today.** Today's exercise slot is chained
+  off today's ~20:00 UTC postclose, hours after the 14:00 UTC cron; evaluating
+  today would page on every trading day. Same retrospective discipline as the
+  EOD window and the preopen canary.
+- Dedup is keyed on the **silent slot** (`role`+`day`) with a 7-day window, so
+  each genuinely new silent day pages exactly once even though it stays
+  visible in the look-back for four more firings.
+- Slot derivation is **imported** from `scripts/weekly_sf_silence_deadman.py`
+  (packaged flat into the zip by `deploy.sh`, like `flow_doctor_telegram.py`),
+  so the scheduled check and the manual rerun
+  (`./scripts/weekly_sf_silence_deadman.py --live`) cannot disagree.
+- Deliberately **not** rebuilt on `AWS/States ExecutionsStarted`: that metric
+  has no `pipeline_role` dimension, so it cannot tell a gated-off day from a
+  dead one — which is why the prior CloudWatch deadman could never fire
+  (config#5599; alarm deleted 2026-08-09).
+
+**IAM (operator-gated).** The cadence read needs
+`ssm:GetParameter` on that parameter — codified in `iam-policy.json`, applied
+only by an operator (`deploy.sh --apply-iam`), because
+`github-actions-lambda-deploy` has no `iam:PutRolePolicy` by design. Until it
+is applied the check reports `checked=false` with a `degraded_reason` and
+pages "DEGRADED: cannot read …" naming the exact command — **UNKNOWN, never
+healthy**. `nous-ergon-ops/infrastructure/iam/check-drift.py --lambdas-root`
+(daily, 09:35 UTC) is the second, automatic detector for the same gap.
 
 ## Why this exists (vs. a dumb CW alarm)
 
@@ -81,16 +126,30 @@ Each per-(SF, date) alert carries a deterministic `dedup_key` and a
 every cron firing. Once the underlying issue is fixed and the SF runs,
 the next cron firing clears the check and stops alerting.
 
+The silence deadman is the one exception: its key is per-(role, silent day)
+with a **7-day** window, deliberately longer than its 5-day look-back. A
+firing-date key would re-page the same silent day on each of the next four
+firings; a slot key with a window shorter than the look-back would do the
+same. Both are the same defect — one page per silent slot is the contract.
+
 ## Deploy
 
 ```bash
 bash infrastructure/lambdas/pipeline-watchdog/deploy.sh --bootstrap   # first-time
+bash infrastructure/lambdas/pipeline-watchdog/deploy.sh --apply-iam   # re-apply iam-policy.json
 bash infrastructure/lambdas/pipeline-watchdog/deploy.sh                # code update
 bash infrastructure/lambdas/pipeline-watchdog/deploy.sh --dry-run     # preview
 bash infrastructure/lambdas/pipeline-watchdog/deploy.sh --smoke       # invoke once
 ```
 
 Bootstrap is idempotent — re-running creates only missing resources.
+
+**`--apply-iam` is required whenever `iam-policy.json` changes.** Flagless
+`deploy.sh` (the CI auto-deploy path in
+`.github/workflows/deploy-pipeline-watchdog.yml`) ships CODE ONLY — the
+`github-actions-lambda-deploy` OIDC role has no `iam:PutRolePolicy` by design
+(`nous-ergon-ops/infrastructure/iam/README.md`, single-writer rule). Run
+`--apply-iam` from an admin profile (`AWS_PROFILE=ne-admin`).
 
 ## Subscribe email to the watchdog topic (manual, post-deploy)
 
@@ -108,14 +167,22 @@ aws sns subscribe \
 - Cron: `cron(0 14 * * ? *)` — daily 14:00 UTC, MUTABLE via
   `aws events put-rule --schedule-expression ...` if the firing window
   needs to shift.
-- Lambda timeout: 60s. Three `ListExecutions` paginated walks per
-  invocation; in practice completes in < 5s.
+- Lambda timeout: 60s. `ListExecutions` paginated walks per invocation, plus
+  one `DescribeExecution` per weekly-SF execution inside the deadman's 7-day
+  fetch (~5-10 rows); in practice completes in < 10s.
 - Logs: `/aws/lambda/alpha-engine-pipeline-watchdog` in us-east-1
-  CloudWatch Logs.
-- IAM: minimum-privilege per `iam-policy.json` — list SF executions,
-  publish to ONE SNS topic, read 2 SSM parameters (Telegram creds),
-  read/write 1 S3 prefix (dedup markers). NO `states:StartExecution`,
-  NO `alpha-engine-alerts` publish.
+  CloudWatch Logs. Every check's verdict — including the deadman's
+  per-slot `OK` / `GATED_OFF` / `CRITICAL` split — is in the returned
+  summary dict, logged at INFO on every firing.
+- IAM: minimum-privilege per `iam-policy.json` — list + describe SF
+  executions, publish to ONE SNS topic, read the Telegram/flow-doctor SSM
+  parameters and the weekly-SF cadence declaration, read/write 1 S3 prefix
+  (dedup markers), the flow-doctor DynamoDB store. NO
+  `states:StartExecution`, NO `alpha-engine-alerts` publish.
+- Trigger state: `alpha-engine-pipeline-watchdog-daily` is listed under
+  `not_paused` in `infrastructure/automation_pause.json` (Brian ruling
+  2026-08-09, config#6697), so `deploy.sh`'s `pause_state` resolves it to
+  ENABLED. The deadman rides this trigger rather than adding a second one.
 
 ## Composes with
 

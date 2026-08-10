@@ -48,18 +48,31 @@ dimension needed.
     filing issue's "weekly for the week's last session" wording, recorded as
     a documented deviation in this change's PR body.
 
-No scheduling/EventBridge wiring in this change (automation pause,
-alpha-engine-config#6617): this script is invocable manually only. On a
-CRITICAL finding it best-effort publishes to the fleet's existing
-``alpha-engine-alerts`` SNS topic (the same topic every SF Publish*Degraded
-state in this repo already uses) and always exits non-zero regardless of
-whether the publish succeeds — the exit code is the durable signal a future
-CI/cron wiring would page on.
+  * A slot on TODAY is usually not-yet-due rather than missing — every
+    launch path fires late in the UTC day. See ``last_due_day``; the CLI
+    stops at yesterday by default and ``--through today`` opts back in.
+
+**Scheduling (alpha-engine-config#6738).** This module is BOTH an operator
+CLI and the slot-derivation library for the scheduled check. The
+``alpha-engine-pipeline-watchdog`` Lambda imports ``compute_expected_slots``
+/ ``evaluate`` / ``fetch_execution_records`` / ``load_cadence_from_ssm`` /
+``last_due_day`` from here (its ``deploy.sh`` packages this file flat into
+the zip) and runs them on the already-un-paused
+``alpha-engine-pipeline-watchdog-daily`` 14:00-UTC trigger, paging the
+independent ``alpha-engine-watchdog-alerts`` topic. One implementation, two
+entry points — a manual rerun and the scheduled check cannot disagree about
+which slots the declaration expects.
+
+Run manually, this script still best-effort publishes a CRITICAL finding to
+the fleet's ``alpha-engine-alerts`` SNS topic and always exits non-zero
+regardless of whether the publish succeeds — the exit code is the durable
+signal, and the scheduled path uses the watchdog topic instead.
 
 Usage:
-  ./scripts/weekly_sf_silence_deadman.py                     # manifest cadence, 5-day window
+  ./scripts/weekly_sf_silence_deadman.py                     # manifest cadence, 5-day window, through yesterday
   ./scripts/weekly_sf_silence_deadman.py --live               # cadence read from live SSM instead
   ./scripts/weekly_sf_silence_deadman.py --window-days 10
+  ./scripts/weekly_sf_silence_deadman.py --through today      # include today (only after its postclose)
   ./scripts/weekly_sf_silence_deadman.py --json --no-notify   # for scripted/CI consumption
 """
 
@@ -109,6 +122,31 @@ def load_cadence_from_ssm(ssm_client) -> str:
 # ---------------------------------------------------------------------------
 # Expected run-slot derivation (pure — no AWS)
 # ---------------------------------------------------------------------------
+
+def last_due_day(today: date) -> date:
+    """The most recent day whose expected run-slots are unambiguously DUE.
+
+    Every launch path for this state machine fires LATE in the UTC day: the
+    exercise leg is chained off that trading day's postclose (~20:00-20:30
+    UTC) and the Saturday cron fires 09:00 UTC on the day after the week's
+    last session. So "today" is, for most of any given UTC day, a slot that
+    has not happened YET rather than a slot that is missing — and a detector
+    that cannot tell those apart reports CRITICAL on a healthy pipeline.
+
+    Measured 2026-08-09 (alpha-engine-config#6738): a live run of this script
+    at 21:00 PT — 2026-08-10 in UTC — classified the 2026-08-10 exercise slot
+    CRITICAL alongside the two genuinely silent days, because Monday's
+    postclose was ~23h in the future. Three CRITICALs, one of them false.
+
+    Anchoring evaluation one day back removes the whole ambiguity class
+    rather than racing it with a cutoff hour: yesterday's exercise slot is
+    18h+ old by the time any consumer reads it, and Saturday's 09:00-UTC
+    weekly slot is 29h+ old when evaluated on Sunday. Both are overdue, not
+    early. Shared by BOTH entry points — the CLI's default anchor and the
+    pipeline-watchdog Lambda's — so neither can drift back into the trap.
+    """
+    return today - timedelta(days=1)
+
 
 @dataclass(frozen=True)
 class ExpectedSlot:
@@ -266,17 +304,28 @@ def _list_all_executions(sf_client, sm_arn: str, cap: int = 500) -> list[dict]:
     return out[:cap]
 
 
-def fetch_execution_records(sf_client, window_days: int) -> list[ExecutionRecord]:
+def fetch_execution_records(
+    sf_client, window_days: int, today: date | None = None
+) -> list[ExecutionRecord]:
     """Live AWS fetch: list recent executions, then describe each one for its
     pipeline_role (never present on the list-executions summary itself —
     every launch path here omits an explicit Name, so role must come from
-    input, not the name)."""
+    input, not the name).
+
+    ``today`` — the anchor the lookback is measured back from. Defaults to
+    ``_today()`` (the CLI's behaviour, unchanged). The pipeline-watchdog
+    Lambda passes its own ``now_utc.date()`` instead (alpha-engine-config
+    #6738) so the fetch window and the slot window are anchored to the SAME
+    instant: a handler that pins ``now`` while this function read the wall
+    clock would silently evaluate slots the fetch never covered.
+    """
     sm_arn = f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:{STATE_MACHINE_NAME}"
     # +2 day pad: a weekly slot's run_day can land one calendar day after the
     # window's nominal start when the window boundary splits a week. Derived
-    # from _today() (not a fresh datetime.now() call) so a test that pins
-    # _today() gets a fully deterministic window.
-    since = datetime.combine(_today(), datetime.min.time(), tzinfo=timezone.utc) - timedelta(days=window_days + 2)
+    # from the anchor (not a fresh datetime.now() call) so a test that pins
+    # the anchor gets a fully deterministic window.
+    anchor = today if today is not None else _today()
+    since = datetime.combine(anchor, datetime.min.time(), tzinfo=timezone.utc) - timedelta(days=window_days + 2)
 
     records: list[ExecutionRecord] = []
     for ex in _list_all_executions(sf_client, sm_arn):
@@ -327,6 +376,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--live", action="store_true", help="read the declared cadence from live SSM instead of the local manifest")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--no-notify", action="store_true", help="never publish to SNS, even on CRITICAL (dry runs / CI)")
+    ap.add_argument(
+        "--through",
+        choices=("last-due", "today"),
+        default="last-due",
+        help=(
+            "newest day to evaluate. 'last-due' (default) stops at yesterday, "
+            "because today's exercise slot is chained off today's ~20:00 UTC "
+            "postclose and is therefore not-yet-due, not missing. 'today' "
+            "includes it — only correct when invoked AFTER today's postclose "
+            "has had time to chain."
+        ),
+    )
     args = ap.parse_args(argv)
 
     import boto3  # local import: keeps the pure functions above importable/testable with zero AWS deps
@@ -341,14 +402,16 @@ def main(argv: list[str] | None = None) -> int:
         cadence = load_cadence_from_manifest()
 
     today = _today()
-    executions = fetch_execution_records(sf, args.window_days)
-    slots = compute_expected_slots(today, cadence, args.window_days, is_trading_day, next_trading_day)
+    through = today if args.through == "today" else last_due_day(today)
+    executions = fetch_execution_records(sf, args.window_days, today=today)
+    slots = compute_expected_slots(through, cadence, args.window_days, is_trading_day, next_trading_day)
     results = evaluate(slots, executions)
     critical = [r for r in results if r.classification == "CRITICAL"]
 
     if args.json:
         print(json.dumps({
             "cadence": cadence,
+            "evaluated_through": through.isoformat(),
             "window_days": args.window_days,
             "checked": len(results),
             "critical": len(critical),
@@ -364,7 +427,11 @@ def main(argv: list[str] | None = None) -> int:
             ],
         }, indent=2))
     else:
-        print(f"weekly-sf silence deadman — cadence={cadence} window={args.window_days}d")
+        print(
+            f"weekly-sf silence deadman — cadence={cadence} "
+            f"window={args.window_days}d through={through.isoformat()}"
+            + ("" if args.through == "today" else " (today excluded: not yet due — --through today to include)")
+        )
         print(format_report(results))
         print(f"\n✗ {len(critical)} CRITICAL slot(s) — expected and absent" if critical else "\n✓ no silent slots")
 
