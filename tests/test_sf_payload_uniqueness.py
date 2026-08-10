@@ -142,7 +142,8 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # Lambda takes no execution-input-derived args today (force_on_demand
     # is reserved for a future retry loop, not currently threaded from the
     # SF); it reads its own config entirely from Lambda env vars.
-    "DispatchWeeklyFreshnessSpot": frozenset(),
+    # config#5504: per-run identity threading for cost attribution.
+    "DispatchWeeklyFreshnessSpot": frozenset({"execution_id.$"}),
 }
 
 # config#1811: the liveness-aware SSM poll iteration — one shared payload
@@ -193,8 +194,10 @@ _WEEKDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # "force_on_demand.$"} selecting the collector invocation + threading the
     # config#2542 retry-budget's on-demand override; the dispatcher returns
     # {data_spot:{launched,instance_id,...}}.
-    "LaunchMorningEnrichSpot": frozenset({"workload", "force_on_demand.$"}),
-    "LaunchMorningArcticAppendSpot": frozenset({"workload", "force_on_demand.$"}),
+    # config#5504: execution_id.$ threads $$.Execution.Id into the dispatcher
+    # payload so the spot box carries per-run identity tags for cost attribution.
+    "LaunchMorningEnrichSpot": frozenset({"workload", "force_on_demand.$", "execution_id.$"}),
+    "LaunchMorningArcticAppendSpot": frozenset({"workload", "force_on_demand.$", "execution_id.$"}),
     # alpha-engine-config-I6494: weekday Scanner — same Lambda as Saturday SF
     # Scanner, payload is run_date only (no research_dry / dry_run_llm on the
     # weekday cadence).

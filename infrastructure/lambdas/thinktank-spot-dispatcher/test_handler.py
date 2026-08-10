@@ -199,7 +199,7 @@ class TestDispatchPosture:
         monkeypatch.setattr(
             mod, "_already_running", lambda: (_ for _ in ()).throw(mod.SpotProbeError("boom"))
         )
-        monkeypatch.setattr(mod, "_launch_instance", lambda _run_token, force_on_demand=False: ("i-abc", "spot"))
+        monkeypatch.setattr(mod, "_launch_instance", lambda _run_token, force_on_demand=False, extra_tags=None: ("i-abc", "spot"))
         monkeypatch.setattr(mod.spot_dispatch, "wait_ssm_online", lambda *a, **k: None)
         monkeypatch.setattr(mod.spot_dispatch, "send_async_command", lambda *a, **k: "cmd-1")
         out = mod.handler({}, None)
@@ -219,7 +219,7 @@ class TestDispatchPosture:
         mod = _load()
         terminated: list[str] = []
         monkeypatch.setattr(mod, "_already_running", lambda: [])
-        monkeypatch.setattr(mod, "_launch_instance", lambda _run_token, force_on_demand=False: ("i-xyz", "spot"))
+        monkeypatch.setattr(mod, "_launch_instance", lambda _run_token, force_on_demand=False, extra_tags=None: ("i-xyz", "spot"))
         monkeypatch.setattr(
             mod.spot_dispatch,
             "wait_ssm_online",
