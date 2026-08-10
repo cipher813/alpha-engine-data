@@ -942,6 +942,14 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+  - class: executor_zero_entries_alarm
+    # In-process emitter merged to crucible-executor while the drift
+    # chokepoint was dead on infra (config-I6753) — caught by the revived
+    # check's first post-merge run.
+    source: "alpha-engine/executor/zero_entries_alarm.py"
+    severities: [error]
+    intake: bus
+    response: drain-queue
 
   # ── laptop LLM-routing plane (claude-code-config, config-I6753) ──
   # All four call sites previously omitted the REQUIRED `publish` subcommand,
