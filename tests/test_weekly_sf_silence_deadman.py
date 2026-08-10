@@ -471,6 +471,15 @@ class TestScheduledSubstrateWiring:
         ]
         assert granted, "watchdog exec role cannot read the cadence declaration"
 
+    def test_the_deploy_workflow_fires_when_this_module_changes(self):
+        """Packaging a file into another component's zip creates a second way
+        for a merged fix to never go live: the deploy workflow's path filter
+        must cover the packaged file, not just the Lambda directory."""
+        workflow = (
+            REPO_ROOT / ".github" / "workflows" / "deploy-pipeline-watchdog.yml"
+        ).read_text(encoding="utf-8")
+        assert "scripts/weekly_sf_silence_deadman.py" in workflow
+
     def test_no_second_trigger_was_introduced_for_the_deadman(self):
         """Design choice (A): one liveness surface. A new EventBridge rule
         would have to be born DISABLED under the 2026-08-07 pause and named in
