@@ -15,6 +15,17 @@
 # execution against the fixed 06:30 AM PT market open (hard floor 06:15 PT,
 # early-warning 06:10 PT, plus a 5-day median trend signal) — same
 # watch-day gate as the Weekday SF check above.
+# Plus (config#6738) the weekly-SF silence deadman: reads the declared
+# exercise cadence from SSM /alpha-engine/weekly-sf/exercise-cadence, derives
+# every run-slot that declaration expects over a trailing 5 days, and pages on
+# any slot with no matching ne-weekly-freshness-pipeline execution. Runs every
+# calendar day (its slot derivation IS the trading-calendar gate). NOTE: that
+# SSM read needs a grant that ships in iam-policy.json but is applied only by
+# an operator running `--apply-iam` (infrastructure/iam/README.md single-writer
+# rule — the CI OIDC role has no iam:PutRolePolicy by design). Until it is
+# applied the check pages "DEGRADED: cannot read <param>" daily and reports
+# UNKNOWN, never healthy; infrastructure/iam/check-drift.py is the second,
+# automatic detector for the same gap.
 # Alerts fire via nousergon_lib.alerts.publish to a DISTINCT SNS topic
 # (alpha-engine-watchdog-alerts) + flow-doctor forum topics for Telegram
 # (config#1742 T2) — channel independence preserved per plan doc §3.5.
@@ -108,6 +119,13 @@ bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
 cp "${SCRIPT_DIR}/../flow_doctor_telegram.py" "${PKG}/flow_doctor_telegram.py"
+# The weekly-SF silence deadman's slot derivation (config#6738). Packaged flat,
+# same device as flow_doctor_telegram.py above, so index.py's silence check and
+# the operator CLI (scripts/weekly_sf_silence_deadman.py --live) share ONE
+# implementation of "which run-slots the declaration expects" instead of a
+# scheduled copy that can drift from the one an operator reruns by hand.
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+cp "${REPO_ROOT}/scripts/weekly_sf_silence_deadman.py" "${PKG}/weekly_sf_silence_deadman.py"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
