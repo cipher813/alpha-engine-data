@@ -95,7 +95,7 @@ class TestWeekdaySpotStatesPresent:
         # config#2542: force_on_demand.$ threads the retry-budget's on-demand
         # override into the dispatcher (see TestWeekdayDataSpotRetryBudget),
         # mirroring the EOD launch states.
-        assert set(st["Parameters"]["Payload"]) == {"workload", "force_on_demand.$"}
+        assert set(st["Parameters"]["Payload"]) == {"workload", "force_on_demand.$", "execution_id.$"}
 
     @pytest.mark.parametrize("name", _POLL)
     def test_poll_state_polls_ssm(self, daily, name):
@@ -311,7 +311,7 @@ class TestEODSpotStatesPresent:
         }
         # 2026-07-14: force_on_demand.$ threads the retry-budget's on-demand
         # override into the dispatcher (see TestEODDataSpotRetryBudget).
-        assert set(st["Parameters"]["Payload"]) == {"workload", "force_on_demand.$"}
+        assert set(st["Parameters"]["Payload"]) == {"workload", "force_on_demand.$", "execution_id.$"}
 
     @pytest.mark.parametrize("name", _POLL)
     def test_poll_state_polls_ssm(self, eod, name):
