@@ -181,13 +181,29 @@ class TestDegradedTerminalState:
 
     def test_stop_trading_instance_leads_to_the_degraded_check(self, states):
         """config-I5489 inserted the weekly-exercise launch between the cost
-        guard and the degraded check, so this is now a two-hop path. What the
-        test actually protects is unchanged: StopTradingInstance is not a
-        terminal, and the degraded check is still what decides the terminal —
-        the inserted state must not swallow or bypass it.
+        guard and the degraded check; alpha-engine-config-I6689 further
+        inserted the declared-cadence read + gate ahead of the launch itself
+        (StopTradingInstance -> ReadExerciseCadence -> CheckExerciseCadence ->
+        LaunchWeeklyExerciseRun on cadence=daily). What the test actually
+        protects is unchanged: StopTradingInstance is not a terminal, and the
+        degraded check is still what decides the terminal — none of the
+        inserted states may swallow or bypass it.
         """
         assert "End" not in states["StopTradingInstance"]
-        assert states["StopTradingInstance"]["Next"] == "LaunchWeeklyExerciseRun"
+        assert states["StopTradingInstance"]["Next"] == "ReadExerciseCadence"
+        assert states["ReadExerciseCadence"]["Next"] == "CheckExerciseCadence"
+        # cadence=daily is the ONLY branch that launches; weekly-only/off skip
+        # straight to the degraded check, same as LaunchWeeklyExerciseRun's
+        # own success Next.
+        daily_choice = next(
+            c for c in states["CheckExerciseCadence"]["Choices"] if c.get("StringEquals") == "daily"
+        )
+        assert daily_choice["Next"] == "LaunchWeeklyExerciseRun"
+        for value in ("weekly-only", "off"):
+            choice = next(
+                c for c in states["CheckExerciseCadence"]["Choices"] if c.get("StringEquals") == value
+            )
+            assert choice["Next"] == "CheckDegradedOutcome"
         # both the success and launch-failure routes converge on the check
         assert states["LaunchWeeklyExerciseRun"]["Next"] == "CheckDegradedOutcome"
         assert states["WeeklyExerciseLaunchFailed"]["Next"] == "CheckDegradedOutcome"
@@ -329,6 +345,7 @@ class TestHealLoopDispatchChain:
         assert st["Parameters"]["FunctionName"] == _DISPATCHER_FN
         assert st["Parameters"]["Payload"] == {
             "workload": "post-market-data", "force_on_demand": True,
+            "execution_id.$": "$$.Execution.Id",
         }
         assert st["Next"] == "HealCheckPostMarketDataSpotLaunched"
 
@@ -350,6 +367,7 @@ class TestHealLoopDispatchChain:
         assert st["Parameters"]["FunctionName"] == _DISPATCHER_FN
         assert st["Parameters"]["Payload"] == {
             "workload": "post-market-arctic-append", "force_on_demand": True,
+            "execution_id.$": "$$.Execution.Id",
         }
 
     def test_arctic_success_chains_to_reprobe(self, states):

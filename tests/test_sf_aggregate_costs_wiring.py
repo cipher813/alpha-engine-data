@@ -100,13 +100,18 @@ class TestFailureIsolation:
     def test_catch_routes_to_branch_a_complete(self, states):
         # Cost telemetry is observability — aggregator failure must NOT
         # halt the pipeline. Mirrors the rationale-clustering Catch.
+        # alpha-engine-config#6722: this Catch matches sf-pipeline-policy.md
+        # §5's NAMED cost-aggregation carve-out, which REQUIRES a degraded
+        # flag — now routes through MarkAggregateCostsDegraded before
+        # converging on BranchAComplete exactly as before.
         catches = states["AggregateCosts"]["Catch"]
         assert len(catches) >= 1
         assert any(
-            c["Next"] == "BranchAComplete"
+            c["Next"] == "MarkAggregateCostsDegraded"
             and "States.ALL" in c["ErrorEquals"]
             for c in catches
         )
+        assert states["MarkAggregateCostsDegraded"]["Next"] == "BranchAComplete"
 
     def test_retry_only_on_lambda_service_errors(self, states):
         # Same shape as rationale-clustering — service-level retries
@@ -137,12 +142,15 @@ class TestEdges:
         # success. (The aggregator's own Catch routes to
         # BranchAComplete so a downstream failure-of-failure can't
         # ladder back into the failed counterfactual error path.)
+        # alpha-engine-config#6722: routes through MarkCounterfactualDegraded
+        # before converging on CheckSkipAggregateCosts exactly as before.
         cf = states["Counterfactual"]
         catches = cf["Catch"]
         assert any(
-            c["Next"] == "CheckSkipAggregateCosts"
+            c["Next"] == "MarkCounterfactualDegraded"
             for c in catches
         )
+        assert states["MarkCounterfactualDegraded"]["Next"] == "CheckSkipAggregateCosts"
 
     def test_check_skip_counterfactual_default_unchanged(self, states):
         # CheckSkipCounterfactual's Default → Counterfactual stays

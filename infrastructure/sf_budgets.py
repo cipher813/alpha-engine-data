@@ -223,12 +223,60 @@ STAGE_BUDGETS: dict[str, StageBudget] = {
         pipeline_segment="sequential",
     ),
     # ── Quality-assurance stages (NOT universe-scaling) ────────────────────
-    "Parity": StageBudget(
-        name="Parity",
-        current_timeout_seconds=7_200,
+    # alpha-engine-config#6030: the bundled Parity stage (pit_parity
+    # lookahead + walkforward + parity replay behind one launcher) is split
+    # into a Parallel of three branch quartets + a PitParityCompare join.
+    # CALIBRATION (alpha-engine-config-I6026/I6027 — measured from SSM logs
+    # of the two healthy bundled completions, 2026-07-03 + 2026-07-11):
+    #   pass1 (lookahead)   12m31s/12m59s  (~780s)
+    #   pass2 (walkforward) 10m11s/10m12s  (~610s)
+    #   parity replay        2m44s/2m26s   (~160s)
+    # Each split stage additionally pays its OWN spot boot/deps (~15 min,
+    # ~900s — the bundled stage paid it once). Per-stage budgets below are
+    # generous per the calibration philosophy ("start generous, tighten as
+    # baselines stabilise") because the 2026-08-01 run took >5x healthy
+    # (anomaly under profile, alpha-engine-config-I6029) and was SIGKILLed
+    # at the bound. The next tightening is seeded from the per-pass
+    # wall_clock_seconds series each pass artifact now records
+    # (parity/{date}/pit_stats_{pass}.json, crucible-backtester
+    # contracts/pit_stats_pass.schema.json) — measured per stage, not per
+    # bundle (I6026 deliverable 2).
+    # pipeline_segment="parity_parallel": the three branches run
+    # CONCURRENTLY inside ParityParallel — the critical path through them is
+    # max(branch), not sum(branch), so they must not inflate the
+    # "sequential" capacity sum.
+    "PitParityLookahead": StageBudget(
+        name="PitParityLookahead",
+        current_timeout_seconds=5_400,
         per_ticker_cost_seconds=None,
-        fixed_overhead_seconds=7_200,
-        max_budget_seconds=14_400,
+        fixed_overhead_seconds=5_400,
+        max_budget_seconds=10_800,
+        pipeline_segment="parity_parallel",
+    ),
+    "PitParityWalkforward": StageBudget(
+        name="PitParityWalkforward",
+        current_timeout_seconds=5_400,
+        per_ticker_cost_seconds=None,
+        fixed_overhead_seconds=5_400,
+        max_budget_seconds=10_800,
+        pipeline_segment="parity_parallel",
+    ),
+    "ParityReplay": StageBudget(
+        name="ParityReplay",
+        current_timeout_seconds=2_700,
+        per_ticker_cost_seconds=None,
+        fixed_overhead_seconds=2_700,
+        max_budget_seconds=7_200,
+        pipeline_segment="parity_parallel",
+    ),
+    # The compare join reads two small JSONs and computes numpy stats —
+    # seconds of compute; the ~15 min spot boot/deps dominates.
+    "PitParityCompare": StageBudget(
+        name="PitParityCompare",
+        current_timeout_seconds=2_700,
+        per_ticker_cost_seconds=None,
+        fixed_overhead_seconds=2_700,
+        max_budget_seconds=7_200,
         pipeline_segment="sequential",
     ),
     # ── Evaluation stage (universe-scaling — THE VICTIM of config#3095) ────

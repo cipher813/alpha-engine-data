@@ -10,6 +10,22 @@
 #   - Weekday SF: 24h window, watch-day = today is a NYSE trading day
 #   - EOD SF:     24h window, watch-day = today is a NYSE trading day
 #   - Saturday SF: 7d window, watch-day = today is Sunday
+# Plus (config#2412) a preopen schedule-buffer canary: reads the finish
+# time of the most recently CLOSED trading day's SUCCEEDED Weekday-SF
+# execution against the fixed 06:30 AM PT market open (hard floor 06:15 PT,
+# early-warning 06:10 PT, plus a 5-day median trend signal) — same
+# watch-day gate as the Weekday SF check above.
+# Plus (config#6738) the weekly-SF silence deadman: reads the declared
+# exercise cadence from SSM /alpha-engine/weekly-sf/exercise-cadence, derives
+# every run-slot that declaration expects over a trailing 5 days, and pages on
+# any slot with no matching ne-weekly-freshness-pipeline execution. Runs every
+# calendar day (its slot derivation IS the trading-calendar gate). NOTE: that
+# SSM read needs a grant that ships in iam-policy.json but is applied only by
+# an operator running `--apply-iam` (infrastructure/iam/README.md single-writer
+# rule — the CI OIDC role has no iam:PutRolePolicy by design). Until it is
+# applied the check pages "DEGRADED: cannot read <param>" daily and reports
+# UNKNOWN, never healthy; infrastructure/iam/check-drift.py is the second,
+# automatic detector for the same gap.
 # Alerts fire via nousergon_lib.alerts.publish to a DISTINCT SNS topic
 # (alpha-engine-watchdog-alerts) + flow-doctor forum topics for Telegram
 # (config#1742 T2) — channel independence preserved per plan doc §3.5.
@@ -23,6 +39,7 @@
 #   bash infrastructure/lambdas/pipeline-watchdog/deploy.sh             # update code only
 #   bash infrastructure/lambdas/pipeline-watchdog/deploy.sh --bootstrap # first-time create + wire SNS + EventBridge
 #   bash infrastructure/lambdas/pipeline-watchdog/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
+#   bash infrastructure/lambdas/pipeline-watchdog/deploy.sh --apply-alarms # upsert the Errors->watchdog-alerts CW alarm (config#6709)
 #   bash infrastructure/lambdas/pipeline-watchdog/deploy.sh --dry-run   # show actions, do not apply
 #   bash infrastructure/lambdas/pipeline-watchdog/deploy.sh --smoke     # invoke once with no event payload
 
@@ -54,12 +71,14 @@ case "${DRY_RUN:-false}" in
 esac
 BOOTSTRAP=false
 APPLY_IAM=false
+APPLY_ALARMS=false
 SMOKE=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
     --bootstrap) BOOTSTRAP=true ;;
     --apply-iam) APPLY_IAM=true ;;
+    --apply-alarms) APPLY_ALARMS=true ;;
     --smoke) SMOKE=true ;;
     -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
   esac
@@ -100,6 +119,13 @@ bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
 cp "${SCRIPT_DIR}/../flow_doctor_telegram.py" "${PKG}/flow_doctor_telegram.py"
+# The weekly-SF silence deadman's slot derivation (config#6738). Packaged flat,
+# same device as flow_doctor_telegram.py above, so index.py's silence check and
+# the operator CLI (scripts/weekly_sf_silence_deadman.py --live) share ONE
+# implementation of "which run-slots the declaration expects" instead of a
+# scheduled copy that can drift from the one an operator reruns by hand.
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+cp "${REPO_ROOT}/scripts/weekly_sf_silence_deadman.py" "${PKG}/weekly_sf_silence_deadman.py"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
@@ -112,6 +138,32 @@ if $APPLY_IAM; then
   TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
   apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
   echo "  ✓ IAM applied."
+fi
+
+# ----- Apply alarms only (config#6709) -------------------------------------
+# The module docstring long claimed "CW alarm on Lambda errors pages the
+# operator"; measured 2026-08-09 there were ZERO alarms on this function, so a
+# fail-loud handler crash (e.g. the Sunday DescribeExecution AccessDenied,
+# config#6709) was silently un-paged. This upserts the alarm the docstring
+# assumes. TreatMissingData=notBreaching: no invocations -> the deadman/pause
+# posture owns that axis, not this alarm.
+if $APPLY_ALARMS; then
+  echo "Upserting ${FUNCTION_NAME}-errors alarm..."
+  aws cloudwatch put-metric-alarm \
+    --region "${REGION}" \
+    --alarm-name "${FUNCTION_NAME}-errors" \
+    --alarm-description "pipeline-watchdog Lambda raised (fail-loud handler): the fleet's same-day pipeline-liveness detector is itself failing - see /aws/lambda/${FUNCTION_NAME} logs (config#6709)" \
+    --namespace "AWS/Lambda" \
+    --metric-name "Errors" \
+    --dimensions "Name=FunctionName,Value=${FUNCTION_NAME}" \
+    --statistic "Sum" \
+    --period 86400 \
+    --evaluation-periods 1 \
+    --threshold 1 \
+    --comparison-operator "GreaterThanOrEqualToThreshold" \
+    --treat-missing-data "notBreaching" \
+    --alarm-actions "arn:aws:sns:us-east-1:711398986525:alpha-engine-watchdog-alerts" >/dev/null
+  echo "  ✓ Alarm ${FUNCTION_NAME}-errors upserted."
 fi
 
 if $BOOTSTRAP; then

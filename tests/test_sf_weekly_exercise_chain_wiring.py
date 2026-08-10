@@ -33,8 +33,18 @@ def weekly() -> dict:
 
 def test_postclose_tail_routes_through_the_exercise_launch(eod):
     """StopTradingInstance is the cost guard and always runs — chaining after
-    it means the exercise run fires on both the green and degraded paths."""
-    assert eod["StopTradingInstance"]["Next"] == "LaunchWeeklyExerciseRun"
+    it means the exercise run fires on both the green and degraded paths.
+    alpha-engine-config-I6689 inserted the declared-cadence read + gate
+    (ReadExerciseCadence -> CheckExerciseCadence) ahead of the launch itself,
+    so this is now a three-hop path on the cadence=daily branch — pinned in
+    full (including the fail-open routes) by
+    tests/test_sf_weekly_cadence_wiring.py."""
+    assert eod["StopTradingInstance"]["Next"] == "ReadExerciseCadence"
+    assert eod["ReadExerciseCadence"]["Next"] == "CheckExerciseCadence"
+    daily_choice = next(
+        c for c in eod["CheckExerciseCadence"]["Choices"] if c.get("StringEquals") == "daily"
+    )
+    assert daily_choice["Next"] == "LaunchWeeklyExerciseRun"
     assert eod["LaunchWeeklyExerciseRun"]["Next"] == "CheckDegradedOutcome"
 
 
@@ -83,10 +93,21 @@ def test_the_run_day_gate_really_does_key_on_that_role(weekly):
 
 
 def test_launch_failure_alerts_and_never_fails_postclose(eod):
-    """A silent non-launch is indistinguishable from a day nobody looked at."""
+    """A silent non-launch is indistinguishable from a day nobody looked at.
+
+    alpha-engine-config#6722: the launch failure previously alerted via SNS
+    (WeeklyExerciseLaunchFailed) but was never threaded into
+    $.degraded_summary — the Catch now routes through
+    SetWeeklyExerciseDegradedFlag first, unchanged continuation otherwise."""
     catch = eod["LaunchWeeklyExerciseRun"]["Catch"][0]
     assert catch["ErrorEquals"] == ["States.ALL"]
-    assert catch["Next"] == "WeeklyExerciseLaunchFailed"
+    assert catch["Next"] == "SetWeeklyExerciseDegradedFlag"
+
+    flag = eod["SetWeeklyExerciseDegradedFlag"]
+    assert flag["Type"] == "Pass"
+    assert flag["ResultPath"] == "$.degraded_summary"
+    assert flag["Parameters"]["degraded"] is True
+    assert flag["Next"] == "WeeklyExerciseLaunchFailed"
 
     failed = eod["WeeklyExerciseLaunchFailed"]
     assert failed["Resource"] == "arn:aws:states:::sns:publish"

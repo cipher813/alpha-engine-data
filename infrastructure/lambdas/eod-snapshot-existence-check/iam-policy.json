@@ -1,0 +1,48 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-eod-snapshot-existence-check:*"
+    },
+    {
+      "Sid": "HeadObjectOnSnapshots",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research/trades/snapshots/*",
+        "arn:aws:s3:::alpha-engine-research/trades/eod_pnl.csv"
+      ]
+    },
+    {
+      "Sid": "ListBucketForSnapshot404",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "trades/snapshots/*",
+            "trades/eod_pnl.csv"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "PublishToWatchdogTopic",
+      "Effect": "Allow",
+      "Action": [
+        "sns:Publish"
+      ],
+      "Resource": "arn:aws:sns:us-east-1:711398986525:alpha-engine-watchdog-alerts"
+    }
+  ]
+}

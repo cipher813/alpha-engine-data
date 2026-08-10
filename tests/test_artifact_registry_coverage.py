@@ -271,6 +271,16 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # data/heal/daily/{run_date}.json in alpha-engine-config/private-docs/
     # ARTIFACT_REGISTRY.yaml.
     "weekly_collector.py": 8,
+    # scripts/weekly_sf_recovery_metric.py (alpha-engine-config#6686):
+    # _sf_completion/ne-weekly-freshness-pipeline/{run_date}-recovery.json —
+    # the operator-actions-to-recover metric (weekly-sf-policy.md §2.5),
+    # written alongside the SF's own WriteCompletionMarker artifact at the
+    # same prefix. FOLLOW-UP (tracked, not yet done in this PR — cross-repo,
+    # private): register this key in alpha-engine-config/private-docs/
+    # ARTIFACT_REGISTRY.yaml and point a console descriptor at it (per
+    # policy-observability: modules log their metrics, the console points
+    # at the source — Brian ruling 2026-08-03).
+    "scripts/weekly_sf_recovery_metric.py": 1,
 }
 
 

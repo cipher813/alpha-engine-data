@@ -206,6 +206,7 @@ def _event(**overrides):
         "execution_arn": "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:run-1",
         "run_date": "2026-07-11",
         "failed_state": "RationaleClustering",
+        "failed_state_detail": "error=States.Timeout cause=RationaleClustering exceeded 900s",
         "cause": "States.Timeout",
         "watch_log_key": "consolidated/saturday_sf_watch/2026-07-11.json",
         "is_preflight": "false",
@@ -272,6 +273,14 @@ def test_valid_event_launches_spot_and_sends_async_ssm(monkeypatch):
     expected_b64 = base64.b64encode(b"States.Timeout").decode("ascii")
     assert f'export SF_CAUSE_B64="{expected_b64}"' in cmd
     assert "States.Timeout" not in cmd
+    # alpha-engine-config-I6616: failed_state_detail crosses BASE64 too, same
+    # rationale as cause — it can carry a matched Choice rule embedding an
+    # arbitrary JSON scalar from the execution input.
+    expected_detail_b64 = base64.b64encode(
+        b"error=States.Timeout cause=RationaleClustering exceeded 900s"
+    ).decode("ascii")
+    assert f'export SF_FAILED_STATE_DETAIL_B64="{expected_detail_b64}"' in cmd
+    assert "RationaleClustering exceeded 900s" not in cmd
     assert "export SF_CAUSE=" not in cmd
     # run_token is NOT threaded into the box (no in-box consumer — the
     # completion marker keys directly on cadence/pipeline/run_date) — only a
@@ -780,12 +789,16 @@ def test_missing_pipeline_name_returns_clean_false(monkeypatch):
 
 
 def test_missing_optional_fields_still_launches(monkeypatch):
-    # failed_state/cause/watch_log_key/state_machine_arn/is_preflight are all
-    # optional — only pipeline_name/cadence_slug/execution_arn/run_date are
-    # required (mirrors sf_watch_spot_bootstrap.sh's own FATAL check).
+    # failed_state/failed_state_detail/cause/watch_log_key/state_machine_arn/
+    # is_preflight are all optional — only pipeline_name/cadence_slug/
+    # execution_arn/run_date are required (mirrors sf_watch_spot_bootstrap.sh's
+    # own FATAL check).
     idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
     event = _event()
-    for optional in ("state_machine_arn", "failed_state", "cause", "watch_log_key", "is_preflight"):
+    for optional in (
+        "state_machine_arn", "failed_state", "failed_state_detail", "cause",
+        "watch_log_key", "is_preflight",
+    ):
         del event[optional]
     out = idx.handler(event, None)
     assert out["launched"] is True

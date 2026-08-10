@@ -272,7 +272,13 @@ class TestMutexWiring:
         # down (see test_sf_prespend_gate_alerting.py for the full quartet).
         assert saturday_sf["States"]["PipelineContractGate"]["Default"] == "EvaluatorDeployDriftCheck"
         assert saturday_sf["States"]["EvaluatorDeployDriftGate"]["Default"] == "EvaluatorDirectorDeployDriftCheck"
-        assert saturday_sf["States"]["EvaluatorDirectorDeployDriftGate"]["Default"] == "CheckMutexRole"
+        # I4494: WeeklyPreflight is composed as the fourth pre-spend gate
+        # between the evaluator-director drift gate and CheckMutexRole — the
+        # mutex is still the entry point's next gate-free state, one gate
+        # further down (see test_sf_prespend_gate_alerting.py for the quartet).
+        assert saturday_sf["States"]["EvaluatorDirectorDeployDriftGate"]["Default"] == "WeeklyPreflight"
+        assert saturday_sf["States"]["WeeklyPreflight"]["Next"] == "WeeklyPreflightGate"
+        assert saturday_sf["States"]["WeeklyPreflightGate"]["Default"] == "CheckMutexRole"
 
     def test_weekday_initialize_input_routes_to_check_mutex_role(self, weekday_sf):
         assert weekday_sf["States"]["InitializeInput"]["Next"] == "CheckMutexRole"
@@ -490,19 +496,46 @@ class TestAcquireMutexSemantics:
     def test_acquire_states_all_catch_fails_open_to_former_first_state(
         self, sf_name, all_sfs
     ):
+        """alpha-engine-config#6722: the States.ALL fail-open now routes
+        through SetMutexAcquireDegradedFlag (a Pass state threading the
+        degraded flag onto the execution record — $.gate_degraded for
+        weekly, $.degraded_summary for daily/eod) before continuing to the
+        SAME former-first-state target as before — the continuation itself
+        is unchanged, only detoured through the flag-setter."""
         former = FORMER_FIRST_STATE_BY_SF[sf_name][1]
-        catches = all_sfs[sf_name]["States"]["AcquireMutex"]["Catch"]
+        states = all_sfs[sf_name]["States"]
+        catches = states["AcquireMutex"]["Catch"]
         match = [c for c in catches if "States.ALL" in c.get("ErrorEquals", [])]
         assert len(match) == 1, (
             f"{sf_name} AcquireMutex must Catch States.ALL (DDB outage / IAM "
             f"drift / transient SDK error) — without it, mutex-side failures "
             f"would hard-fail the SF, defeating the fail-open posture"
         )
-        assert match[0]["Next"] == former, (
-            f"{sf_name} AcquireMutex: States.ALL fail-open must route to "
-            f"the former first state ({former}), so cadence runs survive "
-            f"a DDB outage. Got {match[0]['Next']!r}."
+        assert match[0]["Next"] == "SetMutexAcquireDegradedFlag", (
+            f"{sf_name} AcquireMutex: States.ALL fail-open must route "
+            f"through SetMutexAcquireDegradedFlag. Got {match[0]['Next']!r}."
         )
+        flag_state = states["SetMutexAcquireDegradedFlag"]
+        assert flag_state["Type"] == "Pass"
+        if sf_name == "saturday":
+            # Weekly mirrors LibPinGateDegraded's shape exactly: an extra
+            # best-effort SNS alert hop (PublishMutexAcquireDegraded) between
+            # the flag Pass and the former first state.
+            assert flag_state["ResultPath"] == "$.gate_degraded"
+            assert flag_state["Result"] is True
+            assert flag_state["Next"] == "PublishMutexAcquireDegraded"
+            publish = states["PublishMutexAcquireDegraded"]
+            assert publish["Next"] == former
+            assert all(c["Next"] == former for c in publish["Catch"])
+        else:
+            assert flag_state["ResultPath"] == "$.degraded_summary"
+            assert flag_state["Parameters"]["degraded"] is True
+            assert flag_state["Next"] == former, (
+                f"{sf_name} SetMutexAcquireDegradedFlag must continue to "
+                f"the former first state ({former}), so cadence runs "
+                f"survive a DDB outage exactly as before. Got "
+                f"{flag_state['Next']!r}."
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -95,7 +95,23 @@ import json
 import re
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
+from pathlib import Path
+
+# sys.path insertion (not a package import) so this resolves identically
+# whether run directly (`python scripts/weekly_sf_rerun.py`) or loaded by
+# spec_from_file_location the way tests/test_weekly_sf_rerun.py does.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sf_rerun_common import (  # noqa: E402 — see sys.path insertion above
+    derive_run_date,
+    effective_run_date_of,
+    entered_states,
+    execution_input,
+    fetch_history,
+    list_all_executions,
+    verify_skip_flags_live,
+    _walk_states,  # noqa: F401 — re-exported: tests/test_weekly_sf_rerun.py calls mod._walk_states directly
+)
 
 DEFAULT_STATE_MACHINE_ARN = (
     "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline"
@@ -129,10 +145,13 @@ class Stage:
     gate: str                      # the CheckSkip* Choice state
     work: str                      # the stage's first work state
     witness: frozenset             # entered => completed-or-skipped
-    degraded_witness: frozenset = frozenset()   # a *Degraded / Publish*Degraded
-                                    # state entered => the stage RAN BUT FAILED
-                                    # and was absorbed fail-open — it must
-                                    # RE-RUN, overriding witness (I6055)
+    degraded_witness: frozenset = frozenset()
+    # A *Degraded / Publish*Degraded state entered iff the stage RAN BUT
+    # FAILED and was absorbed fail-open (weekly-sf-policy §2.3) so the
+    # pipeline could continue — entering one OVERRIDES witness: the stage
+    # must RE-RUN on a rerun, never be skipped as complete
+    # (alpha-engine-config-I6055 — the 2026-08-01 Director hard-fail that
+    # the next rerun skipped; extended to Parity by alpha-engine-config-I6025).
     emit_skip: bool = True         # False => never emit the flag (see notes)
     detect_failure: bool = True    # False => another Stage row already owns
                                     # this `work` state's failure detection
@@ -142,21 +161,43 @@ class Stage:
     note: str = ""
 
 
+# Degraded states that existed in a prior SF definition but have since been
+# removed. Retained in degraded_witness for backward compatibility with pre-fix
+# execution histories — derive_plan still needs to recognise them as DEGRADED
+# (not completed) so they're re-run, but they're no longer reachable by new
+# executions (config#6408).
+HISTORICAL_DEGRADED_WITNESS: frozenset[str] = frozenset({
+    "PublishDirectorDegraded",
+})
+
 STAGES: tuple[Stage, ...] = (
     Stage(
         "lib_pin_drift_check", "skip_lib_pin_drift_check",
         "CheckSkipLibPinDriftCheck", "LibPinDriftCheck",
-        frozenset({"CheckMutexRole"}),
-        # the whole pre-workload gate chain (lib-pin / pipeline-contract /
-        # evaluator / evaluator-director drift gates, config#2278 +
-        # config#2348) degrades fail-open through these Pass+Publish pairs —
-        # no skip flag is emitted either way (emit_skip=False), but the
-        # summary must say "degraded", not "completed", when one was hit.
+        frozenset({"PipelineContractCheck"}),
+        # Witness is the first sibling gate the chain re-enters on either the
+        # skip path (I4494: skipping lib-pin no longer jumps straight to
+        # CheckMutexRole — it re-enters at PipelineContractCheck) or the clean
+        # pass path (LibPinDriftGate.Default). The whole pre-workload gate
+        # chain (lib-pin / pipeline-contract / evaluator / evaluator-director
+        # drift gates, config#2278 + config#2348) degrades fail-open through
+        # these Pass+Publish pairs — no skip flag is emitted either way
+        # (emit_skip=False), but the summary must say "degraded", not
+        # "completed", when one was hit.
         degraded_witness=frozenset({
             "LibPinGateDegraded", "PublishLibPinGateDegraded",
             "PipelineContractGateDegraded", "PublishPipelineContractGateDegraded",
             "EvaluatorGateDegraded", "PublishEvaluatorGateDegraded",
             "EvaluatorDirectorGateDegraded", "PublishEvaluatorDirectorGateDegraded",
+            # alpha-engine-config#6722: AcquireMutex's mutex-acquire
+            # infra-error fail-open (DynamoDB outage/IAM drift/transient SDK
+            # error — the SEPARATE ConditionalCheckFailedException conflict
+            # case still hard-Fails via MutexConflict) is the same KIND of
+            # pre-workload precondition check as the four gate pairs above,
+            # even though it sits later in the chain (after
+            # EvaluatorDeployDriftCheck) — folded into this same bucket
+            # rather than a new single-purpose Stage row.
+            "SetMutexAcquireDegradedFlag", "PublishMutexAcquireDegraded",
         }),
         emit_skip=False,
         note=(
@@ -192,11 +233,18 @@ STAGES: tuple[Stage, ...] = (
         "scanner", "skip_scanner",
         "CheckSkipScanner", "Scanner",
         frozenset({"CheckSkipRegimeSubstrate"}),
+        # alpha-engine-config#6722: Scanner's fail-open Catch previously set
+        # no flag at all — MarkScannerDegraded now threads
+        # $.research_degraded_local (folded into the top-level
+        # $.research_predictor_degraded post-join) without changing the
+        # continuation.
+        degraded_witness=frozenset({"MarkScannerDegraded"}),
     ),
     Stage(
         "regime_substrate", "skip_regime_substrate",
         "CheckSkipRegimeSubstrate", "RegimeSubstrate",
         frozenset({"CheckSkipSignalsEnvelope"}),
+        degraded_witness=frozenset({"MarkRegimeSubstrateDegraded"}),
     ),
     Stage(
         "signals_envelope", "skip_signals_envelope",
@@ -215,6 +263,7 @@ STAGES: tuple[Stage, ...] = (
         "challenger_shadow", "skip_challenger_shadow",
         "CheckSkipChallengerShadow", "ChallengerShadow",
         frozenset({"CheckSkipRAGIngestion"}),
+        degraded_witness=frozenset({"MarkChallengerShadowDegraded"}),
     ),
     Stage(
         "rag_ingestion", "skip_rag_ingestion",
@@ -234,6 +283,7 @@ STAGES: tuple[Stage, ...] = (
         "regime_retrospective_eval", "skip_regime_retrospective_eval",
         "CheckSkipRegimeRetrospectiveEval", "RegimeRetrospectiveEval",
         frozenset({"CheckSkipDataPhase2"}),
+        degraded_witness=frozenset({"MarkRegimeRetrospectiveEvalDegraded"}),
     ),
     Stage(
         "data_phase2", "skip_data_phase2",
@@ -244,26 +294,41 @@ STAGES: tuple[Stage, ...] = (
         "eval_judge", "skip_eval_judge",
         "CheckSkipEvalJudge", "ComputeEvalCadence",
         frozenset({"CheckSkipRationaleClustering"}),
+        # alpha-engine-config#6722: MarkEvalJudgeDegraded is the shared
+        # convergence for all four submit/poll/process fail-opens;
+        # MarkEvalRollingMeanDegraded covers EvalRollingMean's own Catch —
+        # both sit between this stage's gate and its witness, so both
+        # belong to this row (there is no separate eval_rolling_mean row).
+        degraded_witness=frozenset({
+            "MarkEvalJudgeDegraded", "MarkEvalRollingMeanDegraded",
+        }),
     ),
     Stage(
         "rationale_clustering", "skip_rationale_clustering",
         "CheckSkipRationaleClustering", "RationaleClustering",
         frozenset({"CheckSkipReplayConcordance"}),
+        degraded_witness=frozenset({"MarkRationaleClusteringDegraded"}),
     ),
     Stage(
         "replay_concordance", "skip_replay_concordance",
         "CheckSkipReplayConcordance", "ReplayConcordance",
         frozenset({"CheckSkipCounterfactual"}),
+        degraded_witness=frozenset({"MarkReplayConcordanceDegraded"}),
     ),
     Stage(
         "counterfactual", "skip_counterfactual",
         "CheckSkipCounterfactual", "Counterfactual",
         frozenset({"CheckSkipAggregateCosts"}),
+        degraded_witness=frozenset({"MarkCounterfactualDegraded"}),
     ),
     Stage(
         "aggregate_costs", "skip_aggregate_costs",
         "CheckSkipAggregateCosts", "AggregateCosts",
         frozenset({"BranchAComplete"}),
+        # alpha-engine-config#6722: matches sf-pipeline-policy.md §5's named
+        # cost-aggregation carve-out, which REQUIRES a degraded flag —
+        # MarkAggregateCostsDegraded now provides it.
+        degraded_witness=frozenset({"MarkAggregateCostsDegraded"}),
     ),
     # --- ResearchPredictorParallel branch B -------------------------------
     Stage(
@@ -280,6 +345,18 @@ STAGES: tuple[Stage, ...] = (
             "skip_predictor_training also skips the best-effort model-zoo"
             " rotation (the flag ends branch B; zoo has no separate gate)."
         ),
+        # alpha-engine-config#6722: the model-zoo rotation group's five
+        # fail-open Catches (ResolveZooSpecs/WaitResolveZoo/ModelZooTrainMap/
+        # ModelZooSelect/WaitForModelZoo) all converge on ONE shared
+        # MarkModelZooDegraded. ACCEPTED trade-off (same granularity limit
+        # this row's note already documents — zoo has no separate gate): a
+        # degraded rotation marks the WHOLE predictor_training stage
+        # degraded, so the rerun sets skip_predictor_training=false and
+        # re-trains the champion even though training itself already
+        # succeeded — there is no finer lever to retry only the rotation.
+        # Correct-but-wasteful is preferred over the pre-#6722 status quo of
+        # the rerun silently skipping a degraded rotation as fully clean.
+        degraded_witness=frozenset({"MarkModelZooDegraded"}),
     ),
     # --- post-parallel tail ------------------------------------------------
     Stage(
@@ -322,34 +399,138 @@ STAGES: tuple[Stage, ...] = (
         "CheckSkipPortfolioOptimizerBacktest", "PortfolioOptimizerBacktest",
         frozenset({"CheckSkipParity"}),
     ),
+    # --- parity family (alpha-engine-config#6030 split) --------------------
     Stage(
+        # Family gate row: CheckSkipParity bypasses the WHOLE parity family
+        # (ParityParallel + PitParityCompare). The four fine-grained rows
+        # below own witness/failure detection and skip emission, so this row
+        # emits nothing and detects nothing — it exists so the lockstep
+        # completeness guard sees the gate covered, and so a post-join
+        # branch-degraded fold (ParityDegraded/PublishParityDegraded, which
+        # no single fine-grained row owns) is still reported as degraded.
         "parity", "skip_parity",
-        "CheckSkipParity", "Parity",
+        "CheckSkipParity", "ParityParallel",
+        # CheckSkipEvaluator is only reachable through/past the parity
+        # family (every family path converges there), so it remains a valid
+        # completed-or-skipped witness — INCLUDING for pre-#6030 execution
+        # histories whose Parity/WaitForParity states no longer exist. Any
+        # degraded state in the family overrides it (degraded beats
+        # completed), so a compare-degraded or branch-degraded run never
+        # emits skip_parity.
         frozenset({"CheckSkipEvaluator"}),
+        degraded_witness=frozenset({"ParityDegraded", "PublishParityDegraded"}),
+        emit_skip=False,
+        detect_failure=False,
+        note=(
+            "family row (alpha-engine-config#6030): skip_parity bypasses the"
+            " WHOLE family but is NEVER auto-emitted — the fine-grained rows"
+            " below own per-branch emission and failure detection, so a"
+            " single failed branch reruns ALONE (the #6030 closes-when)."
+            " Witness CheckSkipEvaluator keeps 'completed' reporting valid"
+            " for pre-#6030 execution histories; a rerun of such a history"
+            " re-runs the parity family (conservative and honest — the old"
+            " bundled artifacts cannot witness the new per-stage set)."
+        ),
+    ),
+    Stage(
+        # Branch rows: witness = the branch's own Complete/Skipped terminal
+        # (entered => completed-or-skipped); degraded = the branch's own
+        # fail-open Degraded terminal (entered => ran-and-failed => must
+        # RE-RUN, never be skipped as completed — I6025 extended per-branch).
+        "pit_parity_lookahead", "skip_pit_parity_lookahead",
+        "CheckSkipPitParityLookahead", "PitParityLookahead",
+        frozenset({"PitParityLookaheadComplete", "PitParityLookaheadSkipped"}),
+        degraded_witness=frozenset({"PitParityLookaheadDegraded"}),
+    ),
+    Stage(
+        "pit_parity_walkforward", "skip_pit_parity_walkforward",
+        "CheckSkipPitParityWalkforward", "PitParityWalkforward",
+        frozenset({"PitParityWalkforwardComplete", "PitParityWalkforwardSkipped"}),
+        degraded_witness=frozenset({"PitParityWalkforwardDegraded"}),
+    ),
+    Stage(
+        "parity_replay", "skip_parity_replay",
+        "CheckSkipParityReplay", "ParityReplay",
+        frozenset({"ParityReplayComplete", "ParityReplaySkipped"}),
+        degraded_witness=frozenset({"ParityReplayDegraded"}),
+    ),
+    Stage(
+        "pit_parity_compare", "skip_pit_parity_compare",
+        "CheckSkipPitParityCompare", "PitParityCompare",
+        frozenset({"PitParityCompareComplete"}),
+        degraded_witness=frozenset({"ParityCompareDegraded", "PublishParityCompareDegraded"}),
+        note=(
+            "the compare join emits verdict UNKNOWN (never pass) when a pass"
+            " artifact is missing (§2.3a); skipping it on a rerun is only"
+            " legal when it already completed for this run_date."
+        ),
     ),
     Stage(
         "evaluator", "skip_evaluator",
         "CheckSkipEvaluator", "Evaluator",
         frozenset({"CheckSkipPostEval"}),
     ),
+    # config#6054: the coarse post_eval span is SPLIT. The two health checks
+    # keep no flag of their own — they are advisory, idempotent, and cheap,
+    # so a tail rerun simply re-runs them (their degraded markers are carried
+    # by the post_eval alias row below, informationally; a health-check
+    # degradation alone never forces a ReportCard re-run, which is why they
+    # are NOT in report_card's degraded_witness). skip_post_eval survives in
+    # the DEFINITION as a deprecated whole-tail alias (CheckSkipPostEval)
+    # for in-flight inputs; the deriver no longer emits it — it emits the
+    # per-stage flags below.
     Stage(
         "post_eval", "skip_post_eval",
         "CheckSkipPostEval", "SaturdayHealthCheck",
         frozenset({"CheckShellRunNotify"}),
-        # Every degraded route in the tail (config#2276 health checks +
-        # config#2302 ReportCard/Director) — entering ANY of them means the
-        # tail ran but something inside it failed and was absorbed; the
-        # tail must re-run, never be skipped as complete (I6055: the
-        # 2026-08-01 Director hard-fail that the next rerun skipped).
+        # Health-check degraded routes only (config#2276) — ReportCard's
+        # and Director's moved to their own rows below (config#6054).
         degraded_witness=frozenset({
             "SaturdayHealthCheckDegraded", "SubstrateHealthCheckDegraded",
-            "PublishReportCardDegraded", "PublishDirectorDegraded",
         }),
+        emit_skip=False,
         note=(
-            "skip_post_eval covers the whole health-check/report-card/"
-            "director tail; a failure inside it re-runs the whole tail"
-            " (no finer-grained flags exist)."
+            "skip_post_eval is a DEPRECATED whole-tail alias (config#6054): "
+            "the deriver emits skip_report_card / skip_director instead; the "
+            "health checks re-run on any tail rerun (advisory + idempotent). "
+            "Remove the alias once a full cycle has passed on the split "
+            "flags."
         ),
+    ),
+    Stage(
+        "report_card", "skip_report_card",
+        "CheckSkipReportCard", "ReportCard",
+        # Success-only witness: ReportCard's success edge now lands on
+        # CheckSkipDirector (config#6054). Pre-split histories entered
+        # "Director" directly on ReportCard success. A skipped ReportCard
+        # ALSO enters CheckSkipDirector — same convention as evaluator's
+        # CheckSkipPostEval witness: a skip in the original run implies a
+        # completion the earlier run derived.
+        frozenset({"CheckSkipDirector", "Director"}),
+        # config#6685: ReportCardDegraded is the Pass state ReportCard's
+        # Catch routes to FIRST (sets $.report_card_degraded), then
+        # PublishReportCardDegraded — degraded overrides witness (I6055).
+        degraded_witness=frozenset({
+            "ReportCardDegraded", "PublishReportCardDegraded",
+        }),
+    ),
+    Stage(
+        "director", "skip_director",
+        "CheckSkipDirector", "Director",
+        # DirectorComplete is entered ONLY via Director's success edge
+        # (config#6054) — deliberately NOT CheckShellRunNotify, which every
+        # bypass path also enters: witnessing on it would mark a bypassed
+        # Director complete and skip it on the rerun (the I6055 trap, and
+        # the exact 2026-08-01 incident). Pre-split histories have no
+        # success-only witness, so the deriver conservatively RE-RUNS
+        # Director for them — re-running the advisory is the safe
+        # direction.
+        frozenset({"DirectorComplete"}),
+        # config#6408: Director failure is TERMINAL (NormalizeFailureContext
+        # → FailExecution) — no witness is entered, so the stage re-runs.
+        # PublishDirectorDegraded is RETAINED for pre-fix execution
+        # histories only; new executions never enter it.
+        degraded_witness=frozenset({"PublishDirectorDegraded"}),
     ),
 )
 
@@ -367,62 +548,15 @@ BRANCH_A_STAGES = frozenset({
 })
 # Stages whose gate is only reachable THROUGH CheckSkipBacktester's run path
 # (the skip route overshoots them — see Stage("backtester").note).
-BACKTESTER_OVERSHADOWED = ("predictor_backtest", "portfolio_optimizer_backtest", "parity")
-
-
-# ---------------------------------------------------------------------------
-# Execution-history parsing (pure functions — unit-tested over fixtures)
-# ---------------------------------------------------------------------------
-
-def entered_states(events: list[dict]) -> set:
-    return {
-        e["stateEnteredEventDetails"]["name"]
-        for e in events
-        if "stateEnteredEventDetails" in e
-    }
-
-
-def execution_input(events: list[dict]) -> dict:
-    for e in events:
-        d = e.get("executionStartedEventDetails")
-        if d is not None:
-            return json.loads(d.get("input") or "{}")
-    raise SystemExit("FATAL: history carries no ExecutionStarted event — cannot recover the original input.")
-
-
-def initialize_input_output(events: list[dict]) -> dict | None:
-    """The merged object InitializeInput emitted — the authoritative source
-    of the run_date every subsequent stage actually keyed its artifacts on."""
-    for e in events:
-        d = e.get("stateExitedEventDetails")
-        if d is not None and d.get("name") == "InitializeInput":
-            try:
-                return json.loads(d.get("output") or "null")
-            except json.JSONDecodeError:
-                return None
-    return None
-
-
-def derive_run_date(events: list[dict], start_time: datetime | None) -> tuple[str, str]:
-    """Return (run_date, provenance). Precedence: explicit input run_date >
-    InitializeInput's merged output > date(Execution start time)."""
-    orig = execution_input(events)
-    if isinstance(orig.get("run_date"), str) and orig["run_date"]:
-        return orig["run_date"], "explicit run_date in the failed execution's input"
-    init = initialize_input_output(events)
-    if isinstance(init, dict) and isinstance(init.get("run_date"), str) and init["run_date"]:
-        return init["run_date"], "InitializeInput merged output of the failed execution"
-    if start_time is not None:
-        rd = start_time.astimezone(timezone.utc).date().isoformat()
-        return rd, (
-            "FALLBACK: UTC date of the failed execution's start time"
-            " (InitializeInput never exited — pre-workload failure)"
-        )
-    raise SystemExit(
-        "FATAL: cannot derive run_date — no explicit input run_date, no "
-        "InitializeInput output in history, and no execution start time "
-        "was supplied."
-    )
+BACKTESTER_OVERSHADOWED = (
+    "predictor_backtest", "portfolio_optimizer_backtest",
+    # alpha-engine-config#6030: the parity family's fine-grained stages —
+    # skip_backtester's whole-pair route jumps past CheckSkipParity, so a
+    # failed parity sub-stage behind skip_backtester needs the
+    # stage-only replacement exactly like the pre-split "parity" did.
+    "pit_parity_lookahead", "pit_parity_walkforward", "parity_replay",
+    "pit_parity_compare",
+)
 
 
 @dataclass
@@ -467,15 +601,39 @@ def _simulate_reachable_works(flags: dict, original_input: dict) -> set:
     run_linear(sorted(BRANCH_A_STAGES, key=lambda n: [s.name for s in STAGES].index(n)))
     run_linear(["predictor_training"])
     # tail: CheckSkipBacktester's skip route OVERSHOOTS to CheckSkipEvaluator
+    def run_parity_family():
+        # alpha-engine-config#6030: skip_parity bypasses the WHOLE family
+        # (ParityParallel + compare); otherwise each fine-grained stage runs
+        # per its own flag (the three branch gates + the compare gate).
+        if effective["parity"]:
+            return
+        # the family row itself: ParityParallel is entered whenever the
+        # family gate is not skipped (its branches then honor their own
+        # flags) — needed so a degraded family fold passes the
+        # reachability guard.
+        ran.add("parity")
+        run_linear([
+            "pit_parity_lookahead", "pit_parity_walkforward", "parity_replay",
+            "pit_parity_compare",
+        ])
+
     if effective["backtester"]:
-        pass  # backtester, predictor_backtest, portfolio_optimizer_backtest, parity all bypassed
+        pass  # backtester, predictor_backtest, portfolio_optimizer_backtest + parity family all bypassed
     elif effective["backtester_stage_only"]:
         # config#2362 Option A: only the Backtester SSM task is bypassed;
         # the tail gates still compose orthogonally past it.
-        run_linear(["predictor_backtest", "portfolio_optimizer_backtest", "parity"])
+        run_linear(["predictor_backtest", "portfolio_optimizer_backtest"])
+        run_parity_family()
     else:
-        run_linear(["backtester", "predictor_backtest", "portfolio_optimizer_backtest", "parity"])
-    run_linear(["evaluator", "post_eval"])
+        run_linear(["backtester", "predictor_backtest", "portfolio_optimizer_backtest"])
+        run_parity_family()
+    # config#6054 split the coarse post_eval span: post_eval survives as the
+    # deprecated whole-tail alias (its health checks re-run on any tail rerun)
+    # while report_card / director are now independently gated. All three are
+    # modeled here so the degraded-aware reachability guard (which now folds
+    # DEGRADED stages into must_rerun) can see post_eval — its health-check
+    # degraded_witness — as reachable when a tail rerun re-runs the span.
+    run_linear(["evaluator", "post_eval", "report_card", "director"])
     return ran
 
 
@@ -526,26 +684,38 @@ def derive_plan(events: list[dict], start_time: datetime | None = None) -> Rerun
     # (its backtest/{run_date}/ artifacts already exist and are reused) while
     # still routing through the predictor-backtest/portfolio-optimizer/parity
     # gates, so the failed stage reruns without re-burning Backtester.
+    # A stage that must RE-RUN is a failed OR degraded one (I6055: degraded
+    # is exactly what a mechanical rerun exists to retry) — both classes get
+    # the overshoot replacement and the reachability guard. Meta rows
+    # (emit_skip=False AND detect_failure=False: the parity family fold,
+    # backtester_stage_only) are excluded — their fine-grained rows carry
+    # the actual work-state guarantee.
+    def _is_meta(name: str) -> bool:
+        st = STAGES_BY_NAME[name]
+        return not st.emit_skip and not st.detect_failure
+
+    must_rerun = [f for f in (*plan.failed, *plan.degraded) if not _is_meta(f)]
+
     if "skip_backtester" in plan.skip_flags and any(
-        f in plan.failed for f in BACKTESTER_OVERSHADOWED
+        f in must_rerun for f in BACKTESTER_OVERSHADOWED
     ):
         del plan.skip_flags["skip_backtester"]
         plan.skip_flags["skip_backtester_stage_only"] = True
         plan.notes.append(
             "skip_backtester replaced with skip_backtester_stage_only: "
             "Backtester completed but its whole-pair skip route would bypass "
-            f"failed stage(s) {[f for f in plan.failed if f in BACKTESTER_OVERSHADOWED]} "
+            f"failed/degraded stage(s) {[f for f in must_rerun if f in BACKTESTER_OVERSHADOWED]} "
             "— skipping only the Backtester SSM task (reusing its "
             "already-written artifacts) instead of re-burning it. config#2362."
         )
 
     reachable = _simulate_reachable_works(plan.skip_flags, original_input)
-    unreachable_failed = [f for f in plan.failed if f not in reachable]
-    if unreachable_failed:
+    unreachable = [f for f in must_rerun if f not in reachable]
+    if unreachable:
         raise SystemExit(
-            f"FATAL: derived skip set would make failed stage(s) "
-            f"{unreachable_failed} unreachable — refusing to emit an input "
-            f"that silently skips a failed stage. Flags: "
+            f"FATAL: derived skip set would make failed/degraded stage(s) "
+            f"{unreachable} unreachable — refusing to emit an input "
+            f"that silently skips a stage that must re-run. Flags: "
             f"{sorted(plan.skip_flags)}; original input flags: "
             f"{ {k: v for k, v in original_input.items() if k.startswith('skip_')} }. "
             f"This means the skip-gate topology changed — update STAGES / "
@@ -572,63 +742,9 @@ def derive_plan(events: list[dict], start_time: datetime | None = None) -> Rerun
 # ---------------------------------------------------------------------------
 # Role-gating verification against the live definition (config#2277 D2)
 # ---------------------------------------------------------------------------
-
-def _walk_states(states: dict):
-    for name, state in states.items():
-        yield name, state
-        if state.get("Type") == "Parallel":
-            for branch in state.get("Branches", []):
-                yield from _walk_states(branch.get("States", {}))
-        if state.get("Type") == "Map":
-            it = state.get("Iterator") or state.get("ItemProcessor") or {}
-            yield from _walk_states(it.get("States", {}))
-
-
-def _rule_role_values(rule: dict) -> tuple[bool, set]:
-    """Return (references_pipeline_role, {StringEquals values on it})."""
-    refs = False
-    values: set = set()
-
-    def rec(node):
-        nonlocal refs
-        if isinstance(node, dict):
-            if node.get("Variable") == "$.pipeline_role":
-                refs = True
-                if "StringEquals" in node:
-                    values.add(node["StringEquals"])
-            for key in ("And", "Or"):
-                for sub in node.get(key, []) or []:
-                    rec(sub)
-            if "Not" in node:
-                rec(node["Not"])
-
-    rec(rule)
-    return refs, values
-
-
-def verify_skip_flags_live(definition: dict, role: str) -> None:
-    """Fail LOUDLY if any CheckSkip* gate structurally conjuncts
-    pipeline_role in a way that would render our skip flags inert under
-    `role` (the EOD SF's config#1614 pattern). A helper that silently emits
-    inert skip flags re-burns every completed spot stage."""
-    offenders = []
-    for name, state in _walk_states(definition.get("States", {})):
-        if not name.startswith("CheckSkip") or state.get("Type") != "Choice":
-            continue
-        for rule in state.get("Choices", []):
-            refs, values = _rule_role_values(rule)
-            if refs and role not in values:
-                offenders.append((name, sorted(values)))
-    if offenders:
-        raise SystemExit(
-            "FATAL (role gating): the weekly SF now conjuncts pipeline_role "
-            f"inside skip gates {offenders}, and role {role!r} is not in the "
-            "live set — the skip flags this helper emits would be silently "
-            "IGNORED and every completed spot stage would re-burn. Update "
-            "scripts/weekly_sf_rerun.py's EMITTED_ROLE / derivation to match "
-            "the SF's new role-gate semantics before rerunning."
-        )
-
+# _walk_states / _rule_role_values / verify_skip_flags_live now live in
+# sf_rerun_common.py (imported above) — lifted unchanged on the weekday_sf_
+# rerun.py second adoption (alpha-engine-config#6694, shared-code-policy).
 
 # ---------------------------------------------------------------------------
 # Mutex-steal decision matrix (config#2280 contract)
@@ -725,35 +841,9 @@ def decide_mutex_action(
 # ---------------------------------------------------------------------------
 # AWS plumbing (thin, injectable)
 # ---------------------------------------------------------------------------
-
-def fetch_history(sf, execution_arn: str) -> list[dict]:
-    events, token = [], None
-    while True:
-        kwargs = {"executionArn": execution_arn, "maxResults": 1000}
-        if token:
-            kwargs["nextToken"] = token
-        resp = sf.get_execution_history(**kwargs)
-        events.extend(resp["events"])
-        token = resp.get("nextToken")
-        if not token:
-            return events
-
-
-def list_all_executions(sf, sm_arn: str, status_filter: str | None = None, cap: int = 1000) -> list[dict]:
-    out, token = [], None
-    while len(out) < cap:
-        kwargs = {"stateMachineArn": sm_arn, "maxResults": 200}
-        if status_filter:
-            kwargs["statusFilter"] = status_filter
-        if token:
-            kwargs["nextToken"] = token
-        resp = sf.list_executions(**kwargs)
-        out.extend(resp["executions"])
-        token = resp.get("nextToken")
-        if not token:
-            break
-    return out[:cap]
-
+# fetch_history / list_all_executions now live in sf_rerun_common.py
+# (imported above) — lifted unchanged on the weekday_sf_rerun.py second
+# adoption (alpha-engine-config#6694, shared-code-policy).
 
 def resolve_default_execution(sf, sm_arn: str) -> dict:
     """Latest terminal-failed (FAILED or TIMED_OUT) execution."""
@@ -777,15 +867,9 @@ def next_rerun_name(sf, sm_arn: str, run_date: str) -> str:
     return f"{prefix}{(max(ns) if ns else 0) + 1}"
 
 
-def effective_run_date_of(sf, execution: dict) -> str:
-    try:
-        desc = sf.describe_execution(executionArn=execution["executionArn"])
-        inp = json.loads(desc.get("input") or "{}")
-        if isinstance(inp.get("run_date"), str) and inp["run_date"]:
-            return inp["run_date"]
-    except Exception as exc:  # noqa: BLE001 — guard is best-effort per-exec; date fallback below is conservative
-        print(f"WARN: could not read input of {execution['executionArn']}: {exc}", file=sys.stderr)
-    return execution["startDate"].astimezone(timezone.utc).date().isoformat()
+# effective_run_date_of now lives in sf_rerun_common.py (imported above) —
+# lifted unchanged on the weekday_sf_rerun.py second adoption
+# (alpha-engine-config#6694, shared-code-policy).
 
 
 # ---------------------------------------------------------------------------

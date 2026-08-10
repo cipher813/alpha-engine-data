@@ -132,8 +132,23 @@ _EXPECTED_SKIPS = {
     "skip_predictor_backtest",
     "skip_portfolio_optimizer_backtest",
     "skip_parity",
+    # alpha-engine-config#6030: the Parity state became ParityParallel
+    # (three fail-open branches, each with its own in-branch gate) + the
+    # PitParityCompare join. skip_parity above is retained as the
+    # whole-family gate; the four fine-grained flags below are what
+    # scripts/weekly_sf_rerun.py emits so a single failed branch reruns
+    # alone.
+    "skip_pit_parity_lookahead",
+    "skip_pit_parity_walkforward",
+    "skip_parity_replay",
+    "skip_pit_parity_compare",
     "skip_evaluator",
     "skip_post_eval",
+    # config#6054: per-stage split of the post-eval tail — skip_post_eval
+    # stays as the deprecated whole-tail alias; these two gate ReportCard
+    # and Director independently.
+    "skip_report_card",
+    "skip_director",
 }
 
 # KEYSTONE + skip-exception rewire: the 8 SPOT workload states. Under
@@ -146,17 +161,24 @@ _EXPECTED_SKIPS = {
 # commands.$/States.Format($.preflight_args) Option-C mechanism the keystone
 # used for the other 7 spots.
 # Maps state name → (mode token the {} immediately follows, log file).
+#
+# alpha-engine-config-I4442/I4497 SF cutover (2026-08-09, nousergon-data
+# #1122 + crucible-backtester#631): MorningEnrich/DataPhase1/RAGIngestion and
+# the five backtest-family states below now invoke their own dedicated
+# per-stage script instead of a shared monolith + mode flag. The old
+# monolith launchers (spot_data_weekly.sh / spot_backtest.sh) are retained
+# on disk, unchanged, only as the rollback path.
 _SPOT_STATES = {
     "MorningEnrich": (
-        "bash infrastructure/spot_data_weekly.sh --morning-enrich-only",
+        "bash infrastructure/spot_morning_enrich.sh",
         "/var/log/morning-enrich.log",
     ),
     "DataPhase1": (
-        "bash infrastructure/spot_data_weekly.sh --phase1-only",
+        "bash infrastructure/spot_data_phase1.sh",
         "/var/log/data-weekly.log",
     ),
     "RAGIngestion": (
-        "bash infrastructure/spot_data_weekly.sh --rag-only",
+        "bash infrastructure/spot_rag_ingestion.sh",
         "/var/log/rag-ingestion.log",
     ),
     # alpha-engine-config-I5759: DataPhase2 moved OFF lambda:invoke onto spot,
@@ -172,34 +194,64 @@ _SPOT_STATES = {
         "/var/log/data-phase2.log",
     ),
     "PredictorTraining": (
-        "bash infrastructure/spot_train.sh --full-only",
+        "bash infrastructure/spot_predictor_training.sh",
         "/var/log/predictor-training.log",
     ),
     "Backtester": (
-        "bash infrastructure/spot_backtest.sh --mode=param-sweep --no-pit-parity --skip-stages=parity,evaluator",
+        "bash infrastructure/spot_backtester.sh",
         "/var/log/backtester.log",
     ),
     "PredictorBacktest": (
-        "bash infrastructure/spot_backtest.sh --mode=predictor-backtest --no-pit-parity --skip-stages=parity,evaluator",
+        "bash infrastructure/spot_predictor_backtest.sh",
         "/var/log/predictor-backtest.log",
     ),
     "PortfolioOptimizerBacktest": (
-        "bash infrastructure/spot_backtest.sh --mode=portfolio-optimizer-backtest --no-pit-parity --skip-stages=parity,evaluator",
+        "bash infrastructure/spot_portfolio_optimizer_backtest.sh",
         "/var/log/portfolio-optimizer.log",
     ),
-    "Parity": (
-        "bash infrastructure/spot_backtest.sh --pit-parity-enabled=1 --skip-stages=backtest,evaluator",
-        "/var/log/parity.log",
+    # alpha-engine-config#6030: the bundled Parity spot became four
+    # independent stages — three ParityParallel branches + the compare join.
+    # Like DataPhase2's I5759 entry, the four have NO pre-keystone form:
+    # their baseline was captured at the split commit, so the pin they
+    # carry is "not drifted since the split", not "identical to the
+    # pre-split Saturday path" (that deliberate change IS the split).
+    "PitParityLookahead": (
+        "bash infrastructure/spot_pit_lookahead.sh",
+        "/var/log/pit-lookahead.log",
+    ),
+    "PitParityWalkforward": (
+        "bash infrastructure/spot_pit_walkforward.sh",
+        "/var/log/pit-walkforward.log",
+    ),
+    "ParityReplay": (
+        "bash infrastructure/spot_parity_replay.sh",
+        "/var/log/parity-replay.log",
+    ),
+    "PitParityCompare": (
+        "bash infrastructure/spot_parity_compare.sh",
+        "/var/log/parity-compare.log",
     ),
     "Evaluator": (
-        "bash infrastructure/spot_backtest.sh --no-pit-parity --skip-stages=backtest,parity",
+        "bash infrastructure/spot_evaluator.sh",
         "/var/log/evaluator.log",
     ),
     # config#902: DriftDetection was collapsed — drift is now bundled onto the
-    # PredictorTraining spot (crucible-predictor spot_train.sh runs
-    # monitoring.drift_detector after training succeeds). Its Friday
-    # --preflight-only dry path folds into spot_train.sh --preflight-only, so
-    # DriftDetection is no longer a standalone spot state here.
+    # PredictorTraining spot (crucible-predictor spot_predictor_training.sh,
+    # pre-cutover spot_train.sh, runs monitoring.drift_detector after
+    # training succeeds). Its Friday --preflight-only dry path folds into
+    # PredictorTraining's own --preflight-only, so DriftDetection is no
+    # longer a standalone spot state here.
+    #
+    # alpha-engine-config-I4442/I4497 predictor-leg cutover (2026-08-09):
+    # PredictorTraining above now invokes spot_predictor_training.sh
+    # (pre-cutover: spot_train.sh --full-only). TrainSpecDispatch and
+    # ModelZooSelect (crucible-predictor spot_train_spec_dispatch.sh /
+    # spot_model_zoo_select.sh --select-only) also honor $.preflight_args
+    # identically but live inside ResearchPredictorParallel's Branch B /
+    # ModelZooTrainMap, outside this table's scope (this table only covers
+    # the SF's single top-level sequential spine) — not a regression, this
+    # gap predates the cutover (spot_train.sh --model-zoo-spec /
+    # --model-zoo-select were never in this table either).
 }
 
 # KEYSTONE + skip-exception rewire: the LAMBDA states routed dry (NOT
@@ -437,6 +489,20 @@ def orig_spot_cmds() -> dict:
       `_eval_expr` learned the `$$.` context-object form; the baseline
       resolves it via `_CONTEXT_OBJECT` so byte-identity stays
       deterministic. See `tests/test_sf_krepis_correlation_id.py`.
+
+    - **Regenerated 2026-08-09** as part of the alpha-engine-config-I4442/
+      I4497 SF cutover (nousergon-data#1122 + crucible-backtester#631):
+      MorningEnrich/DataPhase1/RAGIngestion and the five backtest-family
+      states now resolve to their own dedicated per-stage script
+      (`spot_morning_enrich.sh` / `spot_data_phase1.sh` /
+      `spot_rag_ingestion.sh` / `spot_backtester.sh` /
+      `spot_predictor_backtest.sh` / `spot_portfolio_optimizer_backtest.sh`
+      / `spot_parity.sh` / `spot_evaluator.sh`) with no stage-multiplexing
+      flag, instead of the shared `spot_data_weekly.sh` / `spot_backtest.sh`
+      monolith + mode flag. This is a deliberate, reviewed absent-path
+      change — the whole point of the cutover — so the baseline moves with
+      it. Both monoliths are retained on disk, unchanged, only as the
+      rollback path.
 
     Regenerate ONLY on a deliberate, reviewed change to a spot state's
     absent-path (`preflight_args=""`) command, by re-extracting the
@@ -757,11 +823,13 @@ class TestByteIdenticalAbsentPath:
     def _state(self, sf: dict, name: str) -> dict:
         if name in sf["States"]:
             return sf["States"][name]
-        # Parallel-branch states (Research/DataPhase2/PredictorTraining).
-        par = sf["States"]["ResearchPredictorParallel"]
-        for br in par["Branches"]:
-            if name in br["States"]:
-                return br["States"][name]
+        # Parallel-branch states (Research/DataPhase2/PredictorTraining,
+        # and the alpha-engine-config#6030 parity branches).
+        for par_name in ("ResearchPredictorParallel", "ParityParallel"):
+            par = sf["States"][par_name]
+            for br in par["Branches"]:
+                if name in br["States"]:
+                    return br["States"][name]
         raise KeyError(name)
 
     @pytest.mark.parametrize("name", sorted(_SPOT_STATES))
@@ -866,18 +934,21 @@ class TestByteIdenticalAbsentPath:
 
 class TestConsolidatedNotify:
     def test_substrate_check_routes_to_notify_gate(self, states):
-        # The substrate check flows into two non-fatal advisory states (evaluator
+        # The substrate check flows into two advisory states (evaluator
         # Report Card v2, then the Director) before the notify gate. ReportCard's
-        # SUCCESS Next feeds the Director; its Catch routes to
+        # SUCCESS Next feeds the Director; its Catch routes to ReportCardDegraded
+        # (config#6685: sets $.report_card_degraded so it threads into the
+        # terminal-notify selection) which then continues, unchanged, to
         # PublishReportCardDegraded (config#2302: a WARNING page — advisory grading
-        # failed silently for 9 days pre-fix) which then continues to
-        # CheckShellRunNotify. The Director's own Next lands on CheckShellRunNotify;
-        # its Catch routes to PublishDirectorDegraded (same config#2302 shape) which
-        # then continues to CheckShellRunNotify. The path to the notify gate is
-        # preserved whether grading/advisory succeed or fail. On the Friday preflight
-        # the states still RUN (dry, see test_advisory_tail_runs_dry_on_preflight) —
-        # they are not skipped — so the success edge is identical on real + preflight
-        # runs.
+        # failed silently for 9 days pre-fix) and on to CheckShellRunNotify. The
+        # Director's own Next lands on CheckShellRunNotify on success. config#6408
+        # (Brian's 2026-08-04 operator ruling): Director's Catch now routes to
+        # NormalizeFailureContext — a Director failure terminates the execution
+        # FAILED.
+        # The path to the notify gate is preserved when grading succeeds and
+        # advisory succeeds. On the Friday preflight the states still RUN (dry,
+        # see test_advisory_tail_runs_dry_on_preflight) — they are not skipped —
+        # so the success edge is identical on real + preflight runs.
         # config#2276: the substrate poll resolves to a terminal status
         # first; its Success edge is what feeds ReportCard.
         assert (
@@ -889,15 +960,23 @@ class TestConsolidatedNotify:
             for r in states["CheckSubstrateHealthCheckStatus"]["Choices"]
             if r.get("StringEquals") == "Success"
         )
-        assert substrate_success["Next"] == "ReportCard"
+        # config#6054: the substrate check now lands on the per-stage skip
+        # gates rather than directly on ReportCard; the success chain is
+        # CheckSkipReportCard → ReportCard → CheckSkipDirector → Director →
+        # DirectorComplete (success-only rerun witness) → CheckShellRunNotify.
+        assert substrate_success["Next"] == "CheckSkipReportCard"
+        assert states["CheckSkipReportCard"]["Default"] == "ReportCard"
         report_card = states["ReportCard"]
-        assert report_card["Next"] == "Director"
-        assert all(c["Next"] == "PublishReportCardDegraded" for c in report_card["Catch"])
+        assert report_card["Next"] == "CheckSkipDirector"
+        assert all(c["Next"] == "ReportCardDegraded" for c in report_card["Catch"])
+        assert states["ReportCardDegraded"]["Next"] == "PublishReportCardDegraded"
         assert states["PublishReportCardDegraded"]["Next"] == "CheckShellRunNotify"
+        assert states["CheckSkipDirector"]["Default"] == "Director"
         director = states["Director"]
-        assert director["Next"] == "CheckShellRunNotify"
-        assert all(c["Next"] == "PublishDirectorDegraded" for c in director["Catch"])
-        assert states["PublishDirectorDegraded"]["Next"] == "CheckShellRunNotify"
+        assert director["Next"] == "DirectorComplete"
+        assert states["DirectorComplete"]["Next"] == "CheckShellRunNotify"
+        assert all(c["Next"] == "NormalizeFailureContext" for c in director["Catch"])
+        assert all(c["ResultPath"] == "$.error" for c in director["Catch"])
 
     def test_advisory_tail_runs_dry_on_preflight(self, states):
         """ROADMAP L4504: ReportCard + Director were added after the shell-run
@@ -1129,7 +1208,12 @@ class TestHappyPathTraversal:
             "Backtester",
             "PredictorBacktest",
             "PortfolioOptimizerBacktest",
-            "Parity",
+            # alpha-engine-config#6030: the parity family — the Parallel is
+            # the main-thread hop (its three branches run dry in-branch,
+            # asserted by TestByteIdenticalAbsentPath), the compare joins
+            # after it.
+            "ParityParallel",
+            "PitParityCompare",
             "Evaluator",
         ):
             assert ran_dry in order, (
@@ -1175,6 +1259,10 @@ class TestHappyPathTraversal:
         # then director Lambda) is now composed directly after
         # PipelineContractGate's pass-through, before CheckMutexRole — four
         # extra states in the visited order.
+        # I4494: WeeklyPreflight is composed as the fourth pre-spend gate
+        # between EvaluatorDirectorDeployDriftGate and CheckMutexRole (its
+        # verdict Choice Default proceeds to the mutex on a clean pass) — two
+        # extra states in the visited order.
         # config#2249: CheckSkipMorningEnrich.Default now routes through the
         # SubstrateHealthGate -> CheckSubstrateHealthGate pre-check before
         # MorningEnrich (fast fail on a dead dispatch box) — two extra states
@@ -1187,7 +1275,9 @@ class TestHappyPathTraversal:
         # -> CheckWeeklyFreshnessSpotBootstrapStatus (a green-trace Success ->
         # CheckShellRun, same "resolves to Success" convention this helper
         # already applies to every other WaitFor*/Check*Status poll loop) —
-        # five extra states in the visited order before CheckShellRun.
+        # five extra states in the visited order before CheckShellRun (now six
+        # per alpha-engine-config-I5687's InitWeeklyFreshnessSpotBootstrapPollCount
+        # poll-budget seed).
         assert order[: order.index("CheckSkipMorningEnrich") + 4] == [
             "InitializeInput",
             "CheckWeeklyRunDayGate",
@@ -1201,10 +1291,15 @@ class TestHappyPathTraversal:
             "EvaluatorDeployDriftGate",
             "EvaluatorDirectorDeployDriftCheck",
             "EvaluatorDirectorDeployDriftGate",
+            "WeeklyPreflight",
+            "WeeklyPreflightGate",
             "CheckMutexRole",
             "CheckSpotDispatchNeeded",
             "DispatchWeeklyFreshnessSpot",
             "MergeWeeklyFreshnessSpotInstanceId",
+            # alpha-engine-config-I5687: the poll-budget seed now sits
+            # between the instance-id merge and the first poll.
+            "InitWeeklyFreshnessSpotBootstrapPollCount",
             "WaitForWeeklyFreshnessSpotBootstrap",
             "CheckWeeklyFreshnessSpotBootstrapStatus",
             "CheckShellRun",

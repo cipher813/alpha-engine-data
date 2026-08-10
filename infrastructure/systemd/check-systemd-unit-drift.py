@@ -70,15 +70,26 @@ Three rules follow:
   * **The counts are emitted** (`--metric`), including zeros: a number that
     only appears when something is wrong cannot distinguish healthy from
     dead (`principles.md` §2.7).
+  * **A unit this check cannot READ is `unreadable` — a failing finding,
+    never a crash.** 2026-08-09: `nousergon-console.service` was installed
+    root-owned 0600 and the whole sweep died on the PermissionError, taking
+    coverage of the other 59 units with it. Unit files on these boxes are
+    world-readable 0644 (secrets belong in an EnvironmentFile or SSM, never
+    inline), so unreadable means both a convention violation and a hole in
+    the coverage claim — it exits 1 until the mode is fixed.
 
-"Codified" means a file of the same name under a `--codified-root` (default:
-this script's directory). Units owned by other repos — `metron-*`,
-`crucible-dash-*`, `nousergon-*`, `vires`, `telos-web`, `mnemon*` — are not
-codified *from here* and sit in the baseline with their owning repo noted.
-Teaching this script to read eight repo trees would move the ownership
-question into a script instead of answering it; `infrastructure-ownership-
-policy` answers it, and the baseline is the register of where that answer has
-not been applied yet.
+"Codified" means a file of the same name under a `--codified-root`
+(repeatable; default: this script's directory). The unit passes one root per
+repo checkout on the box that is today-authoritative for its units per
+`infrastructure-ownership-policy` §5 — measured 2026-08-09, byte-identical
+for every covered unit: `alpha-engine-dashboard` (21 units), `metron-ops`
+(10), `telos-ops` (1), plus this repo's 6. The roots do NOT decide
+ownership — `infrastructure-ownership-policy` does; they verify hashes
+wherever a unit is already codified, and the baseline remains the register
+of units codified NOWHERE (22 as of 2026-08-09). The original 2026-08-08
+baseline mislabeled the 21 dashboard-owned units "codified in no known
+root" because this script only read its own directory — a coverage gap in
+the checker, not in the codification.
 """
 
 from __future__ import annotations
@@ -96,10 +107,15 @@ UNCODIFIED_BASELINE_FILE = SCRIPT_DIR / "uncodified-units-baseline.txt"
 
 UNIT_SUFFIXES = (".service", ".timer")
 
-#: CloudWatch namespace for the coverage counts. Shares the box-health
+#: CloudWatch namespace for the coverage counts. Shares box-health's actual
 #: namespace deliberately — coverage of the unit set is a property of the box,
-#: and a separate namespace is one more place to remember to look.
-METRIC_NAMESPACE = "NousErgon/BoxHealth"
+#: and a separate namespace is one more place to remember to look. This was
+#: born as "NousErgon/BoxHealth", which (a) is NOT what box_health.sh emits
+#: to and (b) the box role's PutMetricData grant is namespace-conditioned to
+#: `AlphaEngine`/`AlphaEngine/*` (alpha-engine-cloudwatch-metrics.json), so
+#: every emit would have been denied — measured live 2026-08-09, before the
+#: first `--metric` run ever fired.
+METRIC_NAMESPACE = "AlphaEngine/Box"
 
 # The units this repo codifies and installs. NO LONGER THE SCOPE OF THE
 # CHECK — scope is now whatever is installed (see the docstring). Kept
@@ -177,7 +193,7 @@ def check_unit(
 ) -> tuple[str, str]:
     """Returns (status, detail).
 
-    status in {"clean", "drift", "uncodified", "not-installed"}.
+    status in {"clean", "drift", "uncodified", "not-installed", "unreadable"}.
 
     `SCRIPT_DIR` / `INSTALLED_DIR` are read at CALL time when the arguments
     are omitted, so a caller (or a test) can repoint the module globals.
@@ -193,7 +209,15 @@ def check_unit(
     metron-intraday), so it is informational, never a finding.
     """
     d = installed_dir or INSTALLED_DIR
-    installed_hash = _sha256(d / name)
+    try:
+        installed_hash = _sha256(d / name)
+    except PermissionError:
+        return "unreadable", (
+            f"{name}: installed here but not readable by this user — unit "
+            f"files are world-readable 0644 on this box (secrets belong in an "
+            f"EnvironmentFile or SSM, never inline); drift is unverifiable "
+            f"until the mode is fixed"
+        )
     repo_path = codified_path(name, roots)
 
     if installed_hash is None:
@@ -204,7 +228,10 @@ def check_unit(
     if repo_path is None:
         return "uncodified", f"{name}: installed here, codified in no known root"
 
-    repo_hash = _sha256(repo_path)
+    try:
+        repo_hash = _sha256(repo_path)
+    except PermissionError:
+        return "unreadable", f"{name}: codified copy at {repo_path} is not readable — drift is unverifiable"
     if installed_hash != repo_hash:
         return "drift", f"{name}: installed ({installed_hash[:12]}) != repo ({repo_hash[:12]})"
 
@@ -278,7 +305,9 @@ def main() -> int:
         # dropping out of the comparison.
         names = sorted(set(installed_units()) | set(codified_units(roots)))
 
-    buckets: dict[str, list[str]] = {"clean": [], "drift": [], "uncodified": [], "not-installed": []}
+    buckets: dict[str, list[str]] = {
+        "clean": [], "drift": [], "uncodified": [], "not-installed": [], "unreadable": [],
+    }
     details: dict[str, str] = {}
     for name in names:
         status, detail = check_unit(name, roots)
@@ -289,7 +318,10 @@ def main() -> int:
 
     uncodified = buckets["uncodified"]
     uncodified_new = [n for n in uncodified if n not in baseline]
-    installed_count = len(buckets["clean"]) + len(buckets["drift"]) + len(uncodified)
+    unreadable = buckets["unreadable"]
+    installed_count = (
+        len(buckets["clean"]) + len(buckets["drift"]) + len(uncodified) + len(unreadable)
+    )
 
     print(
         "SUMMARY "
@@ -298,6 +330,7 @@ def main() -> int:
         f"drift={len(buckets['drift'])} "
         f"uncodified={len(uncodified)} "
         f"uncodified_new={len(uncodified_new)} "
+        f"unreadable={len(unreadable)} "
         f"codified_not_installed={len(buckets['not-installed'])}"
     )
 
@@ -308,12 +341,16 @@ def main() -> int:
             "Drifted": len(buckets["drift"]),
             "Uncodified": len(uncodified),
             "UncodifiedNew": len(uncodified_new),
+            "Unreadable": len(unreadable),
         })
 
     exit_code = 0
     findings: list[str] = []
     if buckets["drift"]:
         findings.extend(details[n] for n in buckets["drift"])
+        exit_code = max(exit_code, 1)
+    if unreadable:
+        findings.extend(details[n] for n in unreadable)
         exit_code = max(exit_code, 1)
     if uncodified_new:
         findings.append(
@@ -337,13 +374,14 @@ def main() -> int:
     # "passed" that is true while 54 units sit outside the comparison.
     if not installed_count:
         print("No unit files installed on this box — nothing to compare.")
-    elif not buckets["drift"] and not uncodified:
+    elif not buckets["drift"] and not uncodified and not unreadable:
         print("Systemd unit coverage PASSED (every installed unit is codified and matches).")
     else:
         print(
             f"Systemd unit coverage INCOMPLETE: {len(buckets['clean'])}/{installed_count} "
             f"installed units are codified and clean; {len(uncodified)} uncodified, "
-            f"{len(buckets['drift'])} drifted. This is not a pass."
+            f"{len(buckets['drift'])} drifted, {len(unreadable)} unreadable. "
+            f"This is not a pass."
         )
 
     return exit_code

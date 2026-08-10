@@ -12,24 +12,67 @@ gap → RGEN +14.92% class of bug; config#1229).
 
 This Lambda is the missing backstop. Triggered by EventBridge ~22:30 UTC on
 weekdays (well after the daemon's nominal ~20:15 UTC EOD), it starts the EOD
-SF IFF both:
+SF IFF:
 
-  1. the trading EC2 box is still RUNNING — the daemon never shut it down, so
-     EOD never fired; and CaptureSnapshot needs a live IB session, which only
-     exists while the box is up (this is a SAME-DAY-only recovery), AND
+  1. it is a NYSE trading day (an expected-EOD day at all), AND
   2. no EOD execution has STARTED today — so we never double-run after a
      daemon-triggered EOD that already completed (or is mid-flight).
 
+WIDENED 2026-08-09 (alpha-engine-config-I6690): the original design also
+required the trading box to still be RUNNING before dispatching, on the
+theory that a stopped box meant "EOD already ran" or "box never booted, so
+nothing to reconcile". That second premise was wrong: on 2026-08-05/06 the
+PREOPEN pipeline itself failed pre-boot (config-I6615), the trading box never
+started AT ALL, the daemon never ran, and this backstop's box-running gate
+made it a silent no-op too — no EOD, no ``eod_pnl`` row, and (with
+``alpha-engine-pipeline-watchdog-daily`` paused under I6617) no alert of any
+kind. A box-never-started day is exactly the case this backstop most needs to
+cover, so the box-running condition is dropped entirely: the EOD SF's own
+first real state, ``StartTradingInstance`` (``step_function_eod.json:96``),
+boots the box unconditionally and is idempotent (``ec2:startInstances`` on an
+already-running box is a no-op) — so this Lambda needs no boot logic of its
+own, whether the box was up, down, or never started. ``_trading_box_running``
+is retained purely to TAG the dispatch (``triggered_by``) for observability,
+never to gate it.
+
 If the box is already stopped, EOD either ran (success or failure — both end
-in stopping the box) or the box never booted (no trading → nothing to
-reconcile): either way a no-op. The late-discovery case (box long gone, gap
-found days later) is NOT this Lambda's job — that is the IBKR Flex Query
-``eod_pnl`` backfill (config#1229).
+in stopping the box, caught by the ``eod_ran_today`` guard) or the box never
+booted (caught by the widened dispatch above). The late-discovery case (box
+long gone, gap found days later) is NOT this Lambda's job — that is the IBKR
+Flex Query ``eod_pnl`` backfill (config#1229).
 
 The EOD SF's own DynamoDB mutex (``AcquireMutex``) is the concurrency
 backstop: if a daemon-triggered EOD is mid-flight when this fires, our
 StartExecution would only hit ``MutexConflict`` and fail cleanly — but the
 ``eod_ran_today`` guard means we don't even attempt it.
+
+CaptureSnapshot on a freshly-booted box (config-I6690 evidence, verified
+against crucible-executor + step_function_eod.json, not assumed): IB Gateway
+comes up via the ``ibgateway.service`` systemd unit, which is a hard
+``Requires=``/``After=`` dependency of both ``alpha-engine-daemon.service``
+and ``alpha-engine-morning.service`` (both ``WantedBy=multi-user.target``,
+i.e. boot-enabled) — so any boot of the trading box, cold or warm, pulls
+ibgateway up as a systemd dependency with no separate enablement needed.
+Between ``StartTradingInstance`` and ``CaptureSnapshot`` the EOD SF spends
+several minutes on ``WaitForInstanceReady``/the SSM-readiness poll (up to
+~3 min), the conditional executor-checkout refresh, and — load-bearing —
+``LaunchPostMarketDataSpot``'s post-market-data phase on a wholly separate
+ephemeral spot box (``TimeoutSeconds: 420`` on the launch alone, plus its own
+poll-to-completion), none of which touch or wait on the trading box's IB
+session. That multi-minute buffer comfortably exceeds
+``wait-for-ibgateway.sh``'s own 120s max-wait budget and the ~30s TOTP-auth
+window ``alpha-engine-morning.service`` budgets for. ``executor/
+snapshot_capturer.py``'s ``IBKRClient.connect`` additionally retries 3x with
+exponential backoff (``executor/retry.py``) on its own, an extra ~60-90s of
+tolerance. No explicit ``wait-for-ibgateway`` state exists inside
+``CaptureSnapshot``'s own SSM command, so this is evidence of comfortable
+timing margin, not a guarantee — if a cold-boot CaptureSnapshot failure is
+ever observed in practice, the fix is to add an explicit gateway-readiness
+poll to ``CaptureSnapshot``'s SSM command, not to skip the snapshot (the
+I2700 skip shape assumes a snapshot ALREADY exists from an earlier attempt
+in the same execution — that is never true on a box that never booted, so
+skipping here would just hand ``EODReconcile`` no snapshot to read and it
+would hard-fail with no fallback, by design).
 
 Fail-loud (``feedback_no_silent_fails``): any AWS call failure raises so the
 EventBridge retry + Lambda-error CloudWatch alarm page the operator. We must
@@ -75,17 +118,21 @@ SNS_TOPIC_ARN = os.environ.get(
 )
 
 # Count an EOD as "already fired today" regardless of terminal status — a
-# started-then-failed EOD still ran HandleFailure → ForceStopInstance, so the
-# box would be stopped and the box-running gate already covers it; this guard
-# additionally prevents racing a mid-flight (RUNNING) EOD.
+# started-then-failed EOD still ran HandleFailure → ForceStopInstance (box
+# stopped again either way, config-I6690: no longer load-bearing here since
+# dispatch isn't gated on box state); this guard's job is preventing a
+# double-start, including racing a mid-flight (RUNNING) EOD.
 _STARTED_STATUSES = ("RUNNING", "SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED")
 
 
 def _trading_box_running(ec2_client: Optional[object] = None) -> bool:
     """True iff the trading EC2 instance is in the ``running`` state.
 
-    A stopped/terminated/absent box means EOD already ran (and stopped it) or
-    the box never booted — either way the backstop is a no-op. Raises on an
+    OBSERVABILITY-ONLY (config-I6690): no longer gates dispatch — a stopped
+    box is exactly the box-never-started case this backstop must still cover.
+    Used solely to tag ``_start_eod``'s ``triggered_by`` value so a dashboard
+    reader can tell "daemon was up but didn't fire EOD" apart from "box was
+    never running at all" without re-deriving it from EC2 state. Raises on an
     EC2 API failure (fail-loud)."""
     if ec2_client is None:  # pragma: no cover — production path
         ec2_client = boto3.client("ec2", region_name=REGION)
@@ -141,9 +188,11 @@ def _eod_ran_today(now_utc: datetime, sf_client: Optional[object] = None) -> boo
     return False
 
 
-def _start_eod(trading_day: str, sf_client: Optional[object] = None) -> str:
-    """Start the EOD SF with the same input shape as the daemon, tagged
-    ``triggered_by=backstop``. Returns the execution ARN."""
+def _start_eod(trading_day: str, triggered_by: str, sf_client: Optional[object] = None) -> str:
+    """Start the EOD SF with the same input shape the daemon uses (config-I6690:
+    identical regardless of whether the box was running — see the module
+    docstring's CaptureSnapshot-on-a-cold-box evidence), tagged with the given
+    ``triggered_by``. Returns the execution ARN."""
     if sf_client is None:  # pragma: no cover — production path
         sf_client = boto3.client("stepfunctions", region_name=REGION)
     resp = sf_client.start_execution(
@@ -155,16 +204,16 @@ def _start_eod(trading_day: str, sf_client: Optional[object] = None) -> str:
                 "ec2_instance_id": [DASHBOARD_INSTANCE_ID],
                 "sns_topic_arn": SNS_TOPIC_ARN,
                 "run_date": trading_day,
-                "triggered_by": "backstop",
+                "triggered_by": triggered_by,
                 "pipeline_role": "eod",
             }
         ),
     )
     arn = resp.get("executionArn", "")
     logger.warning(
-        "EOD-BACKSTOP fired: trading box was still running and no EOD ran today "
-        "for trading_day=%s — started EOD SF %s",
-        trading_day, arn,
+        "EOD-BACKSTOP fired (triggered_by=%s): no EOD ran today for "
+        "trading_day=%s — started EOD SF %s",
+        triggered_by, trading_day, arn,
     )
     return arn
 
@@ -180,15 +229,19 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     trading_day = last_closed_trading_day(now_utc).isoformat()
 
-    if not _trading_box_running():
-        logger.info(
-            "Trading box not running — EOD already ran or box never booted; no-op."
-        )
-        return {"action": "noop", "reason": "trading_box_not_running", "trading_day": trading_day}
-
     if _eod_ran_today(now_utc):
         logger.info("An EOD execution already started today — no-op.")
         return {"action": "noop", "reason": "eod_already_ran_today", "trading_day": trading_day}
 
-    execution_arn = _start_eod(trading_day)
-    return {"action": "started_eod", "trading_day": trading_day, "execution_arn": execution_arn}
+    # config-I6690: box state no longer gates dispatch — it is checked only
+    # to tag the run (StartTradingInstance boots the box unconditionally and
+    # idempotently either way; see module docstring).
+    box_was_running = _trading_box_running()
+    triggered_by = "backstop" if box_was_running else "backstop-box-stopped"
+    execution_arn = _start_eod(trading_day, triggered_by)
+    return {
+        "action": "started_eod",
+        "trading_day": trading_day,
+        "execution_arn": execution_arn,
+        "box_was_running": box_was_running,
+    }

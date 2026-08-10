@@ -54,6 +54,23 @@ independence preserved per plan doc §3.5.
       cron completely dead (alpha-engine-config#5597 / #5590). See
       ``WEEKLY_CADENCE_ROLES``.
 
+  - **Weekly-SF silence deadman** (``ne-weekly-freshness-pipeline``,
+      alpha-engine-config#6738 / sf-pipeline-policy §2.6 rule 1)
+      Watch-day: EVERY day. Reads the DECLARED exercise cadence from SSM
+      ``/alpha-engine/weekly-sf/exercise-cadence`` — the same parameter the
+      postclose SF's ``ReadExerciseCadence`` task reads to decide whether to
+      chain the exercise launch — derives every run-slot the declaration
+      expects over a trailing 5-day window, and pages on any slot with NO
+      matching execution. Where the Saturday-SF check above asks "did the
+      weekly cron fire at all this week", this asks the per-day question:
+      the 2026-08-05/06 postclose never fired, so the chained
+      ``pipeline_role=exercise`` launch was silent for two days with zero
+      signal — an absence, invisible to every failure-triggered path.
+      A slot the declaration does NOT expect is classified ``GATED_OFF``
+      and reported as such, never conflated with silence. The slot logic is
+      imported from ``scripts/weekly_sf_silence_deadman.py`` (one
+      implementation, two entry points), not reimplemented here.
+
 **Fail-loud semantics** (per ``feedback_no_silent_fails`` + the
 ``feedback_wire_orphaned_producer_must_fail_loud`` discipline):
 
@@ -81,6 +98,67 @@ doc §3.5). If the operator's regular ``alpha-engine-alerts`` → email
 path silently breaks, this watchdog's separate publish path still
 reaches the operator. The Telegram fan-out via the lib is the
 non-overlapping second channel.
+
+**Preopen schedule-buffer canary** (alpha-engine-config#2412): a 4th check,
+added alongside the 3 liveness checks above. The Weekday SF's trigger
+(``WeekdayPipelineSchedule`` in alpha-engine-orchestration.yaml) has been
+moved earlier TWICE after finishing after the 06:30 PT open —
+06:00→05:45 PT (2026-05-19, 13-min buffer) then 05:45→05:15 PT
+(2026-07-13, ~30-min buffer) — both times the erosion was noticed
+anecdotally, days after it started. This check reads the finish
+(``stopDate``) of the most recent CLOSED trading day's SUCCEEDED Weekday-SF
+execution and alerts before the buffer is fully consumed again, instead of
+after.
+
+Because the watchdog's own cron (14:00 UTC, NOT DST-aware — see deploy.sh)
+fires well before today's session closes (~20:00 UTC) on every date
+regardless of PDT/PST, ``last_closed_trading_day(now_utc)`` at check time
+always resolves to the PRIOR trading day, never today's still-in-flight
+run — see ``_is_trading_day_now`` above for the same reasoning. This is
+deliberate: the canary is a next-morning retrospective on a fully-
+completed session, never a same-day live check, so there is no race with
+whether today's execution has finished yet.
+
+Thresholds (America/Los_Angeles, DST-aware via ``zoneinfo`` — comparisons
+resolve the correct UTC offset per calendar date, no manual DST math):
+market open is a fixed 06:30 PT year-round; ``HARD_ALERT_TIME_PT`` (06:15,
+a 15-min/~25%-of-45-min-runtime buffer floor) fires a severity=error alert;
+``WARN_TREND_TIME_PT`` (06:10) fires a severity=warning early-warning
+alert below the hard floor. A finish at/after 06:30 itself (an actual
+missed-open) gets a distinct "MISSED THE OPEN" message so the alert
+doesn't read the same as a mere late-but-before-open finish. The issue's
+own recommendation (06:20, gated on ``RunDaemon`` state reached) targets a
+different, live/in-flight design point than this retrospective
+finish-time check, so it does not transfer directly — see PR body.
+
+Does NOT filter by ``input.pipeline_role``. Instead takes the
+EARLIEST-started SUCCEEDED execution per PT calendar day as the proxy for
+"the scheduled run" (a same-day manual rerun, if any, would start later,
+in response to a problem with the scheduled one) — mirrors the existing
+unfiltered-count convention this file already uses for the Weekday/EOD
+checks above.
+
+CORRECTED 2026-08-09 (alpha-engine-config#6738): this paragraph used to
+justify the absence of the role filter with "this Lambda's IAM role does
+not grant ``states:DescribeExecution``". That claim is stale —
+``iam-policy.json`` carries a ``DescribeSFExecutions`` statement and the
+LIVE role was measured to carry it. Skipping the filter here is now a cost
+choice (one DescribeExecution per row of a 14-day walk), not a permission
+constraint; revisit under alpha-engine-config-I6748.
+
+Also computes a rolling-median trend over the last
+``ROLLING_WINDOW_TRADING_DAYS`` (5) trading days with SUCCEEDED data: a
+persistent creep that never individually crosses the hard floor on any
+single day (e.g. 06:08, 06:09, 06:11, 06:09, 06:12) still surfaces as an
+early-warning once the median crosses ``WARN_TREND_TIME_PT``. Requires at
+least 3 of the 5 days present or the trend check is skipped (insufficient
+data), never fabricated from fewer points.
+
+No new SNS topic / Telegram channel — reuses ``WATCHDOG_SNS_TOPIC_ARN`` +
+``notify_via_flow_doctor`` exactly like the 3 existing checks, via a
+shared ``_publish_watchdog_alert`` helper factored out of ``_check_sf``'s
+alert path (config#2412 PR — DRY, no behavior change to the 3 existing
+checks).
 """
 
 from __future__ import annotations
@@ -88,19 +166,52 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import boto3
 
 from nousergon_lib import alerts
 from nousergon_lib.trading_calendar import (
+    is_trading_day,
     last_closed_trading_day,
+    next_trading_day,
     previous_trading_day,
 )
 from flow_doctor_telegram import notify_via_flow_doctor
 from nousergon_lib.flow_doctor_fleet import PIPELINE_OBSERVER_TELEGRAM_TOPICS
+
+# The weekly-SF silence deadman's slot derivation + classification
+# (alpha-engine-config#6738). ONE implementation, two entry points: the
+# operator CLI at ``scripts/weekly_sf_silence_deadman.py`` and this Lambda.
+# deploy.sh copies that file flat into the zip alongside index.py — the same
+# device already used for ``flow_doctor_telegram.py`` — so the scheduled check
+# and the manual rerun can never diverge in what they consider a silent slot.
+# Its module-level imports are stdlib only (boto3 is imported inside its
+# ``main``), so this costs the Lambda no cold-start weight beyond the file.
+try:  # deployed layout: flat next to index.py in /var/task
+    from weekly_sf_silence_deadman import (  # noqa: E402
+        compute_expected_slots,
+        evaluate,
+        fetch_execution_records,
+        last_due_day,
+        load_cadence_from_ssm,
+    )
+except ModuleNotFoundError:  # in-repo layout (pytest, ci.yml glob runner)
+    sys.path.insert(
+        0, str(Path(__file__).resolve().parents[3] / "scripts")
+    )
+    from weekly_sf_silence_deadman import (  # noqa: E402
+        compute_expected_slots,
+        evaluate,
+        fetch_execution_records,
+        last_due_day,
+        load_cadence_from_ssm,
+    )
 
 
 logger = logging.getLogger()
@@ -230,6 +341,62 @@ WEEKLY_CADENCE_ROLES = frozenset({"weekly", "watch-rerun", "recovery"})
 # sees ~5 exercise runs + reruns per 7-day window, so this is ~5x headroom;
 # exceeding it raises rather than returning a truncated count.
 _MAX_ROLE_DESCRIBES = 200
+
+# ── Preopen schedule-buffer canary (alpha-engine-config#2412) ──────────────
+
+PT_ZONE = ZoneInfo("America/Los_Angeles")
+
+# Market open is a fixed local-clock time year-round; zoneinfo resolves the
+# correct UTC offset (PDT/PST) per calendar date when combined with a date,
+# so no manual DST arithmetic is needed anywhere below.
+MARKET_OPEN_TIME_PT = time(6, 30)
+
+# 15-min buffer floor (~25% of the ~46-49 min observed total runtime) —
+# breaching this is a severity=error alert. Issue #2412 recommended 06:20
+# but for a DIFFERENT check shape (gated on the SF reaching RunDaemon state
+# live, same-day); this check is a next-morning retrospective on the
+# finish timestamp, so the two thresholds are not directly comparable —
+# 06:15 is used per the binding design note in the PR, named explicitly
+# here rather than silently inherited.
+HARD_ALERT_TIME_PT = time(6, 15)
+
+# Early-warning floor below the hard buffer-floor breach — severity=warning.
+WARN_TREND_TIME_PT = time(6, 10)
+
+# How many trading days back the median-trend signal looks.
+ROLLING_WINDOW_TRADING_DAYS = 5
+
+# Minimum trading days with SUCCEEDED data required before the trend median
+# is trusted — never compute a "5-day median" off 1-2 points.
+_MIN_TREND_DAYS = 3
+
+# Calendar-day lookback for the ListExecutions walk that builds the
+# per-trading-day SUCCEEDED-finish map. Generous relative to
+# ROLLING_WINDOW_TRADING_DAYS(5) so a holiday week doesn't starve the
+# median of data.
+BUFFER_LOOKBACK_CALENDAR_DAYS = 14
+
+# ── Weekly-SF silence deadman (alpha-engine-config#6738) ───────────────────
+
+# SSM parameter carrying the DECLARED exercise cadence. This is the same
+# parameter ``step_function_eod.json``'s ``ReadExerciseCadence`` task reads at
+# execution time (config#6689), which is what makes the deadman's expectation
+# provably identical to the launcher's actual behaviour. Deliberately NOT the
+# in-repo ``infrastructure/weekly_cadence.json`` manifest: a manifest copy
+# baked into the zip is a snapshot of whatever the last CODE deploy carried,
+# and a cadence flip that ships via ``deploy-infrastructure.sh`` alone would
+# leave the detector expecting the old cadence with nothing to say so.
+CADENCE_SSM_PARAM = "/alpha-engine/weekly-sf/exercise-cadence"
+
+# Trailing days of run-slots the deadman re-checks each firing. Five covers a
+# full trading week's exercise slots plus one weekly-cron slot.
+SILENCE_WINDOW_DAYS = 5
+
+# Dedup window for a silence alert. Keyed on the SILENT SLOT (role + day), not
+# on the firing date, so a genuinely new silent day always pages while the same
+# slot — still visible in the 5-day window on each of the next four firings —
+# does not re-page. 7 days > the window, so exactly one page per silent slot.
+SILENCE_DEDUP_WINDOW_MIN = 7 * 24 * 60
 
 
 @dataclass(frozen=True)
@@ -420,6 +587,61 @@ def _count_executions_in_window(
     return seen
 
 
+def _publish_watchdog_alert(
+    message: str,
+    *,
+    severity: str,
+    dedup_key: str,
+    context: dict,
+    dedup_window_min: int = 12 * 60,
+) -> str:
+    """Publish one watchdog alert via the shared SNS + Telegram fan-out.
+
+    Factored out of ``_check_sf``'s alert path (alpha-engine-config#2412) so
+    the preopen-buffer canary below reuses the exact same channel-
+    independence + dedup wiring rather than duplicating it — no new SNS
+    topic or Telegram channel. Returns a compact ``alert_detail`` string for
+    the caller's ``CheckResult``.
+    """
+    result = alerts.publish(
+        message=message,
+        severity=severity,
+        source="alpha-engine-pipeline-watchdog",
+        sns=True,
+        telegram=False,
+        sns_topic_arn=WATCHDOG_SNS_TOPIC_ARN,
+        dedup_key=dedup_key,
+        dedup_window_min=dedup_window_min,
+    )
+    telegram_ok = notify_via_flow_doctor(
+        message,
+        silent=False,
+        severity=severity,
+        dedup_key=dedup_key,
+        flow_name=_FLOW_NAME,
+        topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
+        db_basename=_DB_BASENAME,
+        context=context,
+        # Must match the SNS/bus alerts.publish() source= above exactly —
+        # both paths alert on the same event, and the registered
+        # `pipeline_watchdog_stuck_sf` class in playbooks.yaml keys on this
+        # string (config-I3513).
+        source="alpha-engine-pipeline-watchdog",
+    )
+    logger.warning(
+        "watchdog ALERT: severity=%s dedup_key=%s sns_ok=%s telegram_ok=%s dedup_skipped=%s",
+        severity,
+        dedup_key,
+        result.sns.ok,
+        telegram_ok,
+        getattr(result, "dedup_skipped", False),
+    )
+    return (
+        f"sns_ok={result.sns.ok} telegram_ok={telegram_ok} "
+        f"dedup_skipped={getattr(result, 'dedup_skipped', False)}"
+    )
+
+
 def _check_sf(
     *,
     sf_label: str,
@@ -473,37 +695,11 @@ def _check_sf(
     dedup_key = (
         f"pipeline-watchdog-{sf_label}-{datetime.now(timezone.utc).date().isoformat()}"
     )
-    result = alerts.publish(
-        message=message,
-        severity="error",
-        source="alpha-engine-pipeline-watchdog",
-        sns=True,
-        telegram=False,
-        sns_topic_arn=WATCHDOG_SNS_TOPIC_ARN,
-        dedup_key=dedup_key,
-        dedup_window_min=12 * 60,
-    )
-    telegram_ok = notify_via_flow_doctor(
+    alert_detail = _publish_watchdog_alert(
         message,
-        silent=False,
         severity="error",
         dedup_key=dedup_key,
-        flow_name=_FLOW_NAME,
-        topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
-        db_basename=_DB_BASENAME,
         context={"sf_label": sf_label, "sf_arn": sf_arn},
-        # Must match the SNS/bus alerts.publish() source= above exactly —
-        # both paths alert on the same event, and the registered
-        # `pipeline_watchdog_stuck_sf` class in playbooks.yaml keys on this
-        # string (config-I3513).
-        source="alpha-engine-pipeline-watchdog",
-    )
-    logger.warning(
-        "watchdog ALERT: sf=%s sns_ok=%s telegram_ok=%s dedup_skipped=%s",
-        sf_label,
-        result.sns.ok,
-        telegram_ok,
-        getattr(result, "dedup_skipped", False),
     )
     return CheckResult(
         sf_label=sf_label,
@@ -511,16 +707,743 @@ def _check_sf(
         checked=True,
         executions_seen=0,
         alert_emitted=True,
-        alert_detail=(
-            f"sns_ok={result.sns.ok} telegram_ok={telegram_ok} "
-            f"dedup_skipped={getattr(result, 'dedup_skipped', False)}"
+        alert_detail=alert_detail,
+    )
+
+
+@dataclass(frozen=True)
+class BufferCheckResult:
+    """Outcome of one preopen schedule-buffer canary run."""
+
+    checked: bool
+    skip_reason: Optional[str] = None
+    target_trading_day: Optional[str] = None  # ISO date of the day evaluated
+    finish_pt: Optional[str] = None  # ISO datetime, America/Los_Angeles
+    minutes_before_open: Optional[float] = None  # negative = after open
+    alert_emitted: bool = False
+    alert_severity: Optional[str] = None  # None | "warning" | "error"
+    alert_detail: Optional[str] = None
+    trend_median_minutes_before_open: Optional[float] = None
+    trend_days_used: Optional[int] = None
+    trend_alert_emitted: bool = False
+
+
+def _iter_succeeded_weekday_executions(
+    client: object, lookback_days: int
+) -> "list[tuple[datetime, datetime]]":
+    """Return ``(start_utc, stop_utc)`` for every SUCCEEDED Weekday-SF
+    execution that started within the last ``lookback_days`` calendar days,
+    newest first (as returned by ListExecutions).
+
+    No ``pipeline_role`` filter. The grant for it DOES exist (see the
+    module docstring's 2026-08-09 correction); filtering on
+    status=SUCCEEDED at the API layer is enough to keep this walk cheap
+    without paying one DescribeExecution per row — alpha-engine-config
+    -I6748 revisits whether the precision is worth the cost.
+    """
+    cutoff_utc = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    rows: list[tuple[datetime, datetime]] = []
+    next_token: Optional[str] = None
+    while True:
+        kwargs = {
+            "stateMachineArn": WEEKDAY_SF_ARN,
+            "statusFilter": "SUCCEEDED",
+            "maxResults": 100,
+        }
+        if next_token:
+            kwargs["nextToken"] = next_token
+        resp = client.list_executions(**kwargs)
+        execs = resp.get("executions") or []
+        stop_paging = False
+        for row in execs:
+            start = row.get("startDate")
+            stop = row.get("stopDate")
+            if start is None or stop is None or not hasattr(start, "astimezone"):
+                continue
+            start_utc = (
+                start.astimezone(timezone.utc)
+                if start.tzinfo
+                else start.replace(tzinfo=timezone.utc)
+            )
+            if start_utc < cutoff_utc:
+                # Newest-first ordering → everything after this is older
+                # still. Stop paging.
+                stop_paging = True
+                break
+            stop_utc = (
+                stop.astimezone(timezone.utc)
+                if stop.tzinfo
+                else stop.replace(tzinfo=timezone.utc)
+            )
+            rows.append((start_utc, stop_utc))
+        if stop_paging:
+            break
+        next_token = resp.get("nextToken")
+        if not next_token:
+            break
+    return rows
+
+
+def _weekday_finish_by_trading_day(
+    client: object, lookback_days: int = BUFFER_LOOKBACK_CALENDAR_DAYS
+) -> "dict[date, datetime]":
+    """Map PT calendar trading-day → finish (``stopDate``, PT-zoned) of that
+    day's EARLIEST-started SUCCEEDED Weekday-SF execution — the proxy for
+    "the scheduled 05:15 AM PT run" (see module docstring for why not
+    role-filtered). A same-day manual rerun, if any, starts later and is
+    ignored in favor of the earlier (scheduled) one.
+    """
+    by_day: "dict[date, tuple[datetime, datetime]]" = {}
+    for start_utc, stop_utc in _iter_succeeded_weekday_executions(client, lookback_days):
+        pt_date = start_utc.astimezone(PT_ZONE).date()
+        existing = by_day.get(pt_date)
+        if existing is None or start_utc < existing[0]:
+            by_day[pt_date] = (start_utc, stop_utc.astimezone(PT_ZONE))
+    return {d: finish_pt for d, (_, finish_pt) in by_day.items()}
+
+
+def _classify_buffer_severity(finish_pt: datetime, target_date: date) -> Optional[str]:
+    """Return ``"error"`` (hard floor breach or missed-open), ``"warning"``
+    (early-warning floor), or ``None`` (quiet) for one day's finish time.
+    ``finish_pt`` must already be zoned to ``PT_ZONE``.
+    """
+    # MARKET_OPEN_TIME_PT (06:30) > HARD_ALERT_TIME_PT (06:15) always, so a
+    # finish at/after open is already caught by the hard-floor comparison —
+    # the "missed the open" distinction is made by the caller (message
+    # wording only), not a separate severity tier.
+    hard_pt = datetime.combine(target_date, HARD_ALERT_TIME_PT, tzinfo=PT_ZONE)
+    warn_pt = datetime.combine(target_date, WARN_TREND_TIME_PT, tzinfo=PT_ZONE)
+    if finish_pt >= hard_pt:
+        return "error"
+    if finish_pt >= warn_pt:
+        return "warning"
+    return None
+
+
+def _minutes_before_open(finish_pt: datetime, target_date: date) -> float:
+    open_pt = datetime.combine(target_date, MARKET_OPEN_TIME_PT, tzinfo=PT_ZONE)
+    return (open_pt - finish_pt).total_seconds() / 60.0
+
+
+def _rolling_trend_median(
+    by_day: "dict[date, datetime]", target_date: date, window: int = ROLLING_WINDOW_TRADING_DAYS
+) -> "Optional[tuple[float, int]]":
+    """Median ``minutes_before_open`` (negative = after open) across the
+    most recent ``window`` trading days with SUCCEEDED data, up to and
+    including ``target_date``. Returns ``(median, days_used)`` or ``None``
+    if fewer than ``_MIN_TREND_DAYS`` days have data — never fabricates a
+    trend from too few points.
+    """
+    days = sorted((d for d in by_day if d <= target_date), reverse=True)[:window]
+    if len(days) < _MIN_TREND_DAYS:
+        return None
+    deltas = sorted(_minutes_before_open(by_day[d], d) for d in days)
+    n = len(deltas)
+    median = (
+        deltas[n // 2]
+        if n % 2 == 1
+        else (deltas[n // 2 - 1] + deltas[n // 2]) / 2.0
+    )
+    return median, n
+
+
+def _check_preopen_buffer(
+    *,
+    now_utc: datetime,
+    is_watch_day: bool,
+    client: Optional[object] = None,
+) -> BufferCheckResult:
+    """Preopen schedule-buffer canary (alpha-engine-config#2412). See module
+    docstring for full design rationale."""
+    if not is_watch_day:
+        logger.info("preopen-buffer skip: today is not a NYSE trading day")
+        return BufferCheckResult(
+            checked=False,
+            skip_reason=(
+                "today is not a NYSE trading day (weekend / holiday) per "
+                "nousergon_lib.trading_calendar"
+            ),
+        )
+
+    if client is None:  # pragma: no cover — production path
+        client = boto3.client("stepfunctions", region_name=REGION)
+
+    target_date = last_closed_trading_day(now_utc)
+    by_day = _weekday_finish_by_trading_day(client)
+    finish_pt = by_day.get(target_date)
+
+    if finish_pt is None:
+        # No SUCCEEDED execution for the target day — either it genuinely
+        # didn't run (the existing Weekday-SF liveness check above already
+        # covers that) or it ran and FAILED (the SF's own HandleFailure
+        # path covers that). Either way, do NOT double-page here.
+        logger.info(
+            "preopen-buffer defer: no SUCCEEDED Weekday-SF execution found for %s "
+            "— deferring to the Weekday-SF liveness check / SF failure alert",
+            target_date,
+        )
+        return BufferCheckResult(
+            checked=True,
+            target_trading_day=target_date.isoformat(),
+            skip_reason=(
+                f"no SUCCEEDED execution for {target_date}; deferred to the "
+                f"Weekday-SF liveness check (0-executions case) or the SF's own "
+                f"failure alert — not double-paged here"
+            ),
+        )
+
+    minutes_before_open = _minutes_before_open(finish_pt, target_date)
+    severity = _classify_buffer_severity(finish_pt, target_date)
+    trend = _rolling_trend_median(by_day, target_date)
+    trend_median, trend_days = trend if trend else (None, None)
+    trend_severity = (
+        "warning"
+        if trend_median is not None
+        and trend_median <= (
+            (MARKET_OPEN_TIME_PT.hour * 60 + MARKET_OPEN_TIME_PT.minute)
+            - (WARN_TREND_TIME_PT.hour * 60 + WARN_TREND_TIME_PT.minute)
+        )
+        else None
+    )
+
+    if severity is None and trend_severity is None:
+        logger.info(
+            "preopen-buffer clear: %s finished %s (%.1fmin before 06:30 PT open)",
+            target_date, finish_pt.isoformat(), minutes_before_open,
+        )
+        return BufferCheckResult(
+            checked=True,
+            target_trading_day=target_date.isoformat(),
+            finish_pt=finish_pt.isoformat(),
+            minutes_before_open=minutes_before_open,
+            trend_median_minutes_before_open=trend_median,
+            trend_days_used=trend_days,
+        )
+
+    context = {"target_trading_day": target_date.isoformat(), "sf_arn": WEEKDAY_SF_ARN}
+    alert_detail = None
+    alert_emitted = False
+    trend_alert_emitted = False
+
+    if severity is not None:
+        missed_open = finish_pt >= datetime.combine(
+            target_date, MARKET_OPEN_TIME_PT, tzinfo=PT_ZONE
+        )
+        if missed_open:
+            headline = (
+                f"ne-preopen-trading-pipeline MISSED THE 06:30 PT OPEN on "
+                f"{target_date}: RunDaemon-ready at {finish_pt.strftime('%H:%M:%S %Z')}, "
+                f"{-minutes_before_open:.1f}min AFTER open."
+            )
+        else:
+            headline = (
+                f"ne-preopen-trading-pipeline schedule-buffer breach on {target_date}: "
+                f"finished {finish_pt.strftime('%H:%M:%S %Z')}, only "
+                f"{minutes_before_open:.1f}min before the 06:30 PT open "
+                f"(hard floor {HARD_ALERT_TIME_PT.strftime('%H:%M')} PT)."
+            )
+        message = (
+            f"{headline} This is the schedule-buffer-erosion canary "
+            f"(alpha-engine-config#2412) — the trigger (WeekdayPipelineSchedule) "
+            f"has already been moved earlier twice for this exact failure mode: "
+            f"06:00→05:45 PT (2026-05-19), 05:45→05:15 PT (2026-07-13). "
+            f"Investigate stage-duration creep (CodeFreshnessGate / predictor "
+            f"health / chronic-gap self-heal) or move the trigger earlier again."
+        )
+        dedup_key = f"pipeline-watchdog-preopen-buffer-{target_date.isoformat()}"
+        alert_detail = _publish_watchdog_alert(
+            message, severity=severity, dedup_key=dedup_key, context=context
+        )
+        alert_emitted = True
+    elif trend_severity is not None:
+        # Single-day reading is quiet but the 5-day median has crossed the
+        # warn floor — a creep no single day's threshold caught.
+        message = (
+            f"ne-preopen-trading-pipeline schedule-buffer TREND warning: median "
+            f"finish over the last {trend_days} trading days is "
+            f"{-trend_median if trend_median < 0 else trend_median:.1f}min "
+            f"{'after' if trend_median < 0 else 'before'} the 06:30 PT open — "
+            f"below the {WARN_TREND_TIME_PT.strftime('%H:%M')} PT early-warning "
+            f"floor even though {target_date} itself finished with buffer to "
+            f"spare. This is the schedule-buffer-erosion canary "
+            f"(alpha-engine-config#2412); the trigger has been moved earlier "
+            f"twice before for this pattern (2026-05-19, 2026-07-13)."
+        )
+        dedup_key = f"pipeline-watchdog-preopen-buffer-trend-{target_date.isoformat()}"
+        alert_detail = _publish_watchdog_alert(
+            message, severity="warning", dedup_key=dedup_key, context=context
+        )
+        trend_alert_emitted = True
+
+    return BufferCheckResult(
+        checked=True,
+        target_trading_day=target_date.isoformat(),
+        finish_pt=finish_pt.isoformat(),
+        minutes_before_open=minutes_before_open,
+        alert_emitted=alert_emitted,
+        alert_severity=severity,
+        alert_detail=alert_detail,
+        trend_median_minutes_before_open=trend_median,
+        trend_days_used=trend_days,
+        trend_alert_emitted=trend_alert_emitted,
+    )
+
+
+# ── Prior-day failed-run check (alpha-engine-config#6732) ─────────────────
+#
+# sf-pipeline-policy §4.1 requires a liveness detector INDEPENDENT of the
+# pipeline's own notifier that is sensitive to started-but-never-succeeded.
+# The three liveness checks above answer only "did it fire" — a day where
+# every execution FAILED satisfies them by design (``_STARTED_STATUSES``),
+# failure alerting was delegated to the SF's own HandleFailure path (which
+# is exactly the dependent channel §4.1 says not to rely on), and the
+# independent deadman (ExecutionsSucceeded, 7-day period) needs a week of
+# silence to breach. This check closes that combination: on the watchdog
+# firing after a trading day whose weekday/EOD executions all terminated
+# without success AND without a DEGRADED completion marker (the Option-A
+# visible-degrade terminal, which status-keyed watchers already engage on,
+# config#6692), page. Zero-execution days are deliberately excluded — that
+# is the never-fired case the ``_check_sf`` liveness checks above own.
+
+MARKER_BUCKET = os.environ.get("COMPLETION_MARKER_BUCKET", "alpha-engine-research")
+
+# (sf_label suffix, SF ARN, marker pipeline segment). Marker keys follow the
+# definitions' WriteCompletionMarker states: the {date} segment is the UTC
+# date-part of $$.Execution.StartTime — for both pipelines every legal start
+# (preopen 12:15 UTC, postclose ~20:15–23:00 UTC incl. the backstop path)
+# lands on the same UTC calendar date as the PT trading date, so a lookup by
+# PT trading date is exact.
+_FAILED_DAY_PIPELINES = (
+    ("Weekday SF", WEEKDAY_SF_ARN, "ne-preopen-trading-pipeline"),
+    ("EOD SF", EOD_SF_ARN, "ne-postclose-trading-pipeline"),
+)
+
+
+@dataclass(frozen=True)
+class FailedDayCheckResult:
+    """Per-SF outcome of one prior-day failed-run check."""
+
+    sf_label: str
+    checked: bool
+    target_trading_day: Optional[str] = None
+    skip_reason: Optional[str] = None
+    executions_on_day: Optional[int] = None
+    succeeded_on_day: Optional[int] = None
+    marker_status: Optional[str] = None  # None = not consulted
+    alert_emitted: bool = False
+    alert_detail: Optional[str] = None
+
+
+def _statuses_for_day(
+    client: object, sf_arn: str, target_date: date
+) -> "dict[str, int]":
+    """Count executions per status whose ``startDate`` falls on
+    ``target_date`` in PT calendar terms. Pages newest-first per status and
+    stops once rows predate the target day. Date comparison only — no
+    datetime construction, so ``patch("index.datetime")`` in tests never
+    bites (see the module's ``_eod_window_seconds`` note for the pattern).
+    """
+    counts: "dict[str, int]" = {}
+    for status_filter in _STARTED_STATUSES:
+        next_token: Optional[str] = None
+        while True:
+            kwargs = {
+                "stateMachineArn": sf_arn,
+                "statusFilter": status_filter,
+                "maxResults": 100,
+            }
+            if next_token:
+                kwargs["nextToken"] = next_token
+            resp = client.list_executions(**kwargs)
+            stop_paging = False
+            for row in resp.get("executions") or []:
+                start = row.get("startDate")
+                if start is None or not hasattr(start, "astimezone"):
+                    continue
+                start_utc = (
+                    start.astimezone(timezone.utc)
+                    if start.tzinfo
+                    else start.replace(tzinfo=timezone.utc)
+                )
+                start_pt_date = start_utc.astimezone(PT_ZONE).date()
+                if start_pt_date == target_date:
+                    counts[status_filter] = counts.get(status_filter, 0) + 1
+                elif start_pt_date < target_date:
+                    # Newest-first ordering → everything further is older.
+                    stop_paging = True
+                    break
+            if stop_paging:
+                break
+            next_token = resp.get("nextToken")
+            if not next_token:
+                break
+    return counts
+
+
+def _completion_marker_status(
+    s3_client: object, pipeline_name: str, target_date: date
+) -> str:
+    """Status field of the day's completion marker, ``"ABSENT"`` when the
+    key does not exist, ``"UNREADABLE"`` on any other failure.
+
+    UNREADABLE is deliberately distinct from ABSENT and both page (§2.3a:
+    a missing verdict propagates as UNKNOWN, never as pass) — the swallowed
+    failure modes here (S3 errors other than NoSuchKey, unparseable JSON,
+    missing status field) all route to the caller's alert path plus a
+    WARNING log, never to a silent pass.
+    """
+    key = f"_sf_completion/{pipeline_name}/{target_date.isoformat()}.json"
+    try:
+        resp = s3_client.get_object(Bucket=MARKER_BUCKET, Key=key)
+        marker = json.loads(resp["Body"].read())
+        status = marker.get("status") if isinstance(marker, dict) else None
+        if isinstance(status, str) and status:
+            return status
+        logger.warning(
+            "failed-day check: marker s3://%s/%s has no usable status field",
+            MARKER_BUCKET, key,
+        )
+        return "UNREADABLE"
+    except Exception as exc:  # classified below — never a silent pass
+        code = ""
+        response = getattr(exc, "response", None)
+        if isinstance(response, dict):
+            code = (response.get("Error") or {}).get("Code", "")
+        if code in ("NoSuchKey", "404"):
+            return "ABSENT"
+        logger.warning(
+            "failed-day check: marker s3://%s/%s unreadable (%s: %s)",
+            MARKER_BUCKET, key, type(exc).__name__, exc,
+        )
+        return "UNREADABLE"
+
+
+def _check_failed_day(
+    *,
+    sf_label: str,
+    sf_arn: str,
+    pipeline_name: str,
+    target_date: date,
+    client: Optional[object] = None,
+    s3_client: Optional[object] = None,
+) -> FailedDayCheckResult:
+    """Page when ``target_date`` (the most recent closed trading day) had
+    executions for this SF but none SUCCEEDED and no DEGRADED marker was
+    written. See the block comment above for why this exists."""
+    if client is None:  # pragma: no cover — production path
+        client = boto3.client("stepfunctions", region_name=REGION)
+
+    counts = _statuses_for_day(client, sf_arn, target_date)
+    total = sum(counts.values())
+    succeeded = counts.get("SUCCEEDED", 0)
+
+    if total == 0:
+        return FailedDayCheckResult(
+            sf_label=sf_label,
+            checked=True,
+            target_trading_day=target_date.isoformat(),
+            executions_on_day=0,
+            succeeded_on_day=0,
+            skip_reason=(
+                "no executions on the target day — never-fired is the "
+                "liveness checks' case, not this one's"
+            ),
+        )
+    if succeeded > 0:
+        return FailedDayCheckResult(
+            sf_label=sf_label,
+            checked=True,
+            target_trading_day=target_date.isoformat(),
+            executions_on_day=total,
+            succeeded_on_day=succeeded,
+        )
+
+    running = counts.get("RUNNING", 0)
+    if running > 0:
+        # A prior-day execution still RUNNING at 14:00 UTC the next day is
+        # inside the definitions' top-level TimeoutSeconds only marginally
+        # (postclose ceiling 18h from a ~20:15 UTC start). Don't declare the
+        # day failed yet — but say so at warning severity rather than
+        # silently deferring: an 18h run is itself a hang in the making.
+        message = (
+            f"{sf_label} ({pipeline_name}) still has {running} RUNNING "
+            f"execution(s) from trading day {target_date} at watchdog time — "
+            f"no SUCCEEDED execution for that day yet. This is at or beyond "
+            f"the definition's top-level timeout horizon; investigate: "
+            f"`aws stepfunctions list-executions --state-machine-arn {sf_arn} "
+            f"--max-results 10`."
+        )
+        dedup_key = f"pipeline-watchdog-failed-day-{pipeline_name}-{target_date.isoformat()}"
+        alert_detail = _publish_watchdog_alert(
+            message,
+            severity="warning",
+            dedup_key=dedup_key,
+            context={"sf_label": sf_label, "sf_arn": sf_arn,
+                     "target_trading_day": target_date.isoformat()},
+        )
+        return FailedDayCheckResult(
+            sf_label=sf_label,
+            checked=True,
+            target_trading_day=target_date.isoformat(),
+            executions_on_day=total,
+            succeeded_on_day=0,
+            alert_emitted=True,
+            alert_detail=alert_detail,
+        )
+
+    if s3_client is None:  # pragma: no cover — production path
+        s3_client = boto3.client("s3", region_name=REGION)
+    marker_status = _completion_marker_status(s3_client, pipeline_name, target_date)
+
+    if marker_status == "DEGRADED":
+        # Option-A visible degrade (config#6692): the run terminated in a
+        # Fail state on purpose, the marker says so, and status-keyed
+        # watchers engaged. Not a silent failure — do not double-page.
+        logger.info(
+            "failed-day clear (degraded-by-design): sf=%s day=%s marker=DEGRADED",
+            sf_label, target_date,
+        )
+        return FailedDayCheckResult(
+            sf_label=sf_label,
+            checked=True,
+            target_trading_day=target_date.isoformat(),
+            executions_on_day=total,
+            succeeded_on_day=0,
+            marker_status=marker_status,
+        )
+
+    marker_clause = {
+        "ABSENT": "no completion marker was written",
+        "UNREADABLE": "the completion marker could not be read/parsed (UNKNOWN ≠ pass)",
+    }.get(marker_status, f"completion marker status={marker_status!r}")
+    message = (
+        f"{sf_label} ({pipeline_name}) FAILED trading day {target_date}: "
+        f"{total} execution(s) started, none SUCCEEDED, and {marker_clause}. "
+        f"This is the independent started-but-never-succeeded detector "
+        f"(sf-pipeline-policy §4.1, alpha-engine-config#6732) — do not assume "
+        f"the SF's own failure notification fired. Recover mechanically with "
+        f"the rerun helper: `python scripts/weekday_sf_rerun.py "
+        f"--execution-arn <failed execution arn> --dry-run` (then `--start`); "
+        f"list candidates: `aws stepfunctions list-executions "
+        f"--state-machine-arn {sf_arn} --max-results 10`."
+    )
+    dedup_key = f"pipeline-watchdog-failed-day-{pipeline_name}-{target_date.isoformat()}"
+    alert_detail = _publish_watchdog_alert(
+        message,
+        severity="error",
+        dedup_key=dedup_key,
+        context={"sf_label": sf_label, "sf_arn": sf_arn,
+                 "target_trading_day": target_date.isoformat(),
+                 "marker_status": marker_status},
+    )
+    return FailedDayCheckResult(
+        sf_label=sf_label,
+        checked=True,
+        target_trading_day=target_date.isoformat(),
+        executions_on_day=total,
+        succeeded_on_day=0,
+        marker_status=marker_status,
+        alert_emitted=True,
+        alert_detail=alert_detail,
+    )
+
+
+@dataclass(frozen=True)
+class SilenceCheckResult:
+    """Outcome of one weekly-SF silence-deadman run."""
+
+    checked: bool
+    cadence: Optional[str] = None
+    evaluation_date: Optional[str] = None  # last fully-due day evaluated
+    slots_evaluated: int = 0
+    ok: int = 0
+    gated_off: int = 0
+    critical: int = 0
+    critical_slots: tuple = ()
+    gated_off_slots: tuple = ()
+    alerts_emitted: int = 0
+    degraded_reason: Optional[str] = None
+
+
+def _silence_evaluation_date(now_utc: datetime) -> date:
+    """The last day whose expected run-slots are fully DUE at cron time.
+
+    Thin adapter over the deadman module's ``last_due_day`` — the SHARED
+    definition, so the scheduled check and the operator CLI cannot disagree
+    about whether today's slot counts. Same retrospective discipline as
+    ``_eod_window_seconds`` and ``_check_preopen_buffer``: only look at
+    windows that have fully elapsed. Evaluating "today" at the 14:00 UTC
+    firing would classify every trading day's not-yet-due exercise slot
+    (chained off that day's ~20:00 UTC postclose) as CRITICAL and page daily.
+    """
+    return last_due_day(now_utc.date())
+
+
+def _check_weekly_silence(
+    *,
+    now_utc: datetime,
+    client: Optional[object] = None,
+    ssm_client: Optional[object] = None,
+) -> SilenceCheckResult:
+    """Weekly-SF silence deadman: a day the DECLARED cadence says the pipeline
+    should have run and no execution exists at all (alpha-engine-config#6738,
+    sf-pipeline-policy §2.6 rule 1).
+
+    Distinct from the Saturday-SF liveness check above, which asks only "did
+    the weekly cron fire in the last 7 days". This asks the per-day question
+    the 2026-08-05/06 outage needed and nothing answered: for EVERY run-slot
+    the declaration expects, does a matching execution exist? Postclose never
+    fired on those two days, so the chained ``pipeline_role=exercise`` launch
+    never happened — an absence, not a failure, and therefore invisible to
+    every failure-triggered alert path.
+
+    Deliberately NOT rebuilt on ``AWS/States`` ``ExecutionsStarted``: that
+    metric carries no ``pipeline_role`` dimension, so it cannot separate a
+    gated-off day from a dead one, which is why the prior CloudWatch deadman
+    could never fire (alpha-engine-config#5599, alarm deleted 2026-08-09).
+
+    No watch-day gate. Unlike the three liveness checks, the calendar
+    awareness lives INSIDE the slot derivation (``compute_expected_slots``
+    consults ``nousergon_lib.trading_calendar`` per candidate day), so a
+    weekend or holiday firing simply derives zero expected slots for those
+    days rather than being skipped wholesale.
+    """
+    if client is None:  # pragma: no cover — production path
+        client = boto3.client("stepfunctions", region_name=REGION)
+    if ssm_client is None:  # pragma: no cover — production path
+        ssm_client = boto3.client("ssm", region_name=REGION)
+
+    try:
+        cadence = load_cadence_from_ssm(ssm_client)
+    except Exception as exc:  # noqa: BLE001
+        # NOT a swallow — the failure is converted into a severity=error page
+        # on the independent watchdog topic AND recorded in the handler's
+        # returned summary as degraded_reason. Rationale for not re-raising
+        # (per the fail-loud carve-out): (a) the failure mode is "the cadence
+        # declaration is unreadable", overwhelmingly an IAM grant that has not
+        # been applied yet — this Lambda's exec-role policy is operator-
+        # applied by design (infrastructure/iam/README.md single-writer rule),
+        # so the code can legitimately reach production one deploy ahead of
+        # its grant; (b) raising here would abort the handler AFTER the four
+        # other checks have already published, discarding their summary and
+        # burning EventBridge retries on a condition no retry can fix; (c) the
+        # recording surfaces are this alert (same topic, same dedup wiring as
+        # every other watchdog page) and the summary dict in CloudWatch Logs.
+        # The check reports UNKNOWN, never OK — an unreadable declaration is
+        # never rendered as "no silent slots".
+        reason = f"{type(exc).__name__}: {exc}"
+        logger.error(
+            "weekly-silence deadman DEGRADED: cannot read %s — %s",
+            CADENCE_SSM_PARAM, reason,
+        )
+        _publish_watchdog_alert(
+            (
+                f"weekly-SF silence deadman could NOT read its declared cadence from "
+                f"SSM {CADENCE_SSM_PARAM} ({reason}). The deadman is the only detector "
+                f"for a day the weekly pipeline should have run and produced NO "
+                f"execution at all (the 2026-08-05/06 postclose silence) — it is "
+                f"reporting UNKNOWN, not healthy, until this is fixed. If this is "
+                f"AccessDenied the exec-role grant has not been applied yet; apply it "
+                f"with: `bash infrastructure/lambdas/pipeline-watchdog/deploy.sh "
+                f"--apply-iam` (alpha-engine-config#6738)."
+            ),
+            severity="error",
+            dedup_key=(
+                f"pipeline-watchdog-weekly-silence-degraded-{now_utc.date().isoformat()}"
+            ),
+            context={"ssm_param": CADENCE_SSM_PARAM, "sf_arn": SATURDAY_SF_ARN},
+        )
+        return SilenceCheckResult(
+            checked=False,
+            evaluation_date=_silence_evaluation_date(now_utc).isoformat(),
+            degraded_reason=f"cannot read {CADENCE_SSM_PARAM}: {reason}",
+            alerts_emitted=1,
+        )
+
+    evaluation_date = _silence_evaluation_date(now_utc)
+    # Anchor the fetch to THIS invocation's now, not the wall clock, so the
+    # fetch window and the slot window can never be measured from different
+    # instants (the deadman CLI keeps its own _today() default).
+    executions = fetch_execution_records(
+        client, SILENCE_WINDOW_DAYS, today=now_utc.date()
+    )
+    slots = compute_expected_slots(
+        evaluation_date,
+        cadence,
+        SILENCE_WINDOW_DAYS,
+        is_trading_day,
+        next_trading_day,
+    )
+    results = evaluate(slots, executions)
+
+    critical = [r for r in results if r.classification == "CRITICAL"]
+    gated = [r for r in results if r.classification == "GATED_OFF"]
+    ok = [r for r in results if r.classification == "OK"]
+
+    alerts_emitted = 0
+    for r in critical:
+        day = r.slot.day.isoformat()
+        message = (
+            f"ne-weekly-freshness-pipeline SILENCE on {day} ({r.slot.role} slot): "
+            f"{r.detail}. The declared cadence "
+            f"(SSM {CADENCE_SSM_PARAM} = '{cadence}') EXPECTS this run — this is not "
+            f"a gated-off day and not a failed run, it is a slot that produced no "
+            f"execution at all, which no failure-triggered alert can see. Measured "
+            f"precedent: postclose never fired on 2026-08-05/06 and the chained "
+            f"exercise launch was silent for two days with zero signal "
+            f"(alpha-engine-config#6738 / #6689). Investigate the LAUNCHER, not the "
+            f"pipeline: for an exercise slot check that day's "
+            f"ne-postclose-trading-pipeline execution reached LaunchWeeklyExerciseRun; "
+            f"for a weekly slot check the alpha-engine-saturday EventBridge rule. "
+            f"Reproduce locally: `./scripts/weekly_sf_silence_deadman.py --live "
+            f"--window-days {SILENCE_WINDOW_DAYS} --json --no-notify`."
+        )
+        _publish_watchdog_alert(
+            message,
+            severity="error",
+            dedup_key=f"pipeline-watchdog-weekly-silence-{r.slot.role}-{day}",
+            context={
+                "sf_arn": SATURDAY_SF_ARN,
+                "slot_day": day,
+                "slot_role": r.slot.role,
+                "declared_cadence": cadence,
+            },
+            dedup_window_min=SILENCE_DEDUP_WINDOW_MIN,
+        )
+        alerts_emitted += 1
+
+    logger.info(
+        "weekly-silence deadman: cadence=%s through=%s ok=%d gated_off=%d critical=%d",
+        cadence, evaluation_date.isoformat(), len(ok), len(gated), len(critical),
+    )
+    return SilenceCheckResult(
+        checked=True,
+        cadence=cadence,
+        evaluation_date=evaluation_date.isoformat(),
+        slots_evaluated=len(results),
+        ok=len(ok),
+        gated_off=len(gated),
+        critical=len(critical),
+        # Both lists are reported, not just the failing one: "gated off by
+        # declaration" and "expected and absent" are the two states §2.6
+        # requires an operator to be able to tell apart, and a summary that
+        # only ever names failures cannot show that the quiet days were quiet
+        # ON PURPOSE.
+        critical_slots=tuple(
+            f"{r.slot.day.isoformat()}:{r.slot.role}" for r in critical
         ),
+        gated_off_slots=tuple(
+            f"{r.slot.day.isoformat()}:{r.slot.role}" for r in gated
+        ),
+        alerts_emitted=alerts_emitted,
     )
 
 
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
-    """EventBridge cron handler. Runs the 3 per-SF checks + returns a
-    structured summary the Lambda console / CW logs can read at a glance."""
+    """EventBridge cron handler. Runs the 3 per-SF liveness checks, the
+    preopen schedule-buffer canary, and the 2 prior-day failed-run checks,
+    and returns a structured summary the Lambda console / CW logs can read
+    at a glance."""
     now_utc = datetime.now(timezone.utc)
     is_trading_today = _is_trading_day_now(now_utc)
     is_sunday = now_utc.weekday() == 6  # Mon=0..Sun=6
@@ -565,6 +1488,31 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         window_seconds=WINDOW_SECONDS_WEEKLY,
         role_filter=WEEKLY_CADENCE_ROLES,
     )
+    preopen_buffer = _check_preopen_buffer(
+        now_utc=now_utc,
+        is_watch_day=is_trading_today,
+    )
+
+    # Prior-day failed-run checks (config#6732). The target is the most
+    # recent CLOSED trading day, which exists on every calendar day — so
+    # these run on weekends and holidays too (a Friday failure pages
+    # Saturday 14:00 UTC, not Monday).
+    failed_day_target = last_closed_trading_day(now_utc)
+    failed_day = [
+        _check_failed_day(
+            sf_label=label,
+            sf_arn=arn,
+            pipeline_name=pipeline,
+            target_date=failed_day_target,
+        )
+        for label, arn, pipeline in _FAILED_DAY_PIPELINES
+    ]
+
+    # Weekly-SF silence deadman (config#6738). Runs on EVERY calendar day —
+    # its own slot derivation is the trading-calendar gate, so there is no
+    # watch-day to skip on. Ordered last so that if it ever raises despite the
+    # degraded path below, the five checks above have already published.
+    weekly_silence = _check_weekly_silence(now_utc=now_utc)
 
     summary = {
         "fired_at_utc": now_utc.isoformat(),
@@ -581,6 +1529,46 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             }
             for c in (weekday, eod, saturday)
         ],
+        "preopen_buffer_check": {
+            "checked": preopen_buffer.checked,
+            "skip_reason": preopen_buffer.skip_reason,
+            "target_trading_day": preopen_buffer.target_trading_day,
+            "finish_pt": preopen_buffer.finish_pt,
+            "minutes_before_open": preopen_buffer.minutes_before_open,
+            "alert_emitted": preopen_buffer.alert_emitted,
+            "alert_severity": preopen_buffer.alert_severity,
+            "alert_detail": preopen_buffer.alert_detail,
+            "trend_median_minutes_before_open": preopen_buffer.trend_median_minutes_before_open,
+            "trend_days_used": preopen_buffer.trend_days_used,
+            "trend_alert_emitted": preopen_buffer.trend_alert_emitted,
+        },
+        "failed_day_checks": [
+            {
+                "sf_label": c.sf_label,
+                "checked": c.checked,
+                "target_trading_day": c.target_trading_day,
+                "skip_reason": c.skip_reason,
+                "executions_on_day": c.executions_on_day,
+                "succeeded_on_day": c.succeeded_on_day,
+                "marker_status": c.marker_status,
+                "alert_emitted": c.alert_emitted,
+                "alert_detail": c.alert_detail,
+            }
+            for c in failed_day
+        ],
+        "weekly_silence_check": {
+            "checked": weekly_silence.checked,
+            "cadence": weekly_silence.cadence,
+            "evaluation_date": weekly_silence.evaluation_date,
+            "slots_evaluated": weekly_silence.slots_evaluated,
+            "ok": weekly_silence.ok,
+            "gated_off": weekly_silence.gated_off,
+            "critical": weekly_silence.critical,
+            "critical_slots": list(weekly_silence.critical_slots),
+            "gated_off_slots": list(weekly_silence.gated_off_slots),
+            "alerts_emitted": weekly_silence.alerts_emitted,
+            "degraded_reason": weekly_silence.degraded_reason,
+        },
     }
     logger.info("watchdog summary: %s", summary)
     return summary

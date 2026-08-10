@@ -59,7 +59,9 @@ CHECKS = [
     ("WeeklySubstrateHealthCheck", "WaitForWeeklySubstrateHealthCheck",
      "CheckSubstrateHealthCheckStatus", "SubstrateHealthCheckPollWait",
      "SubstrateHealthCheckDegraded", "$.substrate_check_poll",
-     "ReportCard", 240),
+     # config#6054: the tail entry is now the per-stage skip gate; its
+     # Default is ReportCard, so the degrade-then-proceed property holds.
+     "CheckSkipReportCard", 240),
 ]
 _IDS = [c[0] for c in CHECKS]
 
@@ -130,7 +132,20 @@ def test_no_health_state_catch_targets_notify_complete_directly(states):
 def test_poll_resolves_to_terminal_status(
     states, send, wait, status, poll_wait, degraded, poll, proceed, _t
 ):
-    assert states[send]["Next"] == wait
+    # alpha-engine-config-I5687: send now dispatches through the
+    # poll-budget seed (Init<Label>PollCount) before the first poll, and the
+    # loop-back branch is a bounded And[] (IsPresent + Or[...] +
+    # NumericLessThan cap) rather than a bare Or[] — mirrors the
+    # DataPhase2/ThinkTank precedent.
+    label = {
+        "SaturdayHealthCheck": "SaturdayHealthCheck",
+        "WeeklySubstrateHealthCheck": "SubstrateHealthCheck",
+    }[send]
+    init_name = f"Init{label}PollCount"
+    merge_name = f"Merge{label}PollCount"
+
+    assert states[send]["Next"] == init_name
+    assert states[init_name]["Next"] == wait
     assert states[wait]["Next"] == status, (
         f"{wait} must feed the terminal-status Choice — check-once polling "
         "is how a failing health checker stayed invisible (config#2276)"
@@ -142,14 +157,21 @@ def test_poll_resolves_to_terminal_status(
     assert success["Variable"] == f"{poll}.Status"
     assert success["Next"] == proceed
 
-    in_flight = next(r for r in rules if "Or" in r)
-    looped = {op["StringEquals"] for op in in_flight["Or"]}
+    bounded = next(r for r in rules if "And" in r)
+    poll_var = poll.replace("_poll", "_polls")
+    variables = {cond.get("Variable") for cond in bounded["And"]}
+    assert poll_var in variables
+    or_block = next(cond["Or"] for cond in bounded["And"] if "Or" in cond)
+    looped = {op["StringEquals"] for op in or_block}
     assert looped == {"InProgress", "Pending", "Delayed"}, (
         f"{status} must loop on exactly the non-terminal statuses; got {looped}"
     )
-    assert in_flight["Next"] == poll_wait
+    increment_name = f"{label}Wait"
+    assert bounded["Next"] == increment_name
+    assert states[increment_name]["Next"] == poll_wait
     assert states[poll_wait]["Type"] == "Wait"
-    assert states[poll_wait]["Next"] == wait
+    assert states[poll_wait]["Next"] == merge_name
+    assert states[merge_name]["Next"] == wait
 
     # THE drill edge: a terminal non-Success (Failed / TimedOut / Cancelled
     # — incl. executionTimeout expiry killing a hung checker) must land on

@@ -95,7 +95,7 @@ class TestWeekdaySpotStatesPresent:
         # config#2542: force_on_demand.$ threads the retry-budget's on-demand
         # override into the dispatcher (see TestWeekdayDataSpotRetryBudget),
         # mirroring the EOD launch states.
-        assert set(st["Parameters"]["Payload"]) == {"workload", "force_on_demand.$"}
+        assert set(st["Parameters"]["Payload"]) == {"workload", "force_on_demand.$", "execution_id.$"}
 
     @pytest.mark.parametrize("name", _POLL)
     def test_poll_state_polls_ssm(self, daily, name):
@@ -180,9 +180,18 @@ class TestWeekdayFailureIsolation:
             assert daily[name]["Default"] not in _HALT
 
     def test_error_normalizer_continues_not_halts(self, daily):
-        # ExtractDataSpotError -> PublishDataSpotFailureImmediate -> CONTINUE.
+        # alpha-engine-config#6692: ExtractDataSpotError -> SetDataSpotDegradedFlag
+        # (threads $.degraded_summary, read much later by CheckDegradedOutcome)
+        # -> PublishDataSpotFailureImmediate -> CONTINUE. The fail-open
+        # continuation itself is unchanged by the degraded-flag insertion.
         assert daily["ExtractDataSpotError"]["Type"] == "Pass"
-        assert daily["ExtractDataSpotError"]["Next"] == "PublishDataSpotFailureImmediate"
+        assert daily["ExtractDataSpotError"]["Next"] == "SetDataSpotDegradedFlag"
+        flag = daily["SetDataSpotDegradedFlag"]
+        assert flag["Type"] == "Pass"
+        assert flag["Parameters"]["degraded"] is True
+        assert flag["ResultPath"] == "$.degraded_summary"
+        assert flag["Next"] == "PublishDataSpotFailureImmediate"
+        assert flag["Next"] not in _HALT
         pub = daily["PublishDataSpotFailureImmediate"]
         assert pub["Next"] == self._CONTINUE
         # Even the SNS publish's own Catch is fail-open.
@@ -203,7 +212,7 @@ class TestWeekdayFailureIsolation:
             "PollMorningArcticAppendSpot", "CheckMorningArcticAppendSpotStatus",
             "MorningArcticAppendSpotWait",
             "CheckMorningArcticAppendRetryBudget", "IncrementMorningArcticAppendRetry",
-            "ExtractDataSpotError", "PublishDataSpotFailureImmediate",
+            "ExtractDataSpotError", "SetDataSpotDegradedFlag", "PublishDataSpotFailureImmediate",
         ]
         for name in data_states:
             for tgt in _all_targets(daily[name]):
@@ -302,7 +311,7 @@ class TestEODSpotStatesPresent:
         }
         # 2026-07-14: force_on_demand.$ threads the retry-budget's on-demand
         # override into the dispatcher (see TestEODDataSpotRetryBudget).
-        assert set(st["Parameters"]["Payload"]) == {"workload", "force_on_demand.$"}
+        assert set(st["Parameters"]["Payload"]) == {"workload", "force_on_demand.$", "execution_id.$"}
 
     @pytest.mark.parametrize("name", _POLL)
     def test_poll_state_polls_ssm(self, eod, name):
@@ -369,7 +378,18 @@ class TestEODFailureIsolation:
         assert eod["CheckDataSpotArcticRetryBudget"]["Default"] == "ExtractDataSpotError"
 
     def test_error_normalizer_continues_to_reconcile_path(self, eod):
-        assert eod["ExtractDataSpotError"]["Next"] == "PublishDataSpotFailureImmediate"
+        # alpha-engine-config#6715: ExtractDataSpotError now threads through
+        # SetDataSpotDegradedFlag (mirrors step_function_daily.json's
+        # SetDataSpotDegradedFlag, config#6692 Option-A) before reaching the
+        # SAME PublishDataSpotFailureImmediate -> CheckSkipCaptureSnapshot
+        # fail-open continuation this test has always pinned — the
+        # continuation path itself is unchanged, only $.degraded_summary now
+        # gets set along the way.
+        assert eod["ExtractDataSpotError"]["Next"] == "SetDataSpotDegradedFlag"
+        flag = eod["SetDataSpotDegradedFlag"]
+        assert flag["Type"] == "Pass"
+        assert flag["ResultPath"] == "$.degraded_summary"
+        assert flag["Next"] == "PublishDataSpotFailureImmediate"
         pub = eod["PublishDataSpotFailureImmediate"]
         assert pub["Next"] == self._CONTINUE
         for c in pub.get("Catch", []):
@@ -386,7 +406,7 @@ class TestEODFailureIsolation:
             "PollPostMarketArcticAppendSpot", "CheckPostMarketArcticAppendSpotStatus",
             "PostMarketArcticAppendSpotWait",
             "CheckDataSpotArcticRetryBudget", "IncrementDataSpotArcticRetry",
-            "ExtractDataSpotError", "PublishDataSpotFailureImmediate",
+            "ExtractDataSpotError", "SetDataSpotDegradedFlag", "PublishDataSpotFailureImmediate",
         ]
         for name in data_states:
             for tgt in _all_targets(eod[name]):

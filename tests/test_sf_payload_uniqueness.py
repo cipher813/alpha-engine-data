@@ -142,7 +142,8 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # Lambda takes no execution-input-derived args today (force_on_demand
     # is reserved for a future retry loop, not currently threaded from the
     # SF); it reads its own config entirely from Lambda env vars.
-    "DispatchWeeklyFreshnessSpot": frozenset(),
+    # config#5504: per-run identity threading for cost attribution.
+    "DispatchWeeklyFreshnessSpot": frozenset({"execution_id.$"}),
 }
 
 # config#1811: the liveness-aware SSM poll iteration — one shared payload
@@ -193,8 +194,10 @@ _WEEKDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # "force_on_demand.$"} selecting the collector invocation + threading the
     # config#2542 retry-budget's on-demand override; the dispatcher returns
     # {data_spot:{launched,instance_id,...}}.
-    "LaunchMorningEnrichSpot": frozenset({"workload", "force_on_demand.$"}),
-    "LaunchMorningArcticAppendSpot": frozenset({"workload", "force_on_demand.$"}),
+    # config#5504: execution_id.$ threads $$.Execution.Id into the dispatcher
+    # payload so the spot box carries per-run identity tags for cost attribution.
+    "LaunchMorningEnrichSpot": frozenset({"workload", "force_on_demand.$", "execution_id.$"}),
+    "LaunchMorningArcticAppendSpot": frozenset({"workload", "force_on_demand.$", "execution_id.$"}),
     # alpha-engine-config-I6494: weekday Scanner — same Lambda as Saturday SF
     # Scanner, payload is run_date only (no research_dry / dry_run_llm on the
     # weekday cadence).
@@ -586,6 +589,33 @@ class TestEODSFTopLevelFieldsClosed:
             "weekly_exercise_launch_error",
             "weekly_exercise_launch_notify",
             "weekly_exercise_launch_notify_error",
+            # alpha-engine-config-I6689: ReadExerciseCadence reads the
+            # declared cadence from SSM (source: infrastructure/
+            # weekly_cadence.json) and gates LaunchWeeklyExerciseRun via
+            # CheckExerciseCadence, so daily<->weekly-only<->off is a
+            # one-line manifest diff instead of an SF-topology edit.
+            # $.exercise_cadence_param is both the Task's ResultPath AND
+            # the value SetCadenceReadDegraded / SetCadenceUnknownValueDegraded
+            # float, so all three fail-open paths (read failure, unrecognized
+            # value) agree on one field name for CheckExerciseCadence to read.
+            "exercise_cadence_param",
+            "exercise_cadence_read_error",
+            "exercise_cadence_degraded_notify",
+            "exercise_cadence_degraded_notify_error",
+            "exercise_cadence_unknown_notify",
+            "exercise_cadence_unknown_notify_error",
+            # alpha-engine-config#5569 (2026-08-09): bounded 1-retry same-day
+            # budget for CaptureSnapshot, the EOD pipeline's only stage with an
+            # irreversible per-day deadline. InitCaptureSnapshotRetryCounter /
+            # IncrementCaptureSnapshotRetry carry the attempts counter;
+            # PageCaptureSnapshotFailureImmediate emits its SNS ResultPath on
+            # the FIRST failure (before the retry runs); PageCaptureSnapshot-
+            # IrreversibleFailure emits its own distinct SNS ResultPath once the
+            # retry budget is exhausted. $.error is reused (already registered
+            # above) by CaptureSnapshotRetryExhausted's normalizer.
+            "capture_snapshot_retry",
+            "capture_snapshot_page_notify",
+            "capture_snapshot_irreversible_notify",
         }
     )
 
@@ -652,7 +682,13 @@ class TestEODSFTopLevelFieldsClosed:
 # a 1.1s sleep held inside a module-global lock = 2.2 s/ticker, measured
 # flat at 903 tickers), so ~33 min against Lambda's 900s HARD maximum —
 # a ceiling no further bump can raise.
-_EXPECTED_SATURDAY_SPOT_STATE_COUNT = 11
+# 11 → 14 on alpha-engine-config#6030 (2026-08-09): the bundled Parity spot
+# state was split into a ParityParallel of three fail-open branch spots
+# (PitParityLookahead / PitParityWalkforward / ParityReplay) plus the
+# PitParityCompare join spot — net +3 flat-level spot launchers (the three
+# branches ARE descended into by _flatten_states, same as DataPhase2's
+# Branch A siblings).
+_EXPECTED_SATURDAY_SPOT_STATE_COUNT = 14
 
 
 def _spot_states(sf_path: Path) -> list[str]:

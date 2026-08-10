@@ -7,18 +7,22 @@ history's event vocabulary):
 
 - ``parallel_branch_failure``: branch A dies at RAGIngestion, branch B
   completes through the model zoo (the actual 2026-07-11 shape);
-- ``tail_stage_failure``: Parity fails with everything through the
-  portfolio-optimizer backtest completed — exercises the skip_backtester
-  OVERSHOOT drop (its skip route jumps the failed stage's gate);
+- ``tail_stage_failure``: rebuilt for the alpha-engine-config#6030 parity
+  split — the PitParityWalkforward branch DEGRADES fail-open (its siblings
+  and the compare complete; the compare emits verdict UNKNOWN), and the run
+  then fails terminally at Evaluator. Exercises the skip_backtester
+  OVERSHOOT drop (its skip route jumps a degraded parity-family stage's
+  gate) and per-branch skip emission;
 - ``early_failure``: DataPhase1 fails with only MorningEnrich completed;
 - ``director_degraded``: the REAL watch-rerun-2026-08-01-4 history (the
   "permanent fixture" for alpha-engine-config-I6055 — see its test) — the
   Director hard-failed (ModuleNotFoundError: openai, event 858),
-  PublishDirectorDegraded absorbed it, the tail's health checks degraded
-  too, and the run only failed terminally at WriteCompletionMarker
-  (S3.AccessDeniedException). Its tail states are real events, filtered
-  from the live Step Functions history to the event types this script
-  consumes.
+  PublishDirectorDegraded absorbed it (PRE-FIX behavior — config#6408 now
+  routes Director failure to terminal FailExecution), the tail's health
+  checks degraded too, and the run only failed terminally at
+  WriteCompletionMarker (S3.AccessDeniedException). PublishDirectorDegraded
+  is RETAINED in the degraded_witness set for backward compatibility with
+  pre-fix execution histories.
 
 Plus the config#2280 mutex-steal decision matrix and the role-gating
 verification (config#2277 deliverable 2).
@@ -85,11 +89,25 @@ class TestDerivePlan:
 
     def test_tail_stage_failure_drops_backtester_overshoot(self, mod):
         plan = mod.derive_plan(_events("tail_stage_failure"))
-        assert plan.failed == ["parity"]
-        # skip_backtester completed but its skip route would bypass the
-        # failed parity gate — replaced with skip_backtester_stage_only
-        # (config#2362 Option A) so Backtester's SSM task isn't re-run
-        # while the tail gates still compose orthogonally.
+        # alpha-engine-config#6030 shape: the walkforward BRANCH degraded
+        # fail-open (the run continued), and the run failed terminally at
+        # Evaluator.
+        assert plan.failed == ["evaluator"]
+        assert "pit_parity_walkforward" in plan.degraded
+        assert "parity" in plan.degraded  # the post-join family fold
+        # completed branches + the compare emit their fine-grained flags —
+        # ONLY the degraded branch reruns (the #6030 closes-when)
+        assert plan.skip_flags.get("skip_pit_parity_lookahead") is True
+        assert plan.skip_flags.get("skip_parity_replay") is True
+        assert plan.skip_flags.get("skip_pit_parity_compare") is True
+        assert "skip_pit_parity_walkforward" not in plan.skip_flags
+        # the family flag is never auto-emitted (it would bypass the
+        # degraded branch)
+        assert "skip_parity" not in plan.skip_flags
+        # skip_backtester completed but its whole-pair skip route would
+        # bypass the degraded parity-family gate — replaced with
+        # skip_backtester_stage_only (config#2362 Option A) so Backtester's
+        # SSM task isn't re-run while the tail gates still compose.
         assert "skip_backtester" not in plan.skip_flags
         assert plan.skip_flags.get("skip_backtester_stage_only") is True
         assert any("skip_backtester_stage_only" in n for n in plan.notes)
@@ -115,9 +133,12 @@ class TestDerivePlan:
             "skip_backtester_stage_only",
             "skip_predictor_backtest",
             "skip_portfolio_optimizer_backtest",
+            "skip_pit_parity_lookahead",
+            "skip_parity_replay",
+            "skip_pit_parity_compare",
         }
         # the failed stage must never carry its own skip flag
-        assert "skip_parity" not in plan.skip_flags
+        assert "skip_evaluator" not in plan.skip_flags
 
     def test_early_failure(self, mod):
         plan = mod.derive_plan(_events("early_failure"))
@@ -192,7 +213,7 @@ class TestDerivePlan:
         events = _events("tail_stage_failure")
         started = next(e for e in events if "executionStartedEventDetails" in e)
         inp = json.loads(started["executionStartedEventDetails"]["input"])
-        inp["skip_backtester"] = True  # would jump the failed parity gate
+        inp["skip_backtester"] = True  # would jump the degraded branch's gate
         started["executionStartedEventDetails"]["input"] = json.dumps(inp)
         with pytest.raises(SystemExit, match="unreachable"):
             mod.derive_plan(events)
@@ -205,19 +226,29 @@ class TestDerivePlan:
         the Director hard-fail its rerun was started for. This fixture IS
         the real watch-rerun-2026-08-01-4 history: Director failed with
         'No module named openai' (event 858), PublishDirectorDegraded
-        absorbed it, the health checks degraded too, and the run only
-        failed terminally at WriteCompletionMarker."""
+        absorbed it (PRE-FIX behavior — config#6408 now routes Director
+        failure to terminal FailExecution), the health checks degraded too,
+        and the run only failed terminally at WriteCompletionMarker.
+        PublishDirectorDegraded is retained in degraded_witness for
+        backward compatibility with pre-fix execution histories — new
+        executions never enter it."""
         plan = mod.derive_plan(_events("director_degraded"))
         # the degraded tail must re-run — never skipped, never "completed"
         assert "post_eval" in plan.degraded
         assert "post_eval" not in plan.completed
         assert "skip_post_eval" not in plan.skip_flags
         # the degradation must be surfaced in the derivation notes
+        # (PublishDirectorDegraded retained in degraded_witness for backward compat)
         assert any("DEGRADED" in n and "PublishDirectorDegraded" in n for n in plan.notes)
         # stages that genuinely completed cleanly keep their skip flags
-        # (evaluator and parity really ran to completion on this execution)
+        # (evaluator really ran to completion on this execution). The parity
+        # FAMILY reads completed (pre-#6030 history, witness
+        # CheckSkipEvaluator) but skip_parity is deliberately never
+        # auto-emitted post-#6030 — a rerun of an old history re-runs the
+        # parity family conservatively (the old bundled artifacts cannot
+        # witness the new per-stage set).
         assert plan.skip_flags.get("skip_evaluator") is True
-        assert plan.skip_flags.get("skip_parity") is True
+        assert "skip_parity" not in plan.skip_flags
         assert "evaluator" in plan.completed and "parity" in plan.completed
         # and the rerun input must not bypass the tail
         assert "skip_post_eval" not in plan.rerun_input()
@@ -434,6 +465,19 @@ class TestStageTableLockstep:
                     "ValidatePredictorSkipWeightsFresh",
                 }
                 continue
+            if stage.name == "director":
+                # config#6054: DELIBERATE exception, inverted from the
+                # convention. director's witness is the success-only
+                # DirectorComplete Pass state, and its skip route lands on
+                # CheckShellRunNotify — which every bypass path also enters.
+                # Witnessing on the skip target would mark a bypassed
+                # Director complete and skip it on the rerun (the I6055
+                # trap). Cost of the inversion: an original run that SKIPPED
+                # director yields a rerun that re-runs it — the safe
+                # direction for an advisory stage.
+                assert skip_targets == {"CheckShellRunNotify"}
+                assert "DirectorComplete" not in skip_targets
+                continue
             if stage.name == "backtester_stage_only":
                 # config#2362 Option A additive gate: deliberately empty
                 # witness (it shares Backtester's work state with the
@@ -443,6 +487,16 @@ class TestStageTableLockstep:
                 assert skip_targets == {"CheckSkipPredictorBacktest"}, (
                     "CheckSkipBacktesterStageOnly's skip route changed — "
                     "update the config#2362 Option A additive gate"
+                )
+                continue
+            if stage.name == "pit_parity_compare":
+                # the compare's skip route overshoots its witness to the
+                # evaluator gate — like backtester_stage_only, checked
+                # structurally: a skipped compare emits nothing and the
+                # original input's flag carries over.
+                assert skip_targets == {"CheckSkipEvaluator"}, (
+                    "CheckSkipPitParityCompare's skip route changed — "
+                    "update STAGES (alpha-engine-config#6030)"
                 )
                 continue
             assert skip_targets & stage.witness, (
@@ -456,7 +510,10 @@ class TestStageTableLockstep:
         assert mod.BACKTESTER_OVERSHADOWED == (
             "predictor_backtest",
             "portfolio_optimizer_backtest",
-            "parity",
+            "pit_parity_lookahead",
+            "pit_parity_walkforward",
+            "parity_replay",
+            "pit_parity_compare",
         )
         # config#2362 Option A: CheckSkipBacktester's Default now falls
         # through the additive CheckSkipBacktesterStageOnly gate before
@@ -473,8 +530,11 @@ class TestStageTableLockstep:
         EMAIL surface, not a stage degrading, so it is deliberately
         unmapped."""
         mapped: dict = {}
+        historical = getattr(mod, "HISTORICAL_DEGRADED_WITNESS", frozenset())
         for stage in mod.STAGES:
             for d in stage.degraded_witness:
+                if d in historical:
+                    continue  # retained for backward compat (pre-fix histories)
                 assert d in all_states, (
                     f"{stage.name}: degraded witness {d} is not a state in "
                     f"infrastructure/step_function.json — update STAGES"
@@ -485,13 +545,49 @@ class TestStageTableLockstep:
                     f"one stage"
                 )
                 mapped[d] = stage.name
+        # alpha-engine-config#6722: CheckResearchPredictorDegraded (Choice)
+        # and SetResearchPredictorDegraded (Pass) are the terminal AGGREGATE
+        # fold that decides the completion-EMAIL routing (folded into
+        # NotifyCompleteMultipleDegraded) — the same KIND of thing as the
+        # Notify*Degraded family the docstring above already excludes, not a
+        # per-stage rerun witness. The actual per-stage rerun signal is the
+        # GRANULAR Mark*Degraded/ThinkTankDegraded states each branch owner
+        # threads (those ARE mapped, above) — SetResearchPredictorDegraded
+        # firing is always causally downstream of one of those, so it
+        # carries no additional rerun-actionable information of its own.
+        _AGGREGATE_FOLD_EXCLUDED = {
+            "CheckResearchPredictorDegraded",
+            "SetResearchPredictorDegraded",
+        }
         for name in all_states:
-            if name.endswith("Degraded") and not name.startswith("Notify"):
+            if (
+                name.endswith("Degraded")
+                and not name.startswith("Notify")
+                and name not in _AGGREGATE_FOLD_EXCLUDED
+            ):
                 assert name in mapped, (
                     f"degraded route {name} is not covered by any STAGES "
                     f"degraded_witness — a degraded {name} stage would be "
                     f"skipped as complete on a rerun; add it to STAGES"
                 )
+
+    def test_parity_degraded_route_is_mapped_in_stages(self, mod, all_states):
+        """alpha-engine-config-I6025: the SF now routes every parity
+        non-success through ParityDegraded → PublishParityDegraded and
+        CONTINUES. A degraded parity must re-run on a mechanical rerun —
+        never be skipped as completed — so the STAGES row must map both
+        degraded-route states. (The full degraded-overrides-witness logic
+        ships with alpha-engine-config-I6055; this pins the mapping so the
+        guard can never miss it.)"""
+        parity = next(s for s in mod.STAGES if s.name == "parity")
+        assert parity.degraded_witness == frozenset(
+            {"ParityDegraded", "PublishParityDegraded"}
+        )
+        for d in parity.degraded_witness:
+            assert d in all_states, (
+                f"parity degraded witness {d} is not a state in "
+                f"infrastructure/step_function.json — update STAGES"
+            )
 
 
 # ---------------------------------------------------------------------------

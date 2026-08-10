@@ -2,7 +2,9 @@
 # deploy_step_function_daily.sh — Create/update the weekday pipeline.
 #
 # Orchestrates: Daily Data → Predictor Inference → EC2 Start (executor)
-# Triggered Mon-Fri at 13:05 UTC (6:05 AM PT).
+# Triggered Mon-Fri at 5:15 AM PT (America/Los_Angeles, DST-aware); schedule
+# is CFN-canonical in cloudformation/alpha-engine-orchestration.yaml — do not
+# hand-edit here.
 #
 # Prerequisites:
 #   - Saturday pipeline already deployed (IAM roles, SNS topic exist)
@@ -141,7 +143,7 @@ echo ""
 echo "=== Deployment Complete ==="
 echo ""
 echo "  State machine:  $SM_ARN"
-echo "  EventBridge:    $EVENTBRIDGE_RULE (Mon-Fri 13:05 UTC / 6:05 AM PT)"
+echo "  EventBridge:    $EVENTBRIDGE_RULE (Mon-Fri 5:15 AM PT, America/Los_Angeles, DST-aware; CFN-canonical in cloudformation/alpha-engine-orchestration.yaml — do not hand-edit here)"
 echo "  SNS topic:      $SNS_TOPIC_ARN"
 echo ""
 echo "To test manually:"

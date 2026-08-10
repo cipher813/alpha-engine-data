@@ -22,7 +22,14 @@ _SF_PATH = Path(__file__).resolve().parents[1] / "infrastructure" / "step_functi
 
 @pytest.fixture(scope="module")
 def states() -> dict:
-    return json.loads(_SF_PATH.read_text())["States"]
+    """Top-level States, plus the ParityParallel branch states flattened in
+    (alpha-engine-config#6030 — the three parity branch spots live inside
+    the Parallel but thread RUN_DATE identically)."""
+    top = json.loads(_SF_PATH.read_text())["States"]
+    flat = dict(top)
+    for branch in top["ParityParallel"]["Branches"]:
+        flat.update(branch["States"])
+    return flat
 
 
 def test_initialize_input_stamps_run_date_from_execution_start(states):
@@ -43,21 +50,37 @@ def test_initialize_input_user_run_date_still_wins(states):
     assert expr.rstrip().endswith("$$.Execution.Input,false)")
 
 
-@pytest.mark.parametrize("stage", ["Backtester", "Parity", "Evaluator"])
+# alpha-engine-config-I4442/I4497 SF cutover (2026-08-09): each backtest-
+# family state now invokes its own dedicated script rather than the shared
+# spot_backtest.sh monolith.
+_STAGE_SCRIPT = {
+    "Backtester": "spot_backtester.sh",
+    # alpha-engine-config#6030: the bundled Parity stage became four
+    # independent stages, each threading the same SF-declared RUN_DATE.
+    "PitParityLookahead": "spot_pit_lookahead.sh",
+    "PitParityWalkforward": "spot_pit_walkforward.sh",
+    "ParityReplay": "spot_parity_replay.sh",
+    "PitParityCompare": "spot_parity_compare.sh",
+    "Evaluator": "spot_evaluator.sh",
+}
+
+
+@pytest.mark.parametrize("stage", sorted(_STAGE_SCRIPT))
 def test_spot_stage_exports_run_date_before_launch(states, stage):
     """Each spot stage injects `export RUN_DATE=<run_date>` immediately
-    before the spot_backtest.sh launch so spot_backtest.sh resolves the
-    SF-declared date from env instead of recomputing wall-clock."""
+    before its dedicated per-stage script launch so that script resolves
+    the SF-declared date from env instead of recomputing wall-clock."""
     cmds = extract_commands(states[stage])
     rd_idx = next(
         i for i, c in enumerate(cmds)
         if c.startswith("export RUN_DATE=")
     )
+    script = _STAGE_SCRIPT[stage]
     spot_idx = next(
-        i for i, c in enumerate(cmds) if "spot_backtest.sh" in c
+        i for i, c in enumerate(cmds) if script in c
     )
     assert rd_idx < spot_idx, (
-        f"{stage}: export RUN_DATE must precede the spot_backtest.sh launch"
+        f"{stage}: export RUN_DATE must precede the {script} launch"
     )
     # value is threaded from the SF-stamped $.run_date (States.Format)
     raw_expr = states[stage]["Parameters"]["Parameters"]["commands.$"]

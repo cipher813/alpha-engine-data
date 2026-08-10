@@ -190,15 +190,26 @@ class TestParallelStatePresence:
         # ThinkTankCoverage → RegimeRetrospectiveEval → DataPhase2 → ...
         # (the multi-agent Research state and CheckSkipResearch were
         # removed; SignalsEnvelope is the chain's continuation inside
-        # Branch A). config#3134: Branch A's StartAt is now CheckSkipScanner
+        # Branch A). config#3134: Branch A's StartAt was CheckSkipScanner
         # (Scanner's own new skip gate), not Scanner directly.
-        assert parallel["Branches"][0]["StartAt"] == "CheckSkipScanner"
+        # alpha-engine-config#6722: now InitResearchDegradedFlag (seeds
+        # $.research_degraded_local before anything else runs), which
+        # falls through to CheckSkipScanner unconditionally.
+        assert parallel["Branches"][0]["StartAt"] == "InitResearchDegradedFlag"
         branch_a = parallel["Branches"][0]["States"]
+        assert branch_a["InitResearchDegradedFlag"]["Next"] == "CheckSkipScanner"
         assert "SignalsEnvelope" in branch_a
 
     def test_branch_b_starts_at_check_skip_predictor_training(self, parallel):
+        # alpha-engine-config#6722: now InitPredictorDegradedFlag (seeds
+        # $.research_degraded_local), falling through unconditionally.
         assert (
             parallel["Branches"][1]["StartAt"]
+            == "InitPredictorDegradedFlag"
+        )
+        branch_b = parallel["Branches"][1]["States"]
+        assert (
+            branch_b["InitPredictorDegradedFlag"]["Next"]
             == "CheckSkipPredictorTraining"
         )
 
@@ -449,13 +460,19 @@ class TestBranchBContents:
         assert skipped["ResultPath"] == "$.branch_b"
         assert skipped["Result"]["branch_b_status"] == "OK"
         assert skipped["Result"]["skipped"] is True
-        # Exactly the success contract + the marker — nothing else.
-        assert set(skipped["Result"]) == {"branch_b_status", "skipped"}
+        # Exactly the success contract + the marker + the degraded field
+        # (alpha-engine-config#6722: fixed false — this path never reaches
+        # the model-zoo rotation, and the field must exist unconditionally
+        # so AggregateBranchOutcomes' Parameters.$ extraction never throws).
+        assert set(skipped["Result"]) == {
+            "branch_b_status", "skipped", "branch_b_degraded",
+        }
+        assert skipped["Result"]["branch_b_degraded"] is False
         # Contract equivalence with the real success terminal.
         complete = branch_b["BranchBComplete"]
         assert (
             skipped["Result"]["branch_b_status"]
-            == complete["Result"]["branch_b_status"]
+            == complete["Parameters"]["branch_b_status"]
         )
         assert skipped["ResultPath"] == complete["ResultPath"]
 
@@ -467,19 +484,31 @@ class TestBranchBContents:
     # infra/drop-iam-moved-to-ops cleanup.
 
     def test_predictor_status_poll_quartet_preserved(self, branch_b):
+        # alpha-engine-config-I5687: PredictorTraining dispatches through the
+        # poll-budget seed (InitPredictorPollCount) before the first poll,
+        # and the loop-back branch is a bounded And[], mirroring the
+        # DataPhase2/ThinkTank precedent.
         assert branch_b["PredictorTraining"]["Next"] == (
+            "InitPredictorPollCount"
+        )
+        assert branch_b["InitPredictorPollCount"]["Next"] == (
             "WaitForPredictorTraining"
         )
         assert branch_b["WaitForPredictorTraining"]["Next"] == (
             "CheckPredictorStatus"
         )
-        nexts = {
-            c["StringEquals"]: c["Next"]
-            for c in branch_b["CheckPredictorStatus"]["Choices"]
-        }
-        assert nexts["InProgress"] == "PredictorWait"
-        assert nexts["Pending"] == "PredictorWait"
-        assert branch_b["PredictorWait"]["Next"] == (
+        bounded = next(
+            c for c in branch_b["CheckPredictorStatus"]["Choices"] if "And" in c
+        )
+        variables = {cond.get("Variable") for cond in bounded["And"]}
+        assert "$.predictor_polls" in variables
+        or_block = next(cond["Or"] for cond in bounded["And"] if "Or" in cond)
+        statuses = {c["StringEquals"] for c in or_block}
+        assert statuses == {"InProgress", "Pending"}
+        assert bounded["Next"] == "PredictorWait"
+        assert branch_b["PredictorWait"]["Next"] == "PredictorPollWait"
+        assert branch_b["PredictorPollWait"]["Next"] == "MergePredictorPollCount"
+        assert branch_b["MergePredictorPollCount"]["Next"] == (
             "WaitForPredictorTraining"
         )
 
@@ -504,11 +533,25 @@ class TestBranchBContents:
         rcmd = resolve["Parameters"]["Parameters"]["commands.$"]
         assert "list-rotation-specs" in rcmd
         assert all(c["Next"] != "BranchBFailed" for c in resolve["Catch"])
-        assert resolve["Next"] == "WaitResolveZoo"
+        # alpha-engine-config-I5687: ResolveZooSpecs dispatches through the
+        # poll-budget seed (InitResolveZooPollCount) before the first poll.
+        assert resolve["Next"] == "InitResolveZooPollCount"
+        assert branch_b["InitResolveZooPollCount"]["Next"] == "WaitResolveZoo"
         # Resolve poll → CheckResolveZooStatus: Success → ParseZooSpecs.
         check_resolve = branch_b["CheckResolveZooStatus"]
-        rnexts = {c["StringEquals"]: c["Next"] for c in check_resolve["Choices"]}
+        rnexts = {
+            c["StringEquals"]: c["Next"]
+            for c in check_resolve["Choices"] if "StringEquals" in c
+        }
         assert rnexts["Success"] == "ParseZooSpecs"
+        # The bounded And[] loop-back branch, mirroring DataPhase2/ThinkTank.
+        bounded = next(c for c in check_resolve["Choices"] if "And" in c)
+        variables = {cond.get("Variable") for cond in bounded["And"]}
+        assert "$.resolve_zoo_polls" in variables
+        assert bounded["Next"] == "ResolveZooWait"
+        assert branch_b["ResolveZooWait"]["Next"] == "ResolveZooPollWait"
+        assert branch_b["ResolveZooPollWait"]["Next"] == "MergeResolveZooPollCount"
+        assert branch_b["MergeResolveZooPollCount"]["Next"] == "WaitResolveZoo"
         # Default routes through ExtractModelZooResolveError (mirrors
         # ExtractPredictorError/ExtractSignalsEnvelopeError/ExtractRAGIngestionError)
         # — a Choice.Default transition does not populate $.model_zoo_error the
@@ -543,9 +586,13 @@ class TestBranchBContents:
         assert m["ItemSelector"]["spec_id.$"] == "$$.Map.Item.Value"
         assert m["ItemSelector"]["ec2_instance_id.$"] == "$.ec2_instance_id"
         proc = m["ItemProcessor"]["States"]
-        # The dispatch invokes the per-spec spot mode with the item's spec id.
+        # The dispatch invokes the per-spec spot script with the item's spec
+        # id. alpha-engine-config-I4442/I4497 predictor-leg cutover
+        # (2026-08-09, crucible-predictor#436+#458): spot_train.sh
+        # --model-zoo-spec <id> -> spot_train_spec_dispatch.sh --spec-id <id>.
         dcmd = proc["TrainSpecDispatch"]["Parameters"]["Parameters"]["commands.$"]
-        assert "--model-zoo-spec" in dcmd
+        assert "infrastructure/spot_train_spec_dispatch.sh" in dcmd
+        assert "--spec-id" in dcmd
         assert "$.spec_id" in dcmd
         assert "$.preflight_args" in dcmd
         # PER-ITERATION ISOLATION: both terminals are End:true Pass states
@@ -572,14 +619,21 @@ class TestBranchBContents:
         sel = branch_b["ModelZooSelect"]
         assert sel["Parameters"]["InstanceIds.$"] == "$.ec2_instance_id"
         scmd = sel["Parameters"]["Parameters"]["commands.$"]
-        assert "--model-zoo-select" in scmd
+        # alpha-engine-config-I4442/I4497 predictor-leg cutover (2026-08-09,
+        # crucible-predictor#436+#458): spot_train.sh --model-zoo-select ->
+        # spot_model_zoo_select.sh --select-only.
+        assert "infrastructure/spot_model_zoo_select.sh" in scmd
+        assert "--select-only" in scmd
         assert "$.preflight_args" in scmd
         assert any(
             c["Next"] == "PublishModelZooFailureImmediate" and "States.ALL" in c["ErrorEquals"]
             for c in sel["Catch"]
         )
         assert all(c["Next"] != "BranchBFailed" for c in sel["Catch"])
-        assert sel["Next"] == "WaitForModelZoo"
+        # alpha-engine-config-I5687: ModelZooSelect dispatches through the
+        # poll-budget seed (InitModelZooPollCount) before the first poll.
+        assert sel["Next"] == "InitModelZooPollCount"
+        assert branch_b["InitModelZooPollCount"]["Next"] == "WaitForModelZoo"
         # Select poll Catch is best-effort; routes via the alert, never BranchBFailed.
         wait = branch_b["WaitForModelZoo"]
         assert all(c["Next"] != "BranchBFailed" for c in wait["Catch"])
@@ -595,16 +649,31 @@ class TestBranchBContents:
         assert extract_select["ResultPath"] == "$.model_zoo_error"
         assert extract_select["Parameters"]["poll.$"] == "$.model_zoo_poll"
         assert extract_select["Next"] == "PublishModelZooFailureImmediate"
-        nexts = {c["StringEquals"]: c["Next"] for c in check["Choices"]}
-        assert nexts["InProgress"] == "ModelZooWait"
-        assert nexts["Pending"] == "ModelZooWait"
+        nexts = {
+            c["StringEquals"]: c["Next"] for c in check["Choices"] if "StringEquals" in c
+        }
         assert nexts["Success"] == "BranchBComplete"
-        assert branch_b["ModelZooWait"]["Next"] == "WaitForModelZoo"
-        # The alert state is itself best-effort.
+        # alpha-engine-config-I5687: bounded And[] loop-back, mirroring
+        # DataPhase2/ThinkTank.
+        bounded = next(c for c in check["Choices"] if "And" in c)
+        variables = {cond.get("Variable") for cond in bounded["And"]}
+        assert "$.model_zoo_polls" in variables
+        or_block = next(cond["Or"] for cond in bounded["And"] if "Or" in cond)
+        statuses = {c["StringEquals"] for c in or_block}
+        assert statuses == {"InProgress", "Pending"}
+        assert bounded["Next"] == "ModelZooWait"
+        assert branch_b["ModelZooWait"]["Next"] == "ModelZooPollWait"
+        assert branch_b["ModelZooPollWait"]["Next"] == "MergeModelZooPollCount"
+        assert branch_b["MergeModelZooPollCount"]["Next"] == "WaitForModelZoo"
+        # The alert state is itself best-effort. alpha-engine-config#6722:
+        # routes through MarkModelZooDegraded (sole convergence for all five
+        # model-zoo fail-open Catches) before BranchBComplete.
         alert = branch_b["PublishModelZooFailureImmediate"]
         assert alert["Resource"] == "arn:aws:states:::sns:publish"
-        assert alert["Next"] == "BranchBComplete"
-        assert all(c["Next"] == "BranchBComplete" for c in alert["Catch"])
+        assert alert["Next"] == "MarkModelZooDegraded"
+        assert all(c["Next"] == "MarkModelZooDegraded" for c in alert["Catch"])
+        assert branch_b["MarkModelZooDegraded"]["Next"] == "BranchBComplete"
+        assert branch_b["MarkModelZooDegraded"]["ResultPath"] == "$.research_degraded_local"
         assert "PREDICTOR_DEFER_TRAINING_EMAIL" in alert["Parameters"]["Message.$"]
 
     def test_model_zoo_map_iterator_no_dangling(self, branch_b):
@@ -650,21 +719,28 @@ class TestPerBranchErrorIsolation:
             assert branch_b[t]["End"] is True
 
     def test_branch_a_records_status(self, branch_a):
+        # alpha-engine-config#6722: BranchAComplete moved from a bare
+        # Result to Parameters so it can also hoist branch_a_degraded.$
+        # from the branch-local $.research_degraded_local marker.
         ok = branch_a["BranchAComplete"]
-        assert ok["Result"]["branch_a_status"] == "OK"
+        assert ok["Parameters"]["branch_a_status"] == "OK"
+        assert ok["Parameters"]["branch_a_degraded.$"] == "$.research_degraded_local"
         assert ok["ResultPath"] == "$.branch_a"
         bad = branch_a["BranchAFailed"]
         assert bad["Parameters"]["branch_a_status"] == "FAILED"
         assert bad["Parameters"]["branch_a_error.$"] == "$.error"
+        assert bad["Parameters"]["branch_a_degraded"] is False
         assert bad["ResultPath"] == "$.branch_a"
 
     def test_branch_b_records_status(self, branch_b):
         ok = branch_b["BranchBComplete"]
-        assert ok["Result"]["branch_b_status"] == "OK"
+        assert ok["Parameters"]["branch_b_status"] == "OK"
+        assert ok["Parameters"]["branch_b_degraded.$"] == "$.research_degraded_local"
         assert ok["ResultPath"] == "$.branch_b"
         bad = branch_b["BranchBFailed"]
         assert bad["Parameters"]["branch_b_status"] == "FAILED"
         assert bad["Parameters"]["branch_b_error.$"] == "$.error"
+        assert bad["Parameters"]["branch_b_degraded"] is False
 
     def test_no_branch_state_routes_to_top_level_handle_failure(
         self, parallel
@@ -724,11 +800,14 @@ class TestPerBranchErrorIsolation:
     def test_challenger_shadow_is_non_blocking(self, branch_a):
         """alpha-engine-config-I2515 Phase B: unlike SignalsEnvelope,
         ChallengerShadow is observe-only (producer leaderboard shadow feed)
-        and must never hard-fail Branch A."""
+        and must never hard-fail Branch A. alpha-engine-config#6722: the
+        Catch now routes through MarkChallengerShadowDegraded before
+        converging on CheckSkipRAGIngestion exactly as before."""
         catch_targets = [
             c["Next"] for c in branch_a["ChallengerShadow"]["Catch"]
         ]
-        assert catch_targets == ["CheckSkipRAGIngestion"]
+        assert catch_targets == ["MarkChallengerShadowDegraded"]
+        assert branch_a["MarkChallengerShadowDegraded"]["Next"] == "CheckSkipRAGIngestion"
         assert "BranchAFailed" not in catch_targets
 
     def test_dataphase2_failure_routes_to_branch_a_failed(self, branch_a):
@@ -752,7 +831,15 @@ class TestPerBranchErrorIsolation:
         §3 requires a cycle with no arm output to be recorded as a MISS rather
         than omitted. So this asserts the PROPERTY (converges to the shared
         successor without failing the branch) plus the flag, not a literal
-        target."""
+        target.
+
+        alpha-engine-config#6722: ThinkTankDegraded's flag was ITSELF dead —
+        it wrote $.thinktank_degraded, a path CheckGateDegradedNotify never
+        dereferenced anywhere in this file (the exact trap config#6715 was
+        built to catch). Repointed to the branch-local
+        $.research_degraded_local, folded into the top-level
+        $.research_predictor_degraded post-join — see
+        tests/test_sf_research_predictor_degraded_wiring.py."""
         state = branch_a["ThinkTankCoverage"]
         catch_targets = [c["Next"] for c in state["Catch"]]
         assert catch_targets == ["ThinkTankDegraded"]
@@ -761,7 +848,7 @@ class TestPerBranchErrorIsolation:
         degraded = branch_a["ThinkTankDegraded"]
         # The flag itself — a fail-open without one is what this replaced.
         assert degraded["Result"] is True
-        assert degraded["ResultPath"] == "$.thinktank_degraded"
+        assert degraded["ResultPath"] == "$.research_degraded_local"
         # ...and it converges on the same successor the success path reaches,
         # so the branch is never detoured onto an untested path.
         assert degraded["Next"] == "CheckSkipRegimeRetrospectiveEval"
@@ -908,9 +995,13 @@ class TestPostJoinAggregationAndFailure:
         assert choice["Next"] == "ExtractParallelBranchError"
         # Both OK → continue downstream. config#902 collapsed the standalone
         # DriftDetection state (drift is now bundled onto the PredictorTraining
-        # spot inside Branch B), so the join routes straight to the backtester
-        # skip-gate.
-        assert c["Default"] == "CheckSkipBacktester"
+        # spot inside Branch B). alpha-engine-config#6722 spliced
+        # CheckResearchPredictorDegraded (the branch-degraded fold) onto
+        # this edge — it still falls through unconditionally to
+        # CheckSkipBacktester on a clean run (see
+        # tests/test_sf_research_predictor_degraded_wiring.py for the fold
+        # itself).
+        assert c["Default"] == "CheckResearchPredictorDegraded"
 
     def test_extract_parallel_branch_error_routes_to_handle_failure(
         self, states
@@ -976,10 +1067,17 @@ class TestInboundRewireAndDownstreamUnchanged:
         assert (
             branch_a["RegimeRetrospectiveEval"]["Next"] == "CheckSkipDataPhase2"
         )
+        # alpha-engine-config#6722: routes through
+        # MarkRegimeRetrospectiveEvalDegraded before converging on
+        # CheckSkipDataPhase2 exactly as before.
         assert [
             c["Next"]
             for c in branch_a["RegimeRetrospectiveEval"]["Catch"]
-        ] == ["CheckSkipDataPhase2"]
+        ] == ["MarkRegimeRetrospectiveEvalDegraded"]
+        assert (
+            branch_a["MarkRegimeRetrospectiveEvalDegraded"]["Next"]
+            == "CheckSkipDataPhase2"
+        )
         c = branch_a["CheckSkipRegimeRetrospectiveEval"]
         assert c["Choices"][0]["Next"] == "CheckSkipDataPhase2"
         assert c["Default"] == "RegimeRetrospectiveEval"
@@ -1026,7 +1124,11 @@ class TestInboundRewireAndDownstreamUnchanged:
         state remains."""
         assert "DriftDetection" not in states
         assert "CheckSkipDriftDetection" not in states
-        assert states["CheckBranchOutcomes"]["Default"] == "CheckSkipBacktester"
+        # alpha-engine-config#6722: CheckResearchPredictorDegraded (the
+        # branch-degraded fold) is spliced onto this edge but still falls
+        # through unconditionally to CheckSkipBacktester on a clean run.
+        assert states["CheckBranchOutcomes"]["Default"] == "CheckResearchPredictorDegraded"
+        assert states["CheckResearchPredictorDegraded"]["Default"] == "CheckSkipBacktester"
         # config#2362 Option A: CheckSkipBacktester's Default now falls
         # through the additive CheckSkipBacktesterStageOnly gate before
         # Backtester.

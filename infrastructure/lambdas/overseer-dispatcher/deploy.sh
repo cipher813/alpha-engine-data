@@ -201,8 +201,9 @@ apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json"
 # granted — once added, this step becomes fail-loud (remove the || true).
 echo "Publishing alert_classes to S3..."
 python3 -c "
-import yaml, json, sys
+import json, sys
 try:
+    import yaml
     path = '${SCRIPT_DIR}/../../overseer/playbooks.yaml'
     with open(path) as f:
         data = yaml.safe_load(f)

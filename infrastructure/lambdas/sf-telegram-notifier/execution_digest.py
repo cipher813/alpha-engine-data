@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -285,3 +286,23 @@ def parse_run_date_from_input(raw_input: str | None) -> Optional[str]:
         return None
     run_date = payload.get("run_date")
     return str(run_date) if run_date else None
+
+
+_EXECUTION_NAME_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def parse_run_date_from_execution_name(execution_name: str | None) -> Optional[str]:
+    """Fallback ``run_date`` extraction from the execution name (nousergon-
+    data-i5289) — used when the execution input carries no ``run_date`` key
+    (e.g. a manually re-triggered execution, or an input parse failure).
+
+    Every scheduled trigger names its execution ``<prefix>-{run_date}-<epoch>``
+    (``eod-2026-08-08-1754...`` — ``daemon.py``'s ``_trigger_eod_pipeline``;
+    ``eod-backstop-2026-08-08-...`` — eod-backstop/index.py), so the first
+    ISO-8601 date substring in the name is the run_date. Absence of a match
+    returns ``None`` — never a guess.
+    """
+    if not execution_name:
+        return None
+    match = _EXECUTION_NAME_DATE_RE.search(execution_name)
+    return match.group(0) if match else None
