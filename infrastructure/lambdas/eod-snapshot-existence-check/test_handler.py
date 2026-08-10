@@ -20,10 +20,15 @@ from botocore.exceptions import ClientError
 import index
 
 
-def _s3_head(*, present: bool, error_code: str | None = None):
+def _s3_head(*, present: bool, error_code: str | None = None,
+             pnl_csv: str | None = "date,total_cash\n2026-08-07,100.0\n",
+             pnl_error_code: str | None = None):
     """An S3 client mock whose ``head_object`` either succeeds (present),
     raises a NoSuchKey/404-shaped ClientError (absent), or raises an
-    arbitrary error (probe-infra failure)."""
+    arbitrary error (probe-infra failure). ``get_object`` serves
+    ``pnl_csv`` for the eod_pnl export (default: a CSV containing the
+    2026-08-07 row most handler tests target), or raises
+    ``pnl_error_code``."""
     cli = MagicMock()
     if present:
         cli.head_object.return_value = {"ContentLength": 1234}
@@ -32,6 +37,14 @@ def _s3_head(*, present: bool, error_code: str | None = None):
         cli.head_object.side_effect = ClientError(
             {"Error": {"Code": code, "Message": "Not Found"}}, "HeadObject"
         )
+    if pnl_error_code is not None:
+        cli.get_object.side_effect = ClientError(
+            {"Error": {"Code": pnl_error_code, "Message": "err"}}, "GetObject"
+        )
+    else:
+        body = MagicMock()
+        body.read.return_value = (pnl_csv or "").encode()
+        cli.get_object.return_value = {"Body": body}
     return cli
 
 
@@ -107,7 +120,7 @@ class TestHandler:
 
         assert result == {
             "action": "noop",
-            "reason": "snapshot_present",
+            "reason": "artifacts_present",
             "trading_day": "2026-08-07",
         }
         cli.head_object.assert_called_once_with(
@@ -139,6 +152,97 @@ class TestHandler:
         """Fail-loud: an AccessDenied/throttling/etc S3 error must never
         resolve to a silent no-op or a silently-skipped page."""
         cli = _s3_head(present=False, error_code="AccessDenied")
+        with patch("index.datetime", self._frozen_now("2026-08-07T20:30:00")), \
+             patch("index.is_trading_day", return_value=True), \
+             patch("index.boto3.client", return_value=cli):
+            with pytest.raises(ClientError):
+                index.handler({}, None)
+
+
+# ── eod_pnl NAV-row check (alpha-engine-config-I6733, §4.1 NAV continuity) ──
+
+
+_CSV_WITH_ROW = "date,total_cash\n2026-08-06,99.0\n2026-08-07,100.0\n"
+_CSV_WITHOUT_ROW = "date,total_cash\n2026-08-06,99.0\n"
+
+
+class TestEodPnlRowState:
+    def test_present_when_row_exists(self):
+        cli = _s3_head(present=True, pnl_csv=_CSV_WITH_ROW)
+        assert index._eod_pnl_row_state(cli, "bucket", "2026-08-07") == "PRESENT"
+
+    def test_row_absent_when_day_missing(self):
+        cli = _s3_head(present=True, pnl_csv=_CSV_WITHOUT_ROW)
+        assert index._eod_pnl_row_state(cli, "bucket", "2026-08-07") == "ROW_ABSENT"
+
+    def test_csv_absent_on_nosuchkey(self):
+        cli = _s3_head(present=True, pnl_error_code="NoSuchKey")
+        assert index._eod_pnl_row_state(cli, "bucket", "2026-08-07") == "CSV_ABSENT"
+
+    def test_other_s3_error_raises(self):
+        cli = _s3_head(present=True, pnl_error_code="AccessDenied")
+        with pytest.raises(ClientError):
+            index._eod_pnl_row_state(cli, "bucket", "2026-08-07")
+
+    def test_csv_without_date_column_raises_not_certifies(self):
+        cli = _s3_head(present=True, pnl_csv="nav,cash\n1,2\n")
+        with pytest.raises(ValueError, match="no 'date' column"):
+            index._eod_pnl_row_state(cli, "bucket", "2026-08-07")
+
+    def test_datetime_formatted_date_still_matches(self):
+        cli = _s3_head(present=True, pnl_csv="date,x\n2026-08-07 00:00:00,1\n")
+        assert index._eod_pnl_row_state(cli, "bucket", "2026-08-07") == "PRESENT"
+
+
+class TestPageAbsentEodPnlRow:
+    def test_row_absent_message_names_backfill_and_severity_error(self):
+        with patch("index.alerts.publish") as mock_publish:
+            mock_publish.return_value = MagicMock(sns=MagicMock(ok=True))
+            index._page_absent_eod_pnl_row("2026-08-07", "ROW_ABSENT")
+        kwargs = mock_publish.call_args.kwargs
+        assert kwargs["severity"] == "error"
+        assert "NAV continuity" in kwargs["message"]
+        assert "backfill_eod_pnl.py --date 2026-08-07" in kwargs["message"]
+        assert "alpha-engine-config-I6733" in kwargs["message"]
+
+    def test_csv_absent_message_names_the_missing_export(self):
+        with patch("index.alerts.publish") as mock_publish:
+            mock_publish.return_value = MagicMock(sns=MagicMock(ok=True))
+            index._page_absent_eod_pnl_row("2026-08-07", "CSV_ABSENT")
+        assert "MISSING" in mock_publish.call_args.kwargs["message"]
+
+
+class TestHandlerEodPnl:
+    _frozen_now = TestHandler._frozen_now
+
+    def test_pages_when_row_absent_even_with_snapshot_present(self):
+        """The closes-when demonstration (I6733): a synthetic missing-row
+        trading day takes the PAGE path while the snapshot check stays
+        quiet — the two artifacts page independently."""
+        cli = _s3_head(present=True, pnl_csv=_CSV_WITHOUT_ROW)
+        with patch("index.datetime", self._frozen_now("2026-08-07T20:30:00")), \
+             patch("index.is_trading_day", return_value=True), \
+             patch("index.boto3.client", return_value=cli), \
+             patch("index._page_absent_eod_pnl_row") as mock_page:
+            result = index.handler({}, None)
+        assert result["action"] == "paged"
+        assert result["reason"] == "eod_pnl_row_absent"
+        mock_page.assert_called_once_with("2026-08-07", "ROW_ABSENT")
+
+    def test_pages_both_when_snapshot_and_row_absent(self):
+        cli = _s3_head(present=False, error_code="NoSuchKey", pnl_error_code="NoSuchKey")
+        with patch("index.datetime", self._frozen_now("2026-08-07T20:30:00")), \
+             patch("index.is_trading_day", return_value=True), \
+             patch("index.boto3.client", return_value=cli), \
+             patch("index._page_absent_snapshot") as mock_snap, \
+             patch("index._page_absent_eod_pnl_row") as mock_pnl:
+            result = index.handler({}, None)
+        assert result["reason"] == "snapshot_absent+eod_pnl_csv_absent"
+        mock_snap.assert_called_once()
+        mock_pnl.assert_called_once_with("2026-08-07", "CSV_ABSENT")
+
+    def test_raises_on_pnl_probe_infra_failure(self):
+        cli = _s3_head(present=True, pnl_error_code="AccessDenied")
         with patch("index.datetime", self._frozen_now("2026-08-07T20:30:00")), \
              patch("index.is_trading_day", return_value=True), \
              patch("index.boto3.client", return_value=cli):
