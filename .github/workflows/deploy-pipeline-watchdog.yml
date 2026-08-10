@@ -34,6 +34,12 @@ on:
     paths:
       - 'infrastructure/lambdas/pipeline-watchdog/**'
       - '.github/workflows/deploy-pipeline-watchdog.yml'
+      # deploy.sh packages this file flat into the zip and index.py imports
+      # its slot derivation (config#6738). Without it here, a fix to the
+      # deadman's classification logic would merge and never reach the
+      # Lambda — the "merged fix that never went live" shape this whole
+      # workflow was created to close, one level down.
+      - 'scripts/weekly_sf_silence_deadman.py'
   workflow_dispatch:
 
 concurrency:
@@ -55,6 +61,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: alpha-engine-data
+          # 2 commits so the IAM-parity step below can diff this merge against
+          # its parent. Nothing else here needs history.
+          fetch-depth: 2
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
@@ -70,6 +79,26 @@ jobs:
       - name: Deploy pipeline-watchdog (code-only)
         working-directory: alpha-engine-data
         run: bash infrastructure/lambdas/pipeline-watchdog/deploy.sh
+
+      # The merge emits the exact operator command whenever it ships code whose
+      # IAM this workflow is NOT allowed to apply (config#6738,
+      # pull-request-policy §4.2 form 3). github-actions-lambda-deploy has no
+      # iam:PutRolePolicy by design — the single-writer rule adopted after 4
+      # IAM-clobber incidents (nous-ergon-ops/infrastructure/iam/README.md) —
+      # so a changed iam-policy.json ships as CODE ONLY and the grant lags.
+      # Deliberately does not fail the job: the code deploy really did succeed,
+      # and a one-shot red is not a standing detector. The two standing
+      # detectors are check-drift.py (every PR + daily 09:35 UTC) and the
+      # Lambda's own daily DEGRADED page, which names this same command.
+      - name: Emit operator IAM-apply command if iam-policy.json changed
+        if: always()
+        working-directory: alpha-engine-data
+        run: |
+          CHANGED=$(git diff --name-only HEAD^ HEAD -- infrastructure/lambdas/pipeline-watchdog/iam-policy.json || true)
+          if [ -z "${CHANGED}" ]; then echo "iam-policy.json unchanged in this merge — no operator step."; exit 0; fi
+          CMD="AWS_PROFILE=ne-admin bash infrastructure/lambdas/pipeline-watchdog/deploy.sh --apply-iam"
+          echo "::warning title=Operator IAM apply required::${CMD}"
+          { echo "### Operator step required"; echo ""; echo "\`infrastructure/lambdas/pipeline-watchdog/iam-policy.json\` changed in this merge, and this workflow's OIDC role cannot apply IAM (single-writer rule). Run from a checkout of \`nousergon-data\`:"; echo ""; echo '```'; echo "${CMD}"; echo '```'; echo ""; echo "Until it runs: \`nous-ergon-ops/infrastructure/iam/check-drift.py --lambdas-root ../nousergon-data/infrastructure/lambdas\` stays red (daily 09:35 UTC), and the weekly-silence deadman pages \`DEGRADED: cannot read /alpha-engine/weekly-sf/exercise-cadence\` on every firing."; } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Report deployed version
         working-directory: alpha-engine-data

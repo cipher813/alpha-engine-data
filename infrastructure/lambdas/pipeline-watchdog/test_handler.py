@@ -9,6 +9,7 @@ dedup wiring, fail-loud) per the ``feedback_no_silent_fails`` discipline.
 
 from __future__ import annotations
 
+import json
 import sys
 import types
 from datetime import date, datetime, timedelta, timezone
@@ -24,6 +25,9 @@ _lib_pkg = types.ModuleType("nousergon_lib")
 _tc_mod = types.ModuleType("nousergon_lib.trading_calendar")
 _tc_mod.last_closed_trading_day = MagicMock()
 _tc_mod.previous_trading_day = MagicMock()
+# The weekly-silence deadman's slot derivation (config#6738) calls these two.
+_tc_mod.is_trading_day = MagicMock()
+_tc_mod.next_trading_day = MagicMock()
 _alerts_mod = types.ModuleType("nousergon_lib.alerts")
 _alerts_mod.publish = MagicMock()
 _lib_pkg.trading_calendar = _tc_mod
@@ -63,11 +67,30 @@ def _reset_lib_mocks():
     _tc_mod.last_closed_trading_day.side_effect = None
     _tc_mod.previous_trading_day.reset_mock()
     _tc_mod.previous_trading_day.side_effect = None
+    # Weekday-only calendar default for the silence deadman's slot derivation.
+    # Every date these tests pin is in Aug 2026, which carries no NYSE holiday,
+    # so weekday-only is exact for them; a test needing a holiday overrides.
+    _tc_mod.is_trading_day.reset_mock()
+    _tc_mod.is_trading_day.side_effect = _weekday_only_is_trading_day
+    _tc_mod.next_trading_day.reset_mock()
+    _tc_mod.next_trading_day.side_effect = _weekday_only_next_trading_day
     _alerts_mod.publish.reset_mock()
     _alerts_mod.publish.side_effect = None
     _alerts_mod.publish.return_value = _make_publish_result(sns_ok=True, telegram_ok=True)
     _fd_mod.notify_via_flow_doctor.reset_mock()
     _fd_mod.notify_via_flow_doctor.return_value = True
+
+
+def _weekday_only_is_trading_day(d: date) -> bool:
+    """Mon-Fri calendar stand-in for nousergon_lib.trading_calendar."""
+    return d.weekday() < 5
+
+
+def _weekday_only_next_trading_day(d: date) -> date:
+    nxt = d + timedelta(days=1)
+    while nxt.weekday() >= 5:
+        nxt += timedelta(days=1)
+    return nxt
 
 
 def _make_publish_result(*, sns_ok: bool, telegram_ok: bool, dedup_skipped: bool = False):
@@ -95,6 +118,11 @@ def _make_sfn_client(executions_by_arn: dict) -> MagicMock:
         return {"executions": execs, "nextToken": None}
 
     client.list_executions.side_effect = _list_executions
+    # The same mock stands in for the SSM client in handler-level tests (they
+    # patch index.boto3 wholesale, so every boto3.client(...) returns this),
+    # so give it a valid declared cadence — otherwise every handler test would
+    # exercise the deadman's degraded path instead of its real one.
+    client.get_parameter.return_value = {"Parameter": {"Value": "daily"}}
     return client
 
 
@@ -320,6 +348,7 @@ def test_handler_passes_the_cadence_role_filter_for_the_saturday_check():
     _tc_mod.last_closed_trading_day.side_effect = [
         date(2026, 5, 29),
         date(2026, 5, 29),
+        date(2026, 5, 29),  # failed-day checks' target lookup (config#6732)
     ]
     # _eod_window_seconds runs even on a skipped EOD check (the window is an
     # argument), and the autouse fixture resets side_effect but not
@@ -469,6 +498,7 @@ def test_handler_on_trading_day_checks_weekday_and_eod_skips_saturday():
         date(2026, 5, 26),  # pre-open call at now
         date(2026, 5, 27),  # synthetic 22:00 UTC call → returns today
         date(2026, 5, 26),  # preopen-buffer canary's target-day lookup
+        date(2026, 5, 26),  # failed-day checks' target lookup (config#6732)
     ]
     # EOD window calc: previous_trading_day(2026-05-27) → 2026-05-26 (Tue)
     _tc_mod.previous_trading_day.return_value = date(2026, 5, 26)
@@ -503,6 +533,7 @@ def test_handler_on_saturday_skips_weekday_and_eod():
     _tc_mod.last_closed_trading_day.side_effect = [
         date(2026, 5, 29),  # Friday close
         date(2026, 5, 29),  # synthetic post-close still Friday
+        date(2026, 5, 29),  # failed-day checks' target lookup (config#6732)
     ]
     now = _frozen_now(2026, 5, 30, 14, 0)
     fake_client = _make_sfn_client({})
@@ -528,6 +559,7 @@ def test_handler_on_sunday_checks_saturday_sf_alone():
     _tc_mod.last_closed_trading_day.side_effect = [
         date(2026, 5, 29),  # Friday close
         date(2026, 5, 29),  # synthetic post-close still Friday (Sunday is not a session)
+        date(2026, 5, 29),  # failed-day checks' target lookup (config#6732)
     ]
     now = _frozen_now(2026, 5, 31, 14, 0)
     fake_client = _make_sfn_client({})  # no Saturday SF executions in last 7d → alert
@@ -647,6 +679,7 @@ def test_handler_post_holiday_eod_does_not_false_alert():
         date(2026, 5, 22),  # at 14:00 UTC pre-open, last close was Fri (Mon was holiday)
         date(2026, 5, 26),  # synthetic 22:00 UTC post-close, today is the session
         date(2026, 5, 22),  # preopen-buffer canary's target-day lookup
+        date(2026, 5, 22),  # failed-day checks' target lookup (config#6732)
     ]
     # EOD prev_trading_day → Fri 5/22
     _tc_mod.previous_trading_day.return_value = date(2026, 5, 22)
@@ -690,6 +723,7 @@ def test_handler_post_holiday_eod_alerts_when_friday_eod_missing():
         date(2026, 5, 22),
         date(2026, 5, 26),
         date(2026, 5, 22),  # preopen-buffer canary's target-day lookup
+        date(2026, 5, 22),  # failed-day checks' target lookup (config#6732)
     ]
     _tc_mod.previous_trading_day.return_value = date(2026, 5, 22)
     now = _frozen_now(2026, 5, 26, 14, 0)
@@ -998,6 +1032,7 @@ def test_handler_includes_preopen_buffer_check_in_summary():
         date(2026, 6, 2),  # pre-open call at now
         date(2026, 6, 3),  # synthetic 22:00 UTC call → today
         date(2026, 6, 2),  # preopen-buffer canary's target-day lookup
+        date(2026, 6, 2),  # failed-day checks' target lookup (config#6732)
     ]
     _tc_mod.previous_trading_day.return_value = date(2026, 6, 2)
     now = datetime(2026, 6, 3, 14, 0, tzinfo=timezone.utc)  # Wednesday
@@ -1023,3 +1058,423 @@ def test_handler_includes_preopen_buffer_check_in_summary():
     # same WKD_ARN rows for the canary's SUCCEEDED-only query too, but
     # those rows have no "stopDate" key → no data → deferred, not alerted.
     assert pbc["alert_emitted"] is False
+
+
+# ── _check_failed_day — prior-day failed-run check (config#6732) ─────────
+#
+# sf-pipeline-policy §4.1: independent of the SF's own notifier, sensitive
+# to started-but-never-succeeded. Zero-execution days belong to the
+# liveness checks; DEGRADED-marker days are Option-A visible degrades and
+# must not double-page; everything else without a SUCCEEDED execution
+# pages at severity=error (marker UNKNOWN ≠ pass).
+
+import json as _json
+
+
+class _FakeNoSuchKey(Exception):
+    def __init__(self):
+        super().__init__("NoSuchKey")
+        self.response = {"Error": {"Code": "NoSuchKey"}}
+
+
+def _make_status_aware_sfn_client(rows_by_status: dict) -> MagicMock:
+    """Unlike _make_sfn_client, honors statusFilter — required here because
+    _statuses_for_day's SUCCEEDED/FAILED distinction IS the check."""
+    client = MagicMock()
+
+    def _list_executions(**kwargs):
+        rows = rows_by_status.get(kwargs.get("statusFilter"), [])
+        return {"executions": rows, "nextToken": None}
+
+    client.list_executions.side_effect = _list_executions
+    return client
+
+
+def _make_s3_marker_client(*, marker: dict | None = None, error: Exception | None = None) -> MagicMock:
+    s3 = MagicMock()
+    if error is not None:
+        s3.get_object.side_effect = error
+    else:
+        body = MagicMock()
+        body.read.return_value = _json.dumps(marker).encode()
+        s3.get_object.return_value = {"Body": body}
+    return s3
+
+
+_TARGET = date(2026, 8, 5)
+_TARGET_START = datetime(2026, 8, 5, 12, 20, tzinfo=timezone.utc)  # 05:20 PT
+
+
+def test_failed_day_pages_when_all_executions_failed_and_no_marker():
+    client = _make_status_aware_sfn_client({"FAILED": [{"startDate": _TARGET_START}]})
+    s3 = _make_s3_marker_client(error=_FakeNoSuchKey())
+    result = index._check_failed_day(
+        sf_label="Weekday SF", sf_arn=WKD_ARN,
+        pipeline_name="ne-preopen-trading-pipeline",
+        target_date=_TARGET, client=client, s3_client=s3,
+    )
+    assert result.alert_emitted is True
+    assert result.succeeded_on_day == 0
+    assert result.marker_status == "ABSENT"
+    assert _alerts_mod.publish.call_args.kwargs["severity"] == "error"
+    msg = _alerts_mod.publish.call_args.kwargs["message"]
+    assert "none SUCCEEDED" in msg
+    assert "no completion marker" in msg
+
+
+def test_failed_day_quiet_on_degraded_marker_option_a():
+    """Option-A (config#6692): a deliberate degraded terminal ends FAILED
+    with a DEGRADED marker — status-keyed watchers engaged; no double-page."""
+    client = _make_status_aware_sfn_client({"FAILED": [{"startDate": _TARGET_START}]})
+    s3 = _make_s3_marker_client(marker={"status": "DEGRADED"})
+    result = index._check_failed_day(
+        sf_label="Weekday SF", sf_arn=WKD_ARN,
+        pipeline_name="ne-preopen-trading-pipeline",
+        target_date=_TARGET, client=client, s3_client=s3,
+    )
+    assert result.alert_emitted is False
+    assert result.marker_status == "DEGRADED"
+    _alerts_mod.publish.assert_not_called()
+
+
+def test_failed_day_quiet_when_day_succeeded_and_never_reads_marker():
+    client = _make_status_aware_sfn_client({
+        "SUCCEEDED": [{"startDate": _TARGET_START}],
+        "FAILED": [{"startDate": _TARGET_START + timedelta(minutes=5)}],
+    })
+    s3 = MagicMock()
+    result = index._check_failed_day(
+        sf_label="Weekday SF", sf_arn=WKD_ARN,
+        pipeline_name="ne-preopen-trading-pipeline",
+        target_date=_TARGET, client=client, s3_client=s3,
+    )
+    assert result.alert_emitted is False
+    assert result.succeeded_on_day == 1
+    s3.get_object.assert_not_called()
+    _alerts_mod.publish.assert_not_called()
+
+
+def test_failed_day_skips_zero_execution_day_never_fired_is_livenesss_case():
+    client = _make_status_aware_sfn_client({})
+    result = index._check_failed_day(
+        sf_label="EOD SF", sf_arn=EOD_ARN,
+        pipeline_name="ne-postclose-trading-pipeline",
+        target_date=_TARGET, client=client, s3_client=MagicMock(),
+    )
+    assert result.alert_emitted is False
+    assert result.executions_on_day == 0
+    assert "liveness" in result.skip_reason
+    _alerts_mod.publish.assert_not_called()
+
+
+def test_failed_day_unreadable_marker_pages_unknown_is_not_pass():
+    client = _make_status_aware_sfn_client({"TIMED_OUT": [{"startDate": _TARGET_START}]})
+    s3 = _make_s3_marker_client(error=RuntimeError("s3 5xx"))
+    result = index._check_failed_day(
+        sf_label="EOD SF", sf_arn=EOD_ARN,
+        pipeline_name="ne-postclose-trading-pipeline",
+        target_date=_TARGET, client=client, s3_client=s3,
+    )
+    assert result.alert_emitted is True
+    assert result.marker_status == "UNREADABLE"
+    assert _alerts_mod.publish.call_args.kwargs["severity"] == "error"
+
+
+def test_failed_day_non_degraded_marker_status_still_pages():
+    """A marker whose status is not DEGRADED on a day with zero SUCCEEDED
+    executions is contradictory state — page, do not trust it."""
+    client = _make_status_aware_sfn_client({"ABORTED": [{"startDate": _TARGET_START}]})
+    s3 = _make_s3_marker_client(marker={"status": "SUCCESS"})
+    result = index._check_failed_day(
+        sf_label="Weekday SF", sf_arn=WKD_ARN,
+        pipeline_name="ne-preopen-trading-pipeline",
+        target_date=_TARGET, client=client, s3_client=s3,
+    )
+    assert result.alert_emitted is True
+    assert result.marker_status == "SUCCESS"
+
+
+def test_failed_day_running_execution_warns_not_errors():
+    client = _make_status_aware_sfn_client({
+        "RUNNING": [{"startDate": _TARGET_START}],
+        "FAILED": [{"startDate": _TARGET_START}],
+    })
+    result = index._check_failed_day(
+        sf_label="EOD SF", sf_arn=EOD_ARN,
+        pipeline_name="ne-postclose-trading-pipeline",
+        target_date=_TARGET, client=client, s3_client=MagicMock(),
+    )
+    assert result.alert_emitted is True
+    assert _alerts_mod.publish.call_args.kwargs["severity"] == "warning"
+
+
+def test_failed_day_ignores_executions_from_other_days():
+    """A FAILED execution from the day AFTER the target (e.g. today's
+    in-flight morning) must not condemn the target day."""
+    next_day_start = datetime(2026, 8, 6, 12, 20, tzinfo=timezone.utc)
+    client = _make_status_aware_sfn_client({
+        "FAILED": [{"startDate": next_day_start}, {"startDate": _TARGET_START}],
+        "SUCCEEDED": [{"startDate": _TARGET_START + timedelta(minutes=40)}],
+    })
+    s3 = MagicMock()
+    result = index._check_failed_day(
+        sf_label="Weekday SF", sf_arn=WKD_ARN,
+        pipeline_name="ne-preopen-trading-pipeline",
+        target_date=_TARGET, client=client, s3_client=s3,
+    )
+    assert result.alert_emitted is False
+    assert result.succeeded_on_day == 1
+    assert result.executions_on_day == 2  # target-day rows only
+
+
+# ── Weekly-SF silence deadman (alpha-engine-config#6738) ─────────────────
+#
+# Dates are pinned in August 2026 (no NYSE holiday that week) so the
+# weekday-only calendar stand-in installed by the autouse fixture is exact:
+#   Mon 08-03  Tue 08-04  Wed 08-05  Thu 08-06  Fri 08-07  Sat 08-08  Sun 08-09
+# 2026-08-05/06 are the two real days postclose never fired, which is the
+# outage this check exists to have caught.
+
+
+_WEEKLY_EXEC_ARN_PREFIX = (
+    "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:"
+)
+
+
+def _make_deadman_client(rows, cadence="daily"):
+    """Stepfunctions+SSM stand-in for the silence deadman's live fetch.
+
+    ``rows`` — list of ``(day, role, status, duration_seconds)``. Each becomes
+    one weekly-SF execution whose ``pipeline_role`` is readable ONLY via
+    ``describe_execution`` (exactly like production: neither launch path
+    passes an explicit execution Name, so the role never appears on the
+    list-executions summary).
+    """
+    execs = []
+    inputs = {}
+    for i, (day, role, status, duration) in enumerate(rows):
+        arn = f"{_WEEKLY_EXEC_ARN_PREFIX}x{i}"
+        start = datetime(day.year, day.month, day.day, 20, 30, tzinfo=timezone.utc)
+        execs.append({
+            "name": f"x{i}",
+            "executionArn": arn,
+            "status": status,
+            "startDate": start,
+            "stopDate": start + timedelta(seconds=duration),
+        })
+        inputs[arn] = json.dumps({"pipeline_role": role} if role else {})
+
+    client = MagicMock()
+    client.list_executions.side_effect = lambda **kw: {
+        "executions": execs if kw.get("stateMachineArn") == SAT_ARN else []
+    }
+    client.describe_execution.side_effect = lambda executionArn: {
+        "input": inputs.get(executionArn, "{}")
+    }
+    client.get_parameter.return_value = {"Parameter": {"Value": cadence}}
+    return client
+
+
+def _exercise(day, status="SUCCEEDED", duration=1800):
+    return (day, "exercise", status, duration)
+
+
+def test_silence_never_evaluates_a_slot_that_is_not_yet_due():
+    """THE false-positive trap. The watchdog fires 14:00 UTC; today's
+    exercise slot is chained off today's ~20:00 UTC postclose, so evaluating
+    "today" would page every single trading day. The evaluation date is
+    yesterday and today's slot must not appear anywhere in the verdict."""
+    now = datetime(2026, 8, 7, 14, 0, tzinfo=timezone.utc)  # Friday
+    client = _make_deadman_client([])
+    result = index._check_weekly_silence(
+        now_utc=now, client=client, ssm_client=client
+    )
+    assert result.evaluation_date == "2026-08-06"
+    assert "2026-08-07:exercise" not in result.critical_slots
+    assert "2026-08-07:exercise" not in result.gated_off_slots
+    # Mon-Thu of that week, and nothing later.
+    assert result.critical_slots == (
+        "2026-08-03:exercise",
+        "2026-08-04:exercise",
+        "2026-08-05:exercise",
+        "2026-08-06:exercise",
+    )
+
+
+def test_silence_pages_only_the_days_with_no_execution():
+    """The real 2026-08-05/06 shape: Mon+Tue chained fine, Wed+Thu produced
+    nothing at all."""
+    now = datetime(2026, 8, 7, 14, 0, tzinfo=timezone.utc)
+    client = _make_deadman_client([
+        _exercise(date(2026, 8, 3)),
+        _exercise(date(2026, 8, 4)),
+    ])
+    result = index._check_weekly_silence(
+        now_utc=now, client=client, ssm_client=client
+    )
+    assert result.checked is True
+    assert result.cadence == "daily"
+    assert result.ok == 2
+    assert result.critical == 2
+    assert result.critical_slots == (
+        "2026-08-05:exercise",
+        "2026-08-06:exercise",
+    )
+    assert result.alerts_emitted == 2
+
+    keys = [c.kwargs["dedup_key"] for c in _alerts_mod.publish.call_args_list]
+    assert keys == [
+        "pipeline-watchdog-weekly-silence-exercise-2026-08-05",
+        "pipeline-watchdog-weekly-silence-exercise-2026-08-06",
+    ]
+    for call in _alerts_mod.publish.call_args_list:
+        # Slot-scoped key + a window LONGER than the 5-day look-back: one page
+        # per silent slot, never a re-page on each of the next four firings.
+        assert call.kwargs["dedup_window_min"] == index.SILENCE_DEDUP_WINDOW_MIN
+        assert call.kwargs["dedup_window_min"] > index.SILENCE_WINDOW_DAYS * 24 * 60
+        assert call.kwargs["severity"] == "error"
+        assert call.kwargs["sns_topic_arn"] == index.WATCHDOG_SNS_TOPIC_ARN
+
+
+def test_silence_gated_off_by_declaration_is_not_reported_as_silence():
+    """§2.6's load-bearing distinction: with the declaration set to
+    weekly-only, the very same zero executions are GATED_OFF, not CRITICAL,
+    and nothing pages."""
+    now = datetime(2026, 8, 7, 14, 0, tzinfo=timezone.utc)
+    client = _make_deadman_client([], cadence="weekly-only")
+    result = index._check_weekly_silence(
+        now_utc=now, client=client, ssm_client=client
+    )
+    assert result.cadence == "weekly-only"
+    assert result.critical == 0
+    assert result.critical_slots == ()
+    assert result.gated_off == 4
+    assert result.gated_off_slots == (
+        "2026-08-03:exercise",
+        "2026-08-04:exercise",
+        "2026-08-05:exercise",
+        "2026-08-06:exercise",
+    )
+    assert result.alerts_emitted == 0
+    _alerts_mod.publish.assert_not_called()
+
+
+def test_silence_expects_the_weekly_run_the_day_after_the_last_session():
+    """Sunday firing. The Saturday cron self-gates true on the day AFTER the
+    week's last session, so the weekly slot lands on Sat 08-08 — and every
+    exercise slot that week is satisfied."""
+    now = datetime(2026, 8, 9, 14, 0, tzinfo=timezone.utc)  # Sunday
+    client = _make_deadman_client([
+        _exercise(date(2026, 8, 3)),
+        _exercise(date(2026, 8, 4)),
+        _exercise(date(2026, 8, 5)),
+        _exercise(date(2026, 8, 6)),
+        _exercise(date(2026, 8, 7)),
+    ])
+    result = index._check_weekly_silence(
+        now_utc=now, client=client, ssm_client=client
+    )
+    assert result.evaluation_date == "2026-08-08"
+    assert result.slots_evaluated == 6  # 5 exercise + 1 weekly
+    assert result.critical_slots == ("2026-08-08:weekly",)
+
+
+def test_silence_treats_a_run_day_gate_noop_as_no_weekly_run():
+    """A SUCCEEDED weekly-role execution finishing in 2s is
+    WeeklyRunDayGateChoice's designed skip, not a run. Counting it would hide
+    a genuinely dead cron — the gotcha the CLI is built around, asserted here
+    through the Lambda entry point too."""
+    now = datetime(2026, 8, 9, 14, 0, tzinfo=timezone.utc)
+    weekly_noop = (date(2026, 8, 8), "weekly", "SUCCEEDED", 2)
+    exercises = [_exercise(date(2026, 8, d)) for d in (3, 4, 5, 6, 7)]
+
+    noop_result = index._check_weekly_silence(
+        now_utc=now,
+        client=_make_deadman_client(exercises + [weekly_noop]),
+        ssm_client=_make_deadman_client(exercises + [weekly_noop]),
+    )
+    assert noop_result.critical_slots == ("2026-08-08:weekly",)
+    assert "no-op" in dict(
+        (c.kwargs["dedup_key"], c.kwargs["message"])
+        for c in _alerts_mod.publish.call_args_list
+    )["pipeline-watchdog-weekly-silence-weekly-2026-08-08"]
+
+    _alerts_mod.publish.reset_mock()
+    real_weekly = (date(2026, 8, 8), "weekly", "SUCCEEDED", 3600)
+    ok_result = index._check_weekly_silence(
+        now_utc=now,
+        client=_make_deadman_client(exercises + [real_weekly]),
+        ssm_client=_make_deadman_client(exercises + [real_weekly]),
+    )
+    assert ok_result.critical == 0
+    assert ok_result.ok == 6
+    _alerts_mod.publish.assert_not_called()
+
+
+def test_silence_reports_unknown_and_pages_when_the_declaration_is_unreadable():
+    """An unreadable cadence declaration is never rendered as 'no silent
+    slots'. It pages with the exact operator command and reports checked=False
+    — and does NOT raise, so the five checks that already published keep their
+    summary."""
+    now = datetime(2026, 8, 7, 14, 0, tzinfo=timezone.utc)
+    ssm = MagicMock()
+    ssm.get_parameter.side_effect = RuntimeError(
+        "AccessDeniedException: not authorized to perform ssm:GetParameter"
+    )
+    sfn = _make_deadman_client([])
+
+    result = index._check_weekly_silence(now_utc=now, client=sfn, ssm_client=ssm)
+
+    assert result.checked is False
+    assert result.critical == 0
+    assert result.ok == 0
+    assert index.CADENCE_SSM_PARAM in result.degraded_reason
+    assert result.alerts_emitted == 1
+    # Never silently downgraded to the local manifest, and never a fetch.
+    sfn.list_executions.assert_not_called()
+    _alerts_mod.publish.assert_called_once()
+    kwargs = _alerts_mod.publish.call_args.kwargs
+    assert kwargs["severity"] == "error"
+    assert "UNKNOWN" in kwargs["message"]
+    assert "--apply-iam" in kwargs["message"]
+    assert index.CADENCE_SSM_PARAM in kwargs["message"]
+
+
+def test_silence_reads_the_cadence_from_ssm_not_the_repo_manifest():
+    now = datetime(2026, 8, 7, 14, 0, tzinfo=timezone.utc)
+    client = _make_deadman_client([], cadence="off")
+    result = index._check_weekly_silence(
+        now_utc=now, client=client, ssm_client=client
+    )
+    client.get_parameter.assert_called_once_with(Name=index.CADENCE_SSM_PARAM)
+    assert result.cadence == "off"
+    assert result.critical == 0
+
+
+def test_handler_includes_weekly_silence_check_in_summary():
+    """Friday 2026-08-07 14:00 UTC — the check runs on every calendar day, so
+    the summary always carries its verdict."""
+    _tc_mod.last_closed_trading_day.side_effect = [
+        date(2026, 8, 6),   # pre-open call at now
+        date(2026, 8, 7),   # synthetic post-close → today is a session
+        date(2026, 8, 6),   # preopen-buffer canary target
+        date(2026, 8, 6),   # failed-day checks target
+    ]
+    _tc_mod.previous_trading_day.return_value = date(2026, 8, 6)
+    now = datetime(2026, 8, 7, 14, 0, tzinfo=timezone.utc)
+
+    with patch("index.datetime") as mock_dt, patch("index.boto3") as mock_boto3:
+        mock_dt.now.return_value = now
+        mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
+        mock_dt.fromtimestamp = datetime.fromtimestamp
+        mock_boto3.client.return_value = _make_sfn_client({})
+
+        summary = index.handler({}, None)
+
+    silence = summary["weekly_silence_check"]
+    assert silence["checked"] is True
+    assert silence["cadence"] == "daily"
+    assert silence["evaluation_date"] == "2026-08-06"
+    assert silence["degraded_reason"] is None
+    assert silence["critical"] == 4  # Mon-Thu, no executions in the mock
+    assert silence["critical_slots"][-1] == "2026-08-06:exercise"

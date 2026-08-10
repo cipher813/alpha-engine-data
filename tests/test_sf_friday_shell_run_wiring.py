@@ -132,6 +132,16 @@ _EXPECTED_SKIPS = {
     "skip_predictor_backtest",
     "skip_portfolio_optimizer_backtest",
     "skip_parity",
+    # alpha-engine-config#6030: the Parity state became ParityParallel
+    # (three fail-open branches, each with its own in-branch gate) + the
+    # PitParityCompare join. skip_parity above is retained as the
+    # whole-family gate; the four fine-grained flags below are what
+    # scripts/weekly_sf_rerun.py emits so a single failed branch reruns
+    # alone.
+    "skip_pit_parity_lookahead",
+    "skip_pit_parity_walkforward",
+    "skip_parity_replay",
+    "skip_pit_parity_compare",
     "skip_evaluator",
     "skip_post_eval",
     # config#6054: per-stage split of the post-eval tail — skip_post_eval
@@ -199,9 +209,27 @@ _SPOT_STATES = {
         "bash infrastructure/spot_portfolio_optimizer_backtest.sh",
         "/var/log/portfolio-optimizer.log",
     ),
-    "Parity": (
-        "bash infrastructure/spot_parity.sh",
-        "/var/log/parity.log",
+    # alpha-engine-config#6030: the bundled Parity spot became four
+    # independent stages — three ParityParallel branches + the compare join.
+    # Like DataPhase2's I5759 entry, the four have NO pre-keystone form:
+    # their baseline was captured at the split commit, so the pin they
+    # carry is "not drifted since the split", not "identical to the
+    # pre-split Saturday path" (that deliberate change IS the split).
+    "PitParityLookahead": (
+        "bash infrastructure/spot_pit_lookahead.sh",
+        "/var/log/pit-lookahead.log",
+    ),
+    "PitParityWalkforward": (
+        "bash infrastructure/spot_pit_walkforward.sh",
+        "/var/log/pit-walkforward.log",
+    ),
+    "ParityReplay": (
+        "bash infrastructure/spot_parity_replay.sh",
+        "/var/log/parity-replay.log",
+    ),
+    "PitParityCompare": (
+        "bash infrastructure/spot_parity_compare.sh",
+        "/var/log/parity-compare.log",
     ),
     "Evaluator": (
         "bash infrastructure/spot_evaluator.sh",
@@ -795,11 +823,13 @@ class TestByteIdenticalAbsentPath:
     def _state(self, sf: dict, name: str) -> dict:
         if name in sf["States"]:
             return sf["States"][name]
-        # Parallel-branch states (Research/DataPhase2/PredictorTraining).
-        par = sf["States"]["ResearchPredictorParallel"]
-        for br in par["Branches"]:
-            if name in br["States"]:
-                return br["States"][name]
+        # Parallel-branch states (Research/DataPhase2/PredictorTraining,
+        # and the alpha-engine-config#6030 parity branches).
+        for par_name in ("ResearchPredictorParallel", "ParityParallel"):
+            par = sf["States"][par_name]
+            for br in par["Branches"]:
+                if name in br["States"]:
+                    return br["States"][name]
         raise KeyError(name)
 
     @pytest.mark.parametrize("name", sorted(_SPOT_STATES))
@@ -1178,7 +1208,12 @@ class TestHappyPathTraversal:
             "Backtester",
             "PredictorBacktest",
             "PortfolioOptimizerBacktest",
-            "Parity",
+            # alpha-engine-config#6030: the parity family — the Parallel is
+            # the main-thread hop (its three branches run dry in-branch,
+            # asserted by TestByteIdenticalAbsentPath), the compare joins
+            # after it.
+            "ParityParallel",
+            "PitParityCompare",
             "Evaluator",
         ):
             assert ran_dry in order, (

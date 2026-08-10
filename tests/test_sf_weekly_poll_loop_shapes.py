@@ -61,7 +61,12 @@ ALL_CHECK_STATUS_STATES = [
     "CheckEvaluatorStatus",
     "CheckModelZooStatus",
     "CheckMorningEnrichStatus",
-    "CheckParityStatus",
+    # alpha-engine-config#6030: CheckParityStatus was split into the three
+    # ParityParallel branch loops + the compare-join loop, each bounded.
+    "CheckPitParityLookaheadStatus",
+    "CheckPitParityWalkforwardStatus",
+    "CheckParityReplayStatus",
+    "CheckPitParityCompareStatus",
     "CheckPortfolioOptimizerBacktestStatus",
     "CheckPredictorBacktestStatus",
     "CheckPredictorStatus",
