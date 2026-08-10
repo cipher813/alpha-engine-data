@@ -888,6 +888,16 @@ alert_classes:
     severities: [critical]
     intake: bus
     response: drain-queue
+  - class: scan_unlisted_state
+    # TRACKED-ONLY tier (routing epic config-I6751, re-route config-I6752):
+    # hygiene finding, emitted `--severity warning --no-sns` — silent Telegram
+    # plus this bus event; the drain's disposition issue IS the remediation
+    # path (observability-policy.md §7.4). Scanner breakage pages separately
+    # via the unit's OnFailure=, not through this class.
+    source: "scan-unlisted-state"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
 
   # ── DRAIN-BLIND rows (every one carries its migration or declaration) ──
   - class: executor_emergency_shutdown
