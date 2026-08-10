@@ -94,7 +94,7 @@ bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements
 source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
 HANDLER_TEST_PYTHONPATH="${LAMBDAS_DIR}" \
 HANDLER_TEST_TARGETS="${SCRIPT_DIR}/test_execution_digest.py ${SCRIPT_DIR}/test_eod_artifact_verification.py" \
-  run_handler_tests "${SCRIPT_DIR}"
+  run_handler_tests "${SCRIPT_DIR}" boto3
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
 cp "${SCRIPT_DIR}/execution_digest.py" "${PKG}/execution_digest.py"
