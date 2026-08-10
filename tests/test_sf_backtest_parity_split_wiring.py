@@ -54,6 +54,18 @@ rollback path; no SF state invokes it any longer. The ordering/Catch/
 timeout/ResultPath invariants below are unaffected by the cutover and still
 apply to the per-stage scripts.
 
+alpha-engine-config#6030 (2026-08-09): the standalone Parity state was
+itself found to bundle THREE logical stages (pit_parity lookahead pass +
+walkforward pass + parity replay) behind spot_parity.sh — the same §2.1
+violation one level down. It is now a ParityParallel of three fail-open
+branch quartets (PitParityLookahead / PitParityWalkforward / ParityReplay,
+each its own spot + script + timeout + skip flag) joined by a
+PitParityCompare quartet that reads the per-pass artifacts
+(parity/{run_date}/pit_stats_*.json, crucible-backtester
+contracts/pit_stats_pass.schema.json) and writes
+backtest/{run_date}/pit_parity.json — verdict UNKNOWN when a pass artifact
+is missing (§2.3a). The parity assertions below pin that topology.
+
 This test catches regressions like:
 - Someone reverts a backtest-family state's SSM command back to invoking
   the shared spot_backtest.sh monolith (with any --mode/--skip-stages flag)
@@ -88,6 +100,32 @@ def states(sf) -> dict:
     return sf["States"]
 
 
+@pytest.fixture(scope="module")
+def parity_branches(states) -> dict:
+    """{branch_base_name: branch_states} for the ParityParallel branches
+    (alpha-engine-config#6030), keyed by each branch's StartAt gate's
+    Default target (the work-quartet base name)."""
+    out = {}
+    for branch in states["ParityParallel"]["Branches"]:
+        gate = branch["States"][branch["StartAt"]]
+        out[gate["Default"]] = branch["States"]
+    return out
+
+
+_PARITY_BRANCH_SPECS = {
+    # base: (skip flag, var, script, branch status key, poll bound, exec_to)
+    "PitParityLookahead": (
+        "skip_pit_parity_lookahead", "pit_parity_lookahead",
+        "spot_pit_lookahead.sh", "branch_pit_lookahead", 216, "5400"),
+    "PitParityWalkforward": (
+        "skip_pit_parity_walkforward", "pit_parity_walkforward",
+        "spot_pit_walkforward.sh", "branch_pit_walkforward", 216, "5400"),
+    "ParityReplay": (
+        "skip_parity_replay", "parity_replay",
+        "spot_parity_replay.sh", "branch_parity_replay", 108, "2700"),
+}
+
+
 class TestQuartetPresence:
     """The backtest-stage quartet (kept name `Backtester` + helpers) and
     the new `Parity` quartet (+ Wait/Extract helpers) must both exist,
@@ -103,16 +141,27 @@ class TestQuartetPresence:
             "CheckBacktesterStatus",
             "BacktesterWait",
             "ExtractBacktesterError",
-            # new parity quartet
+            # parity family (alpha-engine-config#6030 split)
             "CheckSkipParity",
-            "Parity",
-            "WaitForParity",
-            "CheckParityStatus",
-            "ParityWait",
-            # degrade-not-fail route (alpha-engine-config-I6025) — replaces
-            # the retired ExtractParityError → NormalizeFailureContext path
+            "ParityParallel",
+            "AggregateParityBranchOutcomes",
+            "CheckParityBranchOutcomes",
+            # degrade-not-fail route (alpha-engine-config-I6025, now the
+            # post-join branch-degraded fold)
             "ParityDegraded",
             "PublishParityDegraded",
+            # compare/join quartet (alpha-engine-config#6030)
+            "CheckSkipPitParityCompare",
+            "PitParityCompare",
+            "InitPitParityComparePollCount",
+            "WaitForPitParityCompare",
+            "CheckPitParityCompareStatus",
+            "PitParityCompareWait",
+            "PitParityComparePollWait",
+            "MergePitParityComparePollCount",
+            "PitParityCompareComplete",
+            "ParityCompareDegraded",
+            "PublishParityCompareDegraded",
         ],
     )
     def test_state_exists(self, states, name):
@@ -122,6 +171,24 @@ class TestQuartetPresence:
         """alpha-engine-config-I6025: Parity no longer fails the SF, so its
         error normalizer is gone — the degrade route owns the failure path."""
         assert "ExtractParityError" not in states
+
+    def test_old_bundled_parity_quartet_retired(self, states):
+        """alpha-engine-config#6030: the single bundled Parity quartet is
+        gone — ParityParallel + PitParityCompare own the topology now."""
+        for name in ("Parity", "WaitForParity", "CheckParityStatus", "ParityWait"):
+            assert name not in states, f"{name} must not reappear post-#6030"
+
+    @pytest.mark.parametrize("base", sorted(_PARITY_BRANCH_SPECS))
+    def test_branch_quartet_states_exist(self, parity_branches, base):
+        assert base in parity_branches, f"{base} branch missing from ParityParallel"
+        b = parity_branches[base]
+        for name in (
+            f"CheckSkip{base}", base, f"Init{base}PollCount", f"WaitFor{base}",
+            f"Check{base}Status", f"{base}Wait", f"{base}PollWait",
+            f"Merge{base}PollCount", f"{base}Complete", f"{base}Skipped",
+            f"{base}Degraded",
+        ):
+            assert name in b, f"{name} missing from the {base} branch"
 
     def test_no_standalone_backtest_state(self, states):
         """Lower-churn option chosen: there is intentionally NO separate
@@ -214,7 +281,7 @@ class TestChainOrdering:
         )
 
     def test_skip_parity_default_runs_parity(self, states):
-        assert states["CheckSkipParity"]["Default"] == "Parity"
+        assert states["CheckSkipParity"]["Default"] == "ParityParallel"
 
     def test_skip_parity_honors_skip_flag(self, states):
         """{"skip_parity": true} must route to CheckSkipEvaluator
@@ -226,48 +293,99 @@ class TestChainOrdering:
         assert variables == {"$.skip_parity"}
         assert c["Next"] == "CheckSkipEvaluator"
 
-    def test_parity_routes_to_wait_state(self, states):
-        # alpha-engine-config-I5687: Parity dispatches through the
-        # poll-budget seed (InitParityPollCount) before the first poll.
-        assert states["Parity"]["Next"] == "InitParityPollCount"
-        assert states["InitParityPollCount"]["Next"] == "WaitForParity"
-        assert states["InitParityPollCount"]["ResultPath"] == "$.parity_polls"
+    def test_parallel_join_chain(self, states):
+        """ParityParallel → AggregateParityBranchOutcomes →
+        CheckParityBranchOutcomes → (degraded fold | compare gate) →
+        PitParityCompare → ... → CheckSkipEvaluator."""
+        assert states["ParityParallel"]["Next"] == "AggregateParityBranchOutcomes"
+        assert states["AggregateParityBranchOutcomes"]["Next"] == "CheckParityBranchOutcomes"
+        cbo = states["CheckParityBranchOutcomes"]
+        assert cbo["Default"] == "CheckSkipPitParityCompare"
+        assert cbo["Choices"][0]["Next"] == "ParityDegraded"
+        degraded_vars = {c["Variable"] for c in cbo["Choices"][0]["Or"]}
+        assert degraded_vars == {
+            "$.parity_branch_outcomes.pit_lookahead_status",
+            "$.parity_branch_outcomes.pit_walkforward_status",
+            "$.parity_branch_outcomes.parity_replay_status",
+        }
+        for cond in cbo["Choices"][0]["Or"]:
+            assert cond["StringEquals"] == "DEGRADED"
 
-    def test_parity_wait_routes_to_status_check(self, states):
-        assert states["WaitForParity"]["Next"] == "CheckParityStatus"
+    def test_aggregate_hoists_all_three_branches(self, states):
+        params = states["AggregateParityBranchOutcomes"]["Parameters"]
+        assert params == {
+            "pit_lookahead_status.$":
+                "$.parity_parallel_result[0].branch_pit_lookahead.status",
+            "pit_walkforward_status.$":
+                "$.parity_parallel_result[1].branch_pit_walkforward.status",
+            "parity_replay_status.$":
+                "$.parity_parallel_result[2].branch_parity_replay.status",
+        }
+        # branch order in the Parallel matches the aggregate's indexing
+        starts = [b["StartAt"] for b in states["ParityParallel"]["Branches"]]
+        assert starts == [
+            "CheckSkipPitParityLookahead",
+            "CheckSkipPitParityWalkforward",
+            "CheckSkipParityReplay",
+        ]
 
-    def test_parity_success_routes_to_existing_evaluator_skipgate(self, states):
-        """Parity success → CheckSkipEvaluator — the existing
-        post-backtester state, UNCHANGED. This pins the original
-        Backtester→CheckSkipEvaluator edge now lives off Parity."""
+    def test_compare_success_routes_to_existing_evaluator_skipgate(self, states):
         success = [
             c["Next"]
-            for c in states["CheckParityStatus"]["Choices"]
+            for c in states["CheckPitParityCompareStatus"]["Choices"]
             if c.get("StringEquals") == "Success"
         ]
-        assert success == ["CheckSkipEvaluator"], (
-            "Parity success must hand off to the existing post-backtester "
-            "state (CheckSkipEvaluator) — downstream chain is unchanged."
-        )
+        assert success == ["PitParityCompareComplete"]
+        assert states["PitParityCompareComplete"]["Next"] == "CheckSkipEvaluator"
 
-    def test_parity_status_loops_and_default(self, states):
-        # alpha-engine-config-I5687: bounded And[] loop-back, mirrors
-        # DataPhase2/ThinkTank/Backtester.
-        bounded = [
-            c for c in states["CheckParityStatus"]["Choices"]
-            if "And" in c
-        ]
-        assert len(bounded) == 1
-        variables = {cond.get("Variable") for cond in bounded[0]["And"]}
-        assert "$.parity_polls" in variables
-        assert bounded[0]["Next"] == "ParityWait"
-        assert states["ParityWait"]["Next"] == "ParityPollWait"
-        assert states["ParityPollWait"]["Next"] == "MergeParityPollCount"
-        assert states["MergeParityPollCount"]["Next"] == "WaitForParity"
-        # alpha-engine-config-I6025: terminal non-Success DEGRADES the run
-        # (ParityDegraded → PublishParityDegraded → CheckSkipEvaluator)
-        # instead of failing the SF through ExtractParityError.
-        assert states["CheckParityStatus"]["Default"] == "ParityDegraded"
+    def test_compare_status_loops_bounded_and_degrades(self, states):
+        check = states["CheckPitParityCompareStatus"]
+        assert check["Default"] == "ParityCompareDegraded"
+        # bounded poll loop (I5687 — the DataPhase2 shape, not the old
+        # unbounded ParityWait)
+        loop = [c for c in check["Choices"] if "And" in c]
+        assert len(loop) == 1
+        bound = [x for x in loop[0]["And"] if "NumericLessThan" in x]
+        assert bound and bound[0]["NumericLessThan"] == 108
+        assert loop[0]["Next"] == "PitParityCompareWait"
+        assert states["PitParityCompareWait"]["Next"] == "PitParityComparePollWait"
+        assert states["PitParityComparePollWait"]["Next"] == "MergePitParityComparePollCount"
+        assert states["MergePitParityComparePollCount"]["Next"] == "WaitForPitParityCompare"
+
+    @pytest.mark.parametrize("base", sorted(_PARITY_BRANCH_SPECS))
+    def test_branch_quartet_wiring(self, parity_branches, base):
+        """Per-branch: skip-gate → sendCommand → bounded poll loop →
+        Complete/Skipped/Degraded terminals, all End:true (branch-level
+        fail-open — a branch NEVER throws into the Parallel)."""
+        flag, var, script, branch_key, poll_bound, _ = _PARITY_BRANCH_SPECS[base]
+        b = parity_branches[base]
+        gate = b[f"CheckSkip{base}"]
+        assert gate["Default"] == base
+        assert gate["Choices"][0]["Next"] == f"{base}Skipped"
+        assert {c["Variable"] for c in gate["Choices"][0]["And"]} == {f"$.{flag}"}
+        assert b[base]["Next"] == f"Init{base}PollCount"
+        assert b[f"Init{base}PollCount"]["Next"] == f"WaitFor{base}"
+        assert b[f"WaitFor{base}"]["Next"] == f"Check{base}Status"
+        check = b[f"Check{base}Status"]
+        assert check["Default"] == f"{base}Degraded"
+        success = [c["Next"] for c in check["Choices"]
+                   if c.get("StringEquals") == "Success"]
+        assert success == [f"{base}Complete"]
+        loop = [c for c in check["Choices"] if "And" in c]
+        assert len(loop) == 1
+        bound = [x for x in loop[0]["And"] if "NumericLessThan" in x]
+        assert bound and bound[0]["NumericLessThan"] == poll_bound
+        # every terminal ends the branch SUCCESS with the status recorded
+        for terminal, status in (
+            (f"{base}Complete", "OK"),
+            (f"{base}Skipped", "SKIPPED"),
+            (f"{base}Degraded", "DEGRADED"),
+        ):
+            st = b[terminal]
+            assert st["Type"] == "Pass"
+            assert st.get("End") is True, f"{terminal} must End the branch"
+            assert st["Parameters"] == {"status": status}
+            assert st["ResultPath"] == f"$.{branch_key}"
 
     def test_backtest_reachable_strictly_before_parity(self, sf, states):
         """Walk the HAPPY path from StartAt and assert Backtester (backtest
@@ -291,6 +409,7 @@ class TestChainOrdering:
                 or name.endswith("Wait")
                 or name.endswith("RetryGate")
                 or name.endswith("Reissue")
+                or name.endswith("Degraded")
                 or name in ("HandleFailure", "FailExecution")
             )
 
@@ -323,16 +442,21 @@ class TestChainOrdering:
                 order.append(cur)
                 break
         assert "Backtester" in order, order
-        assert "Parity" in order, order
+        assert "ParityParallel" in order, order
+        assert "PitParityCompare" in order, order
         assert "Evaluator" in order, order
-        assert order.index("Backtester") < order.index("Parity"), (
-            "Backtester (backtest stage) must precede Parity — the whole "
-            "point of the split is a parity failure never re-runs the "
-            "121-min backtest."
+        assert order.index("Backtester") < order.index("ParityParallel"), (
+            "Backtester (backtest stage) must precede the parity family — "
+            "the whole point of the split is a parity failure never re-runs "
+            "the 121-min backtest."
         )
-        assert order.index("Parity") < order.index("Evaluator"), (
-            "Parity must precede the existing post-backtester Evaluator — "
-            "downstream chain ordering is preserved."
+        assert order.index("ParityParallel") < order.index("PitParityCompare"), (
+            "The compare/join must run AFTER the Parallel — each pass alone "
+            "produces no usable artifact (the product is the delta)."
+        )
+        assert order.index("PitParityCompare") < order.index("Evaluator"), (
+            "The parity family must precede the existing post-backtester "
+            "Evaluator — downstream chain ordering is preserved."
         )
 
 
@@ -363,16 +487,32 @@ class TestSsmCommandShape:
         assert "--skip-stages" not in joined
         assert "--mode=" not in joined
 
-    def test_parity_invokes_parity_stage_only(self, states):
-        joined = " ".join(self._commands(states, "Parity"))
-        assert "spot_parity.sh" in joined, (
-            "Parity must run its dedicated per-stage script post-cutover."
-        )
-        assert "spot_backtest.sh" not in joined, (
-            "Parity must not fall back to the shared monolith launcher."
-        )
+    @pytest.mark.parametrize("base", sorted(_PARITY_BRANCH_SPECS))
+    def test_parity_branch_invokes_its_own_script(self, parity_branches, base):
+        flag, var, script, branch_key, poll_bound, _ = _PARITY_BRANCH_SPECS[base]
+        from tests.sf_command_utils import extract_commands
+        joined = " ".join(extract_commands(parity_branches[base][base]))
+        assert script in joined, f"{base} must run {script}"
+        assert "spot_backtest.sh" not in joined
+        assert "spot_parity.sh " not in joined
         assert "--skip-stages" not in joined
         assert "--pit-parity-enabled" not in joined
+
+    def test_compare_invokes_compare_script(self, states):
+        joined = " ".join(self._commands(states, "PitParityCompare"))
+        assert "spot_parity_compare.sh" in joined
+        assert "spot_backtest.sh" not in joined
+        assert "--skip-stages" not in joined
+
+    def test_bundled_spot_parity_script_unwired(self, sf):
+        """alpha-engine-config#6030: the bundled spot_parity.sh launcher
+        (pit_parity passes + replay in one) must no longer be invoked by ANY
+        SF state — it survives on disk in crucible-backtester only as the
+        rollback path (retirement: alpha-engine-config-I6725)."""
+        blob = json.dumps(sf)
+        # Command form, not bare name — state Comments legitimately narrate
+        # the retired launcher's history.
+        assert "bash infrastructure/spot_parity.sh" not in blob
 
     def test_no_combined_backtester_skip_stages_anywhere(self, sf):
         """The old single combined-Backtester invocation
@@ -396,26 +536,37 @@ class TestSsmCommandShape:
         cmds = self._commands(states, "Backtester")
         assert cmds[0].startswith("set ") and "pipefail" in cmds[0]
 
-    def test_parity_command_starts_with_pipefail(self, states):
-        cmds = self._commands(states, "Parity")
+    def test_parity_family_commands_start_with_pipefail(self, states, parity_branches):
+        from tests.sf_command_utils import extract_commands
+        for base in _PARITY_BRANCH_SPECS:
+            cmds = extract_commands(parity_branches[base][base])
+            assert cmds[0].startswith("set ") and "pipefail" in cmds[0], base
+        cmds = self._commands(states, "PitParityCompare")
         assert cmds[0].startswith("set ") and "pipefail" in cmds[0]
 
-    def test_parity_log_capture_via_lib_cli(self, states):
-        """Parity's log-capture is satisfied by the lib CLI form
-        (lib v0.25.0), not by an inline `trap 'aws s3 cp ...' EXIT`
-        line. 2026-05-22 lift: the inline-trap form broke under
-        `commands.$ States.Array(...)` ASL escape semantics (caught by
-        Friday-PM dry-pass). See alpha-engine-lib PR #57 + sibling
-        states in test_sf_morning_enrich_split_wiring.py.
-        """
-        cmds = self._commands(states, "Parity")
-        work = next(
-            c for c in cmds if "krepis.ssm_log_capture run" in c
-        )
-        assert "--slug parity" in work
-        assert "--log /var/log/parity.log" in work
-        # Post I4442/I4497 cutover: dedicated script, no mode flags.
-        assert "-- bash infrastructure/spot_parity.sh" in work
+    @pytest.mark.parametrize(
+        "state_kind,slug,script",
+        [
+            ("PitParityLookahead", "pit-lookahead", "spot_pit_lookahead.sh"),
+            ("PitParityWalkforward", "pit-walkforward", "spot_pit_walkforward.sh"),
+            ("ParityReplay", "parity-replay", "spot_parity_replay.sh"),
+            ("PitParityCompare", "parity-compare", "spot_parity_compare.sh"),
+        ],
+    )
+    def test_parity_family_log_capture_via_lib_cli(
+            self, states, parity_branches, state_kind, slug, script):
+        """Log-capture via the lib CLI form (lib v0.25.0), never an inline
+        trap — same invariant the old Parity state carried, per stage."""
+        from tests.sf_command_utils import extract_commands
+        if state_kind in parity_branches:
+            st = parity_branches[state_kind][state_kind]
+        else:
+            st = states[state_kind]
+        cmds = extract_commands(st)
+        work = next(c for c in cmds if "krepis.ssm_log_capture run" in c)
+        assert f"--slug {slug}" in work
+        assert f"--log /var/log/{slug}.log" in work
+        assert f"-- bash infrastructure/{script}" in work
         assert not any(c.startswith("trap ") for c in cmds), (
             "Inline trap must not coexist with the lib CLI — the CLI "
             "internalizes the trap."
@@ -423,25 +574,42 @@ class TestSsmCommandShape:
 
 
 class TestBudgetParity:
-    """Parity must keep the heavy budget pattern of the old combined
-    Backtester (copied, not under-sized — per task spec)."""
+    """alpha-engine-config#6030: each split stage carries its OWN declared
+    budget (sf-pipeline-policy §4 — sized per stage from the sf_budgets.py
+    calibration block, no longer the old bundle's copied 7200), with the
+    SF-state TimeoutSeconds strictly exceeding the inner SSM
+    executionTimeout (the I6018 ordering rule, not replicated four times)."""
 
-    def test_parity_timeout_matches_backtester(self, states):
-        assert (
-            states["Parity"]["TimeoutSeconds"]
-            == states["Backtester"]["TimeoutSeconds"]
+    @pytest.mark.parametrize("base", sorted(_PARITY_BRANCH_SPECS))
+    def test_branch_budget_chain_ordering(self, parity_branches, base):
+        _, _, _, _, _, exec_to = _PARITY_BRANCH_SPECS[base]
+        st = parity_branches[base][base]
+        inner = int(st["Parameters"]["Parameters"]["executionTimeout"][0])
+        assert inner == int(exec_to)
+        assert st["Parameters"]["TimeoutSeconds"] == inner
+        assert st["TimeoutSeconds"] > inner, (
+            f"{base}: SF state TimeoutSeconds must strictly exceed the SSM "
+            "executionTimeout (I6018 ordering)"
         )
+        assert st["TimeoutSeconds"] == inner + 60
 
-    def test_parity_ssm_execution_timeout_matches_backtester(self, states):
-        bt = states["Backtester"]["Parameters"]["Parameters"]["executionTimeout"]
-        pa = states["Parity"]["Parameters"]["Parameters"]["executionTimeout"]
-        assert pa == bt
-        assert states["Parity"]["Parameters"]["TimeoutSeconds"] == (
-            states["Backtester"]["Parameters"]["TimeoutSeconds"]
-        )
+    def test_compare_budget_chain_ordering(self, states):
+        st = states["PitParityCompare"]
+        inner = int(st["Parameters"]["Parameters"]["executionTimeout"][0])
+        assert inner == 2700
+        assert st["TimeoutSeconds"] == 2760
 
-    def test_parity_retry_matches_backtester(self, states):
-        assert states["Parity"]["Retry"] == states["Backtester"]["Retry"]
+    def test_parity_family_retry_matches_backtester_convention(
+            self, states, parity_branches):
+        """The config#2279 4+2 jittered sendCommand ladder — unchanged."""
+        expect = states["Backtester"]["Retry"]
+
+        def _strip(r):
+            return [{k: v for k, v in tier.items() if k != "Comment"} for tier in r]
+
+        for base in _PARITY_BRANCH_SPECS:
+            assert _strip(parity_branches[base][base]["Retry"]) == _strip(expect), base
+        assert _strip(states["PitParityCompare"]["Retry"]) == _strip(expect)
 
 
 class TestCatchSemantics:
@@ -455,17 +623,42 @@ class TestCatchSemantics:
       anti-auto-promote-garbage rule).
     """
 
-    @pytest.mark.parametrize("name", ["Parity", "WaitForParity"])
-    def test_parity_catches_route_to_parity_degraded(self, states, name):
+    @pytest.mark.parametrize("base", sorted(_PARITY_BRANCH_SPECS))
+    def test_branch_catches_route_to_branch_degraded(self, parity_branches, base):
+        """Branch-level fail-open (alpha-engine-config#6030): both Task
+        states of each branch Catch States.ALL → the branch's OWN degraded
+        terminal — never NormalizeFailureContext, never a raw branch throw
+        (an uncaught branch failure would make the SF Parallel kill the
+        sibling branches — the §4 blast-radius violation this Catch
+        prevents)."""
+        _, var, _, _, _, _ = _PARITY_BRANCH_SPECS[base]
+        b = parity_branches[base]
+        for name in (base, f"WaitFor{base}"):
+            catches = b[name]["Catch"]
+            assert len(catches) >= 1
+            for c in catches:
+                assert c["ErrorEquals"] == ["States.ALL"]
+                assert c["Next"] == f"{base}Degraded", (
+                    f"{name}'s Catch must route to {base}Degraded "
+                    "(branch-level fail-open, alpha-engine-config#6030)"
+                )
+                assert c["ResultPath"] == f"$.{var}_error"
+
+    @pytest.mark.parametrize("name", ["PitParityCompare", "WaitForPitParityCompare"])
+    def test_compare_catches_route_to_compare_degraded(self, states, name):
         catches = states[name]["Catch"]
         assert len(catches) >= 1
         for c in catches:
             assert c["ErrorEquals"] == ["States.ALL"]
-            assert c["Next"] == "ParityDegraded", (
-                f"{name}'s Catch must route to ParityDegraded "
-                "(degrade-not-fail, alpha-engine-config-I6025)"
-            )
-            assert c["ResultPath"] == "$.parity_error"
+            assert c["Next"] == "ParityCompareDegraded"
+            assert c["ResultPath"] == "$.pit_parity_compare_error"
+
+    def test_parallel_backstop_catch_degrades(self, states):
+        catches = states["ParityParallel"]["Catch"]
+        assert len(catches) == 1
+        assert catches[0]["ErrorEquals"] == ["States.ALL"]
+        assert catches[0]["Next"] == "ParityDegraded"
+        assert catches[0]["ResultPath"] == "$.parity_error"
 
     def test_backtester_still_catches_handle_failure(self, states):
         """Regression guard — the kept Backtester state must keep its
@@ -478,28 +671,49 @@ class TestCatchSemantics:
             for c in catches
         )
 
-    def test_parity_degraded_routes_to_publish_then_evaluator(self, states):
-        """The full degrade chain: ParityDegraded → PublishParityDegraded →
-        CheckSkipEvaluator — the SF CONTINUES (never HandleFailure)."""
+    def test_parity_degraded_routes_to_publish_then_compare(self, states):
+        """The branch-degraded fold: ParityDegraded → PublishParityDegraded
+        → CheckSkipPitParityCompare — the SF CONTINUES *to the compare*
+        (§2.3a: the compare must still run and emit verdict UNKNOWN for the
+        missing pass artifacts; never HandleFailure, never straight to
+        Evaluator around the join)."""
         assert states["ParityDegraded"]["Type"] == "Pass"
+        assert states["ParityDegraded"]["Result"] is True
         assert states["ParityDegraded"]["ResultPath"] == "$.parity_degraded"
         assert states["ParityDegraded"]["Next"] == "PublishParityDegraded"
-        assert states["PublishParityDegraded"]["Next"] == "CheckSkipEvaluator"
+        assert states["PublishParityDegraded"]["Next"] == "CheckSkipPitParityCompare"
+        assert states["PublishParityDegraded"]["Catch"][0]["Next"] == "CheckSkipPitParityCompare"
+
+    def test_compare_degraded_routes_to_publish_then_evaluator(self, states):
+        assert states["ParityCompareDegraded"]["Type"] == "Pass"
+        assert states["ParityCompareDegraded"]["Result"] is True
+        assert states["ParityCompareDegraded"]["ResultPath"] == "$.parity_degraded"
+        assert states["ParityCompareDegraded"]["Next"] == "PublishParityCompareDegraded"
+        assert states["PublishParityCompareDegraded"]["Next"] == "CheckSkipEvaluator"
+        assert states["PublishParityCompareDegraded"]["Catch"][0]["Next"] == "CheckSkipEvaluator"
 
 
 class TestResultPathIsolation:
-    """Parity must not stomp on Backtester's SSM result path."""
+    """The parity-family states must not stomp on each other's (or
+    Backtester's) SSM result paths — the three branches share the SAME
+    execution-input copy semantics inside the Parallel, but their result
+    paths must still be distinct for the aggregate/rerun diagnostics."""
 
-    def test_distinct_result_paths(self, states):
-        assert (
-            states["Parity"]["ResultPath"]
-            != states["Backtester"]["ResultPath"]
-        )
-        assert states["Parity"]["ResultPath"] == "$.parity_result"
+    def test_distinct_result_paths(self, states, parity_branches):
+        paths = {states["Backtester"]["ResultPath"],
+                 states["PitParityCompare"]["ResultPath"]}
+        for base in _PARITY_BRANCH_SPECS:
+            paths.add(parity_branches[base][base]["ResultPath"])
+        assert len(paths) == 5, f"result paths collide: {paths}"
+        assert states["PitParityCompare"]["ResultPath"] == "$.pit_parity_compare_result"
 
-    def test_wait_reads_parity_command_id(self, states):
-        cmd_id = states["WaitForParity"]["Parameters"]["CommandId.$"]
-        assert "parity_result" in cmd_id
+    def test_waits_read_their_own_command_id(self, states, parity_branches):
+        for base in _PARITY_BRANCH_SPECS:
+            _, var, _, _, _, _ = _PARITY_BRANCH_SPECS[base]
+            cmd_id = parity_branches[base][f"WaitFor{base}"]["Parameters"]["CommandId.$"]
+            assert cmd_id == f"$.{var}_result.Command.CommandId", base
+        cmd_id = states["WaitForPitParityCompare"]["Parameters"]["CommandId.$"]
+        assert cmd_id == "$.pit_parity_compare_result.Command.CommandId"
 
 
 class TestL4472PhaseSplit:
@@ -566,37 +780,32 @@ class TestL4472PhaseSplit:
         assert "--skip-stages" not in joined
         assert "--mode=" not in joined
 
-    def test_pit_parity_runs_exactly_once_in_parity_state(self, sf):
-        """L4486: pit_parity fires EXACTLY ONCE, in the standalone Parity
-        state. Post I4442/I4497 cutover this is a structural guarantee of
-        WHICH script each backtest-family state invokes, not a --no-pit-parity
-        / --skip-stages flag parse (those flags no longer exist on any of the
-        five new scripts — crucible-backtester#631's PR body: 'No
-        stage-multiplexing flag exists in any new script's executable code').
-        pit_parity is spot_parity.sh's entire job; Backtester/
-        PredictorBacktest/PortfolioOptimizerBacktest/Evaluator each invoke a
-        DIFFERENT dedicated script that is not spot_parity.sh."""
+    def test_pit_parity_passes_fire_exactly_once_each(self, sf, parity_branches):
+        """alpha-engine-config#6030 successor of the L4486 exactly-once
+        invariant: each pit_parity pass fires exactly once, in its OWN
+        branch, and nowhere else in the SF; the compare fires exactly once
+        after the join. Structural: WHICH script each state invokes."""
+        blob = json.dumps(sf)
+        for script in ("spot_pit_lookahead.sh", "spot_pit_walkforward.sh",
+                       "spot_parity_replay.sh", "spot_parity_compare.sh"):
+            assert blob.count(f"bash infrastructure/{script}") == 1, (
+                f"{script} must be invoked by exactly one SF state"
+            )
+
+    def test_backtest_family_states_invoke_their_own_scripts(self, sf):
+        """Kept half of the retired L4486 exactly-once test: each remaining
+        backtest-family state invokes its OWN dedicated script (post
+        I4442/I4497 cutover), never the monolith."""
         from tests.sf_command_utils import extract_commands
         states = sf["States"]
-
         family_scripts = {
             "Backtester": "spot_backtester.sh",
             "PredictorBacktest": "spot_predictor_backtest.sh",
             "PortfolioOptimizerBacktest": "spot_portfolio_optimizer_backtest.sh",
-            "Parity": "spot_parity.sh",
         }
         for name, script in family_scripts.items():
             joined = " ".join(extract_commands(states[name]))
             assert script in joined, f"{name} must invoke {script}"
-
-        runners = [
-            name
-            for name, script in family_scripts.items()
-            if script == "spot_parity.sh"
-        ]
-        assert runners == ["Parity"], (
-            f"pit_parity must fire exactly once, in Parity; got runners={runners}"
-        )
 
     @pytest.mark.parametrize(
         "name",
@@ -632,7 +841,7 @@ class TestL4472PhaseSplit:
     )
     def test_new_status_gates_loop_and_error_default(self, states, check, wait):
         # alpha-engine-config-I5687: bounded And[] loop-back, mirrors
-        # DataPhase2/ThinkTank/Backtester/Parity.
+        # DataPhase2/ThinkTank/Backtester.
         prefix = {
             "CheckPredictorBacktestStatus": "predictor_backtest",
             "CheckPortfolioOptimizerBacktestStatus": "portfolio_optimizer",

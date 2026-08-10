@@ -22,7 +22,14 @@ _SF_PATH = Path(__file__).resolve().parents[1] / "infrastructure" / "step_functi
 
 @pytest.fixture(scope="module")
 def states() -> dict:
-    return json.loads(_SF_PATH.read_text())["States"]
+    """Top-level States, plus the ParityParallel branch states flattened in
+    (alpha-engine-config#6030 — the three parity branch spots live inside
+    the Parallel but thread RUN_DATE identically)."""
+    top = json.loads(_SF_PATH.read_text())["States"]
+    flat = dict(top)
+    for branch in top["ParityParallel"]["Branches"]:
+        flat.update(branch["States"])
+    return flat
 
 
 def test_initialize_input_stamps_run_date_from_execution_start(states):
@@ -48,12 +55,17 @@ def test_initialize_input_user_run_date_still_wins(states):
 # spot_backtest.sh monolith.
 _STAGE_SCRIPT = {
     "Backtester": "spot_backtester.sh",
-    "Parity": "spot_parity.sh",
+    # alpha-engine-config#6030: the bundled Parity stage became four
+    # independent stages, each threading the same SF-declared RUN_DATE.
+    "PitParityLookahead": "spot_pit_lookahead.sh",
+    "PitParityWalkforward": "spot_pit_walkforward.sh",
+    "ParityReplay": "spot_parity_replay.sh",
+    "PitParityCompare": "spot_parity_compare.sh",
     "Evaluator": "spot_evaluator.sh",
 }
 
 
-@pytest.mark.parametrize("stage", ["Backtester", "Parity", "Evaluator"])
+@pytest.mark.parametrize("stage", sorted(_STAGE_SCRIPT))
 def test_spot_stage_exports_run_date_before_launch(states, stage):
     """Each spot stage injects `export RUN_DATE=<run_date>` immediately
     before its dedicated per-stage script launch so that script resolves

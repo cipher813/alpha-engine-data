@@ -399,16 +399,71 @@ STAGES: tuple[Stage, ...] = (
         "CheckSkipPortfolioOptimizerBacktest", "PortfolioOptimizerBacktest",
         frozenset({"CheckSkipParity"}),
     ),
+    # --- parity family (alpha-engine-config#6030 split) --------------------
     Stage(
+        # Family gate row: CheckSkipParity bypasses the WHOLE parity family
+        # (ParityParallel + PitParityCompare). The four fine-grained rows
+        # below own witness/failure detection and skip emission, so this row
+        # emits nothing and detects nothing — it exists so the lockstep
+        # completeness guard sees the gate covered, and so a post-join
+        # branch-degraded fold (ParityDegraded/PublishParityDegraded, which
+        # no single fine-grained row owns) is still reported as degraded.
         "parity", "skip_parity",
-        "CheckSkipParity", "Parity",
+        "CheckSkipParity", "ParityParallel",
+        # CheckSkipEvaluator is only reachable through/past the parity
+        # family (every family path converges there), so it remains a valid
+        # completed-or-skipped witness — INCLUDING for pre-#6030 execution
+        # histories whose Parity/WaitForParity states no longer exist. Any
+        # degraded state in the family overrides it (degraded beats
+        # completed), so a compare-degraded or branch-degraded run never
+        # emits skip_parity.
         frozenset({"CheckSkipEvaluator"}),
-        # alpha-engine-config-I6025: Parity now degrades-not-fails — a
-        # timeout/crash routes through ParityDegraded → PublishParityDegraded
-        # and the SF continues. A degraded parity must RE-RUN on a rerun
-        # (it is the exact thing a mechanical rerun exists to retry), never
-        # be skipped as completed.
         degraded_witness=frozenset({"ParityDegraded", "PublishParityDegraded"}),
+        emit_skip=False,
+        detect_failure=False,
+        note=(
+            "family row (alpha-engine-config#6030): skip_parity bypasses the"
+            " WHOLE family but is NEVER auto-emitted — the fine-grained rows"
+            " below own per-branch emission and failure detection, so a"
+            " single failed branch reruns ALONE (the #6030 closes-when)."
+            " Witness CheckSkipEvaluator keeps 'completed' reporting valid"
+            " for pre-#6030 execution histories; a rerun of such a history"
+            " re-runs the parity family (conservative and honest — the old"
+            " bundled artifacts cannot witness the new per-stage set)."
+        ),
+    ),
+    Stage(
+        # Branch rows: witness = the branch's own Complete/Skipped terminal
+        # (entered => completed-or-skipped); degraded = the branch's own
+        # fail-open Degraded terminal (entered => ran-and-failed => must
+        # RE-RUN, never be skipped as completed — I6025 extended per-branch).
+        "pit_parity_lookahead", "skip_pit_parity_lookahead",
+        "CheckSkipPitParityLookahead", "PitParityLookahead",
+        frozenset({"PitParityLookaheadComplete", "PitParityLookaheadSkipped"}),
+        degraded_witness=frozenset({"PitParityLookaheadDegraded"}),
+    ),
+    Stage(
+        "pit_parity_walkforward", "skip_pit_parity_walkforward",
+        "CheckSkipPitParityWalkforward", "PitParityWalkforward",
+        frozenset({"PitParityWalkforwardComplete", "PitParityWalkforwardSkipped"}),
+        degraded_witness=frozenset({"PitParityWalkforwardDegraded"}),
+    ),
+    Stage(
+        "parity_replay", "skip_parity_replay",
+        "CheckSkipParityReplay", "ParityReplay",
+        frozenset({"ParityReplayComplete", "ParityReplaySkipped"}),
+        degraded_witness=frozenset({"ParityReplayDegraded"}),
+    ),
+    Stage(
+        "pit_parity_compare", "skip_pit_parity_compare",
+        "CheckSkipPitParityCompare", "PitParityCompare",
+        frozenset({"PitParityCompareComplete"}),
+        degraded_witness=frozenset({"ParityCompareDegraded", "PublishParityCompareDegraded"}),
+        note=(
+            "the compare join emits verdict UNKNOWN (never pass) when a pass"
+            " artifact is missing (§2.3a); skipping it on a rerun is only"
+            " legal when it already completed for this run_date."
+        ),
     ),
     Stage(
         "evaluator", "skip_evaluator",
@@ -493,7 +548,15 @@ BRANCH_A_STAGES = frozenset({
 })
 # Stages whose gate is only reachable THROUGH CheckSkipBacktester's run path
 # (the skip route overshoots them — see Stage("backtester").note).
-BACKTESTER_OVERSHADOWED = ("predictor_backtest", "portfolio_optimizer_backtest", "parity")
+BACKTESTER_OVERSHADOWED = (
+    "predictor_backtest", "portfolio_optimizer_backtest",
+    # alpha-engine-config#6030: the parity family's fine-grained stages —
+    # skip_backtester's whole-pair route jumps past CheckSkipParity, so a
+    # failed parity sub-stage behind skip_backtester needs the
+    # stage-only replacement exactly like the pre-split "parity" did.
+    "pit_parity_lookahead", "pit_parity_walkforward", "parity_replay",
+    "pit_parity_compare",
+)
 
 
 @dataclass
@@ -538,15 +601,39 @@ def _simulate_reachable_works(flags: dict, original_input: dict) -> set:
     run_linear(sorted(BRANCH_A_STAGES, key=lambda n: [s.name for s in STAGES].index(n)))
     run_linear(["predictor_training"])
     # tail: CheckSkipBacktester's skip route OVERSHOOTS to CheckSkipEvaluator
+    def run_parity_family():
+        # alpha-engine-config#6030: skip_parity bypasses the WHOLE family
+        # (ParityParallel + compare); otherwise each fine-grained stage runs
+        # per its own flag (the three branch gates + the compare gate).
+        if effective["parity"]:
+            return
+        # the family row itself: ParityParallel is entered whenever the
+        # family gate is not skipped (its branches then honor their own
+        # flags) — needed so a degraded family fold passes the
+        # reachability guard.
+        ran.add("parity")
+        run_linear([
+            "pit_parity_lookahead", "pit_parity_walkforward", "parity_replay",
+            "pit_parity_compare",
+        ])
+
     if effective["backtester"]:
-        pass  # backtester, predictor_backtest, portfolio_optimizer_backtest, parity all bypassed
+        pass  # backtester, predictor_backtest, portfolio_optimizer_backtest + parity family all bypassed
     elif effective["backtester_stage_only"]:
         # config#2362 Option A: only the Backtester SSM task is bypassed;
         # the tail gates still compose orthogonally past it.
-        run_linear(["predictor_backtest", "portfolio_optimizer_backtest", "parity"])
+        run_linear(["predictor_backtest", "portfolio_optimizer_backtest"])
+        run_parity_family()
     else:
-        run_linear(["backtester", "predictor_backtest", "portfolio_optimizer_backtest", "parity"])
-    run_linear(["evaluator", "report_card", "director"])
+        run_linear(["backtester", "predictor_backtest", "portfolio_optimizer_backtest"])
+        run_parity_family()
+    # config#6054 split the coarse post_eval span: post_eval survives as the
+    # deprecated whole-tail alias (its health checks re-run on any tail rerun)
+    # while report_card / director are now independently gated. All three are
+    # modeled here so the degraded-aware reachability guard (which now folds
+    # DEGRADED stages into must_rerun) can see post_eval — its health-check
+    # degraded_witness — as reachable when a tail rerun re-runs the span.
+    run_linear(["evaluator", "post_eval", "report_card", "director"])
     return ran
 
 
@@ -597,26 +684,38 @@ def derive_plan(events: list[dict], start_time: datetime | None = None) -> Rerun
     # (its backtest/{run_date}/ artifacts already exist and are reused) while
     # still routing through the predictor-backtest/portfolio-optimizer/parity
     # gates, so the failed stage reruns without re-burning Backtester.
+    # A stage that must RE-RUN is a failed OR degraded one (I6055: degraded
+    # is exactly what a mechanical rerun exists to retry) — both classes get
+    # the overshoot replacement and the reachability guard. Meta rows
+    # (emit_skip=False AND detect_failure=False: the parity family fold,
+    # backtester_stage_only) are excluded — their fine-grained rows carry
+    # the actual work-state guarantee.
+    def _is_meta(name: str) -> bool:
+        st = STAGES_BY_NAME[name]
+        return not st.emit_skip and not st.detect_failure
+
+    must_rerun = [f for f in (*plan.failed, *plan.degraded) if not _is_meta(f)]
+
     if "skip_backtester" in plan.skip_flags and any(
-        f in plan.failed for f in BACKTESTER_OVERSHADOWED
+        f in must_rerun for f in BACKTESTER_OVERSHADOWED
     ):
         del plan.skip_flags["skip_backtester"]
         plan.skip_flags["skip_backtester_stage_only"] = True
         plan.notes.append(
             "skip_backtester replaced with skip_backtester_stage_only: "
             "Backtester completed but its whole-pair skip route would bypass "
-            f"failed stage(s) {[f for f in plan.failed if f in BACKTESTER_OVERSHADOWED]} "
+            f"failed/degraded stage(s) {[f for f in must_rerun if f in BACKTESTER_OVERSHADOWED]} "
             "— skipping only the Backtester SSM task (reusing its "
             "already-written artifacts) instead of re-burning it. config#2362."
         )
 
     reachable = _simulate_reachable_works(plan.skip_flags, original_input)
-    unreachable_failed = [f for f in plan.failed if f not in reachable]
-    if unreachable_failed:
+    unreachable = [f for f in must_rerun if f not in reachable]
+    if unreachable:
         raise SystemExit(
-            f"FATAL: derived skip set would make failed stage(s) "
-            f"{unreachable_failed} unreachable — refusing to emit an input "
-            f"that silently skips a failed stage. Flags: "
+            f"FATAL: derived skip set would make failed/degraded stage(s) "
+            f"{unreachable} unreachable — refusing to emit an input "
+            f"that silently skips a stage that must re-run. Flags: "
             f"{sorted(plan.skip_flags)}; original input flags: "
             f"{ {k: v for k, v in original_input.items() if k.startswith('skip_')} }. "
             f"This means the skip-gate topology changed — update STAGES / "

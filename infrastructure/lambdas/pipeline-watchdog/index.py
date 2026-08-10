@@ -54,6 +54,23 @@ independence preserved per plan doc §3.5.
       cron completely dead (alpha-engine-config#5597 / #5590). See
       ``WEEKLY_CADENCE_ROLES``.
 
+  - **Weekly-SF silence deadman** (``ne-weekly-freshness-pipeline``,
+      alpha-engine-config#6738 / sf-pipeline-policy §2.6 rule 1)
+      Watch-day: EVERY day. Reads the DECLARED exercise cadence from SSM
+      ``/alpha-engine/weekly-sf/exercise-cadence`` — the same parameter the
+      postclose SF's ``ReadExerciseCadence`` task reads to decide whether to
+      chain the exercise launch — derives every run-slot the declaration
+      expects over a trailing 5-day window, and pages on any slot with NO
+      matching execution. Where the Saturday-SF check above asks "did the
+      weekly cron fire at all this week", this asks the per-day question:
+      the 2026-08-05/06 postclose never fired, so the chained
+      ``pipeline_role=exercise`` launch was silent for two days with zero
+      signal — an absence, invisible to every failure-triggered path.
+      A slot the declaration does NOT expect is classified ``GATED_OFF``
+      and reported as such, never conflated with silence. The slot logic is
+      imported from ``scripts/weekly_sf_silence_deadman.py`` (one
+      implementation, two entry points), not reimplemented here.
+
 **Fail-loud semantics** (per ``feedback_no_silent_fails`` + the
 ``feedback_wire_orphaned_producer_must_fail_loud`` discipline):
 
@@ -114,16 +131,20 @@ own recommendation (06:20, gated on ``RunDaemon`` state reached) targets a
 different, live/in-flight design point than this retrospective
 finish-time check, so it does not transfer directly — see PR body.
 
-Deliberately does NOT filter by ``input.pipeline_role`` (would require
-``states:DescribeExecution``, which this Lambda's IAM role does not
-currently grant — confirmed live via a real AccessDeniedException the
-Saturday-SF role-filtered path already throws every Sunday since
-config#5597, see PR body / alpha-engine-config-I<N>). Instead takes the
+Does NOT filter by ``input.pipeline_role``. Instead takes the
 EARLIEST-started SUCCEEDED execution per PT calendar day as the proxy for
 "the scheduled run" (a same-day manual rerun, if any, would start later,
 in response to a problem with the scheduled one) — mirrors the existing
 unfiltered-count convention this file already uses for the Weekday/EOD
 checks above.
+
+CORRECTED 2026-08-09 (alpha-engine-config#6738): this paragraph used to
+justify the absence of the role filter with "this Lambda's IAM role does
+not grant ``states:DescribeExecution``". That claim is stale —
+``iam-policy.json`` carries a ``DescribeSFExecutions`` statement and the
+LIVE role was measured to carry it. Skipping the filter here is now a cost
+choice (one DescribeExecution per row of a 14-day walk), not a permission
+constraint; revisit under alpha-engine-config-I6748.
 
 Also computes a rolling-median trend over the last
 ``ROLLING_WINDOW_TRADING_DAYS`` (5) trading days with SUCCEEDED data: a
@@ -145,8 +166,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -154,11 +177,41 @@ import boto3
 
 from nousergon_lib import alerts
 from nousergon_lib.trading_calendar import (
+    is_trading_day,
     last_closed_trading_day,
+    next_trading_day,
     previous_trading_day,
 )
 from flow_doctor_telegram import notify_via_flow_doctor
 from nousergon_lib.flow_doctor_fleet import PIPELINE_OBSERVER_TELEGRAM_TOPICS
+
+# The weekly-SF silence deadman's slot derivation + classification
+# (alpha-engine-config#6738). ONE implementation, two entry points: the
+# operator CLI at ``scripts/weekly_sf_silence_deadman.py`` and this Lambda.
+# deploy.sh copies that file flat into the zip alongside index.py — the same
+# device already used for ``flow_doctor_telegram.py`` — so the scheduled check
+# and the manual rerun can never diverge in what they consider a silent slot.
+# Its module-level imports are stdlib only (boto3 is imported inside its
+# ``main``), so this costs the Lambda no cold-start weight beyond the file.
+try:  # deployed layout: flat next to index.py in /var/task
+    from weekly_sf_silence_deadman import (  # noqa: E402
+        compute_expected_slots,
+        evaluate,
+        fetch_execution_records,
+        last_due_day,
+        load_cadence_from_ssm,
+    )
+except ModuleNotFoundError:  # in-repo layout (pytest, ci.yml glob runner)
+    sys.path.insert(
+        0, str(Path(__file__).resolve().parents[3] / "scripts")
+    )
+    from weekly_sf_silence_deadman import (  # noqa: E402
+        compute_expected_slots,
+        evaluate,
+        fetch_execution_records,
+        last_due_day,
+        load_cadence_from_ssm,
+    )
 
 
 logger = logging.getLogger()
@@ -322,6 +375,28 @@ _MIN_TREND_DAYS = 3
 # ROLLING_WINDOW_TRADING_DAYS(5) so a holiday week doesn't starve the
 # median of data.
 BUFFER_LOOKBACK_CALENDAR_DAYS = 14
+
+# ── Weekly-SF silence deadman (alpha-engine-config#6738) ───────────────────
+
+# SSM parameter carrying the DECLARED exercise cadence. This is the same
+# parameter ``step_function_eod.json``'s ``ReadExerciseCadence`` task reads at
+# execution time (config#6689), which is what makes the deadman's expectation
+# provably identical to the launcher's actual behaviour. Deliberately NOT the
+# in-repo ``infrastructure/weekly_cadence.json`` manifest: a manifest copy
+# baked into the zip is a snapshot of whatever the last CODE deploy carried,
+# and a cadence flip that ships via ``deploy-infrastructure.sh`` alone would
+# leave the detector expecting the old cadence with nothing to say so.
+CADENCE_SSM_PARAM = "/alpha-engine/weekly-sf/exercise-cadence"
+
+# Trailing days of run-slots the deadman re-checks each firing. Five covers a
+# full trading week's exercise slots plus one weekly-cron slot.
+SILENCE_WINDOW_DAYS = 5
+
+# Dedup window for a silence alert. Keyed on the SILENT SLOT (role + day), not
+# on the firing date, so a genuinely new silent day always pages while the same
+# slot — still visible in the 5-day window on each of the next four firings —
+# does not re-page. 7 days > the window, so exactly one page per silent slot.
+SILENCE_DEDUP_WINDOW_MIN = 7 * 24 * 60
 
 
 @dataclass(frozen=True)
@@ -660,12 +735,11 @@ def _iter_succeeded_weekday_executions(
     execution that started within the last ``lookback_days`` calendar days,
     newest first (as returned by ListExecutions).
 
-    No ``pipeline_role`` filter — that would require ``states:
-    DescribeExecution``, which this Lambda's IAM role does not currently
-    grant (see module docstring: the Saturday-SF role-filtered path
-    already throws a live ``AccessDeniedException`` on this exact call).
-    Filtering on status=SUCCEEDED at the API layer is enough to keep this
-    walk cheap without it.
+    No ``pipeline_role`` filter. The grant for it DOES exist (see the
+    module docstring's 2026-08-09 correction); filtering on
+    status=SUCCEEDED at the API layer is enough to keep this walk cheap
+    without paying one DescribeExecution per row — alpha-engine-config
+    -I6748 revisits whether the precision is worth the cost.
     """
     cutoff_utc = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     rows: list[tuple[datetime, datetime]] = []
@@ -1174,6 +1248,197 @@ def _check_failed_day(
     )
 
 
+@dataclass(frozen=True)
+class SilenceCheckResult:
+    """Outcome of one weekly-SF silence-deadman run."""
+
+    checked: bool
+    cadence: Optional[str] = None
+    evaluation_date: Optional[str] = None  # last fully-due day evaluated
+    slots_evaluated: int = 0
+    ok: int = 0
+    gated_off: int = 0
+    critical: int = 0
+    critical_slots: tuple = ()
+    gated_off_slots: tuple = ()
+    alerts_emitted: int = 0
+    degraded_reason: Optional[str] = None
+
+
+def _silence_evaluation_date(now_utc: datetime) -> date:
+    """The last day whose expected run-slots are fully DUE at cron time.
+
+    Thin adapter over the deadman module's ``last_due_day`` — the SHARED
+    definition, so the scheduled check and the operator CLI cannot disagree
+    about whether today's slot counts. Same retrospective discipline as
+    ``_eod_window_seconds`` and ``_check_preopen_buffer``: only look at
+    windows that have fully elapsed. Evaluating "today" at the 14:00 UTC
+    firing would classify every trading day's not-yet-due exercise slot
+    (chained off that day's ~20:00 UTC postclose) as CRITICAL and page daily.
+    """
+    return last_due_day(now_utc.date())
+
+
+def _check_weekly_silence(
+    *,
+    now_utc: datetime,
+    client: Optional[object] = None,
+    ssm_client: Optional[object] = None,
+) -> SilenceCheckResult:
+    """Weekly-SF silence deadman: a day the DECLARED cadence says the pipeline
+    should have run and no execution exists at all (alpha-engine-config#6738,
+    sf-pipeline-policy §2.6 rule 1).
+
+    Distinct from the Saturday-SF liveness check above, which asks only "did
+    the weekly cron fire in the last 7 days". This asks the per-day question
+    the 2026-08-05/06 outage needed and nothing answered: for EVERY run-slot
+    the declaration expects, does a matching execution exist? Postclose never
+    fired on those two days, so the chained ``pipeline_role=exercise`` launch
+    never happened — an absence, not a failure, and therefore invisible to
+    every failure-triggered alert path.
+
+    Deliberately NOT rebuilt on ``AWS/States`` ``ExecutionsStarted``: that
+    metric carries no ``pipeline_role`` dimension, so it cannot separate a
+    gated-off day from a dead one, which is why the prior CloudWatch deadman
+    could never fire (alpha-engine-config#5599, alarm deleted 2026-08-09).
+
+    No watch-day gate. Unlike the three liveness checks, the calendar
+    awareness lives INSIDE the slot derivation (``compute_expected_slots``
+    consults ``nousergon_lib.trading_calendar`` per candidate day), so a
+    weekend or holiday firing simply derives zero expected slots for those
+    days rather than being skipped wholesale.
+    """
+    if client is None:  # pragma: no cover — production path
+        client = boto3.client("stepfunctions", region_name=REGION)
+    if ssm_client is None:  # pragma: no cover — production path
+        ssm_client = boto3.client("ssm", region_name=REGION)
+
+    try:
+        cadence = load_cadence_from_ssm(ssm_client)
+    except Exception as exc:  # noqa: BLE001
+        # NOT a swallow — the failure is converted into a severity=error page
+        # on the independent watchdog topic AND recorded in the handler's
+        # returned summary as degraded_reason. Rationale for not re-raising
+        # (per the fail-loud carve-out): (a) the failure mode is "the cadence
+        # declaration is unreadable", overwhelmingly an IAM grant that has not
+        # been applied yet — this Lambda's exec-role policy is operator-
+        # applied by design (infrastructure/iam/README.md single-writer rule),
+        # so the code can legitimately reach production one deploy ahead of
+        # its grant; (b) raising here would abort the handler AFTER the four
+        # other checks have already published, discarding their summary and
+        # burning EventBridge retries on a condition no retry can fix; (c) the
+        # recording surfaces are this alert (same topic, same dedup wiring as
+        # every other watchdog page) and the summary dict in CloudWatch Logs.
+        # The check reports UNKNOWN, never OK — an unreadable declaration is
+        # never rendered as "no silent slots".
+        reason = f"{type(exc).__name__}: {exc}"
+        logger.error(
+            "weekly-silence deadman DEGRADED: cannot read %s — %s",
+            CADENCE_SSM_PARAM, reason,
+        )
+        _publish_watchdog_alert(
+            (
+                f"weekly-SF silence deadman could NOT read its declared cadence from "
+                f"SSM {CADENCE_SSM_PARAM} ({reason}). The deadman is the only detector "
+                f"for a day the weekly pipeline should have run and produced NO "
+                f"execution at all (the 2026-08-05/06 postclose silence) — it is "
+                f"reporting UNKNOWN, not healthy, until this is fixed. If this is "
+                f"AccessDenied the exec-role grant has not been applied yet; apply it "
+                f"with: `bash infrastructure/lambdas/pipeline-watchdog/deploy.sh "
+                f"--apply-iam` (alpha-engine-config#6738)."
+            ),
+            severity="error",
+            dedup_key=(
+                f"pipeline-watchdog-weekly-silence-degraded-{now_utc.date().isoformat()}"
+            ),
+            context={"ssm_param": CADENCE_SSM_PARAM, "sf_arn": SATURDAY_SF_ARN},
+        )
+        return SilenceCheckResult(
+            checked=False,
+            evaluation_date=_silence_evaluation_date(now_utc).isoformat(),
+            degraded_reason=f"cannot read {CADENCE_SSM_PARAM}: {reason}",
+            alerts_emitted=1,
+        )
+
+    evaluation_date = _silence_evaluation_date(now_utc)
+    # Anchor the fetch to THIS invocation's now, not the wall clock, so the
+    # fetch window and the slot window can never be measured from different
+    # instants (the deadman CLI keeps its own _today() default).
+    executions = fetch_execution_records(
+        client, SILENCE_WINDOW_DAYS, today=now_utc.date()
+    )
+    slots = compute_expected_slots(
+        evaluation_date,
+        cadence,
+        SILENCE_WINDOW_DAYS,
+        is_trading_day,
+        next_trading_day,
+    )
+    results = evaluate(slots, executions)
+
+    critical = [r for r in results if r.classification == "CRITICAL"]
+    gated = [r for r in results if r.classification == "GATED_OFF"]
+    ok = [r for r in results if r.classification == "OK"]
+
+    alerts_emitted = 0
+    for r in critical:
+        day = r.slot.day.isoformat()
+        message = (
+            f"ne-weekly-freshness-pipeline SILENCE on {day} ({r.slot.role} slot): "
+            f"{r.detail}. The declared cadence "
+            f"(SSM {CADENCE_SSM_PARAM} = '{cadence}') EXPECTS this run — this is not "
+            f"a gated-off day and not a failed run, it is a slot that produced no "
+            f"execution at all, which no failure-triggered alert can see. Measured "
+            f"precedent: postclose never fired on 2026-08-05/06 and the chained "
+            f"exercise launch was silent for two days with zero signal "
+            f"(alpha-engine-config#6738 / #6689). Investigate the LAUNCHER, not the "
+            f"pipeline: for an exercise slot check that day's "
+            f"ne-postclose-trading-pipeline execution reached LaunchWeeklyExerciseRun; "
+            f"for a weekly slot check the alpha-engine-saturday EventBridge rule. "
+            f"Reproduce locally: `./scripts/weekly_sf_silence_deadman.py --live "
+            f"--window-days {SILENCE_WINDOW_DAYS} --json --no-notify`."
+        )
+        _publish_watchdog_alert(
+            message,
+            severity="error",
+            dedup_key=f"pipeline-watchdog-weekly-silence-{r.slot.role}-{day}",
+            context={
+                "sf_arn": SATURDAY_SF_ARN,
+                "slot_day": day,
+                "slot_role": r.slot.role,
+                "declared_cadence": cadence,
+            },
+            dedup_window_min=SILENCE_DEDUP_WINDOW_MIN,
+        )
+        alerts_emitted += 1
+
+    logger.info(
+        "weekly-silence deadman: cadence=%s through=%s ok=%d gated_off=%d critical=%d",
+        cadence, evaluation_date.isoformat(), len(ok), len(gated), len(critical),
+    )
+    return SilenceCheckResult(
+        checked=True,
+        cadence=cadence,
+        evaluation_date=evaluation_date.isoformat(),
+        slots_evaluated=len(results),
+        ok=len(ok),
+        gated_off=len(gated),
+        critical=len(critical),
+        # Both lists are reported, not just the failing one: "gated off by
+        # declaration" and "expected and absent" are the two states §2.6
+        # requires an operator to be able to tell apart, and a summary that
+        # only ever names failures cannot show that the quiet days were quiet
+        # ON PURPOSE.
+        critical_slots=tuple(
+            f"{r.slot.day.isoformat()}:{r.slot.role}" for r in critical
+        ),
+        gated_off_slots=tuple(
+            f"{r.slot.day.isoformat()}:{r.slot.role}" for r in gated
+        ),
+        alerts_emitted=alerts_emitted,
+    )
+
+
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """EventBridge cron handler. Runs the 3 per-SF liveness checks, the
     preopen schedule-buffer canary, and the 2 prior-day failed-run checks,
@@ -1243,6 +1508,12 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         for label, arn, pipeline in _FAILED_DAY_PIPELINES
     ]
 
+    # Weekly-SF silence deadman (config#6738). Runs on EVERY calendar day —
+    # its own slot derivation is the trading-calendar gate, so there is no
+    # watch-day to skip on. Ordered last so that if it ever raises despite the
+    # degraded path below, the five checks above have already published.
+    weekly_silence = _check_weekly_silence(now_utc=now_utc)
+
     summary = {
         "fired_at_utc": now_utc.isoformat(),
         "is_trading_today": is_trading_today,
@@ -1285,6 +1556,19 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             }
             for c in failed_day
         ],
+        "weekly_silence_check": {
+            "checked": weekly_silence.checked,
+            "cadence": weekly_silence.cadence,
+            "evaluation_date": weekly_silence.evaluation_date,
+            "slots_evaluated": weekly_silence.slots_evaluated,
+            "ok": weekly_silence.ok,
+            "gated_off": weekly_silence.gated_off,
+            "critical": weekly_silence.critical,
+            "critical_slots": list(weekly_silence.critical_slots),
+            "gated_off_slots": list(weekly_silence.gated_off_slots),
+            "alerts_emitted": weekly_silence.alerts_emitted,
+            "degraded_reason": weekly_silence.degraded_reason,
+        },
     }
     logger.info("watchdog summary: %s", summary)
     return summary

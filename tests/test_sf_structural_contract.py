@@ -131,6 +131,7 @@ _TIMEOUT_EXEMPT: dict[str, dict[str, str]] = {
         "ResearchPredictorParallel.PublishModelZooFailureImmediate": "sns:publish immediate-failure notifier — SDK call, not a wait",
         "PublishReportCardDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait",
         "PublishParityDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait (alpha-engine-config-I6025)",
+        "PublishParityCompareDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait (alpha-engine-config#6030)",
         "PublishMutexAcquireDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait (alpha-engine-config#6722)",
         "NotifyCompleteGatesDegraded": "sns:publish completion notifier — SDK call, not a wait",
         "NotifyCompleteHealthDegraded": "sns:publish completion notifier — SDK call, not a wait",
@@ -163,7 +164,10 @@ _TIMEOUT_EXEMPT: dict[str, dict[str, str]] = {
         "WaitForBacktester": "ssm:getCommandInvocation single poll — bounded by Backtester's own executionTimeout",
         "WaitForPredictorBacktest": "ssm:getCommandInvocation single poll — bounded by PredictorBacktest's own executionTimeout",
         "WaitForPortfolioOptimizerBacktest": "ssm:getCommandInvocation single poll — bounded by PortfolioOptimizerBacktest's own executionTimeout",
-        "WaitForParity": "ssm:getCommandInvocation single poll — bounded by Parity's own executionTimeout",
+        "ParityParallel.WaitForPitParityLookahead": "ssm:getCommandInvocation single poll — bounded by PitParityLookahead's own executionTimeout (alpha-engine-config#6030)",
+        "ParityParallel.WaitForPitParityWalkforward": "ssm:getCommandInvocation single poll — bounded by PitParityWalkforward's own executionTimeout (alpha-engine-config#6030)",
+        "ParityParallel.WaitForParityReplay": "ssm:getCommandInvocation single poll — bounded by ParityReplay's own executionTimeout (alpha-engine-config#6030)",
+        "WaitForPitParityCompare": "ssm:getCommandInvocation single poll — bounded by PitParityCompare's own executionTimeout (alpha-engine-config#6030)",
         "WaitForEvaluator": "ssm:getCommandInvocation single poll — bounded by Evaluator's own executionTimeout",
         "WaitForSaturdayHealthCheck": "ssm:getCommandInvocation single poll — bounded by SaturdayHealthCheck's own executionTimeout",
         "WaitForWeeklySubstrateHealthCheck": "ssm:getCommandInvocation single poll — bounded by WeeklySubstrateHealthCheck's own executionTimeout",
@@ -516,6 +520,49 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
         "ResearchPredictorParallel.ModelZooTrainMap.WaitTrainSpec": (
             "Same per-iteration tolerated-by-design reasoning as "
             "TrainSpecDispatch."
+        ),
+        "ParityParallel.PitParityLookahead": (
+            "alpha-engine-config#6030 branch-level fail-open: the Catch ends "
+            "the branch DEGRADED (PitParityLookaheadDegraded, End:true, "
+            "status into $.branch_pit_lookahead) rather than throwing — a "
+            "branch never aborts its Parallel siblings. The degraded flag "
+            "the terminal notifier reads ($.parity_degraded) is set at the "
+            "JOIN, not in the branch: AggregateParityBranchOutcomes -> "
+            "CheckParityBranchOutcomes reads $.parity_branch_outcomes."
+            "pit_lookahead_status and routes any DEGRADED to ParityDegraded "
+            "(ResultPath $.parity_degraded=true). The join unconditionally "
+            "follows the Parallel, so the flag is guaranteed set — the "
+            "DEGRADED analog of the BranchAFailed/BranchBFailed hard-fail "
+            "join already handled structurally above."
+        ),
+        "ParityParallel.WaitForPitParityLookahead": (
+            "Same branch-level fail-open as PitParityLookahead: the poll's "
+            "Catch converges on the same PitParityLookaheadDegraded branch "
+            "terminal; $.parity_degraded is set at the CheckParityBranch"
+            "Outcomes join (alpha-engine-config#6030)."
+        ),
+        "ParityParallel.PitParityWalkforward": (
+            "Same branch-level fail-open as PitParityLookahead: Catch ends "
+            "the branch DEGRADED (PitParityWalkforwardDegraded); the join "
+            "reads $.parity_branch_outcomes.pit_walkforward_status and sets "
+            "$.parity_degraded (alpha-engine-config#6030)."
+        ),
+        "ParityParallel.WaitForPitParityWalkforward": (
+            "Same branch-level fail-open as PitParityWalkforward: the poll's "
+            "Catch converges on PitParityWalkforwardDegraded; the flag is "
+            "set at the CheckParityBranchOutcomes join "
+            "(alpha-engine-config#6030)."
+        ),
+        "ParityParallel.ParityReplay": (
+            "Same branch-level fail-open as PitParityLookahead: Catch ends "
+            "the branch DEGRADED (ParityReplayDegraded); the join reads "
+            "$.parity_branch_outcomes.parity_replay_status and sets "
+            "$.parity_degraded (alpha-engine-config#6030)."
+        ),
+        "ParityParallel.WaitForParityReplay": (
+            "Same branch-level fail-open as ParityReplay: the poll's Catch "
+            "converges on ParityReplayDegraded; the flag is set at the "
+            "CheckParityBranchOutcomes join (alpha-engine-config#6030)."
         ),
     },
     "step_function_daily.json": {
