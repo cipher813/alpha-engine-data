@@ -1320,6 +1320,7 @@
       "Parameters": {
         "FunctionName": "alpha-engine-data-spot-dispatcher",
         "Payload": {
+          "execution_id.$": "$$.Execution.Id",
           "workload": "morning-enrich",
           "force_on_demand.$": "$.morning_enrich_retry.force_on_demand"
         }
@@ -1496,6 +1497,7 @@
       "Parameters": {
         "FunctionName": "alpha-engine-data-spot-dispatcher",
         "Payload": {
+          "execution_id.$": "$$.Execution.Id",
           "workload": "morning-arctic-append",
           "force_on_demand.$": "$.morning_arctic_append_retry.force_on_demand"
         }

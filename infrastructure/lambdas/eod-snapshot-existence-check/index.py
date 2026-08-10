@@ -57,10 +57,26 @@ established fleet primitive for the operator-surveillance fan-out
 (`alpha-engine-pipeline-watchdog` is the sibling consumer of the SAME
 `alpha-engine-watchdog-alerts` topic) — mirroring rather than
 reinventing a third paging call site.
+
+**Second artifact: the `eod_pnl` NAV row** (alpha-engine-config-I6733,
+sf-pipeline-policy §4.1 NAV continuity). Every trading day must terminate
+with a row in `trades/eod_pnl.csv` — including days when preopen failed
+and no trades occurred; 2026-08-05–07 left a three-day hole that NAV,
+daily return and the alpha series all inherited, and nothing paged. Same
+three-outcome shape and same pre-midnight timing as the snapshot check
+(the row is written by `executor/eod_reconcile.py`'s full-history export
+at EOD, hours before this probe fires), one difference: severity is
+`error`, not `critical`, because unlike the snapshot the row is
+reconstructible after the fact (`executor/backfill_eod_pnl.py`) — the
+page names that command. The two checks page INDEPENDENTLY: a day can
+have its snapshot and still be missing its NAV row (a reconcile that
+died mid-flight), and vice versa.
 """
 
 from __future__ import annotations
 
+import csv
+import io
 import logging
 import os
 from datetime import datetime
@@ -107,6 +123,74 @@ def _snapshot_exists(s3client, bucket: str, key: str) -> bool:
             return False
         raise
     return True
+
+
+# The full-history NAV export written by executor/eod_reconcile.py (one
+# cumulative CSV, one row per trading day, `date` column in ISO form) —
+# duplicated rather than imported for the same standalone-zip reason as
+# _snapshot_key.
+_EOD_PNL_KEY = "trades/eod_pnl.csv"
+
+
+def _eod_pnl_row_state(s3client, bucket: str, trading_day: str) -> str:
+    """``"PRESENT"`` | ``"ROW_ABSENT"`` | ``"CSV_ABSENT"`` for
+    ``trading_day``'s row in the eod_pnl export. Only a genuine
+    NoSuchKey/404 maps to CSV_ABSENT; any other S3 failure RAISES, and a
+    CSV without a ``date`` column RAISES — couldn't-check is never
+    verified-absent (module docstring point 4)."""
+    try:
+        resp = s3client.get_object(Bucket=bucket, Key=_EOD_PNL_KEY)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey"):
+            return "CSV_ABSENT"
+        raise
+    body = resp["Body"].read().decode("utf-8")
+    reader = csv.DictReader(io.StringIO(body))
+    if not reader.fieldnames or "date" not in reader.fieldnames:
+        raise ValueError(
+            f"s3://{bucket}/{_EOD_PNL_KEY} has no 'date' column — corrupted "
+            f"export; refusing to certify row presence"
+        )
+    for row in reader:
+        if (row.get("date") or "").strip().split(" ")[0] == trading_day:
+            return "PRESENT"
+    return "ROW_ABSENT"
+
+
+def _page_absent_eod_pnl_row(trading_day: str, state: str) -> None:
+    """Page the NAV-continuity breach. Severity `error` (recoverable via
+    backfill, unlike the irreversible snapshot). No dedup_key for the same
+    once-per-day reason as _page_absent_snapshot."""
+    what = (
+        f"the whole export s3://{BUCKET}/{_EOD_PNL_KEY} is MISSING"
+        if state == "CSV_ABSENT"
+        else f"s3://{BUCKET}/{_EOD_PNL_KEY} has no row for {trading_day}"
+    )
+    message = (
+        f"NAV continuity breach (sf-pipeline-policy §4.1, "
+        f"alpha-engine-config-I6733): {what} as of the pre-midnight check. "
+        f"Every trading day must produce an eod_pnl row — including days "
+        f"with no trades; 2026-08-05–07 left a silent three-day hole that "
+        f"NAV, daily return and the alpha series all inherited. The row is "
+        f"written by executor/eod_reconcile.py's full-history export, so "
+        f"either the postclose reconcile never ran for {trading_day} or it "
+        f"died before the export. Recover: "
+        f"`python executor/backfill_eod_pnl.py --date {trading_day} --dry-run` "
+        f"on ae-trading (then without --dry-run)."
+    )
+    result = alerts.publish(
+        message=message,
+        severity="error",
+        source="alpha-engine-eod-snapshot-existence-check",
+        sns=True,
+        telegram=False,
+        sns_topic_arn=SNS_TOPIC_ARN,
+    )
+    logger.warning(
+        "EOD-PNL-ROW-CHECK ALERT: trading_day=%s state=%s sns_ok=%s",
+        trading_day, state, result.sns.ok,
+    )
 
 
 def _page_absent_snapshot(trading_day: str, key: str) -> None:
@@ -160,9 +244,27 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     key = _snapshot_key(trading_day)
 
     s3client = boto3.client("s3", region_name=REGION)
-    if _snapshot_exists(s3client, BUCKET, key):
-        logger.info("Snapshot present: s3://%s/%s — silent success.", BUCKET, key)
-        return {"action": "noop", "reason": "snapshot_present", "trading_day": trading_day}
+    snapshot_present = _snapshot_exists(s3client, BUCKET, key)
+    pnl_state = _eod_pnl_row_state(s3client, BUCKET, trading_day)
 
-    _page_absent_snapshot(trading_day, key)
-    return {"action": "paged", "reason": "snapshot_absent", "trading_day": trading_day, "key": key}
+    pages: list[str] = []
+    if not snapshot_present:
+        _page_absent_snapshot(trading_day, key)
+        pages.append("snapshot_absent")
+    if pnl_state != "PRESENT":
+        _page_absent_eod_pnl_row(trading_day, pnl_state)
+        pages.append(
+            "eod_pnl_row_absent" if pnl_state == "ROW_ABSENT" else "eod_pnl_csv_absent"
+        )
+
+    if not pages:
+        logger.info(
+            "Snapshot + eod_pnl row present for %s — silent success.", trading_day
+        )
+        return {"action": "noop", "reason": "artifacts_present", "trading_day": trading_day}
+    return {
+        "action": "paged",
+        "reason": "+".join(pages),
+        "trading_day": trading_day,
+        "key": key,
+    }
