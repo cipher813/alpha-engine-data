@@ -114,7 +114,10 @@ class TestEntryEdgesRouteThroughGates:
         assert states["AcquireMutex"]["Next"] == "StartTradingInstance"
         failopen = [c["Next"] for c in states["AcquireMutex"]["Catch"]
                     if "States.ALL" in c["ErrorEquals"]]
-        assert failopen == ["StartTradingInstance"]
+        # alpha-engine-config#6722: routes through SetMutexAcquireDegradedFlag
+        # before continuing to StartTradingInstance exactly as before.
+        assert failopen == ["SetMutexAcquireDegradedFlag"]
+        assert states["SetMutexAcquireDegradedFlag"]["Next"] == "StartTradingInstance"
         # The ensure-running block's SSM-ready path must land on the first gate,
         # which is now the hoisted deploy-refresh gate (config#1549).
         online = [c["Next"] for c in states["SSMReadyChoice"]["Choices"]

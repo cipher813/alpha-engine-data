@@ -189,6 +189,15 @@ STAGES: tuple[Stage, ...] = (
             "PipelineContractGateDegraded", "PublishPipelineContractGateDegraded",
             "EvaluatorGateDegraded", "PublishEvaluatorGateDegraded",
             "EvaluatorDirectorGateDegraded", "PublishEvaluatorDirectorGateDegraded",
+            # alpha-engine-config#6722: AcquireMutex's mutex-acquire
+            # infra-error fail-open (DynamoDB outage/IAM drift/transient SDK
+            # error — the SEPARATE ConditionalCheckFailedException conflict
+            # case still hard-Fails via MutexConflict) is the same KIND of
+            # pre-workload precondition check as the four gate pairs above,
+            # even though it sits later in the chain (after
+            # EvaluatorDeployDriftCheck) — folded into this same bucket
+            # rather than a new single-purpose Stage row.
+            "SetMutexAcquireDegradedFlag", "PublishMutexAcquireDegraded",
         }),
         emit_skip=False,
         note=(
@@ -224,11 +233,18 @@ STAGES: tuple[Stage, ...] = (
         "scanner", "skip_scanner",
         "CheckSkipScanner", "Scanner",
         frozenset({"CheckSkipRegimeSubstrate"}),
+        # alpha-engine-config#6722: Scanner's fail-open Catch previously set
+        # no flag at all — MarkScannerDegraded now threads
+        # $.research_degraded_local (folded into the top-level
+        # $.research_predictor_degraded post-join) without changing the
+        # continuation.
+        degraded_witness=frozenset({"MarkScannerDegraded"}),
     ),
     Stage(
         "regime_substrate", "skip_regime_substrate",
         "CheckSkipRegimeSubstrate", "RegimeSubstrate",
         frozenset({"CheckSkipSignalsEnvelope"}),
+        degraded_witness=frozenset({"MarkRegimeSubstrateDegraded"}),
     ),
     Stage(
         "signals_envelope", "skip_signals_envelope",
@@ -247,6 +263,7 @@ STAGES: tuple[Stage, ...] = (
         "challenger_shadow", "skip_challenger_shadow",
         "CheckSkipChallengerShadow", "ChallengerShadow",
         frozenset({"CheckSkipRAGIngestion"}),
+        degraded_witness=frozenset({"MarkChallengerShadowDegraded"}),
     ),
     Stage(
         "rag_ingestion", "skip_rag_ingestion",
@@ -266,6 +283,7 @@ STAGES: tuple[Stage, ...] = (
         "regime_retrospective_eval", "skip_regime_retrospective_eval",
         "CheckSkipRegimeRetrospectiveEval", "RegimeRetrospectiveEval",
         frozenset({"CheckSkipDataPhase2"}),
+        degraded_witness=frozenset({"MarkRegimeRetrospectiveEvalDegraded"}),
     ),
     Stage(
         "data_phase2", "skip_data_phase2",
@@ -276,26 +294,41 @@ STAGES: tuple[Stage, ...] = (
         "eval_judge", "skip_eval_judge",
         "CheckSkipEvalJudge", "ComputeEvalCadence",
         frozenset({"CheckSkipRationaleClustering"}),
+        # alpha-engine-config#6722: MarkEvalJudgeDegraded is the shared
+        # convergence for all four submit/poll/process fail-opens;
+        # MarkEvalRollingMeanDegraded covers EvalRollingMean's own Catch —
+        # both sit between this stage's gate and its witness, so both
+        # belong to this row (there is no separate eval_rolling_mean row).
+        degraded_witness=frozenset({
+            "MarkEvalJudgeDegraded", "MarkEvalRollingMeanDegraded",
+        }),
     ),
     Stage(
         "rationale_clustering", "skip_rationale_clustering",
         "CheckSkipRationaleClustering", "RationaleClustering",
         frozenset({"CheckSkipReplayConcordance"}),
+        degraded_witness=frozenset({"MarkRationaleClusteringDegraded"}),
     ),
     Stage(
         "replay_concordance", "skip_replay_concordance",
         "CheckSkipReplayConcordance", "ReplayConcordance",
         frozenset({"CheckSkipCounterfactual"}),
+        degraded_witness=frozenset({"MarkReplayConcordanceDegraded"}),
     ),
     Stage(
         "counterfactual", "skip_counterfactual",
         "CheckSkipCounterfactual", "Counterfactual",
         frozenset({"CheckSkipAggregateCosts"}),
+        degraded_witness=frozenset({"MarkCounterfactualDegraded"}),
     ),
     Stage(
         "aggregate_costs", "skip_aggregate_costs",
         "CheckSkipAggregateCosts", "AggregateCosts",
         frozenset({"BranchAComplete"}),
+        # alpha-engine-config#6722: matches sf-pipeline-policy.md §5's named
+        # cost-aggregation carve-out, which REQUIRES a degraded flag —
+        # MarkAggregateCostsDegraded now provides it.
+        degraded_witness=frozenset({"MarkAggregateCostsDegraded"}),
     ),
     # --- ResearchPredictorParallel branch B -------------------------------
     Stage(
@@ -312,6 +345,18 @@ STAGES: tuple[Stage, ...] = (
             "skip_predictor_training also skips the best-effort model-zoo"
             " rotation (the flag ends branch B; zoo has no separate gate)."
         ),
+        # alpha-engine-config#6722: the model-zoo rotation group's five
+        # fail-open Catches (ResolveZooSpecs/WaitResolveZoo/ModelZooTrainMap/
+        # ModelZooSelect/WaitForModelZoo) all converge on ONE shared
+        # MarkModelZooDegraded. ACCEPTED trade-off (same granularity limit
+        # this row's note already documents — zoo has no separate gate): a
+        # degraded rotation marks the WHOLE predictor_training stage
+        # degraded, so the rerun sets skip_predictor_training=false and
+        # re-trains the champion even though training itself already
+        # succeeded — there is no finer lever to retry only the rotation.
+        # Correct-but-wasteful is preferred over the pre-#6722 status quo of
+        # the rerun silently skipping a degraded rotation as fully clean.
+        degraded_witness=frozenset({"MarkModelZooDegraded"}),
     ),
     # --- post-parallel tail ------------------------------------------------
     Stage(

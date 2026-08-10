@@ -118,11 +118,15 @@ class TestEdges:
     def test_scanner_success_and_catch_converge_on_predictor_gate(self, states):
         assert states["Scanner"]["Next"] == "CheckSkipPredictorInference"
         catches = states["Scanner"]["Catch"]
+        # alpha-engine-config#6722: the Catch now routes through
+        # SetScannerDegradedFlag before converging on
+        # CheckSkipPredictorInference exactly as before.
         assert any(
-            c["Next"] == "CheckSkipPredictorInference"
+            c["Next"] == "SetScannerDegradedFlag"
             and "States.ALL" in c["ErrorEquals"]
             for c in catches
         )
+        assert states["SetScannerDegradedFlag"]["Next"] == "CheckSkipPredictorInference"
 
     def test_no_direct_edge_from_arctic_to_predictor_bypassing_scanner(self, states):
         """Regression: Arctic success must not skip the new Scanner gate."""

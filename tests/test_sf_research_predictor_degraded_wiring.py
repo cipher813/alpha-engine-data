@@ -1,0 +1,414 @@
+"""alpha-engine-config#6722 — ResearchPredictorParallel's own internal
+fail-open Catch routes must propagate to the terminal notifier.
+
+Context: alpha-engine-config#6715 built
+tests/test_sf_structural_contract.py::test_every_fail_open_catch_route_sets_the_degraded_flag_or_is_exempt,
+a structural walker asserting every fail-open Catch route passes through a
+state that writes the degraded-flag JSONPath the terminal notifier actually
+reads. Running it against step_function.json surfaced 21 pre-existing gaps
+inside ResearchPredictorParallel (config#6722's full list) — the walker
+itself cannot trace them directly because ASL Parallel branches are isolated
+JSONPath scopes: a Pass state inside a branch cannot write an outer-scope
+path like $.gate_degraded, so no fix inside a branch is ever visible to a
+generic forward walk starting at top-level Choice states.
+
+The fix (mirrors PR1277's ParityParallel branch-fold pattern,
+alpha-engine-config#6030's CheckParityBranchOutcomes):
+  1. Each branch seeds a branch-LOCAL $.research_degraded_local=false at its
+     own StartAt (InitResearchDegradedFlag for Branch A, InitPredictorDegradedFlag
+     for Branch B).
+  2. Every fail-open Catch inside a branch routes through a small
+     Mark*Degraded Pass state that sets $.research_degraded_local=true
+     without changing the original continuation.
+  3. Every branch terminal (BranchAComplete/BranchAFailed,
+     BranchBComplete/BranchBFailed/PredictorTrainingSkipped) hoists that
+     local marker into its own branch_a_degraded/branch_b_degraded field,
+     UNCONDITIONALLY (including the false/skip/failed paths) so the
+     post-join Parameters.$ extraction can never throw States.Runtime.
+  4. AggregateBranchOutcomes (the Parallel join) hoists both fields onto
+     $.branch_outcomes.
+  5. CheckResearchPredictorDegraded (new Choice, spliced onto
+     CheckBranchOutcomes' non-FAILED Default) ORs the two branch flags and,
+     if either is true, routes through SetResearchPredictorDegraded — the
+     SOLE writer of the new top-level $.research_predictor_degraded flag —
+     before continuing to CheckSkipBacktester exactly as the clean path
+     always did.
+  6. CheckGateDegradedNotify (the terminal completion-email selector) gets a
+     new top rule: research_predictor_degraded=true ALWAYS routes to the
+     generic NotifyCompleteMultipleDegraded, even when it is the ONLY family
+     degraded — deliberately given no single-flag notifier of its own,
+     since it already covers 25+ distinct internal routes.
+
+Because the generic structural walker cannot verify a cross-branch fold,
+the 21 corresponding tests/test_sf_structural_contract.py
+_DEGRADED_FLAG_EXEMPT entries stay in place (not deleted) with their
+"VIOLATION — tracked" reason replaced by a real, verified justification
+citing this module — the same disposition PR1277 used for ParityParallel's
+six intra-branch entries.
+"""
+from __future__ import annotations
+
+import itertools
+import json
+import pathlib
+
+import pytest
+
+_WEEKLY = pathlib.Path(__file__).parent.parent / "infrastructure" / "step_function.json"
+
+
+@pytest.fixture(scope="module")
+def sf() -> dict:
+    return json.loads(_WEEKLY.read_text())
+
+
+@pytest.fixture(scope="module")
+def states(sf) -> dict:
+    return sf["States"]
+
+
+@pytest.fixture(scope="module")
+def parallel(states) -> dict:
+    return states["ResearchPredictorParallel"]
+
+
+@pytest.fixture(scope="module")
+def branch_a(parallel) -> dict:
+    return parallel["Branches"][0]["States"]
+
+
+@pytest.fixture(scope="module")
+def branch_b(parallel) -> dict:
+    return parallel["Branches"][1]["States"]
+
+
+# ---------------------------------------------------------------------------
+# Branch-local seeding
+# ---------------------------------------------------------------------------
+
+
+def test_branch_a_starts_at_init_research_degraded(parallel):
+    assert parallel["Branches"][0]["StartAt"] == "InitResearchDegradedFlag"
+
+
+def test_branch_b_starts_at_init_predictor_degraded(parallel):
+    assert parallel["Branches"][1]["StartAt"] == "InitPredictorDegradedFlag"
+
+
+def test_init_research_degraded_seeds_false(branch_a):
+    st = branch_a["InitResearchDegradedFlag"]
+    assert st["Type"] == "Pass"
+    assert st["Result"] is False
+    assert st["ResultPath"] == "$.research_degraded_local"
+    assert st["Next"] == "CheckSkipScanner"
+
+
+def test_init_predictor_degraded_seeds_false(branch_b):
+    st = branch_b["InitPredictorDegradedFlag"]
+    assert st["Type"] == "Pass"
+    assert st["Result"] is False
+    assert st["ResultPath"] == "$.research_degraded_local"
+    assert st["Next"] == "CheckSkipPredictorTraining"
+
+
+# ---------------------------------------------------------------------------
+# Branch A Mark*Degraded states — each threads the local flag without
+# changing the pre-existing fail-open continuation.
+# ---------------------------------------------------------------------------
+
+_BRANCH_A_MARK_STATES = {
+    "MarkScannerDegraded": "CheckSkipRegimeSubstrate",
+    "MarkRegimeSubstrateDegraded": "CheckSkipSignalsEnvelope",
+    "MarkChallengerShadowDegraded": "CheckSkipRAGIngestion",
+    "MarkRegimeRetrospectiveEvalDegraded": "CheckSkipDataPhase2",
+    "MarkEvalJudgeDegraded": "EvalRollingMean",
+    "MarkEvalRollingMeanDegraded": "CheckSkipRationaleClustering",
+    "MarkRationaleClusteringDegraded": "CheckSkipReplayConcordance",
+    "MarkReplayConcordanceDegraded": "CheckSkipCounterfactual",
+    "MarkCounterfactualDegraded": "CheckSkipAggregateCosts",
+    "MarkAggregateCostsDegraded": "BranchAComplete",
+}
+
+
+@pytest.mark.parametrize("name,next_target", sorted(_BRANCH_A_MARK_STATES.items()))
+def test_branch_a_mark_state_shape(branch_a, name, next_target):
+    st = branch_a[name]
+    assert st["Type"] == "Pass"
+    assert st["Result"] is True
+    assert st["ResultPath"] == "$.research_degraded_local"
+    assert st["Next"] == next_target
+
+
+@pytest.mark.parametrize(
+    "owner",
+    [
+        "Scanner",
+        "RegimeSubstrate",
+        "ChallengerShadow",
+        "RegimeRetrospectiveEval",
+        "EvalJudgeSubmitFirstSaturday",
+        "EvalJudgeSubmitWeekly",
+        "EvalJudgePoll",
+        "EvalJudgeProcess",
+        "EvalRollingMean",
+        "RationaleClustering",
+        "ReplayConcordance",
+        "Counterfactual",
+        "AggregateCosts",
+    ],
+)
+def test_branch_a_owner_catch_routes_through_a_mark_state(branch_a, owner):
+    """Every one of the 12 fail-open owner states routes its Catch through
+    SOME Mark*Degraded state (shared where multiple owners converge, e.g.
+    all four eval-judge submit/poll/process states share
+    MarkEvalJudgeDegraded — the pre-existing convergence on EvalRollingMean
+    is unchanged, only detoured through the flag-setter)."""
+    (catch,) = branch_a[owner]["Catch"]
+    assert catch["Next"].startswith("Mark") and catch["Next"].endswith("Degraded")
+    assert catch["Next"] in branch_a
+    assert branch_a[catch["Next"]]["ResultPath"] == "$.research_degraded_local"
+
+
+def test_thinktank_degraded_repointed_to_local_flag(branch_a):
+    """alpha-engine-config#6722: ThinkTankDegraded previously wrote the DEAD
+    $.thinktank_degraded (never read anywhere). Repointed to the same
+    branch-local marker every other Branch A fail-open uses."""
+    st = branch_a["ThinkTankDegraded"]
+    assert st["Type"] == "Pass"
+    assert st["Result"] is True
+    assert st["ResultPath"] == "$.research_degraded_local"
+    assert st["Next"] == "CheckSkipRegimeRetrospectiveEval"
+
+
+def test_no_state_writes_the_old_dead_thinktank_path(branch_a, branch_b, states):
+    """Regression guard: $.thinktank_degraded must have zero writers anywhere
+    in the file post-repoint — a stray second writer would resurrect the
+    dead-flag trap config#6715 was built to catch."""
+    all_states = {**states, **branch_a, **branch_b}
+    writers = [
+        name for name, st in all_states.items()
+        if isinstance(st, dict) and st.get("ResultPath") == "$.thinktank_degraded"
+    ]
+    assert writers == []
+
+
+# ---------------------------------------------------------------------------
+# Branch B: the model-zoo rotation group shares ONE convergence point
+# (PublishModelZooFailureImmediate) for all 5 fail-open Catches.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "owner",
+    ["ResolveZooSpecs", "WaitResolveZoo", "ModelZooTrainMap", "ModelZooSelect", "WaitForModelZoo"],
+)
+def test_branch_b_model_zoo_owner_catch_converges_on_publish(branch_b, owner):
+    (catch,) = branch_b[owner]["Catch"]
+    assert catch["Next"] == "PublishModelZooFailureImmediate"
+
+
+def test_publish_model_zoo_failure_routes_through_mark_model_zoo_degraded(branch_b):
+    st = branch_b["PublishModelZooFailureImmediate"]
+    assert st["Next"] == "MarkModelZooDegraded"
+    (catch,) = st["Catch"]
+    assert catch["Next"] == "MarkModelZooDegraded"
+
+
+def test_mark_model_zoo_degraded_shape(branch_b):
+    st = branch_b["MarkModelZooDegraded"]
+    assert st["Type"] == "Pass"
+    assert st["Result"] is True
+    assert st["ResultPath"] == "$.research_degraded_local"
+    assert st["Next"] == "BranchBComplete"
+
+
+# ---------------------------------------------------------------------------
+# Every branch terminal sets its *_degraded field UNCONDITIONALLY — the
+# Parameters.$ extraction downstream must never throw States.Runtime.
+# ---------------------------------------------------------------------------
+
+
+def test_branch_a_complete_hoists_local_flag(branch_a):
+    st = branch_a["BranchAComplete"]
+    assert st["Parameters"]["branch_a_status"] == "OK"
+    assert st["Parameters"]["branch_a_degraded.$"] == "$.research_degraded_local"
+
+
+def test_branch_a_failed_sets_degraded_false(branch_a):
+    st = branch_a["BranchAFailed"]
+    assert st["Parameters"]["branch_a_status"] == "FAILED"
+    assert st["Parameters"]["branch_a_degraded"] is False
+
+
+def test_branch_b_complete_hoists_local_flag(branch_b):
+    st = branch_b["BranchBComplete"]
+    assert st["Parameters"]["branch_b_status"] == "OK"
+    assert st["Parameters"]["branch_b_degraded.$"] == "$.research_degraded_local"
+
+
+def test_branch_b_failed_sets_degraded_false(branch_b):
+    st = branch_b["BranchBFailed"]
+    assert st["Parameters"]["branch_b_status"] == "FAILED"
+    assert st["Parameters"]["branch_b_degraded"] is False
+
+
+def test_predictor_training_skipped_sets_degraded_false(branch_b):
+    st = branch_b["PredictorTrainingSkipped"]
+    assert st["Result"]["branch_b_status"] == "OK"
+    assert st["Result"]["branch_b_degraded"] is False
+
+
+# ---------------------------------------------------------------------------
+# The post-join fold
+# ---------------------------------------------------------------------------
+
+
+def test_aggregate_branch_outcomes_hoists_both_degraded_fields(states):
+    p = states["AggregateBranchOutcomes"]["Parameters"]
+    assert p["branch_a_degraded.$"] == "$.parallel_result[0].branch_a.branch_a_degraded"
+    assert p["branch_b_degraded.$"] == "$.parallel_result[1].branch_b.branch_b_degraded"
+
+
+def test_check_branch_outcomes_default_is_the_degraded_fold(states):
+    assert states["CheckBranchOutcomes"]["Default"] == "CheckResearchPredictorDegraded"
+
+
+def test_check_research_predictor_degraded_ors_both_branches(states):
+    """config#2275: each Or leaf is itself an IsPresent-guarded
+    And:[{IsPresent},{BooleanEquals}] pair — a bare Or of unguarded
+    BooleanEquals leaves would States.Runtime on any payload where a branch
+    field happens to be absent (tests/test_sf_choice_guards.py enforces this
+    convention repo-wide)."""
+    c = states["CheckResearchPredictorDegraded"]
+    assert c["Type"] == "Choice"
+    (choice,) = c["Choices"]
+    leaf_vars = set()
+    for and_leaf in choice["Or"]:
+        conds = and_leaf["And"]
+        var_names = {cond["Variable"] for cond in conds}
+        assert len(var_names) == 1, "each Or leaf must guard exactly one Variable"
+        (var,) = var_names
+        leaf_vars.add(var)
+        present = next(c for c in conds if "IsPresent" in c)
+        boolean = next(c for c in conds if "BooleanEquals" in c)
+        assert present["IsPresent"] is True
+        assert boolean["BooleanEquals"] is True
+    assert leaf_vars == {
+        "$.branch_outcomes.branch_a_degraded",
+        "$.branch_outcomes.branch_b_degraded",
+    }
+    assert choice["Next"] == "SetResearchPredictorDegraded"
+    assert c["Default"] == "CheckSkipBacktester"
+
+
+def test_set_research_predictor_degraded_shape(states):
+    st = states["SetResearchPredictorDegraded"]
+    assert st["Type"] == "Pass"
+    assert st["Result"] is True
+    assert st["ResultPath"] == "$.research_predictor_degraded"
+    assert st["Next"] == "CheckSkipBacktester"
+
+
+def test_only_set_research_predictor_degraded_writes_the_flag(states):
+    """SF-controlled: exactly one Pass state may write
+    $.research_predictor_degraded (mirrors test_only_parity_degraded_pass_sets_the_flag)."""
+    writers = [
+        name for name, st in states.items()
+        if st.get("ResultPath") == "$.research_predictor_degraded"
+    ]
+    assert writers == ["SetResearchPredictorDegraded"]
+
+
+# ---------------------------------------------------------------------------
+# The hard invariant: research_predictor_degraded=true never reaches plain
+# NotifyComplete, for every combination of the five degraded flags, and
+# ALWAYS resolves to the generic combined notifier (no dedicated single-flag
+# notifier exists for this family by design).
+# ---------------------------------------------------------------------------
+
+
+def _notify_target(states, data: dict) -> str:
+    """Evaluate the CheckShellRunNotify -> CheckGateDegradedNotify selection
+    with ASL short-circuit semantics against a partial payload. Mirrors
+    tests/test_sf_parity_gate_notify_wiring.py::_notify_target exactly."""
+    def eval_rule(rule):
+        if "And" in rule:
+            return all(eval_rule(op) for op in rule["And"])
+        var = rule["Variable"].lstrip("$.")
+        present = var in data
+        if "IsPresent" in rule:
+            return present == rule["IsPresent"]
+        assert present, f"unguarded dereference of {var} in drill payload {data}"
+        return data[var] == rule["BooleanEquals"]
+
+    cur = "CheckShellRunNotify"
+    while states[cur]["Type"] == "Choice":
+        for rule in states[cur]["Choices"]:
+            if eval_rule(rule):
+                cur = rule["Next"]
+                break
+        else:
+            cur = states[cur]["Default"]
+    return cur
+
+
+_FLAGS = (
+    "gate_degraded",
+    "health_check_degraded",
+    "report_card_degraded",
+    "parity_degraded",
+    "research_predictor_degraded",
+)
+_FLAG_COMBOS = [dict(zip(_FLAGS, bits)) for bits in itertools.product([True, False], repeat=len(_FLAGS))]
+
+
+@pytest.mark.parametrize(
+    "combo",
+    _FLAG_COMBOS,
+    ids=lambda c: (
+        ("g" if c["gate_degraded"] else "-")
+        + ("h" if c["health_check_degraded"] else "-")
+        + ("r" if c["report_card_degraded"] else "-")
+        + ("p" if c["parity_degraded"] else "-")
+        + ("R" if c["research_predictor_degraded"] else "-")
+    ),
+)
+def test_research_predictor_degraded_never_reaches_plain_notify_complete(states, combo):
+    payload = {k: True for k, v in combo.items() if v}
+    target = _notify_target(states, payload)
+    if combo["research_predictor_degraded"]:
+        assert target != "NotifyComplete", (
+            f"payload {payload} reached plain NotifyComplete — a "
+            "ResearchPredictorParallel internal degradation must always "
+            "surface in the terminal notification (weekly-sf-policy.md "
+            "§2.3/§2.3a)"
+        )
+        assert target == "NotifyCompleteMultipleDegraded", (
+            f"payload {payload} resolved to {target!r} — "
+            "research_predictor_degraded is deliberately folded into the "
+            "generic combined notifier ONLY, with no single-flag notifier "
+            "of its own."
+        )
+        subject = states[target]["Parameters"]["Subject"]
+        message = states[target]["Parameters"]["Message"]
+        assert "research" in message.lower() or "research" in subject.lower()
+    else:
+        if not any(combo.values()):
+            assert target == "NotifyComplete"
+
+
+def test_multiple_degraded_names_research_predictor(states):
+    st = states["NotifyCompleteMultipleDegraded"]
+    subject = st["Parameters"]["Subject"]
+    message = st["Parameters"]["Message"]
+    assert "research_predictor_degraded" in message
+    assert "SUCCESS" in subject and "DEGRADED" in subject
+    assert 0 < len(subject) <= 100
+
+
+def test_multiple_degraded_still_names_all_prior_families(states):
+    """Regression guard: adding the fifth family must not have dropped any
+    of the four pre-existing ones from the generic notifier's text."""
+    message = states["NotifyCompleteMultipleDegraded"]["Parameters"]["Message"].lower()
+    for needle in ("gate", "health check", "report card", "parity"):
+        assert needle in message

@@ -134,7 +134,11 @@ class TestAllEntryPathsEnsureRunning:
         assert states["AcquireMutex"]["Next"] == "StartTradingInstance"
         failopen = [c["Next"] for c in states["AcquireMutex"]["Catch"]
                     if "States.ALL" in c["ErrorEquals"]]
-        assert failopen == ["StartTradingInstance"]
+        # alpha-engine-config#6722: the fail-open now routes through
+        # SetMutexAcquireDegradedFlag (threads $.degraded_summary) before
+        # continuing to StartTradingInstance exactly as before.
+        assert failopen == ["SetMutexAcquireDegradedFlag"]
+        assert states["SetMutexAcquireDegradedFlag"]["Next"] == "StartTradingInstance"
 
     def test_start_block_reaches_first_sendcommand_only_via_readiness(self, states):
         """Static reachability: from StartTradingInstance, no ssm:sendCommand is
