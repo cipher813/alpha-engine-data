@@ -915,10 +915,270 @@ def _check_preopen_buffer(
     )
 
 
+# ── Prior-day failed-run check (alpha-engine-config#6732) ─────────────────
+#
+# sf-pipeline-policy §4.1 requires a liveness detector INDEPENDENT of the
+# pipeline's own notifier that is sensitive to started-but-never-succeeded.
+# The three liveness checks above answer only "did it fire" — a day where
+# every execution FAILED satisfies them by design (``_STARTED_STATUSES``),
+# failure alerting was delegated to the SF's own HandleFailure path (which
+# is exactly the dependent channel §4.1 says not to rely on), and the
+# independent deadman (ExecutionsSucceeded, 7-day period) needs a week of
+# silence to breach. This check closes that combination: on the watchdog
+# firing after a trading day whose weekday/EOD executions all terminated
+# without success AND without a DEGRADED completion marker (the Option-A
+# visible-degrade terminal, which status-keyed watchers already engage on,
+# config#6692), page. Zero-execution days are deliberately excluded — that
+# is the never-fired case the ``_check_sf`` liveness checks above own.
+
+MARKER_BUCKET = os.environ.get("COMPLETION_MARKER_BUCKET", "alpha-engine-research")
+
+# (sf_label suffix, SF ARN, marker pipeline segment). Marker keys follow the
+# definitions' WriteCompletionMarker states: the {date} segment is the UTC
+# date-part of $$.Execution.StartTime — for both pipelines every legal start
+# (preopen 12:15 UTC, postclose ~20:15–23:00 UTC incl. the backstop path)
+# lands on the same UTC calendar date as the PT trading date, so a lookup by
+# PT trading date is exact.
+_FAILED_DAY_PIPELINES = (
+    ("Weekday SF", WEEKDAY_SF_ARN, "ne-preopen-trading-pipeline"),
+    ("EOD SF", EOD_SF_ARN, "ne-postclose-trading-pipeline"),
+)
+
+
+@dataclass(frozen=True)
+class FailedDayCheckResult:
+    """Per-SF outcome of one prior-day failed-run check."""
+
+    sf_label: str
+    checked: bool
+    target_trading_day: Optional[str] = None
+    skip_reason: Optional[str] = None
+    executions_on_day: Optional[int] = None
+    succeeded_on_day: Optional[int] = None
+    marker_status: Optional[str] = None  # None = not consulted
+    alert_emitted: bool = False
+    alert_detail: Optional[str] = None
+
+
+def _statuses_for_day(
+    client: object, sf_arn: str, target_date: date
+) -> "dict[str, int]":
+    """Count executions per status whose ``startDate`` falls on
+    ``target_date`` in PT calendar terms. Pages newest-first per status and
+    stops once rows predate the target day. Date comparison only — no
+    datetime construction, so ``patch("index.datetime")`` in tests never
+    bites (see the module's ``_eod_window_seconds`` note for the pattern).
+    """
+    counts: "dict[str, int]" = {}
+    for status_filter in _STARTED_STATUSES:
+        next_token: Optional[str] = None
+        while True:
+            kwargs = {
+                "stateMachineArn": sf_arn,
+                "statusFilter": status_filter,
+                "maxResults": 100,
+            }
+            if next_token:
+                kwargs["nextToken"] = next_token
+            resp = client.list_executions(**kwargs)
+            stop_paging = False
+            for row in resp.get("executions") or []:
+                start = row.get("startDate")
+                if start is None or not hasattr(start, "astimezone"):
+                    continue
+                start_utc = (
+                    start.astimezone(timezone.utc)
+                    if start.tzinfo
+                    else start.replace(tzinfo=timezone.utc)
+                )
+                start_pt_date = start_utc.astimezone(PT_ZONE).date()
+                if start_pt_date == target_date:
+                    counts[status_filter] = counts.get(status_filter, 0) + 1
+                elif start_pt_date < target_date:
+                    # Newest-first ordering → everything further is older.
+                    stop_paging = True
+                    break
+            if stop_paging:
+                break
+            next_token = resp.get("nextToken")
+            if not next_token:
+                break
+    return counts
+
+
+def _completion_marker_status(
+    s3_client: object, pipeline_name: str, target_date: date
+) -> str:
+    """Status field of the day's completion marker, ``"ABSENT"`` when the
+    key does not exist, ``"UNREADABLE"`` on any other failure.
+
+    UNREADABLE is deliberately distinct from ABSENT and both page (§2.3a:
+    a missing verdict propagates as UNKNOWN, never as pass) — the swallowed
+    failure modes here (S3 errors other than NoSuchKey, unparseable JSON,
+    missing status field) all route to the caller's alert path plus a
+    WARNING log, never to a silent pass.
+    """
+    key = f"_sf_completion/{pipeline_name}/{target_date.isoformat()}.json"
+    try:
+        resp = s3_client.get_object(Bucket=MARKER_BUCKET, Key=key)
+        marker = json.loads(resp["Body"].read())
+        status = marker.get("status") if isinstance(marker, dict) else None
+        if isinstance(status, str) and status:
+            return status
+        logger.warning(
+            "failed-day check: marker s3://%s/%s has no usable status field",
+            MARKER_BUCKET, key,
+        )
+        return "UNREADABLE"
+    except Exception as exc:  # classified below — never a silent pass
+        code = ""
+        response = getattr(exc, "response", None)
+        if isinstance(response, dict):
+            code = (response.get("Error") or {}).get("Code", "")
+        if code in ("NoSuchKey", "404"):
+            return "ABSENT"
+        logger.warning(
+            "failed-day check: marker s3://%s/%s unreadable (%s: %s)",
+            MARKER_BUCKET, key, type(exc).__name__, exc,
+        )
+        return "UNREADABLE"
+
+
+def _check_failed_day(
+    *,
+    sf_label: str,
+    sf_arn: str,
+    pipeline_name: str,
+    target_date: date,
+    client: Optional[object] = None,
+    s3_client: Optional[object] = None,
+) -> FailedDayCheckResult:
+    """Page when ``target_date`` (the most recent closed trading day) had
+    executions for this SF but none SUCCEEDED and no DEGRADED marker was
+    written. See the block comment above for why this exists."""
+    if client is None:  # pragma: no cover — production path
+        client = boto3.client("stepfunctions", region_name=REGION)
+
+    counts = _statuses_for_day(client, sf_arn, target_date)
+    total = sum(counts.values())
+    succeeded = counts.get("SUCCEEDED", 0)
+
+    if total == 0:
+        return FailedDayCheckResult(
+            sf_label=sf_label,
+            checked=True,
+            target_trading_day=target_date.isoformat(),
+            executions_on_day=0,
+            succeeded_on_day=0,
+            skip_reason=(
+                "no executions on the target day — never-fired is the "
+                "liveness checks' case, not this one's"
+            ),
+        )
+    if succeeded > 0:
+        return FailedDayCheckResult(
+            sf_label=sf_label,
+            checked=True,
+            target_trading_day=target_date.isoformat(),
+            executions_on_day=total,
+            succeeded_on_day=succeeded,
+        )
+
+    running = counts.get("RUNNING", 0)
+    if running > 0:
+        # A prior-day execution still RUNNING at 14:00 UTC the next day is
+        # inside the definitions' top-level TimeoutSeconds only marginally
+        # (postclose ceiling 18h from a ~20:15 UTC start). Don't declare the
+        # day failed yet — but say so at warning severity rather than
+        # silently deferring: an 18h run is itself a hang in the making.
+        message = (
+            f"{sf_label} ({pipeline_name}) still has {running} RUNNING "
+            f"execution(s) from trading day {target_date} at watchdog time — "
+            f"no SUCCEEDED execution for that day yet. This is at or beyond "
+            f"the definition's top-level timeout horizon; investigate: "
+            f"`aws stepfunctions list-executions --state-machine-arn {sf_arn} "
+            f"--max-results 10`."
+        )
+        dedup_key = f"pipeline-watchdog-failed-day-{pipeline_name}-{target_date.isoformat()}"
+        alert_detail = _publish_watchdog_alert(
+            message,
+            severity="warning",
+            dedup_key=dedup_key,
+            context={"sf_label": sf_label, "sf_arn": sf_arn,
+                     "target_trading_day": target_date.isoformat()},
+        )
+        return FailedDayCheckResult(
+            sf_label=sf_label,
+            checked=True,
+            target_trading_day=target_date.isoformat(),
+            executions_on_day=total,
+            succeeded_on_day=0,
+            alert_emitted=True,
+            alert_detail=alert_detail,
+        )
+
+    if s3_client is None:  # pragma: no cover — production path
+        s3_client = boto3.client("s3", region_name=REGION)
+    marker_status = _completion_marker_status(s3_client, pipeline_name, target_date)
+
+    if marker_status == "DEGRADED":
+        # Option-A visible degrade (config#6692): the run terminated in a
+        # Fail state on purpose, the marker says so, and status-keyed
+        # watchers engaged. Not a silent failure — do not double-page.
+        logger.info(
+            "failed-day clear (degraded-by-design): sf=%s day=%s marker=DEGRADED",
+            sf_label, target_date,
+        )
+        return FailedDayCheckResult(
+            sf_label=sf_label,
+            checked=True,
+            target_trading_day=target_date.isoformat(),
+            executions_on_day=total,
+            succeeded_on_day=0,
+            marker_status=marker_status,
+        )
+
+    marker_clause = {
+        "ABSENT": "no completion marker was written",
+        "UNREADABLE": "the completion marker could not be read/parsed (UNKNOWN ≠ pass)",
+    }.get(marker_status, f"completion marker status={marker_status!r}")
+    message = (
+        f"{sf_label} ({pipeline_name}) FAILED trading day {target_date}: "
+        f"{total} execution(s) started, none SUCCEEDED, and {marker_clause}. "
+        f"This is the independent started-but-never-succeeded detector "
+        f"(sf-pipeline-policy §4.1, alpha-engine-config#6732) — do not assume "
+        f"the SF's own failure notification fired. Recover mechanically with "
+        f"the rerun helper: `python scripts/weekday_sf_rerun.py "
+        f"--execution-arn <failed execution arn> --dry-run` (then `--start`); "
+        f"list candidates: `aws stepfunctions list-executions "
+        f"--state-machine-arn {sf_arn} --max-results 10`."
+    )
+    dedup_key = f"pipeline-watchdog-failed-day-{pipeline_name}-{target_date.isoformat()}"
+    alert_detail = _publish_watchdog_alert(
+        message,
+        severity="error",
+        dedup_key=dedup_key,
+        context={"sf_label": sf_label, "sf_arn": sf_arn,
+                 "target_trading_day": target_date.isoformat(),
+                 "marker_status": marker_status},
+    )
+    return FailedDayCheckResult(
+        sf_label=sf_label,
+        checked=True,
+        target_trading_day=target_date.isoformat(),
+        executions_on_day=total,
+        succeeded_on_day=0,
+        marker_status=marker_status,
+        alert_emitted=True,
+        alert_detail=alert_detail,
+    )
+
+
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
-    """EventBridge cron handler. Runs the 3 per-SF liveness checks + the
-    preopen schedule-buffer canary, and returns a structured summary the
-    Lambda console / CW logs can read at a glance."""
+    """EventBridge cron handler. Runs the 3 per-SF liveness checks, the
+    preopen schedule-buffer canary, and the 2 prior-day failed-run checks,
+    and returns a structured summary the Lambda console / CW logs can read
+    at a glance."""
     now_utc = datetime.now(timezone.utc)
     is_trading_today = _is_trading_day_now(now_utc)
     is_sunday = now_utc.weekday() == 6  # Mon=0..Sun=6
@@ -968,6 +1228,21 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         is_watch_day=is_trading_today,
     )
 
+    # Prior-day failed-run checks (config#6732). The target is the most
+    # recent CLOSED trading day, which exists on every calendar day — so
+    # these run on weekends and holidays too (a Friday failure pages
+    # Saturday 14:00 UTC, not Monday).
+    failed_day_target = last_closed_trading_day(now_utc)
+    failed_day = [
+        _check_failed_day(
+            sf_label=label,
+            sf_arn=arn,
+            pipeline_name=pipeline,
+            target_date=failed_day_target,
+        )
+        for label, arn, pipeline in _FAILED_DAY_PIPELINES
+    ]
+
     summary = {
         "fired_at_utc": now_utc.isoformat(),
         "is_trading_today": is_trading_today,
@@ -996,6 +1271,20 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             "trend_days_used": preopen_buffer.trend_days_used,
             "trend_alert_emitted": preopen_buffer.trend_alert_emitted,
         },
+        "failed_day_checks": [
+            {
+                "sf_label": c.sf_label,
+                "checked": c.checked,
+                "target_trading_day": c.target_trading_day,
+                "skip_reason": c.skip_reason,
+                "executions_on_day": c.executions_on_day,
+                "succeeded_on_day": c.succeeded_on_day,
+                "marker_status": c.marker_status,
+                "alert_emitted": c.alert_emitted,
+                "alert_detail": c.alert_detail,
+            }
+            for c in failed_day
+        ],
     }
     logger.info("watchdog summary: %s", summary)
     return summary
