@@ -1352,7 +1352,17 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
         )
     dedup_key = resolve_dedup_key(spec, now)
 
-    publish(
+    # config-I6796: `publish()` is the only channel here whose dedup actually
+    # matches the artifact's own cadence (dedup_window_min=None + a
+    # cycle-scoped dedup_key ⇒ exactly one send per cadence window). Flow-doctor's
+    # Telegram dedup is a fleet-wide 1-minute DynamoDB cooldown
+    # (flow_doctor_telegram.build_flow_doctor_config) completely decoupled from
+    # cadence — any artifact re-evaluated more than 1 minute apart (every 30-min
+    # intraday tick, or the daily vs. historical cron) re-pages Telegram even
+    # though `dedup_key` is unchanged. Gating the Telegram send on `publish()`'s
+    # own dedup verdict makes the already-correct cadence-window dedup the single
+    # source of truth for BOTH channels, instead of letting Telegram ignore it.
+    publish_result = publish(
         body,
         severity=severity,
         source="freshness-monitor",
@@ -1360,6 +1370,14 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
         dedup_window_min=None,  # one alert per cadence window — substrate handles cycle bucketing
         telegram=False,
     )
+    if publish_result.dedup_skipped:
+        logger.info(
+            "telegram suppressed (config-I6796): %s state=%s already paged "
+            "this cadence window (%s)",
+            spec.artifact_id, result.state, publish_result.dedup_reason,
+        )
+        return True
+
     notify_via_flow_doctor(
         body,
         silent=False,
