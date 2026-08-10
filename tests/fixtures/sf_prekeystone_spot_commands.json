@@ -48,14 +48,41 @@
     "export HOME=/home/ec2-user",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug morning-enrich --log /var/log/morning-enrich.log -- bash infrastructure/spot_morning_enrich.sh"
   ],
-  "Parity": [
+  "ParityReplay": [
     "set -eo pipefail",
     "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
     "export RUN_DATE='2026-05-18'",
-    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug parity --log /var/log/parity.log -- bash infrastructure/spot_parity.sh"
+    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug parity-replay --log /var/log/parity-replay.log -- bash infrastructure/spot_parity_replay.sh"
+  ],
+  "PitParityCompare": [
+    "set -eo pipefail",
+    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "cd /home/ec2-user/alpha-engine-backtester",
+    "export HOME=/home/ec2-user",
+    "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
+    "export RUN_DATE='2026-05-18'",
+    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug parity-compare --log /var/log/parity-compare.log -- bash infrastructure/spot_parity_compare.sh"
+  ],
+  "PitParityLookahead": [
+    "set -eo pipefail",
+    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "cd /home/ec2-user/alpha-engine-backtester",
+    "export HOME=/home/ec2-user",
+    "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
+    "export RUN_DATE='2026-05-18'",
+    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug pit-lookahead --log /var/log/pit-lookahead.log -- bash infrastructure/spot_pit_lookahead.sh"
+  ],
+  "PitParityWalkforward": [
+    "set -eo pipefail",
+    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "cd /home/ec2-user/alpha-engine-backtester",
+    "export HOME=/home/ec2-user",
+    "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
+    "export RUN_DATE='2026-05-18'",
+    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug pit-walkforward --log /var/log/pit-walkforward.log -- bash infrastructure/spot_pit_walkforward.sh"
   ],
   "PortfolioOptimizerBacktest": [
     "set -eo pipefail",
