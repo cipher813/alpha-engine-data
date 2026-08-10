@@ -141,14 +141,17 @@ class TestBacktesterTransition:
         # skip_parity short-circuit reaches the Evaluator gate directly.
         skip_parity = states["CheckSkipParity"]
         assert skip_parity["Choices"][0]["Next"] == "CheckSkipEvaluator"
-        # Default = run Parity; Parity success → CheckSkipEvaluator.
-        assert skip_parity["Default"] == "Parity"
-        parity_success = next(
+        # Default = run the parity family (alpha-engine-config#6030:
+        # ParityParallel → compare join); the compare's success terminal
+        # hands off to CheckSkipEvaluator.
+        assert skip_parity["Default"] == "ParityParallel"
+        compare_success = next(
             c
-            for c in states["CheckParityStatus"]["Choices"]
+            for c in states["CheckPitParityCompareStatus"]["Choices"]
             if c.get("StringEquals") == "Success"
         )
-        assert parity_success["Next"] == "CheckSkipEvaluator"
+        assert compare_success["Next"] == "PitParityCompareComplete"
+        assert states["PitParityCompareComplete"]["Next"] == "CheckSkipEvaluator"
 
 
 # ── Skip gate ─────────────────────────────────────────────────────────────

@@ -682,7 +682,13 @@ class TestEODSFTopLevelFieldsClosed:
 # a 1.1s sleep held inside a module-global lock = 2.2 s/ticker, measured
 # flat at 903 tickers), so ~33 min against Lambda's 900s HARD maximum —
 # a ceiling no further bump can raise.
-_EXPECTED_SATURDAY_SPOT_STATE_COUNT = 11
+# 11 → 14 on alpha-engine-config#6030 (2026-08-09): the bundled Parity spot
+# state was split into a ParityParallel of three fail-open branch spots
+# (PitParityLookahead / PitParityWalkforward / ParityReplay) plus the
+# PitParityCompare join spot — net +3 flat-level spot launchers (the three
+# branches ARE descended into by _flatten_states, same as DataPhase2's
+# Branch A siblings).
+_EXPECTED_SATURDAY_SPOT_STATE_COUNT = 14
 
 
 def _spot_states(sf_path: Path) -> list[str]:

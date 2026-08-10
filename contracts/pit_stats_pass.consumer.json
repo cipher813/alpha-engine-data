@@ -1,0 +1,27 @@
+{
+  "$comment": "SF-level consumer contract for the per-pass pit_parity stats artifacts (alpha-engine-config#6030, M0 rule: producer/consumer contract tests at birth). PRODUCER: crucible-backtester analysis/pit_stats_artifact.py::publish_pass_artifact, governed by crucible-backtester/contracts/pit_stats_pass.schema.json — the schema_id and key_template below are the shared surface; change them in lockstep with that schema (its test: crucible-backtester tests/test_pit_stats_artifact.py) or not at all. CONSUMER: the weekly SF's PitParityCompare state (backtest.py --pit-parity-compare via infrastructure/spot_parity_compare.sh), which reads both keys and writes backtest/{run_date}/pit_parity.json — verdict UNKNOWN when either is missing/unparseable/non-ok (sf-pipeline-policy §2.3a). ENFORCED BY tests/test_pit_stats_consumer_contract.py, which pins this file against infrastructure/step_function.json's parity-family wiring.",
+  "schema_id": "pit_stats_pass-1.0.0",
+  "schema_source": "crucible-backtester/contracts/pit_stats_pass.schema.json",
+  "bucket": "alpha-engine-research",
+  "key_template": "parity/{run_date}/pit_stats_{pass}.json",
+  "passes": ["lookahead", "walkforward"],
+  "producers": {
+    "lookahead": {
+      "sf_state": "PitParityLookahead",
+      "script": "infrastructure/spot_pit_lookahead.sh",
+      "cli": "backtest.py --pit-parity-pass-publish lookahead"
+    },
+    "walkforward": {
+      "sf_state": "PitParityWalkforward",
+      "script": "infrastructure/spot_pit_walkforward.sh",
+      "cli": "backtest.py --pit-parity-pass-publish walkforward"
+    }
+  },
+  "consumer": {
+    "sf_state": "PitParityCompare",
+    "script": "infrastructure/spot_parity_compare.sh",
+    "cli": "backtest.py --pit-parity-compare",
+    "output_key_template": "backtest/{run_date}/pit_parity.json",
+    "missing_input_behavior": "verdict UNKNOWN (status: unknown) — never pass, never abort (sf-pipeline-policy §2.3a)"
+  }
+}

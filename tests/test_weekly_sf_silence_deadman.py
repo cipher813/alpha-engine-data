@@ -329,8 +329,9 @@ class TestMainCLI:
         monkeypatch.setattr(mod, "_today", lambda: date(2026, 8, 9))
 
     def test_exit_zero_when_every_expected_slot_is_covered(self, mod, monkeypatch, capsys):
-        # today=2026-08-09, window=5 -> exercise slots on 08-04..08-07, weekly
-        # slot on 08-08 (day after the week's last session, 08-07).
+        # --through today, today=2026-08-09 (a Sunday), window=5 -> exercise
+        # slots on 08-04..08-07, weekly slot on 08-08 (day after the week's
+        # last session, 08-07). 08-09 itself is not a trading day.
         execs = [
             _fake_execution("e0804", "exercise", "SUCCEEDED", date(2026, 8, 4)),
             _fake_execution("e0805", "exercise", "SUCCEEDED", date(2026, 8, 5)),
@@ -340,9 +341,52 @@ class TestMainCLI:
         ]
         sns = _FakeSNS()
         self._patch_boto3(monkeypatch, mod, execs, sns)
-        rc = mod.main(["--window-days", "5", "--no-notify"])
+        rc = mod.main(["--window-days", "5", "--no-notify", "--through", "today"])
         assert rc == 0
         assert sns.published == []
+
+    def test_default_anchor_excludes_todays_not_yet_due_slot(self, mod, monkeypatch, capsys):
+        """alpha-engine-config#6738. Measured live 2026-08-09: run at 21:00 PT
+        (= 2026-08-10 UTC), the CLI reported the 2026-08-10 exercise slot
+        CRITICAL — Monday's postclose was ~23h in the FUTURE. The default
+        anchor stops at the last DUE day so a not-yet-due slot can never be
+        reported as silence."""
+        # anchor 08-09, window 5 -> [08-04 .. 08-09]
+        execs = [
+            _fake_execution("e0804", "exercise", "SUCCEEDED", date(2026, 8, 4)),
+            _fake_execution("e0805", "exercise", "SUCCEEDED", date(2026, 8, 5)),
+            _fake_execution("e0806", "exercise", "SUCCEEDED", date(2026, 8, 6)),
+            _fake_execution("e0807", "exercise", "SUCCEEDED", date(2026, 8, 7)),
+            _fake_execution("w0808", "weekly", "SUCCEEDED", date(2026, 8, 8), hours=3),
+        ]
+        sns = _FakeSNS()
+        self._patch_boto3(monkeypatch, mod, execs, sns)
+        monkeypatch.setattr(mod, "_today", lambda: date(2026, 8, 10))
+
+        rc = mod.main(["--window-days", "5", "--no-notify", "--json"])
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["evaluated_through"] == "2026-08-09"
+        assert "2026-08-10" not in [r["day"] for r in parsed["results"]]
+        assert parsed["critical"] == 0
+        assert rc == 0
+
+        # ...and opting back in reports exactly the one not-yet-due slot.
+        rc_today = mod.main(
+            ["--window-days", "5", "--no-notify", "--json", "--through", "today"]
+        )
+        parsed_today = json.loads(capsys.readouterr().out)
+        assert parsed_today["evaluated_through"] == "2026-08-10"
+        assert [
+            r["day"] for r in parsed_today["results"] if r["classification"] == "CRITICAL"
+        ] == ["2026-08-10"]
+        assert rc_today == 1
+
+    def test_last_due_day_is_the_shared_anchor_for_both_entry_points(self, mod):
+        assert mod.last_due_day(date(2026, 8, 10)) == date(2026, 8, 9)
+        # Purely calendar arithmetic — no trading-day skipping. The slot
+        # derivation already drops non-sessions, so a Sunday anchor simply
+        # yields no Sunday slot rather than silently sliding the window.
+        assert mod.last_due_day(date(2026, 8, 9)) == date(2026, 8, 8)
 
     def test_critical_triggers_sns_publish_by_default(self, mod, monkeypatch):
         sns = _FakeSNS()
@@ -367,3 +411,91 @@ class TestMainCLI:
         parsed = json.loads(out)
         assert parsed["cadence"] == "daily"
         assert "results" in parsed
+
+
+class TestScheduledSubstrateWiring:
+    """alpha-engine-config#6738 — the deadman's schedule surface is the
+    already-scheduled, already-un-paused ``alpha-engine-pipeline-watchdog``
+    Lambda rather than a second EventBridge trigger of its own.
+
+    These are packaging invariants, not behaviour: each one, if it silently
+    broke, would leave the scheduled check importing nothing, reading nothing,
+    or drifting from the CLI an operator reruns by hand — with the Lambda
+    still reporting a clean summary. The detector for a detector.
+    """
+
+    WATCHDOG_DIR = REPO_ROOT / "infrastructure" / "lambdas" / "pipeline-watchdog"
+
+    def test_deploy_packages_the_deadman_module_into_the_zip(self):
+        """index.py imports ``weekly_sf_silence_deadman`` at module scope; if
+        deploy.sh stops copying it the Lambda dies on cold start."""
+        deploy = (self.WATCHDOG_DIR / "deploy.sh").read_text(encoding="utf-8")
+        assert "scripts/weekly_sf_silence_deadman.py" in deploy
+        assert '"${PKG}/weekly_sf_silence_deadman.py"' in deploy
+
+    def test_watchdog_imports_the_shared_slot_logic_rather_than_copying_it(self):
+        index_src = (self.WATCHDOG_DIR / "index.py").read_text(encoding="utf-8")
+        assert "from weekly_sf_silence_deadman import" in index_src
+        for symbol in (
+            "compute_expected_slots",
+            "evaluate",
+            "fetch_execution_records",
+            "load_cadence_from_ssm",
+        ):
+            assert symbol in index_src
+        # A second, local re-derivation of the slot rules is the drift this
+        # single-implementation packaging exists to prevent.
+        assert "def compute_expected_slots" not in index_src
+
+    def test_watchdog_role_is_granted_the_cadence_parameter_read(self):
+        """The substrate identity needs its own grant — the existing SSM read
+        for /alpha-engine/weekly-sf/exercise-cadence covers the SF role only
+        (config#6701)."""
+        policy = json.loads(
+            (self.WATCHDOG_DIR / "iam-policy.json").read_text(encoding="utf-8")
+        )
+        wanted = (
+            "arn:aws:ssm:us-east-1:711398986525:parameter"
+            "/alpha-engine/weekly-sf/exercise-cadence"
+        )
+        granted = [
+            stmt
+            for stmt in policy["Statement"]
+            if stmt.get("Effect") == "Allow"
+            and "ssm:GetParameter" in stmt.get("Action", [])
+            and wanted in (
+                stmt["Resource"]
+                if isinstance(stmt["Resource"], list)
+                else [stmt["Resource"]]
+            )
+        ]
+        assert granted, "watchdog exec role cannot read the cadence declaration"
+
+    def test_the_deploy_workflow_fires_when_this_module_changes(self):
+        """Packaging a file into another component's zip creates a second way
+        for a merged fix to never go live: the deploy workflow's path filter
+        must cover the packaged file, not just the Lambda directory."""
+        workflow = (
+            REPO_ROOT / ".github" / "workflows" / "deploy-pipeline-watchdog.yml"
+        ).read_text(encoding="utf-8")
+        assert "scripts/weekly_sf_silence_deadman.py" in workflow
+
+    def test_no_second_trigger_was_introduced_for_the_deadman(self):
+        """Design choice (A): one liveness surface. A new EventBridge rule
+        would have to be born DISABLED under the 2026-08-07 pause and named in
+        automation_pause.json's pending block — this asserts the alternative
+        was not half-built."""
+        manifest = json.loads(
+            (REPO_ROOT / "infrastructure" / "automation_pause.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        names = (
+            set(manifest.get("pending", {}))
+            | set(manifest["paused"]["events_rules"])
+            | set(manifest["paused"]["scheduler_schedules"])
+            | set(manifest["not_paused"])
+        )
+        assert not [n for n in names if "silence-deadman" in n]
+        # ...and the surface it rides on is the un-paused watchdog trigger.
+        assert "alpha-engine-pipeline-watchdog-daily" in manifest["not_paused"]

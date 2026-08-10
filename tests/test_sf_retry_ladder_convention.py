@@ -51,7 +51,13 @@ SPOT_STAGE_SEND_STATES = {
     "Backtester",
     "PredictorBacktest",
     "PortfolioOptimizerBacktest",
-    "Parity",
+    # alpha-engine-config#6030: the bundled Parity spot became four
+    # independent stages (three ParityParallel branches + the compare join),
+    # each carrying the same gold ladder for the same idempotency reason.
+    "PitParityLookahead",
+    "PitParityWalkforward",
+    "ParityReplay",
+    "PitParityCompare",
     "Evaluator",
 }
 HEALTH_OBSERVE_SEND_STATES = {
