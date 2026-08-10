@@ -507,8 +507,26 @@ class TestStageTableLockstep:
                     f"one stage"
                 )
                 mapped[d] = stage.name
+        # alpha-engine-config#6722: CheckResearchPredictorDegraded (Choice)
+        # and SetResearchPredictorDegraded (Pass) are the terminal AGGREGATE
+        # fold that decides the completion-EMAIL routing (folded into
+        # NotifyCompleteMultipleDegraded) — the same KIND of thing as the
+        # Notify*Degraded family the docstring above already excludes, not a
+        # per-stage rerun witness. The actual per-stage rerun signal is the
+        # GRANULAR Mark*Degraded/ThinkTankDegraded states each branch owner
+        # threads (those ARE mapped, above) — SetResearchPredictorDegraded
+        # firing is always causally downstream of one of those, so it
+        # carries no additional rerun-actionable information of its own.
+        _AGGREGATE_FOLD_EXCLUDED = {
+            "CheckResearchPredictorDegraded",
+            "SetResearchPredictorDegraded",
+        }
         for name in all_states:
-            if name.endswith("Degraded") and not name.startswith("Notify"):
+            if (
+                name.endswith("Degraded")
+                and not name.startswith("Notify")
+                and name not in _AGGREGATE_FOLD_EXCLUDED
+            ):
                 assert name in mapped, (
                     f"degraded route {name} is not covered by any STAGES "
                     f"degraded_witness — a degraded {name} stage would be "

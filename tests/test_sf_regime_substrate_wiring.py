@@ -153,12 +153,15 @@ def test_regime_substrate_failure_is_non_blocking() -> None:
     states = _flat_states(sf)
     catches = states["RegimeSubstrate"]["Catch"]
     states_all = next(c for c in catches if c["ErrorEquals"] == ["States.ALL"])
-    assert states_all["Next"] == "CheckSkipSignalsEnvelope", (
+    # alpha-engine-config#6722: routes through MarkRegimeSubstrateDegraded
+    # before converging on CheckSkipSignalsEnvelope exactly as before.
+    assert states_all["Next"] == "MarkRegimeSubstrateDegraded", (
         "RegimeSubstrate Catch[States.ALL] must route to "
-        "CheckSkipSignalsEnvelope (non-blocking), not HandleFailure "
+        "MarkRegimeSubstrateDegraded (non-blocking), not HandleFailure "
         "(blocking). Stage A is observe-only; a regime substrate failure "
         "must not halt downstream."
     )
+    assert states["MarkRegimeSubstrateDegraded"]["Next"] == "CheckSkipSignalsEnvelope"
 
 
 def test_regime_substrate_next_is_signals_envelope() -> None:
@@ -261,9 +264,11 @@ def test_check_skip_regime_retrospective_eval_routes_correctly() -> None:
     # The chain is no longer at top level — it forks parallel to Branch B.
     par = sf["States"]["ResearchPredictorParallel"]
     assert par["Type"] == "Parallel"
-    # config#3134: Branch A's StartAt is now CheckSkipScanner (Scanner's
-    # own skip gate), not Scanner directly.
-    assert par["Branches"][0]["StartAt"] == "CheckSkipScanner"
+    # config#3134: Branch A's StartAt was CheckSkipScanner (Scanner's own
+    # skip gate). alpha-engine-config#6722: now InitResearchDegradedFlag, which
+    # falls through to CheckSkipScanner unconditionally.
+    assert par["Branches"][0]["StartAt"] == "InitResearchDegradedFlag"
+    assert branch_a["InitResearchDegradedFlag"]["Next"] == "CheckSkipScanner"
     assert "CheckSkipRegimeRetrospectiveEval" not in sf["States"]
     assert "Scanner" not in sf["States"]
 
@@ -284,11 +289,18 @@ def test_regime_retrospective_eval_failure_is_non_blocking() -> None:
     ]
     catches = branch_a["RegimeRetrospectiveEval"]["Catch"]
     states_all = next(c for c in catches if c["ErrorEquals"] == ["States.ALL"])
-    assert states_all["Next"] == "CheckSkipDataPhase2", (
-        "RegimeRetrospectiveEval Catch[States.ALL] must route to the "
-        "in-branch state CheckSkipDataPhase2 (non-blocking), "
+    # alpha-engine-config#6722: routes through
+    # MarkRegimeRetrospectiveEvalDegraded before converging on
+    # CheckSkipDataPhase2 exactly as before.
+    assert states_all["Next"] == "MarkRegimeRetrospectiveEvalDegraded", (
+        "RegimeRetrospectiveEval Catch[States.ALL] must route to "
+        "MarkRegimeRetrospectiveEvalDegraded (non-blocking), "
         "not HandleFailure (blocking) nor the parent Parallel. T1 is "
         "observability; a failure must not halt Branch A."
+    )
+    assert (
+        branch_a["MarkRegimeRetrospectiveEvalDegraded"]["Next"]
+        == "CheckSkipDataPhase2"
     )
     assert states_all["Next"] in branch_a
 

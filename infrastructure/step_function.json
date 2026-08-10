@@ -578,12 +578,41 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block a real trading cadence run. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability' carve-out, the primary deliverable survives a mutex-side failure. The error is captured in $.mutex_error for forensic review.",
-          "Next": "CheckSpotDispatchNeeded",
+          "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block a real trading cadence run. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability' carve-out, the primary deliverable survives a mutex-side failure. The error is captured in $.mutex_error for forensic review. alpha-engine-config#6722: this fail-open previously proceeded with no degraded flag at all — now routes through SetMutexAcquireDegradedFlag (mirrors LibPinGateDegraded/PipelineContractGateDegraded exactly: this IS a pre-spend precondition check, same family as the other two gate-infra fail-opens) so the completion email says so via CheckGateDegradedNotify.",
+          "Next": "SetMutexAcquireDegradedFlag",
           "ResultPath": "$.mutex_error"
         }
       ],
       "ResultPath": "$.mutex_result",
+      "Next": "CheckSpotDispatchNeeded"
+    },
+    "SetMutexAcquireDegradedFlag": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config#6722: the mutex-acquire infra-error Catch (DynamoDB outage / IAM drift / transient SDK error — NOT the ConditionalCheckFailedException conflict case, which the separate MutexConflict Fail already handles) previously proceeded to CheckSpotDispatchNeeded with zero visibility. Mirrors LibPinGateDegraded's shape exactly: gate_degraded=true threads into the completion email via CheckGateDegradedNotify, and PublishMutexAcquireDegraded alerts NOW.",
+      "Result": true,
+      "ResultPath": "$.gate_degraded",
+      "Next": "PublishMutexAcquireDegraded"
+    },
+    "PublishMutexAcquireDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config#6722: fail-open + alert, mirroring PublishLibPinGateDegraded/PublishPipelineContractGateDegraded. Subject/Message are hardcoded constants (config#1819 discipline). Best-effort Catch: a publish failure must not halt the fail-open path this alert decorates.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline — Mutex Acquire DEGRADED (Proceeding Unchecked)",
+        "Message": "AcquireMutex could not complete its DynamoDB conditional PUT (infra error, not a genuine duplicate-run conflict). Proceeding FAIL-OPEN: this run's duplicate-execution protection is unchecked for this run_date. The completion email will carry the gates-degraded marker. View pipeline status: https://console.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.mutex_acquire_degraded_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert — a publish failure must not halt the fail-open path.",
+          "ResultPath": "$.mutex_acquire_degraded_notify_error",
+          "Next": "CheckSpotDispatchNeeded"
+        }
+      ],
       "Next": "CheckSpotDispatchNeeded"
     },
     "MutexConflict": {
@@ -1005,8 +1034,15 @@
       "Comment": "Research and PredictorTraining are DATA-INDEPENDENT (no S3/db data flows between them \u2014 see CLAUDE.md Architecture). They previously ran sequentially ONLY to 'spread API load', a now-STALE rationale: predictor TRAINING (training/train_handler.py) reads ArcticDB + CPU LightGBM and makes NO Anthropic calls (the yfinance fallback was removed by predictor PR #6; train_handler yfinance docstrings are stale). Research's only heavy load is Anthropic. They do not contend on the rate-limited API, so they run in parallel here to decouple PredictorTraining from Research's variable <=75-min strict-retry runtime and shorten SF wall-clock. Branch A = the full Research-consuming chain (DataPhase2 + eval-judge chain + agent-justification triple), Branch B = the PredictorTraining quartet. PER-BRANCH ERROR ISOLATION: each branch ends in a branch-local Pass terminal (End:true) that records OK/FAILED as DATA \u2014 a branch NEVER throws, so SF Parallel's default cancel-all-siblings-on-error behaviour can never abandon or waste an in-flight (or completed+S3-promoted) sibling. The SF is failed AFTER the join by CheckBranchOutcomes if either branch recorded FAILED. The Parallel-level Catch is a defense-in-depth backstop for genuine SF-engine Parallel errors only (the branches themselves always succeed). (config#885: the Scanner\u2192RAGIngestion\u2192RegimeSubstrate\u2192RegimeRetrospectiveEval chain was relocated FROM top-level INTO Branch A's head so PredictorTraining (Branch B) now forks parallel to it directly after DataPhase1 \u2014 Predictor \u22a5 Scanner/RAG/Regime, all of which produce side-effect S3/ArcticDB artifacts, never SF-state JSON consumed by Branch B or any post-join state. Their in-branch error edges were rewired to the branch-fail path PublishResearchFailureImmediate\u2192BranchAFailed.)",
       "Branches": [
         {
-          "StartAt": "CheckSkipScanner",
+          "StartAt": "InitResearchDegradedFlag",
           "States": {
+            "InitResearchDegradedFlag": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config#6722: seeds the branch-local $.research_degraded_local marker every fail-open Catch inside Branch A threads through (the Scanner/RegimeSubstrate/ChallengerShadow/RegimeRetrospectiveEval research-substep group, ThinkTankDegraded's flag, the eval-judge chain, and AggregateCosts's named sf-pipeline-policy.md §5 cost-aggregation carve-out). Must be seeded BEFORE any Mark*Degraded state or BranchAComplete's Parameters.$ extraction would throw States.Runtime on a clean run that never sets it. Folded into the top-level $.research_predictor_degraded at AggregateBranchOutcomes/CheckResearchPredictorDegraded (mirrors CheckParityBranchOutcomes' branch-status fold, alpha-engine-config#6030) since a Parallel branch cannot write an outer-scope JSONPath directly — ASL scopes each branch to its own copy of the state.",
+              "Result": false,
+              "ResultPath": "$.research_degraded_local",
+              "Next": "CheckSkipScanner"
+            },
             "CheckSkipScanner": {
               "Type": "Choice",
               "Comment": "Skip-gate (config#3134). {\"skip_scanner\": true} bypasses the Scanner Lambda and jumps straight to CheckSkipRegimeSubstrate \u2014 Scanner's own convergence point on both its success and Catch edges, so skipping it is behaviorally identical to a Scanner run that did nothing. Defaults to running (Default: Scanner) so scheduled Saturday runs and any rerun that has not explicitly set the flag are unaffected. Set true by the mode=backtest-eval preset (ApplyBacktestEvalPreset): a Backtester/Evaluator-only assessment rerun needs no fresh candidates.json \u2014 the flag exists precisely so a partial rerun does not re-scan and overwrite that day's already-produced universe-board artifact (config#3134: the 2026-07-20 assessment-rerun arc overwrote candidates/2026-07-17/candidates.json six times for no benefit to the assessment being rerun).",
@@ -1056,12 +1092,19 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Scanner failure must NOT halt the pipeline at the SF layer \u2014 Catch and Next now converge sensibly on the SAME state (CheckSkipRegimeSubstrate) under the config-I2515 Phase B reorder, since RegimeSubstrate is an independent macro/HMM fit with no scanner-board dependency. Genuine downstream impact of a missing board surfaces properly (not silently) at SignalsEnvelope, which is LOAD-BEARING and has NO non-blocking Catch \u2014 a scanner failure that leaves the board stale/missing will fail SignalsEnvelope's own invoke and correctly hard-fail Branch A instead of being swallowed here.",
-                  "Next": "CheckSkipRegimeSubstrate",
+                  "Comment": "Scanner failure must NOT halt the pipeline at the SF layer \u2014 Catch now routes through MarkScannerDegraded before converging on CheckSkipRegimeSubstrate under the config-I2515 Phase B reorder, since RegimeSubstrate is an independent macro/HMM fit with no scanner-board dependency. Genuine downstream impact of a missing board surfaces properly (not silently) at SignalsEnvelope, which is LOAD-BEARING and has NO non-blocking Catch \u2014 a scanner failure that leaves the board stale/missing will fail SignalsEnvelope's own invoke and correctly hard-fail Branch A instead of being swallowed here. alpha-engine-config#6722: this fail-open previously set no degraded flag at all.",
+                  "Next": "MarkScannerDegraded",
                   "ResultPath": "$.scanner_error"
                 }
               ],
               "ResultPath": "$.scanner_result",
+              "Next": "CheckSkipRegimeSubstrate"
+            },
+            "MarkScannerDegraded": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config#6722: threads $.research_degraded_local=true onto Scanner's fail-open path without changing its continuation (still CheckSkipRegimeSubstrate) \u2014 folded into the top-level $.research_predictor_degraded post-join (AggregateBranchOutcomes/CheckResearchPredictorDegraded).",
+              "Result": true,
+              "ResultPath": "$.research_degraded_local",
               "Next": "CheckSkipRegimeSubstrate"
             },
             "CheckSkipRegimeSubstrate": {
@@ -1112,11 +1155,19 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Next": "CheckSkipSignalsEnvelope",
+                  "Comment": "alpha-engine-config#6722: routes through MarkRegimeSubstrateDegraded before converging on CheckSkipSignalsEnvelope — this fail-open previously set no degraded flag.",
+                  "Next": "MarkRegimeSubstrateDegraded",
                   "ResultPath": "$.regime_substrate_error"
                 }
               ],
               "ResultPath": "$.regime_substrate_result",
+              "Next": "CheckSkipSignalsEnvelope"
+            },
+            "MarkRegimeSubstrateDegraded": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config#6722: threads $.research_degraded_local=true onto RegimeSubstrate's fail-open path without changing its continuation (still CheckSkipSignalsEnvelope).",
+              "Result": true,
+              "ResultPath": "$.research_degraded_local",
               "Next": "CheckSkipSignalsEnvelope"
             },
             "CheckSkipSignalsEnvelope": {
@@ -1232,12 +1283,19 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Observe-mode non-blocking: a ChallengerShadow failure (including a stale graph-run precondition inside _run_challengers_only) must NOT halt the pipeline. Routes forward to CheckSkipRAGIngestion exactly like ThinkTankCoverage's own non-blocking Catch.",
-                  "Next": "CheckSkipRAGIngestion",
+                  "Comment": "Observe-mode non-blocking: a ChallengerShadow failure (including a stale graph-run precondition inside _run_challengers_only) must NOT halt the pipeline. Routes through MarkChallengerShadowDegraded then forward to CheckSkipRAGIngestion exactly like ThinkTankCoverage's own non-blocking Catch. alpha-engine-config#6722: this fail-open previously set no degraded flag.",
+                  "Next": "MarkChallengerShadowDegraded",
                   "ResultPath": "$.challenger_shadow_error"
                 }
               ],
               "ResultPath": "$.challenger_shadow_result",
+              "Next": "CheckSkipRAGIngestion"
+            },
+            "MarkChallengerShadowDegraded": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config#6722: threads $.research_degraded_local=true onto ChallengerShadow's fail-open path without changing its continuation (still CheckSkipRAGIngestion).",
+              "Result": true,
+              "ResultPath": "$.research_degraded_local",
               "Next": "CheckSkipRAGIngestion"
             },
             "CheckSkipRAGIngestion": {
@@ -1627,9 +1685,9 @@
             },
             "ThinkTankDegraded": {
               "Type": "Pass",
-              "Comment": "THE VISIBLE DEGRADED FLAG (alpha-engine-config-I5758). Every non-Success path converges here \u2014 dispatch failure, already_running, poll failure, poll-budget exhaustion, a non-Success SSM status. weekly-sf-policy.md \u00a72.3: a stage may fail-open ONLY if the fail-open sets a visible degraded flag that propagates to the terminal notification, and a pipeline reaching NotifyComplete having degraded a stage must say so BY NAME. champion-challenger-policy.md \u00a73: a cycle where an arm produces no output is recorded as a MISS, not omitted \u2014 silent absence and a genuine zero must never render identically. The predecessor of this state had no flag at all, which is exactly why 13 consecutive days of 900s Lambda timeouts (2026-07-17 onward) passed unnoticed while the thinktank_coverage challenger arm was absent from the champion/challenger loop.",
+              "Comment": "alpha-engine-config-I5758, REPOINTED by alpha-engine-config#6722. Every non-Success path converges here \u2014 dispatch failure, already_running, poll failure, poll-budget exhaustion, a non-Success SSM status. weekly-sf-policy.md \u00a72.3: a stage may fail-open ONLY if the fail-open sets a visible degraded flag that propagates to the terminal notification, and a pipeline reaching NotifyComplete having degraded a stage must say so BY NAME. champion-challenger-policy.md \u00a73: a cycle where an arm produces no output is recorded as a MISS, not omitted \u2014 silent absence and a genuine zero must never render identically. PRE-#6722 this wrote $.thinktank_degraded, a name CheckGateDegradedNotify never dereferenced anywhere in this file \u2014 the exact 'follow the actual JSONPath the notifier reads, not any degraded-named key' trap config#6715 was built to catch (13 consecutive days of 900s Lambda timeouts, 2026-07-17 onward, passed unnoticed while the thinktank_coverage challenger arm was absent from the champion/challenger loop). Now writes the branch-local $.research_degraded_local (the same marker Scanner/RegimeSubstrate/ChallengerShadow/the eval-judge chain/AggregateCosts thread), folded into the top-level $.research_predictor_degraded post-join (AggregateBranchOutcomes/CheckResearchPredictorDegraded) \u2014 genuinely wired this time, verified by tests/test_sf_research_predictor_degraded_wiring.py.",
               "Result": true,
-              "ResultPath": "$.thinktank_degraded",
+              "ResultPath": "$.research_degraded_local",
               "Next": "CheckSkipRegimeRetrospectiveEval"
             },
             "CheckSkipRegimeRetrospectiveEval": {
@@ -1679,11 +1737,19 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Next": "CheckSkipDataPhase2",
+                  "Comment": "alpha-engine-config#6722: routes through MarkRegimeRetrospectiveEvalDegraded before converging on CheckSkipDataPhase2 exactly as before.",
+                  "Next": "MarkRegimeRetrospectiveEvalDegraded",
                   "ResultPath": "$.regime_retrospective_eval_error"
                 }
               ],
               "ResultPath": "$.regime_retrospective_eval_result",
+              "Next": "CheckSkipDataPhase2"
+            },
+            "MarkRegimeRetrospectiveEvalDegraded": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config#6722: threads $.research_degraded_local=true onto RegimeRetrospectiveEval's fail-open path without changing its continuation (still CheckSkipDataPhase2).",
+              "Result": true,
+              "ResultPath": "$.research_degraded_local",
               "Next": "CheckSkipDataPhase2"
             },
             "CheckSkipDataPhase2": {
@@ -1979,8 +2045,8 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Eval is observability per ROADMAP \u00a71635 \u2014 submit failures must NOT halt the pipeline. EvalRollingMean still runs against historical data.",
-                  "Next": "EvalRollingMean",
+                  "Comment": "Eval is observability per ROADMAP \u00a71635 \u2014 submit failures must NOT halt the pipeline. EvalRollingMean still runs against historical data. alpha-engine-config#6722: routes through MarkEvalJudgeDegraded first.",
+                  "Next": "MarkEvalJudgeDegraded",
                   "ResultPath": "$.eval_judge_error"
                 }
               ],
@@ -2017,8 +2083,8 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Eval is observability \u2014 submit failures must NOT halt the pipeline.",
-                  "Next": "EvalRollingMean",
+                  "Comment": "Eval is observability \u2014 submit failures must NOT halt the pipeline. alpha-engine-config#6722: routes through MarkEvalJudgeDegraded first.",
+                  "Next": "MarkEvalJudgeDegraded",
                   "ResultPath": "$.eval_judge_error"
                 }
               ],
@@ -2095,8 +2161,8 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "A poll-level failure is recoverable \u2014 Anthropic retains batch results 29 days, so a transient poll Lambda failure can be re-run by a human if needed. Route to EvalRollingMean so the rest of the pipeline isn't blocked.",
-                  "Next": "EvalRollingMean",
+                  "Comment": "A poll-level failure is recoverable \u2014 Anthropic retains batch results 29 days, so a transient poll Lambda failure can be re-run by a human if needed. Route through MarkEvalJudgeDegraded then EvalRollingMean so the rest of the pipeline isn't blocked. alpha-engine-config#6722.",
+                  "Next": "MarkEvalJudgeDegraded",
                   "ResultPath": "$.eval_judge_error"
                 }
               ],
@@ -2191,12 +2257,19 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Eval is observability \u2014 Process failures must NOT halt the pipeline. EvalRollingMean still runs against historical data.",
-                  "Next": "EvalRollingMean",
+                  "Comment": "Eval is observability \u2014 Process failures must NOT halt the pipeline. Routes through MarkEvalJudgeDegraded then EvalRollingMean, which still runs against historical data. alpha-engine-config#6722.",
+                  "Next": "MarkEvalJudgeDegraded",
                   "ResultPath": "$.eval_judge_error"
                 }
               ],
               "ResultPath": "$.eval_judge_result",
+              "Next": "EvalRollingMean"
+            },
+            "MarkEvalJudgeDegraded": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config#6722: shared convergence for the eval-judge chain's four fail-open Catches (EvalJudgeSubmitFirstSaturday/EvalJudgeSubmitWeekly/EvalJudgePoll/EvalJudgeProcess all previously converged directly on EvalRollingMean with no degraded flag). Threads $.research_degraded_local=true without changing the continuation.",
+              "Result": true,
+              "ResultPath": "$.research_degraded_local",
               "Next": "EvalRollingMean"
             },
             "EvalRollingMean": {
@@ -2226,12 +2299,19 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Eval observability layer \u2014 failures must NOT halt the pipeline.",
-                  "Next": "CheckSkipRationaleClustering",
+                  "Comment": "Eval observability layer \u2014 failures must NOT halt the pipeline. alpha-engine-config#6722: routes through MarkEvalRollingMeanDegraded first.",
+                  "Next": "MarkEvalRollingMeanDegraded",
                   "ResultPath": "$.eval_rolling_mean_error"
                 }
               ],
               "ResultPath": "$.eval_rolling_mean_result",
+              "Next": "CheckSkipRationaleClustering"
+            },
+            "MarkEvalRollingMeanDegraded": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config#6722: threads $.research_degraded_local=true onto EvalRollingMean's own fail-open path without changing its continuation (still CheckSkipRationaleClustering).",
+              "Result": true,
+              "ResultPath": "$.research_degraded_local",
               "Next": "CheckSkipRationaleClustering"
             },
             "CheckSkipRationaleClustering": {
@@ -2282,12 +2362,19 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Eval observability layer \u2014 failures must NOT halt the pipeline.",
-                  "Next": "CheckSkipReplayConcordance",
+                  "Comment": "Eval observability layer \u2014 failures must NOT halt the pipeline. alpha-engine-config#6722: routes through MarkRationaleClusteringDegraded first.",
+                  "Next": "MarkRationaleClusteringDegraded",
                   "ResultPath": "$.rationale_clustering_error"
                 }
               ],
               "ResultPath": "$.rationale_clustering_result",
+              "Next": "CheckSkipReplayConcordance"
+            },
+            "MarkRationaleClusteringDegraded": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config#6722: threads $.research_degraded_local=true onto RationaleClustering's fail-open path without changing its continuation (still CheckSkipReplayConcordance).",
+              "Result": true,
+              "ResultPath": "$.research_degraded_local",
               "Next": "CheckSkipReplayConcordance"
             },
             "CheckSkipReplayConcordance": {
@@ -2343,12 +2430,19 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Eval observability layer \u2014 concordance failure must NOT halt the pipeline. Same Catch pattern as eval-judge / eval-rolling-mean / rationale-clustering.",
-                  "Next": "CheckSkipCounterfactual",
+                  "Comment": "Eval observability layer \u2014 concordance failure must NOT halt the pipeline. Same Catch pattern as eval-judge / eval-rolling-mean / rationale-clustering. alpha-engine-config#6722: routes through MarkReplayConcordanceDegraded first.",
+                  "Next": "MarkReplayConcordanceDegraded",
                   "ResultPath": "$.replay_concordance_error"
                 }
               ],
               "ResultPath": "$.replay_concordance_result",
+              "Next": "CheckSkipCounterfactual"
+            },
+            "MarkReplayConcordanceDegraded": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config#6722: threads $.research_degraded_local=true onto ReplayConcordance's fail-open path without changing its continuation (still CheckSkipCounterfactual).",
+              "Result": true,
+              "ResultPath": "$.research_degraded_local",
               "Next": "CheckSkipCounterfactual"
             },
             "CheckSkipCounterfactual": {
@@ -2401,12 +2495,19 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Eval observability layer \u2014 counterfactual failure must NOT halt the pipeline. Same Catch pattern as the rest of the agent-justification triple. Routes to CheckSkipAggregateCosts so the cost-telemetry aggregation step still runs even when counterfactual fails (the JSONLs the aggregator reads were written by Research / eval-judge / rationale-clustering / replay-concordance / counterfactual independently; a counterfactual failure doesn't invalidate the upstream cost rows).",
-                  "Next": "CheckSkipAggregateCosts",
+                  "Comment": "Eval observability layer \u2014 counterfactual failure must NOT halt the pipeline. Same Catch pattern as the rest of the agent-justification triple. Routes through MarkCounterfactualDegraded then CheckSkipAggregateCosts so the cost-telemetry aggregation step still runs even when counterfactual fails (the JSONLs the aggregator reads were written by Research / eval-judge / rationale-clustering / replay-concordance / counterfactual independently; a counterfactual failure doesn't invalidate the upstream cost rows). alpha-engine-config#6722.",
+                  "Next": "MarkCounterfactualDegraded",
                   "ResultPath": "$.counterfactual_error"
                 }
               ],
               "ResultPath": "$.counterfactual_result",
+              "Next": "CheckSkipAggregateCosts"
+            },
+            "MarkCounterfactualDegraded": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config#6722: threads $.research_degraded_local=true onto Counterfactual's fail-open path without changing its continuation (still CheckSkipAggregateCosts).",
+              "Result": true,
+              "ResultPath": "$.research_degraded_local",
               "Next": "CheckSkipAggregateCosts"
             },
             "CheckSkipAggregateCosts": {
@@ -2457,12 +2558,19 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Cost-telemetry aggregation is observability \u2014 failure must NOT halt the pipeline. The next Saturday SF will retry over a fresh _cost_raw partition; the prior week's parquet (or the manual-trigger fallback via scripts/aggregate_costs.py) remains available.",
-                  "Next": "BranchAComplete",
+                  "Comment": "Cost-telemetry aggregation is observability \u2014 failure must NOT halt the pipeline. The next Saturday SF will retry over a fresh _cost_raw partition; the prior week's parquet (or the manual-trigger fallback via scripts/aggregate_costs.py) remains available. alpha-engine-config#6722: this Catch matches sf-pipeline-policy.md \u00a75's NAMED cost-aggregation carve-out verbatim ('Health-check and cost-aggregation stages may fail-open ... They must still set a degraded flag') \u2014 previously routed straight to BranchAComplete with zero flag, a policy non-compliance on an explicit clause. Now routes through MarkAggregateCostsDegraded first.",
+                  "Next": "MarkAggregateCostsDegraded",
                   "ResultPath": "$.aggregate_costs_error"
                 }
               ],
               "ResultPath": "$.aggregate_costs_result",
+              "Next": "BranchAComplete"
+            },
+            "MarkAggregateCostsDegraded": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config#6722: threads $.research_degraded_local=true onto AggregateCosts's fail-open path (the sf-pipeline-policy.md \u00a75 cost-aggregation carve-out's required flag) without changing its continuation (still BranchAComplete).",
+              "Result": true,
+              "ResultPath": "$.research_degraded_local",
               "Next": "BranchAComplete"
             },
             "ExtractSignalsEnvelopeError": {
@@ -2500,19 +2608,21 @@
             },
             "BranchAComplete": {
               "Type": "Pass",
-              "Comment": "Branch A (Scanner \u2192 RegimeSubstrate \u2192 SignalsEnvelope \u2192 ChallengerShadow \u2192 RAG chain \u2192 ThinkTankCoverage \u2192 RegimeRetrospectiveEval \u2192 DataPhase2 \u2192 eval-judge chain \u2192 EvalRollingMean \u2192 RationaleClustering \u2192 ReplayConcordance \u2192 Counterfactual \u2192 AggregateCosts) completed (config-I2515 Phase B reorder \u2014 the multi-agent Research graph runner was removed). Records branch_a_status=OK so the post-join AggregateBranchOutcomes can decide whether to halt the SF. End:true so the Parallel branch SUCCEEDS \u2014 it must never throw, because a thrown branch would cancel the sibling PredictorTraining branch (default SF Parallel semantics).",
-              "Result": {
-                "branch_a_status": "OK"
+              "Comment": "Branch A (Scanner \u2192 RegimeSubstrate \u2192 SignalsEnvelope \u2192 ChallengerShadow \u2192 RAG chain \u2192 ThinkTankCoverage \u2192 RegimeRetrospectiveEval \u2192 DataPhase2 \u2192 eval-judge chain \u2192 EvalRollingMean \u2192 RationaleClustering \u2192 ReplayConcordance \u2192 Counterfactual \u2192 AggregateCosts) completed (config-I2515 Phase B reorder \u2014 the multi-agent Research graph runner was removed). Records branch_a_status=OK so the post-join AggregateBranchOutcomes can decide whether to halt the SF. End:true so the Parallel branch SUCCEEDS \u2014 it must never throw, because a thrown branch would cancel the sibling PredictorTraining branch (default SF Parallel semantics). alpha-engine-config#6722: also hoists $.research_degraded_local (seeded false by InitResearchDegradedFlag, set true by any of Branch A's internal fail-open Mark*Degraded states) as branch_a_degraded \u2014 read by AggregateBranchOutcomes/CheckResearchPredictorDegraded post-join since a Parallel branch cannot write an outer-scope JSONPath directly.",
+              "Parameters": {
+                "branch_a_status": "OK",
+                "branch_a_degraded.$": "$.research_degraded_local"
               },
               "ResultPath": "$.branch_a",
               "End": true
             },
             "BranchAFailed": {
               "Type": "Pass",
-              "Comment": "Branch A hard-failed (SignalsEnvelope failure \u2014 the LOAD-BEARING signals.json producer post config-I2515 Phase B \u2014 RAGIngestion failure, or DataPhase2 failure). Records branch_a_status=FAILED + the captured $.error as DATA and End:true \u2014 the branch SUCCEEDS in SF terms so the sibling PredictorTraining branch is NEVER abandoned by Parallel's cancel-siblings default. The SF is failed AFTER the join by CheckBranchOutcomes. Recovery: if Branch B completed + promoted weights to S3, the re-run uses {\"skip_predictor_training\": true} (weights are already live) and re-runs only Branch A.",
+              "Comment": "Branch A hard-failed (SignalsEnvelope failure \u2014 the LOAD-BEARING signals.json producer post config-I2515 Phase B \u2014 RAGIngestion failure, or DataPhase2 failure). Records branch_a_status=FAILED + the captured $.error as DATA and End:true \u2014 the branch SUCCEEDS in SF terms so the sibling PredictorTraining branch is NEVER abandoned by Parallel's cancel-siblings default. The SF is failed AFTER the join by CheckBranchOutcomes. Recovery: if Branch B completed + promoted weights to S3, the re-run uses {\"skip_predictor_training\": true} (weights are already live) and re-runs only Branch A. alpha-engine-config#6722: branch_a_degraded is fixed false here \u2014 a hard FAILED branch is reported via CheckBranchOutcomes' Or-gate before AggregateBranchOutcomes' degraded-fold is ever consulted, but the field must still exist unconditionally so that Parameters.$ extraction never throws States.Runtime.",
               "Parameters": {
                 "branch_a_status": "FAILED",
-                "branch_a_error.$": "$.error"
+                "branch_a_error.$": "$.error",
+                "branch_a_degraded": false
               },
               "ResultPath": "$.branch_a",
               "End": true
@@ -2538,8 +2648,15 @@
           }
         },
         {
-          "StartAt": "CheckSkipPredictorTraining",
+          "StartAt": "InitPredictorDegradedFlag",
           "States": {
+            "InitPredictorDegradedFlag": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config#6722: seeds the branch-local $.research_degraded_local marker Branch B's model-zoo rotation fail-open group (ResolveZooSpecs/WaitResolveZoo/ModelZooTrainMap/ModelZooSelect/WaitForModelZoo, all converging on PublishModelZooFailureImmediate) threads through. Must be seeded BEFORE BranchBComplete's Parameters.$ extraction would throw States.Runtime on a clean run that never sets it. Same field name as Branch A's InitResearchDegradedFlag — branches are isolated JSONPath scopes, so no collision — folded into the top-level $.research_predictor_degraded at AggregateBranchOutcomes/CheckResearchPredictorDegraded.",
+              "Result": false,
+              "ResultPath": "$.research_degraded_local",
+              "Next": "CheckSkipPredictorTraining"
+            },
             "CheckSkipPredictorTraining": {
               "Type": "Choice",
               "Comment": "Skip-gate (config#2253 validated-skip upgrade). {\"skip_predictor_training\": true} bypasses GBM retrain (and, per config#902, the bundled drift step riding the same spot) AND the config#1083 model-zoo fan-out \u2014 but the skip claim is VALIDATED first: ValidatePredictorSkipWeightsFresh HeadObjects the live weights manifest (predictor/weights/meta/manifest.json \u2014 written UNCONDITIONALLY by every non-dry training run in alpha-engine-predictor training/meta_trainer.py, regardless of the promotion gate, unlike the live .pkl weights which only move on gate-pass) and CheckPredictorSkipWeightsFresh requires its LastModified DATE >= $.run_date \u2014 i.e. this run_date's training genuinely completed before the operator/watch-agent claimed it. Stale manifest \u2192 BranchBFailed (fail loud: silently honoring a false weights-are-already-live claim would hand Backtester stale weights AND swallow the very re-training the pipeline owed). EXCEPTION (first Choice rule): mode=backtest-eval (config#830 replay preset, which force-seeds this flag) routes straight to PredictorTrainingSkipped with NO freshness validation \u2014 that preset's contract is 'replay Backtester+Evaluator against existing artifacts, whatever their vintage', so a mid-week replay must not demand a same-day manifest. NOTE the manifest is the validation surface, NOT weights/meta/archive/{date}/: the dated archive is TRADING-DAY-keyed (config#1015 \u2014 Friday's close), while $.run_date is the Saturday calendar date, so an archive-prefix check would NEVER match on the standard Saturday recovery rerun this flag exists for. Cross-UTC-midnight recovery reruns: pass the ORIGINAL run_date explicitly (the watch charter's take-the-original-input rule already implies this for every date-keyed stage) and the lexicographic >= compare composes correctly.",
@@ -2647,10 +2764,11 @@
             },
             "PredictorTrainingSkipped": {
               "Type": "Pass",
-              "Comment": "config#2253 branch-B skip terminal. Reads as a SUCCEEDED branch to AggregateBranchOutcomes/CheckBranchOutcomes \u2014 the join reads ONLY $.parallel_result[1].branch_b.branch_b_status, and this records the identical branch_b_status=OK contract as BranchBComplete \u2014 plus an explicit skipped:true marker for execution-history forensics (no fabricated training payload beyond what routing requires). End:true so the sibling Research branch is never cancelled (the per-branch error-isolation invariant).",
+              "Comment": "config#2253 branch-B skip terminal. Reads as a SUCCEEDED branch to AggregateBranchOutcomes/CheckBranchOutcomes \u2014 the join reads $.parallel_result[1].branch_b.branch_b_status (+ branch_b_degraded, alpha-engine-config#6722), and this records the identical branch_b_status=OK contract as BranchBComplete \u2014 plus an explicit skipped:true marker for execution-history forensics (no fabricated training payload beyond what routing requires). branch_b_degraded is fixed false: this path never reaches the model-zoo rotation (the skip claim is validated fresh weights, so there is nothing to rotate), and the field must exist unconditionally so AggregateBranchOutcomes' Parameters.$ extraction never throws States.Runtime. End:true so the sibling Research branch is never cancelled (the per-branch error-isolation invariant).",
               "Result": {
                 "branch_b_status": "OK",
-                "skipped": true
+                "skipped": true,
+                "branch_b_degraded": false
               },
               "ResultPath": "$.branch_b",
               "End": true
@@ -3367,7 +3485,7 @@
             },
             "PublishModelZooFailureImmediate": {
               "Type": "Task",
-              "Comment": "Fire an SNS failure alert when the model-zoo rotation fails/times-out. REQUIRED for fallback safety: PredictorTraining now exports PREDICTOR_DEFER_TRAINING_EMAIL=1, so the base champion-arch retrain DEFERS its per-run training email to the consolidated zoo digest (sent at the end of run_rotation_and_select). If the zoo then fails, NEITHER email goes out \u2014 without this alert the run would be SILENT. Best-effort like the predictor early-signal alert: an SNS publish failure is caught and still routes to BranchBComplete (the champion already trained+promoted; the rotation is non-critical, so a zoo failure must NEVER fail the branch).",
+              "Comment": "Fire an SNS failure alert when the model-zoo rotation fails/times-out. REQUIRED for fallback safety: PredictorTraining now exports PREDICTOR_DEFER_TRAINING_EMAIL=1, so the base champion-arch retrain DEFERS its per-run training email to the consolidated zoo digest (sent at the end of run_rotation_and_select). If the zoo then fails, NEITHER email goes out \u2014 without this alert the run would be SILENT. Best-effort like the predictor early-signal alert: an SNS publish failure is caught and still routes to MarkModelZooDegraded/BranchBComplete (the champion already trained+promoted; the rotation is non-critical, so a zoo failure must NEVER fail the branch). alpha-engine-config#6722: this is the SOLE convergence point for all five model-zoo rotation fail-open Catches (ResolveZooSpecs/WaitResolveZoo/ModelZooTrainMap/ModelZooSelect/WaitForModelZoo) \u2014 previously routed straight to BranchBComplete with no degraded flag despite firing a real SNS alert; now routes through MarkModelZooDegraded first.",
               "Resource": "arn:aws:states:::sns:publish",
               "Parameters": {
                 "TopicArn.$": "$.sns_topic_arn",
@@ -3375,7 +3493,7 @@
                 "Message.$": "States.Format('The model-zoo rotation failed or timed out. The base champion-arch retrain already trained+promoted and DEFERRED its training email to the zoo digest (PREDICTOR_DEFER_TRAINING_EMAIL=1), so the consolidated digest email may NOT have been sent for this run \u2014 review predictor-model-zoo.log on the spot and predictor/model_zoo/leaderboard/. The branch will still complete (the champion is live); the rotation is best-effort. Error: {}', States.JsonToString($.model_zoo_error))"
               },
               "ResultPath": null,
-              "Next": "BranchBComplete",
+              "Next": "MarkModelZooDegraded",
               "Catch": [
                 {
                   "ErrorEquals": [
@@ -3383,9 +3501,16 @@
                   ],
                   "Comment": "Best-effort: a failed SNS publish must not prevent the branch from completing. The champion is already live.",
                   "ResultPath": null,
-                  "Next": "BranchBComplete"
+                  "Next": "MarkModelZooDegraded"
                 }
               ]
+            },
+            "MarkModelZooDegraded": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config#6722: threads $.research_degraded_local=true onto the model-zoo rotation fail-open group (ResolveZooSpecs/WaitResolveZoo/ModelZooTrainMap/ModelZooSelect/WaitForModelZoo \u2014 all five converge on PublishModelZooFailureImmediate above) without changing the continuation (still BranchBComplete).",
+              "Result": true,
+              "ResultPath": "$.research_degraded_local",
+              "Next": "BranchBComplete"
             },
             "ModelZooWait": {
               "Type": "Pass",
@@ -3398,19 +3523,21 @@
             },
             "BranchBComplete": {
               "Type": "Pass",
-              "Comment": "Branch B (PredictorTraining quartet) completed (training success; the L4544 model-zoo rotation, if it ran, is best-effort and converges here regardless of outcome). The skip_predictor_training path terminates at its own PredictorTrainingSkipped terminal (config#2253) with the same branch_b_status=OK contract plus a skipped:true marker. Records branch_b_status=OK. End:true so the branch SUCCEEDS and never cancels the sibling Research branch.",
-              "Result": {
-                "branch_b_status": "OK"
+              "Comment": "Branch B (PredictorTraining quartet) completed (training success; the L4544 model-zoo rotation, if it ran, is best-effort and converges here regardless of outcome). The skip_predictor_training path terminates at its own PredictorTrainingSkipped terminal (config#2253) with the same branch_b_status=OK contract plus a skipped:true marker. Records branch_b_status=OK. End:true so the branch SUCCEEDS and never cancels the sibling Research branch. alpha-engine-config#6722: also hoists $.research_degraded_local (seeded false by InitPredictorDegradedFlag, set true by MarkModelZooDegraded) as branch_b_degraded \u2014 read by AggregateBranchOutcomes/CheckResearchPredictorDegraded post-join since a Parallel branch cannot write an outer-scope JSONPath directly.",
+              "Parameters": {
+                "branch_b_status": "OK",
+                "branch_b_degraded.$": "$.research_degraded_local"
               },
               "ResultPath": "$.branch_b",
               "End": true
             },
             "BranchBFailed": {
               "Type": "Pass",
-              "Comment": "Branch B (PredictorTraining) failed/timed-out (SSM non-Success normalized by ExtractPredictorError, or a Task Catch). Records branch_b_status=FAILED + $.error as DATA, End:true so the branch SUCCEEDS and the sibling Research branch runs to its own completion \u2014 a completed Research branch's signals.json / decision_artifacts are NOT silently discarded. The SF is failed AFTER the join by CheckBranchOutcomes. NOTE: if PredictorTraining promoted weights to S3 before failing a later poll, those weights persist; the recovery re-run skips the genuinely-completed branch.",
+              "Comment": "Branch B (PredictorTraining) failed/timed-out (SSM non-Success normalized by ExtractPredictorError, or a Task Catch). Records branch_b_status=FAILED + $.error as DATA, End:true so the branch SUCCEEDS and the sibling Research branch runs to its own completion \u2014 a completed Research branch's signals.json / decision_artifacts are NOT silently discarded. The SF is failed AFTER the join by CheckBranchOutcomes. NOTE: if PredictorTraining promoted weights to S3 before failing a later poll, those weights persist; the recovery re-run skips the genuinely-completed branch. alpha-engine-config#6722: branch_b_degraded is fixed false here \u2014 a hard FAILED branch is reported via CheckBranchOutcomes' Or-gate before AggregateBranchOutcomes' degraded-fold is ever consulted, but the field must still exist unconditionally so Parameters.$ extraction never throws States.Runtime.",
               "Parameters": {
                 "branch_b_status": "FAILED",
-                "branch_b_error.$": "$.error"
+                "branch_b_error.$": "$.error",
+                "branch_b_degraded": false
               },
               "ResultPath": "$.branch_b",
               "End": true
@@ -3496,17 +3623,19 @@
     },
     "AggregateBranchOutcomes": {
       "Type": "Pass",
-      "Comment": "Parallel join sync point. $.parallel_result is the 2-element array of each branch's final effective input (branch order matches the Branches array: [0]=Research branch, [1]=PredictorTraining branch). Each branch terminal wrote its status under $.branch_a / $.branch_b, so hoist both statuses to a flat path for the Choice. This is the natural Backtester sync point \u2014 Backtester needs BOTH Research signal history AND PredictorTraining weights.",
+      "Comment": "Parallel join sync point. $.parallel_result is the 2-element array of each branch's final effective input (branch order matches the Branches array: [0]=Research branch, [1]=PredictorTraining branch). Each branch terminal wrote its status under $.branch_a / $.branch_b, so hoist both statuses to a flat path for the Choice. This is the natural Backtester sync point \u2014 Backtester needs BOTH Research signal history AND PredictorTraining weights. alpha-engine-config#6722: also hoists branch_a_degraded/branch_b_degraded \u2014 the branch-local $.research_degraded_local marker each branch threads through its own internal fail-open Catch routes (Branch A: Scanner/RegimeSubstrate/ChallengerShadow/RegimeRetrospectiveEval/ThinkTankDegraded/the eval-judge chain/AggregateCosts; Branch B: the model-zoo rotation group), folded here since a Parallel branch cannot write an outer-scope JSONPath directly \u2014 mirrors CheckParityBranchOutcomes' branch-status fold (alpha-engine-config#6030). Every branch terminal (BranchAComplete/BranchAFailed, BranchBComplete/BranchBFailed/PredictorTrainingSkipped) sets its *_degraded field unconditionally, so this Parameters.$ extraction never throws States.Runtime.",
       "Parameters": {
         "branch_a_status.$": "$.parallel_result[0].branch_a.branch_a_status",
-        "branch_b_status.$": "$.parallel_result[1].branch_b.branch_b_status"
+        "branch_b_status.$": "$.parallel_result[1].branch_b.branch_b_status",
+        "branch_a_degraded.$": "$.parallel_result[0].branch_a.branch_a_degraded",
+        "branch_b_degraded.$": "$.parallel_result[1].branch_b.branch_b_degraded"
       },
       "ResultPath": "$.branch_outcomes",
       "Next": "CheckBranchOutcomes"
     },
     "CheckBranchOutcomes": {
       "Type": "Choice",
-      "Comment": "Fail the SF AFTER the join if EITHER branch recorded FAILED \u2014 so the OTHER branch's completed work (Research signals.json / decision_artifacts, OR PredictorTraining's already-S3-promoted weights) persists and the recovery re-run's skip-set can skip whichever branch genuinely completed. Research-fail + Predictor-done \u2192 recovery re-run with {\"skip_predictor_training\": true}. Predictor-fail + Research-done \u2192 recovery re-run with {\"skip_research\": true, ... per the live-SF-derived skip-set practice}. Only when BOTH branches are OK does the pipeline continue to CheckSkipBacktester -> Backtester -> Parity -> Evaluator. (config#902: the standalone DriftDetection state was collapsed \u2014 drift is now bundled onto the PredictorTraining spot inside Branch B's spot_train.sh, running non-blocking after training succeeds \u2014 so the join routes straight to the backtester skip-gate.)",
+      "Comment": "Fail the SF AFTER the join if EITHER branch recorded FAILED \u2014 so the OTHER branch's completed work (Research signals.json / decision_artifacts, OR PredictorTraining's already-S3-promoted weights) persists and the recovery re-run's skip-set can skip whichever branch genuinely completed. Research-fail + Predictor-done \u2192 recovery re-run with {\"skip_predictor_training\": true}. Predictor-fail + Research-done \u2192 recovery re-run with {\"skip_research\": true, ... per the live-SF-derived skip-set practice}. Only when BOTH branches are OK does the pipeline continue to CheckResearchPredictorDegraded -> CheckSkipBacktester -> Backtester -> Parity -> Evaluator. (config#902: the standalone DriftDetection state was collapsed \u2014 drift is now bundled onto the PredictorTraining spot inside Branch B's spot_train.sh, running non-blocking after training succeeds \u2014 so the join routes straight to the degraded-fold gate then the backtester skip-gate.)",
       "Choices": [
         {
           "Or": [
@@ -3522,7 +3651,50 @@
           "Next": "ExtractParallelBranchError"
         }
       ],
+      "Default": "CheckResearchPredictorDegraded"
+    },
+    "CheckResearchPredictorDegraded": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config#6722: EITHER branch recording a fail-open advisory degradation (branch_a_degraded/branch_b_degraded, hoisted by AggregateBranchOutcomes above) sets the top-level $.research_predictor_degraded CheckGateDegradedNotify actually reads (folded into the generic NotifyCompleteMultipleDegraded \u2014 see that state's Comment) \u2014 a fifth flag family alongside gate_degraded/health_check_degraded/report_card_degraded/parity_degraded, covering ResearchPredictorParallel's own internal fail-open Catch routes: the Scanner/RegimeSubstrate/ChallengerShadow/RegimeRetrospectiveEval research-substep group, ThinkTankDegraded's now-correctly-wired flag (it previously wrote the dead $.thinktank_degraded), the eval-judge chain, AggregateCosts's named sf-pipeline-policy.md \u00a75 cost-aggregation carve-out, and the model-zoo rotation group. Only reached on the non-FAILED path (CheckBranchOutcomes' Default) \u2014 a hard branch failure is reported via HandleFailure instead, independent of this fold. Verified by tests/test_sf_research_predictor_degraded_wiring.py.",
+      "Choices": [
+        {
+          "Or": [
+            {
+              "And": [
+                {
+                  "Variable": "$.branch_outcomes.branch_a_degraded",
+                  "IsPresent": true
+                },
+                {
+                  "Variable": "$.branch_outcomes.branch_a_degraded",
+                  "BooleanEquals": true
+                }
+              ]
+            },
+            {
+              "And": [
+                {
+                  "Variable": "$.branch_outcomes.branch_b_degraded",
+                  "IsPresent": true
+                },
+                {
+                  "Variable": "$.branch_outcomes.branch_b_degraded",
+                  "BooleanEquals": true
+                }
+              ]
+            }
+          ],
+          "Next": "SetResearchPredictorDegraded"
+        }
+      ],
       "Default": "CheckSkipBacktester"
+    },
+    "SetResearchPredictorDegraded": {
+      "Type": "Pass",
+      "Comment": "THE VISIBLE RESEARCH/PREDICTOR DEGRADED FLAG (alpha-engine-config#6722). The SOLE writer of $.research_predictor_degraded (pinned by tests/test_sf_research_predictor_degraded_wiring.py). weekly-sf-policy.md \u00a72.3 honest-degradation: the run CONTINUES to CheckSkipBacktester -> Backtester/Parity/Evaluator \u2014 none of the folded ResearchPredictorParallel substeps are load-bearing preconditions for those downstream stages.",
+      "Result": true,
+      "ResultPath": "$.research_predictor_degraded",
+      "Next": "CheckSkipBacktester"
     },
     "ExtractParallelBranchError": {
       "Type": "Pass",
@@ -4790,8 +4962,21 @@
     },
     "CheckGateDegradedNotify": {
       "Type": "Choice",
-      "Comment": "config#2278 + config#2276 + config#6685 + alpha-engine-config-I6025: a green run that could not run its pre-spend gates (gate_degraded \u2014 set ONLY by the LibPinGateDegraded / PipelineContractGateDegraded Pass states), and/or its tail health checks (health_check_degraded \u2014 set ONLY by the SaturdayHealthCheckDegraded / SubstrateHealthCheckDegraded Pass states), and/or ReportCard's advisory grading (report_card_degraded \u2014 set ONLY by ReportCardDegraded, config#6685), and/or the Parity verdict (parity_degraded \u2014 set ONLY by ParityDegraded, alpha-engine-config-I6025/I6044: absence of a parity verdict must never render as a clean pass) must SAY SO in the completion email (weekly-sf-policy.md \u00a72.3 / \u00a72.3a). All four are SF-controlled booleans, IsPresent-guarded per config#2275. Rules are ordered most-specific-first: parity_degraded combined with ANY other family routes to the single generic NotifyCompleteMultipleDegraded first (mirrors the report_card_degraded fold below \u2014 the config#2276 comment's predicted 'third flag family' generalizes to a fourth the same way: fold into the existing generic combined notifier rather than enumerating more per-combination hardcoded Task states); then report_card_degraded combined with EITHER remaining family also routes to NotifyCompleteMultipleDegraded (config#6685); the pre-existing gates+health / gates-only / health-only rules are UNCHANGED (each still implies report_card_degraded and parity_degraded are both absent, since any report_card_degraded-true or parity_degraded-true path is intercepted by the rules ahead of them); report_card_degraded alone gets its own single-flag notifier (NotifyCompleteReportCardDegraded) mirroring NotifyCompleteGatesDegraded/NotifyCompleteHealthDegraded exactly, and parity_degraded alone (all three other flags absent) gets NotifyCompleteParityDegraded (alpha-engine-config-I6025), same shape. Each still routes to a SEPARATE hardcoded-constant notifier rather than States.Format-ing flags into NotifyComplete \u2014 preserving config#1819's Subject/Message-are-constants invariant. Name retained from config#2278 (it is the wave-1 chain anchor referenced across tests/comments) \u2014 read it as the degraded-completion selector.",
+      "Comment": "config#2278 + config#2276 + config#6685 + alpha-engine-config-I6025 + alpha-engine-config#6722: a green run that could not run its pre-spend gates (gate_degraded \u2014 set by the LibPinGateDegraded / PipelineContractGateDegraded / SetMutexAcquireDegradedFlag Pass states), and/or its tail health checks (health_check_degraded \u2014 set ONLY by the SaturdayHealthCheckDegraded / SubstrateHealthCheckDegraded Pass states), and/or ReportCard's advisory grading (report_card_degraded \u2014 set ONLY by ReportCardDegraded, config#6685), and/or the Parity verdict (parity_degraded \u2014 set ONLY by ParityDegraded, alpha-engine-config-I6025/I6044: absence of a parity verdict must never render as a clean pass), and/or ResearchPredictorParallel's own internal fail-open Catch routes (research_predictor_degraded \u2014 set ONLY by SetResearchPredictorDegraded, alpha-engine-config#6722) must SAY SO in the completion email (weekly-sf-policy.md \u00a72.3 / \u00a72.3a). All five are SF-controlled booleans, IsPresent-guarded per config#2275. Rules are ordered most-specific-first: research_predictor_degraded ALWAYS routes to the generic NotifyCompleteMultipleDegraded first, regardless of any other flag \u2014 deliberately given NO single-flag notifier of its own (unlike the other four) because it already covers 25+ distinct internal fail-open routes; adding a sixth per-combination axis on top would multiply the enumeration this Choice already avoids for the fourth flag (parity_degraded, next). parity_degraded combined with ANY other family also routes to NotifyCompleteMultipleDegraded (mirrors the report_card_degraded fold below \u2014 the config#2276 comment's predicted 'third flag family' generalizes further the same way: fold into the existing generic combined notifier rather than enumerating more per-combination hardcoded Task states); then report_card_degraded combined with EITHER remaining family also routes to NotifyCompleteMultipleDegraded (config#6685); the pre-existing gates+health / gates-only / health-only rules are UNCHANGED (each still implies report_card_degraded, parity_degraded and research_predictor_degraded are all absent, since any of those being true is intercepted by the rules ahead of them); report_card_degraded alone gets its own single-flag notifier (NotifyCompleteReportCardDegraded) mirroring NotifyCompleteGatesDegraded/NotifyCompleteHealthDegraded exactly, and parity_degraded alone (all three other flags absent) gets NotifyCompleteParityDegraded (alpha-engine-config-I6025), same shape. Each still routes to a SEPARATE hardcoded-constant notifier rather than States.Format-ing flags into NotifyComplete \u2014 preserving config#1819's Subject/Message-are-constants invariant. Name retained from config#2278 (it is the wave-1 chain anchor referenced across tests/comments) \u2014 read it as the degraded-completion selector.",
       "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.research_predictor_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.research_predictor_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyCompleteMultipleDegraded"
+        },
         {
           "And": [
             {
@@ -5063,12 +5248,12 @@
     },
     "NotifyCompleteMultipleDegraded": {
       "Type": "Task",
-      "Comment": "config#6685 + alpha-engine-config-I6025: SUCCESS notifier for a run where TWO OR MORE of the four degraded-flag families fired together (pre-spend gates, tail health checks, report card advisory grading, parity verdict). Folded (config#2276's own comment predicted a third flag family would need a data-driven notifier rather than a 7-way enumeration, and the same reasoning generalizes to the fourth): a single generic combined-degradation notifier for every 2+-family combination, instead of enumerating every additional per-combination Task state. Deliberately does NOT assert which SPECIFIC families degraded in the constant Subject/Message (config#1819 forbids States.Format-ing the exact set into the text) \u2014 names all four categories generically and points at the execution record ($.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded) for the exact combination, which stays truthful regardless of which subset actually fired. Mirrors NotifyCompleteGatesDegraded's shape \u2014 constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819).",
+      "Comment": "config#6685 + alpha-engine-config-I6025 + alpha-engine-config#6722: SUCCESS notifier for a run where TWO OR MORE of the (now five) degraded-flag families fired together (pre-spend gates, tail health checks, report card advisory grading, parity verdict, ResearchPredictorParallel's internal fail-open routes) \u2014 OR research_predictor_degraded fired ALONE, which is deliberately folded here too rather than given its own single-flag notifier (it already covers 25+ distinct internal routes; a sixth per-combination axis would re-introduce the enumeration explosion this notifier exists to avoid). Folded (config#2276's own comment predicted a third flag family would need a data-driven notifier rather than a 7-way enumeration, and the same reasoning generalizes further): a single generic combined-degradation notifier, instead of enumerating every additional per-combination Task state. Deliberately does NOT assert which SPECIFIC families degraded in the constant Subject/Message (config#1819 forbids States.Format-ing the exact set into the text) \u2014 names all five categories generically and points at the execution record ($.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded / $.research_predictor_degraded) for the exact combination, which stays truthful regardless of which subset actually fired (including the single-family research_predictor_degraded-only case). Mirrors NotifyCompleteGatesDegraded's shape \u2014 constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819).",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (multiple stages DEGRADED)",
-        "Message": "All steps completed successfully \u2014 BUT two or more of the following degraded on this run: the pre-spend gates (LibPinDriftCheck/PipelineContractCheck), the tail health checks (SaturdayHealthCheck/WeeklySubstrateHealthCheck), the report card advisory grading (ReportCard Lambda), and/or the Parity verdict (pit_parity/replay \u2014 absence of a verdict must NOT be read as a clean pass). Exact combination is on the execution record: $.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded, with detail at $.report_card_error and (if set) $.health_check_error / $.substrate_check_error / $.parity_error. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (run DEGRADED)",
+        "Message": "All steps completed successfully \u2014 BUT one or more of the following degraded on this run: the pre-spend gates (LibPinDriftCheck/PipelineContractCheck/AcquireMutex), the tail health checks (SaturdayHealthCheck/WeeklySubstrateHealthCheck), the report card advisory grading (ReportCard Lambda), the Parity verdict (pit_parity/replay \u2014 absence of a verdict must NOT be read as a clean pass), and/or an internal ResearchPredictorParallel fail-open (Scanner/RegimeSubstrate/ChallengerShadow/ThinkTank/the eval-judge chain/cost aggregation/the model-zoo rotation). Exact combination is on the execution record: $.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded / $.research_predictor_degraded, with detail at $.report_card_error and (if set) $.health_check_error / $.substrate_check_error / $.parity_error / $.branch_outcomes. View pipeline status: https://console.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [

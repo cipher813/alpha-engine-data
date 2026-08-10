@@ -93,10 +93,21 @@ def test_the_run_day_gate_really_does_key_on_that_role(weekly):
 
 
 def test_launch_failure_alerts_and_never_fails_postclose(eod):
-    """A silent non-launch is indistinguishable from a day nobody looked at."""
+    """A silent non-launch is indistinguishable from a day nobody looked at.
+
+    alpha-engine-config#6722: the launch failure previously alerted via SNS
+    (WeeklyExerciseLaunchFailed) but was never threaded into
+    $.degraded_summary — the Catch now routes through
+    SetWeeklyExerciseDegradedFlag first, unchanged continuation otherwise."""
     catch = eod["LaunchWeeklyExerciseRun"]["Catch"][0]
     assert catch["ErrorEquals"] == ["States.ALL"]
-    assert catch["Next"] == "WeeklyExerciseLaunchFailed"
+    assert catch["Next"] == "SetWeeklyExerciseDegradedFlag"
+
+    flag = eod["SetWeeklyExerciseDegradedFlag"]
+    assert flag["Type"] == "Pass"
+    assert flag["ResultPath"] == "$.degraded_summary"
+    assert flag["Parameters"]["degraded"] is True
+    assert flag["Next"] == "WeeklyExerciseLaunchFailed"
 
     failed = eod["WeeklyExerciseLaunchFailed"]
     assert failed["Resource"] == "arn:aws:states:::sns:publish"

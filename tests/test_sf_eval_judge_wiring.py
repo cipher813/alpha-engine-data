@@ -351,9 +351,12 @@ class TestEvalJudgeSubmitContract:
     def test_submit_catch_routes_to_rolling_mean_not_failure(
         self, states, state_name,
     ):
+        # alpha-engine-config#6722: routes through the shared
+        # MarkEvalJudgeDegraded convergence before EvalRollingMean.
         catch = states[state_name]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
-        assert catch["Next"] == "EvalRollingMean"
+        assert catch["Next"] == "MarkEvalJudgeDegraded"
+        assert states["MarkEvalJudgeDegraded"]["Next"] == "EvalRollingMean"
 
 
 class TestEvalJudgePollChoice:
@@ -481,9 +484,12 @@ class TestEvalJudgeProcessContract:
         assert states["EvalJudgeProcess"]["Next"] == "EvalRollingMean"
 
     def test_process_catch_routes_to_rolling_mean_not_failure(self, states):
+        # alpha-engine-config#6722: routes through the shared
+        # MarkEvalJudgeDegraded convergence before EvalRollingMean.
         catch = states["EvalJudgeProcess"]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
-        assert catch["Next"] == "EvalRollingMean"
+        assert catch["Next"] == "MarkEvalJudgeDegraded"
+        assert states["MarkEvalJudgeDegraded"]["Next"] == "EvalRollingMean"
 
 
 # ── Non-blocking failure semantics — preserved across the chain ──────────
@@ -507,10 +513,13 @@ class TestBatchChainNonBlocking:
     def test_states_all_states_catch_routes_to_rolling_mean(
         self, states, state_name,
     ):
+        # alpha-engine-config#6722: all four share the MarkEvalJudgeDegraded
+        # convergence, which itself continues to EvalRollingMean unchanged.
         catch = states[state_name]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
-        assert catch["Next"] == "EvalRollingMean"
+        assert catch["Next"] == "MarkEvalJudgeDegraded"
         assert catch["Next"] != "HandleFailure"
+        assert states["MarkEvalJudgeDegraded"]["Next"] == "EvalRollingMean"
 
 
 # ── EvalRollingMean state (PR 4c) ─────────────────────────────────────────
@@ -541,10 +550,13 @@ class TestEvalRollingMean:
         assert states["EvalRollingMean"]["Next"] == "CheckSkipRationaleClustering"
 
     def test_catch_routes_to_rationale_clustering_gate_not_failure(self, states):
+        # alpha-engine-config#6722: routes through MarkEvalRollingMeanDegraded
+        # before converging on CheckSkipRationaleClustering exactly as before.
         catch = states["EvalRollingMean"]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
-        assert catch["Next"] == "CheckSkipRationaleClustering"
+        assert catch["Next"] == "MarkEvalRollingMeanDegraded"
         assert catch["Next"] != "HandleFailure"
+        assert states["MarkEvalRollingMeanDegraded"]["Next"] == "CheckSkipRationaleClustering"
 
     def test_retries_on_transient_lambda_errors(self, states):
         # Same retry posture as the eval-judge state — one retry on
@@ -609,10 +621,13 @@ class TestRationaleClustering:
         assert states["RationaleClustering"]["Next"] == "CheckSkipReplayConcordance"
 
     def test_catch_routes_to_concordance_gate_not_failure(self, states):
+        # alpha-engine-config#6722: routes through MarkRationaleClusteringDegraded
+        # before converging on CheckSkipReplayConcordance exactly as before.
         catch = states["RationaleClustering"]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
-        assert catch["Next"] == "CheckSkipReplayConcordance"
+        assert catch["Next"] == "MarkRationaleClusteringDegraded"
         assert catch["Next"] != "HandleFailure"
+        assert states["MarkRationaleClusteringDegraded"]["Next"] == "CheckSkipReplayConcordance"
 
     def test_retries_on_transient_lambda_errors(self, states):
         retry = states["RationaleClustering"]["Retry"][0]
@@ -672,10 +687,13 @@ class TestReplayConcordance:
         assert states["ReplayConcordance"]["Next"] == "CheckSkipCounterfactual"
 
     def test_catch_routes_to_counterfactual_gate_not_failure(self, states):
+        # alpha-engine-config#6722: routes through MarkReplayConcordanceDegraded
+        # before converging on CheckSkipCounterfactual exactly as before.
         catch = states["ReplayConcordance"]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
-        assert catch["Next"] == "CheckSkipCounterfactual"
+        assert catch["Next"] == "MarkReplayConcordanceDegraded"
         assert catch["Next"] != "HandleFailure"
+        assert states["MarkReplayConcordanceDegraded"]["Next"] == "CheckSkipCounterfactual"
 
     def test_retries_on_transient_lambda_errors(self, states):
         retry = states["ReplayConcordance"]["Retry"][0]
@@ -759,10 +777,13 @@ class TestCounterfactual:
         # Counterfactual and the branch terminal is itself a separate
         # observability layer with its own Catch routing to
         # BranchAComplete.
+        # alpha-engine-config#6722: routes through MarkCounterfactualDegraded
+        # before converging on CheckSkipAggregateCosts exactly as before.
         catch = states["Counterfactual"]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
-        assert catch["Next"] == "CheckSkipAggregateCosts"
+        assert catch["Next"] == "MarkCounterfactualDegraded"
         assert catch["Next"] != "HandleFailure"
+        assert states["MarkCounterfactualDegraded"]["Next"] == "CheckSkipAggregateCosts"
 
     def test_retries_on_transient_lambda_errors(self, states):
         retry = states["Counterfactual"]["Retry"][0]
@@ -832,9 +853,16 @@ class TestJudgeChainBeforePredictor:
         BranchAComplete is preserved (CheckSkipAggregateCosts.Default →
         AggregateCosts.Next → BranchAComplete; CheckSkipAggregateCosts's
         skip-branch → BranchAComplete directly)."""
+        # alpha-engine-config#6722: the Catch edge now detours through
+        # MarkCounterfactualDegraded, still transitively reaching
+        # CheckSkipAggregateCosts.
         assert states["Counterfactual"]["Next"] == "CheckSkipAggregateCosts"
         assert (
             states["Counterfactual"]["Catch"][0]["Next"]
+            == "MarkCounterfactualDegraded"
+        )
+        assert (
+            states["MarkCounterfactualDegraded"]["Next"]
             == "CheckSkipAggregateCosts"
         )
         assert (

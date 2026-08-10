@@ -73,14 +73,32 @@ notifier/marker-selector actually reads (``$.gate_degraded`` /
 an explicit, reasoned ``_DEGRADED_FLAG_EXEMPT`` entry. Scoped to the three
 SCHEDULED pipelines only (``step_function_groom.json`` has no such
 concept — see ``_DEGRADED_FLAG_SF_FILES``). Running the walker against the
-definitions as measured on this branch surfaced 25 pre-existing gaps
-(tracked, not fixed, at alpha-engine-config#6722 — including a NAMED §5
-carve-out non-compliance on ``AggregateCosts`` and a dead flag on
-``ThinkTankDegraded`` that is set but never read) and one genuinely
-mechanical fix applied directly in this PR: ``step_function_eod.json``'s
+definitions as measured at alpha-engine-config#6715's PR surfaced 25
+pre-existing gaps (tracked at alpha-engine-config#6722 — including a NAMED
+§5 carve-out non-compliance on ``AggregateCosts`` and a dead flag on
+``ThinkTankDegraded`` that was set but never read) plus one genuinely
+mechanical fix applied directly in that PR: ``step_function_eod.json``'s
 post-market data-spot fail-open path was missing the
 ``SetDataSpotDegradedFlag`` state its sibling ``step_function_daily.json``
 already has (config#6692) — added verbatim, mirroring the daily pattern.
+
+alpha-engine-config#6722 (this PR) wired all 25: 4 top-level mutex/scanner/
+exercise-launch fail-opens directly (their entries are DELETED — the walker
+verifies them without any exemption), and the 20 remaining routes living
+INSIDE ``ResearchPredictorParallel``'s two branches via a branch-local
+fold (``$.research_degraded_local``, seeded per-branch, threaded through
+Mark*Degraded Pass states, hoisted by each branch terminal, folded into a
+fifth top-level flag — ``$.research_predictor_degraded`` — by the new
+``CheckResearchPredictorDegraded``/``SetResearchPredictorDegraded`` pair
+spliced onto ``CheckBranchOutcomes``' non-FAILED path). The fold is real
+and verified end-to-end by ``tests/test_sf_research_predictor_degraded_
+wiring.py``, but a Parallel branch cannot write an outer-scope JSONPath
+(ASL scoping), so this walker's forward trace from a top-level Catch can
+never see it — the 20 corresponding ``_DEGRADED_FLAG_EXEMPT`` entries below
+therefore stay in place with their reason reworded from "VIOLATION —
+tracked" to a verified justification, the same disposition PR1277 used for
+ParityParallel's six intra-branch entries (alpha-engine-config#6030).
+Zero ``VIOLATION`` entries remain.
 """
 from __future__ import annotations
 
@@ -113,6 +131,7 @@ _TIMEOUT_EXEMPT: dict[str, dict[str, str]] = {
         "ResearchPredictorParallel.PublishModelZooFailureImmediate": "sns:publish immediate-failure notifier — SDK call, not a wait",
         "PublishReportCardDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait",
         "PublishParityDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait (alpha-engine-config-I6025)",
+        "PublishMutexAcquireDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait (alpha-engine-config#6722)",
         "NotifyCompleteGatesDegraded": "sns:publish completion notifier — SDK call, not a wait",
         "NotifyCompleteHealthDegraded": "sns:publish completion notifier — SDK call, not a wait",
         "NotifyCompleteGatesAndHealthDegraded": "sns:publish completion notifier — SDK call, not a wait",
@@ -240,6 +259,7 @@ _DEGRADED_FLAG_JSONPATHS: dict[str, frozenset[str]] = {
             "$.health_check_degraded",
             "$.report_card_degraded",
             "$.parity_degraded",
+            "$.research_predictor_degraded",
         }
     ),
     "step_function_daily.json": frozenset({"$.degraded_summary"}),
@@ -320,13 +340,20 @@ _NOTIFY_RESOURCE = "arn:aws:states:::sns:publish"
 #     that unconditionally precedes this state" claim (cites the ancestor);
 #   * a deliberate documented SWALLOW that fails SAFE toward the primary
 #     path rather than toward silent success (cites the state's own
-#     inline rationale); or
-#   * "VIOLATION — tracked (alpha-engine-config#6722)" — a genuine,
-#     un-fixed policy gap this PR did NOT silently paper over. #6722 is the
-#     tracker; alpha-engine-config#6715 built this test and fixed the one
-#     instance (EOD's data-spot path) mechanical enough to fix in place —
-#     see infrastructure/step_function_eod.json's new
-#     SetDataSpotDegradedFlag state.
+#     inline rationale);
+#   * a FIXED-but-not-directly-walker-visible fold (alpha-engine-config#6722):
+#     the flag genuinely gets set and reaches the terminal notifier, but via
+#     a branch-local marker + post-join hoist this walker's single-scope
+#     forward trace cannot see (ASL Parallel branches cannot write an
+#     outer-scope JSONPath) — cites the Mark*Degraded state, the branch
+#     terminal that hoists it, and the post-join fold, and is verified by a
+#     dedicated wiring test module (mirrors PR1277's disposition for
+#     ParityParallel's intra-branch entries, alpha-engine-config#6030); or
+#   * "VIOLATION — tracked (alpha-engine-config#NNNN)" — a genuine,
+#     un-fixed policy gap. NONE remain as of alpha-engine-config#6722
+#     (which wired the last 25 gaps alpha-engine-config#6715 surfaced) —
+#     any future re-appearance of this literal string is a REAL new gap
+#     needing its own tracker issue, not a leftover.
 _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
     "step_function.json": {
         "WeeklyRunDayGate": (
@@ -335,110 +362,148 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
             "the mutex handles duplicates.' No degraded flag required by "
             "design, unlike the other three named §5 families."
         ),
-        "AcquireMutex": (
-            "VIOLATION — tracked (alpha-engine-config#6722): the "
-            "mutex-acquire infra-error Catch clause (DynamoDB failure "
-            "other than ConditionalCheckFailedException, which the "
-            "SEPARATE MutexConflict Catch/Fail already handles) proceeds "
-            "silently with no degraded flag."
-        ),
         "ResearchPredictorParallel.Scanner": (
-            "VIOLATION — tracked (alpha-engine-config#6722): research-"
-            "substep fail-open group (Scanner/RegimeSubstrate/"
-            "ChallengerShadow/RegimeRetrospectiveEval) with no degraded flag."
+            "FIXED, not directly walker-visible (alpha-engine-config#6722): "
+            "an ASL Parallel branch cannot write an outer-scope JSONPath "
+            "(the CAUTION this issue's own body names), so no in-branch fix "
+            "is ever detectable by this walker starting from a top-level "
+            "Choice. Scanner's Catch now routes through MarkScannerDegraded "
+            "(sets branch-local $.research_degraded_local=true, seeded "
+            "false by InitResearchDegradedFlag at Branch A's StartAt) before "
+            "converging on CheckSkipRegimeSubstrate exactly as before. "
+            "BranchAComplete hoists that marker as branch_a_degraded; "
+            "AggregateBranchOutcomes hoists it post-join; "
+            "CheckResearchPredictorDegraded ORs it with Branch B's "
+            "equivalent and sets the real top-level $.research_predictor_"
+            "degraded CheckGateDegradedNotify reads (folded into "
+            "NotifyCompleteMultipleDegraded). Verified end-to-end by "
+            "tests/test_sf_research_predictor_degraded_wiring.py — mirrors "
+            "the CheckParityBranchOutcomes fold PR1277 built for "
+            "ParityParallel (alpha-engine-config#6030), the same disposition "
+            "used there for its own intra-branch entries."
         ),
         "ResearchPredictorParallel.RegimeSubstrate": (
-            "VIOLATION — tracked (alpha-engine-config#6722): same "
-            "research-substep group as Scanner."
+            "Same fold as Scanner (routes through MarkRegimeSubstrateDegraded) "
+            "— see that entry for the full mechanism; verified by "
+            "tests/test_sf_research_predictor_degraded_wiring.py."
         ),
         "ResearchPredictorParallel.ChallengerShadow": (
-            "VIOLATION — tracked (alpha-engine-config#6722): same "
-            "research-substep group as Scanner."
+            "Same fold as Scanner (routes through MarkChallengerShadowDegraded) "
+            "— see that entry for the full mechanism; verified by "
+            "tests/test_sf_research_predictor_degraded_wiring.py."
         ),
         "ResearchPredictorParallel.ThinkTankCoverage": (
-            "VIOLATION — tracked (alpha-engine-config#6722): "
-            "ThinkTankDegraded DOES set a flag ($.thinktank_degraded=true) "
-            "but it is DEAD — never read by CheckGateDegradedNotify or "
-            "anywhere else in this file. The exact 'follow the actual "
-            "JSONPath, not any degraded-named key' trap config#6715 was "
-            "built to catch."
+            "FIXED (alpha-engine-config#6722): ThinkTankDegraded USED to set "
+            "$.thinktank_degraded=true, but that path was DEAD — never read "
+            "by CheckGateDegradedNotify or anywhere else in this file, the "
+            "exact 'follow the actual JSONPath, not any degraded-named key' "
+            "trap config#6715 was built to catch. Repointed to write the "
+            "same branch-local $.research_degraded_local every other "
+            "Branch A fail-open uses, folded into $.research_predictor_"
+            "degraded post-join (see Scanner's entry for the full "
+            "mechanism). Verified live-wired (not just renamed) by "
+            "tests/test_sf_research_predictor_degraded_wiring.py."
         ),
         "ResearchPredictorParallel.WaitForThinkTank": (
-            "VIOLATION — tracked (alpha-engine-config#6722): same dead-"
-            "flag finding as ThinkTankCoverage."
+            "Same repoint as ThinkTankCoverage — both Catches converge on "
+            "the same ThinkTankDegraded state, now writing the real, "
+            "verified branch-local flag."
         ),
         "ResearchPredictorParallel.RegimeRetrospectiveEval": (
-            "VIOLATION — tracked (alpha-engine-config#6722): same "
-            "research-substep group as Scanner."
+            "Same fold as Scanner (routes through "
+            "MarkRegimeRetrospectiveEvalDegraded) — see that entry for the "
+            "full mechanism; verified by "
+            "tests/test_sf_research_predictor_degraded_wiring.py."
         ),
         "ResearchPredictorParallel.EvalJudgeSubmitFirstSaturday": (
-            "VIOLATION — tracked (alpha-engine-config#6722): eval-judge "
-            "chain fail-open group (EvalJudgeSubmit*/EvalJudgePoll/"
-            "EvalJudgeProcess/EvalRollingMean/RationaleClustering/"
-            "ReplayConcordance/Counterfactual) with no degraded flag."
+            "FIXED, not directly walker-visible (alpha-engine-config#6722, "
+            "same branch-scoping constraint as Scanner's entry above): this "
+            "and the sibling eval-judge Catches (EvalJudgeSubmitWeekly/"
+            "EvalJudgePoll/EvalJudgeProcess) all previously converged "
+            "directly on EvalRollingMean with no flag. Now share ONE "
+            "convergence Pass (MarkEvalJudgeDegraded, sets $.research_"
+            "degraded_local=true) before continuing to EvalRollingMean "
+            "unchanged, folded into $.research_predictor_degraded post-join "
+            "exactly as Scanner's entry describes. Verified by "
+            "tests/test_sf_research_predictor_degraded_wiring.py."
         ),
         "ResearchPredictorParallel.EvalJudgeSubmitWeekly": (
-            "VIOLATION — tracked (alpha-engine-config#6722): same "
-            "eval-judge chain group as EvalJudgeSubmitFirstSaturday."
+            "Same shared fold as EvalJudgeSubmitFirstSaturday (both route "
+            "through MarkEvalJudgeDegraded)."
         ),
         "ResearchPredictorParallel.EvalJudgePoll": (
-            "VIOLATION — tracked (alpha-engine-config#6722): same "
-            "eval-judge chain group as EvalJudgeSubmitFirstSaturday."
+            "Same shared fold as EvalJudgeSubmitFirstSaturday (routes "
+            "through MarkEvalJudgeDegraded)."
         ),
         "ResearchPredictorParallel.EvalJudgeProcess": (
-            "VIOLATION — tracked (alpha-engine-config#6722): same "
-            "eval-judge chain group as EvalJudgeSubmitFirstSaturday."
+            "Same shared fold as EvalJudgeSubmitFirstSaturday (routes "
+            "through MarkEvalJudgeDegraded)."
         ),
         "ResearchPredictorParallel.EvalRollingMean": (
-            "VIOLATION — tracked (alpha-engine-config#6722): same "
-            "eval-judge chain group as EvalJudgeSubmitFirstSaturday."
+            "Same fold as Scanner, on EvalRollingMean's OWN Catch (distinct "
+            "from the eval-judge submit/poll/process group above) — routes "
+            "through MarkEvalRollingMeanDegraded before continuing to "
+            "CheckSkipRationaleClustering unchanged."
         ),
         "ResearchPredictorParallel.RationaleClustering": (
-            "VIOLATION — tracked (alpha-engine-config#6722): same "
-            "eval-judge chain group as EvalJudgeSubmitFirstSaturday."
+            "Same fold as Scanner (routes through "
+            "MarkRationaleClusteringDegraded) before continuing to "
+            "CheckSkipReplayConcordance unchanged."
         ),
         "ResearchPredictorParallel.ReplayConcordance": (
-            "VIOLATION — tracked (alpha-engine-config#6722): same "
-            "eval-judge chain group as EvalJudgeSubmitFirstSaturday."
+            "Same fold as Scanner (routes through "
+            "MarkReplayConcordanceDegraded) before continuing to "
+            "CheckSkipCounterfactual unchanged."
         ),
         "ResearchPredictorParallel.Counterfactual": (
-            "VIOLATION — tracked (alpha-engine-config#6722): same "
-            "eval-judge chain group as EvalJudgeSubmitFirstSaturday."
+            "Same fold as Scanner (routes through MarkCounterfactualDegraded) "
+            "before continuing to CheckSkipAggregateCosts unchanged."
         ),
         "ResearchPredictorParallel.AggregateCosts": (
-            "VIOLATION — tracked (alpha-engine-config#6722): matches "
-            "sf-pipeline-policy.md §5's NAMED cost-aggregation carve-out "
-            "verbatim ('Health-check and cost-aggregation stages may "
-            "fail-open ... They must still set a degraded flag.') — "
-            "Catch routes straight to BranchAComplete with zero flag. "
-            "Policy non-compliance on an explicit clause."
+            "FIXED (alpha-engine-config#6722): matched sf-pipeline-policy.md "
+            "§5's NAMED cost-aggregation carve-out verbatim ('Health-check "
+            "and cost-aggregation stages may fail-open ... They must still "
+            "set a degraded flag') without complying — Catch routed "
+            "straight to BranchAComplete with zero flag. Now routes through "
+            "MarkAggregateCostsDegraded (same branch-local fold as Scanner) "
+            "before continuing to BranchAComplete unchanged — the §5 "
+            "clause's flag requirement is now met, verified by "
+            "tests/test_sf_research_predictor_degraded_wiring.py."
         ),
         "ResearchPredictorParallel.ResolveZooSpecs": (
-            "VIOLATION — tracked (alpha-engine-config#6722): model-zoo "
-            "rotation fail-open group (ResolveZooSpecs/WaitResolveZoo/"
-            "ModelZooTrainMap/ModelZooSelect/WaitForModelZoo) with no "
-            "degraded flag — the champion is already trained+promoted so "
-            "the rotation is advisory, but policy still requires a "
-            "visible flag for any fail-open stage."
+            "FIXED, not directly walker-visible (alpha-engine-config#6722, "
+            "Branch B's version of the Scanner-entry constraint): the "
+            "model-zoo rotation group (ResolveZooSpecs/WaitResolveZoo/"
+            "ModelZooTrainMap/ModelZooSelect/WaitForModelZoo) all converge "
+            "on ONE existing state, PublishModelZooFailureImmediate, which "
+            "now routes through MarkModelZooDegraded (sets Branch B's "
+            "branch-local $.research_degraded_local=true, seeded false by "
+            "InitPredictorDegradedFlag at Branch B's StartAt) before continuing "
+            "to BranchBComplete unchanged. BranchBComplete hoists the "
+            "marker as branch_b_degraded; the champion is already "
+            "trained+promoted so the rotation stays advisory, but the "
+            "required visible flag is now real — see Scanner's entry for "
+            "the full post-join fold. Verified by "
+            "tests/test_sf_research_predictor_degraded_wiring.py."
         ),
         "ResearchPredictorParallel.WaitResolveZoo": (
-            "VIOLATION — tracked (alpha-engine-config#6722): same "
-            "model-zoo rotation group as ResolveZooSpecs."
+            "Same shared convergence as ResolveZooSpecs (both route to "
+            "PublishModelZooFailureImmediate -> MarkModelZooDegraded)."
         ),
         "ResearchPredictorParallel.ModelZooTrainMap": (
-            "VIOLATION — tracked (alpha-engine-config#6722): same "
-            "model-zoo rotation group as ResolveZooSpecs (the Map state's "
+            "Same shared convergence as ResolveZooSpecs (the Map state's "
             "OWN Catch — a genuine Map-engine error, not a per-iteration "
             "one; see TrainSpecDispatch/WaitTrainSpec below for the "
-            "per-iteration case)."
+            "per-iteration case — also routes to PublishModelZooFailure"
+            "Immediate -> MarkModelZooDegraded)."
         ),
         "ResearchPredictorParallel.ModelZooSelect": (
-            "VIOLATION — tracked (alpha-engine-config#6722): same "
-            "model-zoo rotation group as ResolveZooSpecs."
+            "Same shared convergence as ResolveZooSpecs (routes to "
+            "PublishModelZooFailureImmediate -> MarkModelZooDegraded)."
         ),
         "ResearchPredictorParallel.WaitForModelZoo": (
-            "VIOLATION — tracked (alpha-engine-config#6722): same "
-            "model-zoo rotation group as ResolveZooSpecs."
+            "Same shared convergence as ResolveZooSpecs (routes to "
+            "PublishModelZooFailureImmediate -> MarkModelZooDegraded)."
         ),
         "ResearchPredictorParallel.ModelZooTrainMap.TrainSpecDispatch": (
             "Map ITERATION-level failure, tolerated by design per this "
@@ -454,11 +519,6 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
         ),
     },
     "step_function_daily.json": {
-        "AcquireMutex": (
-            "VIOLATION — tracked (alpha-engine-config#6722): same "
-            "mutex-acquire-infra-error gap as step_function.json's / "
-            "step_function_eod.json's AcquireMutex."
-        ),
         "TradingDayGate": (
             "Same design intent as the NAMED weekly run-day-gate §5 "
             "carve-out (missing a trading day is worse than a duplicate; "
@@ -470,13 +530,6 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
             "entry already treats it as the same accepted pattern. Stated "
             "assumption (alpha-engine-config#6715 session) — a §5 wording "
             "PR to name it explicitly is a cheap follow-up."
-        ),
-        "Scanner": (
-            "VIOLATION — tracked (alpha-engine-config#6722): daily "
-            "Scanner fail-open (mirrors weekly's identical pattern) sets "
-            "no degraded flag; PredictorInference's own downstream "
-            "freshness/age gate mitigates the trading-safety risk but the "
-            "terminal notify still says nothing about the miss."
         ),
     },
     "step_function_eod.json": {
@@ -491,10 +544,6 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
             "Same route as CaptureSnapshot's Catch (config#5569): poll "
             "failure enters the same bounded-retry-then-HandleFailure "
             "path; fail-closed, not fail-open."
-        ),
-        "AcquireMutex": (
-            "VIOLATION — tracked (alpha-engine-config#6722): same "
-            "mutex-acquire-infra-error gap as the sibling files."
         ),
         "ProbeEODReconcilePrecondition": (
             "Deliberate documented SWALLOW — this state's own Comment "
@@ -542,12 +591,6 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
             "weekly-sf-policy §5's 'missed exercise run is the worse "
             "failure mode' reasoning, the same intent as the named "
             "run-day-gate carve-out."
-        ),
-        "LaunchWeeklyExerciseRun": (
-            "VIOLATION — tracked (alpha-engine-config#6722): the "
-            "weekly-exercise sub-pipeline launch failure alerts via SNS "
-            "(WeeklyExerciseLaunchFailed) but is never threaded into "
-            "$.degraded_summary."
         ),
     },
 }
