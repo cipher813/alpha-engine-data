@@ -849,8 +849,13 @@ alert_classes:
   - class: boot_pull
     # config-I3211 backstop registration (alpha-engine-config#5714 / #4793):
     # boot-time repo pull on a box failed, risking stale code at session start.
-    # Alert payload's raw `Source:` field is the hyphenated `boot-pull`.
-    source: "alpha-engine/infrastructure/boot-pull.sh"
+    # Source corrected config-I6753: both boot-pull.sh scripts (dashboard +
+    # executor boxes) emit `--source boot-pull` on the wire; the previous
+    # path-shaped value never matched any emitted event, so this class was
+    # registered but unmatchable — exactly the drift the CLI-shape chokepoint
+    # extension now catches. One row covers both boxes; per-box attribution
+    # rides the message body.
+    source: "boot-pull"
     severities: [error]
     intake: bus
     response: drain-queue
@@ -886,6 +891,80 @@ alert_classes:
   - class: deploy_on_merge
     source: "deploy-on-merge"
     severities: [critical]
+    intake: bus
+    response: drain-queue
+  - class: scan_unlisted_state
+    # TRACKED-ONLY tier (routing epic config-I6751, re-route config-I6752):
+    # hygiene finding, emitted `--severity warning --no-sns` — silent Telegram
+    # plus this bus event; the drain's disposition issue IS the remediation
+    # path (observability-policy.md §7.4). Scanner breakage pages separately
+    # via the unit's OnFailure=, not through this class.
+    source: "scan-unlisted-state"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+
+  # ── CLI-shaped emitters the config-I6753 chokepoint extension surfaced ──
+  # These predate the extension; every one emitted through the krepis CLI,
+  # a shape the drift check could not see until it learned `-m krepis.alerts`.
+  - class: morning_signal_watchdog
+    source: "morning-signal-watchdog"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: reboot_if_needed
+    source: "reboot-if-needed"
+    severities: [dynamic]
+    intake: bus
+    response: drain-queue
+  - class: deploy_notification_backtester_concordance
+    source: "alpha-engine-backtester/infrastructure/deploy_concordance.sh"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+  - class: deploy_notification_backtester_counterfactual
+    source: "alpha-engine-backtester/infrastructure/deploy_counterfactual.sh"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+  - class: deploy_notification_backtester_health
+    source: "alpha-engine-backtester/infrastructure/deploy_health.sh"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+  - class: eod_snapshot_existence_check
+    source: "alpha-engine-eod-snapshot-existence-check"
+    severities: [critical]
+    intake: bus
+    response: drain-queue
+  - class: weekly_sf_recovery_metric
+    source: "nousergon-data/scripts/weekly_sf_recovery_metric.py"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+
+  # ── laptop LLM-routing plane (claude-code-config, config-I6753) ──
+  # All four call sites previously omitted the REQUIRED `publish` subcommand,
+  # so every invocation died on an argparse error the callers swallowed —
+  # none of these classes had ever delivered an alert before the I6753 fix.
+  - class: router_canary
+    source: "router-canary"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+  - class: llm_egress_proxy_sli
+    source: "llm-egress-proxy"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+  - class: llm_router_reload_health
+    source: "llm-router-reload"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+  - class: litellm_proxy_degraded_start
+    source: "litellm-proxy-shim"
+    severities: [warning]
     intake: bus
     response: drain-queue
 
