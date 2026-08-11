@@ -58,7 +58,8 @@ SPOT_STAGE_SEND_STATES = {
     "PitParityWalkforward",
     "ParityReplay",
     "PitParityCompare",
-    "Evaluator",
+    "EvaluatorDiagnostics",
+    "EvaluatorOptimize",
 }
 HEALTH_OBSERVE_SEND_STATES = {
     "SaturdayHealthCheck",

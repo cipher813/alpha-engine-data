@@ -176,8 +176,10 @@ class TestNormalizeFailureContextIsSoleChokepoint:
             "WaitForPredictorBacktest",
             "PortfolioOptimizerBacktest",
             "WaitForPortfolioOptimizerBacktest",
-            "Evaluator",
-            "WaitForEvaluator",
+            "EvaluatorDiagnostics",
+            "WaitForEvaluatorDiagnostics",
+            "EvaluatorOptimize",
+            "WaitForEvaluatorOptimize",
         ]
         # NOTE: Parity + WaitForParity are deliberately NOT in the list —
         # alpha-engine-config-I6025: parity failures degrade (ParityDegraded →
@@ -200,7 +202,8 @@ class TestNormalizeFailureContextIsSoleChokepoint:
             "ExtractBacktesterError",
             "ExtractPredictorBacktestError",
             "ExtractPortfolioOptimizerBacktestError",
-            "ExtractEvaluatorError",
+            "ExtractEvaluatorDiagnosticsError",
+            "ExtractEvaluatorOptimizeError",
         ]
         # ExtractParityError removed with the degrade-not-fail route (I6025).
         assert "ExtractParityError" not in weekly_states

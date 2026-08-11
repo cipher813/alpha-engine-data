@@ -186,7 +186,7 @@ class TestSkipBacktesterPreservesEvalJudge:
     def test_evaluator_skip_gate_always_reaches_health_check(self, states):
         """Both branches of CheckSkipEvaluator must converge into the
         post-eval tail — the skip path and the run path
-        (Evaluator → CheckEvaluatorStatus → Success) both exit to
+        (EvaluatorOptimize → CheckEvaluatorOptimizeStatus → Success) both exit to
         CheckSkipPostEval, the config#830 tail skip-gate, which defaults
         to SaturdayHealthCheck (full observability tail).
 
@@ -205,10 +205,10 @@ class TestSkipBacktesterPreservesEvalJudge:
         gate = states["CheckSkipEvaluator"]
         skip_choice = gate["Choices"][0]
         assert skip_choice["Next"] == "CheckSkipPostEval"
-        assert gate["Default"] == "Evaluator"
+        assert gate["Default"] == "EvaluatorDiagnostics"
         # Run path success also exits to the tail gate (judge already ran upstream).
         assert (
-            states["CheckEvaluatorStatus"]["Choices"][0]["Next"]
+            states["CheckEvaluatorOptimizeStatus"]["Choices"][0]["Next"]
             == "CheckSkipPostEval"
         )
         # The tail gate defaults to the full health-check tail (normal run).
@@ -878,7 +878,7 @@ class TestJudgeChainBeforePredictor:
         (judge ran upstream). It exits to the post-eval tail gate
         (CheckSkipPostEval, config#830), which defaults to SaturdayHealthCheck."""
         success = next(
-            c for c in states["CheckEvaluatorStatus"]["Choices"]
+            c for c in states["CheckEvaluatorOptimizeStatus"]["Choices"]
             if c.get("StringEquals") == "Success"
         )
         assert success["Next"] == "CheckSkipPostEval"

@@ -104,7 +104,8 @@ SSM_STAGE_NAMES = [
     "PitParityWalkforward",
     "ParityReplay",
     "PitParityCompare",
-    "Evaluator",
+    "EvaluatorDiagnostics",
+    "EvaluatorOptimize",
     "SaturdayHealthCheck",
     "WeeklySubstrateHealthCheck",
 ]
@@ -166,8 +167,11 @@ class TestSsmExecutionTimeoutPins:
     def test_pit_parity_compare(self):
         self._check("PitParityCompare")
 
-    def test_evaluator(self):
-        self._check("Evaluator")
+    def test_evaluator_diagnostics(self):
+        self._check("EvaluatorDiagnostics")
+
+    def test_evaluator_optimize(self):
+        self._check("EvaluatorOptimize")
 
     def test_saturday_health_check(self):
         self._check("SaturdayHealthCheck")
@@ -303,15 +307,39 @@ class TestAntiRegressionGuard:
                 f"RAGIngestion at universe {n} exceeds max {rag.max_budget_seconds}s"
             )
 
-    def test_evaluator_does_not_exceed_max_budget(self):
-        """Even without a precise per-ticker measurement, Evaluator is bounded."""
+    @pytest.mark.parametrize("stage", ["EvaluatorDiagnostics", "EvaluatorOptimize"])
+    def test_evaluator_halves_do_not_exceed_max_budget(self, stage):
+        """Both halves stay bounded as the universe grows (config-I3112).
+
+        The per-ticker figures are UPPER BOUNDS, not fits — all three source
+        runs sat at the same ~944-ticker universe, so they contain no slope,
+        and each half attributes 100% of its measured phase time to universe
+        scaling. That makes this assertion pessimistic on purpose.
+        """
         from infrastructure.sf_budgets import STAGE_BUDGETS
-        eval_b = STAGE_BUDGETS["Evaluator"]
+        b = STAGE_BUDGETS[stage]
         for n in (CURRENT_UNIVERSE_SIZE, 2000, 5000):
-            rec = eval_b.recommended_timeout(n)
-            assert rec <= eval_b.max_budget_seconds, (
-                f"Evaluator at universe {n}: recommended {rec}s > max {eval_b.max_budget_seconds}s"
+            rec = b.recommended_timeout(n)
+            assert rec <= b.max_budget_seconds, (
+                f"{stage} at universe {n}: recommended {rec}s > max {b.max_budget_seconds}s"
             )
+
+    def test_the_split_did_not_quietly_grow_the_evaluator_budget(self):
+        """The two halves together must cost the pipeline LESS than the one
+        state they replace, not more.
+
+        The single Evaluator state held 7200s against a measured 482s stage.
+        Splitting it is a decomposition, not a licence to widen: if a future
+        edit pushes the pair back past the old ceiling, the sequential tail
+        has silently reacquired budget nobody argued for.
+        """
+        from infrastructure.sf_budgets import STAGE_BUDGETS
+        pair = (STAGE_BUDGETS["EvaluatorDiagnostics"].current_timeout_seconds
+                + STAGE_BUDGETS["EvaluatorOptimize"].current_timeout_seconds)
+        assert pair <= 7_200, (
+            f"EvaluatorDiagnostics + EvaluatorOptimize = {pair}s exceeds the "
+            f"7200s the single Evaluator state held before the config-I3112 split"
+        )
 
 
 # ── Guard 4: fetch_budget.py integration (RAGIngestion cross-reference) ──────

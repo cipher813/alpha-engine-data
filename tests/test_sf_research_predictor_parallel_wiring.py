@@ -118,7 +118,7 @@ _BRANCH_B_STATES = {
     "WaitForModelZoo", "CheckModelZooStatus", "ModelZooWait",
     "ModelZooSelectLivenessGate", "ExtractModelZooSelectError",
     "ExtractModelZooSelectSubstrateLostError", "PredictorTrainingLivenessGate",
-    "ExtractPredictorSubstrateLostError", "PublishModelZooFailureImmediate",
+    "PublishModelZooFailureImmediate",
     # config#2253 validated skip path: skip_predictor_training=true routes
     # through a manifest-freshness HeadObject before the branch may read
     # as succeeded (backtest-eval preset bypasses validation by design).
