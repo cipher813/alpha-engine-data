@@ -61,7 +61,8 @@ ALL_CHECK_STATUS_STATES = [
     "CheckBacktesterStatus",
     "CheckDataPhase1Status",
     "CheckDataPhase2Status",
-    "CheckEvaluatorStatus",
+    "CheckEvaluatorDiagnosticsStatus",
+    "CheckEvaluatorOptimizeStatus",
     "CheckModelZooStatus",
     "CheckMorningEnrichStatus",
     # alpha-engine-config#6030: CheckParityStatus was split into the three

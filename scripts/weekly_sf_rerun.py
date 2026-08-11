@@ -153,6 +153,16 @@ class Stage:
     # (alpha-engine-config-I6055 — the 2026-08-01 Director hard-fail that
     # the next rerun skipped; extended to Parity by alpha-engine-config-I6025).
     emit_skip: bool = True         # False => never emit the flag (see notes)
+    historical_work: frozenset = frozenset()
+    # Work-state names this stage carried in a PRIOR SF definition. Failure
+    # detection reads `work in entered`, and this script runs against captured
+    # execution histories — including ones written before a rename or a split.
+    # Without this, renaming a work state silently blinds the rerun planner to
+    # every failure in every history older than the rename: the stage stops
+    # appearing in plan.failed, and derive_plan's own "no failed or degraded
+    # WORK stage identified" warning is the only trace, which reads as a
+    # pre-workload failure rather than as a lost signal. Same reasoning as
+    # HISTORICAL_DEGRADED_WITNESS below, applied to the work state.
     detect_failure: bool = True    # False => another Stage row already owns
                                     # this `work` state's failure detection
                                     # (config#2362: skip_backtester_stage_only
@@ -458,8 +468,25 @@ STAGES: tuple[Stage, ...] = (
     ),
     Stage(
         "evaluator", "skip_evaluator",
-        "CheckSkipEvaluator", "Evaluator",
+        # config-I3112 deliverable 3: one Evaluator state became
+        # EvaluatorDiagnostics -> EvaluatorOptimize. `work` is the FIRST half
+        # deliberately, and one row still covers both:
+        #   * skip_evaluator gates the pair at CheckSkipEvaluator, so the flag
+        #     semantics are unchanged — it was never per-half.
+        #   * the witness (CheckSkipPostEval) is reached only after BOTH halves
+        #     succeed, so a failure in either leaves it un-entered.
+        #   * detect_failure reads `work in entered`, and EvaluatorDiagnostics
+        #     is entered on every path that reaches the optimize half — so a
+        #     failure in the SECOND half is still attributed to this stage and
+        #     still re-runs the pair.
+        # A second row would double-count the same stage without changing any
+        # outcome; the halves are not independently re-runnable anyway, because
+        # optimize consumes the S3 snapshot diagnostics produces.
+        "CheckSkipEvaluator", "EvaluatorDiagnostics",
         frozenset({"CheckSkipPostEval"}),
+        # Pre-2026-08-11 histories entered the merged "Evaluator" state; a
+        # rerun derived from one of those must still attribute the failure.
+        historical_work=frozenset({"Evaluator"}),
     ),
     # config#6054: the coarse post_eval span is SPLIT. The two health checks
     # keep no flag of their own — they are advisory, idempotent, and cheap,
@@ -657,7 +684,9 @@ def derive_plan(events: list[dict], start_time: datetime | None = None) -> Rerun
                 plan.skip_flags[stage.flag] = True
             elif stage.note:
                 plan.notes.append(f"{stage.name}: {stage.note}")
-        elif stage.detect_failure and stage.work in entered:
+        elif stage.detect_failure and (
+            stage.work in entered or (entered & stage.historical_work)
+        ):
             plan.failed.append(stage.name)
 
     if not plan.failed and not plan.degraded:

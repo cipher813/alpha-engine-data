@@ -438,13 +438,13 @@ class TestChainOrdering:
                     cur = forward[0] if forward else default
             else:
                 cur = st.get("Next")
-            if cur == "Evaluator":
+            if cur == "EvaluatorDiagnostics":
                 order.append(cur)
                 break
         assert "Backtester" in order, order
         assert "ParityParallel" in order, order
         assert "PitParityCompare" in order, order
-        assert "Evaluator" in order, order
+        assert "EvaluatorDiagnostics" in order, order
         assert order.index("Backtester") < order.index("ParityParallel"), (
             "Backtester (backtest stage) must precede the parity family — "
             "the whole point of the split is a parity failure never re-runs "
@@ -454,7 +454,7 @@ class TestChainOrdering:
             "The compare/join must run AFTER the Parallel — each pass alone "
             "produces no usable artifact (the product is the delta)."
         )
-        assert order.index("PitParityCompare") < order.index("Evaluator"), (
+        assert order.index("PitParityCompare") < order.index("EvaluatorDiagnostics"), (
             "The parity family must precede the existing post-backtester "
             "Evaluator — downstream chain ordering is preserved."
         )
