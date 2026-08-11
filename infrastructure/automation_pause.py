@@ -85,6 +85,20 @@ def pending_names(manifest: dict | None = None) -> set[str]:
     return {k for k in m.get("pending", {}) if not k.startswith("_")}
 
 
+def kept_names(manifest: dict | None = None) -> set[str]:
+    """Triggers for which ENABLED is the INTENDED live state.
+
+    The ``not_paused`` block holds two kinds of key: real trigger names, and
+    prose labels grouping things the pause does not reach (``_non-eventbridge``
+    covers a DLM policy and two SSM associations; ``_reactive-notifier-rules``
+    names an EventPattern family with no schedule to remove). Prose keys carry
+    the leading-underscore marker ``pending`` already uses, so the two are
+    distinguishable without a second allowlist that could drift from this one.
+    """
+    m = manifest if manifest is not None else load_manifest()
+    return {k for k in m.get("not_paused", {}) if not k.startswith("_")}
+
+
 def paused_names(manifest: dict | None = None) -> set[str]:
     """Every name for which DISABLED is the INTENDED live state.
 
@@ -174,6 +188,53 @@ def check() -> list[dict]:
                     f"Fix: ./infrastructure/automation_pause.py --enforce"
                 ),
             })
+
+    # ── the other direction: a KEPT trigger that stopped running ─────────────
+    #
+    # Until 2026-08-11 `not_paused` asserted nothing. It was a list of reasons,
+    # and by this file's own standard — "an entry that can never fail is not a
+    # record, it is a comment" — it was a comment. The paused half was already
+    # two-directional; the kept half was not directional at all.
+    #
+    # What that costs is specific and was the reason this was written. Every
+    # entry here is kept because something breaks without it: the two SF
+    # triggers, the cost-safety backstops that stop a t3.large running all
+    # night, the freshness monitors, and now the expense collector — the sole
+    # guard against the provider-credit exhaustion that left every autonomous
+    # lane dark for three days (config#6613). A `deploy.sh --reconcile-schedules`
+    # rewrite, a console edit, or a CFN template edit can flip any of them to
+    # DISABLED, and nothing here would have said so. A guard that silently
+    # stopped running looks exactly like a guard with nothing to report.
+    #
+    # NOT a mirror of `enforce()`: this reports only. Re-ENABLING a trigger
+    # unattended would let this script start scheduled work, which is the one
+    # thing the ruling it implements exists to prevent.
+    for name in sorted(kept_names()):
+        surfaces = {s: _live_state(s, name) for s in ("events", "scheduler")}
+        live = {s: v for s, v in surfaces.items() if v is not None}
+        if not live:
+            findings.append({
+                "trigger": name, "surface": "unknown", "kind": "kept-but-missing",
+                "detail": (
+                    "listed as deliberately KEPT but exists on neither the events nor "
+                    "the scheduler surface — it was deleted or renamed, and whatever it "
+                    "protected is now unprotected. If it is prose rather than a trigger "
+                    "name, prefix the key with '_' as the pending block does."
+                ),
+            })
+            continue
+        for surface, state in live.items():
+            if state != "ENABLED":
+                findings.append({
+                    "trigger": name, "surface": surface, "kind": "kept-but-disabled",
+                    "detail": (
+                        f"deliberately kept ENABLED, but live state is {state}. A deploy, "
+                        f"a --reconcile-schedules run or a console edit turned off a "
+                        f"trigger the pause explicitly spared. Re-enable it deliberately "
+                        f"— this script will not do it for you, because re-enabling "
+                        f"scheduled work unattended is what the pause forbids."
+                    ),
+                })
     return findings
 
 
@@ -216,11 +277,15 @@ def main() -> int:
         return 2
 
     if args.json:
-        print(json.dumps({"checked": len(entries), "findings": findings}, indent=2))
+        print(json.dumps({"checked": len(entries),
+                          "kept_checked": len(kept_names()),
+                          "findings": findings}, indent=2))
     else:
-        print(f"automation pause — {len(entries)} paused trigger(s) checked")
+        kept = kept_names()
+        print(f"automation pause — {len(entries)} paused / {len(kept)} kept trigger(s) checked")
         if not findings:
             print("  ✓ every paused trigger exists live and is DISABLED")
+            print("  ✓ every kept trigger exists live and is ENABLED")
         for f in findings:
             print(f"  ✗ [{f['kind']}] {f['surface']}:{f['trigger']}")
             print(f"      {f['detail']}")
