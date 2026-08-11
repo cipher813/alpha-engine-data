@@ -13,17 +13,41 @@ logger = logging.getLogger(__name__)
 S3_BUCKET = "alpha-engine-research"
 
 # Minimum plausible wall-clock duration (seconds) for spot workload Task states.
+#
+# A FLOOR IS AN ANNOTATION, NOT AN ADMISSION TICKET (alpha-engine-config-I6857).
+# A state absent from this mapping renders with no floor; it is never dropped.
+# The reverse — treating this mapping and DIGEST_STATE_ORDER below as a
+# whitelist — is why every weekday alert read "(no workload states in
+# history)" on every run, success or failure: both collections list weekly
+# pipeline state names only, and not one preopen or postclose state appears
+# in either.
 STATE_DURATION_FLOORS_SEC: Mapping[str, int] = {
+    # Weekly — ne-weekly-freshness-pipeline
     "MorningEnrich": 15 * 60,
     "DataPhase1": 15 * 60,
     "RAGIngestion": 10 * 60,
     "PredictorTraining": 20 * 60,
     "Backtester": 10 * 60,
-    "ModelZooRotation": 8 * 60,
+    # Was "ModelZooRotation", a state no definition has had for some time —
+    # the rotation is ModelZooSelect -> ModelZooTrainMap ("ModelZooResolve"
+    # is a phase LABEL in an error extractor, not a state),
+    # and the floor sat on the training map's old name, annotating nothing.
+    # Same drift class as I6857 itself, caught by
+    # test_every_weekday_state_name_in_the_order_list_exists_in_a_definition.
+    "ModelZooTrainMap": 8 * 60,
+    # Weekday — ne-preopen-trading-pipeline. Floors sit on the POLL states,
+    # not the Launch states: a Launch returns in ~20s having only dispatched
+    # the spot request, so a floor there would fire on every healthy run,
+    # while the poll loop is what actually spans the workload.
+    "PollMorningEnrichSpot": 8 * 60,
+    "PollMorningArcticAppendSpot": 8 * 60,
+    "Scanner": 60,
 }
 
-# Display order for digest lines (unknown states sort after, alphabetically).
+# Display order for digest lines. States NOT listed here still render — they
+# sort after these, longest-running first. See _sort_key.
 DIGEST_STATE_ORDER: Tuple[str, ...] = (
+    # Weekly
     "MorningEnrich",
     "DataPhase1",
     "RAGIngestion",
@@ -31,11 +55,36 @@ DIGEST_STATE_ORDER: Tuple[str, ...] = (
     "PredictorTraining",
     "DataPhase2",
     "Backtester",
-    "Parity",
-    "ModelZooRotation",
+    # "Parity" and "ModelZooRotation" were stale: the states were split into
+    # the names below and this list was never updated, so both entries
+    # ordered nothing for however long that has been true.
+    "ParityParallel",
+    "PitParityCompare",
+    "ModelZooSelect",
+    "ModelZooTrainMap",
     "Evaluator",
     "ReportCard",
+    # Weekday preopen, in pipeline order
+    "StartExecutorEC2",
+    "CodeFreshnessGate",
+    "LaunchMorningEnrichSpot",
+    "PollMorningEnrichSpot",
+    "LaunchMorningArcticAppendSpot",
+    "PollMorningArcticAppendSpot",
+    "Scanner",
+    "PredictorInference",
+    "CheckPredictorCoverage",
+    "RunMorningPlanner",
+    "RunDaemon",
 )
+
+# Digest rows kept, before the elision line. Telegram messages are read on a
+# phone; a preopen execution touches ~25 distinct Task states and dumping all
+# of them buries the one that mattered. Truncation is by RELEVANCE (anomalies
+# first, then pipeline order, then longest-running) and is always ANNOUNCED —
+# a bound that renders as though it were the whole list is how "covered
+# everything" gets asserted about a sample.
+_MAX_DIGEST_ROWS = 14
 
 _HISTORY_EVENT_TYPES = (
     "TaskStateEntered",
@@ -92,8 +141,15 @@ def last_workload_state_entered(events: Sequence[dict]) -> Optional[str]:
 
     Entered-but-never-exited is exactly the signature of the interesting
     failure — a hang, a timeout, a kill — so it is the one the digest must
-    name. Untracked states (gates, Pass, poll loops) are ignored: naming
-    "CheckMorningEnrichStatus" would be true and useless.
+    name.
+
+    Every Task state is eligible, not only those in DIGEST_STATE_ORDER
+    (alpha-engine-config-I6857). Restricting it to known names meant that on
+    the weekday pipelines — whose states appear in neither collection — this
+    fallback could never fire either, so a run dying before its first exit
+    named nothing on the two pipelines that trade real money. Choice and Pass
+    states are still excluded, by _state_name_from_event: naming
+    "CheckMorningEnrichSpotStatus" would be true and useless.
     """
     last: Optional[str] = None
     for event in events:
@@ -102,15 +158,29 @@ def last_workload_state_entered(events: Sequence[dict]) -> Optional[str]:
         name = _state_name_from_event(event)
         if not name:
             continue
-        if name in STATE_DURATION_FLOORS_SEC or name in DIGEST_STATE_ORDER:
-            last = name
+        last = name
     return last
 
 
 def parse_task_state_durations(events: Sequence[dict]) -> Dict[str, int]:
-    """Return max wall-clock seconds per Task state name from history events."""
-    entered_at: Dict[str, datetime] = {}
-    durations: Dict[str, int] = {}
+    """Wall-clock seconds per Task state name: FIRST entry to LAST exit.
+
+    The span, not the longest single entry/exit pair (alpha-engine-config-I6857).
+
+    The weekday pipelines poll: ``PollMorningEnrichSpot`` is entered and
+    exited every 15 seconds for as long as the spot workload runs. Under
+    max-per-pair that 15-minute stage reported ``0s`` — technically a row,
+    and worse than none, because it says the stage was instant. Under the
+    span it reports the elapsed time an operator would recognise.
+
+    For a state entered once the two are identical, so nothing about the
+    weekly digest changes. For a RETRIED state the span includes the gap
+    between attempts, which is the honest number: the pipeline really did
+    spend that wall-clock inside the stage, and the floor comparison should
+    see it.
+    """
+    first_entry: Dict[str, datetime] = {}
+    last_exit: Dict[str, datetime] = {}
 
     for event in events:
         etype = event.get("type")
@@ -121,20 +191,36 @@ def parse_task_state_durations(events: Sequence[dict]) -> Dict[str, int]:
         if not isinstance(ts, datetime):
             continue
         if etype == "TaskStateEntered":
-            entered_at[name] = ts
-        elif etype == "TaskStateExited" and name in entered_at:
-            delta = int((ts - entered_at[name]).total_seconds())
-            durations[name] = max(durations.get(name, 0), delta)
-            entered_at.pop(name, None)
+            first_entry.setdefault(name, ts)
+        elif etype == "TaskStateExited":
+            last_exit[name] = ts
 
-    return durations
+    return {
+        name: max(0, int((last_exit[name] - entered).total_seconds()))
+        for name, entered in first_entry.items()
+        if name in last_exit
+    }
 
 
-def _sort_key(name: str) -> Tuple[int, str]:
-    try:
-        return (DIGEST_STATE_ORDER.index(name), name)
-    except ValueError:
-        return (len(DIGEST_STATE_ORDER), name)
+def _sort_key(row: "StateDuration") -> Tuple[int, int, int, str]:
+    """Relevance order: anomalies, then pipeline order, then longest-running.
+
+    Anomalies lead because the digest is read on a phone under a red alert,
+    and because _MAX_DIGEST_ROWS truncates the tail — a bound that can drop a
+    floor breach while keeping a healthy state has inverted its own purpose.
+
+    States outside DIGEST_STATE_ORDER sort after those in it, longest-running
+    first. This is the branch the old code's comment promised ("unknown states
+    sort after, alphabetically") and the whitelist filter one function away
+    made unreachable: nothing unknown ever arrived here to be sorted.
+    """
+    known = DIGEST_STATE_ORDER.index(row.name) if row.name in DIGEST_STATE_ORDER else None
+    return (
+        0 if row.anomaly else 1,
+        len(DIGEST_STATE_ORDER) if known is None else known,
+        -row.duration_sec,
+        row.name,
+    )
 
 
 def _ms_to_datetime(ms: int | None) -> Optional[datetime]:
@@ -196,8 +282,10 @@ def build_state_durations(
 ) -> List[StateDuration]:
     rows: List[StateDuration] = []
     for name, secs in durations_sec.items():
-        if name not in STATE_DURATION_FLOORS_SEC and name not in DIGEST_STATE_ORDER:
-            continue
+        # NO whitelist filter. Every tracked Task state renders; the two
+        # module-level collections supply the floor and the sort position
+        # when they happen to know the state, and nothing when they do not
+        # (alpha-engine-config-I6857).
         floor = None if is_preflight else STATE_DURATION_FLOORS_SEC.get(name)
         floor_breach = bool(floor is not None and secs < floor)
         attestation_failed = False
@@ -221,7 +309,7 @@ def build_state_durations(
                 attestation_failed=attestation_failed,
             )
         )
-    rows.sort(key=lambda r: _sort_key(r.name))
+    rows.sort(key=_sort_key)
     return rows
 
 
@@ -232,8 +320,9 @@ def format_digest_lines(
         if last_entered:
             return [f"{last_entered} — entered, never completed ⚠️"]
         return ["_(no workload states in history)_"]
+    kept, elided = list(rows[:_MAX_DIGEST_ROWS]), len(rows) - _MAX_DIGEST_ROWS
     lines: List[str] = []
-    for row in rows:
+    for row in kept:
         dur = format_duration_short(row.duration_sec)
         if row.anomaly:
             detail = "⚠️"
@@ -244,6 +333,10 @@ def format_digest_lines(
         else:
             detail = "✓"
         lines.append(f"{row.name} {dur} {detail}")
+    if elided > 0:
+        # Announced, never silent. A truncated list rendered as a whole one
+        # is an assertion that nothing else ran.
+        lines.append(f"_(+{elided} more state{'s' if elided > 1 else ''}, shortest-running, elided)_")
     return lines
 
 
