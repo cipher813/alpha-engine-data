@@ -82,7 +82,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block the EOD reconcile + instance-stop path. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability' carve-out, the primary deliverable (reconcile + stop trading EC2) survives a mutex-side failure. The error is captured in $.mutex_error for forensic review. alpha-engine-config#6722: previously proceeded with no degraded flag at all — now routes through SetMutexAcquireDegradedFlag (Option-A parity with SetDataSpotDegradedFlag/SetDegradedFlag) so CheckDegradedOutcome's terminal reflects it.",
+          "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block the EOD reconcile + instance-stop path. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability' carve-out, the primary deliverable (reconcile + stop trading EC2) survives a mutex-side failure. The error is captured in $.mutex_error for forensic review. alpha-engine-config#6722: previously proceeded with no degraded flag at all \u2014 now routes through SetMutexAcquireDegradedFlag (Option-A parity with SetDataSpotDegradedFlag/SetDegradedFlag) so CheckDegradedOutcome's terminal reflects it.",
           "Next": "SetMutexAcquireDegradedFlag",
           "ResultPath": "$.mutex_error"
         }
@@ -92,7 +92,7 @@
     },
     "SetMutexAcquireDegradedFlag": {
       "Type": "Pass",
-      "Comment": "alpha-engine-config#6722 (Option-A parity with SetDataSpotDegradedFlag/SetDegradedFlag, config#6692/config-I2702 shape): threads $.degraded_summary onto the mutex-acquire infra-error fail-open path (DynamoDB outage / IAM drift / transient SDK error — NOT the ConditionalCheckFailedException conflict case, which the separate MutexConflict Fail already handles) WITHOUT changing its fail-open continuation — Next still leads to StartTradingInstance exactly as before. Last-write-wins if a later stage also degrades. Does not clobber $.mutex_error (set by AcquireMutex's own Catch ResultPath).",
+      "Comment": "alpha-engine-config#6722 (Option-A parity with SetDataSpotDegradedFlag/SetDegradedFlag, config#6692/config-I2702 shape): threads $.degraded_summary onto the mutex-acquire infra-error fail-open path (DynamoDB outage / IAM drift / transient SDK error \u2014 NOT the ConditionalCheckFailedException conflict case, which the separate MutexConflict Fail already handles) WITHOUT changing its fail-open continuation \u2014 Next still leads to StartTradingInstance exactly as before. Last-write-wins if a later stage also degrades. Does not clobber $.mutex_error (set by AcquireMutex's own Catch ResultPath).",
       "Parameters": {
         "degraded": true,
         "reason": "eod_mutex_acquire_fail_open",
@@ -307,7 +307,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "config#5569: same bounded same-day retry as CaptureSnapshot's own Catch — a persistent SSM poll failure on this stage is treated as a capture failure, not routed straight to hard-fail.",
+          "Comment": "config#5569: same bounded same-day retry as CaptureSnapshot's own Catch \u2014 a persistent SSM poll failure on this stage is treated as a capture failure, not routed straight to hard-fail.",
           "Next": "CheckCaptureSnapshotRetryBudget",
           "ResultPath": "$.error"
         }
@@ -1206,7 +1206,7 @@
     },
     "InitCaptureSnapshotRetryCounter": {
       "Type": "Pass",
-      "Comment": "config#5569: retry budget for the same-day bounded CaptureSnapshot retry — mirrors InitDataSpotRetryCounter. CaptureSnapshot is the EOD pipeline's only stage with an irreversible per-day deadline (trades/snapshots/{run_date}.json must exist before midnight or eod_reconcile's correction path is permanently gone — alpha-engine-config-I5325 lost 2026-07-27 this way), so unlike the generic re-runnable stages this counter exists specifically to bound ONE same-day retry before the terminal irreversible-deadline page.",
+      "Comment": "config#5569: retry budget for the same-day bounded CaptureSnapshot retry \u2014 mirrors InitDataSpotRetryCounter. CaptureSnapshot is the EOD pipeline's only stage with an irreversible per-day deadline (trades/snapshots/{run_date}.json must exist before midnight or eod_reconcile's correction path is permanently gone \u2014 alpha-engine-config-I5325 lost 2026-07-27 this way), so unlike the generic re-runnable stages this counter exists specifically to bound ONE same-day retry before the terminal irreversible-deadline page.",
       "Result": {
         "attempts": 0
       },
@@ -1997,7 +1997,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "alpha-engine-config#6722: a launch failure previously alerted via SNS (WeeklyExerciseLaunchFailed) but was never threaded into $.degraded_summary — routes through SetWeeklyExerciseDegradedFlag first so CheckDegradedOutcome's terminal reflects it too.",
+          "Comment": "alpha-engine-config#6722: a launch failure previously alerted via SNS (WeeklyExerciseLaunchFailed) but was never threaded into $.degraded_summary \u2014 routes through SetWeeklyExerciseDegradedFlag first so CheckDegradedOutcome's terminal reflects it too.",
           "Next": "SetWeeklyExerciseDegradedFlag",
           "ResultPath": "$.weekly_exercise_launch_error"
         }
@@ -2007,7 +2007,7 @@
     },
     "SetWeeklyExerciseDegradedFlag": {
       "Type": "Pass",
-      "Comment": "alpha-engine-config#6722 (Option-A parity with SetDataSpotDegradedFlag/SetDegradedFlag/SetMutexAcquireDegradedFlag, config#6692/config-I2702 shape): threads $.degraded_summary onto the weekly-exercise sub-pipeline launch-failure path WITHOUT changing its continuation — Next still leads to WeeklyExerciseLaunchFailed's SNS alert exactly as before. Last-write-wins if a later stage also degrades. Does not clobber $.weekly_exercise_launch_error (set by LaunchWeeklyExerciseRun's own Catch ResultPath).",
+      "Comment": "alpha-engine-config#6722 (Option-A parity with SetDataSpotDegradedFlag/SetDegradedFlag/SetMutexAcquireDegradedFlag, config#6692/config-I2702 shape): threads $.degraded_summary onto the weekly-exercise sub-pipeline launch-failure path WITHOUT changing its continuation \u2014 Next still leads to WeeklyExerciseLaunchFailed's SNS alert exactly as before. Last-write-wins if a later stage also degrades. Does not clobber $.weekly_exercise_launch_error (set by LaunchWeeklyExerciseRun's own Catch ResultPath).",
       "Parameters": {
         "degraded": true,
         "reason": "eod_weekly_exercise_launch_failed",
@@ -2115,8 +2115,8 @@
     "DegradedRun": {
       "Type": "Fail",
       "Error": "DegradedRun",
-      "Cause": "EOD pipeline skipped EODReconcile (data gap) \u2014 load-bearing state not executed. Check $.degraded_summary in execution input and SkipEODReconcileDataGap/Heal* notifications in execution history. Per Brian's 2026-07-28 Option-A ruling: a degraded run must FAIL so status-keyed watchers (sf-watch, EventBridge, notifier) engage with zero new plumbing.",
-      "Comment": "config-I2702 deliverable #4 FOLLOW-UP (Brian's 2026-07-28 Option-A ruling, alpha-engine-config#2699): the original DegradedSucceeded (Type: Succeed) left every status-keyed consumer (sf-watch, EventBridge, sf-telegram-notifier) seeing green \u2014 repeating the exact failure mode of the 2026-07-15 incident. Replaced with Type: Fail so FAILED execution status engages all watchers with zero new plumbing. StopTradingInstance remains unconditionally reachable BEFORE this terminal (SetDegradedFlag -> HealLoop -> CheckHealLoopEligible -> StopTradingInstance -> CheckDegradedOutcome)."
+      "CausePath": "States.Format('EOD pipeline DEGRADED \u2014 reason: {}. Full degraded_summary: {}. Per the 2026-07-28 Option-A ruling (alpha-engine-config#2699): a degraded run must FAIL so status-keyed watchers (sf-watch, EventBridge, sf-telegram-notifier) engage with zero new plumbing. StopTradingInstance remains unconditionally reachable BEFORE this terminal.', $.degraded_summary.reason, States.JsonToString($.degraded_summary))",
+      "Comment": "alpha-engine-config-I6856: the Cause is DERIVED from $.degraded_summary, never an enumeration of the paths that can reach here. It WAS an enumeration, and it drifted \u2014 4 states set $.degraded_summary in this definition (SetDataSpotDegradedFlag, SetDegradedFlag, SetMutexAcquireDegradedFlag, SetWeeklyExerciseDegradedFlag) and the hardcoded string named one. On 2026-08-11 the preopen terminal asserted 'run_daemon_restart_failed and/or daily_data_spot_fail_open' when neither fired; the real reason, daily_scanner_fail_open, appeared nowhere, and the message sent the operator hunting for a PublishDataSpotFailureImmediate event that could not exist on that path. An enumeration that drifts is worse than boilerplate because it reads as specific (sf-pipeline-policy.md \u00a72.3 corollary). $.degraded_summary.reason is dereferenced UNGUARDED on purpose: CheckDegradedOutcome only routes here when degraded is true, every Set*DegradedFlag state sets reason, and tests/test_degraded_terminal_derives_its_cause.py fails the build if a new one does not \u2014 a defensive fallback here would let that guarantee lapse silently. JsonToString takes the WHOLE summary rather than $.degraded_summary.stage_error, which not every path sets."
     },
     "HandleFailure": {
       "Type": "Task",
