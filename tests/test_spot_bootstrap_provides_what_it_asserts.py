@@ -25,11 +25,10 @@ from pathlib import Path
 
 import pytest
 
+from nousergon_lib.shell_guards import BINARY_PROVIDERS, unprovided_binary_violations
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _COMMON = _REPO_ROOT / "infrastructure" / "_spot_common.sh"
-
-# How a bootstrap may legitimately provide a binary.
-_PROVIDERS = ("dnf install", "yum install", "apt-get install", "curl -", "pip install")
 
 
 def _bootstrap_block() -> str:
@@ -39,53 +38,27 @@ def _bootstrap_block() -> str:
     return m.group(1)
 
 
-def _fatal_command_v_guards(block: str) -> list[tuple[str, int]]:
-    """(binary, offset) for each `command -v X` guard that exits non-zero."""
-    out = []
-    for m in re.finditer(r"command -v (\S+)[^\n]*\|\|[^\n]*exit 1", block):
-        out.append((m.group(1), m.start()))
-    return out
-
-
 def test_every_asserted_binary_is_installed_first():
-    block = _bootstrap_block()
-    guards = _fatal_command_v_guards(block)
-    assert guards, (
-        "no fatal `command -v` guard found — if the bootstrap stopped asserting "
-        "its interpreter, this test has lost its subject and must be updated "
-        "deliberately, not deleted"
+    violations = unprovided_binary_violations(_bootstrap_block())
+    assert not violations, (
+        "_spot_common.sh: " + "; ".join(violations) +
+        " This is the 2026-08-11 MorningEnrich failure "
+        "(`ERROR: python3.12 not found`), inherited by DataPhase1 and "
+        "RAGIngestion too."
     )
-    for binary, offset in guards:
-        before = block[:offset]
-        provided = any(
-            p in line and binary.split(".")[0] in line
-            for line in before.splitlines()
-            for p in _PROVIDERS
-        )
-        assert provided, (
-            f"_spot_common.sh bootstrap asserts `{binary}` is present but never "
-            f"installs it — a bootstrap establishes preconditions, it does not "
-            f"require them. This is the 2026-08-11 MorningEnrich failure "
-            f"(`ERROR: python3.12 not found`), inherited by DataPhase1 and "
-            f"RAGIngestion too."
-        )
 
 
 def test_bootstrap_installs_python312_explicitly():
-    """Anchored: 3.12 specifically, since requirements.txt resolves against it
-    and a silent fall back to the system python3 is its own drift class."""
-    block = _bootstrap_block()
-    assert re.search(r"dnf install[^\n]*python3\.12", block), (
+    """Anchored: the interpreter the whole stage depends on."""
+    assert re.search(r"dnf install[^\n]*python3\.12", _bootstrap_block()), (
         "the bootstrap must install python3.12 explicitly"
     )
 
 
 @pytest.mark.parametrize("tool", ["git", "gcc"])
-def test_bootstrap_installs_the_tools_the_later_steps_use(tool: str):
-    """`git clone` runs in this same block, and requirements.txt builds wheels
-    from source — both were in the monolith's install line."""
+def test_bootstrap_installs_the_tools_the_later_steps_use(tool):
+    """git for the clone, gcc for source-built wheels in requirements.txt."""
     block = _bootstrap_block()
-    install_lines = [ln for ln in block.splitlines() if "dnf install" in ln]
-    assert any(tool in ln for ln in install_lines), (
+    assert any(p in block for p in BINARY_PROVIDERS) and tool in block, (
         f"{tool} is used by the bootstrap or the deps step but is not installed"
     )
