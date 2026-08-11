@@ -268,7 +268,25 @@ WDSH
   }
 fi
 
-command -v python3.12 >/dev/null || { echo "ERROR: python3.12 not found" >&2; exit 1; }
+# Install the interpreter — the AL2023 spot AMI does not ship python3.12.
+# The retired spot_data_weekly.sh monolith installed it here; the per-stage
+# split (#1122) replaced the install with a bare assertion, encoding an AMI
+# contract nothing provides. Latent until #1269 repointed the weekly SF onto
+# these scripts (2026-08-09); the first run over the new path died on
+# "ERROR: python3.12 not found" (watch-rerun-2026-08-10-3, 2026-08-11).
+# gcc + devel are needed by source-built wheels in requirements.txt; git for
+# the clone below. Measured on the monolith's own successful bootstraps
+# (2026-08-07 and 08-08): this whole step ran in 48-49s, well inside the 300s
+# budget, so the budget stays as it is.
+dnf install -y -q python3.12 python3.12-pip python3.12-devel git gcc 2>/dev/null || \
+    dnf install -y -q python3 python3-pip python3-devel git gcc
+
+# Post-condition, not a precondition: the install above is what makes this
+# true, and a silent fallback to a system python3 is exactly the drift the
+# per-stage scripts must not inherit (requirements.txt is resolved against
+# 3.12).
+command -v python3.12 >/dev/null || { echo "ERROR: python3.12 not found after dnf install" >&2; exit 1; }
+echo "Using: $(python3.12 --version)"
 
 if [ ! -d /home/ec2-user/data/.git ]; then
   rm -rf /home/ec2-user/data
