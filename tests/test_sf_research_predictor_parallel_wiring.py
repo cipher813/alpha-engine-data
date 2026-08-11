@@ -331,9 +331,13 @@ class TestBranchAContents:
         assert branch_a["MergeDataPhase2PollCount"]["ResultPath"] == "$.data_phase2_polls"
         # Exhaustion falls to the retry gate, never to the judge chain.
         assert branch_a["CheckDataPhase2Status"]["Default"] == "DataPhase2RetryGate"
-        assert branch_a["DataPhase2RetryGate"]["Choices"][0]["Next"] == (
-            "SetDataPhase2ExhaustedError"
-        )
+        # Position-independent: config#5688 inserted the substrate-loss branch
+        # ahead of the exhaustion arm (a dead instance must be caught before
+        # the re-issue decision), so what matters is that the exhaustion route
+        # is still REACHABLE from this gate, not that it is Choices[0].
+        assert "SetDataPhase2ExhaustedError" in [
+            c["Next"] for c in branch_a["DataPhase2RetryGate"]["Choices"]
+        ]
         assert branch_a["SetDataPhase2ExhaustedError"]["Next"] == (
             "PublishResearchFailureImmediate"
         )
