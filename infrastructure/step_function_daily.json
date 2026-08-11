@@ -91,7 +91,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block a real trading cadence run. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability hung off a primary path' carve-out, the primary deliverable survives a mutex-side failure. The error is captured in $.mutex_error for forensic review via SF execution history; CW alarm wiring deferred (operator-decision when first non-Conditional-Check mutex error appears). alpha-engine-config#6722: previously proceeded with no degraded flag at all — now routes through SetMutexAcquireDegradedFlag (Option-A parity with SetDataSpotDegradedFlag/SetDaemonDegradedFlag/SetDeployDriftDegradedFlag) so CheckDegradedOutcome's terminal reflects it.",
+          "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block a real trading cadence run. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability hung off a primary path' carve-out, the primary deliverable survives a mutex-side failure. The error is captured in $.mutex_error for forensic review via SF execution history; CW alarm wiring deferred (operator-decision when first non-Conditional-Check mutex error appears). alpha-engine-config#6722: previously proceeded with no degraded flag at all \u2014 now routes through SetMutexAcquireDegradedFlag (Option-A parity with SetDataSpotDegradedFlag/SetDaemonDegradedFlag/SetDeployDriftDegradedFlag) so CheckDegradedOutcome's terminal reflects it.",
           "Next": "SetMutexAcquireDegradedFlag",
           "ResultPath": "$.mutex_error"
         }
@@ -101,7 +101,7 @@
     },
     "SetMutexAcquireDegradedFlag": {
       "Type": "Pass",
-      "Comment": "alpha-engine-config#6722 (Option-A parity with SetDataSpotDegradedFlag/SetDaemonDegradedFlag/SetDeployDriftDegradedFlag, config#6692 shape): threads $.degraded_summary onto the mutex-acquire infra-error fail-open path (DynamoDB outage / IAM drift / transient SDK error — NOT the ConditionalCheckFailedException conflict case, which the separate MutexConflict Fail already handles) WITHOUT changing its fail-open continuation — Next still leads to DeployDriftCheck exactly as before. Last-write-wins if a later stage also degrades (same convention SetDaemonDegradedFlag documents); does not clobber $.mutex_error (set by AcquireMutex's own Catch ResultPath).",
+      "Comment": "alpha-engine-config#6722 (Option-A parity with SetDataSpotDegradedFlag/SetDaemonDegradedFlag/SetDeployDriftDegradedFlag, config#6692 shape): threads $.degraded_summary onto the mutex-acquire infra-error fail-open path (DynamoDB outage / IAM drift / transient SDK error \u2014 NOT the ConditionalCheckFailedException conflict case, which the separate MutexConflict Fail already handles) WITHOUT changing its fail-open continuation \u2014 Next still leads to DeployDriftCheck exactly as before. Last-write-wins if a later stage also degrades (same convention SetDaemonDegradedFlag documents); does not clobber $.mutex_error (set by AcquireMutex's own Catch ResultPath).",
       "Parameters": {
         "degraded": true,
         "reason": "daily_mutex_acquire_fail_open",
@@ -1186,7 +1186,7 @@
     },
     "Scanner": {
       "Type": "Task",
-      "Comment": "Weekday invoke of the SAME standalone scanner Lambda the Saturday SF runs (alpha-engine-research-scanner:live \u2014 ROADMAP L1995 / alpha-engine-config-I6494). Placed AFTER MorningArcticAppend so ArcticDB technicals for the trading day are present, and BEFORE PredictorInference so universe_membership/{date} + factor profiles (+ provenance) are fresh for the membership consumer (I6495). Features are daily-capable (I5360 / research-PR545; SCANNER_FEATURE_SOURCE default arcticdb). Status contract OK / ERROR \u2014 Catch is non-blocking at the SF layer (mirrors Saturday): Catch and Next converge on CheckSkipPredictorInference; a missing/stale membership surfaces at the predictor's own age gate rather than hard-failing preopen. dry_run_llm omitted \u2014 weekday cadence has no Friday-Preflight research_dry shell path.",
+      "Comment": "Weekday invoke of the SAME standalone scanner Lambda the Saturday SF runs (alpha-engine-research-scanner:live \u2014 ROADMAP L1995 / alpha-engine-config-I6494). Placed AFTER MorningArcticAppend so ArcticDB technicals for the trading day are present, and BEFORE PredictorInference so universe_membership/{date} + factor profiles (+ provenance) are fresh for the membership consumer (I6495). Features are daily-capable (I5360 / research-PR545; SCANNER_FEATURE_SOURCE default arcticdb). Status contract OK / ERROR \u2014 Catch is non-blocking at the SF layer (mirrors Saturday): Catch and Next converge on CheckSkipPredictorInference; a missing/stale membership surfaces at the predictor's own age gate rather than hard-failing preopen. dry_run_llm omitted \u2014 weekday cadence has no Friday-Preflight research_dry shell path. alpha-engine-config-I6855: 600 -> 440. The SF budget must sit BELOW the function timeout or it can never bind \u2014 on 2026-08-11 this state declared 600s while alpha-engine-research-scanner carried 300s, so both preopen invocations died at 300s with Sandbox.Timedout and the 600 described nothing. The function is now 450s (crucible-research-PR601, p95 x 1.5); 440 keeps the SF the effective budget, so a scanner overrun surfaces as States.Timeout naming this state rather than as an opaque Lambda error.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-research-scanner:live",
@@ -1194,7 +1194,7 @@
           "run_date.$": "$.run_date"
         }
       },
-      "TimeoutSeconds": 600,
+      "TimeoutSeconds": 440,
       "Retry": [
         {
           "ErrorEquals": [

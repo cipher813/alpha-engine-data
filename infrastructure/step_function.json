@@ -405,7 +405,7 @@
     },
     "WeeklyPreflight": {
       "Type": "Task",
-      "Comment": "I4494: pre-spend gate — runs sf_preflight.py checks against live AWS state before the pipeline spends on any spot or mutex acquisition. Checks: IAM reachability, tool contracts, definition input coherence, Lambda memory headroom. Fail-hard on assertion failure (preflight is cheaper than a Saturday spot run that would die for the same reason). Routes failures through ExtractWeeklyPreflightError → NormalizeFailureContext (the same chokepoint all pre-spend gate failures use), NOT directly to HandleFailure. Reads-only: no writes, no cost, no side effects. <60s target.",
+      "Comment": "I4494: pre-spend gate \u2014 runs sf_preflight.py checks against live AWS state before the pipeline spends on any spot or mutex acquisition. Checks: IAM reachability, tool contracts, definition input coherence, Lambda memory headroom. Fail-hard on assertion failure (preflight is cheaper than a Saturday spot run that would die for the same reason). Routes failures through ExtractWeeklyPreflightError \u2192 NormalizeFailureContext (the same chokepoint all pre-spend gate failures use), NOT directly to HandleFailure. Reads-only: no writes, no cost, no side effects. <60s target.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "TimeoutSeconds": 60,
       "Parameters": {
@@ -440,7 +440,7 @@
     },
     "WeeklyPreflightGate": {
       "Type": "Choice",
-      "Comment": "I4494: hard-fail when the preflight reports any failing check. Stops the pipeline before any spot spend, naming the failing assertion. Routes via ExtractWeeklyPreflightError (NOT straight to HandleFailure), mirroring the other pre-spend gate conventions: a Choice transition does not populate $.error the way a Task Catch (ResultPath $.error) does, and HandleFailure's Message template calls States.JsonToString($.error) — a direct Choice→HandleFailure jump would die with States.Runtime, swallowing the violation list behind an opaque meta-error. config#1819: ExtractWeeklyPreflightError hands off to NormalizeFailureContext, not HandleFailure directly.",
+      "Comment": "I4494: hard-fail when the preflight reports any failing check. Stops the pipeline before any spot spend, naming the failing assertion. Routes via ExtractWeeklyPreflightError (NOT straight to HandleFailure), mirroring the other pre-spend gate conventions: a Choice transition does not populate $.error the way a Task Catch (ResultPath $.error) does, and HandleFailure's Message template calls States.JsonToString($.error) \u2014 a direct Choice\u2192HandleFailure jump would die with States.Runtime, swallowing the violation list behind an opaque meta-error. config#1819: ExtractWeeklyPreflightError hands off to NormalizeFailureContext, not HandleFailure directly.",
       "Choices": [
         {
           "And": [
@@ -453,7 +453,7 @@
               "BooleanEquals": true
             }
           ],
-          "Comment": "Preflight found one or more failing checks — stop before spend. The Payload carries the violation list for the SNS alert.",
+          "Comment": "Preflight found one or more failing checks \u2014 stop before spend. The Payload carries the violation list for the SNS alert.",
           "Next": "ExtractWeeklyPreflightError"
         },
         {
@@ -461,7 +461,7 @@
             "Variable": "$.weekly_preflight_result.Payload.has_violation",
             "IsPresent": true
           },
-          "Comment": "Preflight returned a payload WITHOUT has_violation (partial/malformed result). Fail-closed: a preflight that cannot produce a verdict must not proceed, unlike the advisory gates (LibPinDriftCheck/PipelineContractCheck) which fail-open. The preflight is the last check before spend — failing open here defeats its purpose.",
+          "Comment": "Preflight returned a payload WITHOUT has_violation (partial/malformed result). Fail-closed: a preflight that cannot produce a verdict must not proceed, unlike the advisory gates (LibPinDriftCheck/PipelineContractCheck) which fail-open. The preflight is the last check before spend \u2014 failing open here defeats its purpose.",
           "Next": "ExtractWeeklyPreflightError"
         }
       ],
@@ -469,7 +469,7 @@
     },
     "ExtractWeeklyPreflightError": {
       "Type": "Pass",
-      "Comment": "Normalize a confirmed preflight failure (WeeklyPreflightGate has_violation==true) into $.error for HandleFailure's States.Format/JsonToString template. The gate is a Choice, so — unlike a Task Catch (ResultPath $.error) — it does NOT populate $.error; without this normalizer HandleFailure's States.JsonToString($.error) raises States.Runtime and the SF dies with an opaque meta-error instead of surfacing the preflight failure details. Carries the whole preflight Payload (failures/warnings) so the FAILED SNS alert names the exact check that must pass before redrive. References only $.weekly_preflight_result.Payload — guaranteed present because the gate already dereferenced Payload.has_violation to route here. Mirrors ExtractPipelineContractError's convention.",
+      "Comment": "Normalize a confirmed preflight failure (WeeklyPreflightGate has_violation==true) into $.error for HandleFailure's States.Format/JsonToString template. The gate is a Choice, so \u2014 unlike a Task Catch (ResultPath $.error) \u2014 it does NOT populate $.error; without this normalizer HandleFailure's States.JsonToString($.error) raises States.Runtime and the SF dies with an opaque meta-error instead of surfacing the preflight failure details. Carries the whole preflight Payload (failures/warnings) so the FAILED SNS alert names the exact check that must pass before redrive. References only $.weekly_preflight_result.Payload \u2014 guaranteed present because the gate already dereferenced Payload.has_violation to route here. Mirrors ExtractPipelineContractError's convention.",
       "Parameters": {
         "phase": "WeeklyPreflightGate",
         "source": "WeeklyPreflightGate.has_violation",
@@ -578,7 +578,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block a real trading cadence run. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability' carve-out, the primary deliverable survives a mutex-side failure. The error is captured in $.mutex_error for forensic review. alpha-engine-config#6722: this fail-open previously proceeded with no degraded flag at all — now routes through SetMutexAcquireDegradedFlag (mirrors LibPinGateDegraded/PipelineContractGateDegraded exactly: this IS a pre-spend precondition check, same family as the other two gate-infra fail-opens) so the completion email says so via CheckGateDegradedNotify.",
+          "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block a real trading cadence run. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability' carve-out, the primary deliverable survives a mutex-side failure. The error is captured in $.mutex_error for forensic review. alpha-engine-config#6722: this fail-open previously proceeded with no degraded flag at all \u2014 now routes through SetMutexAcquireDegradedFlag (mirrors LibPinGateDegraded/PipelineContractGateDegraded exactly: this IS a pre-spend precondition check, same family as the other two gate-infra fail-opens) so the completion email says so via CheckGateDegradedNotify.",
           "Next": "SetMutexAcquireDegradedFlag",
           "ResultPath": "$.mutex_error"
         }
@@ -588,7 +588,7 @@
     },
     "SetMutexAcquireDegradedFlag": {
       "Type": "Pass",
-      "Comment": "alpha-engine-config#6722: the mutex-acquire infra-error Catch (DynamoDB outage / IAM drift / transient SDK error — NOT the ConditionalCheckFailedException conflict case, which the separate MutexConflict Fail already handles) previously proceeded to CheckSpotDispatchNeeded with zero visibility. Mirrors LibPinGateDegraded's shape exactly: gate_degraded=true threads into the completion email via CheckGateDegradedNotify, and PublishMutexAcquireDegraded alerts NOW.",
+      "Comment": "alpha-engine-config#6722: the mutex-acquire infra-error Catch (DynamoDB outage / IAM drift / transient SDK error \u2014 NOT the ConditionalCheckFailedException conflict case, which the separate MutexConflict Fail already handles) previously proceeded to CheckSpotDispatchNeeded with zero visibility. Mirrors LibPinGateDegraded's shape exactly: gate_degraded=true threads into the completion email via CheckGateDegradedNotify, and PublishMutexAcquireDegraded alerts NOW.",
       "Result": true,
       "ResultPath": "$.gate_degraded",
       "Next": "PublishMutexAcquireDegraded"
@@ -599,7 +599,7 @@
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekly Pipeline — Mutex Acquire DEGRADED (Proceeding Unchecked)",
+        "Subject": "Alpha Engine Weekly Pipeline \u2014 Mutex Acquire DEGRADED (Proceeding Unchecked)",
         "Message": "AcquireMutex could not complete its DynamoDB conditional PUT (infra error, not a genuine duplicate-run conflict). Proceeding FAIL-OPEN: this run's duplicate-execution protection is unchecked for this run_date. The completion email will carry the gates-degraded marker. View pipeline status: https://console.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.mutex_acquire_degraded_notify",
@@ -608,7 +608,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Best-effort alert — a publish failure must not halt the fail-open path.",
+          "Comment": "Best-effort alert \u2014 a publish failure must not halt the fail-open path.",
           "ResultPath": "$.mutex_acquire_degraded_notify_error",
           "Next": "CheckSpotDispatchNeeded"
         }
@@ -1038,7 +1038,7 @@
           "States": {
             "InitResearchDegradedFlag": {
               "Type": "Pass",
-              "Comment": "alpha-engine-config#6722: seeds the branch-local $.research_degraded_local marker every fail-open Catch inside Branch A threads through (the Scanner/RegimeSubstrate/ChallengerShadow/RegimeRetrospectiveEval research-substep group, ThinkTankDegraded's flag, the eval-judge chain, and AggregateCosts's named sf-pipeline-policy.md §5 cost-aggregation carve-out). Must be seeded BEFORE any Mark*Degraded state or BranchAComplete's Parameters.$ extraction would throw States.Runtime on a clean run that never sets it. Folded into the top-level $.research_predictor_degraded at AggregateBranchOutcomes/CheckResearchPredictorDegraded (mirrors CheckParityBranchOutcomes' branch-status fold, alpha-engine-config#6030) since a Parallel branch cannot write an outer-scope JSONPath directly — ASL scopes each branch to its own copy of the state.",
+              "Comment": "alpha-engine-config#6722: seeds the branch-local $.research_degraded_local marker every fail-open Catch inside Branch A threads through (the Scanner/RegimeSubstrate/ChallengerShadow/RegimeRetrospectiveEval research-substep group, ThinkTankDegraded's flag, the eval-judge chain, and AggregateCosts's named sf-pipeline-policy.md \u00a75 cost-aggregation carve-out). Must be seeded BEFORE any Mark*Degraded state or BranchAComplete's Parameters.$ extraction would throw States.Runtime on a clean run that never sets it. Folded into the top-level $.research_predictor_degraded at AggregateBranchOutcomes/CheckResearchPredictorDegraded (mirrors CheckParityBranchOutcomes' branch-status fold, alpha-engine-config#6030) since a Parallel branch cannot write an outer-scope JSONPath directly \u2014 ASL scopes each branch to its own copy of the state.",
               "Result": false,
               "ResultPath": "$.research_degraded_local",
               "Next": "CheckSkipScanner"
@@ -1065,7 +1065,7 @@
             },
             "Scanner": {
               "Type": "Task",
-              "Comment": "Standalone scanner Lambda (ROADMAP L1995 Phase 1 \u2014 alpha-engine-research #235). Reads constituents.json + feature store, runs run_quant_filter, writes the candidates.json universe-board artifact for THIS run_date (crucible-research PR425, merged). alpha-engine-config-I2515 Phase B: this write is now LOAD-BEARING \u2014 SignalsEnvelope, ChallengerShadow, and the relocated (post-RAG) ThinkTankCoverage all read the SAME-DAY board, closing the no-week-old-data invariant (config#1580 ruling). The multi-agent Research graph runner that previously consumed this artifact has been REMOVED from this SF; the champion path is scanner \u2192 predictor direct. Status contract OK / ERROR \u2014 no SKIPPED today (constituents.json + feature store are hard preconditions). dry_run_llm threads the Friday-Preflight shell-run signal so the Lambda boots+imports without S3 read on $.research_dry=true.",
+              "Comment": "Standalone scanner Lambda (ROADMAP L1995 Phase 1 \u2014 alpha-engine-research #235). Reads constituents.json + feature store, runs run_quant_filter, writes the candidates.json universe-board artifact for THIS run_date (crucible-research PR425, merged). alpha-engine-config-I2515 Phase B: this write is now LOAD-BEARING \u2014 SignalsEnvelope, ChallengerShadow, and the relocated (post-RAG) ThinkTankCoverage all read the SAME-DAY board, closing the no-week-old-data invariant (config#1580 ruling). The multi-agent Research graph runner that previously consumed this artifact has been REMOVED from this SF; the champion path is scanner \u2192 predictor direct. Status contract OK / ERROR \u2014 no SKIPPED today (constituents.json + feature store are hard preconditions). dry_run_llm threads the Friday-Preflight shell-run signal so the Lambda boots+imports without S3 read on $.research_dry=true. alpha-engine-config-I6855: 600 -> 440. The SF budget must sit BELOW the function timeout or it can never bind \u2014 on 2026-08-11 this state declared 600s while alpha-engine-research-scanner carried 300s, so both preopen invocations died at 300s with Sandbox.Timedout and the 600 described nothing. The function is now 450s (crucible-research-PR601, p95 x 1.5); 440 keeps the SF the effective budget, so a scanner overrun surfaces as States.Timeout naming this state rather than as an opaque Lambda error.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-scanner:live",
@@ -1074,7 +1074,7 @@
                   "dry_run_llm.$": "$.research_dry"
                 }
               },
-              "TimeoutSeconds": 600,
+              "TimeoutSeconds": 440,
               "Retry": [
                 {
                   "ErrorEquals": [
@@ -1155,7 +1155,7 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "alpha-engine-config#6722: routes through MarkRegimeSubstrateDegraded before converging on CheckSkipSignalsEnvelope — this fail-open previously set no degraded flag.",
+                  "Comment": "alpha-engine-config#6722: routes through MarkRegimeSubstrateDegraded before converging on CheckSkipSignalsEnvelope \u2014 this fail-open previously set no degraded flag.",
                   "Next": "MarkRegimeSubstrateDegraded",
                   "ResultPath": "$.regime_substrate_error"
                 }
@@ -2461,7 +2461,7 @@
           "States": {
             "InitPredictorDegradedFlag": {
               "Type": "Pass",
-              "Comment": "alpha-engine-config#6722: seeds the branch-local $.research_degraded_local marker Branch B's model-zoo rotation fail-open group (ResolveZooSpecs/WaitResolveZoo/ModelZooTrainMap/ModelZooSelect/WaitForModelZoo, all converging on PublishModelZooFailureImmediate) threads through. Must be seeded BEFORE BranchBComplete's Parameters.$ extraction would throw States.Runtime on a clean run that never sets it. Same field name as Branch A's InitResearchDegradedFlag — branches are isolated JSONPath scopes, so no collision — folded into the top-level $.research_predictor_degraded at AggregateBranchOutcomes/CheckResearchPredictorDegraded.",
+              "Comment": "alpha-engine-config#6722: seeds the branch-local $.research_degraded_local marker Branch B's model-zoo rotation fail-open group (ResolveZooSpecs/WaitResolveZoo/ModelZooTrainMap/ModelZooSelect/WaitForModelZoo, all converging on PublishModelZooFailureImmediate) threads through. Must be seeded BEFORE BranchBComplete's Parameters.$ extraction would throw States.Runtime on a clean run that never sets it. Same field name as Branch A's InitResearchDegradedFlag \u2014 branches are isolated JSONPath scopes, so no collision \u2014 folded into the top-level $.research_predictor_degraded at AggregateBranchOutcomes/CheckResearchPredictorDegraded.",
               "Result": false,
               "ResultPath": "$.research_degraded_local",
               "Next": "CheckSkipPredictorTraining"
