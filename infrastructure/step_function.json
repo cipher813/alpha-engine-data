@@ -814,8 +814,29 @@
     },
     "MorningEnrichRetryGate": {
       "Type": "Choice",
-      "Comment": "SOTA bounded auto-retry (config#1059): re-issue MorningEnrich ONCE on a polled non-Success SSM status before giving up (idempotent re-run on the same always-on instance). Absent counter => re-issue; counter=1 => give up to ExtractMorningEnrichError.",
+      "Comment": "SOTA bounded auto-retry (config#1059), liveness-branched (config#5688). The launcher is an EPHEMERAL per-execution spot since config#2248 (DispatchWeeklyFreshnessSpot replaced the always-on dashboard box as the $.ec2_instance_id source), so the dominant reason a poll goes non-Success is that the instance is GONE — and a re-issue of ssm:sendCommand to a terminated instance id can only raise Ssm.InvalidInstanceIdException, burning the retry ladder (5 attempts / ~4m20s measured on execution 158e7fe8-a6ca-4278-b097-c02ca4e34752) on a deterministic no-op. SUBSTRATE LOST (StatusDetails Undeliverable/Terminated) => fail fast to ExtractMorningEnrichSubstrateLostError WITHOUT consuming the re-issue counter, so a later genuine transient workload failure still gets its retry; recovery is the mechanical scripts/weekly_sf_rerun.py, which derives the skip-set from the failed execution. WORKLOAD FAILED on a live instance => the original single idempotent re-issue is correct and unchanged: absent counter => re-issue; counter=1 => give up to ExtractMorningEnrichError.",
       "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.morning_enrich_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.morning_enrich_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.morning_enrich_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractMorningEnrichSubstrateLostError"
+        },
         {
           "And": [
             {
@@ -1004,8 +1025,29 @@
     },
     "DataPhase1RetryGate": {
       "Type": "Choice",
-      "Comment": "SOTA bounded auto-retry (config#1059): a polled non-Success SSM status on this idempotent batch step is retriable, not terminal. Re-issue DataPhase1 ONCE on the same always-on instance ($.ec2_instance_id) before giving up \u2014 re-running is safe (the data job overwrites the same run_date S3 keys). Absent counter => first failure => re-issue; counter present (=1) => second failure => give up to ExtractDataPhase1Error. Keeps the scheduled execution alive through a transient blip so it succeeds first-pass (moves unattended_first_pass_rate).",
+      "Comment": "SOTA bounded auto-retry (config#1059), liveness-branched (config#5688). A polled non-Success SSM status on this idempotent batch step is retriable, not terminal \u2014 but ONLY while the instance is alive. The launcher is an EPHEMERAL per-execution spot since config#2248, so re-issuing to $.ec2_instance_id after substrate loss can only raise Ssm.InvalidInstanceIdException. SUBSTRATE LOST (StatusDetails Undeliverable/Terminated) => fail fast to ExtractDataPhase1SubstrateLostError WITHOUT consuming the re-issue counter; recovery is the mechanical scripts/weekly_sf_rerun.py. WORKLOAD FAILED on a live instance => re-issue DataPhase1 ONCE ($.ec2_instance_id) before giving up \u2014 re-running is safe (the data job overwrites the same run_date S3 keys). Absent counter => first failure => re-issue; counter present (=1) => second failure => give up to ExtractDataPhase1Error. Keeps the scheduled execution alive through a transient blip so it succeeds first-pass (moves unattended_first_pass_rate).",
       "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.data_phase1_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.data_phase1_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.data_phase1_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractDataPhase1SubstrateLostError"
+        },
         {
           "And": [
             {
@@ -1463,8 +1505,29 @@
             },
             "RAGIngestionRetryGate": {
               "Type": "Choice",
-              "Comment": "SOTA bounded auto-retry (config#1059): re-issue RAGIngestion ONCE on a polled non-Success SSM status before giving up (idempotent re-run on the same always-on instance). Absent counter => re-issue; counter=1 => give up to ExtractRAGIngestionError.",
+              "Comment": "SOTA bounded auto-retry (config#1059), liveness-branched (config#5688). The launcher is an EPHEMERAL per-execution spot since config#2248, so a re-issue to a terminated $.ec2_instance_id can only raise Ssm.InvalidInstanceIdException — this gate is where that was MEASURED (execution 158e7fe8-a6ca-4278-b097-c02ca4e34752, 2026-07-30: 5 consecutive TaskFailed over 4m20s after the reaper terminated the box 52s before the poll flipped to Undeliverable). SUBSTRATE LOST (StatusDetails Undeliverable/Terminated) => fail fast to ExtractRAGIngestionSubstrateLostError WITHOUT consuming the re-issue counter; recovery is the mechanical scripts/weekly_sf_rerun.py. WORKLOAD FAILED on a live instance => re-issue RAGIngestion ONCE before giving up: absent counter => re-issue; counter=1 => give up to ExtractRAGIngestionError.",
               "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.rag_ingestion_poll.StatusDetails",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.rag_ingestion_poll.StatusDetails",
+                          "StringEquals": "Undeliverable"
+                        },
+                        {
+                          "Variable": "$.rag_ingestion_poll.StatusDetails",
+                          "StringEquals": "Terminated"
+                        }
+                      ]
+                    }
+                  ],
+                  "Next": "ExtractRAGIngestionSubstrateLostError"
+                },
                 {
                   "And": [
                     {
@@ -1494,6 +1557,17 @@
               "Parameters": {
                 "phase": "RAGIngestion",
                 "source": "CheckRAGIngestionStatus.Default",
+                "poll.$": "$.rag_ingestion_poll"
+              },
+              "ResultPath": "$.error",
+              "Next": "PublishResearchFailureImmediate"
+            },
+            "ExtractRAGIngestionSubstrateLostError": {
+              "Type": "Pass",
+              "Comment": "config#5688: the SUBSTRATE-LOST sibling of ExtractRAGIngestionError. Same normalization, distinguishable phase — the launcher spot was gone (StatusDetails Undeliverable/Terminated) before the workload could report, so this is an infrastructure event, not a RAG failure. The distinct phase reaches the SNS body through the same NormalizeFailureContext chain, which is what makes substrate loss separable from workload failure in failure telemetry instead of both arriving as a bare \"RAGIngestion\" phase. Deliberately does NOT route through RAGIngestionReissue: re-issuing ssm:sendCommand to a terminated instance id is a guaranteed Ssm.InvalidInstanceIdException, and consuming $.rag_ingestion_attempts here would spend the one bounded retry that a genuine transient workload failure needs.",
+              "Parameters": {
+                "phase": "RAGIngestion/SubstrateLost",
+                "source": "RAGIngestionRetryGate.SubstrateLost",
                 "poll.$": "$.rag_ingestion_poll"
               },
               "ResultPath": "$.error",
@@ -1746,8 +1820,29 @@
             },
             "DataPhase2RetryGate": {
               "Type": "Choice",
-              "Comment": "One bounded re-issue, mirroring DataPhase1RetryGate. A second failure is a real failure and takes Branch A down rather than looping: alt data is a model input, and a silent skip would write 0.0 into seven feature-store columns for the whole universe.",
+              "Comment": "One bounded re-issue, mirroring DataPhase1RetryGate, liveness-branched (config#5688). A second failure is a real failure and takes Branch A down rather than looping: alt data is a model input, and a silent skip would write 0.0 into seven feature-store columns for the whole universe. SUBSTRATE LOST (StatusDetails Undeliverable/Terminated) => fail fast to ExtractDataPhase2SubstrateLostError WITHOUT consuming the re-issue counter — the launcher is an ephemeral spot (config#2248), so re-issuing to a terminated $.ec2_instance_id can only raise Ssm.InvalidInstanceIdException; recovery is the mechanical scripts/weekly_sf_rerun.py. This gate was NOT named in config#5688's three-gate scope; it carries the identical shape and premise, and fixing three of four would have left the class open (engagement-protocol §5).",
               "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.data_phase2_poll.StatusDetails",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.data_phase2_poll.StatusDetails",
+                          "StringEquals": "Undeliverable"
+                        },
+                        {
+                          "Variable": "$.data_phase2_poll.StatusDetails",
+                          "StringEquals": "Terminated"
+                        }
+                      ]
+                    }
+                  ],
+                  "Next": "ExtractDataPhase2SubstrateLostError"
+                },
                 {
                   "And": [
                     {
@@ -1771,6 +1866,17 @@
                 "phase": "DataPhase2",
                 "source": "DataPhase2RetryGate.exhausted",
                 "error": "DataPhase2 SSM command exhausted its retry budget (1 re-issue) without succeeding \u2014 the alternative data collector failed on both attempts."
+              },
+              "ResultPath": "$.error",
+              "Next": "PublishResearchFailureImmediate"
+            },
+            "ExtractDataPhase2SubstrateLostError": {
+              "Type": "Pass",
+              "Comment": "config#5688: the SUBSTRATE-LOST sibling of SetDataPhase2ExhaustedError. Same normalization, distinguishable phase \u2014 the launcher spot was gone (StatusDetails Undeliverable/Terminated) before the workload could report, so this is an infrastructure event, not a DataPhase2 failure, and it is emphatically NOT retry-budget exhaustion (the budget is untouched). Deliberately does NOT route through DataPhase2Reissue: re-issuing ssm:sendCommand to a terminated instance id is a guaranteed Ssm.InvalidInstanceIdException, and consuming $.data_phase2_attempts here would spend the one bounded retry a genuine transient workload failure needs.",
+              "Parameters": {
+                "phase": "DataPhase2/SubstrateLost",
+                "source": "DataPhase2RetryGate.SubstrateLost",
+                "poll.$": "$.data_phase2_poll"
               },
               "ResultPath": "$.error",
               "Next": "PublishResearchFailureImmediate"
@@ -5973,12 +6079,34 @@
       "ResultPath": "$.error",
       "Next": "NormalizeFailureContext"
     },
+    "ExtractMorningEnrichSubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#5688: the SUBSTRATE-LOST sibling of ExtractMorningEnrichError. Same normalization, distinguishable phase \u2014 the launcher spot was gone (StatusDetails Undeliverable/Terminated) before the workload could report, so this is an infrastructure event, not a MorningEnrich failure. The distinct phase reaches the SNS body through the same NormalizeFailureContext chain, which is what makes substrate loss separable from workload failure in failure telemetry. Deliberately does NOT route through MorningEnrichReissue: re-issuing ssm:sendCommand to a terminated instance id is a guaranteed Ssm.InvalidInstanceIdException, and consuming $.morning_enrich_attempts here would spend the one bounded retry a genuine transient workload failure needs.",
+      "Parameters": {
+        "phase": "MorningEnrich/SubstrateLost",
+        "source": "MorningEnrichRetryGate.SubstrateLost",
+        "poll.$": "$.morning_enrich_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
     "ExtractDataPhase1Error": {
       "Type": "Pass",
       "Comment": "Normalize DataPhase1 SSM non-Success poll into $.error so HandleFailure's States.Format template has something to serialize (the soft-failure path from CheckDataPhase1Status.Default does not populate $.error \u2014 only Task Catch blocks do).",
       "Parameters": {
         "phase": "DataPhase1",
         "source": "CheckDataPhase1Status.Default",
+        "poll.$": "$.data_phase1_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "ExtractDataPhase1SubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#5688: the SUBSTRATE-LOST sibling of ExtractDataPhase1Error. Same normalization, distinguishable phase \u2014 the launcher spot was gone (StatusDetails Undeliverable/Terminated) before the workload could report, so this is an infrastructure event, not a DataPhase1 failure. The distinct phase reaches the SNS body through the same NormalizeFailureContext chain, which is what makes substrate loss separable from workload failure in failure telemetry. Deliberately does NOT route through DataPhase1Reissue: re-issuing ssm:sendCommand to a terminated instance id is a guaranteed Ssm.InvalidInstanceIdException, and consuming $.data_phase1_attempts here would spend the one bounded retry a genuine transient workload failure needs.",
+      "Parameters": {
+        "phase": "DataPhase1/SubstrateLost",
+        "source": "DataPhase1RetryGate.SubstrateLost",
         "poll.$": "$.data_phase1_poll"
       },
       "ResultPath": "$.error",
