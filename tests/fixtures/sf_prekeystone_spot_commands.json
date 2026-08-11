@@ -31,14 +31,23 @@
     "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --slug drift-detection --log /var/log/drift-detection.log -- bash infrastructure/spot_drift_detection.sh"
   ],
-  "Evaluator": [
+  "EvaluatorDiagnostics": [
     "set -eo pipefail",
     "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
     "export RUN_DATE='2026-05-18'",
-    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug evaluator --log /var/log/evaluator.log -- bash infrastructure/spot_evaluator.sh"
+    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug evaluator-diagnostics --log /var/log/evaluator-diagnostics.log -- bash infrastructure/spot_evaluator.sh --eval-half=diagnostics"
+  ],
+  "EvaluatorOptimize": [
+    "set -eo pipefail",
+    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "cd /home/ec2-user/alpha-engine-backtester",
+    "export HOME=/home/ec2-user",
+    "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
+    "export RUN_DATE='2026-05-18'",
+    "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug evaluator-optimize --log /var/log/evaluator-optimize.log -- bash infrastructure/spot_evaluator.sh --eval-half=optimize"
   ],
   "MorningEnrich": [
     "set -eo pipefail",

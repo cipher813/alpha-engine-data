@@ -232,9 +232,16 @@ _SPOT_STATES = {
         "bash infrastructure/spot_parity_compare.sh",
         "/var/log/parity-compare.log",
     ),
-    "Evaluator": (
-        "bash infrastructure/spot_evaluator.sh",
-        "/var/log/evaluator.log",
+    # config-I3112 deliverable 3: one Evaluator state became two, each with
+    # its own --eval-half, its own ssm_log_capture slug and its own log path,
+    # so the two halves' logs are separable in s3://.../_ssm_logs/.
+    "EvaluatorDiagnostics": (
+        "bash infrastructure/spot_evaluator.sh --eval-half=diagnostics",
+        "/var/log/evaluator-diagnostics.log",
+    ),
+    "EvaluatorOptimize": (
+        "bash infrastructure/spot_evaluator.sh --eval-half=optimize",
+        "/var/log/evaluator-optimize.log",
     ),
     # config#902: DriftDetection was collapsed — drift is now bundled onto the
     # PredictorTraining spot (crucible-predictor spot_predictor_training.sh,
@@ -504,6 +511,15 @@ def orig_spot_cmds() -> dict:
       change — the whole point of the cutover — so the baseline moves with
       it. Both monoliths are retained on disk, unchanged, only as the
       rollback path.
+
+    - **Regenerated 2026-08-11** for the alpha-engine-config-I3112
+      deliverable-3 Evaluator split (Brian design ruling 2026-07-20). The
+      single `Evaluator` key became `EvaluatorDiagnostics` and
+      `EvaluatorOptimize`, each carrying its own `--eval-half` token, its own
+      `--slug` and its own `--log` path so the two halves are separable in
+      `s3://alpha-engine-research/_ssm_logs/`. A deliberate, reviewed
+      absent-path change: the real Saturday path now runs two commands where
+      it ran one, which is the entire point of the split.
 
     Regenerate ONLY on a deliberate, reviewed change to a spot state's
     absent-path (`preflight_args=""`) command, by re-extracting the
@@ -1215,7 +1231,8 @@ class TestHappyPathTraversal:
             # after it.
             "ParityParallel",
             "PitParityCompare",
-            "Evaluator",
+            "EvaluatorDiagnostics",
+            "EvaluatorOptimize",
         ):
             assert ran_dry in order, (
                 f"{ran_dry} was NOT visited under shell_run — the rewire "

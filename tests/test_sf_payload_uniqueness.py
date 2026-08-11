@@ -687,7 +687,16 @@ class TestEODSFTopLevelFieldsClosed:
 # PitParityCompare join spot — net +3 flat-level spot launchers (the three
 # branches ARE descended into by _flatten_states, same as DataPhase2's
 # Branch A siblings).
-_EXPECTED_SATURDAY_SPOT_STATE_COUNT = 14
+# 14 → 15 on alpha-engine-config-I3112 deliverable 3 (2026-08-11): the single
+# Evaluator spot state was split into EvaluatorDiagnostics -> EvaluatorOptimize,
+# each dispatching its own spot via spot_evaluator.sh --eval-half=. The extra
+# launcher is a KNOWN, measured cost and not an oversight: _spot_common.sh
+# terminates its instance in a trap with no keep-alive or attach path, so two
+# SF states means two boots. Measured at ~200s per boot against a ~4h20m
+# pipeline (the 2026-08-08 succeeded run put the whole merged Evaluator stage
+# at 482s, of which evaluate.py was 282s). Reusing one box would mean weakening
+# a termination trap every stage depends on, to save ~200s.
+_EXPECTED_SATURDAY_SPOT_STATE_COUNT = 15
 
 
 def _spot_states(sf_path: Path) -> list[str]:

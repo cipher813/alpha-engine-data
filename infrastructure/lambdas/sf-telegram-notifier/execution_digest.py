@@ -62,7 +62,12 @@ DIGEST_STATE_ORDER: Tuple[str, ...] = (
     "PitParityCompare",
     "ModelZooSelect",
     "ModelZooTrainMap",
-    "Evaluator",
+    # config-I3112 deliverable 3: the single Evaluator state became two,
+    # and the digest orders by this list — a stale single entry would
+    # order NEITHER half, the same way the "Parity"/"ModelZooRotation"
+    # entries above silently ordered nothing after their own splits.
+    "EvaluatorDiagnostics",
+    "EvaluatorOptimize",
     "ReportCard",
     # Weekday preopen, in pipeline order
     "StartExecutorEC2",
