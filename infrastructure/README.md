@@ -81,7 +81,7 @@ it). This is the operational equivalent of a targeted redrive:
 ```
 skip_weekly_run_day_gate, skip_morning_enrich, skip_data_phase1, skip_data_phase2,
 skip_lib_pin_drift_check, skip_scanner, skip_signals_envelope, skip_challenger_shadow,
-skip_regime_substrate, skip_research, skip_rag_ingestion, skip_thinktank_coverage,
+skip_regime_substrate, skip_research, skip_rag_ingestion,
 skip_rationale_clustering, skip_eval_judge, skip_evaluator, skip_post_eval,
 skip_regime_retrospective_eval, skip_predictor_training, skip_predictor_backtest,
 skip_portfolio_optimizer_backtest, skip_backtester, skip_backtester_stage_only,
@@ -105,14 +105,16 @@ completed but a `predictor_backtest` / `portfolio_optimizer_backtest` /
 of `skip_backtester`.
 
 **Lane-A flags (config#3134)**: `skip_scanner`, `skip_signals_envelope`,
-`skip_challenger_shadow`, `skip_thinktank_coverage` extend this charter to
-the Scanner/SignalsEnvelope/ChallengerShadow/ThinkTankCoverage research
-states inside `ResearchPredictorParallel`'s branch A — previously NONE of
-the four had a skip gate, so every partial rerun (e.g. `mode=backtest-eval`,
-see below) unconditionally re-scanned `candidates.json`, re-called the
-ChallengerShadow producer, and re-attempted ThinkTankCoverage's `gap_fill`
-thesis generation (real challenger-corpus writes + OpenRouter token burn)
-regardless of what was actually being rerun. **`skip_signals_envelope` is
+`skip_challenger_shadow` extend this charter to the
+Scanner/SignalsEnvelope/ChallengerShadow research states inside
+`ResearchPredictorParallel`'s branch A (`skip_thinktank_coverage` was a
+fourth until 2026-08-10, when the ThinkTankCoverage chain was removed from
+this SF — the Think Tank runs daily in shadow mode on its own cadence).
+Previously none of them had a skip gate, so every partial rerun (e.g.
+`mode=backtest-eval`, see below) unconditionally re-scanned
+`candidates.json` and re-called the ChallengerShadow producer — real
+artifact writes and token burn — regardless of what was actually being
+rerun. **`skip_signals_envelope` is
 the one exception to "safe to set true for a completed stage": its gate
 defaults FALSE** because SignalsEnvelope is LOAD-BEARING for a real weekly
 run (I2880 staleness guard — the executor hard-fails Monday without a

@@ -148,9 +148,9 @@
     },
     "ApplyBacktestEvalPreset": {
       "Type": "Pass",
-      "Comment": "mode=backtest-eval ONLY (config#830; lane-A flags added config#3134). Seeds skip_* defaults that bypass every stage EXCEPT Backtester + Evaluator: the front half (lib-pin/morning-enrich/data-phase1/rag/regime/research/data-phase2/eval-judge chain/aggregate-costs/predictor-training), the post-backtest model block (predictor-backtest + portfolio-optimizer), parity, and the post-eval tail (health checks/report-card/director via skip_post_eval). skip_backtester / skip_evaluator are deliberately NOT set, so those two run. config#3134: also seeds skip_scanner, skip_challenger_shadow, skip_thinktank_coverage true (all three are observe-only/side-effect producers a Backtester+Evaluator-only assessment rerun does not need \u2014 a bare mode=backtest-eval run was previously re-scanning candidates.json, re-calling the ChallengerShadow producer, and re-attempting ThinkTankCoverage's gap_fill thesis generation on every partial rerun for no benefit to the assessment). ALSO seeds skip_signals_envelope true HERE ONLY \u2014 SignalsEnvelope is LOAD-BEARING for a real weekly run (I2880 staleness guard; the executor hard-fails Monday without a fresh signals.json) and its own CheckSkipSignalsEnvelope gate defaults false for exactly that reason, but this preset's whole contract is 'replay Backtester+Evaluator against existing artifacts, whatever their vintage' \u2014 a backtest-eval rerun never reaches the executor and never needs a refreshed signals.json, so skipping the envelope here is safe specifically because this preset already skips everything that would consume a stale one. Merge order States.JsonMerge(preset, $, false) makes the preset the BASE and the live input ($) WIN \u2014 so an operator can still override any single flag (e.g. {\"mode\": \"backtest-eval\", \"skip_parity\": false}) and it takes effect. Mirrors InitializeInput's JsonMerge-defaults idiom.",
+      "Comment": "mode=backtest-eval ONLY (config#830; lane-A flags added config#3134). Seeds skip_* defaults that bypass every stage EXCEPT Backtester + Evaluator: the front half (lib-pin/morning-enrich/data-phase1/rag/regime/research/data-phase2/eval-judge chain/aggregate-costs/predictor-training), the post-backtest model block (predictor-backtest + portfolio-optimizer), parity, and the post-eval tail (health checks/report-card/director via skip_post_eval). skip_backtester / skip_evaluator are deliberately NOT set, so those two run. config#3134: also seeds skip_scanner and skip_challenger_shadow true (both are observe-only/side-effect producers a Backtester+Evaluator-only assessment rerun does not need \u2014 a bare mode=backtest-eval run was previously re-scanning candidates.json and re-calling the ChallengerShadow producer on every partial rerun for no benefit to the assessment). It also seeded skip_thinktank_coverage until 2026-08-10, when the ThinkTankCoverage chain was removed from this SF (Brian ruling: the Think Tank runs daily in shadow mode, outside the weekly pipeline). ALSO seeds skip_signals_envelope true HERE ONLY \u2014 SignalsEnvelope is LOAD-BEARING for a real weekly run (I2880 staleness guard; the executor hard-fails Monday without a fresh signals.json) and its own CheckSkipSignalsEnvelope gate defaults false for exactly that reason, but this preset's whole contract is 'replay Backtester+Evaluator against existing artifacts, whatever their vintage' \u2014 a backtest-eval rerun never reaches the executor and never needs a refreshed signals.json, so skipping the envelope here is safe specifically because this preset already skips everything that would consume a stale one. Merge order States.JsonMerge(preset, $, false) makes the preset the BASE and the live input ($) WIN \u2014 so an operator can still override any single flag (e.g. {\"mode\": \"backtest-eval\", \"skip_parity\": false}) and it takes effect. Mirrors InitializeInput's JsonMerge-defaults idiom.",
       "Parameters": {
-        "merged.$": "States.JsonMerge(States.StringToJson('{\"skip_lib_pin_drift_check\":true,\"skip_morning_enrich\":true,\"skip_data_phase1\":true,\"skip_scanner\":true,\"skip_signals_envelope\":true,\"skip_challenger_shadow\":true,\"skip_rag_ingestion\":true,\"skip_thinktank_coverage\":true,\"skip_regime_substrate\":true,\"skip_regime_retrospective_eval\":true,\"skip_research\":true,\"skip_data_phase2\":true,\"skip_eval_judge\":true,\"skip_rationale_clustering\":true,\"skip_replay_concordance\":true,\"skip_counterfactual\":true,\"skip_aggregate_costs\":true,\"skip_predictor_training\":true,\"skip_predictor_backtest\":true,\"skip_portfolio_optimizer_backtest\":true,\"skip_parity\":true,\"skip_post_eval\":true}'),$,false)"
+        "merged.$": "States.JsonMerge(States.StringToJson('{\"skip_lib_pin_drift_check\":true,\"skip_morning_enrich\":true,\"skip_data_phase1\":true,\"skip_scanner\":true,\"skip_signals_envelope\":true,\"skip_challenger_shadow\":true,\"skip_rag_ingestion\":true,\"skip_regime_substrate\":true,\"skip_regime_retrospective_eval\":true,\"skip_research\":true,\"skip_data_phase2\":true,\"skip_eval_judge\":true,\"skip_rationale_clustering\":true,\"skip_replay_concordance\":true,\"skip_counterfactual\":true,\"skip_aggregate_costs\":true,\"skip_predictor_training\":true,\"skip_predictor_backtest\":true,\"skip_portfolio_optimizer_backtest\":true,\"skip_parity\":true,\"skip_post_eval\":true}'),$,false)"
       },
       "OutputPath": "$.merged",
       "Next": "CheckSkipLibPinDriftCheck"
@@ -1300,7 +1300,7 @@
             },
             "CheckSkipRAGIngestion": {
               "Type": "Choice",
-              "Comment": "Skip-gate. Input like {\"skip_rag_ingestion\": true} routes past RAG ingestion directly to CheckSkipThinkTankCoverage (config#3134: retargeted from a direct ThinkTankCoverage jump so the new ThinkTankCoverage skip-gate sits on EVERY path into ThinkTankCoverage, not just the RAGIngestion-ran path) (config-I2515 Phase B: ThinkTankCoverage moved to run AFTER RAG so its theses read the fresh corpus). Missing flag = run as normal. Useful when DataPhase1 ran fresh but the RAG corpus is already current.",
+              "Comment": "Skip-gate. Input like {\"skip_rag_ingestion\": true} routes past RAG ingestion directly to CheckSkipRegimeRetrospectiveEval. Until 2026-08-10 it routed into the ThinkTankCoverage chain, which has been removed from this SF (Brian ruling: the Think Tank runs daily in shadow mode and is not part of the weekly pipeline). Missing flag = run as normal. Useful when DataPhase1 ran fresh but the RAG corpus is already current.",
               "Choices": [
                 {
                   "And": [
@@ -1313,7 +1313,7 @@
                       "BooleanEquals": true
                     }
                   ],
-                  "Next": "CheckSkipThinkTankCoverage"
+                  "Next": "CheckSkipRegimeRetrospectiveEval"
                 }
               ],
               "Default": "RAGIngestion"
@@ -1421,7 +1421,7 @@
                 {
                   "Variable": "$.rag_ingestion_poll.Status",
                   "StringEquals": "Success",
-                  "Next": "CheckSkipThinkTankCoverage"
+                  "Next": "CheckSkipRegimeRetrospectiveEval"
                 },
                 {
                   "And": [
@@ -1498,197 +1498,6 @@
               },
               "ResultPath": "$.error",
               "Next": "PublishResearchFailureImmediate"
-            },
-            "CheckSkipThinkTankCoverage": {
-              "Type": "Choice",
-              "Comment": "Skip-gate (config#3134). {\"skip_thinktank_coverage\": true} bypasses the ThinkTankCoverage Lambda (mode=gap_fill THESIS GENERATION \u2014 real challenger-corpus writes + OpenRouter token burn) and jumps straight to CheckSkipRegimeRetrospectiveEval \u2014 ThinkTankCoverage's own Next/Catch convergence point, so skipping it is behaviorally identical to a ThinkTankCoverage run that did nothing. Defaults to running (Default: ThinkTankCoverage) so scheduled Saturday runs and unflagged reruns are unaffected. Set true by the mode=backtest-eval preset: the observe-only gap_fill coverage top-up is not needed for a Backtester/Evaluator-only assessment rerun, and skipping it avoids real thesis-generation writes + token spend for no benefit (config#3134: the 2026-07-20 assessment-rerun arc re-attempted gap_fill on every one of six rerun attempts, bumping FIVE/BJ/HQY/PTC thesis versions before timing out at the config#3072 ceiling each time).",
-              "Choices": [
-                {
-                  "And": [
-                    {
-                      "Variable": "$.skip_thinktank_coverage",
-                      "IsPresent": true
-                    },
-                    {
-                      "Variable": "$.skip_thinktank_coverage",
-                      "BooleanEquals": true
-                    }
-                  ],
-                  "Next": "CheckSkipRegimeRetrospectiveEval"
-                }
-              ],
-              "Default": "ThinkTankCoverage"
-            },
-            "ThinkTankCoverage": {
-              "Type": "Task",
-              "Comment": "Think Tank observe-mode coverage top-up, dispatched to EC2 SPOT (alpha-engine-config-I5758). PREVIOUSLY a direct lambda:invoke against alpha-engine-research-thinktank with TimeoutSeconds 900 \u2014 the AWS Lambda MAXIMUM, which this workload cannot fit in: measured 2026-07-30 on watch-rerun-2026-07-29-1, both attempts hit States.Timeout at 900s (11:24:47 and 11:40:48) for 30 min of wall-clock and zero output. alpha-engine-config-I5208 established the same failure on the DAILY cadence and ARCHITECTURE \u00a747 ruled the fix: a long-running agent loop runs on owned compute behind a dispatcher. That fix shipped for the daily path (crucible-research infrastructure/thinktank_box_runner.py + thinktank_spot_bootstrap.sh + this dispatcher) and THIS state was never repointed \u2014 the weekly SF kept re-entering the failure the migration already fixed, on the one path inside a decision pipeline. The dispatcher fires an ASYNC detached SSM command and returns immediately, so this state only LAUNCHES; the poll quartet below waits for the box, mirroring the RAGIngestion / WaitForRAGIngestion / CheckRAGIngestionStatus / RAGIngestionWait shape. Budget chain (load-bearing, asserted by the dispatcher's own handler and test_handler.py): THINKTANK_RUN_BUDGET_SECONDS (5400) < THINKTANK_SPOT_RUN_TIMEOUT_SECONDS (7200) < this state's poll bound. If the budget ever meets the SSM timeout, SSM guillotines the run mid-loop and every terminal write is lost \u2014 the exact I5208 failure, reintroduced by config drift. config-I2515 Phase B ordering is preserved: this runs AFTER the RAG chain so Think Tank's theses read the FRESH corpus. The daily EventBridge cadence stays the primary coverage-growth mechanism; this state remains the reactive gap_fill top-up.",
-              "Resource": "arn:aws:states:::lambda:invoke",
-              "Parameters": {
-                "FunctionName": "alpha-engine-thinktank-spot-dispatcher",
-                "Payload": {
-                  "mode": "gap_fill",
-                  "run_date.$": "$.run_date"
-                }
-              },
-              "TimeoutSeconds": 330,
-              "Retry": [
-                {
-                  "ErrorEquals": [
-                    "Lambda.ServiceException",
-                    "Lambda.TooManyRequestsException",
-                    "Lambda.SdkClientException"
-                  ],
-                  "MaxAttempts": 2,
-                  "IntervalSeconds": 30,
-                  "BackoffRate": 2.0
-                }
-              ],
-              "Catch": [
-                {
-                  "ErrorEquals": [
-                    "States.ALL"
-                  ],
-                  "Comment": "Observe-mode non-blocking: a Think Tank failure must NOT halt the pipeline (config-I2515 Phase B). Routes to ThinkTankDegraded, which SETS A VISIBLE FLAG before converging \u2014 weekly-sf-policy.md \u00a72.3 permits fail-open ONLY with a flag that propagates to the terminal notification, and champion-challenger-policy.md \u00a73 requires a cycle with no arm output to be recorded as a MISS, never omitted. The flagless fail-open this replaces is why 13 days of silent Lambda timeouts went unnoticed.",
-                  "Next": "ThinkTankDegraded",
-                  "ResultPath": "$.thinktank_error"
-                }
-              ],
-              "ResultSelector": {
-                "launched.$": "$.Payload.launched",
-                "instance_id.$": "$.Payload.instance_id",
-                "command_id.$": "$.Payload.command_id"
-              },
-              "ResultPath": "$.thinktank_dispatch",
-              "Next": "CheckThinkTankLaunched"
-            },
-            "CheckThinkTankLaunched": {
-              "Type": "Choice",
-              "Comment": "The dispatcher returns launched=false with reason=already_running when a Think Tank box is already up \u2014 normally the DAILY cadence's box. That box writes the same terminal artifacts this state wants, so waiting for a command_id we do not have would be wrong; converge with a degraded flag naming the reason instead. Skipping silently would render identically to a genuine zero, which champion-challenger-policy.md \u00a73 forbids.",
-              "Choices": [
-                {
-                  "Variable": "$.thinktank_dispatch.launched",
-                  "BooleanEquals": true,
-                  "Next": "InitThinkTankPollCount"
-                }
-              ],
-              "Default": "ThinkTankDegraded"
-            },
-            "InitThinkTankPollCount": {
-              "Type": "Pass",
-              "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Every other poll loop in this pipeline is unbounded and instance-liveness-blind, which cost 5h11m of blind polling on 2026-07-29; this new loop ships bounded rather than adding a 16th instance of that defect. Bound is derived: THINKTANK_SPOT_RUN_TIMEOUT_SECONDS (7200) / Wait 60s = 120 polls, +20% slack = 144.",
-              "Result": 0,
-              "ResultPath": "$.thinktank_polls",
-              "Next": "WaitForThinkTank"
-            },
-            "WaitForThinkTank": {
-              "Type": "Task",
-              "Comment": "Poll the detached SSM command until it reaches a terminal status.",
-              "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
-              "Parameters": {
-                "CommandId.$": "$.thinktank_dispatch.command_id",
-                "InstanceId.$": "$.thinktank_dispatch.instance_id"
-              },
-              "Retry": [
-                {
-                  "ErrorEquals": [
-                    "Ssm.InvocationDoesNotExistException",
-                    "Ssm.InvocationDoesNotExist"
-                  ],
-                  "Comment": "The dispatcher sends the command asynchronously, so the invocation can lag the returned command_id by a beat.",
-                  "MaxAttempts": 10,
-                  "IntervalSeconds": 30,
-                  "BackoffRate": 1.5
-                },
-                {
-                  "ErrorEquals": [
-                    "Ssm.SdkClientException",
-                    "States.Timeout"
-                  ],
-                  "MaxAttempts": 2,
-                  "IntervalSeconds": 5,
-                  "BackoffRate": 1.5
-                }
-              ],
-              "Catch": [
-                {
-                  "ErrorEquals": [
-                    "States.ALL"
-                  ],
-                  "Next": "ThinkTankDegraded",
-                  "ResultPath": "$.thinktank_error"
-                }
-              ],
-              "ResultSelector": {
-                "Status.$": "$.Status",
-                "ResponseCode.$": "$.ResponseCode",
-                "StatusDetails.$": "$.StatusDetails",
-                "StandardErrorContent.$": "$.StandardErrorContent"
-              },
-              "ResultPath": "$.thinktank_poll",
-              "Next": "CheckThinkTankStatus"
-            },
-            "CheckThinkTankStatus": {
-              "Type": "Choice",
-              "Choices": [
-                {
-                  "Variable": "$.thinktank_poll.Status",
-                  "StringEquals": "Success",
-                  "Next": "CheckSkipRegimeRetrospectiveEval"
-                },
-                {
-                  "And": [
-                    {
-                      "Variable": "$.thinktank_polls",
-                      "IsPresent": true
-                    },
-                    {
-                      "Or": [
-                        {
-                          "Variable": "$.thinktank_poll.Status",
-                          "StringEquals": "InProgress"
-                        },
-                        {
-                          "Variable": "$.thinktank_poll.Status",
-                          "StringEquals": "Pending"
-                        }
-                      ]
-                    },
-                    {
-                      "Variable": "$.thinktank_polls",
-                      "NumericLessThan": 144
-                    }
-                  ],
-                  "Next": "ThinkTankWait"
-                }
-              ],
-              "Default": "ThinkTankDegraded"
-            },
-            "ThinkTankWait": {
-              "Type": "Pass",
-              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckThinkTankStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
-              "Parameters": {
-                "polls.$": "States.MathAdd($.thinktank_polls, 1)"
-              },
-              "ResultPath": "$.thinktank_poll_count",
-              "Next": "ThinkTankPollWait"
-            },
-            "ThinkTankPollWait": {
-              "Type": "Wait",
-              "Seconds": 60,
-              "Next": "MergeThinkTankPollCount"
-            },
-            "MergeThinkTankPollCount": {
-              "Type": "Pass",
-              "InputPath": "$.thinktank_poll_count.polls",
-              "ResultPath": "$.thinktank_polls",
-              "Next": "WaitForThinkTank"
-            },
-            "ThinkTankDegraded": {
-              "Type": "Pass",
-              "Comment": "alpha-engine-config-I5758, REPOINTED by alpha-engine-config#6722. Every non-Success path converges here \u2014 dispatch failure, already_running, poll failure, poll-budget exhaustion, a non-Success SSM status. weekly-sf-policy.md \u00a72.3: a stage may fail-open ONLY if the fail-open sets a visible degraded flag that propagates to the terminal notification, and a pipeline reaching NotifyComplete having degraded a stage must say so BY NAME. champion-challenger-policy.md \u00a73: a cycle where an arm produces no output is recorded as a MISS, not omitted \u2014 silent absence and a genuine zero must never render identically. PRE-#6722 this wrote $.thinktank_degraded, a name CheckGateDegradedNotify never dereferenced anywhere in this file \u2014 the exact 'follow the actual JSONPath the notifier reads, not any degraded-named key' trap config#6715 was built to catch (13 consecutive days of 900s Lambda timeouts, 2026-07-17 onward, passed unnoticed while the thinktank_coverage challenger arm was absent from the champion/challenger loop). Now writes the branch-local $.research_degraded_local (the same marker Scanner/RegimeSubstrate/ChallengerShadow/the eval-judge chain/AggregateCosts thread), folded into the top-level $.research_predictor_degraded post-join (AggregateBranchOutcomes/CheckResearchPredictorDegraded) \u2014 genuinely wired this time, verified by tests/test_sf_research_predictor_degraded_wiring.py.",
-              "Result": true,
-              "ResultPath": "$.research_degraded_local",
-              "Next": "CheckSkipRegimeRetrospectiveEval"
             },
             "CheckSkipRegimeRetrospectiveEval": {
               "Type": "Choice",
@@ -2608,7 +2417,7 @@
             },
             "BranchAComplete": {
               "Type": "Pass",
-              "Comment": "Branch A (Scanner \u2192 RegimeSubstrate \u2192 SignalsEnvelope \u2192 ChallengerShadow \u2192 RAG chain \u2192 ThinkTankCoverage \u2192 RegimeRetrospectiveEval \u2192 DataPhase2 \u2192 eval-judge chain \u2192 EvalRollingMean \u2192 RationaleClustering \u2192 ReplayConcordance \u2192 Counterfactual \u2192 AggregateCosts) completed (config-I2515 Phase B reorder \u2014 the multi-agent Research graph runner was removed). Records branch_a_status=OK so the post-join AggregateBranchOutcomes can decide whether to halt the SF. End:true so the Parallel branch SUCCEEDS \u2014 it must never throw, because a thrown branch would cancel the sibling PredictorTraining branch (default SF Parallel semantics). alpha-engine-config#6722: also hoists $.research_degraded_local (seeded false by InitResearchDegradedFlag, set true by any of Branch A's internal fail-open Mark*Degraded states) as branch_a_degraded \u2014 read by AggregateBranchOutcomes/CheckResearchPredictorDegraded post-join since a Parallel branch cannot write an outer-scope JSONPath directly.",
+              "Comment": "Branch A (Scanner \u2192 RegimeSubstrate \u2192 SignalsEnvelope \u2192 ChallengerShadow \u2192 RAG chain \u2192 RegimeRetrospectiveEval \u2192 DataPhase2 \u2192 eval-judge chain \u2192 EvalRollingMean \u2192 RationaleClustering \u2192 ReplayConcordance \u2192 Counterfactual \u2192 AggregateCosts) completed (config-I2515 Phase B reorder \u2014 the multi-agent Research graph runner was removed). Records branch_a_status=OK so the post-join AggregateBranchOutcomes can decide whether to halt the SF. End:true so the Parallel branch SUCCEEDS \u2014 it must never throw, because a thrown branch would cancel the sibling PredictorTraining branch (default SF Parallel semantics). alpha-engine-config#6722: also hoists $.research_degraded_local (seeded false by InitResearchDegradedFlag, set true by any of Branch A's internal fail-open Mark*Degraded states) as branch_a_degraded \u2014 read by AggregateBranchOutcomes/CheckResearchPredictorDegraded post-join since a Parallel branch cannot write an outer-scope JSONPath directly.",
               "Parameters": {
                 "branch_a_status": "OK",
                 "branch_a_degraded.$": "$.research_degraded_local"

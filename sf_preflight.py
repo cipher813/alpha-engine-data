@@ -1131,7 +1131,6 @@ def _build_proposed_input(skip_flags: dict[str, bool] | None = None) -> dict:
         "skip_signals_envelope": False,
         "skip_challenger_shadow": False,
         "skip_rag_ingestion": False,
-        "skip_thinktank_coverage": False,
         "skip_regime_substrate": False,
         "skip_regime_retrospective_eval": False,
         "skip_research": False,

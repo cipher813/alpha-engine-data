@@ -87,7 +87,6 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # config#1824 weekly run-day gate (pure calendar; mirrors LibPinDriftCheck shape).
     "WeeklyRunDayGate": frozenset({"action"}),
     "Scanner": frozenset({"dry_run_llm.$", "run_date.$"}),
-    "ThinkTankCoverage": frozenset({"mode", "run_date.$"}),
     "RegimeSubstrate": frozenset({"action.$"}),
     "RegimeRetrospectiveEval": frozenset({"action.$"}),
     # alpha-engine-config-I2515 Phase B: replaces the removed multi-agent
