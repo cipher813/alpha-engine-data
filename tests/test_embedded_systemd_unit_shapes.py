@@ -34,79 +34,39 @@ from pathlib import Path
 
 import pytest
 
+from nousergon_lib.shell_guards import (
+    embedded_units,
+    endless_execstart_violations,
+)
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _INFRA = _REPO_ROOT / "infrastructure"
-
-# A service type whose `systemctl start` waits for ExecStart to exit.
-_BLOCKING_TYPES = {"oneshot"}
-# Shapes that never return on their own.
-_ENDLESS = (
-    re.compile(r"while\s+true"),
-    re.compile(r"while\s+:\s*;"),
-    re.compile(r"for\s*\(\(\s*;\s*;\s*\)\)"),
-)
 
 
 def _shell_scripts() -> list[Path]:
     return sorted(p for p in _INFRA.rglob("*.sh") if p.is_file())
 
 
-def _units_in(text: str) -> list[tuple[str, str]]:
-    """Return (unit_body, whole_file_text) for each embedded unit file."""
-    return [(m.group(0), text) for m in re.finditer(r"\[Unit\].*?\[Install\]", text, re.S)]
-
-
-def _execstart_target(unit: str) -> str | None:
-    m = re.search(r"^ExecStart=(\S+)", unit, re.M)
-    return m.group(1) if m else None
-
-
-def _service_type(unit: str) -> str:
-    m = re.search(r"^Type=(\S+)", unit, re.M)
-    return m.group(1) if m else "simple"
-
-
-def _body_of(script_path: str, text: str) -> str:
-    """The inline heredoc body written to *script_path* in the same file.
-
-    Bootstrap scripts write their ExecStart target in the same heredoc that
-    declares the unit, e.g. ``cat > /usr/local/bin/x.sh <<'WDSH' ... WDSH``.
-    """
-    name = re.escape(script_path)
-    m = re.search(rf"cat\s*>\s*{name}\s*<<'?(\w+)'?\n(.*?)\n\1", text, re.S)
-    return m.group(2) if m else ""
-
-
 @pytest.mark.parametrize("script", _shell_scripts(), ids=lambda p: p.name)
 def test_endless_execstart_is_never_a_blocking_service_type(script: Path):
-    text = script.read_text()
-    for unit, whole in _units_in(text):
-        target = _execstart_target(unit)
-        if not target:
-            continue
-        body = _body_of(target, whole)
-        if not body:
-            continue  # ExecStart lives outside this file — nothing to assert
-        if not any(rx.search(body) for rx in _ENDLESS):
-            continue
-        stype = _service_type(unit)
-        assert stype not in _BLOCKING_TYPES, (
-            f"{script.name}: {target} runs an unbounded loop but its unit "
-            f"declares Type={stype}. `systemctl start` will block until "
-            f"ExecStart exits — which it never does — and the caller dies "
-            f"when its own timeout kills it (2026-08-10: the weekly SF's "
-            f"MorningEnrich bootstrap, rc=137 at PT5M0.1S). Use Type=simple."
-        )
+    violations = endless_execstart_violations(script.read_text())
+    assert not violations, (
+        f"{script.name}: " + "; ".join(violations) +
+        " (2026-08-10: the weekly SF's MorningEnrich bootstrap, rc=137 at PT5M0.1S)"
+    )
 
 
 def test_the_spot_watchdog_unit_is_a_simple_service():
     """Anchored assertion on the specific unit that hung the pipeline."""
     text = (_INFRA / "_spot_common.sh").read_text()
-    units = [u for u, _ in _units_in(text) if "ec2-spot-watchdog" in u or "EC2 Spot Watchdog" in u]
+    units = [
+        u for u in embedded_units(text)
+        if "ec2-spot-watchdog" in u.body or "EC2 Spot Watchdog" in u.body
+    ]
     assert units, "ec2-spot-watchdog unit not found in _spot_common.sh"
     for unit in units:
-        assert _service_type(unit) == "simple", unit
-        assert "RemainAfterExit" not in unit, (
+        assert unit.service_type == "simple", unit.body
+        assert "RemainAfterExit" not in unit.body, (
             "RemainAfterExit belongs to oneshot units; a supervised daemon "
             "uses Restart= instead"
         )
