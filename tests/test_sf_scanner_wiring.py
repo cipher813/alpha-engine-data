@@ -241,6 +241,12 @@ class TestResultPaths:
 class TestTimeout:
     def test_timeout_is_bounded(self, states):
         # The handler's expected wallclock is ~minutes for the full
-        # ~903-ticker filter pass + small artifact write. 600s gives
-        # generous headroom while still tripping a hung run.
-        assert states["Scanner"]["TimeoutSeconds"] == 600
+        # ~903-ticker filter pass + universe board + membership + leaderboard.
+        # 600 -> 440 (alpha-engine-config-I6855). 600 could never bind: the
+        # function's own timeout was 300s, so both 2026-08-11 preopen
+        # invocations died at 300.00s with Sandbox.Timedout and the pipeline
+        # terminated DEGRADED. The function is now 450s (p95 x 1.5,
+        # crucible-research-PR601) and the SF budget sits below it, so an
+        # overrun surfaces as States.Timeout naming this state.
+        # Ordering guard: tests/test_sf_lambda_timeout_ordering.py.
+        assert states["Scanner"]["TimeoutSeconds"] == 440
