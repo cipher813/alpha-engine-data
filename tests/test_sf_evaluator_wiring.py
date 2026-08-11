@@ -228,7 +228,7 @@ class TestEvaluatorPollLoop:
         assert bounded["Next"] == "EvaluatorWait"
 
     def test_check_status_default_extracts_error(self, states):
-        assert states["CheckEvaluatorStatus"]["Default"] == "ExtractEvaluatorError"
+        assert states["CheckEvaluatorStatus"]["Default"] == "EvaluatorLivenessGate"  # config#6938: gate ahead of the normalizer
 
     def test_evaluator_wait_loops_back_to_poll(self, states):
         # alpha-engine-config-I5687: EvaluatorWait now increments the poll

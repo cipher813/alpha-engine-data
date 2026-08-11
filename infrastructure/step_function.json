@@ -814,7 +814,7 @@
     },
     "MorningEnrichRetryGate": {
       "Type": "Choice",
-      "Comment": "SOTA bounded auto-retry (config#1059), liveness-branched (config#5688). The launcher is an EPHEMERAL per-execution spot since config#2248 (DispatchWeeklyFreshnessSpot replaced the always-on dashboard box as the $.ec2_instance_id source), so the dominant reason a poll goes non-Success is that the instance is GONE — and a re-issue of ssm:sendCommand to a terminated instance id can only raise Ssm.InvalidInstanceIdException, burning the retry ladder (5 attempts / ~4m20s measured on execution 158e7fe8-a6ca-4278-b097-c02ca4e34752) on a deterministic no-op. SUBSTRATE LOST (StatusDetails Undeliverable/Terminated) => fail fast to ExtractMorningEnrichSubstrateLostError WITHOUT consuming the re-issue counter, so a later genuine transient workload failure still gets its retry; recovery is the mechanical scripts/weekly_sf_rerun.py, which derives the skip-set from the failed execution. WORKLOAD FAILED on a live instance => the original single idempotent re-issue is correct and unchanged: absent counter => re-issue; counter=1 => give up to ExtractMorningEnrichError.",
+      "Comment": "SOTA bounded auto-retry (config#1059), liveness-branched (config#5688). The launcher is an EPHEMERAL per-execution spot since config#2248 (DispatchWeeklyFreshnessSpot replaced the always-on dashboard box as the $.ec2_instance_id source), so the dominant reason a poll goes non-Success is that the instance is GONE \u2014 and a re-issue of ssm:sendCommand to a terminated instance id can only raise Ssm.InvalidInstanceIdException, burning the retry ladder (5 attempts / ~4m20s measured on execution 158e7fe8-a6ca-4278-b097-c02ca4e34752) on a deterministic no-op. SUBSTRATE LOST (StatusDetails Undeliverable/Terminated) => fail fast to ExtractMorningEnrichSubstrateLostError WITHOUT consuming the re-issue counter, so a later genuine transient workload failure still gets its retry; recovery is the mechanical scripts/weekly_sf_rerun.py, which derives the skip-set from the failed execution. WORKLOAD FAILED on a live instance => the original single idempotent re-issue is correct and unchanged: absent counter => re-issue; counter=1 => give up to ExtractMorningEnrichError.",
       "Choices": [
         {
           "And": [
@@ -1505,7 +1505,7 @@
             },
             "RAGIngestionRetryGate": {
               "Type": "Choice",
-              "Comment": "SOTA bounded auto-retry (config#1059), liveness-branched (config#5688). The launcher is an EPHEMERAL per-execution spot since config#2248, so a re-issue to a terminated $.ec2_instance_id can only raise Ssm.InvalidInstanceIdException — this gate is where that was MEASURED (execution 158e7fe8-a6ca-4278-b097-c02ca4e34752, 2026-07-30: 5 consecutive TaskFailed over 4m20s after the reaper terminated the box 52s before the poll flipped to Undeliverable). SUBSTRATE LOST (StatusDetails Undeliverable/Terminated) => fail fast to ExtractRAGIngestionSubstrateLostError WITHOUT consuming the re-issue counter; recovery is the mechanical scripts/weekly_sf_rerun.py. WORKLOAD FAILED on a live instance => re-issue RAGIngestion ONCE before giving up: absent counter => re-issue; counter=1 => give up to ExtractRAGIngestionError.",
+              "Comment": "SOTA bounded auto-retry (config#1059), liveness-branched (config#5688). The launcher is an EPHEMERAL per-execution spot since config#2248, so a re-issue to a terminated $.ec2_instance_id can only raise Ssm.InvalidInstanceIdException \u2014 this gate is where that was MEASURED (execution 158e7fe8-a6ca-4278-b097-c02ca4e34752, 2026-07-30: 5 consecutive TaskFailed over 4m20s after the reaper terminated the box 52s before the poll flipped to Undeliverable). SUBSTRATE LOST (StatusDetails Undeliverable/Terminated) => fail fast to ExtractRAGIngestionSubstrateLostError WITHOUT consuming the re-issue counter; recovery is the mechanical scripts/weekly_sf_rerun.py. WORKLOAD FAILED on a live instance => re-issue RAGIngestion ONCE before giving up: absent counter => re-issue; counter=1 => give up to ExtractRAGIngestionError.",
               "Choices": [
                 {
                   "And": [
@@ -1564,7 +1564,7 @@
             },
             "ExtractRAGIngestionSubstrateLostError": {
               "Type": "Pass",
-              "Comment": "config#5688: the SUBSTRATE-LOST sibling of ExtractRAGIngestionError. Same normalization, distinguishable phase — the launcher spot was gone (StatusDetails Undeliverable/Terminated) before the workload could report, so this is an infrastructure event, not a RAG failure. The distinct phase reaches the SNS body through the same NormalizeFailureContext chain, which is what makes substrate loss separable from workload failure in failure telemetry instead of both arriving as a bare \"RAGIngestion\" phase. Deliberately does NOT route through RAGIngestionReissue: re-issuing ssm:sendCommand to a terminated instance id is a guaranteed Ssm.InvalidInstanceIdException, and consuming $.rag_ingestion_attempts here would spend the one bounded retry that a genuine transient workload failure needs.",
+              "Comment": "config#5688: the SUBSTRATE-LOST sibling of ExtractRAGIngestionError. Same normalization, distinguishable phase \u2014 the launcher spot was gone (StatusDetails Undeliverable/Terminated) before the workload could report, so this is an infrastructure event, not a RAG failure. The distinct phase reaches the SNS body through the same NormalizeFailureContext chain, which is what makes substrate loss separable from workload failure in failure telemetry instead of both arriving as a bare \"RAGIngestion\" phase. Deliberately does NOT route through RAGIngestionReissue: re-issuing ssm:sendCommand to a terminated instance id is a guaranteed Ssm.InvalidInstanceIdException, and consuming $.rag_ingestion_attempts here would spend the one bounded retry that a genuine transient workload failure needs.",
               "Parameters": {
                 "phase": "RAGIngestion/SubstrateLost",
                 "source": "RAGIngestionRetryGate.SubstrateLost",
@@ -1820,7 +1820,7 @@
             },
             "DataPhase2RetryGate": {
               "Type": "Choice",
-              "Comment": "One bounded re-issue, mirroring DataPhase1RetryGate, liveness-branched (config#5688). A second failure is a real failure and takes Branch A down rather than looping: alt data is a model input, and a silent skip would write 0.0 into seven feature-store columns for the whole universe. SUBSTRATE LOST (StatusDetails Undeliverable/Terminated) => fail fast to ExtractDataPhase2SubstrateLostError WITHOUT consuming the re-issue counter — the launcher is an ephemeral spot (config#2248), so re-issuing to a terminated $.ec2_instance_id can only raise Ssm.InvalidInstanceIdException; recovery is the mechanical scripts/weekly_sf_rerun.py. This gate was NOT named in config#5688's three-gate scope; it carries the identical shape and premise, and fixing three of four would have left the class open (engagement-protocol §5).",
+              "Comment": "One bounded re-issue, mirroring DataPhase1RetryGate, liveness-branched (config#5688). A second failure is a real failure and takes Branch A down rather than looping: alt data is a model input, and a silent skip would write 0.0 into seven feature-store columns for the whole universe. SUBSTRATE LOST (StatusDetails Undeliverable/Terminated) => fail fast to ExtractDataPhase2SubstrateLostError WITHOUT consuming the re-issue counter \u2014 the launcher is an ephemeral spot (config#2248), so re-issuing to a terminated $.ec2_instance_id can only raise Ssm.InvalidInstanceIdException; recovery is the mechanical scripts/weekly_sf_rerun.py. This gate was NOT named in config#5688's three-gate scope; it carries the identical shape and premise, and fixing three of four would have left the class open (engagement-protocol \u00a75).",
               "Choices": [
                 {
                   "And": [
@@ -2821,8 +2821,36 @@
                   "Next": "PredictorWait"
                 }
               ],
-              "Default": "ExtractPredictorError",
-              "Comment": "[I5687: poll budget cap=108 via $.predictor_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
+              "Default": "PredictorTrainingLivenessGate",
+              "Comment": "[I5687: poll budget cap=108 via $.predictor_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default] [config#6938: the Default now routes through PredictorTrainingRetryGate rather than straight to ExtractPredictorError, so substrate loss is separable from a training failure.]"
+            },
+            "PredictorTrainingLivenessGate": {
+              "Type": "Choice",
+              "Comment": "config#6938. PredictorTraining was the one branch-terminal SSM stage with NO gate: CheckPredictorStatus.Default went straight to ExtractPredictorError, so the failure mode most EXPECTED on spot \u2014 the box going away \u2014 took Branch B down on first occurrence, on the longest and most expensive stage, indistinguishable in telemetry from a training failure. Measured on watch-rerun-2026-08-10-8 (2026-08-11): ResponseCode -1 / StatusDetails Undeliverable, no log shipped, and ec2:DescribeInstances showed Server.SpotInstanceTermination across neighbouring instances in the same window \u2014 AWS reclaiming capacity, not a code fault. NOTE ON THE FIX CHOSEN (config#6938 deliverable 2 asked whether to relaunch-and-rebind instead): the instance this sendCommand targets is $.ec2_instance_id, the SHARED launcher box from DispatchWeeklyFreshnessSpot \u2014 not the training spot, which spot_train.sh launches and retries itself via MAX_SPOT_ATTEMPTS. When that launcher is reclaimed, every remaining stage is equally dead, so a per-stage rebind would fix one symptom of a pipeline-wide loss. Fail fast here, consistent with the four gates of config#5688; relaunching the launcher is a pipeline-level concern tracked separately. No re-issue counter is consumed on this path.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.predictor_poll.StatusDetails",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.predictor_poll.StatusDetails",
+                          "StringEquals": "Undeliverable"
+                        },
+                        {
+                          "Variable": "$.predictor_poll.StatusDetails",
+                          "StringEquals": "Terminated"
+                        }
+                      ]
+                    }
+                  ],
+                  "Next": "ExtractPredictorSubstrateLostError"
+                }
+              ],
+              "Default": "ExtractPredictorError"
             },
             "PredictorWait": {
               "Type": "Pass",
@@ -2839,6 +2867,17 @@
               "Parameters": {
                 "phase": "PredictorTraining",
                 "source": "CheckPredictorStatus.Default",
+                "poll.$": "$.predictor_poll"
+              },
+              "ResultPath": "$.error",
+              "Next": "PublishPredictorFailureImmediate"
+            },
+            "ExtractPredictorSubstrateLostError": {
+              "Type": "Pass",
+              "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractPredictorError. Same normalization, distinguishable phase \u2014 the launcher box was gone (StatusDetails Undeliverable/Terminated) before the workload could report, so this is an infrastructure event, not a training failure. The distinct phase reaches the SNS body through the same PublishPredictorFailureImmediate path, which is what lets an operator tell a reclaim from an OOM without opening the execution history. Mirrors the Extract*SubstrateLostError states config#5688 added for the other four SSM stages.",
+              "Parameters": {
+                "phase": "PredictorTraining/SubstrateLost",
+                "source": "PredictorTrainingLivenessGate.SubstrateLost",
                 "poll.$": "$.predictor_poll"
               },
               "ResultPath": "$.error",
@@ -3003,7 +3042,7 @@
                   "Next": "ParseZooSpecs"
                 }
               ],
-              "Default": "ExtractModelZooResolveError"
+              "Default": "ModelZooResolveLivenessGate"
             },
             "ExtractModelZooResolveError": {
               "Type": "Pass",
@@ -3385,7 +3424,7 @@
                   "Next": "BranchBComplete"
                 }
               ],
-              "Default": "ExtractModelZooSelectError"
+              "Default": "ModelZooSelectLivenessGate"
             },
             "ExtractModelZooSelectError": {
               "Type": "Pass",
@@ -3510,6 +3549,84 @@
               "InputPath": "$.model_zoo_poll_count.polls",
               "ResultPath": "$.model_zoo_polls",
               "Next": "WaitForModelZoo"
+            },
+            "ModelZooResolveLivenessGate": {
+              "Type": "Choice",
+              "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that ModelZooResolve failed. Without this the two are indistinguishable in the alert and the run dies as a ModelZooResolve fault. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates. Recovery is the mechanical scripts/weekly_sf_rerun.py, which derives the skip-set from the failed execution.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.resolve_zoo_poll.StatusDetails",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.resolve_zoo_poll.StatusDetails",
+                          "StringEquals": "Undeliverable"
+                        },
+                        {
+                          "Variable": "$.resolve_zoo_poll.StatusDetails",
+                          "StringEquals": "Terminated"
+                        }
+                      ]
+                    }
+                  ],
+                  "Next": "ExtractModelZooResolveSubstrateLostError"
+                }
+              ],
+              "Default": "ExtractModelZooResolveError"
+            },
+            "ExtractModelZooResolveSubstrateLostError": {
+              "Type": "Pass",
+              "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractModelZooResolveError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a ModelZooResolve failure without opening the execution history.",
+              "Parameters": {
+                "phase": "ModelZooResolve/SubstrateLost",
+                "source": "ModelZooResolveLivenessGate.SubstrateLost",
+                "poll.$": "$.resolve_zoo_poll"
+              },
+              "ResultPath": "$.error",
+              "Next": "PublishModelZooFailureImmediate"
+            },
+            "ModelZooSelectLivenessGate": {
+              "Type": "Choice",
+              "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that ModelZooSelect failed. Without this the two are indistinguishable in the alert and the run dies as a ModelZooSelect fault. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates. Recovery is the mechanical scripts/weekly_sf_rerun.py, which derives the skip-set from the failed execution.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.model_zoo_poll.StatusDetails",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.model_zoo_poll.StatusDetails",
+                          "StringEquals": "Undeliverable"
+                        },
+                        {
+                          "Variable": "$.model_zoo_poll.StatusDetails",
+                          "StringEquals": "Terminated"
+                        }
+                      ]
+                    }
+                  ],
+                  "Next": "ExtractModelZooSelectSubstrateLostError"
+                }
+              ],
+              "Default": "ExtractModelZooSelectError"
+            },
+            "ExtractModelZooSelectSubstrateLostError": {
+              "Type": "Pass",
+              "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractModelZooSelectError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a ModelZooSelect failure without opening the execution history.",
+              "Parameters": {
+                "phase": "ModelZooSelect/SubstrateLost",
+                "source": "ModelZooSelectLivenessGate.SubstrateLost",
+                "poll.$": "$.model_zoo_poll"
+              },
+              "ResultPath": "$.error",
+              "Next": "PublishModelZooFailureImmediate"
             }
           }
         }
@@ -3798,7 +3915,7 @@
           "Next": "BacktesterWait"
         }
       ],
-      "Default": "ExtractBacktesterError",
+      "Default": "BacktesterLivenessGate",
       "Comment": "[I5687: poll budget cap=144 via $.backtester_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
     },
     "BacktesterWait": {
@@ -3963,7 +4080,7 @@
           "Next": "PredictorBacktestWait"
         }
       ],
-      "Default": "ExtractPredictorBacktestError",
+      "Default": "PredictorBacktestLivenessGate",
       "Comment": "[I5687: poll budget cap=144 via $.predictor_backtest_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
     },
     "PredictorBacktestWait": {
@@ -4128,7 +4245,7 @@
           "Next": "PortfolioOptimizerBacktestWait"
         }
       ],
-      "Default": "ExtractPortfolioOptimizerBacktestError",
+      "Default": "PortfolioOptimizerBacktestLivenessGate",
       "Comment": "[I5687: poll budget cap=144 via $.portfolio_optimizer_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
     },
     "PortfolioOptimizerBacktestWait": {
@@ -5232,7 +5349,7 @@
           "Next": "EvaluatorWait"
         }
       ],
-      "Default": "ExtractEvaluatorError",
+      "Default": "EvaluatorLivenessGate",
       "Comment": "[I5687: poll budget cap=144 via $.evaluator_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
     },
     "EvaluatorWait": {
@@ -6728,7 +6845,7 @@
           "Next": "WeeklyFreshnessSpotBootstrapWait"
         }
       ],
-      "Default": "ExtractWeeklyFreshnessSpotBootstrapError"
+      "Default": "WeeklyFreshnessSpotBootstrapLivenessGate"
     },
     "WeeklyFreshnessSpotBootstrapWait": {
       "Type": "Pass",
@@ -6975,6 +7092,201 @@
       "Type": "Pass",
       "Comment": "config#6054: success-only witness for the rerun deriver (scripts/weekly_sf_rerun.py). Director's success and every bypass path previously converged on CheckShellRunNotify, so no state uniquely witnessed 'Director actually completed' \u2014 the I6055-class trap: a rerun could mark a bypassed Director complete and skip it. Entered ONLY via Director's success edge.",
       "Next": "CheckShellRunNotify"
+    },
+    "BacktesterLivenessGate": {
+      "Type": "Choice",
+      "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that Backtester failed. Without this the two are indistinguishable in the alert and the run dies as a Backtester fault. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates. Recovery is the mechanical scripts/weekly_sf_rerun.py, which derives the skip-set from the failed execution.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.backtester_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.backtester_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.backtester_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractBacktesterSubstrateLostError"
+        }
+      ],
+      "Default": "ExtractBacktesterError"
+    },
+    "ExtractBacktesterSubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractBacktesterError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a Backtester failure without opening the execution history.",
+      "Parameters": {
+        "phase": "Backtester/SubstrateLost",
+        "source": "BacktesterLivenessGate.SubstrateLost",
+        "poll.$": "$.backtester_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "PredictorBacktestLivenessGate": {
+      "Type": "Choice",
+      "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that PredictorBacktest failed. Without this the two are indistinguishable in the alert and the run dies as a PredictorBacktest fault. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates. Recovery is the mechanical scripts/weekly_sf_rerun.py, which derives the skip-set from the failed execution.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.predictor_backtest_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.predictor_backtest_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.predictor_backtest_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractPredictorBacktestSubstrateLostError"
+        }
+      ],
+      "Default": "ExtractPredictorBacktestError"
+    },
+    "ExtractPredictorBacktestSubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractPredictorBacktestError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a PredictorBacktest failure without opening the execution history.",
+      "Parameters": {
+        "phase": "PredictorBacktest/SubstrateLost",
+        "source": "PredictorBacktestLivenessGate.SubstrateLost",
+        "poll.$": "$.predictor_backtest_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "PortfolioOptimizerBacktestLivenessGate": {
+      "Type": "Choice",
+      "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that PortfolioOptimizerBacktest failed. Without this the two are indistinguishable in the alert and the run dies as a PortfolioOptimizerBacktest fault. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates. Recovery is the mechanical scripts/weekly_sf_rerun.py, which derives the skip-set from the failed execution.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.portfolio_optimizer_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.portfolio_optimizer_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.portfolio_optimizer_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractPortfolioOptimizerBacktestSubstrateLostError"
+        }
+      ],
+      "Default": "ExtractPortfolioOptimizerBacktestError"
+    },
+    "ExtractPortfolioOptimizerBacktestSubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractPortfolioOptimizerBacktestError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a PortfolioOptimizerBacktest failure without opening the execution history.",
+      "Parameters": {
+        "phase": "PortfolioOptimizerBacktest/SubstrateLost",
+        "source": "PortfolioOptimizerBacktestLivenessGate.SubstrateLost",
+        "poll.$": "$.portfolio_optimizer_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "EvaluatorLivenessGate": {
+      "Type": "Choice",
+      "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that Evaluator failed. Without this the two are indistinguishable in the alert and the run dies as a Evaluator fault. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates. Recovery is the mechanical scripts/weekly_sf_rerun.py, which derives the skip-set from the failed execution.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.evaluator_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.evaluator_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.evaluator_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractEvaluatorSubstrateLostError"
+        }
+      ],
+      "Default": "ExtractEvaluatorError"
+    },
+    "ExtractEvaluatorSubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractEvaluatorError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a Evaluator failure without opening the execution history.",
+      "Parameters": {
+        "phase": "Evaluator/SubstrateLost",
+        "source": "EvaluatorLivenessGate.SubstrateLost",
+        "poll.$": "$.evaluator_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "WeeklyFreshnessSpotBootstrapLivenessGate": {
+      "Type": "Choice",
+      "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that WeeklyFreshnessSpotBootstrap failed. Without this the two are indistinguishable in the alert and the run dies as a WeeklyFreshnessSpotBootstrap fault. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates. Recovery is the mechanical scripts/weekly_sf_rerun.py, which derives the skip-set from the failed execution.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.weekly_freshness_spot_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.weekly_freshness_spot_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.weekly_freshness_spot_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractWeeklyFreshnessSpotBootstrapSubstrateLostError"
+        }
+      ],
+      "Default": "ExtractWeeklyFreshnessSpotBootstrapError"
+    },
+    "ExtractWeeklyFreshnessSpotBootstrapSubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractWeeklyFreshnessSpotBootstrapError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a WeeklyFreshnessSpotBootstrap failure without opening the execution history.",
+      "Parameters": {
+        "phase": "WeeklyFreshnessSpotBootstrap/SubstrateLost",
+        "source": "WeeklyFreshnessSpotBootstrapLivenessGate.SubstrateLost",
+        "poll.$": "$.weekly_freshness_spot_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
     }
   }
 }
