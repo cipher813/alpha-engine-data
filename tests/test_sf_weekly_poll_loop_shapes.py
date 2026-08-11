@@ -53,7 +53,10 @@ SF_PATH = Path(__file__).resolve().parents[1] / "infrastructure" / "step_functio
 
 # Every Check*Status Choice as of the I5687 reconciliation (2026-08-09):
 # DataPhase2 and ThinkTank shipped bounded from birth; the remaining 15 were
-# reconciled here mirroring their shape.
+# reconciled here mirroring their shape. CheckThinkTankStatus left this list
+# on 2026-08-10 with the rest of the ThinkTankCoverage chain (Brian ruling:
+# the Think Tank runs daily in shadow mode, outside the weekly SF) — the
+# bounded-loop shape it established is still the pattern the others follow.
 ALL_CHECK_STATUS_STATES = [
     "CheckBacktesterStatus",
     "CheckDataPhase1Status",
@@ -74,7 +77,6 @@ ALL_CHECK_STATUS_STATES = [
     "CheckResolveZooStatus",
     "CheckSaturdayHealthCheckStatus",
     "CheckSubstrateHealthCheckStatus",
-    "CheckThinkTankStatus",
     "CheckTrainSpecStatus",
     "CheckWeeklyFreshnessSpotBootstrapStatus",
 ]
