@@ -208,6 +208,77 @@ def test_substrate_lost_branch_does_not_consume_the_retry_counter(gate_name):
         )
 
 
+# ---------------------------------------------------------------------------
+# Drill — execute the gate logic, don't just inspect its shape
+#
+# weekly-sf-policy.md §7.2 route 1: the rehearsal for this change is a
+# CI-validatable path, not a live Saturday. Shape assertions alone would pass a
+# branch wired to the wrong target, so these feed real poll payloads through the
+# same ASL mini-evaluator test_sf_choice_guards uses (shared rather than
+# re-implemented) and assert where each one actually lands.
+# ---------------------------------------------------------------------------
+
+from tests.test_sf_choice_guards import _eval_rule  # noqa: E402  (shared drill evaluator)
+
+
+def _route(gate: dict, payload: dict) -> str:
+    for rule in gate.get("Choices", []):
+        if _eval_rule(rule, payload):
+            return rule["Next"]
+    return gate["Default"]
+
+
+def _poll_key(gate_name: str, scope: dict) -> str:
+    """The `$.<stage>_poll` key this gate's branch reads."""
+    gate = scope[gate_name]
+    for rule in gate.get("Choices", []):
+        for cond in _leaf_conditions(rule):
+            var = str(cond.get("Variable", ""))
+            if var.endswith("_poll.StatusDetails"):
+                return var.split(".")[1]
+    raise AssertionError(f"{gate_name} has no _poll.StatusDetails branch")
+
+
+@pytest.mark.parametrize("gate_name", _gate_ids())
+@pytest.mark.parametrize("status_details", sorted(_SUBSTRATE_LOST_DETAILS))
+def test_drill_dead_instance_never_reaches_a_reissue(gate_name, status_details):
+    """A poll reporting a gone instance must not route to the re-issue."""
+    _, gate, scope = next(g for g in _gate_scopes() if g[0] == gate_name)
+    key = _poll_key(gate_name, scope)
+
+    target = _route(gate, {key: {"Status": "Failed", "StatusDetails": status_details}})
+    assert target.endswith("SubstrateLostError"), (
+        f"{gate_name} routes a {status_details!r} poll to {target!r}; "
+        f"ssm:sendCommand to that instance id can only raise "
+        f"Ssm.InvalidInstanceIdException"
+    )
+
+
+@pytest.mark.parametrize("gate_name", _gate_ids())
+def test_drill_live_instance_workload_failure_still_gets_its_one_reissue(gate_name):
+    """The unchanged half: a real workload failure on a live box retries once."""
+    _, gate, scope = next(g for g in _gate_scopes() if g[0] == gate_name)
+    key = _poll_key(gate_name, scope)
+    poll = {"Status": "Failed", "StatusDetails": "Failed", "ResponseCode": 1}
+
+    first = _route(gate, {key: poll})
+    assert first.endswith("Reissue"), (
+        f"{gate_name} sends a first live-instance failure to {first!r} instead "
+        f"of re-issuing — the bounded retry this gate exists for is gone"
+    )
+
+    attempts_key = scope[first]["ResultPath"].lstrip("$.")
+    second = _route(gate, {key: poll, attempts_key: 1})
+    assert not second.endswith("Reissue"), (
+        f"{gate_name} re-issues a second time ({second!r}); the bound is one"
+    )
+    assert not second.endswith("SubstrateLostError"), (
+        f"{gate_name} attributes an exhausted live-instance failure to "
+        f"substrate loss ({second!r}) — that misreports a real workload failure "
+        f"as an infrastructure event"
+    )
+
+
 def test_stale_always_on_instance_premise_is_gone():
     """The comment that let the invalidated premise survive config#2248."""
     assert "always-on instance" not in _RAW, (
