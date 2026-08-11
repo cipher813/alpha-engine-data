@@ -173,12 +173,47 @@ def test_last_workload_state_entered_finds_the_unexited_state():
 
 
 def test_last_workload_state_entered_ignores_untracked_states():
-    """Naming a poll or gate state would be true and useless."""
+    """Naming a gate or wait state would be true and useless.
+
+    The exclusion is by EVENT TYPE, not by a name whitelist
+    (alpha-engine-config-I6857). Choice and Wait states emit
+    ChoiceStateEntered / WaitStateEntered, which _state_name_from_event does
+    not read, so they cannot reach this function whatever they are called.
+
+    This test previously fed CheckMorningEnrichStatus in as a
+    TaskStateEntered and asserted it was dropped — which passed only because
+    the name was missing from DIGEST_STATE_ORDER, and asserted a shape Step
+    Functions never emits. Under the whitelist that also meant every genuine
+    weekday Task state was dropped with it, which is the defect I6857 fixed.
+    """
     from execution_digest import last_workload_state_entered
 
     base = datetime(2026, 8, 10, 23, 58, 0, tzinfo=timezone.utc)
-    events = [_entered(base, "CheckMorningEnrichStatus", 0), _entered(base, "WaitForMorningEnrich", 5)]
+    events = [
+        {
+            "type": "ChoiceStateEntered",
+            "timestamp": _ts(base, 0),
+            "stateEnteredEventDetails": {"name": "CheckMorningEnrichStatus"},
+        },
+        {
+            "type": "WaitStateEntered",
+            "timestamp": _ts(base, 5),
+            "stateEnteredEventDetails": {"name": "MorningEnrichWait"},
+        },
+    ]
     assert last_workload_state_entered(events) is None
+
+
+def test_last_workload_state_entered_names_a_weekday_task_state():
+    """The counterpart: a Task state absent from DIGEST_STATE_ORDER is named.
+
+    Under the old whitelist this returned None for every weekday pipeline
+    state, so a preopen run dying before its first exit named nothing.
+    """
+    from execution_digest import last_workload_state_entered
+
+    base = datetime(2026, 8, 11, 12, 15, 0, tzinfo=timezone.utc)
+    assert last_workload_state_entered([_entered(base, "SomeBrandNewState", 0)]) == "SomeBrandNewState"
 
 
 def test_digest_names_the_entered_state_instead_of_saying_nothing():
@@ -216,3 +251,176 @@ def test_build_execution_digest_names_the_hung_state_end_to_end():
     )
     assert lines == ["MorningEnrich — entered, never completed ⚠️"]
     assert hollow is False
+
+
+# ── Weekday pipelines render at all (alpha-engine-config-I6857) ───────────
+#
+# The 2026-08-11 preopen alert rendered "_(no workload states in history)_"
+# for an execution with 1403 events across 18 distinct Task states. Not a
+# one-off: DIGEST_STATE_ORDER and STATE_DURATION_FLOORS_SEC listed weekly
+# state names only, and build_state_durations dropped everything in neither,
+# so EVERY weekday alert rendered an empty list on EVERY run.
+#
+# nousergon-data-PR1295 had shipped that morning and did not prevent it — it
+# covered a run dying before its first TaskStateExited. This run exited many.
+
+import execution_digest as ed
+import json as _json
+from pathlib import Path as _Path
+
+_FIXTURE = _Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "sf_history_preopen_2026-08-11.json"
+
+
+def _preopen_history() -> list[dict]:
+    """The real 2026-08-11 preopen execution, trimmed to Task state events.
+
+    Execution 021b85f7-4814-477e-9fe0-05c77f4296d6 — the one whose alert
+    named no states. Timestamps are parsed back to datetimes because that is
+    what botocore hands the digest.
+    """
+    from datetime import datetime
+
+    events = _json.loads(_FIXTURE.read_text())
+    for e in events:
+        e["timestamp"] = datetime.fromisoformat(e["timestamp"])
+    return events
+
+
+def test_the_real_2026_08_11_preopen_history_renders_states():
+    """The regression, against the execution that produced it."""
+    events = _preopen_history()
+    durations = ed.parse_task_state_durations(events)
+    rows = ed.build_state_durations(
+        durations,
+        is_preflight=False,
+        execution_start=events[0]["timestamp"],
+        run_date="2026-08-11",
+        s3_client=None,
+    )
+    lines = ed.format_digest_lines(rows, last_entered=ed.last_workload_state_entered(events))
+
+    assert lines != ["_(no workload states in history)_"]
+    assert any("Scanner" in line for line in lines), (
+        "the state that degraded the run must appear in the digest of that run"
+    )
+
+
+def test_the_preopen_poll_loop_reports_its_elapsed_not_zero():
+    """PollMorningEnrichSpot spans ~15 min across ~60 entry/exit pairs.
+
+    Max-per-pair reported 0s, which is worse than omitting it: it asserts the
+    stage was instant.
+    """
+    durations = ed.parse_task_state_durations(_preopen_history())
+    assert durations["PollMorningEnrichSpot"] > 10 * 60
+    assert durations["PollMorningArcticAppendSpot"] > 10 * 60
+
+
+def test_a_state_in_neither_collection_still_renders():
+    """The filter is gone; the collections annotate and order only."""
+    from datetime import datetime, timezone
+
+    start = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+    rows = ed.build_state_durations(
+        {"TotallyUnknownState": 42},
+        is_preflight=False,
+        execution_start=start,
+        run_date="2026-08-11",
+        s3_client=None,
+    )
+    assert [r.name for r in rows] == ["TotallyUnknownState"]
+    assert rows[0].floor_sec is None
+    assert not rows[0].anomaly
+
+
+def test_unknown_states_sort_after_known_ones_longest_first():
+    from datetime import datetime, timezone
+
+    start = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+    rows = ed.build_state_durations(
+        {"ZebraState": 10, "AardvarkState": 900, "Scanner": 700},
+        is_preflight=False,
+        execution_start=start,
+        run_date="2026-08-11",
+        s3_client=None,
+    )
+    rows.sort(key=ed._sort_key)
+    assert [r.name for r in rows] == ["Scanner", "AardvarkState", "ZebraState"]
+
+
+def test_anomalous_states_lead_so_truncation_cannot_drop_them():
+    from datetime import datetime, timezone
+
+    start = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+    rows = ed.build_state_durations(
+        {"Scanner": 5, "MorningEnrich": 20 * 60},  # Scanner breaches its 60s floor
+        is_preflight=False,
+        execution_start=start,
+        run_date="2026-08-11",
+        s3_client=None,
+    )
+    rows.sort(key=ed._sort_key)
+    assert rows[0].name == "Scanner"
+    assert rows[0].floor_breach
+
+
+def test_truncation_is_announced_never_silent():
+    from datetime import datetime, timezone
+
+    start = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+    many = {f"State{i:02d}": 100 - i for i in range(ed._MAX_DIGEST_ROWS + 3)}
+    rows = ed.build_state_durations(
+        many, is_preflight=False, execution_start=start, run_date=None, s3_client=None
+    )
+    rows.sort(key=ed._sort_key)
+    lines = ed.format_digest_lines(rows)
+
+    assert len(lines) == ed._MAX_DIGEST_ROWS + 1
+    assert "+3 more states" in lines[-1]
+
+
+def test_no_truncation_line_when_everything_fits():
+    from datetime import datetime, timezone
+
+    start = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+    rows = ed.build_state_durations(
+        {"Scanner": 700}, is_preflight=False, execution_start=start, run_date=None, s3_client=None
+    )
+    lines = ed.format_digest_lines(rows)
+    assert len(lines) == 1
+    assert "elided" not in lines[0]
+
+
+def test_every_weekday_state_name_in_the_order_list_exists_in_a_definition():
+    """A misspelled state name is a silent no-op — it orders nothing.
+
+    The old collections were not wrong about spelling, they were wrong about
+    WHICH pipeline; this guard catches the other way of being wrong.
+    """
+    def _walk(states: dict) -> set[str]:
+        """State names including those nested in Parallel branches / Map iterators.
+
+        A flat scan of the top-level States map misses PredictorTraining,
+        Parity and the rest, which live inside ResearchPredictorParallel's
+        branches — and would then declare the digest's own weekly names
+        phantom.
+        """
+        found = set(states)
+        for body in states.values():
+            for branch in body.get("Branches") or []:
+                found |= _walk(branch.get("States") or {})
+            iterator = body.get("Iterator") or body.get("ItemProcessor")
+            if iterator:
+                found |= _walk(iterator.get("States") or {})
+        return found
+
+    infra = _Path(__file__).resolve().parents[3] / "infrastructure"
+    known: set[str] = set()
+    for name in ("step_function.json", "step_function_daily.json", "step_function_eod.json"):
+        known |= _walk(_json.loads((infra / name).read_text())["States"])
+
+    unknown = sorted(s for s in ed.DIGEST_STATE_ORDER if s not in known)
+    assert not unknown, f"DIGEST_STATE_ORDER names states no definition has: {unknown}"
+
+    unknown_floors = sorted(s for s in ed.STATE_DURATION_FLOORS_SEC if s not in known)
+    assert not unknown_floors, f"STATE_DURATION_FLOORS_SEC names states no definition has: {unknown_floors}"
