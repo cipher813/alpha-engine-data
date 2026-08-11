@@ -133,7 +133,16 @@ class TestEdges:
             and "States.ALL" in c["ErrorEquals"]
             for c in catches
         )
-        assert states["SetScannerDegradedFlag"]["Next"] == "CheckSkipPredictorInference"
+        # config-I6903: PublishScannerFailureImmediate now sits between the
+        # flag and the gate. The edge that matters is CONVERGENCE — both the
+        # success and the fail-open path reach CheckSkipPredictorInference —
+        # and it survives inserting the notification the fail-open was missing.
+        assert states["SetScannerDegradedFlag"]["Next"] == "PublishScannerFailureImmediate"
+        publish = states["PublishScannerFailureImmediate"]
+        assert publish["Next"] == "CheckSkipPredictorInference"
+        assert publish["Catch"][0]["Next"] == "CheckSkipPredictorInference", (
+            "an SNS failure must not abort a pipeline that deliberately continued"
+        )
 
     def test_no_direct_edge_from_arctic_to_predictor_bypassing_scanner(self, states):
         """Regression: Arctic success must not skip the new Scanner gate."""
