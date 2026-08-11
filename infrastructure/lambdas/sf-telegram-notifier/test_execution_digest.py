@@ -141,3 +141,78 @@ def test_history_fetch_failure_surfaces_marker():
     )
     assert hollow is False
     assert any("digest unavailable" in line for line in lines)
+
+
+# ── A failure notification must name the state that broke ───────────────────
+#
+# Live 2026-08-10: ne-weekly-freshness-pipeline failed twice at MorningEnrich
+# (watch-rerun-2026-08-10-1 and -2), whose spot bootstrap hung and was SIGKILLed
+# at its SSM budget. Both Telegram alerts rendered
+# "States: -(no workload states in history)-" on a 60-state pipeline, because
+# no workload state had EXITED so no duration existed. The state that broke was
+# in the events the whole time, as a TaskStateEntered with no matching exit.
+
+
+def _entered(base, name, offset=0):
+    return {
+        "type": "TaskStateEntered",
+        "timestamp": _ts(base, offset),
+        "taskStateEnteredEventDetails": {"name": name},
+    }
+
+
+def test_last_workload_state_entered_finds_the_unexited_state():
+    from execution_digest import last_workload_state_entered
+
+    base = datetime(2026, 8, 10, 23, 58, 0, tzinfo=timezone.utc)
+    events = [
+        _entered(base, "CheckSkipMorningEnrich", 0),   # untracked gate — ignored
+        _entered(base, "MorningEnrich", 10),
+    ]
+    assert last_workload_state_entered(events) == "MorningEnrich"
+
+
+def test_last_workload_state_entered_ignores_untracked_states():
+    """Naming a poll or gate state would be true and useless."""
+    from execution_digest import last_workload_state_entered
+
+    base = datetime(2026, 8, 10, 23, 58, 0, tzinfo=timezone.utc)
+    events = [_entered(base, "CheckMorningEnrichStatus", 0), _entered(base, "WaitForMorningEnrich", 5)]
+    assert last_workload_state_entered(events) is None
+
+
+def test_digest_names_the_entered_state_instead_of_saying_nothing():
+    lines = format_digest_lines([], last_entered="MorningEnrich")
+    assert lines == ["MorningEnrich — entered, never completed ⚠️"]
+    assert "no workload states in history" not in " ".join(lines)
+
+
+def test_digest_keeps_the_empty_message_when_nothing_workload_ran():
+    """A run that truly reached no workload state — the narrowed
+    director-verify shape — still says so."""
+    assert format_digest_lines([], last_entered=None) == [
+        "_(no workload states in history)_"
+    ]
+
+
+def test_build_execution_digest_names_the_hung_state_end_to_end():
+    """The 2026-08-10 shape, through the real entry point."""
+    start_ms = 1_786_400_000_000
+    base = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
+    sf = MagicMock()
+    sf.get_execution_history.return_value = {
+        "events": [
+            _entered(base, "MorningEnrich", 30),  # entered, never exited
+        ]
+    }
+    lines, hollow = build_execution_digest(
+        execution_arn="arn:aws:states:us-east-1:711398986525:execution:"
+        "ne-weekly-freshness-pipeline:watch-rerun-2026-08-10-2",
+        is_preflight=False,
+        execution_start_ms=start_ms,
+        run_date="2026-08-10",
+        sf_client=sf,
+        s3_client=None,
+    )
+    assert lines == ["MorningEnrich — entered, never completed ⚠️"]
+    assert hollow is False

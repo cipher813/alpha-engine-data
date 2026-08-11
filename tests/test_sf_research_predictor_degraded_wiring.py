@@ -169,17 +169,6 @@ def test_branch_a_owner_catch_routes_through_a_mark_state(branch_a, owner):
     assert branch_a[catch["Next"]]["ResultPath"] == "$.research_degraded_local"
 
 
-def test_thinktank_degraded_repointed_to_local_flag(branch_a):
-    """alpha-engine-config#6722: ThinkTankDegraded previously wrote the DEAD
-    $.thinktank_degraded (never read anywhere). Repointed to the same
-    branch-local marker every other Branch A fail-open uses."""
-    st = branch_a["ThinkTankDegraded"]
-    assert st["Type"] == "Pass"
-    assert st["Result"] is True
-    assert st["ResultPath"] == "$.research_degraded_local"
-    assert st["Next"] == "CheckSkipRegimeRetrospectiveEval"
-
-
 def test_no_state_writes_the_old_dead_thinktank_path(branch_a, branch_b, states):
     """Regression guard: $.thinktank_degraded must have zero writers anywhere
     in the file post-repoint — a stray second writer would resurrect the

@@ -479,7 +479,7 @@ def test_handler_observe_mode_does_not_alert(
     _patch_now(monkeypatch, fixed_now)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
 
-    publish_mock = mock.Mock()
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
     monkeypatch.setattr(index, "publish", publish_mock)
 
     result = index.handler({}, None)
@@ -525,7 +525,7 @@ def test_handler_alerts_enabled_fires_with_dedup_key(
     _patch_now(monkeypatch, fixed_now)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
 
-    publish_mock = mock.Mock()
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
     notify_mock = mock.Mock(return_value=True)
     monkeypatch.setattr(index, "publish", publish_mock)
     monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
@@ -579,7 +579,7 @@ artifacts:
     _patch_now(monkeypatch, fixed_now)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
 
-    publish_mock = mock.Mock()
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
     notify_mock = mock.Mock(return_value=True)
     monkeypatch.setattr(index, "publish", publish_mock)
     monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
@@ -638,7 +638,7 @@ def test_handler_probe_failed_routes_to_critical(
     _patch_now(monkeypatch, fixed_now)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
 
-    publish_mock = mock.Mock()
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
     notify_mock = mock.Mock(return_value=True)
     monkeypatch.setattr(index, "publish", publish_mock)
     monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
@@ -691,7 +691,7 @@ artifacts:
     importlib.reload(index)
     _patch_now(monkeypatch, fixed_now)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
-    monkeypatch.setattr(index, "publish", mock.Mock())
+    monkeypatch.setattr(index, "publish", mock.Mock(return_value=mock.Mock(dedup_skipped=False)))
 
     result = index.handler({}, None)
 
@@ -716,7 +716,7 @@ def test_handler_observe_to_production_cutover_via_env_flip(
     importlib.reload(index)
     _patch_now(monkeypatch, fixed_now)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
-    publish_mock = mock.Mock()
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
     monkeypatch.setattr(index, "publish", publish_mock)
     r1 = index.handler({}, None)
     assert r1["alerts_enabled"] is False
@@ -728,7 +728,7 @@ def test_handler_observe_to_production_cutover_via_env_flip(
     importlib.reload(index)
     _patch_now(monkeypatch, fixed_now)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
-    publish_mock2 = mock.Mock()
+    publish_mock2 = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
     monkeypatch.setattr(index, "publish", publish_mock2)
     r2 = index.handler({}, None)
     assert r2["alerts_enabled"] is True
@@ -752,7 +752,7 @@ def test_maybe_alert_skips_fresh_state(monkeypatch, fixed_now):
         severity="warning", owner_repo="ae-test", created_at=date(2025, 1, 1),
     )
     result = CheckResult(state="fresh")
-    publish_mock = mock.Mock()
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
     monkeypatch.setattr(index, "publish", publish_mock)
     assert index._maybe_alert(spec, result, fixed_now) is False
     assert publish_mock.call_count == 0
@@ -773,7 +773,7 @@ def test_maybe_alert_skips_missing_within_sla_grace(monkeypatch, fixed_now):
     )
     # missing but sla_violated_by_minutes=0 ⇒ still within grace; no alert.
     result = CheckResult(state="missing", sla_violated_by_minutes=0)
-    publish_mock = mock.Mock()
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
     monkeypatch.setattr(index, "publish", publish_mock)
     assert index._maybe_alert(spec, result, fixed_now) is False
     assert publish_mock.call_count == 0
@@ -801,7 +801,7 @@ def test_maybe_alert_fires_missing_past_sla(monkeypatch, fixed_now):
         state="missing", sla_violated_by_minutes=120,
         canonical_key="k/2026-05-30", reason="absent",
     )
-    publish_mock = mock.Mock()
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
     notify_mock = mock.Mock(return_value=True)
     monkeypatch.setattr(index, "publish", publish_mock)
     monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
@@ -814,6 +814,45 @@ def test_maybe_alert_fires_missing_past_sla(monkeypatch, fixed_now):
     assert call.kwargs["dedup_key"] == "freshness_x_2026-W22"
     notify_mock.assert_called_once()
     assert notify_mock.call_args.kwargs["dedup_key"] == "freshness_x_2026-W22"
+
+
+def test_maybe_alert_telegram_suppressed_when_publish_dedup_skipped(monkeypatch, fixed_now):
+    """config-I6796: when ``publish()`` reports ``dedup_skipped=True`` (an
+    earlier probe already paged this same cadence window), the Telegram path
+    must NOT fire a second time — even though the SLA violation is still
+    active and would otherwise satisfy every severity/state gate above.
+    Before this fix, ``notify_via_flow_doctor`` was called unconditionally
+    regardless of the SNS channel's own dedup verdict, so a daily-cadence
+    artifact re-probed by the 30-min intraday cron re-paged Telegram on every
+    tick because flow-doctor's DynamoDB cooldown (1 minute,
+    flow_doctor_telegram.build_flow_doctor_config) is decoupled from the
+    artifact's registered cadence. ``_maybe_alert`` still returns True — the
+    event was genuinely alerting, just not re-delivered to Telegram."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+
+    from nousergon_lib.artifact_freshness import ArtifactSpec, CheckResult
+
+    spec = ArtifactSpec(
+        artifact_id="x", s3_bucket="b", s3_key_template="k/{date}",
+        cadence="saturday_sf", sla_minutes_after_cron=60,
+        severity="critical", owner_repo="ae-test", created_at=date(2025, 1, 1),
+    )
+    result = CheckResult(
+        state="missing", sla_violated_by_minutes=120,
+        canonical_key="k/2026-05-30", reason="absent",
+    )
+    publish_mock = mock.Mock(
+        return_value=mock.Mock(dedup_skipped=True, dedup_reason="within window")
+    )
+    notify_mock = mock.Mock(return_value=True)
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
+    assert index._maybe_alert(spec, result, fixed_now) is True
+    publish_mock.assert_called_once()
+    notify_mock.assert_not_called()
 
 
 def test_maybe_alert_telegram_path_carries_freshness_monitor_source(monkeypatch, fixed_now):
@@ -841,7 +880,7 @@ def test_maybe_alert_telegram_path_carries_freshness_monitor_source(monkeypatch,
         state="missing", sla_violated_by_minutes=120,
         canonical_key="k/2026-05-30", reason="absent",
     )
-    publish_mock = mock.Mock()
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
     notify_mock = mock.Mock(return_value=True)
     monkeypatch.setattr(index, "publish", publish_mock)
     monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
@@ -878,7 +917,7 @@ def test_maybe_alert_warning_missing_console_only(monkeypatch, fixed_now):
         state="missing", sla_violated_by_minutes=120,
         canonical_key="k/2026-05-30", reason="absent",
     )
-    publish_mock = mock.Mock()
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
     notify_mock = mock.Mock(return_value=True)
     monkeypatch.setattr(index, "publish", publish_mock)
     monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
@@ -902,7 +941,7 @@ def test_maybe_alert_probe_failed_uses_critical_severity(monkeypatch, fixed_now)
         severity="warning", owner_repo="ae-test", created_at=date(2025, 1, 1),
     )
     result = CheckResult(state="probe_failed", reason="403")
-    publish_mock = mock.Mock()
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
     notify_mock = mock.Mock(return_value=True)
     monkeypatch.setattr(index, "publish", publish_mock)
     monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
@@ -1089,7 +1128,7 @@ def test_handle_intraday_scopes_to_intraday_artifact_ids_only(
     importlib.reload(index)
     _patch_now(monkeypatch, fixed_now)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
-    monkeypatch.setattr(index, "publish", mock.Mock())
+    monkeypatch.setattr(index, "publish", mock.Mock(return_value=mock.Mock(dedup_skipped=False)))
 
     result = index.handler({"mode": "intraday"}, None)
 
@@ -1111,7 +1150,7 @@ def test_handle_intraday_does_not_write_shared_dashboard_surfaces(
     importlib.reload(index)
     _patch_now(monkeypatch, fixed_now)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
-    monkeypatch.setattr(index, "publish", mock.Mock())
+    monkeypatch.setattr(index, "publish", mock.Mock(return_value=mock.Mock(dedup_skipped=False)))
 
     index.handler({"mode": "intraday"}, None)
 
@@ -1147,7 +1186,7 @@ artifacts:
     importlib.reload(index)
     _patch_now(monkeypatch, fixed_now)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
-    monkeypatch.setattr(index, "publish", mock.Mock())
+    monkeypatch.setattr(index, "publish", mock.Mock(return_value=mock.Mock(dedup_skipped=False)))
 
     result = index.handler({"mode": "intraday"}, None)
 
@@ -1258,7 +1297,7 @@ def _run_handler(monkeypatch, fake_s3, fixed_now, *, registry_body):
     importlib.reload(index)
     _patch_now(monkeypatch, fixed_now)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
-    monkeypatch.setattr(index, "publish", mock.Mock())
+    monkeypatch.setattr(index, "publish", mock.Mock(return_value=mock.Mock(dedup_skipped=False)))
     return index.handler({}, None)
 
 
@@ -1358,7 +1397,7 @@ def test_handler_cycle_rollup_failure_is_non_fatal(
     importlib.reload(index)
     _patch_now(monkeypatch, fixed_now)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
-    monkeypatch.setattr(index, "publish", mock.Mock())
+    monkeypatch.setattr(index, "publish", mock.Mock(return_value=mock.Mock(dedup_skipped=False)))
     # Force the rollup to blow up.
     def _boom(*a, **kw):
         raise RuntimeError("rollup exploded")
@@ -1387,7 +1426,7 @@ def test_handler_cw_emit_failure_does_not_suppress_cycle_verdict_write(
     importlib.reload(index)
     _patch_now(monkeypatch, fixed_now)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
-    monkeypatch.setattr(index, "publish", mock.Mock())
+    monkeypatch.setattr(index, "publish", mock.Mock(return_value=mock.Mock(dedup_skipped=False)))
     # The metric emit (only) explodes — S3 write already happened before it.
     def _boom(*a, **kw):
         raise RuntimeError("PutMetricData AccessDenied")
@@ -1417,7 +1456,7 @@ def test_handler_cycle_verdict_error_metric_on_swallowed_failure(
     importlib.reload(index)
     _patch_now(monkeypatch, fixed_now)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
-    monkeypatch.setattr(index, "publish", mock.Mock())
+    monkeypatch.setattr(index, "publish", mock.Mock(return_value=mock.Mock(dedup_skipped=False)))
     def _boom(*a, **kw):
         raise RuntimeError("serialize exploded")
     monkeypatch.setattr(index, "_serialize_cycle_verdicts", _boom)
@@ -1520,7 +1559,7 @@ def _run_recovery_handler(monkeypatch, fake_s3, fixed_now, *, recovery_enabled):
     _patch_now(monkeypatch, fixed_now)
     factory, sf, lam = _make_clients(fake_s3)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=factory))
-    monkeypatch.setattr(index, "publish", mock.Mock())
+    monkeypatch.setattr(index, "publish", mock.Mock(return_value=mock.Mock(dedup_skipped=False)))
     result = index.handler({}, None)
     return result, sf, lam, index
 
@@ -1595,7 +1634,7 @@ def test_recovery_dedup_prevents_redispatch(monkeypatch, fake_s3, fixed_now):
 
     factory, sf, lam = _make_clients(fake_s3)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=factory))
-    monkeypatch.setattr(index, "publish", mock.Mock())
+    monkeypatch.setattr(index, "publish", mock.Mock(return_value=mock.Mock(dedup_skipped=False)))
 
     result = index.handler({}, None)
 
@@ -1632,7 +1671,7 @@ def test_recovery_stale_marker_allows_redispatch(monkeypatch, fake_s3, fixed_now
 
     factory, sf, lam = _make_clients(fake_s3)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=factory))
-    monkeypatch.setattr(index, "publish", mock.Mock())
+    monkeypatch.setattr(index, "publish", mock.Mock(return_value=mock.Mock(dedup_skipped=False)))
 
     result = index.handler({}, None)
     assert result["dispatched"] == 1
@@ -1672,7 +1711,7 @@ def test_recovery_dispatch_failure_does_not_sink_pass(monkeypatch, fake_s3, fixe
     sf.start_execution.side_effect = RuntimeError("States.AccessDenied")
     factory, _, lam = _make_clients(fake_s3, sf_mock=sf)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=factory))
-    monkeypatch.setattr(index, "publish", mock.Mock())
+    monkeypatch.setattr(index, "publish", mock.Mock(return_value=mock.Mock(dedup_skipped=False)))
 
     result = index.handler({}, None)
 
@@ -1698,7 +1737,7 @@ def test_recovery_mode_dispatch_suppresses_page(monkeypatch, fake_s3, fixed_now)
     _patch_now(monkeypatch, fixed_now)
     factory, sf, lam = _make_clients(fake_s3)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=factory))
-    publish_mock = mock.Mock()
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
     notify_mock = mock.Mock(return_value=True)
     monkeypatch.setattr(index, "publish", publish_mock)
     monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
@@ -1858,7 +1897,7 @@ def test_maybe_alert_warning_escalates_after_threshold(monkeypatch, fixed_now):
     import importlib
     import index
     importlib.reload(index)
-    publish_mock = mock.Mock()
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
     notify_mock = mock.Mock(return_value=True)
     monkeypatch.setattr(index, "publish", publish_mock)
     monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
@@ -1877,7 +1916,7 @@ def test_maybe_alert_warning_below_threshold_stays_console_only(
     import importlib
     import index
     importlib.reload(index)
-    publish_mock = mock.Mock()
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
     monkeypatch.setattr(index, "publish", publish_mock)
     spec, result = _warning_spec_and_missing_result(index)
     assert index._maybe_alert(
@@ -2281,7 +2320,7 @@ def _run_drain_handler(monkeypatch, fake_s3, fixed_now, *, drain_enabled,
     _patch_now(monkeypatch, fixed_now)
     factory, sf, lam = _make_clients(fake_s3)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=factory))
-    monkeypatch.setattr(index, "publish", mock.Mock())
+    monkeypatch.setattr(index, "publish", mock.Mock(return_value=mock.Mock(dedup_skipped=False)))
     monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
     result = index.handler({}, None)
     return result, sf, lam, index
@@ -2409,7 +2448,7 @@ def test_drain_dispatch_failure_does_not_sink_pass(
     lam.invoke.side_effect = RuntimeError("router down")
     factory, _sf, _lam = _make_clients(fake_s3, lambda_mock=lam)
     monkeypatch.setattr(index, "boto3", mock.Mock(client=factory))
-    monkeypatch.setattr(index, "publish", mock.Mock())
+    monkeypatch.setattr(index, "publish", mock.Mock(return_value=mock.Mock(dedup_skipped=False)))
     monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
 
     result = index.handler({}, None)  # must not raise
@@ -2597,7 +2636,7 @@ def test_maybe_alert_suppressed_when_producer_disabled(monkeypatch, fixed_now):
         severity="critical", owner_repo="ae-test", created_at=date(2025, 1, 1),
     )
     result = CheckResult(state="missing", sla_violated_by_minutes=999)
-    publish_mock = mock.Mock()
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
     monkeypatch.setattr(index, "publish", publish_mock)
     monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock())
 
@@ -2666,3 +2705,141 @@ def test_check_results_row_defaults_are_inert_without_suppression(fixed_now):
     assert row["alert_suppressed"] is False
     assert row["producer_trigger"] is None
     assert row["producer_disabled_since"] is None
+
+
+# ── config-I6817 D4: the account-wide disabled-schedule inventory ───────────
+#
+# The 2026-08-07 pause disabled 23 EventBridge rules. `alpha-research-thinktank
+# -daily` then stayed off for three days after the provider-balance condition
+# that justified it was resolved, because I6617 was CLOSED and NO SURFACE
+# ANYWHERE listed which rules were off. The suppression path could not have
+# caught it: it only walks triggers some ARTIFACT_REGISTRY row names.
+
+
+class _FakeEventsPaginator:
+    def __init__(self, pages):
+        self._pages = pages
+
+    def paginate(self):
+        return iter(self._pages)
+
+
+class _FakeEvents:
+    def __init__(self, rules, raises=False):
+        self._rules = rules
+        self._raises = raises
+
+    def get_paginator(self, _name):
+        if self._raises:
+            raise RuntimeError("AccessDenied enumerating rules")
+        return _FakeEventsPaginator([{"Rules": self._rules}])
+
+
+class _FakeScheduler:
+    def __init__(self, schedules=None):
+        self._schedules = schedules or []
+
+    def get_paginator(self, _name):
+        return _FakeEventsPaginator([{"Schedules": self._schedules}])
+
+
+def test_inventory_enumerates_disabled_rules_no_registry_row_names():
+    """The load-bearing case. A disabled rule that no artifact row references
+    is invisible to every other surface in the fleet — both probes paused on
+    2026-08-07 are in that class."""
+    import importlib
+    import index
+    importlib.reload(index)
+    events = _FakeEvents([
+        {"Name": "alpha-research-thinktank-daily", "State": "DISABLED",
+         "ScheduleExpression": "cron(30 14 * * ? *)"},
+        {"Name": "alpha-engine-ssm-reachability-probe-5min", "State": "DISABLED",
+         "ScheduleExpression": "rate(5 minutes)"},
+        {"Name": "alpha-engine-saturday", "State": "ENABLED",
+         "ScheduleExpression": "cron(0 9 * * 6 *)"},
+    ])
+    rows = index.enumerate_disabled_schedules(events, _FakeScheduler())
+    names = {r["name"] for r in rows}
+    assert names == {
+        "alpha-research-thinktank-daily",
+        "alpha-engine-ssm-reachability-probe-5min",
+    }, "ENABLED rules must not appear; both DISABLED ones must"
+
+
+def test_an_unenumerable_surface_is_an_error_row_never_an_empty_inventory():
+    """An empty inventory must mean 'nothing is disabled', never 'the walk
+    failed' — that conflation is the defect this whole feature exists to
+    close, reproduced one level up."""
+    import importlib
+    import index
+    importlib.reload(index)
+    rows = index.enumerate_disabled_schedules(
+        _FakeEvents([], raises=True), _FakeScheduler()
+    )
+    errs = [r for r in rows if r.get("error")]
+    assert errs, "a failed enumeration produced no error row — silent empty"
+    assert "AccessDenied" in errs[0]["error"]
+
+
+def test_the_payload_flags_rows_no_artifact_row_references(monkeypatch):
+    import importlib
+    import index
+    importlib.reload(index)
+    events = _FakeEvents([
+        {"Name": "alpha-research-thinktank-daily", "State": "DISABLED",
+         "ScheduleExpression": "cron(30 14 * * ? *)"},
+        {"Name": "alpha-engine-router-exposure-probe-15min", "State": "DISABLED",
+         "ScheduleExpression": "rate(15 minutes)"},
+    ])
+    monkeypatch.setattr(
+        index, "_load_producer_disabled_since",
+        lambda _s: {"events:alpha-research-thinktank-daily": "2026-08-07"},
+    )
+
+    class _S3:
+        def __init__(self):
+            self.put = None
+
+        def put_object(self, **kw):
+            self.put = kw
+
+    s3 = _S3()
+    now = datetime(2026, 8, 10, tzinfo=timezone.utc)
+    payload = index.write_disabled_producer_inventory(
+        s3, now, {"events:alpha-research-thinktank-daily"}, events, _FakeScheduler()
+    )
+
+    assert payload["complete"] is True
+    assert payload["disabled_count"] == 2
+    assert payload["unreferenced_count"] == 1, (
+        "the router-exposure probe is named by no artifact row and must be "
+        "counted as unreferenced — that is the class the thinktank rule's "
+        "three-day overrun belongs to"
+    )
+    by_name = {r["name"]: r for r in payload["rows"]}
+    tt = by_name["alpha-research-thinktank-daily"]
+    assert tt["disabled_since"] == "2026-08-07"
+    assert tt["days_disabled"] == 3, "age must come from producer_disabled_since"
+    assert tt["referenced_by_registry"] is True
+    assert by_name["alpha-engine-router-exposure-probe-15min"][
+        "referenced_by_registry"] is False
+    assert s3.put is not None, "the inventory was not written"
+    assert s3.put["Key"] == index.DISABLED_PRODUCER_INVENTORY_KEY
+
+
+def test_a_failed_write_does_not_take_down_the_sweep():
+    """This is an observability side effect. The sweep's alerting has already
+    run by the time it is called; raising here would trade a real page for a
+    bookkeeping failure."""
+    import importlib
+    import index
+    importlib.reload(index)
+    class _S3:
+        def put_object(self, **kw):
+            raise RuntimeError("s3 down")
+
+    payload = index.write_disabled_producer_inventory(
+        _S3(), datetime(2026, 8, 10, tzinfo=timezone.utc), set(),
+        _FakeEvents([]), _FakeScheduler(),
+    )
+    assert payload["disabled_count"] == 0

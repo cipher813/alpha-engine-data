@@ -883,3 +883,210 @@ def test_simulate_requires_every_result_allowed():
         ]
     }
     assert sfp._simulate(iam, "arn:role", "ssm:SendCommand", "arn:inst") is False
+
+
+# ── Environment capability profile (the 2026-08-10 WeeklyPreflight outage) ────
+#
+# ne-weekly-freshness-pipeline halted on its first real WeeklyPreflightGate
+# invocation with ``ModuleNotFoundError: No module named 'nousergon_lib'``,
+# raised out of run_preflight's PROLOGUE (_previous_trading_day_str) — before
+# the per-check try/except exists, so the whole gate returned status=ERROR.
+# Two defects behind it, both pinned here:
+#   1. weekly-preflight/requirements.txt did not declare nousergon-lib even
+#      though the packaged sf_preflight.py imports it in five places;
+#   2. the Lambda ran the FULL check list, which includes checks that require
+#      arcticdb, the repo's collector modules and sibling checkouts on local
+#      disk — none of which a Lambda has. Those return status="fail", so the
+#      gate could not have returned OK even with (1) fixed.
+
+import ast as _ast
+import pathlib as _pathlib
+import sys as _sys
+
+_REPO_ROOT = _pathlib.Path(sfp.__file__).resolve().parent
+_LAMBDA_DIR = _REPO_ROOT / "infrastructure" / "lambdas" / "weekly-preflight"
+
+# Modules the python3.12 Lambda runtime provides without a requirements entry.
+_LAMBDA_RUNTIME_MODULES = {"boto3", "botocore", "jmespath", "dateutil", "urllib3", "s3transfer"}
+# import name -> distribution name, for the specs weekly-preflight declares.
+_DIST_FOR_MODULE = {
+    "nousergon_lib": "nousergon-lib",
+    "aws_assume_role_lib": "aws-assume-role-lib",
+}
+
+
+def _fn_node(name: str) -> _ast.FunctionDef:
+    tree = _ast.parse(_REPO_ROOT.joinpath("sf_preflight.py").read_text())
+    for node in tree.body:
+        if isinstance(node, _ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{name} not found in sf_preflight.py")
+
+
+def _imports_of(node: _ast.AST) -> set[str]:
+    found: set[str] = set()
+    for sub in _ast.walk(node):
+        if isinstance(sub, _ast.Import):
+            found.update(a.name.split(".")[0] for a in sub.names)
+        elif isinstance(sub, _ast.ImportFrom) and sub.module and sub.level == 0:
+            found.add(sub.module.split(".")[0])
+    return found
+
+
+def _declared_distributions() -> set[str]:
+    out: set[str] = set()
+    for line in _LAMBDA_DIR.joinpath("requirements.txt").read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # "nousergon-lib[extra] @ git+https://..." / "pkg==1.2" / "pkg"
+        out.add(line.split("@")[0].split("[")[0].split("=")[0].split(">")[0].strip())
+    return out
+
+
+def test_every_check_declares_its_capabilities():
+    """A new check may not silently inherit or lose Lambda eligibility."""
+    listed = {fn.__name__ for fn in sfp.CHECKS}
+    declared = set(sfp.CHECK_CAPABILITIES)
+    assert listed == declared, (
+        "CHECKS and CHECK_CAPABILITIES disagree; add the missing entry "
+        f"(only in CHECKS: {sorted(listed - declared)}; "
+        f"only in CHECK_CAPABILITIES: {sorted(declared - listed)})"
+    )
+    known = sfp.FULL_CAPABILITIES
+    for name, caps in sfp.CHECK_CAPABILITIES.items():
+        assert caps, f"{name}: declare at least one capability"
+        assert caps <= known, f"{name}: unknown capability {sorted(caps - known)}"
+
+
+def test_lambda_profile_runs_at_least_one_check():
+    """A gate observing nothing is not a gate (principles.md §2.7)."""
+    eligible = [
+        fn for fn in sfp.CHECKS
+        if sfp.CHECK_CAPABILITIES[fn.__name__] <= sfp.LAMBDA_CAPABILITIES
+    ]
+    assert eligible, "no check is runnable under LAMBDA_CAPABILITIES"
+
+
+def test_lambda_profile_imports_are_packaged():
+    """Every module the Lambda-eligible code path imports must be in the zip.
+
+    This is the test that would have caught the 2026-08-10 outage: the
+    prologue's nousergon_lib import against a requirements.txt that never
+    declared it. Scans the prologue plus every Lambda-eligible check.
+    """
+    packaged = _declared_distributions() | _LAMBDA_RUNTIME_MODULES
+    scanned = ["_previous_trading_day_str", "run_preflight"] + [
+        fn.__name__ for fn in sfp.CHECKS
+        if sfp.CHECK_CAPABILITIES[fn.__name__] <= sfp.LAMBDA_CAPABILITIES
+    ]
+    for fn_name in scanned:
+        for mod in _imports_of(_fn_node(fn_name)):
+            if mod in _sys.stdlib_module_names or mod == "sf_preflight":
+                continue
+            dist = _DIST_FOR_MODULE.get(mod, mod)
+            assert dist in packaged or mod in packaged, (
+                f"{fn_name} imports {mod!r}, which weekly-preflight's "
+                f"requirements.txt does not provide — the Lambda will raise "
+                f"ModuleNotFoundError at run time, and the gate will halt the "
+                f"Saturday pipeline"
+            )
+
+
+def test_lambda_profile_checks_need_no_local_checkout():
+    """_sibling_repo returns None in a Lambda — the check then FAILS, not skips."""
+    for fn in sfp.CHECKS:
+        if sfp.CHECK_CAPABILITIES[fn.__name__] <= sfp.LAMBDA_CAPABILITIES:
+            src = _ast.dump(_fn_node(fn.__name__))
+            assert "_sibling_repo" not in src, (
+                f"{fn.__name__} reads a sibling checkout but is declared "
+                f"Lambda-eligible; add CAP_CHECKOUT to its capabilities"
+            )
+
+
+def test_run_preflight_skips_rather_than_fails_on_missing_capability():
+    n_fail, results = sfp.run_preflight(
+        bucket="test-bucket", capabilities=frozenset()
+    )
+    assert n_fail == 0, "an absent capability is not a violation"
+    assert results and all(r.status == "skip" for r in results)
+    assert all("Not run" in r.message for r in results)
+
+
+def test_run_preflight_defaults_to_the_full_profile():
+    """The CLI and the spot box must keep running every check."""
+    def check_sf_iam_reachability(ctx):  # name matters: CHECK_CAPABILITIES key
+        return sfp.CheckResult(name="sf_iam_reachability", status="ok", message="ran")
+
+    def check_tool_contracts(ctx):  # requires CAP_CHECKOUT — absent in a Lambda
+        return sfp.CheckResult(name="tool_contracts", status="ok", message="ran")
+
+    with patch.object(sfp, "CHECKS", [check_sf_iam_reachability, check_tool_contracts]):
+        n_fail, results = sfp.run_preflight(bucket="test-bucket")
+        assert n_fail == 0
+        assert [r.status for r in results] == ["ok", "ok"]
+
+        _, lambda_results = sfp.run_preflight(
+            bucket="test-bucket", capabilities=sfp.LAMBDA_CAPABILITIES
+        )
+    assert [r.status for r in lambda_results] == ["ok", "skip"]
+
+
+def test_definition_input_coherence_ignores_mid_flow_refs():
+    """A ref to a value a PRIOR STATE produces is not an input violation.
+
+    The 2026-08-10 false-positive class: resolving every ``.$`` ref against
+    the execution input reported 177 unresolvable paths on a live, working
+    definition ($.libpin_drift_result.Payload, $.Status, $.ec2_instance_id[0]),
+    which would have failed the pre-spend gate every Saturday forever.
+    """
+    import json
+    from unittest.mock import patch, MagicMock
+
+    sf_def = {
+        "StartAt": "Launch",
+        "States": {
+            "Launch": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {"FunctionName": "launcher"},
+                "ResultPath": "$.launch_result",
+                "Next": "Wrap",
+            },
+            # Writes ec2_instance_id inside an intrinsic format string —
+            # invisible to any key walk (WrapEc2InstanceIdInArray's shape).
+            "Wrap": {
+                "Type": "Pass",
+                "Parameters": {
+                    "merged.$": "States.JsonMerge($, States.StringToJson("
+                                "States.Format('{\"ec2_instance_id\":[\"{}\"]}', "
+                                "$.launch_result.instance_id)), false)"
+                },
+                "OutputPath": "$.merged",
+                "Next": "Poll",
+            },
+            "Poll": {  # output-replacing Task: emits the raw SSM response
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+                "Parameters": {"InstanceIds.$": "$.ec2_instance_id[0]"},
+                "Next": "Done",
+            },
+            "Done": {
+                "Type": "Pass",
+                "Parameters": {
+                    "status.$": "$.Status",                     # SSM response field
+                    "payload.$": "$.launch_result.Payload",     # prior state's result
+                    "instance.$": "$.ec2_instance_id[0]",       # intrinsic-written
+                    "role.$": "$.pipeline_role",                # execution input
+                },
+                "End": True,
+            },
+        },
+    }
+    fake_sfn = MagicMock()
+    fake_sfn.describe_state_machine.return_value = {"definition": json.dumps(sf_def)}
+    with patch("boto3.client", return_value=fake_sfn):
+        result = sfp.check_definition_input_coherence(_ctx())
+    assert result.status == "ok", result.details
+    assert result.details["undecidable_refs"] >= 3
+    assert result.details["checked"] >= 1  # $.pipeline_role still verified

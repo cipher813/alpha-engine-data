@@ -79,6 +79,34 @@ def _state_name_from_event(event: dict) -> Optional[str]:
     return None
 
 
+def last_workload_state_entered(events: Sequence[dict]) -> Optional[str]:
+    """The last tracked workload state ENTERED, completed or not.
+
+    A run that dies before any workload state EXITS produces no durations, so
+    the digest rendered "_(no workload states in history)_" — a failure
+    notification that names nothing, on a pipeline with 60+ states. Live
+    2026-08-10: MorningEnrich hung in its spot bootstrap and was killed, twice;
+    both alerts said only that no state was in history, while the state that
+    broke was sitting in the events all along as a TaskStateEntered with no
+    matching exit.
+
+    Entered-but-never-exited is exactly the signature of the interesting
+    failure — a hang, a timeout, a kill — so it is the one the digest must
+    name. Untracked states (gates, Pass, poll loops) are ignored: naming
+    "CheckMorningEnrichStatus" would be true and useless.
+    """
+    last: Optional[str] = None
+    for event in events:
+        if event.get("type") != "TaskStateEntered":
+            continue
+        name = _state_name_from_event(event)
+        if not name:
+            continue
+        if name in STATE_DURATION_FLOORS_SEC or name in DIGEST_STATE_ORDER:
+            last = name
+    return last
+
+
 def parse_task_state_durations(events: Sequence[dict]) -> Dict[str, int]:
     """Return max wall-clock seconds per Task state name from history events."""
     entered_at: Dict[str, datetime] = {}
@@ -197,8 +225,12 @@ def build_state_durations(
     return rows
 
 
-def format_digest_lines(rows: Sequence[StateDuration]) -> List[str]:
+def format_digest_lines(
+    rows: Sequence[StateDuration], *, last_entered: Optional[str] = None
+) -> List[str]:
     if not rows:
+        if last_entered:
+            return [f"{last_entered} — entered, never completed ⚠️"]
         return ["_(no workload states in history)_"]
     lines: List[str] = []
     for row in rows:
@@ -272,7 +304,10 @@ def build_execution_digest(
         s3_client=s3_client,
     )
     hollow = any(r.anomaly for r in rows) if not is_preflight else False
-    return format_digest_lines(rows), hollow
+    return (
+        format_digest_lines(rows, last_entered=last_workload_state_entered(events)),
+        hollow,
+    )
 
 
 def parse_run_date_from_input(raw_input: str | None) -> Optional[str]:

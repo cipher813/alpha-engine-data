@@ -119,7 +119,6 @@ class TestDerivePlan:
             "skip_signals_envelope",
             "skip_challenger_shadow",
             "skip_rag_ingestion",
-            "skip_thinktank_coverage",
             "skip_regime_retrospective_eval",
             # skip_research retired: alpha-engine-config-I2515 Phase B
             # removed the multi-agent Research state entirely.
@@ -254,23 +253,28 @@ class TestDerivePlan:
         assert "skip_post_eval" not in plan.rerun_input()
 
     def test_degraded_branch_a_stage_is_rerun_not_skipped(self, mod):
-        """The same degraded-overrides-witness rule holds for branch A:
-        ThinkTankDegraded (alpha-engine-config-I5758) must drop
-        skip_thinktank_coverage even when the stage's witness was also
-        entered — degraded beats completed."""
-        events = _events("tail_stage_failure")  # thinktank_coverage completed
+        """The same degraded-overrides-witness rule holds for branch A: a
+        Mark*Degraded state must drop that stage's skip flag even when the
+        stage's witness was also entered — degraded beats completed.
+
+        This used to be pinned on ThinkTankDegraded, whose chain was removed
+        from the weekly SF on 2026-08-10 (Brian ruling: the Think Tank runs
+        daily in shadow mode, outside this pipeline). ChallengerShadow is the
+        same shape — an observe-only branch-A stage with its own degraded
+        state — so the rule is pinned there instead of going unpinned."""
+        events = _events("tail_stage_failure")
         events = list(events) + [
             {
                 "type": "PassStateEntered",
                 "id": 99999,
                 "timestamp": "2026-07-11T09:00:00Z",
-                "stateEnteredEventDetails": {"name": "ThinkTankDegraded"},
+                "stateEnteredEventDetails": {"name": "MarkChallengerShadowDegraded"},
             }
         ]
         plan = mod.derive_plan(events)
-        assert "thinktank_coverage" in plan.degraded
-        assert "thinktank_coverage" not in plan.completed
-        assert "skip_thinktank_coverage" not in plan.skip_flags
+        assert "challenger_shadow" in plan.degraded
+        assert "challenger_shadow" not in plan.completed
+        assert "skip_challenger_shadow" not in plan.skip_flags
 
 
 # ---------------------------------------------------------------------------
@@ -620,8 +624,9 @@ def _choice_next(state: dict, flags: dict) -> str:
 
 class TestBacktestEvalPresetLaneA:
     """config#3134 acceptance: a mode=backtest-eval execution's derived
-    input must route the CheckSkip choices past all four lane-A states
-    (Scanner, SignalsEnvelope, ChallengerShadow, ThinkTankCoverage) —
+    input must route the CheckSkip choices past every lane-A state
+    (Scanner, SignalsEnvelope, ChallengerShadow — ThinkTankCoverage was the
+    fourth until its chain left the weekly SF on 2026-08-10) —
     verified directly against the SF's Choice logic, mirroring the
     Backtester+Evaluator-only contract config#830 established for the
     non-lane-A stages."""
@@ -646,12 +651,11 @@ class TestBacktestEvalPresetLaneA:
     def preset_flags(self, all_states):
         return _extract_preset_flags(all_states)
 
-    def test_preset_sets_all_four_lane_a_flags_true(self, preset_flags):
+    def test_preset_sets_every_lane_a_flag_true(self, preset_flags):
         for flag in (
             "skip_scanner",
             "skip_signals_envelope",
             "skip_challenger_shadow",
-            "skip_thinktank_coverage",
         ):
             assert preset_flags.get(flag) is True, (
                 f"mode=backtest-eval preset must seed {flag}=true"
@@ -663,7 +667,6 @@ class TestBacktestEvalPresetLaneA:
             ("CheckSkipScanner", "CheckSkipRegimeSubstrate"),
             ("CheckSkipSignalsEnvelope", "CheckSkipChallengerShadow"),
             ("CheckSkipChallengerShadow", "CheckSkipRAGIngestion"),
-            ("CheckSkipThinkTankCoverage", "CheckSkipRegimeRetrospectiveEval"),
         ],
     )
     def test_preset_flags_route_past_each_lane_a_gate(

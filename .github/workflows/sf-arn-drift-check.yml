@@ -3,11 +3,26 @@ name: SF-ARN Drift Check
 # Catches drift on four config#1464 axes: EventBridge rule stateMachineArn
 # drift, Step Function LoggingConfiguration drift, SF lambda:invoke
 # states referencing Lambdas that don't exist live, and SF definition drift
-# (codified vs live vs S3-staged — see check-definition-drift.py). Mirrors
-# iam-drift-check.yml's trigger/auth shape exactly
-# (same OIDC role, same PR-touching-path + daily + workflow_dispatch
-# trigger set) — see that workflow's header for why this shape (PR-time
-# catch + daily out-of-band sweep).
+# (codified vs live vs S3-staged — see check-definition-drift.py).
+#
+# NOT a pull_request check (Brian ruling 2026-08-10). Every step here
+# compares CODIFIED source against LIVE AWS. That comparison says nothing
+# about a PR's diff: it is red whenever live state has drifted, whoever
+# caused it and whenever — so a PR author sees a red X they did not cause
+# and cannot clear, and the merge decision gets clouded by a signal that is
+# not about the change under review. Four steps had already been carved off
+# the PR path one at a time for exactly this reason (weekly-cadence,
+# SF-definition, fleet-wide scheduler, manifest drift); the 2026-08-10
+# instance was the automation-pause step reddening #1291, whose diff was a
+# Lambda capability profile, because a thinktank EventBridge rule had been
+# re-enabled out of band. The trigger set is now the whole fix: drift is
+# graded post-merge (push to main, right after the deploy applies) and daily
+# out of band. Nothing is lost — no step ran on PRs that does not run here —
+# and no drift red can ever sit on an open PR again.
+#
+# Corollary for anything added below: if a step reads live AWS, it belongs
+# on this trigger set. If a future step grades the DIFF (codified vs
+# codified), it belongs in ci.yml, not here.
 #
 # infrastructure/eventbridge/check-drift.py and
 # infrastructure/step-functions/check-drift.py were merged code-complete
@@ -24,7 +39,8 @@ name: SF-ARN Drift Check
 # nousergon-data). Same identity iam-drift-check.yml already uses.
 
 on:
-  pull_request:
+  push:
+    branches: [main]
     paths:
       - 'infrastructure/eventbridge/**'
       - 'infrastructure/step-functions/**'
@@ -51,8 +67,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-        with:
-          fetch-depth: 0  # full history — needed for PR diff in scheduler step
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
@@ -64,8 +78,11 @@ jobs:
       # weekly/preopen/postclose SFs and the 24/7 box. This asserts the pause
       # still holds — the opposite direction from every other check here, and
       # the only surface that would notice a redeploy quietly switching a
-      # paused trigger back on. Runs unconditionally (not PR-scoped): the
-      # invariant is about live AWS, not about which files a PR touched.
+      # paused trigger back on. Runs unconditionally on every trigger this
+      # workflow has: the invariant is about live AWS, and tests/
+      # test_automation_pause.py::test_ci_runs_the_pause_check pins that it
+      # carries no `if:` — the 2026-08-10 fix was to the workflow's TRIGGER
+      # set, never to this step's reachability.
       # Read-only; needs nothing beyond the events:DescribeRule +
       # scheduler:GetSchedule this role already holds.
       - name: Scheduled-automation pause still holds (live)
@@ -76,12 +93,9 @@ jobs:
       # path runs --enforce; this catches drift BETWEEN deploys). AccessDenied
       # here means ops-PR538's grant has not been applied yet — the DAILY
       # scheduled run staying red is the form-3 detector for that
-      # operator-gated apply. Schedule/dispatch only: `drift-check` is a
-      # REQUIRED PR check, so running this on the pull_request path before the
-      # grant exists would block every PR on a red only an operator can clear
-      # (the gate-only-the-blocked-actor-can-clear trap).
+      # operator-gated apply. (This step carried the first `if:` excluding the
+      # PR path; the whole workflow now excludes it, so the guard is gone.)
       - name: Weekly exercise-cadence drift (manifest vs live SSM)
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: python3 infrastructure/weekly_cadence_drift.py --check
 
       - name: EventBridge SF-ARN drift (codified vs live)
@@ -93,19 +107,15 @@ jobs:
       - name: SF lambda:invoke Lambda-existence check (codified vs live)
         run: python3 infrastructure/step-functions/check-lambda-existence.py
 
-      # PR-time only, this check compares the PR BRANCH's bytes against
-      # live/S3 — but a PR that changes infrastructure/step_function*.json
-      # (the legitimate change mechanism) IS the divergence, and the
-      # restamp only happens at deploy, post-merge (config#2273). It can
-      # never pass on such PRs and blocked the Director-terminal-failure PR
-      # through three escalation cycles (alpha-engine-config-I6591). The
-      # invariant this check enforces is "deployed truth == repo source",
-      # which only exists on the pushed branch: fleet-wide runs happen on
-      # every merge (deploy-infrastructure.yml, right after the deploy
-      # applies) and daily via the schedule below — same shape as the
-      # scheduler checks.
+      # The invariant here is "deployed truth == repo source", which only
+      # exists once the branch is pushed: on a PR that changes
+      # infrastructure/step_function*.json — the legitimate change mechanism —
+      # the diff IS the divergence, and the restamp happens at deploy,
+      # post-merge (config#2273). This check blocked the Director-terminal-
+      # failure PR through three escalation cycles before it was carved off
+      # the PR path (alpha-engine-config-I6591). Fleet-wide runs also happen
+      # on every merge via deploy-infrastructure.yml, right after the deploy.
       - name: SF definition drift (codified vs live vs S3-staged)
-        if: github.event_name != 'pull_request'
         run: python3 infrastructure/step-functions/check-definition-drift.py
 
       # alpha-engine-config-I5805. The out-of-band half of schedule coverage.
@@ -114,49 +124,17 @@ jobs:
       # can see — a rule disabled or retimed in the console, or one belonging to
       # a dispatcher whose repo has no deploy workflow at all.
       #
-      # On PRs: scope to only the deploy.sh files this PR changed
-      # (HEAD^1 = base, HEAD^2 = PR head — the merge commit gives us both).
-      # The fleet-wide check still runs daily via the schedule trigger.
-      - name: Find changed deploy.sh files (PR only)
-        if: github.event_name == 'pull_request'
-        id: changed-deploys
-        run: |
-          FILES=$(git diff --name-only HEAD^1...HEAD^2 -- 'infrastructure/lambdas/*/deploy.sh' || true)
-          if [ -n "$FILES" ]; then
-            {
-              echo "files<<DEPLOY_EOF"
-              echo "$FILES"
-              echo "DEPLOY_EOF"
-            } >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: EventBridge Scheduler rule drift (PR-scoped, codified vs live)
-        if: github.event_name == 'pull_request' && steps.changed-deploys.outputs.files != ''
-        run: |
-          echo "${{ steps.changed-deploys.outputs.files }}" | while IFS= read -r f; do
-            [ -z "$f" ] && continue
-            echo "::group::check-schedule-drift --source-file $f"
-            # --ignore-kind missing-in-aws: on a PR, schedules that do not exist
-            # live yet (because the PR that declares them hasn't merged) are
-            # expected — the deploy workflow's own post-deploy assertion catches
-            # them after merge.  The daily fleet-wide sweep (which does NOT pass
-            # this flag) still hard-fails on every kind, so real drift (a rule
-            # deleted or disabled in the console post-deploy) is still caught.
-            python3 infrastructure/scheduler/check-schedule-drift.py \
-              --source-file "$f" --ignore-kind missing-in-aws
-            echo "::endgroup::"
-          done
-
+      # The PR-scoped variant of this step (changed deploy.sh files only,
+      # --ignore-kind missing-in-aws) is deleted with the PR trigger: every
+      # rule it covered is covered here unscoped, on merge and daily.
       - name: EventBridge Scheduler rule drift (fleet-wide, codified vs live)
-        if: github.event_name != 'pull_request'
         run: python3 infrastructure/scheduler/check-schedule-drift.py
 
       # alpha-engine-config-I6461: the manifest-vs-live leg check-schedule-
       # drift.py above does not cover (manifest completeness — reason +
       # actuation_tier + attended_window present — and manifest cron vs LIVE
-      # AWS state, not just vs the deploy.sh literal). Daily-only, like the
-      # fleet-wide check above: --live makes an AWS call per manifest entry,
-      # too costly to run on every PR.
+      # AWS state, not just vs the deploy.sh literal). --live makes an AWS
+      # call per manifest entry, which is why it belongs on merge and the
+      # daily sweep rather than on every push of a branch.
       - name: schedule-manifest.json drift (fleet-wide, vs live AWS)
-        if: github.event_name != 'pull_request'
         run: python3 infrastructure/scheduler/check-manifest-drift.py --live

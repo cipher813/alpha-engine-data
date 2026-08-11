@@ -155,7 +155,6 @@ _TIMEOUT_EXEMPT: dict[str, dict[str, str]] = {
         "WaitForMorningEnrich": "ssm:getCommandInvocation single poll — bounded by MorningEnrich's own executionTimeout",
         "WaitForDataPhase1": "ssm:getCommandInvocation single poll — bounded by DataPhase1's own executionTimeout",
         "ResearchPredictorParallel.WaitForRAGIngestion": "ssm:getCommandInvocation single poll — bounded by RAGIngestion's own executionTimeout",
-        "ResearchPredictorParallel.WaitForThinkTank": "ssm:getCommandInvocation single poll — bounded by ThinkTankCoverage's own executionTimeout",
         "ResearchPredictorParallel.WaitForDataPhase2": "ssm:getCommandInvocation single poll — bounded by DataPhase2's own executionTimeout",
         "ResearchPredictorParallel.WaitForPredictorTraining": "ssm:getCommandInvocation single poll — bounded by PredictorTraining's own executionTimeout",
         "ResearchPredictorParallel.WaitResolveZoo": "ssm:getCommandInvocation single poll — bounded by ResolveZooSpecs' own executionTimeout",
@@ -395,23 +394,6 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
             "Same fold as Scanner (routes through MarkChallengerShadowDegraded) "
             "— see that entry for the full mechanism; verified by "
             "tests/test_sf_research_predictor_degraded_wiring.py."
-        ),
-        "ResearchPredictorParallel.ThinkTankCoverage": (
-            "FIXED (alpha-engine-config#6722): ThinkTankDegraded USED to set "
-            "$.thinktank_degraded=true, but that path was DEAD — never read "
-            "by CheckGateDegradedNotify or anywhere else in this file, the "
-            "exact 'follow the actual JSONPath, not any degraded-named key' "
-            "trap config#6715 was built to catch. Repointed to write the "
-            "same branch-local $.research_degraded_local every other "
-            "Branch A fail-open uses, folded into $.research_predictor_"
-            "degraded post-join (see Scanner's entry for the full "
-            "mechanism). Verified live-wired (not just renamed) by "
-            "tests/test_sf_research_predictor_degraded_wiring.py."
-        ),
-        "ResearchPredictorParallel.WaitForThinkTank": (
-            "Same repoint as ThinkTankCoverage — both Catches converge on "
-            "the same ThinkTankDegraded state, now writing the real, "
-            "verified branch-local flag."
         ),
         "ResearchPredictorParallel.RegimeRetrospectiveEval": (
             "Same fold as Scanner (routes through "

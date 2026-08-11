@@ -16,7 +16,7 @@ state + CheckSkipResearch were removed):
 2. ``CheckSkipRegimeSubstrate`` state exists and routes to either
    ``RegimeSubstrate`` (default) or ``SignalsEnvelope`` (when
    ``skip_regime_substrate: true``).
-3. The post-RAG control flow lands on ``ThinkTankCoverage`` (moved to run
+3. The post-RAG control flow lands on ``CheckSkipRegimeRetrospectiveEval`` (the
    after RAG so its theses read the fresh corpus), not on
    ``CheckSkipRegimeSubstrate`` (which now runs BEFORE RAG). Two routes:
    the ``CheckSkipRAGIngestion`` skip path AND the
@@ -118,27 +118,31 @@ def test_check_skip_regime_substrate_routes_correctly() -> None:
     assert skip_choice["Next"] == "CheckSkipSignalsEnvelope"
 
 
-def test_post_rag_control_flow_lands_on_thinktank_coverage() -> None:
-    """alpha-engine-config-I2515 Phase B: ThinkTankCoverage moved to run
-    AFTER the RAG chain (was between Scanner and RAG) so its theses read
-    the fresh corpus. config#3134: both post-RAG routes now point at
-    CheckSkipThinkTankCoverage (the new gate in front of ThinkTankCoverage)
-    rather than CheckSkipRegimeSubstrate (which runs BEFORE RAG in the new
-    order). Catches a refactor that re-introduces the stale-corpus bug."""
+def test_post_rag_control_flow_lands_on_regime_retrospective_eval() -> None:
+    """Both post-RAG routes converge on CheckSkipRegimeRetrospectiveEval.
+
+    They pointed at CheckSkipThinkTankCoverage until 2026-08-10, when the
+    ThinkTankCoverage chain was removed from the weekly SF (Brian ruling: the
+    Think Tank runs daily in shadow mode, on its own EventBridge cadence, and
+    is not part of the weekly pipeline). Both routes must move together — one
+    of them left behind is a partial rewire that only shows up on the rerun
+    path, which is the half nobody exercises by hand."""
     sf = _sf()
     states = _flat_states(sf)
     # CheckSkipRAGIngestion's skip-branch
     skip_choice = states["CheckSkipRAGIngestion"]["Choices"][0]
-    assert skip_choice["Next"] == "CheckSkipThinkTankCoverage", (
-        "CheckSkipRAGIngestion skip path must land on CheckSkipThinkTankCoverage"
+    assert skip_choice["Next"] == "CheckSkipRegimeRetrospectiveEval", (
+        "CheckSkipRAGIngestion skip path must land on "
+        "CheckSkipRegimeRetrospectiveEval"
     )
     # CheckRAGIngestionStatus's success branch
     success_choice = next(
         c for c in states["CheckRAGIngestionStatus"]["Choices"]
         if c.get("StringEquals") == "Success"
     )
-    assert success_choice["Next"] == "CheckSkipThinkTankCoverage", (
-        "CheckRAGIngestionStatus success path must land on CheckSkipThinkTankCoverage"
+    assert success_choice["Next"] == "CheckSkipRegimeRetrospectiveEval", (
+        "CheckRAGIngestionStatus success path must land on "
+        "CheckSkipRegimeRetrospectiveEval"
     )
 
 
