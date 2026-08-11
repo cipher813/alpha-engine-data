@@ -268,16 +268,7 @@ STAGES: tuple[Stage, ...] = (
     Stage(
         "rag_ingestion", "skip_rag_ingestion",
         "CheckSkipRAGIngestion", "RAGIngestion",
-        frozenset({"CheckSkipThinkTankCoverage"}),
-    ),
-    Stage(
-        "thinktank_coverage", "skip_thinktank_coverage",
-        "CheckSkipThinkTankCoverage", "ThinkTankCoverage",
         frozenset({"CheckSkipRegimeRetrospectiveEval"}),
-        # ThinkTankDegraded (alpha-engine-config-I5758) sets the visible
-        # thinktank_degraded flag and converges into this stage's witness —
-        # a degraded ThinkTank must re-run, not be skipped as completed.
-        degraded_witness=frozenset({"ThinkTankDegraded"}),
     ),
     Stage(
         "regime_retrospective_eval", "skip_regime_retrospective_eval",
@@ -539,10 +530,13 @@ BRANCH_A_STAGES = frozenset({
     # alpha-engine-config-I2515 Phase B: "research" removed (the
     # multi-agent Research state — and its skip_research flag /
     # CheckSkipResearch gate — no longer exists). config#3134: scanner,
-    # signals_envelope, challenger_shadow, thinktank_coverage added once
-    # each got its own CheckSkip* gate.
+    # signals_envelope, challenger_shadow added once each got its own
+    # CheckSkip* gate. thinktank_coverage was one of them until 2026-08-10,
+    # when the ThinkTankCoverage chain was removed from the weekly SF
+    # (Brian ruling: the Think Tank runs daily in shadow mode, outside this
+    # pipeline) — the daily EventBridge cadence owns it now.
     "scanner", "regime_substrate", "signals_envelope", "challenger_shadow",
-    "rag_ingestion", "thinktank_coverage", "regime_retrospective_eval",
+    "rag_ingestion", "regime_retrospective_eval",
     "data_phase2", "eval_judge", "rationale_clustering",
     "replay_concordance", "counterfactual", "aggregate_costs",
 })

@@ -30,7 +30,7 @@ runner (CheckSkipResearch/Research/CheckResearchStatus) was REMOVED from
 Branch A. Current Branch A head: Scanner -> CheckSkipRegimeSubstrate ->
 RegimeSubstrate -> SignalsEnvelope (new load-bearing signals.json
 producer) -> ChallengerShadow (new, non-blocking) -> CheckSkipRAGIngestion
--> RAG chain -> ThinkTankCoverage (moved here, post-RAG) ->
+-> RAG chain ->
 CheckSkipRegimeRetrospectiveEval -> RegimeRetrospectiveEval ->
 CheckSkipDataPhase2 -> DataPhase2 -> eval-judge chain -> ... ->
 Counterfactual. The Parallel/Branch-B/join structure and the
@@ -78,11 +78,20 @@ _BRANCH_A_STATES = {
     # ThinkTank), followed by the new SignalsEnvelope (thin envelope
     # producer replacing Research as the signals.json producer) and
     # ChallengerShadow (keeps the no_agent champion-baseline shadow alive).
-    # ThinkTankCoverage moved to run AFTER RAG so its theses read the fresh
-    # corpus. ExtractResearchError was renamed ExtractSignalsEnvelopeError.
+    # ExtractResearchError was renamed ExtractSignalsEnvelopeError.
+    #
+    # 2026-08-10 (Brian ruling): the ThinkTankCoverage chain
+    # (CheckSkipThinkTankCoverage / ThinkTankCoverage / CheckThinkTankLaunched
+    # / InitThinkTankPollCount / WaitForThinkTank / CheckThinkTankStatus /
+    # ThinkTankWait / ThinkTankPollWait / MergeThinkTankPollCount /
+    # ThinkTankDegraded) was REMOVED from this branch. The Think Tank runs
+    # daily in shadow mode on its own EventBridge cadence
+    # (alpha-research-thinktank-daily -> alpha-engine-thinktank-spot-
+    # dispatcher) and is not part of the weekly pipeline; the RAG chain now
+    # lands directly on CheckSkipRegimeRetrospectiveEval.
     "Scanner", "CheckSkipRegimeSubstrate", "RegimeSubstrate",
     "SignalsEnvelope", "ChallengerShadow",
-    "ThinkTankCoverage", "CheckSkipRAGIngestion", "RAGIngestion",
+    "CheckSkipRAGIngestion", "RAGIngestion",
     "WaitForRAGIngestion", "CheckRAGIngestionStatus", "RAGIngestionWait",
     "RAGIngestionRetryGate", "RAGIngestionReissue", "ExtractRAGIngestionError",
     "CheckSkipRegimeRetrospectiveEval", "RegimeRetrospectiveEval",
@@ -187,7 +196,7 @@ class TestParallelStatePresence:
         # config#885: Branch A now leads with the relocated Scanner chain.
         # alpha-engine-config-I2515 Phase B: the chain is now Scanner →
         # RegimeSubstrate → SignalsEnvelope → ChallengerShadow → RAG →
-        # ThinkTankCoverage → RegimeRetrospectiveEval → DataPhase2 → ...
+        # RegimeRetrospectiveEval → DataPhase2 → ...
         # (the multi-agent Research state and CheckSkipResearch were
         # removed; SignalsEnvelope is the chain's continuation inside
         # Branch A). config#3134: Branch A's StartAt was CheckSkipScanner
@@ -778,8 +787,7 @@ class TestPerBranchErrorIsolation:
         ExtractSignalsEnvelopeError (renamed from ExtractResearchError) →
         PublishResearchFailureImmediate (the fast-SNS-alert state added
         2026-05-24, shared with RAGIngestion failures) → BranchAFailed —
-        NO non-blocking Catch-to-continue, unlike ThinkTankCoverage/
-        ChallengerShadow."""
+        NO non-blocking Catch-to-continue, unlike ChallengerShadow."""
         catch_targets = [
             c["Next"] for c in branch_a["SignalsEnvelope"]["Catch"]
         ]
@@ -815,99 +823,47 @@ class TestPerBranchErrorIsolation:
             "BranchAFailed"
         ]
 
-    def test_thinktank_coverage_is_non_blocking(self, branch_a):
-        """config#3218 (§119 rule 3): the gap_fill top-up is observe-only and
-        must never halt the pipeline.
+    def test_thinktank_chain_is_absent_from_the_weekly_pipeline(self, branch_a):
+        """Brian ruling 2026-08-10: the Think Tank runs daily in shadow mode
+        and is NOT part of the weekly SF.
 
-        alpha-engine-config-I5758 changed HOW that holds. It used to be
-        "absorbed silently" — the Catch pointed straight at the success path's
-        Next. That silence is precisely why 13 consecutive days of 900s Lambda
-        timeouts (2026-07-17 onward) went unnoticed while the
-        thinktank_coverage challenger arm was absent from the loop.
+        It used to be a gap_fill top-up inside this branch — a ten-state chain
+        (skip gate, spot dispatch, launch check, poll quartet, degraded
+        convergence) whose only job was to top up coverage the daily cadence
+        already owns. The daily EventBridge rule
+        ``alpha-research-thinktank-daily`` -> ``alpha-engine-thinktank-spot-
+        dispatcher`` is now the single producer, so the weekly pipeline neither
+        launches spot for it nor waits on it.
 
-        Non-blocking is now reached VIA ThinkTankDegraded, which sets a visible
-        flag first. weekly-sf-policy.md §2.3 permits fail-open only with a flag
-        that propagates to the terminal notification; champion-challenger-policy
-        §3 requires a cycle with no arm output to be recorded as a MISS rather
-        than omitted. So this asserts the PROPERTY (converges to the shared
-        successor without failing the branch) plus the flag, not a literal
-        target.
-
-        alpha-engine-config#6722: ThinkTankDegraded's flag was ITSELF dead —
-        it wrote $.thinktank_degraded, a path CheckGateDegradedNotify never
-        dereferenced anywhere in this file (the exact trap config#6715 was
-        built to catch). Repointed to the branch-local
-        $.research_degraded_local, folded into the top-level
-        $.research_predictor_degraded post-join — see
-        tests/test_sf_research_predictor_degraded_wiring.py."""
-        state = branch_a["ThinkTankCoverage"]
-        catch_targets = [c["Next"] for c in state["Catch"]]
-        assert catch_targets == ["ThinkTankDegraded"]
-        assert "BranchAFailed" not in catch_targets
-
-        degraded = branch_a["ThinkTankDegraded"]
-        # The flag itself — a fail-open without one is what this replaced.
-        assert degraded["Result"] is True
-        assert degraded["ResultPath"] == "$.research_degraded_local"
-        # ...and it converges on the same successor the success path reaches,
-        # so the branch is never detoured onto an untested path.
-        assert degraded["Next"] == "CheckSkipRegimeRetrospectiveEval"
+        This asserts absence rather than deletion history: a future change that
+        re-adds any of these states to the weekly pipeline reverses a ruling and
+        must be a deliberate edit to this test, not a quiet re-wire."""
+        removed = {
+            "CheckSkipThinkTankCoverage", "ThinkTankCoverage",
+            "CheckThinkTankLaunched", "InitThinkTankPollCount",
+            "WaitForThinkTank", "CheckThinkTankStatus", "ThinkTankWait",
+            "ThinkTankPollWait", "MergeThinkTankPollCount", "ThinkTankDegraded",
+        }
+        present = removed & set(branch_a)
+        assert not present, (
+            f"the weekly SF carries Think Tank state(s) {sorted(present)}. The "
+            "Think Tank runs daily in shadow mode on its own cadence (Brian "
+            "ruling 2026-08-10) — the weekly pipeline must not launch or poll it."
+        )
+        # Nothing may still route at the removed chain, and the RAG chain must
+        # land on the successor the chain used to converge on.
+        import json as _json
+        blob = _json.dumps(branch_a)
+        for name in removed:
+            assert f'"{name}"' not in blob, f"dangling reference to {name}"
         assert (
-            branch_a["CheckThinkTankStatus"]["Choices"][0]["Next"]
+            branch_a["CheckSkipRAGIngestion"]["Choices"][0]["Next"]
             == "CheckSkipRegimeRetrospectiveEval"
         )
-
-        # Failure output must be quarantined off the dispatch ResultPath so a
-        # caught error can never masquerade as a real dispatch result.
-        assert [c["ErrorEquals"] for c in state["Catch"]] == [["States.ALL"]]
-        assert state["ResultPath"] == "$.thinktank_dispatch"
-        assert all(
-            c["ResultPath"] != state["ResultPath"] for c in state["Catch"]
+        assert (
+            branch_a["CheckRAGIngestionStatus"]["Choices"][0]["Next"]
+            == "CheckSkipRegimeRetrospectiveEval"
         )
-
-    def test_thinktank_runs_on_spot_not_a_ceilinged_lambda(self, branch_a):
-        """alpha-engine-config-I5758 / I5208, ARCHITECTURE §47: a long-running
-        agent loop runs on owned compute behind a dispatcher, never on a
-        metered/ceilinged runtime.
-
-        The regression this pins is specific and already happened: the spot
-        migration shipped for the DAILY cadence while this state kept invoking
-        alpha-engine-research-thinktank directly at TimeoutSeconds 900 — the
-        AWS Lambda maximum — so the weekly SF re-entered the exact failure the
-        migration had fixed. Measured 2026-07-30 on watch-rerun-2026-07-29-1:
-        two States.Timeouts, 30 min of wall-clock, zero output."""
-        state = branch_a["ThinkTankCoverage"]
-        fn = state["Parameters"]["FunctionName"]
-        assert fn == "alpha-engine-thinktank-spot-dispatcher", (
-            f"ThinkTankCoverage must dispatch to spot, not invoke {fn!r} "
-            "directly — 900s is the AWS Lambda maximum and this workload does "
-            "not fit in it"
-        )
-        assert "alpha-engine-research-thinktank" not in fn
-        # The dispatcher launches and returns; it never babysits the run, so
-        # this Task's timeout bounds a LAUNCH, not the agent loop.
-        assert state["TimeoutSeconds"] <= 600
-
-    def test_thinktank_poll_loop_is_bounded(self, branch_a):
-        """alpha-engine-config-I5687: the other 15 poll loops in this pipeline
-        are unbounded and instance-liveness-blind, which cost 5h11m of blind
-        polling on 2026-07-29. A new loop ships bounded rather than adding a
-        16th instance of that defect.
-
-        Also pins that the counter actually ADVANCES — a bound whose counter
-        never increments is an unbounded loop wearing a bound."""
-        choice = branch_a["CheckThinkTankStatus"]
-        in_progress = choice["Choices"][1]["And"]
-        # config#2275: the IsPresent guard must PRECEDE the dereference.
-        assert in_progress[0]["Variable"] == "$.thinktank_polls"
-        assert in_progress[0]["IsPresent"] is True
-        bound = [c for c in in_progress if "NumericLessThan" in c]
-        assert bound and bound[0]["NumericLessThan"] > 0
-        # Exhausting the budget must degrade, never spin.
-        assert choice["Default"] == "ThinkTankDegraded"
-        # The increment exists and feeds back into the same variable.
-        assert "States.MathAdd" in branch_a["ThinkTankWait"]["Parameters"]["polls.$"]
-        assert branch_a["MergeThinkTankPollCount"]["ResultPath"] == "$.thinktank_polls"
 
     def test_predictor_failure_routes_to_branch_b_failed(self, branch_b):
         """PredictorTraining failures (Task Catch + WaitForPredictorTraining

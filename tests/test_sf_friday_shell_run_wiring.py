@@ -90,10 +90,12 @@ _EXPECTED_SKIPS = {
     "skip_lib_pin_drift_check",
     "skip_morning_enrich",
     "skip_data_phase1",
-    # config#3134: Scanner, SignalsEnvelope, ChallengerShadow, and
-    # ThinkTankCoverage each got their own CheckSkip* gate — previously
-    # NONE of the four had one, so every partial rerun unconditionally
-    # re-ran all four regardless of flags. skip_signals_envelope's gate
+    # config#3134: Scanner, SignalsEnvelope, ChallengerShadow and (until
+    # 2026-08-10) ThinkTankCoverage each got their own CheckSkip* gate —
+    # previously NONE of them had one, so every partial rerun unconditionally
+    # re-ran all of them regardless of flags. skip_thinktank_coverage retired
+    # with the ThinkTankCoverage chain (Brian ruling: the Think Tank runs
+    # daily in shadow mode, outside the weekly SF). skip_signals_envelope's gate
     # DEFAULTS FALSE (SignalsEnvelope is LOAD-BEARING — I2880 staleness
     # guard — unlike the other three, which are safe defaults-false too
     # but carry no comparable live-run hazard).
@@ -101,7 +103,6 @@ _EXPECTED_SKIPS = {
     "skip_signals_envelope",
     "skip_challenger_shadow",
     "skip_rag_ingestion",
-    "skip_thinktank_coverage",
     "skip_regime_substrate",
     "skip_regime_retrospective_eval",
     # skip_research retired: alpha-engine-config-I2515 Phase B removed the
