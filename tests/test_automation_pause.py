@@ -429,3 +429,109 @@ def test_paused_names_includes_pending_but_check_does_not(manifest, module):
 
 def test_pending_notes_are_not_returned_as_names(module, manifest):
     assert not any(n.startswith("_") for n in module.pending_names(manifest))
+
+
+# ── the kept half is now asserted, not merely documented (config#6613) ────────
+#
+# Until 2026-08-11 `not_paused` was prose: `check()` iterated only the paused
+# entries, so a kept trigger that silently flipped to DISABLED produced no
+# finding. That is the failure this file's own docstring names — "an entry that
+# can never fail is not a record, it is a comment" — applied to the paused half
+# and not the kept one. The expense collector is what made it matter: it is the
+# only guard against the provider-credit exhaustion that took every autonomous
+# lane dark for three days, and it had been cold since 2026-08-07.
+
+
+def test_kept_names_excludes_prose_keys(module, manifest):
+    names = module.kept_names(manifest)
+    for key in manifest["not_paused"]:
+        if key.startswith("_"):
+            assert key not in names, f"{key} is prose and must not be probed as a trigger"
+    assert names, "not_paused holds no real trigger names — the check would assert nothing"
+
+
+def test_every_prose_key_uses_the_underscore_marker(manifest):
+    # A prose key without the marker becomes a `kept-but-missing` finding, and a
+    # trigger name WITH the marker silently drops out of the check. Both fail
+    # quietly, so the convention is pinned here rather than left to review.
+    for key, reason in manifest["not_paused"].items():
+        if key.startswith("_"):
+            continue
+        assert key.startswith(("alpha-", "DO-NOT-DELETE-")), (
+            f"not_paused key {key!r} does not look like a live trigger name; if it "
+            "is a grouping label, prefix it with '_' as the pending block does"
+        )
+        assert reason.strip(), f"{key} is kept with no stated reason"
+
+
+def test_check_reports_a_kept_trigger_that_went_disabled(module, monkeypatch):
+    kept = sorted(module.kept_names())[0]
+
+    def fake(surface, name):
+        if name == kept:
+            return "DISABLED" if surface == "events" else None
+        return "DISABLED"      # every paused entry is correctly off
+
+    monkeypatch.setattr(module, "_live_state", fake)
+    findings = module.check()
+    kinds = {(f["trigger"], f["kind"]) for f in findings}
+    assert (kept, "kept-but-disabled") in kinds, (
+        f"a kept trigger sitting DISABLED produced no finding: {findings}"
+    )
+
+
+def test_check_reports_a_kept_trigger_that_vanished(module, monkeypatch):
+    kept = sorted(module.kept_names())[0]
+
+    def fake(surface, name):
+        if name == kept:
+            return None        # exists on neither surface
+        return "DISABLED"
+
+    monkeypatch.setattr(module, "_live_state", fake)
+    findings = module.check()
+    kinds = {(f["trigger"], f["kind"]) for f in findings}
+    assert (kept, "kept-but-missing") in kinds, (
+        f"a kept trigger that no longer exists produced no finding: {findings}"
+    )
+
+
+def test_check_is_silent_when_kept_triggers_are_enabled(module, monkeypatch):
+    monkeypatch.setattr(
+        module, "_live_state",
+        lambda surface, name: "ENABLED" if name in module.kept_names() else "DISABLED")
+    assert module.check() == []
+
+
+def test_enforce_never_touches_a_kept_trigger(module, monkeypatch):
+    # enforce() may only ever DISABLE. If it learned to re-enable, this script
+    # would start scheduled work unattended — the one thing the ruling forbids.
+    disabled: list[str] = []
+    monkeypatch.setattr(module, "_live_state", lambda surface, name: "ENABLED")
+    monkeypatch.setattr(module, "_disable", lambda surface, name: disabled.append(name))
+    module.enforce()
+    assert not (set(disabled) & module.kept_names()), (
+        f"enforce() disabled a deliberately-kept trigger: "
+        f"{sorted(set(disabled) & module.kept_names())}"
+    )
+
+
+def test_the_expense_collector_is_kept_and_names_its_ruling(manifest, module):
+    name = "alpha-engine-expense-collector-twicedaily"
+    assert name in module.kept_names(manifest), (
+        "the balance/spend collector is the only guard against the provider-credit "
+        "exhaustion of config#6613; it must be in not_paused, not paused"
+    )
+    reason = manifest["not_paused"][name]
+    assert "2026-08-11" in reason and "6613" in reason, (
+        "an un-pause must name the ruling that authorised it, or the next pause "
+        "audit cannot tell an exception from drift"
+    )
+
+
+def test_reconcile_monthly_is_paused_not_pending(manifest, module):
+    # It exists live (verified DISABLED 2026-08-11), and `pending` asserts
+    # neither existence nor state — only `paused` does.
+    name = "alpha-engine-expense-collector-reconcile-monthly"
+    assert name in manifest["paused"]["scheduler_schedules"]
+    assert name not in module.pending_names(manifest)
