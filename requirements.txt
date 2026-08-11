@@ -61,7 +61,12 @@ arcticdb>=6.20.0
 # nousergon-lib#226 registered the 9 states this repo's SF JSONs were
 # missing (2 Saturday + 7 EOD) and shipped in v0.124.8 — bumped to that tag
 # here (was v0.124.6) to unblock the new source-check test.
-nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.44
+# v0.124.44 -> v0.124.47 (config-I3112, nousergon-lib-PR303): the weekly SF's
+# single Evaluator state became EvaluatorDiagnostics -> EvaluatorOptimize, and
+# test_pipeline_status_registry_source_check.py reads the LIB registry — the
+# SF JSON in this PR is red until the pin carries both halves. Lockstep by
+# construction: registry entry first, pin second, same PR as the SF change.
+nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.47
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,
