@@ -44,7 +44,16 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-_SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+# The changes table is not pinned to one page: on 2026-08-11 a Wikipedia editor
+# split it out of "List of S&P 500 companies" into its own article
+# ("move to [[Historical components of the S&P 500]], format"), which failed
+# this collector 3h later. Both candidates are tried in order and the first
+# carrying a date+added+removed table wins, so a future move back — or to a
+# third title added here — degrades to a slower fetch rather than a hard stop.
+_SP500_CHANGES_URLS = (
+    "https://en.wikipedia.org/wiki/Historical_components_of_the_S%26P_500",
+    "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+)
 _HEADERS = {"User-Agent": "alpha-engine-data/1.0 (historical-constituents)"}
 
 ADDED = "added"
@@ -204,11 +213,35 @@ def build_pit_membership(
     return pit
 
 
-def _fetch_changes_table() -> pd.DataFrame:
-    resp = requests.get(_SP500_URL, headers=_HEADERS, timeout=15)
-    resp.raise_for_status()
-    tables = pd.read_html(StringIO(resp.text))
-    return select_changes_table(tables)
+def _fetch_changes_table(
+    urls: tuple[str, ...] = _SP500_CHANGES_URLS,
+) -> tuple[pd.DataFrame, str]:
+    """Return the changes table and the URL it actually came from.
+
+    Tries each candidate in order; a fetch error or a page with no matching
+    table falls through to the next. Raises only when every candidate fails,
+    naming what was tried and why each one did not serve."""
+    failures = []
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=_HEADERS, timeout=15)
+            resp.raise_for_status()
+            df = select_changes_table(pd.read_html(StringIO(resp.text)))
+        except Exception as exc:  # noqa: BLE001 — recorded and re-raised below
+            failures.append(f"{url}: {type(exc).__name__}: {exc}")
+            continue
+        if failures:
+            logger.warning(
+                "historical_constituents: changes table served by fallback %s "
+                "(earlier candidates failed: %s)", url, "; ".join(failures),
+            )
+        return df, url
+    raise RuntimeError(
+        "No S&P 500 'Selected changes to the list' table found on any known "
+        "Wikipedia page (need columns matching date + added + removed). "
+        "Wikipedia layout drift — add the new article to _SP500_CHANGES_URLS. "
+        "Tried: " + " | ".join(failures)
+    )
 
 
 def collect(
@@ -224,12 +257,13 @@ def collect(
     roster and keeps the two collectors' rosters consistent. Writes
     ``{s3_prefix}historical_constituents.json`` per the memo's recommended
     path."""
-    changes = parse_changes_table(_fetch_changes_table())
+    changes_table, source_url = _fetch_changes_table()
+    changes = parse_changes_table(changes_table)
     pit = build_pit_membership(current_tickers, changes)
 
     result = {
         "schema_version": 1,
-        "source": _SP500_URL,
+        "source": source_url,
         "index": "S&P 500",
         "current_count": len(current_tickers),
         "n_changes": len(changes),
