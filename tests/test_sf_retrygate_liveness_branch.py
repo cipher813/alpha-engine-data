@@ -59,6 +59,12 @@ def _gate_scopes():
     for scope in _SCOPES:
         for name, state in scope.items():
             if name.endswith("RetryGate") and state.get("Type") == "Choice":
+                # *LivenessGate states are deliberately excluded here: they add
+                # a substrate-loss branch WITHOUT a bounded re-issue (config#6938
+                # — the box those stages address is the shared launcher, so a
+                # re-issue could not help). The gate tests below are about the
+                # re-issue contract; the no-gate test further down covers both
+                # kinds.
                 yield name, state, scope
 
 
@@ -276,6 +282,94 @@ def test_drill_live_instance_workload_failure_still_gets_its_one_reissue(gate_na
         f"{gate_name} attributes an exhausted live-instance failure to "
         f"substrate loss ({second!r}) — that misreports a real workload failure "
         f"as an infrastructure event"
+    )
+
+
+# ---------------------------------------------------------------------------
+# A stage with NO gate is the defect this file could not see
+# ---------------------------------------------------------------------------
+
+def _branch_terminal_ssm_stages():
+    """(stage, check_state, scope) for every SSM poll whose non-Success arm is
+    terminal for its branch.
+
+    The gate discovery above enumerates gates that EXIST, so a stage carrying
+    none is invisible to it — which is exactly how PredictorTraining went
+    ungated through config#5688's sweep and then lost Branch B to a routine
+    spot reclaim on 2026-08-11 (config#6938). This walks the poll Choices
+    instead, so the absence is what gets asserted.
+    """
+    for scope in _SCOPES:
+        for name, state in scope.items():
+            if not (name.startswith("Check") and name.endswith("Status")):
+                continue
+            if state.get("Type") != "Choice":
+                continue
+            poll_vars = {
+                str(c.get("Variable", ""))
+                for rule in state.get("Choices", [])
+                for c in _leaf_conditions(rule)
+            }
+            if not any(v.endswith("_poll.Status") for v in poll_vars):
+                continue  # not an SSM poll gate
+
+            # Only stages whose non-Success arm is TERMINAL. A stage that
+            # routes to a *Degraded pass already survives substrate loss —
+            # the run continues with the degrade recorded — so a liveness
+            # branch would add a distinction without a consequence. The
+            # asymmetry is the point: the gates matter exactly where losing
+            # the box loses the run.
+            default = scope[name].get("Default", "")
+            target = scope.get(default, {})
+            if default.endswith(("Degraded", "Failed")) and not target.get("Parameters", {}).get("phase"):
+                continue
+            yield name[len("Check"):-len("Status")], name, scope
+
+
+def test_there_are_ssm_poll_stages_to_check():
+    assert list(_branch_terminal_ssm_stages()), (
+        "no Check*Status SSM poll Choice states found — if the polling shape "
+        "changed, retarget this test rather than leaving it vacuously green"
+    )
+
+
+@pytest.mark.parametrize(
+    "stage,check_state,scope",
+    list(_branch_terminal_ssm_stages()),
+    ids=lambda v: v if isinstance(v, str) else "",
+)
+def test_every_ssm_poll_stage_has_a_liveness_branch(stage, check_state, scope):
+    """The non-Success route must reach a substrate-loss branch somewhere.
+
+    Either the Default is a *RetryGate carrying one, or the stage routes
+    directly to a state whose phase names substrate loss. A stage that treats
+    every non-Success identically cannot tell a reclaimed instance from a
+    failed workload, and pays a full pipeline failure for the former.
+    """
+    default = scope[check_state].get("Default", "")
+    target = scope.get(default, {})
+
+    if default.endswith(("RetryGate", "LivenessGate")):
+        values = {
+            c.get("StringEquals")
+            for rule in target.get("Choices", [])
+            for c in _leaf_conditions(rule)
+            if str(c.get("Variable", "")).endswith("_poll.StatusDetails")
+        }
+        assert values & _SUBSTRATE_LOST_DETAILS, (
+            f"{check_state}.Default routes to {default}, which never branches "
+            f"on StatusDetails — a reclaimed instance is handled as a workload "
+            f"failure (config#5688)"
+        )
+        return
+
+    phase = target.get("Parameters", {}).get("phase", "")
+    assert phase.endswith("/SubstrateLost"), (
+        f"{check_state}.Default routes straight to {default!r} with phase "
+        f"{phase!r}: this stage has NO liveness branch at all. A spot reclaim "
+        f"— the failure mode most expected on this substrate — is recorded as "
+        f"a {stage} failure and takes the branch down on first occurrence. "
+        f"That is config#6938, measured on watch-rerun-2026-08-10-8."
     )
 
 
