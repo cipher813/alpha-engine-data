@@ -209,7 +209,7 @@ def test_substrate_lost_branch_is_distinguishable_and_reaches_the_notifier(gate_
             f"States.JsonToString($.error) throws States.Runtime otherwise"
         )
         # Both routes must still converge on the same failure-notification
-        # chain, but config-I7118 interposes a RECOVERY path on the substrate
+        # chain, but config-I7119 interposes a RECOVERY path on the substrate
         # side: one bounded forced-on-demand relaunch of the launcher box, and
         # only if that budget is already spent does the run fail. So the
         # handoff is now reachability, not identity — a substrate-lost site

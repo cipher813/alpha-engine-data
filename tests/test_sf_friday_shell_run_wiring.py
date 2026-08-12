@@ -1337,7 +1337,7 @@ class TestHappyPathTraversal:
             "InitWeeklyFreshnessSpotBootstrapPollCount",
             "WaitForWeeklyFreshnessSpotBootstrap",
             "CheckWeeklyFreshnessSpotBootstrapStatus",
-            # config-I7118: bootstrap success now routes through a dedicated
+            # config-I7119: bootstrap success now routes through a dedicated
             # router rather than straight to CheckShellRun — a FIRST boot
             # ($.substrate_relaunch_attempts == 0, the trace's default) takes
             # its Default here, so the pre-keystone chain is unchanged; a

@@ -1,11 +1,11 @@
-"""In-execution substrate-loss recovery for the weekly SF (config-I7118).
+"""In-execution substrate-loss recovery for the weekly SF (config-I7119).
 
 A reclaimed launcher spot used to be TERMINAL: every ``Extract*SubstrateLost
 Error`` state routed straight to ``NormalizeFailureContext`` -> ``FailExecution``,
 and recovery meant a human running ``scripts/weekly_sf_rerun.py``. Measured
 2026-08-12: 3 of 11 recent spot requests in the account died
 ``instance-terminated-no-capacity``, one of them mid-``DataPhase1`` on that
-day's scheduled run (resource ids in alpha-engine-config-I7118).
+day's scheduled run (resource ids in alpha-engine-config-I7119).
 
 These tests pin the replacement path: ONE bounded, forced-on-demand relaunch
 of the launcher box, then resume at the interrupted stage.
@@ -201,7 +201,7 @@ def test_parallel_branch_sites_are_knowingly_out_of_scope(doc):
     This asserts the boundary rather than the absence: if a branch site is
     ever wired to the top-level gate the definition will not deploy, and if
     the count changes someone must decide deliberately. Tracked as
-    alpha-engine-config-I7119.
+    alpha-engine-config-I7120.
     """
     branch_sites = {
         f"{label}:{name}"
@@ -211,7 +211,7 @@ def test_parallel_branch_sites_are_knowingly_out_of_scope(doc):
     }
     assert len(branch_sites) == 5, (
         f"the in-Parallel substrate-lost set changed: {sorted(branch_sites)} — "
-        f"re-examine I7119 before adjusting this number"
+        f"re-examine I7120 before adjusting this number"
     )
     for label, states in _scopes(doc):
         if label == "<root>":

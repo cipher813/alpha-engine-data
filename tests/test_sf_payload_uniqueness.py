@@ -141,7 +141,7 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # config from Lambda env vars.
     # config#5504: per-run identity threading for cost attribution.
     "DispatchWeeklyFreshnessSpot": frozenset({"execution_id.$"}),
-    # config-I7118: the SAME dispatcher, invoked to replace a launcher box that
+    # config-I7119: the SAME dispatcher, invoked to replace a launcher box that
     # was reclaimed mid-run. force_on_demand was added to the dispatcher in
     # config#2248 and documented there as "reserved for a future bounded
     # retry-on-relaunch ... no current caller sets it" — this is that caller,
