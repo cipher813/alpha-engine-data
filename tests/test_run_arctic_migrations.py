@@ -264,6 +264,20 @@ def test_run_noop_when_nothing_pending(mod, monkeypatch):
     assert marker["payload"]["state"] == "noop_up_to_date"
     assert marker["payload"]["current_version"] == 3
 
+    # alpha-engine-config-I7123: a no-op is not an event. This lane is idle by
+    # design most of the time, so notifying "nothing was pending" on every run
+    # is pure operator noise.
+    assert recorded["notifies"] == [], (
+        "the no-op path must not notify — it carries no decision, no failure "
+        "and no state change"
+    )
+    # ...but the run is still OBSERVED. The removal above is of notification,
+    # never of observation: the marker asserted above is one durable surface,
+    # and the dispatcher's `publish_lane ok` (config-I7029) emits the lane's
+    # console row on this same exit path. An absent run stays visible as an
+    # ageing console row, so silence here does not read as health.
+    assert marker["payload"]["rc"] == 0
+
 
 def test_run_success_applies_all_pending(mod, monkeypatch):
     recorded = _stub_side_effects(mod, monkeypatch)
