@@ -10,6 +10,16 @@
 # Managed outside CloudFormation — same rationale as all sibling Lambdas
 # in this directory (narrow OIDC role blast radius).
 #
+# iam-policy.json (2026-08-12, alpha-engine-config-I7051): this Lambda's role
+# granted no `logs:` action at all — 18 invocations over 3 days, zero log
+# records, no /aws/lambda/alpha-engine-weekly-preflight log group. It gates
+# the weekly SF, so a failure here was undiagnosable. Added a CloudWatchLogs
+# statement scoped to this function's own log group. The github-actions-lambda-deploy
+# OIDC identity deliberately lacks iam:PutRolePolicy (see _shared/apply_iam_policy.sh
+# and infrastructure/iam/README.md "Single-writer rule"), so this grant does
+# NOT go live on merge — an operator must run --apply-iam once, with their own
+# admin credentials, per iam-policy-change-guard.yml's own preferred sequence.
+#
 # Usage:
 #   bash infrastructure/lambdas/weekly-preflight/deploy.sh             # update code only (CI path)
 #   bash infrastructure/lambdas/weekly-preflight/deploy.sh --bootstrap # first-time create
