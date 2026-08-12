@@ -282,14 +282,42 @@ if $RECONCILE_SCHEDULES; then
     target="{\"Arn\":\"${FN_ARN}\",\"RoleArn\":\"${SCHED_ROLE_ARN}\",\"Input\":\"{}\"}"
     if aws scheduler get-schedule --name "${name}" --region "${REGION}" --query 'Name' --output text >/dev/null 2>&1; then
       echo "  Updating Scheduler rule: ${name} → ${cron}"
-      run aws scheduler update-schedule --name "${name}" --state "$(pause_state "${name}")" --schedule-expression "${cron}" \
-        --schedule-expression-timezone "UTC" --flexible-time-window '{"Mode":"OFF"}' \
-        --target "${target}" --region "${REGION}" --query 'ScheduleArn' --output text
+      if $DRY_RUN; then
+        echo "DRY: aws scheduler update-schedule --name ${name} --state $(pause_state ${name}) ..."
+      else
+        sched_out=$(aws scheduler update-schedule --name "${name}" --state "$(pause_state "${name}")" --schedule-expression "${cron}" \
+          --schedule-expression-timezone "UTC" --flexible-time-window '{"Mode":"OFF"}' \
+          --target "${target}" --region "${REGION}" --query 'ScheduleArn' --output text 2>&1) || {
+          if echo "${sched_out}" | grep -q "must allow AWS EventBridge Scheduler to assume the role"; then
+            echo "  ⚠  Scheduler role ${SCHED_ROLE_NAME} not bootstrapped — reconciliation skipped."
+            echo "     Run deploy.sh --bootstrap-iam as an operator, then re-deploy to wire the schedules."
+            echo "skipped_not_bootstrapped=true" >> "${GITHUB_OUTPUT:-/dev/null}"
+            exit 0
+          fi
+          echo "ERROR: ${sched_out}" >&2
+          exit 1
+        }
+        echo "    ${sched_out}"
+      fi
     else
       echo "  Creating Scheduler rule: ${name} → ${cron}"
-      run aws scheduler create-schedule --name "${name}" --state "$(pause_state "${name}")" --schedule-expression "${cron}" \
-        --schedule-expression-timezone "UTC" --flexible-time-window '{"Mode":"OFF"}' \
-        --target "${target}" --region "${REGION}" --query 'ScheduleArn' --output text
+      if $DRY_RUN; then
+        echo "DRY: aws scheduler create-schedule --name ${name} --state $(pause_state ${name}) ..."
+      else
+        sched_out=$(aws scheduler create-schedule --name "${name}" --state "$(pause_state "${name}")" --schedule-expression "${cron}" \
+          --schedule-expression-timezone "UTC" --flexible-time-window '{"Mode":"OFF"}' \
+          --target "${target}" --region "${REGION}" --query 'ScheduleArn' --output text 2>&1) || {
+          if echo "${sched_out}" | grep -q "must allow AWS EventBridge Scheduler to assume the role"; then
+            echo "  ⚠  Scheduler role ${SCHED_ROLE_NAME} not bootstrapped — reconciliation skipped."
+            echo "     Run deploy.sh --bootstrap-iam as an operator, then re-deploy to wire the schedules."
+            echo "skipped_not_bootstrapped=true" >> "${GITHUB_OUTPUT:-/dev/null}"
+            exit 0
+          fi
+          echo "ERROR: ${sched_out}" >&2
+          exit 1
+        }
+        echo "    ${sched_out}"
+      fi
     fi
     if ! $DRY_RUN; then
       aws scheduler get-schedule --name "${name}" --region "${REGION}" --query 'Name' --output text >/dev/null \
