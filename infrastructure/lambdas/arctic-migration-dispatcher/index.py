@@ -432,7 +432,15 @@ export HOME=/home/ec2-user
 export XDG_CACHE_HOME=/home/ec2-user/.cache
 export AWS_REGION={REGION}
 export AWS_DEFAULT_REGION={REGION}
-fail() {{ echo "[arctic-migration-prelude] FATAL: $1"; aws s3 cp {log} "{s3_log}" --region {REGION} --quiet || true; shutdown -h now; exit 1; }}
+# The lane's own console row (alpha-engine-config-I7029). Guarded on the file
+# existing, because `fail()` is reachable BEFORE the clone — and a prelude that
+# died before cloning is exactly why the DISPATCHER publishes an `attention`
+# row at launch: that row is what stands, and ages, when nothing here runs.
+publish_lane() {{ [ -f /home/ec2-user/nousergon-data/scripts/publish_lane_result.py ] \\
+  && (cd /home/ec2-user/nousergon-data && .venv/bin/python scripts/publish_lane_result.py \\
+       --status "$1" --summary "$2" --deep-link "{s3_log}" >/dev/null 2>&1) \\
+  || echo "[arctic-migration] lane telemetry publish skipped/failed"; }}
+fail() {{ echo "[arctic-migration-prelude] FATAL: $1"; publish_lane error "FAILED on $(hostname -s): $1 — no migration was marked complete"; aws s3 cp {log} "{s3_log}" --region {REGION} --quiet || true; shutdown -h now; exit 1; }}
 systemd-run --on-active={MAX_RUNTIME_SECONDS} --unit=alpha-engine-arctic-migration-watchdog \\
   --description='alpha-engine arctic-migration spot hard-timeout' /sbin/shutdown -h now || true
 dnf install -y -q python3.12 python3.12-pip python3.12-devel git gcc >/dev/null 2>&1 \\
@@ -464,6 +472,7 @@ rc=${{PIPESTATUS[0]}}
 set -e
 aws s3 cp {log} "{s3_log}" --region {REGION} --quiet || true
 [ "$rc" -eq 0 ] || fail "migration runner exited $rc"
+publish_lane ok "completed head {head} at merged_sha {merged_sha[:12]} on $(hostname -s)"
 echo "[arctic-migration] head {head} complete"
 """
 
@@ -509,6 +518,38 @@ def _running_instance_ids(head_migration_number: int) -> list[str]:
 
 def _terminate_instance(instance_id: str) -> None:
     spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="arctic-migration")
+
+
+def _publish_lane_start(instance_id: str, market: str, head: int) -> None:
+    """Mark `overseer-arctic-migration` as in flight on the console.
+
+    Never raises and never changes the dispatch outcome: the dispatcher's
+    deliverable is the box being in flight, and a telemetry blip must not turn
+    a successful dispatch into a failed one. A missing envelope renders as
+    unreadable on the console, never as `ok`, so the gap stays visible.
+    """
+    try:
+        from nousergon_lib import fleet_check_result as fcr
+
+        env = fcr.build(
+            check_id="overseer-arctic-migration",
+            label="Overseer lane: arctic-migration",
+            status=fcr.STATUS_ATTENTION,
+            summary=(
+                f"dispatched to {instance_id} ({market}) for head={head} — in "
+                f"flight, superseded by the box's own finish envelope; if this "
+                f"row persists, the prelude died before it could report"
+            ),
+            # Event-driven ("merge-triggered; no scheduled wake"), so there is
+            # no cadence to declare and the field is nulled after the builder's
+            # positivity check. See scripts/publish_lane_result.py for why an
+            # unauditable row is preferred to a fabricated cadence.
+            cadence_minutes=1,
+        )
+        env["cadence_minutes"] = None
+        fcr.emit(env)
+    except Exception:  # noqa: BLE001 — telemetry must not fail the dispatch
+        logger.warning("could not publish the arctic-migration start row", exc_info=True)
 
 
 def handler(event: dict, context) -> dict:
@@ -609,6 +650,15 @@ def handler(event: dict, context) -> dict:
         "arctic-migration dispatched: instance=%s market=%s command=%s head=%d sha=%s",
         instance_id, market, command_id, head, fields["merged_sha"],
     )
+
+    # The lane's START row (alpha-engine-config-I7029). `attention`, never `ok`:
+    # a dispatcher starting a box says NOTHING about whether the lane ran, and
+    # rendering a lane green because its dispatcher succeeded is the specific
+    # thing I7029 forbids. This exists because the on-box `fail()` is reachable
+    # before the clone that carries the publisher — so for the earliest prelude
+    # failures this DEGRADED row is the only record, and it stands until the
+    # box's own finish envelope supersedes it.
+    _publish_lane_start(instance_id, market, head)
 
     # Arm the defer-not-drop safety-net (config#2226): create a one-shot
     # schedule that re-checks the completion marker in DEFER_DELAY_SECONDS.
