@@ -1,0 +1,3804 @@
+{
+ "changes": [
+  {
+   "action": "removed",
+   "date": "1976-07-01",
+   "ticker": "AYE"
+  },
+  {
+   "action": "added",
+   "date": "1976-07-01",
+   "ticker": "BUD"
+  },
+  {
+   "action": "added",
+   "date": "1976-07-01",
+   "ticker": "DIS"
+  },
+  {
+   "action": "removed",
+   "date": "1976-07-01",
+   "ticker": "HNG"
+  },
+  {
+   "action": "removed",
+   "date": "1994-09-30",
+   "ticker": "MCK"
+  },
+  {
+   "action": "added",
+   "date": "1994-09-30",
+   "ticker": "NCC"
+  },
+  {
+   "action": "added",
+   "date": "1997-06-17",
+   "ticker": "CCR"
+  },
+  {
+   "action": "removed",
+   "date": "1997-06-17",
+   "ticker": "USL"
+  },
+  {
+   "action": "removed",
+   "date": "1998-12-11",
+   "ticker": "AN"
+  },
+  {
+   "action": "added",
+   "date": "1998-12-11",
+   "ticker": "CCL"
+  },
+  {
+   "action": "added",
+   "date": "1998-12-11",
+   "ticker": "CPWR"
+  },
+  {
+   "action": "added",
+   "date": "1998-12-11",
+   "ticker": "FSR"
+  },
+  {
+   "action": "removed",
+   "date": "1998-12-11",
+   "ticker": "GRN"
+  },
+  {
+   "action": "removed",
+   "date": "1998-12-11",
+   "ticker": "SUN"
+  },
+  {
+   "action": "added",
+   "date": "1999-04-12",
+   "ticker": "ACT"
+  },
+  {
+   "action": "removed",
+   "date": "1999-06-09",
+   "ticker": "HPH"
+  },
+  {
+   "action": "added",
+   "date": "1999-06-09",
+   "ticker": "WLP"
+  },
+  {
+   "action": "removed",
+   "date": "1999-12-08",
+   "ticker": "LDW"
+  },
+  {
+   "action": "added",
+   "date": "1999-12-08",
+   "ticker": "YHOO"
+  },
+  {
+   "action": "added",
+   "date": "2000-06-07",
+   "ticker": "SBUX"
+  },
+  {
+   "action": "removed",
+   "date": "2000-06-07",
+   "ticker": "SMS"
+  },
+  {
+   "action": "added",
+   "date": "2000-06-12",
+   "ticker": "CVG"
+  },
+  {
+   "action": "removed",
+   "date": "2000-06-12",
+   "ticker": "TMC"
+  },
+  {
+   "action": "added",
+   "date": "2000-07-27",
+   "ticker": "JDSU"
+  },
+  {
+   "action": "removed",
+   "date": "2000-07-27",
+   "ticker": "RAD"
+  },
+  {
+   "action": "added",
+   "date": "2000-12-05",
+   "ticker": "ABK"
+  },
+  {
+   "action": "added",
+   "date": "2000-12-05",
+   "ticker": "AYE"
+  },
+  {
+   "action": "removed",
+   "date": "2000-12-05",
+   "ticker": "BS"
+  },
+  {
+   "action": "removed",
+   "date": "2000-12-05",
+   "ticker": "CCK"
+  },
+  {
+   "action": "removed",
+   "date": "2000-12-05",
+   "ticker": "GRA"
+  },
+  {
+   "action": "added",
+   "date": "2000-12-05",
+   "ticker": "INTU"
+  },
+  {
+   "action": "removed",
+   "date": "2000-12-05",
+   "ticker": "OI"
+  },
+  {
+   "action": "added",
+   "date": "2000-12-05",
+   "ticker": "SBL"
+  },
+  {
+   "action": "added",
+   "date": "2003-09-25",
+   "ticker": "ESRX"
+  },
+  {
+   "action": "removed",
+   "date": "2003-09-25",
+   "ticker": "QTRN"
+  },
+  {
+   "action": "removed",
+   "date": "2005-07-01",
+   "ticker": "GLK"
+  },
+  {
+   "action": "added",
+   "date": "2005-07-01",
+   "ticker": "STZ"
+  },
+  {
+   "action": "added",
+   "date": "2005-11-18",
+   "ticker": "AMZN"
+  },
+  {
+   "action": "removed",
+   "date": "2005-11-18",
+   "ticker": "T"
+  },
+  {
+   "action": "removed",
+   "date": "2006-06-02",
+   "ticker": "ABS"
+  },
+  {
+   "action": "added",
+   "date": "2006-06-02",
+   "ticker": "JNPR"
+  },
+  {
+   "action": "added",
+   "date": "2007-01-10",
+   "ticker": "AVB"
+  },
+  {
+   "action": "removed",
+   "date": "2007-01-10",
+   "ticker": "SBL"
+  },
+  {
+   "action": "added",
+   "date": "2007-03-30",
+   "ticker": "KFT"
+  },
+  {
+   "action": "removed",
+   "date": "2007-03-30",
+   "ticker": "TSG"
+  },
+  {
+   "action": "removed",
+   "date": "2007-07-02",
+   "ticker": "ADCT"
+  },
+  {
+   "action": "added",
+   "date": "2007-07-02",
+   "ticker": "DFS"
+  },
+  {
+   "action": "removed",
+   "date": "2007-08-24",
+   "ticker": "KSE"
+  },
+  {
+   "action": "added",
+   "date": "2007-08-24",
+   "ticker": "LUK"
+  },
+  {
+   "action": "removed",
+   "date": "2007-09-26",
+   "ticker": "FDC"
+  },
+  {
+   "action": "added",
+   "date": "2007-09-26",
+   "ticker": "ICE"
+  },
+  {
+   "action": "removed",
+   "date": "2007-09-27",
+   "ticker": "MXIM"
+  },
+  {
+   "action": "added",
+   "date": "2007-09-27",
+   "ticker": "TSO"
+  },
+  {
+   "action": "removed",
+   "date": "2007-10-01",
+   "ticker": "NCR"
+  },
+  {
+   "action": "added",
+   "date": "2007-10-01",
+   "ticker": "TDC"
+  },
+  {
+   "action": "added",
+   "date": "2007-10-02",
+   "ticker": "EXPE"
+  },
+  {
+   "action": "removed",
+   "date": "2007-10-02",
+   "ticker": "SLR"
+  },
+  {
+   "action": "removed",
+   "date": "2007-10-26",
+   "ticker": "AV"
+  },
+  {
+   "action": "added",
+   "date": "2007-10-26",
+   "ticker": "JEC"
+  },
+  {
+   "action": "removed",
+   "date": "2007-12-13",
+   "ticker": "DJ"
+  },
+  {
+   "action": "added",
+   "date": "2007-12-13",
+   "ticker": "GME"
+  },
+  {
+   "action": "added",
+   "date": "2007-12-20",
+   "ticker": "RRC"
+  },
+  {
+   "action": "removed",
+   "date": "2007-12-20",
+   "ticker": "TRB"
+  },
+  {
+   "action": "removed",
+   "date": "2008-06-10",
+   "ticker": "ABK"
+  },
+  {
+   "action": "added",
+   "date": "2008-06-10",
+   "ticker": "LO"
+  },
+  {
+   "action": "removed",
+   "date": "2008-06-23",
+   "ticker": "BC"
+  },
+  {
+   "action": "added",
+   "date": "2008-06-23",
+   "ticker": "COG"
+  },
+  {
+   "action": "added",
+   "date": "2008-06-23",
+   "ticker": "MEE"
+  },
+  {
+   "action": "removed",
+   "date": "2008-06-23",
+   "ticker": "OMX"
+  },
+  {
+   "action": "added",
+   "date": "2008-07-01",
+   "ticker": "AKS"
+  },
+  {
+   "action": "removed",
+   "date": "2008-07-01",
+   "ticker": "CFC"
+  },
+  {
+   "action": "added",
+   "date": "2008-09-12",
+   "ticker": "CRM"
+  },
+  {
+   "action": "added",
+   "date": "2008-09-12",
+   "ticker": "FAST"
+  },
+  {
+   "action": "removed",
+   "date": "2008-09-12",
+   "ticker": "FNM"
+  },
+  {
+   "action": "removed",
+   "date": "2008-09-12",
+   "ticker": "FRE"
+  },
+  {
+   "action": "added",
+   "date": "2008-09-16",
+   "ticker": "HRS"
+  },
+  {
+   "action": "removed",
+   "date": "2008-09-16",
+   "ticker": "LEH"
+  },
+  {
+   "action": "added",
+   "date": "2008-12-31",
+   "ticker": "OI"
+  },
+  {
+   "action": "removed",
+   "date": "2008-12-31",
+   "ticker": "WB"
+  },
+  {
+   "action": "removed",
+   "date": "2009-03-03",
+   "ticker": "ACAS"
+  },
+  {
+   "action": "added",
+   "date": "2009-03-03",
+   "ticker": "HRL"
+  },
+  {
+   "action": "removed",
+   "date": "2009-03-03",
+   "ticker": "JNY"
+  },
+  {
+   "action": "added",
+   "date": "2009-03-03",
+   "ticker": "VTR"
+  },
+  {
+   "action": "removed",
+   "date": "2009-06-05",
+   "ticker": "COV"
+  },
+  {
+   "action": "added",
+   "date": "2009-06-05",
+   "ticker": "FTI"
+  },
+  {
+   "action": "removed",
+   "date": "2009-06-25",
+   "ticker": "TEL"
+  },
+  {
+   "action": "added",
+   "date": "2009-06-29",
+   "ticker": "PCS"
+  },
+  {
+   "action": "removed",
+   "date": "2009-08-19",
+   "ticker": "CTX"
+  },
+  {
+   "action": "added",
+   "date": "2009-08-19",
+   "ticker": "FMC"
+  },
+  {
+   "action": "added",
+   "date": "2009-09-28",
+   "ticker": "ARG"
+  },
+  {
+   "action": "removed",
+   "date": "2009-09-28",
+   "ticker": "CBE"
+  },
+  {
+   "action": "added",
+   "date": "2009-11-03",
+   "ticker": "PCLN"
+  },
+  {
+   "action": "removed",
+   "date": "2009-11-03",
+   "ticker": "SGP"
+  },
+  {
+   "action": "removed",
+   "date": "2009-12-18",
+   "ticker": "CIEN"
+  },
+  {
+   "action": "added",
+   "date": "2009-12-18",
+   "ticker": "CLF"
+  },
+  {
+   "action": "removed",
+   "date": "2009-12-18",
+   "ticker": "CVG"
+  },
+  {
+   "action": "removed",
+   "date": "2009-12-18",
+   "ticker": "DYN"
+  },
+  {
+   "action": "removed",
+   "date": "2009-12-18",
+   "ticker": "KBH"
+  },
+  {
+   "action": "removed",
+   "date": "2009-12-18",
+   "ticker": "MBI"
+  },
+  {
+   "action": "added",
+   "date": "2009-12-18",
+   "ticker": "MJN"
+  },
+  {
+   "action": "added",
+   "date": "2009-12-18",
+   "ticker": "ROST"
+  },
+  {
+   "action": "added",
+   "date": "2009-12-18",
+   "ticker": "SAI"
+  },
+  {
+   "action": "added",
+   "date": "2009-12-18",
+   "ticker": "V"
+  },
+  {
+   "action": "added",
+   "date": "2010-02-26",
+   "ticker": "HP"
+  },
+  {
+   "action": "removed",
+   "date": "2010-02-26",
+   "ticker": "RX"
+  },
+  {
+   "action": "removed",
+   "date": "2010-04-29",
+   "ticker": "BJS"
+  },
+  {
+   "action": "added",
+   "date": "2010-04-29",
+   "ticker": "CERN"
+  },
+  {
+   "action": "added",
+   "date": "2010-06-28",
+   "ticker": "KMX"
+  },
+  {
+   "action": "removed",
+   "date": "2010-06-28",
+   "ticker": "XTO"
+  },
+  {
+   "action": "added",
+   "date": "2010-06-30",
+   "ticker": "QEP"
+  },
+  {
+   "action": "removed",
+   "date": "2010-06-30",
+   "ticker": "STR"
+  },
+  {
+   "action": "added",
+   "date": "2010-07-14",
+   "ticker": "CB"
+  },
+  {
+   "action": "removed",
+   "date": "2010-07-14",
+   "ticker": "MIL"
+  },
+  {
+   "action": "removed",
+   "date": "2010-08-26",
+   "ticker": "SII"
+  },
+  {
+   "action": "added",
+   "date": "2010-08-26",
+   "ticker": "TYC"
+  },
+  {
+   "action": "added",
+   "date": "2010-11-17",
+   "ticker": "IR"
+  },
+  {
+   "action": "removed",
+   "date": "2010-11-17",
+   "ticker": "PTV"
+  },
+  {
+   "action": "added",
+   "date": "2010-12-17",
+   "ticker": "CVC"
+  },
+  {
+   "action": "removed",
+   "date": "2010-12-17",
+   "ticker": "EK"
+  },
+  {
+   "action": "added",
+   "date": "2010-12-17",
+   "ticker": "FFIV"
+  },
+  {
+   "action": "removed",
+   "date": "2010-12-17",
+   "ticker": "KG"
+  },
+  {
+   "action": "added",
+   "date": "2010-12-17",
+   "ticker": "NFLX"
+  },
+  {
+   "action": "added",
+   "date": "2010-12-17",
+   "ticker": "NFX"
+  },
+  {
+   "action": "removed",
+   "date": "2010-12-17",
+   "ticker": "NYT"
+  },
+  {
+   "action": "removed",
+   "date": "2010-12-17",
+   "ticker": "ODP"
+  },
+  {
+   "action": "removed",
+   "date": "2011-01-03",
+   "ticker": "MDP"
+  },
+  {
+   "action": "added",
+   "date": "2011-01-03",
+   "ticker": "MMI"
+  },
+  {
+   "action": "removed",
+   "date": "2011-02-25",
+   "ticker": "AYE"
+  },
+  {
+   "action": "added",
+   "date": "2011-02-25",
+   "ticker": "JOYG"
+  },
+  {
+   "action": "added",
+   "date": "2011-02-28",
+   "ticker": "COV"
+  },
+  {
+   "action": "removed",
+   "date": "2011-02-28",
+   "ticker": "MFE"
+  },
+  {
+   "action": "added",
+   "date": "2011-03-31",
+   "ticker": "EW"
+  },
+  {
+   "action": "removed",
+   "date": "2011-03-31",
+   "ticker": "Q"
+  },
+  {
+   "action": "added",
+   "date": "2011-04-01",
+   "ticker": "BLK"
+  },
+  {
+   "action": "removed",
+   "date": "2011-04-01",
+   "ticker": "GENZ"
+  },
+  {
+   "action": "added",
+   "date": "2011-04-27",
+   "ticker": "CMG"
+  },
+  {
+   "action": "removed",
+   "date": "2011-04-27",
+   "ticker": "NOVL"
+  },
+  {
+   "action": "added",
+   "date": "2011-06-01",
+   "ticker": "ANR"
+  },
+  {
+   "action": "removed",
+   "date": "2011-06-01",
+   "ticker": "MEE"
+  },
+  {
+   "action": "added",
+   "date": "2011-06-30",
+   "ticker": "MPC"
+  },
+  {
+   "action": "removed",
+   "date": "2011-06-30",
+   "ticker": "RSH"
+  },
+  {
+   "action": "added",
+   "date": "2011-07-05",
+   "ticker": "ACN"
+  },
+  {
+   "action": "removed",
+   "date": "2011-07-05",
+   "ticker": "MI"
+  },
+  {
+   "action": "added",
+   "date": "2011-09-23",
+   "ticker": "MOS"
+  },
+  {
+   "action": "removed",
+   "date": "2011-09-23",
+   "ticker": "NSM"
+  },
+  {
+   "action": "removed",
+   "date": "2011-10-14",
+   "ticker": "CEPH"
+  },
+  {
+   "action": "added",
+   "date": "2011-10-14",
+   "ticker": "TEL"
+  },
+  {
+   "action": "removed",
+   "date": "2011-10-31",
+   "ticker": "ITT"
+  },
+  {
+   "action": "added",
+   "date": "2011-10-31",
+   "ticker": "XYL"
+  },
+  {
+   "action": "added",
+   "date": "2011-11-18",
+   "ticker": "CBE"
+  },
+  {
+   "action": "removed",
+   "date": "2011-11-18",
+   "ticker": "JNS"
+  },
+  {
+   "action": "added",
+   "date": "2011-12-12",
+   "ticker": "GAS"
+  },
+  {
+   "action": "removed",
+   "date": "2011-12-12",
+   "ticker": "GAS"
+  },
+  {
+   "action": "removed",
+   "date": "2011-12-16",
+   "ticker": "AKS"
+  },
+  {
+   "action": "added",
+   "date": "2011-12-16",
+   "ticker": "BWA"
+  },
+  {
+   "action": "added",
+   "date": "2011-12-16",
+   "ticker": "DLTR"
+  },
+  {
+   "action": "removed",
+   "date": "2011-12-16",
+   "ticker": "MWW"
+  },
+  {
+   "action": "added",
+   "date": "2011-12-16",
+   "ticker": "PRGO"
+  },
+  {
+   "action": "removed",
+   "date": "2011-12-16",
+   "ticker": "WFR"
+  },
+  {
+   "action": "removed",
+   "date": "2011-12-20",
+   "ticker": "TLAB"
+  },
+  {
+   "action": "added",
+   "date": "2011-12-20",
+   "ticker": "TRIP"
+  },
+  {
+   "action": "removed",
+   "date": "2011-12-31",
+   "ticker": "CPWR"
+  },
+  {
+   "action": "added",
+   "date": "2011-12-31",
+   "ticker": "WPX"
+  },
+  {
+   "action": "added",
+   "date": "2012-03-13",
+   "ticker": "CCI"
+  },
+  {
+   "action": "removed",
+   "date": "2012-03-13",
+   "ticker": "CEG"
+  },
+  {
+   "action": "added",
+   "date": "2012-04-03",
+   "ticker": "FOSL"
+  },
+  {
+   "action": "removed",
+   "date": "2012-04-03",
+   "ticker": "MHS"
+  },
+  {
+   "action": "added",
+   "date": "2012-04-23",
+   "ticker": "PSX"
+  },
+  {
+   "action": "removed",
+   "date": "2012-04-23",
+   "ticker": "SVU"
+  },
+  {
+   "action": "removed",
+   "date": "2012-05-17",
+   "ticker": "EP"
+  },
+  {
+   "action": "added",
+   "date": "2012-05-17",
+   "ticker": "KMI"
+  },
+  {
+   "action": "added",
+   "date": "2012-05-21",
+   "ticker": "ALXN"
+  },
+  {
+   "action": "removed",
+   "date": "2012-05-21",
+   "ticker": "MMI"
+  },
+  {
+   "action": "added",
+   "date": "2012-06-05",
+   "ticker": "LRCX"
+  },
+  {
+   "action": "removed",
+   "date": "2012-06-05",
+   "ticker": "NVLS"
+  },
+  {
+   "action": "added",
+   "date": "2012-06-29",
+   "ticker": "MNST"
+  },
+  {
+   "action": "removed",
+   "date": "2012-06-29",
+   "ticker": "SLE"
+  },
+  {
+   "action": "removed",
+   "date": "2012-07-02",
+   "ticker": "PGN"
+  },
+  {
+   "action": "added",
+   "date": "2012-07-02",
+   "ticker": "STX"
+  },
+  {
+   "action": "added",
+   "date": "2012-07-31",
+   "ticker": "ESV"
+  },
+  {
+   "action": "removed",
+   "date": "2012-07-31",
+   "ticker": "GR"
+  },
+  {
+   "action": "added",
+   "date": "2012-09-05",
+   "ticker": "LYB"
+  },
+  {
+   "action": "removed",
+   "date": "2012-09-05",
+   "ticker": "SHLD"
+  },
+  {
+   "action": "added",
+   "date": "2012-10-01",
+   "ticker": "ADT"
+  },
+  {
+   "action": "removed",
+   "date": "2012-10-01",
+   "ticker": "DV"
+  },
+  {
+   "action": "removed",
+   "date": "2012-10-01",
+   "ticker": "LXK"
+  },
+  {
+   "action": "added",
+   "date": "2012-10-01",
+   "ticker": "PNR"
+  },
+  {
+   "action": "removed",
+   "date": "2012-10-02",
+   "ticker": "ANR"
+  },
+  {
+   "action": "removed",
+   "date": "2012-10-02",
+   "ticker": "KFT"
+  },
+  {
+   "action": "added",
+   "date": "2012-10-02",
+   "ticker": "KRFT"
+  },
+  {
+   "action": "added",
+   "date": "2012-10-02",
+   "ticker": "MDLZ"
+  },
+  {
+   "action": "added",
+   "date": "2012-10-10",
+   "ticker": "PETM"
+  },
+  {
+   "action": "removed",
+   "date": "2012-10-10",
+   "ticker": "SUN"
+  },
+  {
+   "action": "removed",
+   "date": "2012-12-03",
+   "ticker": "CBE"
+  },
+  {
+   "action": "added",
+   "date": "2012-12-03",
+   "ticker": "DG"
+  },
+  {
+   "action": "added",
+   "date": "2012-12-11",
+   "ticker": "GRMN"
+  },
+  {
+   "action": "removed",
+   "date": "2012-12-11",
+   "ticker": "RRD"
+  },
+  {
+   "action": "added",
+   "date": "2012-12-21",
+   "ticker": "DLPH"
+  },
+  {
+   "action": "removed",
+   "date": "2012-12-21",
+   "ticker": "TIE"
+  },
+  {
+   "action": "added",
+   "date": "2013-01-02",
+   "ticker": "ABBV"
+  },
+  {
+   "action": "removed",
+   "date": "2013-01-02",
+   "ticker": "FII"
+  },
+  {
+   "action": "removed",
+   "date": "2013-02-15",
+   "ticker": "BIG"
+  },
+  {
+   "action": "added",
+   "date": "2013-02-15",
+   "ticker": "PVH"
+  },
+  {
+   "action": "removed",
+   "date": "2013-04-30",
+   "ticker": "PCS"
+  },
+  {
+   "action": "added",
+   "date": "2013-04-30",
+   "ticker": "REGN"
+  },
+  {
+   "action": "removed",
+   "date": "2013-05-08",
+   "ticker": "CVH"
+  },
+  {
+   "action": "added",
+   "date": "2013-05-08",
+   "ticker": "MAC"
+  },
+  {
+   "action": "removed",
+   "date": "2013-05-23",
+   "ticker": "DF"
+  },
+  {
+   "action": "added",
+   "date": "2013-05-23",
+   "ticker": "KSU"
+  },
+  {
+   "action": "added",
+   "date": "2013-06-06",
+   "ticker": "GM"
+  },
+  {
+   "action": "removed",
+   "date": "2013-06-06",
+   "ticker": "HNZ"
+  },
+  {
+   "action": "removed",
+   "date": "2013-06-21",
+   "ticker": "FHN"
+  },
+  {
+   "action": "added",
+   "date": "2013-06-21",
+   "ticker": "ZTS"
+  },
+  {
+   "action": "removed",
+   "date": "2013-07-01",
+   "ticker": "APOL"
+  },
+  {
+   "action": "added",
+   "date": "2013-07-01",
+   "ticker": "NWSA"
+  },
+  {
+   "action": "added",
+   "date": "2013-07-08",
+   "ticker": "NLSN"
+  },
+  {
+   "action": "removed",
+   "date": "2013-07-08",
+   "ticker": "S"
+  },
+  {
+   "action": "removed",
+   "date": "2013-09-10",
+   "ticker": "BMC"
+  },
+  {
+   "action": "added",
+   "date": "2013-09-10",
+   "ticker": "DAL"
+  },
+  {
+   "action": "removed",
+   "date": "2013-09-20",
+   "ticker": "AMD"
+  },
+  {
+   "action": "added",
+   "date": "2013-09-20",
+   "ticker": "AME"
+  },
+  {
+   "action": "removed",
+   "date": "2013-09-20",
+   "ticker": "SAI"
+  },
+  {
+   "action": "added",
+   "date": "2013-09-20",
+   "ticker": "VRTX"
+  },
+  {
+   "action": "removed",
+   "date": "2013-10-29",
+   "ticker": "DELL"
+  },
+  {
+   "action": "added",
+   "date": "2013-10-29",
+   "ticker": "RIG"
+  },
+  {
+   "action": "added",
+   "date": "2013-11-13",
+   "ticker": "KORS"
+  },
+  {
+   "action": "removed",
+   "date": "2013-11-13",
+   "ticker": "NYX"
+  },
+  {
+   "action": "added",
+   "date": "2013-12-02",
+   "ticker": "ALLE"
+  },
+  {
+   "action": "removed",
+   "date": "2013-12-02",
+   "ticker": "JCP"
+  },
+  {
+   "action": "added",
+   "date": "2013-12-10",
+   "ticker": "GGP"
+  },
+  {
+   "action": "removed",
+   "date": "2013-12-10",
+   "ticker": "MOLX"
+  },
+  {
+   "action": "added",
+   "date": "2013-12-23",
+   "ticker": "ADS"
+  },
+  {
+   "action": "removed",
+   "date": "2013-12-23",
+   "ticker": "ANF"
+  },
+  {
+   "action": "added",
+   "date": "2013-12-23",
+   "ticker": "FB"
+  },
+  {
+   "action": "removed",
+   "date": "2013-12-23",
+   "ticker": "JDSU"
+  },
+  {
+   "action": "added",
+   "date": "2013-12-23",
+   "ticker": "MHK"
+  },
+  {
+   "action": "removed",
+   "date": "2013-12-23",
+   "ticker": "TER"
+  },
+  {
+   "action": "removed",
+   "date": "2014-01-24",
+   "ticker": "LIFE"
+  },
+  {
+   "action": "added",
+   "date": "2014-01-24",
+   "ticker": "TSCO"
+  },
+  {
+   "action": "added",
+   "date": "2014-03-21",
+   "ticker": "GMCR"
+  },
+  {
+   "action": "removed",
+   "date": "2014-03-21",
+   "ticker": "WPX"
+  },
+  {
+   "action": "removed",
+   "date": "2014-04-02",
+   "ticker": "CLF"
+  },
+  {
+   "action": "added",
+   "date": "2014-04-02",
+   "ticker": "ESS"
+  },
+  {
+   "action": "added",
+   "date": "2014-04-03",
+   "ticker": "GOOGL"
+  },
+  {
+   "action": "removed",
+   "date": "2014-05-01",
+   "ticker": "BEAM"
+  },
+  {
+   "action": "added",
+   "date": "2014-05-01",
+   "ticker": "NAVI"
+  },
+  {
+   "action": "removed",
+   "date": "2014-05-01",
+   "ticker": "SLM"
+  },
+  {
+   "action": "added",
+   "date": "2014-05-01",
+   "ticker": "UA"
+  },
+  {
+   "action": "added",
+   "date": "2014-05-08",
+   "ticker": "AVGO"
+  },
+  {
+   "action": "removed",
+   "date": "2014-05-08",
+   "ticker": "LSI"
+  },
+  {
+   "action": "removed",
+   "date": "2014-06-20",
+   "ticker": "IGT"
+  },
+  {
+   "action": "added",
+   "date": "2014-06-20",
+   "ticker": "XEC"
+  },
+  {
+   "action": "added",
+   "date": "2014-07-01",
+   "ticker": "AMG"
+  },
+  {
+   "action": "removed",
+   "date": "2014-07-01",
+   "ticker": "FRX"
+  },
+  {
+   "action": "added",
+   "date": "2014-07-02",
+   "ticker": "MLM"
+  },
+  {
+   "action": "removed",
+   "date": "2014-07-02",
+   "ticker": "X"
+  },
+  {
+   "action": "added",
+   "date": "2014-08-06",
+   "ticker": "DISCK"
+  },
+  {
+   "action": "added",
+   "date": "2014-08-18",
+   "ticker": "MNK"
+  },
+  {
+   "action": "removed",
+   "date": "2014-08-18",
+   "ticker": "RDC"
+  },
+  {
+   "action": "removed",
+   "date": "2014-09-20",
+   "ticker": "BTU"
+  },
+  {
+   "action": "removed",
+   "date": "2014-09-20",
+   "ticker": "GHC"
+  },
+  {
+   "action": "added",
+   "date": "2014-09-20",
+   "ticker": "UHS"
+  },
+  {
+   "action": "added",
+   "date": "2014-09-20",
+   "ticker": "URI"
+  },
+  {
+   "action": "removed",
+   "date": "2014-11-05",
+   "ticker": "JBL"
+  },
+  {
+   "action": "added",
+   "date": "2014-11-05",
+   "ticker": "LVLT"
+  },
+  {
+   "action": "removed",
+   "date": "2014-12-05",
+   "ticker": "BMS"
+  },
+  {
+   "action": "added",
+   "date": "2014-12-05",
+   "ticker": "RCL"
+  },
+  {
+   "action": "removed",
+   "date": "2015-01-27",
+   "ticker": "COV"
+  },
+  {
+   "action": "added",
+   "date": "2015-01-27",
+   "ticker": "ENDP"
+  },
+  {
+   "action": "added",
+   "date": "2015-01-27",
+   "ticker": "HCA"
+  },
+  {
+   "action": "removed",
+   "date": "2015-01-27",
+   "ticker": "SWY"
+  },
+  {
+   "action": "removed",
+   "date": "2015-03-12",
+   "ticker": "PETM"
+  },
+  {
+   "action": "added",
+   "date": "2015-03-12",
+   "ticker": "SWKS"
+  },
+  {
+   "action": "removed",
+   "date": "2015-03-18",
+   "ticker": "CFN"
+  },
+  {
+   "action": "added",
+   "date": "2015-03-18",
+   "ticker": "HSIC"
+  },
+  {
+   "action": "added",
+   "date": "2015-03-23",
+   "ticker": "AAL"
+  },
+  {
+   "action": "removed",
+   "date": "2015-03-23",
+   "ticker": "AGN"
+  },
+  {
+   "action": "removed",
+   "date": "2015-03-23",
+   "ticker": "AVP"
+  },
+  {
+   "action": "removed",
+   "date": "2015-03-23",
+   "ticker": "DNR"
+  },
+  {
+   "action": "added",
+   "date": "2015-03-23",
+   "ticker": "EQIX"
+  },
+  {
+   "action": "added",
+   "date": "2015-03-23",
+   "ticker": "HBI"
+  },
+  {
+   "action": "removed",
+   "date": "2015-03-23",
+   "ticker": "NBR"
+  },
+  {
+   "action": "added",
+   "date": "2015-03-23",
+   "ticker": "SLG"
+  },
+  {
+   "action": "added",
+   "date": "2015-04-07",
+   "ticker": "O"
+  },
+  {
+   "action": "removed",
+   "date": "2015-04-07",
+   "ticker": "WIN"
+  },
+  {
+   "action": "removed",
+   "date": "2015-06-11",
+   "ticker": "LO"
+  },
+  {
+   "action": "added",
+   "date": "2015-06-11",
+   "ticker": "QRVO"
+  },
+  {
+   "action": "added",
+   "date": "2015-07-01",
+   "ticker": "BXLT"
+  },
+  {
+   "action": "added",
+   "date": "2015-07-01",
+   "ticker": "JBHT"
+  },
+  {
+   "action": "removed",
+   "date": "2015-07-01",
+   "ticker": "QEP"
+  },
+  {
+   "action": "removed",
+   "date": "2015-07-01",
+   "ticker": "TEG"
+  },
+  {
+   "action": "removed",
+   "date": "2015-07-02",
+   "ticker": "ATI"
+  },
+  {
+   "action": "added",
+   "date": "2015-07-02",
+   "ticker": "CPGX"
+  },
+  {
+   "action": "added",
+   "date": "2015-07-06",
+   "ticker": "KHC"
+  },
+  {
+   "action": "removed",
+   "date": "2015-07-06",
+   "ticker": "KRFT"
+  },
+  {
+   "action": "added",
+   "date": "2015-07-08",
+   "ticker": "AAP"
+  },
+  {
+   "action": "removed",
+   "date": "2015-07-08",
+   "ticker": "FDO"
+  },
+  {
+   "action": "removed",
+   "date": "2015-07-20",
+   "ticker": "NE"
+  },
+  {
+   "action": "added",
+   "date": "2015-07-20",
+   "ticker": "PYPL"
+  },
+  {
+   "action": "removed",
+   "date": "2015-07-29",
+   "ticker": "DTV"
+  },
+  {
+   "action": "added",
+   "date": "2015-07-29",
+   "ticker": "SIG"
+  },
+  {
+   "action": "added",
+   "date": "2015-08-28",
+   "ticker": "ATVI"
+  },
+  {
+   "action": "removed",
+   "date": "2015-08-28",
+   "ticker": "PLL"
+  },
+  {
+   "action": "removed",
+   "date": "2015-09-02",
+   "ticker": "HSP"
+  },
+  {
+   "action": "added",
+   "date": "2015-09-02",
+   "ticker": "UAL"
+  },
+  {
+   "action": "added",
+   "date": "2015-09-18",
+   "ticker": "CMCSK"
+  },
+  {
+   "action": "added",
+   "date": "2015-09-18",
+   "ticker": "FOX"
+  },
+  {
+   "action": "added",
+   "date": "2015-09-18",
+   "ticker": "NWS"
+  },
+  {
+   "action": "removed",
+   "date": "2015-10-07",
+   "ticker": "JOY"
+  },
+  {
+   "action": "added",
+   "date": "2015-10-07",
+   "ticker": "VRSK"
+  },
+  {
+   "action": "removed",
+   "date": "2015-11-02",
+   "ticker": "HCBK"
+  },
+  {
+   "action": "added",
+   "date": "2015-11-02",
+   "ticker": "HPE"
+  },
+  {
+   "action": "removed",
+   "date": "2015-11-18",
+   "ticker": "GNW"
+  },
+  {
+   "action": "added",
+   "date": "2015-11-18",
+   "ticker": "SYF"
+  },
+  {
+   "action": "added",
+   "date": "2015-11-19",
+   "ticker": "ILMN"
+  },
+  {
+   "action": "removed",
+   "date": "2015-11-19",
+   "ticker": "SIAL"
+  },
+  {
+   "action": "removed",
+   "date": "2015-12-01",
+   "ticker": "CSC"
+  },
+  {
+   "action": "added",
+   "date": "2015-12-01",
+   "ticker": "CSRA"
+  },
+  {
+   "action": "removed",
+   "date": "2015-12-15",
+   "ticker": "CMCSK"
+  },
+  {
+   "action": "removed",
+   "date": "2015-12-29",
+   "ticker": "ALTR"
+  },
+  {
+   "action": "added",
+   "date": "2015-12-29",
+   "ticker": "CHD"
+  },
+  {
+   "action": "removed",
+   "date": "2016-01-05",
+   "ticker": "FOSL"
+  },
+  {
+   "action": "added",
+   "date": "2016-01-05",
+   "ticker": "WLTW"
+  },
+  {
+   "action": "removed",
+   "date": "2016-01-19",
+   "ticker": "ACE"
+  },
+  {
+   "action": "added",
+   "date": "2016-01-19",
+   "ticker": "EXR"
+  },
+  {
+   "action": "removed",
+   "date": "2016-02-01",
+   "ticker": "BRCM"
+  },
+  {
+   "action": "added",
+   "date": "2016-02-01",
+   "ticker": "CFG"
+  },
+  {
+   "action": "added",
+   "date": "2016-02-01",
+   "ticker": "FRT"
+  },
+  {
+   "action": "removed",
+   "date": "2016-02-01",
+   "ticker": "PCP"
+  },
+  {
+   "action": "added",
+   "date": "2016-02-22",
+   "ticker": "CXO"
+  },
+  {
+   "action": "removed",
+   "date": "2016-02-22",
+   "ticker": "PCL"
+  },
+  {
+   "action": "added",
+   "date": "2016-03-04",
+   "ticker": "AWK"
+  },
+  {
+   "action": "removed",
+   "date": "2016-03-04",
+   "ticker": "CNX"
+  },
+  {
+   "action": "removed",
+   "date": "2016-03-07",
+   "ticker": "GMCR"
+  },
+  {
+   "action": "added",
+   "date": "2016-03-07",
+   "ticker": "UDR"
+  },
+  {
+   "action": "added",
+   "date": "2016-03-30",
+   "ticker": "CNC"
+  },
+  {
+   "action": "removed",
+   "date": "2016-03-30",
+   "ticker": "ESV"
+  },
+  {
+   "action": "added",
+   "date": "2016-03-30",
+   "ticker": "HOLX"
+  },
+  {
+   "action": "removed",
+   "date": "2016-03-30",
+   "ticker": "POM"
+  },
+  {
+   "action": "removed",
+   "date": "2016-04-04",
+   "ticker": "CAM"
+  },
+  {
+   "action": "added",
+   "date": "2016-04-04",
+   "ticker": "FL"
+  },
+  {
+   "action": "added",
+   "date": "2016-04-08",
+   "ticker": "UA"
+  },
+  {
+   "action": "removed",
+   "date": "2016-04-18",
+   "ticker": "THC"
+  },
+  {
+   "action": "added",
+   "date": "2016-04-18",
+   "ticker": "ULTA"
+  },
+  {
+   "action": "removed",
+   "date": "2016-04-25",
+   "ticker": "GME"
+  },
+  {
+   "action": "added",
+   "date": "2016-04-25",
+   "ticker": "GPN"
+  },
+  {
+   "action": "removed",
+   "date": "2016-05-03",
+   "ticker": "ADT"
+  },
+  {
+   "action": "added",
+   "date": "2016-05-03",
+   "ticker": "AYI"
+  },
+  {
+   "action": "added",
+   "date": "2016-05-13",
+   "ticker": "ALK"
+  },
+  {
+   "action": "removed",
+   "date": "2016-05-13",
+   "ticker": "SNDK"
+  },
+  {
+   "action": "added",
+   "date": "2016-05-18",
+   "ticker": "DLR"
+  },
+  {
+   "action": "removed",
+   "date": "2016-05-18",
+   "ticker": "TWC"
+  },
+  {
+   "action": "removed",
+   "date": "2016-05-23",
+   "ticker": "ARG"
+  },
+  {
+   "action": "added",
+   "date": "2016-05-23",
+   "ticker": "LKQ"
+  },
+  {
+   "action": "added",
+   "date": "2016-05-31",
+   "ticker": "AJG"
+  },
+  {
+   "action": "removed",
+   "date": "2016-05-31",
+   "ticker": "CCE"
+  },
+  {
+   "action": "removed",
+   "date": "2016-06-03",
+   "ticker": "BXLT"
+  },
+  {
+   "action": "added",
+   "date": "2016-06-03",
+   "ticker": "TDG"
+  },
+  {
+   "action": "removed",
+   "date": "2016-06-22",
+   "ticker": "CVC"
+  },
+  {
+   "action": "added",
+   "date": "2016-06-22",
+   "ticker": "FBHS"
+  },
+  {
+   "action": "added",
+   "date": "2016-07-01",
+   "ticker": "ALB"
+  },
+  {
+   "action": "removed",
+   "date": "2016-07-01",
+   "ticker": "GAS"
+  },
+  {
+   "action": "added",
+   "date": "2016-07-01",
+   "ticker": "LNT"
+  },
+  {
+   "action": "removed",
+   "date": "2016-07-01",
+   "ticker": "TE"
+  },
+  {
+   "action": "removed",
+   "date": "2016-07-05",
+   "ticker": "CPGX"
+  },
+  {
+   "action": "added",
+   "date": "2016-07-05",
+   "ticker": "FTV"
+  },
+  {
+   "action": "added",
+   "date": "2016-09-06",
+   "ticker": "MTD"
+  },
+  {
+   "action": "removed",
+   "date": "2016-09-06",
+   "ticker": "TYC"
+  },
+  {
+   "action": "added",
+   "date": "2016-09-08",
+   "ticker": "CHTR"
+  },
+  {
+   "action": "removed",
+   "date": "2016-09-08",
+   "ticker": "EMC"
+  },
+  {
+   "action": "added",
+   "date": "2016-09-22",
+   "ticker": "COO"
+  },
+  {
+   "action": "removed",
+   "date": "2016-09-22",
+   "ticker": "HOT"
+  },
+  {
+   "action": "added",
+   "date": "2016-09-30",
+   "ticker": "COTY"
+  },
+  {
+   "action": "removed",
+   "date": "2016-09-30",
+   "ticker": "DO"
+  },
+  {
+   "action": "removed",
+   "date": "2016-11-01",
+   "ticker": "AA"
+  },
+  {
+   "action": "added",
+   "date": "2016-11-01",
+   "ticker": "ARNC"
+  },
+  {
+   "action": "added",
+   "date": "2016-12-02",
+   "ticker": "EVHC"
+  },
+  {
+   "action": "removed",
+   "date": "2016-12-02",
+   "ticker": "LM"
+  },
+  {
+   "action": "added",
+   "date": "2016-12-02",
+   "ticker": "MAA"
+  },
+  {
+   "action": "removed",
+   "date": "2016-12-02",
+   "ticker": "OI"
+  },
+  {
+   "action": "added",
+   "date": "2017-01-05",
+   "ticker": "IDXX"
+  },
+  {
+   "action": "removed",
+   "date": "2017-01-05",
+   "ticker": "STJ"
+  },
+  {
+   "action": "added",
+   "date": "2017-02-28",
+   "ticker": "INCY"
+  },
+  {
+   "action": "removed",
+   "date": "2017-02-28",
+   "ticker": "SE"
+  },
+  {
+   "action": "added",
+   "date": "2017-03-01",
+   "ticker": "CBOE"
+  },
+  {
+   "action": "removed",
+   "date": "2017-03-01",
+   "ticker": "PBI"
+  },
+  {
+   "action": "removed",
+   "date": "2017-03-02",
+   "ticker": "ENDP"
+  },
+  {
+   "action": "added",
+   "date": "2017-03-02",
+   "ticker": "REG"
+  },
+  {
+   "action": "added",
+   "date": "2017-03-13",
+   "ticker": "DISH"
+  },
+  {
+   "action": "removed",
+   "date": "2017-03-13",
+   "ticker": "LLTC"
+  },
+  {
+   "action": "removed",
+   "date": "2017-03-16",
+   "ticker": "HAR"
+  },
+  {
+   "action": "added",
+   "date": "2017-03-16",
+   "ticker": "SNPS"
+  },
+  {
+   "action": "added",
+   "date": "2017-03-20",
+   "ticker": "AMD"
+  },
+  {
+   "action": "added",
+   "date": "2017-03-20",
+   "ticker": "ARE"
+  },
+  {
+   "action": "removed",
+   "date": "2017-03-20",
+   "ticker": "FSLR"
+  },
+  {
+   "action": "removed",
+   "date": "2017-03-20",
+   "ticker": "FTR"
+  },
+  {
+   "action": "added",
+   "date": "2017-03-20",
+   "ticker": "RJF"
+  },
+  {
+   "action": "removed",
+   "date": "2017-03-20",
+   "ticker": "URBN"
+  },
+  {
+   "action": "added",
+   "date": "2017-04-04",
+   "ticker": "DXC"
+  },
+  {
+   "action": "removed",
+   "date": "2017-04-04",
+   "ticker": "SWN"
+  },
+  {
+   "action": "removed",
+   "date": "2017-04-05",
+   "ticker": "DNB"
+  },
+  {
+   "action": "added",
+   "date": "2017-04-05",
+   "ticker": "IT"
+  },
+  {
+   "action": "added",
+   "date": "2017-06-02",
+   "ticker": "INFO"
+  },
+  {
+   "action": "removed",
+   "date": "2017-06-02",
+   "ticker": "TGNA"
+  },
+  {
+   "action": "added",
+   "date": "2017-06-19",
+   "ticker": "ALGN"
+  },
+  {
+   "action": "added",
+   "date": "2017-06-19",
+   "ticker": "ANSS"
+  },
+  {
+   "action": "added",
+   "date": "2017-06-19",
+   "ticker": "HLT"
+  },
+  {
+   "action": "removed",
+   "date": "2017-06-19",
+   "ticker": "MJN"
+  },
+  {
+   "action": "removed",
+   "date": "2017-06-19",
+   "ticker": "R"
+  },
+  {
+   "action": "added",
+   "date": "2017-06-19",
+   "ticker": "RE"
+  },
+  {
+   "action": "removed",
+   "date": "2017-06-19",
+   "ticker": "TDC"
+  },
+  {
+   "action": "removed",
+   "date": "2017-06-19",
+   "ticker": "YHOO"
+  },
+  {
+   "action": "removed",
+   "date": "2017-07-07",
+   "ticker": "BHI"
+  },
+  {
+   "action": "added",
+   "date": "2017-07-07",
+   "ticker": "BKR"
+  },
+  {
+   "action": "added",
+   "date": "2017-07-26",
+   "ticker": "AOS"
+  },
+  {
+   "action": "removed",
+   "date": "2017-07-26",
+   "ticker": "BBBY"
+  },
+  {
+   "action": "added",
+   "date": "2017-07-26",
+   "ticker": "DRE"
+  },
+  {
+   "action": "added",
+   "date": "2017-07-26",
+   "ticker": "MGM"
+  },
+  {
+   "action": "removed",
+   "date": "2017-07-26",
+   "ticker": "MNK"
+  },
+  {
+   "action": "removed",
+   "date": "2017-07-26",
+   "ticker": "MUR"
+  },
+  {
+   "action": "added",
+   "date": "2017-07-26",
+   "ticker": "PKG"
+  },
+  {
+   "action": "removed",
+   "date": "2017-07-26",
+   "ticker": "RAI"
+  },
+  {
+   "action": "removed",
+   "date": "2017-07-26",
+   "ticker": "RIG"
+  },
+  {
+   "action": "added",
+   "date": "2017-07-26",
+   "ticker": "RMD"
+  },
+  {
+   "action": "removed",
+   "date": "2017-08-08",
+   "ticker": "AN"
+  },
+  {
+   "action": "added",
+   "date": "2017-08-08",
+   "ticker": "BHF"
+  },
+  {
+   "action": "added",
+   "date": "2017-08-29",
+   "ticker": "Q"
+  },
+  {
+   "action": "removed",
+   "date": "2017-08-29",
+   "ticker": "WFM"
+  },
+  {
+   "action": "removed",
+   "date": "2017-09-01",
+   "ticker": "DD"
+  },
+  {
+   "action": "removed",
+   "date": "2017-09-01",
+   "ticker": "DOW"
+  },
+  {
+   "action": "added",
+   "date": "2017-09-01",
+   "ticker": "DWDP"
+  },
+  {
+   "action": "added",
+   "date": "2017-09-01",
+   "ticker": "SBAC"
+  },
+  {
+   "action": "added",
+   "date": "2017-09-18",
+   "ticker": "CDNS"
+  },
+  {
+   "action": "removed",
+   "date": "2017-09-18",
+   "ticker": "SPLS"
+  },
+  {
+   "action": "removed",
+   "date": "2017-10-13",
+   "ticker": "LVLT"
+  },
+  {
+   "action": "added",
+   "date": "2017-10-13",
+   "ticker": "NCLH"
+  },
+  {
+   "action": "added",
+   "date": "2017-11-15",
+   "ticker": "IQV"
+  },
+  {
+   "action": "removed",
+   "date": "2017-11-15",
+   "ticker": "Q"
+  },
+  {
+   "action": "removed",
+   "date": "2018-01-03",
+   "ticker": "BCR"
+  },
+  {
+   "action": "added",
+   "date": "2018-01-03",
+   "ticker": "HII"
+  },
+  {
+   "action": "added",
+   "date": "2018-03-07",
+   "ticker": "IPGP"
+  },
+  {
+   "action": "removed",
+   "date": "2018-03-07",
+   "ticker": "SNI"
+  },
+  {
+   "action": "removed",
+   "date": "2018-03-19",
+   "ticker": "CHK"
+  },
+  {
+   "action": "added",
+   "date": "2018-03-19",
+   "ticker": "NKTR"
+  },
+  {
+   "action": "removed",
+   "date": "2018-03-19",
+   "ticker": "PDCO"
+  },
+  {
+   "action": "removed",
+   "date": "2018-03-19",
+   "ticker": "SIG"
+  },
+  {
+   "action": "added",
+   "date": "2018-03-19",
+   "ticker": "SIVB"
+  },
+  {
+   "action": "added",
+   "date": "2018-03-19",
+   "ticker": "TTWO"
+  },
+  {
+   "action": "removed",
+   "date": "2018-04-04",
+   "ticker": "CSRA"
+  },
+  {
+   "action": "added",
+   "date": "2018-04-04",
+   "ticker": "MSCI"
+  },
+  {
+   "action": "added",
+   "date": "2018-05-31",
+   "ticker": "ABMD"
+  },
+  {
+   "action": "removed",
+   "date": "2018-05-31",
+   "ticker": "WYN"
+  },
+  {
+   "action": "added",
+   "date": "2018-06-05",
+   "ticker": "EVRG"
+  },
+  {
+   "action": "removed",
+   "date": "2018-06-05",
+   "ticker": "NAVI"
+  },
+  {
+   "action": "removed",
+   "date": "2018-06-07",
+   "ticker": "MON"
+  },
+  {
+   "action": "added",
+   "date": "2018-06-07",
+   "ticker": "TWTR"
+  },
+  {
+   "action": "removed",
+   "date": "2018-06-18",
+   "ticker": "AYI"
+  },
+  {
+   "action": "added",
+   "date": "2018-06-18",
+   "ticker": "BR"
+  },
+  {
+   "action": "added",
+   "date": "2018-06-18",
+   "ticker": "HFC"
+  },
+  {
+   "action": "removed",
+   "date": "2018-06-18",
+   "ticker": "RRC"
+  },
+  {
+   "action": "added",
+   "date": "2018-06-20",
+   "ticker": "FLT"
+  },
+  {
+   "action": "removed",
+   "date": "2018-06-20",
+   "ticker": "TWX"
+  },
+  {
+   "action": "added",
+   "date": "2018-07-02",
+   "ticker": "CPRT"
+  },
+  {
+   "action": "removed",
+   "date": "2018-07-02",
+   "ticker": "DPS"
+  },
+  {
+   "action": "added",
+   "date": "2018-08-28",
+   "ticker": "ANET"
+  },
+  {
+   "action": "removed",
+   "date": "2018-08-28",
+   "ticker": "GGP"
+  },
+  {
+   "action": "added",
+   "date": "2018-09-14",
+   "ticker": "WCG"
+  },
+  {
+   "action": "removed",
+   "date": "2018-09-14",
+   "ticker": "XL"
+  },
+  {
+   "action": "removed",
+   "date": "2018-10-01",
+   "ticker": "ANDV"
+  },
+  {
+   "action": "added",
+   "date": "2018-10-01",
+   "ticker": "ROL"
+  },
+  {
+   "action": "removed",
+   "date": "2018-10-11",
+   "ticker": "EVHC"
+  },
+  {
+   "action": "added",
+   "date": "2018-10-11",
+   "ticker": "FTNT"
+  },
+  {
+   "action": "removed",
+   "date": "2018-11-06",
+   "ticker": "CA"
+  },
+  {
+   "action": "added",
+   "date": "2018-11-06",
+   "ticker": "KEYS"
+  },
+  {
+   "action": "removed",
+   "date": "2018-11-13",
+   "ticker": "EQT"
+  },
+  {
+   "action": "added",
+   "date": "2018-11-13",
+   "ticker": "JKHY"
+  },
+  {
+   "action": "removed",
+   "date": "2018-12-03",
+   "ticker": "AET"
+  },
+  {
+   "action": "removed",
+   "date": "2018-12-03",
+   "ticker": "COL"
+  },
+  {
+   "action": "added",
+   "date": "2018-12-03",
+   "ticker": "FANG"
+  },
+  {
+   "action": "added",
+   "date": "2018-12-03",
+   "ticker": "LW"
+  },
+  {
+   "action": "added",
+   "date": "2018-12-03",
+   "ticker": "MXIM"
+  },
+  {
+   "action": "removed",
+   "date": "2018-12-03",
+   "ticker": "SRCL"
+  },
+  {
+   "action": "added",
+   "date": "2018-12-24",
+   "ticker": "CE"
+  },
+  {
+   "action": "removed",
+   "date": "2018-12-24",
+   "ticker": "ESRX"
+  },
+  {
+   "action": "added",
+   "date": "2019-01-02",
+   "ticker": "FRC"
+  },
+  {
+   "action": "removed",
+   "date": "2019-01-02",
+   "ticker": "SCG"
+  },
+  {
+   "action": "removed",
+   "date": "2019-01-18",
+   "ticker": "PCG"
+  },
+  {
+   "action": "added",
+   "date": "2019-01-18",
+   "ticker": "TFX"
+  },
+  {
+   "action": "added",
+   "date": "2019-02-15",
+   "ticker": "ATO"
+  },
+  {
+   "action": "removed",
+   "date": "2019-02-15",
+   "ticker": "NFX"
+  },
+  {
+   "action": "removed",
+   "date": "2019-02-27",
+   "ticker": "GT"
+  },
+  {
+   "action": "added",
+   "date": "2019-02-27",
+   "ticker": "WAB"
+  },
+  {
+   "action": "added",
+   "date": "2019-03-19",
+   "ticker": "FOX"
+  },
+  {
+   "action": "removed",
+   "date": "2019-03-19",
+   "ticker": "FOX"
+  },
+  {
+   "action": "added",
+   "date": "2019-03-19",
+   "ticker": "FOXA"
+  },
+  {
+   "action": "removed",
+   "date": "2019-03-19",
+   "ticker": "FOXA"
+  },
+  {
+   "action": "removed",
+   "date": "2019-04-02",
+   "ticker": "BHF"
+  },
+  {
+   "action": "added",
+   "date": "2019-04-02",
+   "ticker": "DOW"
+  },
+  {
+   "action": "added",
+   "date": "2019-06-03",
+   "ticker": "CTVA"
+  },
+  {
+   "action": "added",
+   "date": "2019-06-03",
+   "ticker": "DD"
+  },
+  {
+   "action": "removed",
+   "date": "2019-06-03",
+   "ticker": "DWDP"
+  },
+  {
+   "action": "removed",
+   "date": "2019-06-03",
+   "ticker": "FLR"
+  },
+  {
+   "action": "added",
+   "date": "2019-06-07",
+   "ticker": "BMS"
+  },
+  {
+   "action": "removed",
+   "date": "2019-06-07",
+   "ticker": "MAT"
+  },
+  {
+   "action": "added",
+   "date": "2019-06-11",
+   "ticker": "AMCR"
+  },
+  {
+   "action": "removed",
+   "date": "2019-06-11",
+   "ticker": "BMS"
+  },
+  {
+   "action": "removed",
+   "date": "2019-07-01",
+   "ticker": "LLL"
+  },
+  {
+   "action": "added",
+   "date": "2019-07-01",
+   "ticker": "MKTX"
+  },
+  {
+   "action": "removed",
+   "date": "2019-07-15",
+   "ticker": "RHT"
+  },
+  {
+   "action": "added",
+   "date": "2019-07-15",
+   "ticker": "TMUS"
+  },
+  {
+   "action": "removed",
+   "date": "2019-08-09",
+   "ticker": "APC"
+  },
+  {
+   "action": "removed",
+   "date": "2019-08-09",
+   "ticker": "FL"
+  },
+  {
+   "action": "added",
+   "date": "2019-08-09",
+   "ticker": "IEX"
+  },
+  {
+   "action": "added",
+   "date": "2019-08-09",
+   "ticker": "LDOS"
+  },
+  {
+   "action": "added",
+   "date": "2019-09-23",
+   "ticker": "CDW"
+  },
+  {
+   "action": "removed",
+   "date": "2019-09-23",
+   "ticker": "TSS"
+  },
+  {
+   "action": "removed",
+   "date": "2019-09-26",
+   "ticker": "JEF"
+  },
+  {
+   "action": "added",
+   "date": "2019-09-26",
+   "ticker": "NVR"
+  },
+  {
+   "action": "added",
+   "date": "2019-10-03",
+   "ticker": "LVS"
+  },
+  {
+   "action": "removed",
+   "date": "2019-10-03",
+   "ticker": "NKTR"
+  },
+  {
+   "action": "removed",
+   "date": "2019-11-21",
+   "ticker": "CELG"
+  },
+  {
+   "action": "added",
+   "date": "2019-11-21",
+   "ticker": "NOW"
+  },
+  {
+   "action": "removed",
+   "date": "2019-12-05",
+   "ticker": "VIAB"
+  },
+  {
+   "action": "added",
+   "date": "2019-12-05",
+   "ticker": "WRB"
+  },
+  {
+   "action": "added",
+   "date": "2019-12-09",
+   "ticker": "ODFL"
+  },
+  {
+   "action": "removed",
+   "date": "2019-12-09",
+   "ticker": "STI"
+  },
+  {
+   "action": "removed",
+   "date": "2019-12-23",
+   "ticker": "AMG"
+  },
+  {
+   "action": "added",
+   "date": "2019-12-23",
+   "ticker": "LYV"
+  },
+  {
+   "action": "removed",
+   "date": "2019-12-23",
+   "ticker": "MAC"
+  },
+  {
+   "action": "added",
+   "date": "2019-12-23",
+   "ticker": "STE"
+  },
+  {
+   "action": "removed",
+   "date": "2019-12-23",
+   "ticker": "TRIP"
+  },
+  {
+   "action": "added",
+   "date": "2019-12-23",
+   "ticker": "ZBRA"
+  },
+  {
+   "action": "added",
+   "date": "2020-01-28",
+   "ticker": "PAYC"
+  },
+  {
+   "action": "removed",
+   "date": "2020-01-28",
+   "ticker": "WCG"
+  },
+  {
+   "action": "added",
+   "date": "2020-03-02",
+   "ticker": "IR"
+  },
+  {
+   "action": "removed",
+   "date": "2020-03-02",
+   "ticker": "XEC"
+  },
+  {
+   "action": "removed",
+   "date": "2020-04-01",
+   "ticker": "ARNC"
+  },
+  {
+   "action": "added",
+   "date": "2020-04-01",
+   "ticker": "HWM"
+  },
+  {
+   "action": "added",
+   "date": "2020-04-03",
+   "ticker": "CARR"
+  },
+  {
+   "action": "added",
+   "date": "2020-04-03",
+   "ticker": "OTIS"
+  },
+  {
+   "action": "removed",
+   "date": "2020-04-06",
+   "ticker": "M"
+  },
+  {
+   "action": "removed",
+   "date": "2020-04-06",
+   "ticker": "RTN"
+  },
+  {
+   "action": "removed",
+   "date": "2020-05-12",
+   "ticker": "AGN"
+  },
+  {
+   "action": "removed",
+   "date": "2020-05-12",
+   "ticker": "CPRI"
+  },
+  {
+   "action": "added",
+   "date": "2020-05-12",
+   "ticker": "DPZ"
+  },
+  {
+   "action": "added",
+   "date": "2020-05-12",
+   "ticker": "DXCM"
+  },
+  {
+   "action": "removed",
+   "date": "2020-05-22",
+   "ticker": "HP"
+  },
+  {
+   "action": "added",
+   "date": "2020-05-22",
+   "ticker": "WST"
+  },
+  {
+   "action": "removed",
+   "date": "2020-06-22",
+   "ticker": "ADS"
+  },
+  {
+   "action": "added",
+   "date": "2020-06-22",
+   "ticker": "BIO"
+  },
+  {
+   "action": "removed",
+   "date": "2020-06-22",
+   "ticker": "HOG"
+  },
+  {
+   "action": "removed",
+   "date": "2020-06-22",
+   "ticker": "JWN"
+  },
+  {
+   "action": "added",
+   "date": "2020-06-22",
+   "ticker": "TDY"
+  },
+  {
+   "action": "added",
+   "date": "2020-06-22",
+   "ticker": "TYL"
+  },
+  {
+   "action": "removed",
+   "date": "2020-09-21",
+   "ticker": "COTY"
+  },
+  {
+   "action": "added",
+   "date": "2020-09-21",
+   "ticker": "CTLT"
+  },
+  {
+   "action": "added",
+   "date": "2020-09-21",
+   "ticker": "ETSY"
+  },
+  {
+   "action": "removed",
+   "date": "2020-09-21",
+   "ticker": "HRB"
+  },
+  {
+   "action": "removed",
+   "date": "2020-09-21",
+   "ticker": "KSS"
+  },
+  {
+   "action": "added",
+   "date": "2020-09-21",
+   "ticker": "TER"
+  },
+  {
+   "action": "removed",
+   "date": "2020-10-07",
+   "ticker": "ETFC"
+  },
+  {
+   "action": "added",
+   "date": "2020-10-07",
+   "ticker": "POOL"
+  },
+  {
+   "action": "added",
+   "date": "2020-10-09",
+   "ticker": "VNT"
+  },
+  {
+   "action": "removed",
+   "date": "2020-10-12",
+   "ticker": "NBL"
+  },
+  {
+   "action": "removed",
+   "date": "2020-12-21",
+   "ticker": "AIV"
+  },
+  {
+   "action": "added",
+   "date": "2020-12-21",
+   "ticker": "TSLA"
+  },
+  {
+   "action": "added",
+   "date": "2021-01-07",
+   "ticker": "ENPH"
+  },
+  {
+   "action": "removed",
+   "date": "2021-01-07",
+   "ticker": "TIF"
+  },
+  {
+   "action": "removed",
+   "date": "2021-01-21",
+   "ticker": "CXO"
+  },
+  {
+   "action": "added",
+   "date": "2021-01-21",
+   "ticker": "TRMB"
+  },
+  {
+   "action": "removed",
+   "date": "2021-02-12",
+   "ticker": "FTI"
+  },
+  {
+   "action": "added",
+   "date": "2021-02-12",
+   "ticker": "MPWR"
+  },
+  {
+   "action": "added",
+   "date": "2021-03-22",
+   "ticker": "CZR"
+  },
+  {
+   "action": "removed",
+   "date": "2021-03-22",
+   "ticker": "FLS"
+  },
+  {
+   "action": "added",
+   "date": "2021-03-22",
+   "ticker": "GNRC"
+  },
+  {
+   "action": "added",
+   "date": "2021-03-22",
+   "ticker": "NXPI"
+  },
+  {
+   "action": "added",
+   "date": "2021-03-22",
+   "ticker": "PENN"
+  },
+  {
+   "action": "removed",
+   "date": "2021-03-22",
+   "ticker": "SLG"
+  },
+  {
+   "action": "removed",
+   "date": "2021-03-22",
+   "ticker": "VNT"
+  },
+  {
+   "action": "removed",
+   "date": "2021-03-22",
+   "ticker": "XRX"
+  },
+  {
+   "action": "added",
+   "date": "2021-04-20",
+   "ticker": "PTC"
+  },
+  {
+   "action": "removed",
+   "date": "2021-04-20",
+   "ticker": "VAR"
+  },
+  {
+   "action": "added",
+   "date": "2021-05-14",
+   "ticker": "CRL"
+  },
+  {
+   "action": "removed",
+   "date": "2021-05-14",
+   "ticker": "FLIR"
+  },
+  {
+   "action": "added",
+   "date": "2021-06-03",
+   "ticker": "OGN"
+  },
+  {
+   "action": "removed",
+   "date": "2021-06-04",
+   "ticker": "HFC"
+  },
+  {
+   "action": "removed",
+   "date": "2021-07-21",
+   "ticker": "ALXN"
+  },
+  {
+   "action": "added",
+   "date": "2021-07-21",
+   "ticker": "MRNA"
+  },
+  {
+   "action": "removed",
+   "date": "2021-08-30",
+   "ticker": "MXIM"
+  },
+  {
+   "action": "added",
+   "date": "2021-08-30",
+   "ticker": "TECH"
+  },
+  {
+   "action": "added",
+   "date": "2021-09-20",
+   "ticker": "BRO"
+  },
+  {
+   "action": "added",
+   "date": "2021-09-20",
+   "ticker": "CDAY"
+  },
+  {
+   "action": "added",
+   "date": "2021-09-20",
+   "ticker": "MTCH"
+  },
+  {
+   "action": "removed",
+   "date": "2021-09-20",
+   "ticker": "NOV"
+  },
+  {
+   "action": "removed",
+   "date": "2021-09-20",
+   "ticker": "PRGO"
+  },
+  {
+   "action": "removed",
+   "date": "2021-09-20",
+   "ticker": "UNM"
+  },
+  {
+   "action": "added",
+   "date": "2021-12-14",
+   "ticker": "EPAM"
+  },
+  {
+   "action": "removed",
+   "date": "2021-12-14",
+   "ticker": "KSU"
+  },
+  {
+   "action": "added",
+   "date": "2021-12-20",
+   "ticker": "FDS"
+  },
+  {
+   "action": "removed",
+   "date": "2021-12-20",
+   "ticker": "HBI"
+  },
+  {
+   "action": "removed",
+   "date": "2021-12-20",
+   "ticker": "LEG"
+  },
+  {
+   "action": "added",
+   "date": "2021-12-20",
+   "ticker": "SBNY"
+  },
+  {
+   "action": "added",
+   "date": "2021-12-20",
+   "ticker": "SEDG"
+  },
+  {
+   "action": "removed",
+   "date": "2021-12-20",
+   "ticker": "WU"
+  },
+  {
+   "action": "removed",
+   "date": "2022-01-10",
+   "ticker": "WLTW"
+  },
+  {
+   "action": "added",
+   "date": "2022-01-10",
+   "ticker": "WTW"
+  },
+  {
+   "action": "added",
+   "date": "2022-02-02",
+   "ticker": "CEG"
+  },
+  {
+   "action": "removed",
+   "date": "2022-02-03",
+   "ticker": "GPS"
+  },
+  {
+   "action": "added",
+   "date": "2022-02-15",
+   "ticker": "NDSN"
+  },
+  {
+   "action": "removed",
+   "date": "2022-02-15",
+   "ticker": "XLNX"
+  },
+  {
+   "action": "removed",
+   "date": "2022-03-02",
+   "ticker": "INFO"
+  },
+  {
+   "action": "added",
+   "date": "2022-03-02",
+   "ticker": "MOH"
+  },
+  {
+   "action": "added",
+   "date": "2022-04-04",
+   "ticker": "CPT"
+  },
+  {
+   "action": "removed",
+   "date": "2022-04-04",
+   "ticker": "PBCT"
+  },
+  {
+   "action": "removed",
+   "date": "2022-04-11",
+   "ticker": "DISCA"
+  },
+  {
+   "action": "removed",
+   "date": "2022-04-11",
+   "ticker": "DISCK"
+  },
+  {
+   "action": "added",
+   "date": "2022-04-11",
+   "ticker": "WBD"
+  },
+  {
+   "action": "removed",
+   "date": "2022-06-08",
+   "ticker": "CERN"
+  },
+  {
+   "action": "added",
+   "date": "2022-06-08",
+   "ticker": "VICI"
+  },
+  {
+   "action": "removed",
+   "date": "2022-06-21",
+   "ticker": "IPGP"
+  },
+  {
+   "action": "added",
+   "date": "2022-06-21",
+   "ticker": "KDP"
+  },
+  {
+   "action": "added",
+   "date": "2022-06-21",
+   "ticker": "ON"
+  },
+  {
+   "action": "removed",
+   "date": "2022-06-21",
+   "ticker": "UA"
+  },
+  {
+   "action": "removed",
+   "date": "2022-06-21",
+   "ticker": "UAA"
+  },
+  {
+   "action": "added",
+   "date": "2022-09-19",
+   "ticker": "CSGP"
+  },
+  {
+   "action": "added",
+   "date": "2022-09-19",
+   "ticker": "INVH"
+  },
+  {
+   "action": "removed",
+   "date": "2022-09-19",
+   "ticker": "PENN"
+  },
+  {
+   "action": "removed",
+   "date": "2022-09-19",
+   "ticker": "PVH"
+  },
+  {
+   "action": "removed",
+   "date": "2022-10-03",
+   "ticker": "CTXS"
+  },
+  {
+   "action": "removed",
+   "date": "2022-10-03",
+   "ticker": "DRE"
+  },
+  {
+   "action": "added",
+   "date": "2022-10-03",
+   "ticker": "EQT"
+  },
+  {
+   "action": "added",
+   "date": "2022-10-03",
+   "ticker": "PCG"
+  },
+  {
+   "action": "removed",
+   "date": "2022-10-12",
+   "ticker": "NLSN"
+  },
+  {
+   "action": "added",
+   "date": "2022-10-12",
+   "ticker": "TRGP"
+  },
+  {
+   "action": "added",
+   "date": "2022-11-01",
+   "ticker": "ACGL"
+  },
+  {
+   "action": "removed",
+   "date": "2022-11-01",
+   "ticker": "TWTR"
+  },
+  {
+   "action": "added",
+   "date": "2022-12-15",
+   "ticker": "MBC"
+  },
+  {
+   "action": "removed",
+   "date": "2022-12-19",
+   "ticker": "FBHS"
+  },
+  {
+   "action": "added",
+   "date": "2022-12-19",
+   "ticker": "FSLR"
+  },
+  {
+   "action": "removed",
+   "date": "2022-12-19",
+   "ticker": "MBC"
+  },
+  {
+   "action": "removed",
+   "date": "2022-12-22",
+   "ticker": "ABMD"
+  },
+  {
+   "action": "added",
+   "date": "2022-12-22",
+   "ticker": "STLD"
+  },
+  {
+   "action": "added",
+   "date": "2023-01-04",
+   "ticker": "GEHC"
+  },
+  {
+   "action": "removed",
+   "date": "2023-01-05",
+   "ticker": "VNO"
+  },
+  {
+   "action": "added",
+   "date": "2023-03-15",
+   "ticker": "BG"
+  },
+  {
+   "action": "added",
+   "date": "2023-03-15",
+   "ticker": "PODD"
+  },
+  {
+   "action": "removed",
+   "date": "2023-03-15",
+   "ticker": "SBNY"
+  },
+  {
+   "action": "removed",
+   "date": "2023-03-15",
+   "ticker": "SIVB"
+  },
+  {
+   "action": "added",
+   "date": "2023-03-20",
+   "ticker": "FICO"
+  },
+  {
+   "action": "removed",
+   "date": "2023-03-20",
+   "ticker": "LUMN"
+  },
+  {
+   "action": "added",
+   "date": "2023-05-04",
+   "ticker": "AXON"
+  },
+  {
+   "action": "removed",
+   "date": "2023-05-04",
+   "ticker": "FRC"
+  },
+  {
+   "action": "removed",
+   "date": "2023-06-20",
+   "ticker": "DISH"
+  },
+  {
+   "action": "added",
+   "date": "2023-06-20",
+   "ticker": "PANW"
+  },
+  {
+   "action": "added",
+   "date": "2023-07-10",
+   "ticker": "EG"
+  },
+  {
+   "action": "removed",
+   "date": "2023-07-10",
+   "ticker": "RE"
+  },
+  {
+   "action": "removed",
+   "date": "2023-08-25",
+   "ticker": "AAP"
+  },
+  {
+   "action": "added",
+   "date": "2023-08-25",
+   "ticker": "KVUE"
+  },
+  {
+   "action": "added",
+   "date": "2023-09-18",
+   "ticker": "ABNB"
+  },
+  {
+   "action": "added",
+   "date": "2023-09-18",
+   "ticker": "BX"
+  },
+  {
+   "action": "removed",
+   "date": "2023-09-18",
+   "ticker": "LNC"
+  },
+  {
+   "action": "removed",
+   "date": "2023-09-18",
+   "ticker": "NWL"
+  },
+  {
+   "action": "added",
+   "date": "2023-10-02",
+   "ticker": "VLTO"
+  },
+  {
+   "action": "removed",
+   "date": "2023-10-03",
+   "ticker": "DXC"
+  },
+  {
+   "action": "removed",
+   "date": "2023-10-18",
+   "ticker": "ATVI"
+  },
+  {
+   "action": "added",
+   "date": "2023-10-18",
+   "ticker": "HUBB"
+  },
+  {
+   "action": "added",
+   "date": "2023-10-18",
+   "ticker": "LULU"
+  },
+  {
+   "action": "removed",
+   "date": "2023-10-18",
+   "ticker": "OGN"
+  },
+  {
+   "action": "removed",
+   "date": "2023-12-18",
+   "ticker": "ALK"
+  },
+  {
+   "action": "added",
+   "date": "2023-12-18",
+   "ticker": "BLDR"
+  },
+  {
+   "action": "added",
+   "date": "2023-12-18",
+   "ticker": "JBL"
+  },
+  {
+   "action": "removed",
+   "date": "2023-12-18",
+   "ticker": "SEDG"
+  },
+  {
+   "action": "removed",
+   "date": "2023-12-18",
+   "ticker": "SEE"
+  },
+  {
+   "action": "added",
+   "date": "2023-12-18",
+   "ticker": "UBER"
+  },
+  {
+   "action": "removed",
+   "date": "2024-02-01",
+   "ticker": "CDAY"
+  },
+  {
+   "action": "added",
+   "date": "2024-02-01",
+   "ticker": "DAY"
+  },
+  {
+   "action": "added",
+   "date": "2024-03-18",
+   "ticker": "DECK"
+  },
+  {
+   "action": "added",
+   "date": "2024-03-18",
+   "ticker": "SMCI"
+  },
+  {
+   "action": "removed",
+   "date": "2024-03-18",
+   "ticker": "WHR"
+  },
+  {
+   "action": "removed",
+   "date": "2024-03-18",
+   "ticker": "ZION"
+  },
+  {
+   "action": "added",
+   "date": "2024-03-25",
+   "ticker": "CPAY"
+  },
+  {
+   "action": "removed",
+   "date": "2024-03-25",
+   "ticker": "FLT"
+  },
+  {
+   "action": "added",
+   "date": "2024-04-01",
+   "ticker": "SOLV"
+  },
+  {
+   "action": "added",
+   "date": "2024-04-02",
+   "ticker": "GEV"
+  },
+  {
+   "action": "removed",
+   "date": "2024-04-03",
+   "ticker": "VFC"
+  },
+  {
+   "action": "removed",
+   "date": "2024-04-03",
+   "ticker": "XRAY"
+  },
+  {
+   "action": "removed",
+   "date": "2024-05-08",
+   "ticker": "PXD"
+  },
+  {
+   "action": "added",
+   "date": "2024-05-08",
+   "ticker": "VST"
+  },
+  {
+   "action": "removed",
+   "date": "2024-06-24",
+   "ticker": "CMA"
+  },
+  {
+   "action": "added",
+   "date": "2024-06-24",
+   "ticker": "CRWD"
+  },
+  {
+   "action": "added",
+   "date": "2024-06-24",
+   "ticker": "GDDY"
+  },
+  {
+   "action": "removed",
+   "date": "2024-06-24",
+   "ticker": "ILMN"
+  },
+  {
+   "action": "added",
+   "date": "2024-06-24",
+   "ticker": "KKR"
+  },
+  {
+   "action": "removed",
+   "date": "2024-06-24",
+   "ticker": "RHI"
+  },
+  {
+   "action": "removed",
+   "date": "2024-09-23",
+   "ticker": "AAL"
+  },
+  {
+   "action": "removed",
+   "date": "2024-09-23",
+   "ticker": "BIO"
+  },
+  {
+   "action": "added",
+   "date": "2024-09-23",
+   "ticker": "DELL"
+  },
+  {
+   "action": "added",
+   "date": "2024-09-23",
+   "ticker": "ERIE"
+  },
+  {
+   "action": "removed",
+   "date": "2024-09-23",
+   "ticker": "ETSY"
+  },
+  {
+   "action": "added",
+   "date": "2024-09-23",
+   "ticker": "PLTR"
+  },
+  {
+   "action": "added",
+   "date": "2024-09-30",
+   "ticker": "AMTM"
+  },
+  {
+   "action": "removed",
+   "date": "2024-10-01",
+   "ticker": "BBWI"
+  },
+  {
+   "action": "removed",
+   "date": "2024-11-26",
+   "ticker": "MRO"
+  },
+  {
+   "action": "added",
+   "date": "2024-11-26",
+   "ticker": "TPL"
+  },
+  {
+   "action": "removed",
+   "date": "2024-12-23",
+   "ticker": "AMTM"
+  },
+  {
+   "action": "added",
+   "date": "2024-12-23",
+   "ticker": "APO"
+  },
+  {
+   "action": "removed",
+   "date": "2024-12-23",
+   "ticker": "CTLT"
+  },
+  {
+   "action": "added",
+   "date": "2024-12-23",
+   "ticker": "LII"
+  },
+  {
+   "action": "removed",
+   "date": "2024-12-23",
+   "ticker": "QRVO"
+  },
+  {
+   "action": "added",
+   "date": "2024-12-23",
+   "ticker": "WDAY"
+  },
+  {
+   "action": "removed",
+   "date": "2025-03-24",
+   "ticker": "BWA"
+  },
+  {
+   "action": "removed",
+   "date": "2025-03-24",
+   "ticker": "CE"
+  },
+  {
+   "action": "added",
+   "date": "2025-03-24",
+   "ticker": "DASH"
+  },
+  {
+   "action": "added",
+   "date": "2025-03-24",
+   "ticker": "EXE"
+  },
+  {
+   "action": "removed",
+   "date": "2025-03-24",
+   "ticker": "FMC"
+  },
+  {
+   "action": "removed",
+   "date": "2025-03-24",
+   "ticker": "TFX"
+  },
+  {
+   "action": "added",
+   "date": "2025-03-24",
+   "ticker": "TKO"
+  },
+  {
+   "action": "added",
+   "date": "2025-03-24",
+   "ticker": "WSM"
+  },
+  {
+   "action": "added",
+   "date": "2025-05-19",
+   "ticker": "COIN"
+  },
+  {
+   "action": "removed",
+   "date": "2025-05-19",
+   "ticker": "DFS"
+  },
+  {
+   "action": "added",
+   "date": "2025-07-09",
+   "ticker": "DDOG"
+  },
+  {
+   "action": "removed",
+   "date": "2025-07-09",
+   "ticker": "JNPR"
+  },
+  {
+   "action": "removed",
+   "date": "2025-07-18",
+   "ticker": "ANSS"
+  },
+  {
+   "action": "added",
+   "date": "2025-07-18",
+   "ticker": "TTD"
+  },
+  {
+   "action": "removed",
+   "date": "2025-07-23",
+   "ticker": "HES"
+  },
+  {
+   "action": "added",
+   "date": "2025-07-23",
+   "ticker": "XYZ"
+  },
+  {
+   "action": "added",
+   "date": "2025-08-28",
+   "ticker": "IBKR"
+  },
+  {
+   "action": "removed",
+   "date": "2025-08-28",
+   "ticker": "WBA"
+  },
+  {
+   "action": "added",
+   "date": "2025-09-22",
+   "ticker": "APP"
+  },
+  {
+   "action": "removed",
+   "date": "2025-09-22",
+   "ticker": "CZR"
+  },
+  {
+   "action": "added",
+   "date": "2025-09-22",
+   "ticker": "EME"
+  },
+  {
+   "action": "removed",
+   "date": "2025-09-22",
+   "ticker": "ENPH"
+  },
+  {
+   "action": "added",
+   "date": "2025-09-22",
+   "ticker": "HOOD"
+  },
+  {
+   "action": "removed",
+   "date": "2025-09-22",
+   "ticker": "MKTX"
+  },
+  {
+   "action": "added",
+   "date": "2025-10-30",
+   "ticker": "SOLS"
+  },
+  {
+   "action": "removed",
+   "date": "2025-10-31",
+   "ticker": "KMX"
+  },
+  {
+   "action": "added",
+   "date": "2025-11-03",
+   "ticker": "Q"
+  },
+  {
+   "action": "removed",
+   "date": "2025-11-04",
+   "ticker": "EMN"
+  },
+  {
+   "action": "removed",
+   "date": "2025-11-28",
+   "ticker": "IPG"
+  },
+  {
+   "action": "added",
+   "date": "2025-11-28",
+   "ticker": "SNDK"
+  },
+  {
+   "action": "added",
+   "date": "2025-12-11",
+   "ticker": "ARES"
+  },
+  {
+   "action": "removed",
+   "date": "2025-12-11",
+   "ticker": "K"
+  },
+  {
+   "action": "added",
+   "date": "2025-12-22",
+   "ticker": "CRH"
+  },
+  {
+   "action": "added",
+   "date": "2025-12-22",
+   "ticker": "CVNA"
+  },
+  {
+   "action": "added",
+   "date": "2025-12-22",
+   "ticker": "FIX"
+  },
+  {
+   "action": "removed",
+   "date": "2025-12-22",
+   "ticker": "LKQ"
+  },
+  {
+   "action": "removed",
+   "date": "2025-12-22",
+   "ticker": "MHK"
+  },
+  {
+   "action": "removed",
+   "date": "2025-12-22",
+   "ticker": "SOLS"
+  },
+  {
+   "action": "added",
+   "date": "2026-02-09",
+   "ticker": "CIEN"
+  },
+  {
+   "action": "removed",
+   "date": "2026-02-09",
+   "ticker": "DAY"
+  },
+  {
+   "action": "added",
+   "date": "2026-03-23",
+   "ticker": "COHR"
+  },
+  {
+   "action": "added",
+   "date": "2026-03-23",
+   "ticker": "LITE"
+  },
+  {
+   "action": "removed",
+   "date": "2026-03-23",
+   "ticker": "LW"
+  },
+  {
+   "action": "removed",
+   "date": "2026-03-23",
+   "ticker": "MOH"
+  },
+  {
+   "action": "removed",
+   "date": "2026-03-23",
+   "ticker": "MTCH"
+  },
+  {
+   "action": "removed",
+   "date": "2026-03-23",
+   "ticker": "PAYC"
+  },
+  {
+   "action": "added",
+   "date": "2026-03-23",
+   "ticker": "SATS"
+  },
+  {
+   "action": "added",
+   "date": "2026-03-23",
+   "ticker": "VRT"
+  }
+ ],
+ "content_sha256": "bd7d1e8518966db35c179505f9955fe0ae89ccd6292ba424789666a796a3f911",
+ "covers": {
+  "from": "1976-07-01",
+  "to_exclusive": "2026-04-04"
+ },
+ "frozen_at": "2026-08-12",
+ "index": "S&P 500",
+ "n_changes": 758,
+ "schema_version": 1,
+ "source": "https://en.wikipedia.org/wiki/Historical_components_of_the_S%26P_500"
+}
