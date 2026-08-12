@@ -15,7 +15,7 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from unittest.mock import MagicMock
 
@@ -404,6 +404,18 @@ class TestS3ParquetWriter:
 
 
 class TestIngestForTickers:
+    # ``_search_form4_filings`` drops any filing older than
+    # ``date.today() - lookback_days``. A PINNED filed_date in a
+    # discovery fixture therefore has an expiry: it silently ages out of
+    # the window and every orchestrator test starts asserting against 0
+    # discoveries, with no code change to blame. That is exactly what
+    # happened on 2026-08-12 UTC, when the pinned 2026-05-13 fixtures
+    # passed day 90 of the default 90-day lookback and turned main red
+    # (config-I6953). Discovery fixture dates are always computed
+    # relative to today so the window they sit in is the one under test.
+    _FILED_IN_WINDOW = date.today() - timedelta(days=7)
+    _FILED_IN_WINDOW_OLDER = date.today() - timedelta(days=30)
+
     def _make_http_mock(self, *, form4_list, xml_by_url):
         """Build a MagicMock http object that responds to:
           - GET /files/company_tickers.json → returns ticker→CIK map
@@ -464,7 +476,7 @@ class TestIngestForTickers:
             {
                 "form_type": "4",
                 "accession_number": "0000320193-26-000001",
-                "filed_date": date(2026, 5, 13),
+                "filed_date": self._FILED_IN_WINDOW,
                 "primary": "form4.xml",
             },
         ]
@@ -501,13 +513,13 @@ class TestIngestForTickers:
             {
                 "form_type": "10-K",  # not form 4
                 "accession_number": "0000320193-26-100001",
-                "filed_date": date(2026, 5, 1),
+                "filed_date": self._FILED_IN_WINDOW_OLDER,
                 "primary": "10k.htm",
             },
             {
                 "form_type": "4",
                 "accession_number": "0000320193-26-100002",
-                "filed_date": date(2026, 5, 13),
+                "filed_date": self._FILED_IN_WINDOW,
                 "primary": "form4.xml",
             },
         ]
@@ -533,7 +545,7 @@ class TestIngestForTickers:
         form4_list = [{
             "form_type": "4",
             "accession_number": "abc",
-            "filed_date": date(2026, 5, 13),
+            "filed_date": self._FILED_IN_WINDOW,
             "primary": "form4.xml",
         }]
         http = self._make_http_mock(
@@ -561,13 +573,13 @@ class TestIngestForTickers:
             {
                 "form_type": "4",
                 "accession_number": "a",
-                "filed_date": date(2026, 5, 13),
+                "filed_date": self._FILED_IN_WINDOW,
                 "primary": "form4.xml",
             },
             {
                 "form_type": "4",
                 "accession_number": "b",
-                "filed_date": date(2026, 5, 13),
+                "filed_date": self._FILED_IN_WINDOW,
                 "primary": "missing.xml",  # 404
             },
         ]
@@ -585,6 +597,44 @@ class TestIngestForTickers:
         # Successful filing still got parsed + written
         assert stats["n_transactions_parsed"] == 1
         assert stats["n_parquet_writes"] == 1
+
+    def test_filings_older_than_the_lookback_are_dropped(self, monkeypatch):
+        """The lookback window is asserted directly, relative to today.
+
+        Every other orchestrator test above sits comfortably INSIDE the
+        window, so none of them would notice if the cutoff stopped
+        filtering. This one pins both sides of the boundary to
+        ``date.today()`` so it tests the window rather than a calendar
+        date (config-I6953).
+        """
+        from rag.pipelines import ingest_form4
+        monkeypatch.setattr(ingest_form4, "_CIK_CACHE", {})
+        monkeypatch.setattr(ingest_form4, "_INTER_REQUEST_SLEEP_SECONDS", 0)
+
+        lookback_days = 30
+        form4_list = [
+            {
+                "form_type": "4",
+                "accession_number": "in-window",
+                "filed_date": date.today() - timedelta(days=lookback_days - 1),
+                "primary": "form4.xml",
+            },
+            {
+                "form_type": "4",
+                "accession_number": "too-old",
+                "filed_date": date.today() - timedelta(days=lookback_days + 1),
+                "primary": "form4.xml",
+            },
+        ]
+        http = self._make_http_mock(
+            form4_list=form4_list,
+            xml_by_url={"form4.xml": _FORM4_SINGLE_SALE},
+        )
+        stats = ingest_for_tickers(
+            ["AAPL"], lookback_days=lookback_days,
+            s3_client=_InMemoryS3(), http=http,
+        )
+        assert stats["n_filings_discovered"] == 1
 
 
 # ── Schema version ────────────────────────────────────────────────────
