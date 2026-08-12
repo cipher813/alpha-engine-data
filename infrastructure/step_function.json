@@ -2821,7 +2821,7 @@
                   "Next": "PredictorWait"
                 }
               ],
-              "Default": "ExtractPredictorError",
+              "Default": "PredictorTrainingLivenessGate",
               "Comment": "[I5687: poll budget cap=108 via $.predictor_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
             },
             "PredictorWait": {
@@ -3003,7 +3003,7 @@
                   "Next": "ParseZooSpecs"
                 }
               ],
-              "Default": "ExtractModelZooResolveError"
+              "Default": "ModelZooResolveLivenessGate"
             },
             "ExtractModelZooResolveError": {
               "Type": "Pass",
@@ -3385,7 +3385,7 @@
                   "Next": "BranchBComplete"
                 }
               ],
-              "Default": "ExtractModelZooSelectError"
+              "Default": "ModelZooSelectLivenessGate"
             },
             "ExtractModelZooSelectError": {
               "Type": "Pass",
@@ -3510,6 +3510,123 @@
               "InputPath": "$.model_zoo_poll_count.polls",
               "ResultPath": "$.model_zoo_polls",
               "Next": "WaitForModelZoo"
+            },
+            "PredictorTrainingLivenessGate": {
+              "Type": "Choice",
+              "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that PredictorTraining failed. Without this the two are indistinguishable in the alert and the run dies as a PredictorTraining fault \u2014 measured on watch-rerun-2026-08-10-8 (2026-08-11): ResponseCode -1 / Undeliverable, no log shipped, Server.SpotInstanceTermination on neighbouring instances in the same window. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates; recovery is the mechanical scripts/weekly_sf_rerun.py.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.predictor_poll.StatusDetails",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.predictor_poll.StatusDetails",
+                          "StringEquals": "Undeliverable"
+                        },
+                        {
+                          "Variable": "$.predictor_poll.StatusDetails",
+                          "StringEquals": "Terminated"
+                        }
+                      ]
+                    }
+                  ],
+                  "Next": "ExtractPredictorTrainingSubstrateLostError"
+                }
+              ],
+              "Default": "ExtractPredictorError"
+            },
+            "ExtractPredictorTrainingSubstrateLostError": {
+              "Type": "Pass",
+              "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractPredictorError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a PredictorTraining failure without opening the execution history.",
+              "Parameters": {
+                "phase": "PredictorTraining/SubstrateLost",
+                "source": "PredictorTrainingLivenessGate.SubstrateLost",
+                "poll.$": "$.predictor_poll"
+              },
+              "ResultPath": "$.error",
+              "Next": "PublishPredictorFailureImmediate"
+            },
+            "ModelZooResolveLivenessGate": {
+              "Type": "Choice",
+              "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that ModelZooResolve failed. Without this the two are indistinguishable in the alert and the run dies as a ModelZooResolve fault \u2014 measured on watch-rerun-2026-08-10-8 (2026-08-11): ResponseCode -1 / Undeliverable, no log shipped, Server.SpotInstanceTermination on neighbouring instances in the same window. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates; recovery is the mechanical scripts/weekly_sf_rerun.py.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.resolve_zoo_poll.StatusDetails",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.resolve_zoo_poll.StatusDetails",
+                          "StringEquals": "Undeliverable"
+                        },
+                        {
+                          "Variable": "$.resolve_zoo_poll.StatusDetails",
+                          "StringEquals": "Terminated"
+                        }
+                      ]
+                    }
+                  ],
+                  "Next": "ExtractModelZooResolveSubstrateLostError"
+                }
+              ],
+              "Default": "ExtractModelZooResolveError"
+            },
+            "ExtractModelZooResolveSubstrateLostError": {
+              "Type": "Pass",
+              "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractModelZooResolveError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a ModelZooResolve failure without opening the execution history.",
+              "Parameters": {
+                "phase": "ModelZooResolve/SubstrateLost",
+                "source": "ModelZooResolveLivenessGate.SubstrateLost",
+                "poll.$": "$.resolve_zoo_poll"
+              },
+              "ResultPath": "$.error",
+              "Next": "PublishModelZooFailureImmediate"
+            },
+            "ModelZooSelectLivenessGate": {
+              "Type": "Choice",
+              "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that ModelZooSelect failed. Without this the two are indistinguishable in the alert and the run dies as a ModelZooSelect fault \u2014 measured on watch-rerun-2026-08-10-8 (2026-08-11): ResponseCode -1 / Undeliverable, no log shipped, Server.SpotInstanceTermination on neighbouring instances in the same window. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates; recovery is the mechanical scripts/weekly_sf_rerun.py.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.model_zoo_poll.StatusDetails",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.model_zoo_poll.StatusDetails",
+                          "StringEquals": "Undeliverable"
+                        },
+                        {
+                          "Variable": "$.model_zoo_poll.StatusDetails",
+                          "StringEquals": "Terminated"
+                        }
+                      ]
+                    }
+                  ],
+                  "Next": "ExtractModelZooSelectSubstrateLostError"
+                }
+              ],
+              "Default": "ExtractModelZooSelectError"
+            },
+            "ExtractModelZooSelectSubstrateLostError": {
+              "Type": "Pass",
+              "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractModelZooSelectError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a ModelZooSelect failure without opening the execution history.",
+              "Parameters": {
+                "phase": "ModelZooSelect/SubstrateLost",
+                "source": "ModelZooSelectLivenessGate.SubstrateLost",
+                "poll.$": "$.model_zoo_poll"
+              },
+              "ResultPath": "$.error",
+              "Next": "PublishModelZooFailureImmediate"
             }
           }
         }
@@ -3798,7 +3915,7 @@
           "Next": "BacktesterWait"
         }
       ],
-      "Default": "ExtractBacktesterError",
+      "Default": "BacktesterLivenessGate",
       "Comment": "[I5687: poll budget cap=144 via $.backtester_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
     },
     "BacktesterWait": {
@@ -3963,7 +4080,7 @@
           "Next": "PredictorBacktestWait"
         }
       ],
-      "Default": "ExtractPredictorBacktestError",
+      "Default": "PredictorBacktestLivenessGate",
       "Comment": "[I5687: poll budget cap=144 via $.predictor_backtest_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
     },
     "PredictorBacktestWait": {
@@ -4128,7 +4245,7 @@
           "Next": "PortfolioOptimizerBacktestWait"
         }
       ],
-      "Default": "ExtractPortfolioOptimizerBacktestError",
+      "Default": "PortfolioOptimizerBacktestLivenessGate",
       "Comment": "[I5687: poll budget cap=144 via $.portfolio_optimizer_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
     },
     "PortfolioOptimizerBacktestWait": {
@@ -5239,7 +5356,7 @@
           "Next": "EvaluatorDiagnosticsWait"
         }
       ],
-      "Default": "ExtractEvaluatorDiagnosticsError",
+      "Default": "EvaluatorDiagnosticsLivenessGate",
       "Comment": "[I5687: poll budget cap=36 via $.evaluator_diagnostics_polls = ceil(timeout/60s * 1.2 slack), the DataPhase2/ThinkTank convention applied to this half's own timeout rather than inherited from the merged state; budget exhaustion falls through to the existing Default]"
     },
     "EvaluatorDiagnosticsWait": {
@@ -5413,7 +5530,7 @@
           "Next": "EvaluatorOptimizeWait"
         }
       ],
-      "Default": "ExtractEvaluatorOptimizeError",
+      "Default": "EvaluatorOptimizeLivenessGate",
       "Comment": "[I5687: poll budget cap=24 via $.evaluator_optimize_polls = ceil(timeout/60s * 1.2 slack), the DataPhase2/ThinkTank convention applied to this half's own timeout rather than inherited from the merged state; budget exhaustion falls through to the existing Default]"
     },
     "EvaluatorOptimizeWait": {
@@ -6920,7 +7037,7 @@
           "Next": "WeeklyFreshnessSpotBootstrapWait"
         }
       ],
-      "Default": "ExtractWeeklyFreshnessSpotBootstrapError"
+      "Default": "WeeklyFreshnessSpotBootstrapLivenessGate"
     },
     "WeeklyFreshnessSpotBootstrapWait": {
       "Type": "Pass",
@@ -7149,6 +7266,240 @@
       "Type": "Pass",
       "Comment": "config#6054: success-only witness for the rerun deriver (scripts/weekly_sf_rerun.py). Director's success and every bypass path previously converged on CheckShellRunNotify, so no state uniquely witnessed 'Director actually completed' \u2014 the I6055-class trap: a rerun could mark a bypassed Director complete and skip it. Entered ONLY via Director's success edge.",
       "Next": "CheckShellRunNotify"
+    },
+    "BacktesterLivenessGate": {
+      "Type": "Choice",
+      "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that Backtester failed. Without this the two are indistinguishable in the alert and the run dies as a Backtester fault \u2014 measured on watch-rerun-2026-08-10-8 (2026-08-11): ResponseCode -1 / Undeliverable, no log shipped, Server.SpotInstanceTermination on neighbouring instances in the same window. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates; recovery is the mechanical scripts/weekly_sf_rerun.py.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.backtester_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.backtester_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.backtester_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractBacktesterSubstrateLostError"
+        }
+      ],
+      "Default": "ExtractBacktesterError"
+    },
+    "ExtractBacktesterSubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractBacktesterError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a Backtester failure without opening the execution history.",
+      "Parameters": {
+        "phase": "Backtester/SubstrateLost",
+        "source": "BacktesterLivenessGate.SubstrateLost",
+        "poll.$": "$.backtester_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "PredictorBacktestLivenessGate": {
+      "Type": "Choice",
+      "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that PredictorBacktest failed. Without this the two are indistinguishable in the alert and the run dies as a PredictorBacktest fault \u2014 measured on watch-rerun-2026-08-10-8 (2026-08-11): ResponseCode -1 / Undeliverable, no log shipped, Server.SpotInstanceTermination on neighbouring instances in the same window. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates; recovery is the mechanical scripts/weekly_sf_rerun.py.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.predictor_backtest_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.predictor_backtest_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.predictor_backtest_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractPredictorBacktestSubstrateLostError"
+        }
+      ],
+      "Default": "ExtractPredictorBacktestError"
+    },
+    "ExtractPredictorBacktestSubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractPredictorBacktestError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a PredictorBacktest failure without opening the execution history.",
+      "Parameters": {
+        "phase": "PredictorBacktest/SubstrateLost",
+        "source": "PredictorBacktestLivenessGate.SubstrateLost",
+        "poll.$": "$.predictor_backtest_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "PortfolioOptimizerBacktestLivenessGate": {
+      "Type": "Choice",
+      "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that PortfolioOptimizerBacktest failed. Without this the two are indistinguishable in the alert and the run dies as a PortfolioOptimizerBacktest fault \u2014 measured on watch-rerun-2026-08-10-8 (2026-08-11): ResponseCode -1 / Undeliverable, no log shipped, Server.SpotInstanceTermination on neighbouring instances in the same window. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates; recovery is the mechanical scripts/weekly_sf_rerun.py.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.portfolio_optimizer_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.portfolio_optimizer_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.portfolio_optimizer_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractPortfolioOptimizerBacktestSubstrateLostError"
+        }
+      ],
+      "Default": "ExtractPortfolioOptimizerBacktestError"
+    },
+    "ExtractPortfolioOptimizerBacktestSubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractPortfolioOptimizerBacktestError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a PortfolioOptimizerBacktest failure without opening the execution history.",
+      "Parameters": {
+        "phase": "PortfolioOptimizerBacktest/SubstrateLost",
+        "source": "PortfolioOptimizerBacktestLivenessGate.SubstrateLost",
+        "poll.$": "$.portfolio_optimizer_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "EvaluatorDiagnosticsLivenessGate": {
+      "Type": "Choice",
+      "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that EvaluatorDiagnostics failed. Without this the two are indistinguishable in the alert and the run dies as a EvaluatorDiagnostics fault \u2014 measured on watch-rerun-2026-08-10-8 (2026-08-11): ResponseCode -1 / Undeliverable, no log shipped, Server.SpotInstanceTermination on neighbouring instances in the same window. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates; recovery is the mechanical scripts/weekly_sf_rerun.py.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.evaluator_diagnostics_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.evaluator_diagnostics_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.evaluator_diagnostics_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractEvaluatorDiagnosticsSubstrateLostError"
+        }
+      ],
+      "Default": "ExtractEvaluatorDiagnosticsError"
+    },
+    "ExtractEvaluatorDiagnosticsSubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractEvaluatorDiagnosticsError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a EvaluatorDiagnostics failure without opening the execution history.",
+      "Parameters": {
+        "phase": "EvaluatorDiagnostics/SubstrateLost",
+        "source": "EvaluatorDiagnosticsLivenessGate.SubstrateLost",
+        "poll.$": "$.evaluator_diagnostics_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "EvaluatorOptimizeLivenessGate": {
+      "Type": "Choice",
+      "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that EvaluatorOptimize failed. Without this the two are indistinguishable in the alert and the run dies as a EvaluatorOptimize fault \u2014 measured on watch-rerun-2026-08-10-8 (2026-08-11): ResponseCode -1 / Undeliverable, no log shipped, Server.SpotInstanceTermination on neighbouring instances in the same window. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates; recovery is the mechanical scripts/weekly_sf_rerun.py.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.evaluator_optimize_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.evaluator_optimize_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.evaluator_optimize_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractEvaluatorOptimizeSubstrateLostError"
+        }
+      ],
+      "Default": "ExtractEvaluatorOptimizeError"
+    },
+    "ExtractEvaluatorOptimizeSubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractEvaluatorOptimizeError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a EvaluatorOptimize failure without opening the execution history.",
+      "Parameters": {
+        "phase": "EvaluatorOptimize/SubstrateLost",
+        "source": "EvaluatorOptimizeLivenessGate.SubstrateLost",
+        "poll.$": "$.evaluator_optimize_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "WeeklyFreshnessSpotBootstrapLivenessGate": {
+      "Type": "Choice",
+      "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that WeeklyFreshnessSpotBootstrap failed. Without this the two are indistinguishable in the alert and the run dies as a WeeklyFreshnessSpotBootstrap fault \u2014 measured on watch-rerun-2026-08-10-8 (2026-08-11): ResponseCode -1 / Undeliverable, no log shipped, Server.SpotInstanceTermination on neighbouring instances in the same window. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates; recovery is the mechanical scripts/weekly_sf_rerun.py.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.weekly_freshness_spot_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.weekly_freshness_spot_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.weekly_freshness_spot_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractWeeklyFreshnessSpotBootstrapSubstrateLostError"
+        }
+      ],
+      "Default": "ExtractWeeklyFreshnessSpotBootstrapError"
+    },
+    "ExtractWeeklyFreshnessSpotBootstrapSubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractWeeklyFreshnessSpotBootstrapError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a WeeklyFreshnessSpotBootstrap failure without opening the execution history.",
+      "Parameters": {
+        "phase": "WeeklyFreshnessSpotBootstrap/SubstrateLost",
+        "source": "WeeklyFreshnessSpotBootstrapLivenessGate.SubstrateLost",
+        "poll.$": "$.weekly_freshness_spot_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
     }
   }
 }

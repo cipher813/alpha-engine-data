@@ -112,10 +112,13 @@ _BRANCH_B_STATES = {
     "ExtractPredictorError", "PublishPredictorFailureImmediate",
     # config#1083 parallel model-zoo fan-out: ResolveZooSpecs -> Map -> Select.
     "ResolveZooSpecs", "WaitResolveZoo", "CheckResolveZooStatus",
-    "ResolveZooWait", "ExtractModelZooResolveError", "ParseZooSpecs",
+    "ResolveZooWait", "ModelZooResolveLivenessGate", "ExtractModelZooResolveError",
+    "ExtractModelZooResolveSubstrateLostError", "ParseZooSpecs",
     "ModelZooTrainMap", "ModelZooSelect",
     "WaitForModelZoo", "CheckModelZooStatus", "ModelZooWait",
-    "ExtractModelZooSelectError", "PublishModelZooFailureImmediate",
+    "ModelZooSelectLivenessGate", "ExtractModelZooSelectError",
+    "ExtractModelZooSelectSubstrateLostError", "PredictorTrainingLivenessGate",
+    "PublishModelZooFailureImmediate",
     # config#2253 validated skip path: skip_predictor_training=true routes
     # through a manifest-freshness HeadObject before the branch may read
     # as succeeded (backtest-eval preset bypasses validation by design).
@@ -572,7 +575,8 @@ class TestBranchBContents:
         # Message calls States.JsonToString($.model_zoo_error); a direct
         # Choice->Task jump on this edge died with States.Runtime, masking the
         # real zoo-resolve failure (observed live 2026-07-10, config#2160 arc).
-        assert check_resolve["Default"] == "ExtractModelZooResolveError"
+        assert check_resolve["Default"] == "ModelZooResolveLivenessGate"  # config#6938
+        assert branch_b["ModelZooResolveLivenessGate"]["Default"] == "ExtractModelZooResolveError"
         extract_resolve = branch_b["ExtractModelZooResolveError"]
         assert extract_resolve["Type"] == "Pass"
         assert extract_resolve["ResultPath"] == "$.model_zoo_error"
@@ -656,7 +660,8 @@ class TestBranchBContents:
         # does not populate $.model_zoo_error, and a direct jump to
         # PublishModelZooFailureImmediate died with States.Runtime (observed
         # live 2026-07-10, config#2160 arc).
-        assert check["Default"] == "ExtractModelZooSelectError"
+        assert check["Default"] == "ModelZooSelectLivenessGate"  # config#6938
+        assert branch_b["ModelZooSelectLivenessGate"]["Default"] == "ExtractModelZooSelectError"
         extract_select = branch_b["ExtractModelZooSelectError"]
         assert extract_select["Type"] == "Pass"
         assert extract_select["ResultPath"] == "$.model_zoo_error"
@@ -892,8 +897,15 @@ class TestPerBranchErrorIsolation:
         assert publish["Next"] == "BranchBFailed"
         for c in publish.get("Catch", []):
             assert c["Next"] == "BranchBFailed"
+        # config#6938: the non-Success arm reaches the normalizer THROUGH the
+        # liveness gate, which separates a reclaimed launcher from a training
+        # failure. Assert the route, not one hop of it.
         assert (
             branch_b["CheckPredictorStatus"]["Default"]
+            == "PredictorTrainingLivenessGate"
+        )
+        assert (
+            branch_b["PredictorTrainingLivenessGate"]["Default"]
             == "ExtractPredictorError"
         )
 
@@ -1109,6 +1121,7 @@ class TestInboundRewireAndDownstreamUnchanged:
                 or name.startswith("NormalizeFailureContext")
                 or name.endswith("Wait")
                 or name.endswith("RetryGate")
+                or name.endswith("LivenessGate")  # config#6938: error-side branch
                 or name.endswith("Reissue")
                 or name in ("HandleFailure", "FailExecution")
             )
