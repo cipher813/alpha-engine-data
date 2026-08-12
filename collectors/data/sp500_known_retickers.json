@@ -1,0 +1,18 @@
+{
+ "_comment": "Ticker changes that a holdings diff sees as a same-date remove+add but that are NOT index-membership events. Consulted before Polygon, which does not report these as ticker_change (verified 2026-08-12: get_ticker_events('BK') returns []). Each entry needs the effective date and one line of evidence; the reference changes table NOT listing it is corroboration, not proof. alpha-engine-config-I6946.",
+ "schema_version": 1,
+ "retickers": [
+  {
+   "old": "BK",
+   "new": "BNY",
+   "effective": "2026-05-22",
+   "evidence": "BNY Mellon corporate rebrand to 'BNY'; identity preserved, no index change. Absent from the reference changes table, which lists every real S&P 500 add/remove."
+  },
+  {
+   "old": "SATS",
+   "new": "ECHO",
+   "effective": "2026-06-25",
+   "evidence": "EchoStar symbol change; identity preserved, no index change. Absent from the reference changes table."
+  }
+ ]
+}
