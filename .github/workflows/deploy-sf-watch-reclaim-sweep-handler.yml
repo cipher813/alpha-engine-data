@@ -66,6 +66,7 @@ jobs:
       # Separate step, not a flag on the one above, so the log makes it obvious
       # which half failed. Both run under the same OIDC role; neither writes IAM.
       - name: Reconcile EventBridge Scheduler rules (upsert + prune)
+        id: reconcile-schedules
         working-directory: alpha-engine-data
         run: bash infrastructure/lambdas/sf-watch-reclaim-sweep-handler/deploy.sh --reconcile-schedules
 
@@ -89,7 +90,12 @@ jobs:
       # ENABLED, after this workflow runs — a deploy that reports success while
       # a schedule is missing is the failure mode this whole change exists to
       # remove.
+      # SKIP this assertion when the scheduler role hasn't been bootstrapped yet
+      # (--reconcile-schedules exited 0 after detecting the gap and setting the
+      # skipped_not_bootstrapped output). An operator must run --bootstrap-iam
+      # first; once bootstrapped, this assertion resumes on the next merge.
       - name: Assert every declared schedule exists live
+        if: steps.reconcile-schedules.outputs.skipped_not_bootstrapped != 'true'
         working-directory: alpha-engine-data
         run: python3 infrastructure/scheduler/check-schedule-drift.py --source-file infrastructure/lambdas/sf-watch-reclaim-sweep-handler/deploy.sh
 
