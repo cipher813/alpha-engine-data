@@ -1898,7 +1898,7 @@
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
         "Subject": "Alpha Engine \u2014 weekly exercise-cadence read DEGRADED (defaulted to daily)",
-        "Message": "ReadExerciseCadence could not read /alpha-engine/weekly-sf/exercise-cadence from SSM (permission not yet granted \u2014 see alpha-engine-config#6689 \u2014 throttling, or a transient SSM fault). Proceeding FAIL-OPEN as cadence=daily: the exercise launch is NOT skipped. If the declared cadence is actually weekly-only or off, this run launched the exercise anyway; investigate the SSM read path before trusting any cadence flip. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "ReadExerciseCadence could not read /alpha-engine/weekly-sf/exercise-cadence from SSM (permission not yet granted \u2014 see alpha-engine-config#6689 \u2014 throttling, or a transient SSM fault). Proceeding FAIL-OPEN as cadence=daily: the exercise launch is NOT skipped. If the declared cadence is actually weekly-only or off, this run launched the exercise anyway; investigate the SSM read path before trusting any cadence flip. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.exercise_cadence_degraded_notify",
       "Catch": [
@@ -2126,7 +2126,7 @@
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
         "Subject": "Alpha Engine EOD Pipeline \u2014 FAILED",
-        "Message.$": "States.Format('EOD pipeline failed. Error: {}. View the failing state + per-state detail at https://console.nousergon.ai/pipeline-status', States.JsonToString($.error))"
+        "Message.$": "States.Format('EOD pipeline failed. Error: {}. View the failing state + per-state detail at https://dashboard.nousergon.ai/pipeline-status', States.JsonToString($.error))"
       },
       "ResultPath": "$.failure_notify",
       "TimeoutSeconds": 60,

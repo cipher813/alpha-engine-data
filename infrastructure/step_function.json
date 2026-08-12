@@ -359,7 +359,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekly Pipeline \u2014 Lib-Pin Gate DEGRADED (Proceeding Unchecked)",
-        "Message": "LibPinDriftCheck could not verify cross-repo pin parity (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN: this run's spot spend is NOT protected against the co-install break this gate exists to catch. The completion email will carry the gates-degraded marker. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "LibPinDriftCheck could not verify cross-repo pin parity (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN: this run's spot spend is NOT protected against the co-install break this gate exists to catch. The completion email will carry the gates-degraded marker. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.libpin_gate_degraded_notify",
       "Catch": [
@@ -388,7 +388,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekly Pipeline \u2014 Contract Gate DEGRADED (Proceeding Unchecked)",
-        "Message": "PipelineContractCheck could not verify PIPELINE_CONTRACT.yaml self-consistency (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN: this run's spot spend is NOT protected against the contract break this gate exists to catch. The completion email will carry the gates-degraded marker. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "PipelineContractCheck could not verify PIPELINE_CONTRACT.yaml self-consistency (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN: this run's spot spend is NOT protected against the contract break this gate exists to catch. The completion email will carry the gates-degraded marker. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.pipeline_contract_gate_degraded_notify",
       "Catch": [
@@ -600,7 +600,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekly Pipeline \u2014 Mutex Acquire DEGRADED (Proceeding Unchecked)",
-        "Message": "AcquireMutex could not complete its DynamoDB conditional PUT (infra error, not a genuine duplicate-run conflict). Proceeding FAIL-OPEN: this run's duplicate-execution protection is unchecked for this run_date. The completion email will carry the gates-degraded marker. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "AcquireMutex could not complete its DynamoDB conditional PUT (infra error, not a genuine duplicate-run conflict). Proceeding FAIL-OPEN: this run's duplicate-execution protection is unchecked for this run_date. The completion email will carry the gates-degraded marker. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.mutex_acquire_degraded_notify",
       "Catch": [
@@ -5199,7 +5199,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekly Pipeline \u2014 PitParityCompare DEGRADED (continuing to Evaluator)",
-        "Message": "The PitParityCompare stage (join of the split pit_parity passes \u2014 computes delta_pit_minus_current and writes backtest/{run_date}/pit_parity.json) did not complete \u2014 SSM timeout, crash, or dispatch/poll failure. NON-FATAL: the weekly run continues to Evaluator/ReportCard/Director, but this run produced NO parity verdict; absence of a verdict must NOT be read as a clean pass (sf-pipeline-policy \u00a72.3a). The per-pass artifacts parity/{run_date}/pit_stats_*.json may exist and can be compared on a rerun without re-running the passes (skip_pit_parity_lookahead/skip_pit_parity_walkforward + skip_parity_replay, or scripts/weekly_sf_rerun.py --dry-run). Specifics on the execution record: $.pit_parity_compare_poll / $.pit_parity_compare_error. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "The PitParityCompare stage (join of the split pit_parity passes \u2014 computes delta_pit_minus_current and writes backtest/{run_date}/pit_parity.json) did not complete \u2014 SSM timeout, crash, or dispatch/poll failure. NON-FATAL: the weekly run continues to Evaluator/ReportCard/Director, but this run produced NO parity verdict; absence of a verdict must NOT be read as a clean pass (sf-pipeline-policy \u00a72.3a). The per-pass artifacts parity/{run_date}/pit_stats_*.json may exist and can be compared on a rerun without re-running the passes (skip_pit_parity_lookahead/skip_pit_parity_walkforward + skip_parity_replay, or scripts/weekly_sf_rerun.py --dry-run). Specifics on the execution record: $.pit_parity_compare_poll / $.pit_parity_compare_error. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.parity_compare_degraded_notify",
       "Catch": [
@@ -5909,7 +5909,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekly Pipeline \u2014 ReportCard WARNING (Advisory Grading Degraded)",
-        "Message": "ReportCard (the Evaluator Report Card v2 Lambda) failed \u2014 see $.report_card_error on the execution record for detail. This is NON-FATAL: the weekly run's real trading artifacts are unaffected, but the advisory grading layer (report_card.json, and downstream Director) did not run. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "ReportCard (the Evaluator Report Card v2 Lambda) failed \u2014 see $.report_card_error on the execution record for detail. This is NON-FATAL: the weekly run's real trading artifacts are unaffected, but the advisory grading layer (report_card.json, and downstream Director) did not run. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.report_card_degraded_notify",
       "Catch": [
@@ -6185,7 +6185,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (pre-spend gates DEGRADED)",
-        "Message": "All steps completed successfully \u2014 BUT one or both pre-spend gates (LibPinDriftCheck / PipelineContractCheck) could not check and failed OPEN; a gate-degraded alert fired earlier in this run. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "All steps completed successfully \u2014 BUT one or both pre-spend gates (LibPinDriftCheck / PipelineContractCheck) could not check and failed OPEN; a gate-degraded alert fired earlier in this run. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6207,7 +6207,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (health checks DEGRADED)",
-        "Message": "All steps completed successfully \u2014 BUT a post-pipeline health check (SaturdayHealthCheck freshness and/or WeeklySubstrateHealthCheck substrate/constituents-drift) could not run to Success; the run's freshness validation is NOT confirmed. Which check degraded is on the execution record: $.health_check_error / $.health_check_poll (freshness) vs $.substrate_check_error / $.substrate_check_poll (substrate). View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "All steps completed successfully \u2014 BUT a post-pipeline health check (SaturdayHealthCheck freshness and/or WeeklySubstrateHealthCheck substrate/constituents-drift) could not run to Success; the run's freshness validation is NOT confirmed. Which check degraded is on the execution record: $.health_check_error / $.health_check_poll (freshness) vs $.substrate_check_error / $.substrate_check_poll (substrate). View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6229,7 +6229,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (gates + health checks DEGRADED)",
-        "Message": "All steps completed successfully \u2014 BUT (1) one or both pre-spend gates (LibPinDriftCheck / PipelineContractCheck) could not check and failed OPEN (a gate-degraded alert fired earlier in this run), AND (2) a post-pipeline health check (SaturdayHealthCheck freshness and/or WeeklySubstrateHealthCheck substrate/constituents-drift) could not run to Success. Specifics are on the execution record: $.health_check_error / $.health_check_poll / $.substrate_check_error / $.substrate_check_poll. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "All steps completed successfully \u2014 BUT (1) one or both pre-spend gates (LibPinDriftCheck / PipelineContractCheck) could not check and failed OPEN (a gate-degraded alert fired earlier in this run), AND (2) a post-pipeline health check (SaturdayHealthCheck freshness and/or WeeklySubstrateHealthCheck substrate/constituents-drift) could not run to Success. Specifics are on the execution record: $.health_check_error / $.health_check_poll / $.substrate_check_error / $.substrate_check_poll. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6251,7 +6251,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (report card DEGRADED)",
-        "Message": "All steps completed successfully \u2014 BUT ReportCard (the Evaluator Report Card v2 Lambda, advisory grading) failed and did not run; a report-card-degraded alert fired earlier in this run. See $.report_card_error on the execution record for detail. The weekly run's real trading artifacts are unaffected; only the advisory grading layer (report_card.json, and downstream Director) did not run. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "All steps completed successfully \u2014 BUT ReportCard (the Evaluator Report Card v2 Lambda, advisory grading) failed and did not run; a report-card-degraded alert fired earlier in this run. See $.report_card_error on the execution record for detail. The weekly run's real trading artifacts are unaffected; only the advisory grading layer (report_card.json, and downstream Director) did not run. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6273,7 +6273,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (run DEGRADED)",
-        "Message": "All steps completed successfully \u2014 BUT one or more of the following degraded on this run: the pre-spend gates (LibPinDriftCheck/PipelineContractCheck/AcquireMutex), the tail health checks (SaturdayHealthCheck/WeeklySubstrateHealthCheck), the report card advisory grading (ReportCard Lambda), the Parity verdict (pit_parity/replay \u2014 absence of a verdict must NOT be read as a clean pass), and/or an internal ResearchPredictorParallel fail-open (Scanner/RegimeSubstrate/ChallengerShadow/ThinkTank/the eval-judge chain/cost aggregation/the model-zoo rotation). Exact combination is on the execution record: $.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded / $.research_predictor_degraded, with detail at $.report_card_error and (if set) $.health_check_error / $.substrate_check_error / $.parity_error / $.branch_outcomes. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "All steps completed successfully \u2014 BUT one or more of the following degraded on this run: the pre-spend gates (LibPinDriftCheck/PipelineContractCheck/AcquireMutex), the tail health checks (SaturdayHealthCheck/WeeklySubstrateHealthCheck), the report card advisory grading (ReportCard Lambda), the Parity verdict (pit_parity/replay \u2014 absence of a verdict must NOT be read as a clean pass), and/or an internal ResearchPredictorParallel fail-open (Scanner/RegimeSubstrate/ChallengerShadow/ThinkTank/the eval-judge chain/cost aggregation/the model-zoo rotation). Exact combination is on the execution record: $.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded / $.research_predictor_degraded, with detail at $.report_card_error and (if set) $.health_check_error / $.substrate_check_error / $.parity_error / $.branch_outcomes. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6295,7 +6295,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (parity DEGRADED)",
-        "Message": "All steps completed successfully \u2014 BUT the Parity stage (pit_parity look-ahead/walk-forward contamination check + backtester\u2194executor replay) did not complete; a parity-degraded alert fired earlier in this run. This run produced NO parity verdict \u2014 absence of a verdict must NOT be read as a clean pass. See $.parity_poll / $.parity_error on the execution record for detail. The weekly run's real trading artifacts are unaffected; only the parity verdict is missing. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "All steps completed successfully \u2014 BUT the Parity stage (pit_parity look-ahead/walk-forward contamination check + backtester\u2194executor replay) did not complete; a parity-degraded alert fired earlier in this run. This run produced NO parity verdict \u2014 absence of a verdict must NOT be read as a clean pass. See $.parity_poll / $.parity_error on the execution record for detail. The weekly run's real trading artifacts are unaffected; only the parity verdict is missing. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6340,7 +6340,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Preflight Pipeline \u2014 SUCCESS",
-        "Message": "Friday-PM Preflight Pipeline of the Saturday SF completed: all workload states ran in --preflight-only / dry mode, health/substrate checks ran. No Saturday-fatal bootstrap break detected for tomorrow's 02:00 PT real run. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "Friday-PM Preflight Pipeline of the Saturday SF completed: all workload states ran in --preflight-only / dry mode, health/substrate checks ran. No Saturday-fatal bootstrap break detected for tomorrow's 02:00 PT real run. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6374,7 +6374,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS",
-        "Message": "All steps completed successfully. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "All steps completed successfully. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6470,7 +6470,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekly Pipeline \u2014 Parity branch DEGRADED (compare will emit UNKNOWN)",
-        "Message": "One or more parity branches (PitParityLookahead / PitParityWalkforward / ParityReplay) did not complete \u2014 SSM timeout, crash, dispatch/poll failure, or poll-budget exhaustion. NON-FATAL and sibling-isolated: the other branches finished independently, and the weekly run continues to PitParityCompare \u2192 Evaluator/ReportCard/Director. The compare will emit the parity verdict as UNKNOWN for any missing pass artifact \u2014 absence of a verdict must NOT be read as a clean pass (sf-pipeline-policy \u00a72.3a). Which branch: $.parity_branch_outcomes on the execution record (per-branch specifics at $.pit_parity_lookahead_poll / $.pit_parity_walkforward_poll / $.parity_replay_poll and *_error). Rerun ONLY the failed branch via scripts/weekly_sf_rerun.py --dry-run (it derives skip flags for the completed branches). View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "One or more parity branches (PitParityLookahead / PitParityWalkforward / ParityReplay) did not complete \u2014 SSM timeout, crash, dispatch/poll failure, or poll-budget exhaustion. NON-FATAL and sibling-isolated: the other branches finished independently, and the weekly run continues to PitParityCompare \u2192 Evaluator/ReportCard/Director. The compare will emit the parity verdict as UNKNOWN for any missing pass artifact \u2014 absence of a verdict must NOT be read as a clean pass (sf-pipeline-policy \u00a72.3a). Which branch: $.parity_branch_outcomes on the execution record (per-branch specifics at $.pit_parity_lookahead_poll / $.pit_parity_walkforward_poll / $.parity_replay_poll and *_error). Rerun ONLY the failed branch via scripts/weekly_sf_rerun.py --dry-run (it derives skip flags for the completed branches). View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.parity_degraded_notify",
       "Catch": [
@@ -6557,7 +6557,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject.$": "States.Format('Alpha Engine Saturday{} Pipeline \u2014 FAILED', $.pipeline_label)",
-        "Message.$": "States.Format('Saturday{} Pipeline failed. Error: {}. View the failing state + per-state detail at https://console.nousergon.ai/pipeline-status  (redrive-execution is a no-op on this pipeline: every Task Catch routes to this shared FailExecution state, so redrive just re-enters FailExecution and re-fails immediately with no retry. To retry MECHANICALLY: from a nousergon-data checkout run  python3 scripts/weekly_sf_rerun.py --dry-run  -- it derives the original run_date + the correct skip_* set from this failed execution and handles the run-slot mutex; review, then rerun with --start. Manual fallback: start a fresh execution with skip_* input flags set true for stages already completed, e.g. skip_morning_enrich / skip_data_phase1 / skip_backtester -- see infrastructure/README.md for the full flag list and rationale.)', $.pipeline_label, States.JsonToString($.error))"
+        "Message.$": "States.Format('Saturday{} Pipeline failed. Error: {}. View the failing state + per-state detail at https://dashboard.nousergon.ai/pipeline-status  (redrive-execution is a no-op on this pipeline: every Task Catch routes to this shared FailExecution state, so redrive just re-enters FailExecution and re-fails immediately with no retry. To retry MECHANICALLY: from a nousergon-data checkout run  python3 scripts/weekly_sf_rerun.py --dry-run  -- it derives the original run_date + the correct skip_* set from this failed execution and handles the run-slot mutex; review, then rerun with --start. Manual fallback: start a fresh execution with skip_* input flags set true for stages already completed, e.g. skip_morning_enrich / skip_data_phase1 / skip_backtester -- see infrastructure/README.md for the full flag list and rationale.)', $.pipeline_label, States.JsonToString($.error))"
       },
       "ResultPath": "$.failure_notify",
       "Next": "FailExecution"

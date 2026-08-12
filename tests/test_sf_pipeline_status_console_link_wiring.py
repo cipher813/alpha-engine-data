@@ -4,7 +4,7 @@ of the three producer Step Functions (config#856).
 Pipeline reporting revamp shape: *pull-for-state console page + push-on-
 transition emails*. The push-on-transition notifications (DAG complete / DAG
 fail) must deep-link to the pull-for-state console page
-(``https://console.nousergon.ai/pipeline-status`` — the ``pipeline-status``
+(``https://dashboard.nousergon.ai/pipeline-status`` — the ``pipeline-status``
 slug pinned on the dashboard's ``25_Pipeline_Status.py``) so the operator can
 jump from the terminal email to the full per-state render, instead of the old
 generic "Check dashboard" / bare ``JsonToString($.error)`` text.
@@ -29,7 +29,7 @@ _INFRA = pathlib.Path(__file__).resolve().parent.parent / "infrastructure"
 
 # Must match krepis.console (host) + the dashboard 25_Pipeline_Status.py url_path
 # (slug). If either moves, this pin and the dashboard slug-drift test both fail.
-CONSOLE_PIPELINE_URL = "https://console.nousergon.ai/pipeline-status"
+CONSOLE_PIPELINE_URL = "https://dashboard.nousergon.ai/pipeline-status"
 
 # The three producer pipelines the console page renders (weekly / weekday / EOD).
 _TEMPLATES = [
@@ -100,6 +100,23 @@ class PipelineStatusConsoleLinkWiringTest(unittest.TestCase):
                     "Check dashboard for results",
                     msg,
                     f"{fname}:{name} reverted to the pre-revamp generic text",
+                )
+
+    def test_no_terminal_notify_uses_old_console_host(self):
+        # console.nousergon.ai/pipeline-status 404s (config-I6140) — the
+        # console app (nousergon-console v2) never registered a
+        # pipeline-status view; only dashboard.nousergon.ai (the Streamlit
+        # app) serves the slug. A regression to the old host silently
+        # breaks the deep-link again.
+        for fname in _TEMPLATES:
+            sf = self._load(fname)
+            for name, st in _terminal_notify_states(sf).items():
+                msg = _message_of(st)
+                self.assertNotIn(
+                    "console.nousergon.ai",
+                    msg,
+                    f"{fname}:{name} deep-links to the old console host "
+                    f"(config-I6140) — must be dashboard.nousergon.ai",
                 )
 
     def test_templates_are_valid_json(self):
