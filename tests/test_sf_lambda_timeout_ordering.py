@@ -244,3 +244,111 @@ def test_the_codified_function_timeouts_match_live() -> None:
         if live != codified:
             drift.append(f"{fn}: codified {codified}s, live {live}s")
     assert not drift, "\n  ".join(drift)
+
+
+# ── SSM sendCommand stages (alpha-engine-config-I6948) ───────────────────────
+#
+# The same "declare a ceiling the service can never reach" defect, in the other
+# direction and with a worse failure mode. An `aws-sdk:ssm:sendCommand` task has
+# two ceilings: the state's `TimeoutSeconds` and SSM's own `executionTimeout`
+# parameter. Which one should bind is the OPPOSITE of the lambda:invoke case:
+#
+#   SSM <  SF     CORRECT. SSM kills the command, the agent returns
+#                 `Status=TimedOut ResponseCode=137 ExecutionTimedOut`, the poll
+#                 state reads it, and the operator gets a named cause.
+#   SSM == SF     RACE. Undefined which fires; the error is not reproducible.
+#   SSM >  SF     DEFECT, and expensive. The state gives up while the command
+#                 KEEPS RUNNING on the box — Step Functions does not cancel an
+#                 SSM invocation. The stage fails with a bare `States.Timeout`
+#                 naming nothing, a spot instance carries on billing, and the
+#                 declared SSM budget is decorative.
+#
+# Found by this guard on its first run: `RAGIngestion` declared
+# `executionTimeout=21600` against `TimeoutSeconds=3660`. config#2938
+# (2026-07-18) had deliberately widened that budget 3600 -> 14400 -> 21600 after
+# live measurement — "the SEC-filings phase alone needs >=1h before the news
+# sweep starts", with the Polygon leg covering ~944 tickers at 5 req/min
+# (~3.15h). `TimeoutSeconds` was never moved with it, so the state has been
+# killing at 61 minutes ever since and the measured widening has been inert. The
+# commit message records the intent; nothing enforced it.
+#
+# I6948 asked for the ordering to be added to this file specifically, so it
+# lives here rather than in a sibling — the defect class is identical ("a stage
+# timeout that can never bind"), only the correct direction differs.
+
+
+def _ssm_send_command_states(states: dict) -> Iterator[tuple[str, int | None, int | None]]:
+    """``(state_name, TimeoutSeconds, executionTimeout)`` for every sendCommand.
+
+    Recurses the same way as :func:`_lambda_invoke_states` — every spot-bearing
+    stage of the weekly pipeline lives inside `ResearchPredictorParallel` or
+    `ParityParallel`, so a top-level-only scan would exempt all of them.
+
+    ``executionTimeout`` is an SSM *document parameter*, so it arrives as a list
+    of strings: ``{"Parameters": {"executionTimeout": ["5400"]}}``.
+    """
+    for name, body in states.items():
+        resource = body.get("Resource")
+        if isinstance(resource, str) and resource.endswith(":ssm:sendCommand"):
+            params = ((body.get("Parameters") or {}).get("Parameters") or {})
+            raw = params.get("executionTimeout")
+            if isinstance(raw, list):
+                raw = raw[0] if raw else None
+            try:
+                execution_timeout = int(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                execution_timeout = None
+            yield name, body.get("TimeoutSeconds"), execution_timeout
+        for branch in body.get("Branches") or []:
+            yield from _ssm_send_command_states(branch.get("States") or {})
+        iterator = body.get("Iterator") or body.get("ItemProcessor")
+        if iterator:
+            yield from _ssm_send_command_states(iterator.get("States") or {})
+
+
+@pytest.mark.parametrize("definition", _DEFS)
+def test_every_ssm_send_command_declares_both_ceilings(definition: str) -> None:
+    """Neither budget may be left implicit.
+
+    A missing `executionTimeout` takes the SSM document default; a missing
+    `TimeoutSeconds` takes the definition ceiling. Either way the stage's real
+    budget is somewhere other than the stage.
+    """
+    missing = [
+        f"{name}: TimeoutSeconds={sf} executionTimeout={ssm}"
+        for name, sf, ssm in _ssm_send_command_states(_states(definition))
+        if sf is None or ssm is None
+    ]
+    assert not missing, f"{definition}:\n  " + "\n  ".join(missing)
+
+
+@pytest.mark.parametrize("definition", _DEFS)
+def test_ssm_kills_the_command_before_the_state_gives_up(definition: str) -> None:
+    """`executionTimeout` strictly below `TimeoutSeconds`.
+
+    Ordered this way the operator sees `TimedOut/137/ExecutionTimedOut` naming
+    the SSM command. Inverted, the state abandons a command that is still
+    running: bare `States.Timeout`, no cause, and a spot instance still billing.
+    """
+    violations: list[str] = []
+    for name, sf, ssm in _ssm_send_command_states(_states(definition)):
+        if sf is None or ssm is None:
+            continue  # covered by the declaration test above
+        if ssm >= sf:
+            violations.append(
+                f"{name}: executionTimeout={ssm} >= TimeoutSeconds={sf} "
+                f"({'race' if ssm == sf else 'the state abandons a live command'})"
+            )
+    assert not violations, f"{definition}:\n  " + "\n  ".join(violations)
+
+
+@pytest.mark.parametrize("definition", _DEFS)
+def test_the_ssm_scan_is_not_empty(definition: str) -> None:
+    """A recursion bug would make every assertion above vacuously true.
+
+    `step_function.json` alone carries 19 spot-bearing stages, all of them
+    nested inside Parallel branches. A scan returning nothing would report
+    clean — the empty-denominator shape this fleet keeps re-shipping.
+    """
+    found = list(_ssm_send_command_states(_states(definition)))
+    assert found, f"{definition}: no ssm:sendCommand states found — the walk is broken"
