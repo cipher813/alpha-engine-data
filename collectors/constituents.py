@@ -196,9 +196,39 @@ def collect(
         tickers, sector_etf_map, sub_industry_map
     )
 
+    # Explicit per-index rosters (alpha-engine-config-I6946). `tickers` is the
+    # SPY batch followed by the MDY batch, so the S&P 500 slice was recoverable
+    # only as `tickers[:sp500_count]` — an ORDERING contract that nothing
+    # declared and no test held. historical_constituents now diffs these
+    # snapshots to derive index membership changes, which makes a silent
+    # reordering here a burst of fabricated index churn there. Naming the two
+    # lists retires the dependency for every snapshot written from now on;
+    # `_sp500_roster` falls back to the prefix for the ones already on S3.
+    #
+    # The slice is only sound when the counts account for the whole list —
+    # `tickers` is deduped, so an overlap between the two funds would shorten
+    # it without moving either count. When they disagree the keys are OMITTED
+    # rather than written wrong: a reader that finds them absent falls back to
+    # the same guarded prefix, where a reader that finds them WRONG has no way
+    # to tell.
+    per_index: dict[str, list[str]] = {}
+    if sp500_count + sp400_count == len(tickers):
+        per_index = {
+            "sp500_tickers": tickers[:sp500_count],
+            "sp400_tickers": tickers[sp500_count:],
+        }
+    else:
+        logger.warning(
+            "constituents: sp500_count(%d) + sp400_count(%d) != len(tickers)(%d) "
+            "— omitting sp500_tickers/sp400_tickers rather than slicing on a "
+            "count that does not describe this list (config-I6946)",
+            sp500_count, sp400_count, len(tickers),
+        )
+
     result = {
         "date": run_date,
         "tickers": tickers,
+        **per_index,
         "sector_map": sector_map,
         "sector_etf_map": sector_etf_map,
         "sub_industry_map": sub_industry_map,
