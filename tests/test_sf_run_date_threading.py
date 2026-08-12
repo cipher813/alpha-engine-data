@@ -61,7 +61,8 @@ _STAGE_SCRIPT = {
     "PitParityWalkforward": "spot_pit_walkforward.sh",
     "ParityReplay": "spot_parity_replay.sh",
     "PitParityCompare": "spot_parity_compare.sh",
-    "Evaluator": "spot_evaluator.sh",
+    "EvaluatorDiagnostics": "spot_evaluator.sh",
+    "EvaluatorOptimize": "spot_evaluator.sh",
 }
 
 

@@ -77,7 +77,14 @@ class TestSameEntrypointAsWeekly:
         )
 
     def test_timeout_matches_weekly(self, states, weekly_scanner):
-        assert states["Scanner"]["TimeoutSeconds"] == weekly_scanner["TimeoutSeconds"] == 600
+        # 600 -> 440 (alpha-engine-config-I6855). 600 could never bind: the
+        # function's own timeout was 300s, so both 2026-08-11 preopen
+        # invocations died at 300.00s with Sandbox.Timedout and the pipeline
+        # terminated DEGRADED. The function is now 450s (p95 x 1.5,
+        # crucible-research-PR601) and the SF budget sits below it, so an
+        # overrun surfaces as States.Timeout naming this state.
+        # Ordering guard: tests/test_sf_lambda_timeout_ordering.py.
+        assert states["Scanner"]["TimeoutSeconds"] == weekly_scanner["TimeoutSeconds"] == 440
 
 
 class TestPayloadAndRunDate:
@@ -126,7 +133,16 @@ class TestEdges:
             and "States.ALL" in c["ErrorEquals"]
             for c in catches
         )
-        assert states["SetScannerDegradedFlag"]["Next"] == "CheckSkipPredictorInference"
+        # config-I6903: PublishScannerFailureImmediate now sits between the
+        # flag and the gate. The edge that matters is CONVERGENCE — both the
+        # success and the fail-open path reach CheckSkipPredictorInference —
+        # and it survives inserting the notification the fail-open was missing.
+        assert states["SetScannerDegradedFlag"]["Next"] == "PublishScannerFailureImmediate"
+        publish = states["PublishScannerFailureImmediate"]
+        assert publish["Next"] == "CheckSkipPredictorInference"
+        assert publish["Catch"][0]["Next"] == "CheckSkipPredictorInference", (
+            "an SNS failure must not abort a pipeline that deliberately continued"
+        )
 
     def test_no_direct_edge_from_arctic_to_predictor_bypassing_scanner(self, states):
         """Regression: Arctic success must not skip the new Scanner gate."""

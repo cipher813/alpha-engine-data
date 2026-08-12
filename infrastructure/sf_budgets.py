@@ -15,8 +15,8 @@ makes every future universe jump re-scale all ceilings at once.
 Usage:
     from infrastructure.sf_budgets import stage_budgets, recommend_timeout
 
-    budget = recommend_timeout("Evaluator", universe_size=944)
-    # => 7200 (current timeout for the ~944-ticker universe)
+    budget = recommend_timeout("EvaluatorDiagnostics", universe_size=944)
+    # => 1800 (current timeout for the ~944-ticker universe)
 
 Anti-regression guard:
     from infrastructure.sf_budgets import regression_guard
@@ -279,18 +279,58 @@ STAGE_BUDGETS: dict[str, StageBudget] = {
         max_budget_seconds=7_200,
         pipeline_segment="sequential",
     ),
-    # ── Evaluation stage (universe-scaling — THE VICTIM of config#3095) ────
-    "Evaluator": StageBudget(
-        name="Evaluator",
-        current_timeout_seconds=7_200,  # bumped 3600→7200 by PR969
-        # PER-TICKER COST UNMEASURED (config#3095's own profiling note:
-        # needs operator ssm:GetCommandInvocation on i-09b539c844515d549
-        # to pull /var/log/evaluator.log for per-stage timing).
-        # Estimated here as ~7s/ticker (so ~6600s for 944 tickers within
-        # the 7200s budget).
-        per_ticker_cost_seconds=6.9,
-        fixed_overhead_seconds=600,
-        max_budget_seconds=14_400,
+    # ── Evaluation stages (split by config-I3112 deliverable 3) ────────────
+    #
+    # THE PROFILING NOTE IS DISCHARGED. config#3095 left this stage with an
+    # explicitly UNMEASURED 6.9 s/ticker estimate and a note that measuring it
+    # needed operator ssm:GetCommandInvocation to pull per-stage timing. Both
+    # sources now exist and were read on 2026-08-11:
+    #
+    #   * SF execution history, the 2026-08-08 SUCCEEDED weekly run:
+    #     CheckSkipEvaluator 06:06:03 -> CheckSkipPostEval 06:14:06 = 482s
+    #     wall-clock, against the 7200s ceiling — 6.7% utilisation.
+    #   * Phase markers under backtest/{date}/.phases/, three consecutive
+    #     weekly runs (2026-07-31 / 2026-08-04 / 2026-08-07):
+    #         evaluator_signal_quality        7.85 /   8.43 /   9.64
+    #         evaluator_diagnostics         198.67 / 231.43 / 230.18
+    #         evaluator_optimizers           29.71 /  33.86 /  33.82
+    #         assembler+apply_audit+champion+regression      ~1.7 / ~1.9 / ~2.0
+    #   * evaluate.py's own span in the stage log: 282s. The remaining ~200s
+    #     of the 482s is the spot request, boot, bootstrap, smoke and one 60s
+    #     poll tick — a FLOOR both halves pay independently, because
+    #     spot_evaluator.sh dispatches and terminates its own instance.
+    #
+    # The old estimate predicted 944 * 6.9 + 600 = 7114s for a stage that
+    # takes 482s: ~15x too high. It was never wrong in a way anything could
+    # notice, because a ceiling is only ever observed when it is hit.
+    #
+    # PER-TICKER COST IS AN UPPER BOUND, NOT A FIT. All three runs sit at the
+    # same ~944-ticker universe, so these measurements contain no slope. Each
+    # half's per-ticker figure below attributes 100% of its measured phase
+    # time to universe scaling — deliberately pessimistic, since the true
+    # slope cannot be below zero and cannot be above this. Re-derive the day
+    # the universe actually moves; until then, treat the slope as unmeasured
+    # and the intercept as measured.
+    "EvaluatorDiagnostics": StageBudget(
+        name="EvaluatorDiagnostics",
+        current_timeout_seconds=1_800,
+        # (9.64 + 230.18) / 944, the worst observed run.
+        per_ticker_cost_seconds=0.254,
+        # Spot request + boot + bootstrap + smoke + one poll tick, plus the
+        # S3 handoff snapshot write this half owns.
+        fixed_overhead_seconds=300,
+        max_budget_seconds=7_200,
+        pipeline_segment="sequential",
+    ),
+    "EvaluatorOptimize": StageBudget(
+        name="EvaluatorOptimize",
+        current_timeout_seconds=1_200,
+        # (33.86 + ~2.0) / 944, the worst observed run.
+        per_ticker_cost_seconds=0.038,
+        # Same boot floor, plus the snapshot read. This half's ceiling is
+        # made of its overhead, not of its work.
+        fixed_overhead_seconds=300,
+        max_budget_seconds=7_200,
         pipeline_segment="sequential",
     ),
     # ── Health-check stages (constant, small) ──────────────────────────────

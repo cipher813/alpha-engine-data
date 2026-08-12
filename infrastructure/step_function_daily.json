@@ -91,7 +91,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block a real trading cadence run. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability hung off a primary path' carve-out, the primary deliverable survives a mutex-side failure. The error is captured in $.mutex_error for forensic review via SF execution history; CW alarm wiring deferred (operator-decision when first non-Conditional-Check mutex error appears). alpha-engine-config#6722: previously proceeded with no degraded flag at all — now routes through SetMutexAcquireDegradedFlag (Option-A parity with SetDataSpotDegradedFlag/SetDaemonDegradedFlag/SetDeployDriftDegradedFlag) so CheckDegradedOutcome's terminal reflects it.",
+          "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block a real trading cadence run. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability hung off a primary path' carve-out, the primary deliverable survives a mutex-side failure. The error is captured in $.mutex_error for forensic review via SF execution history; CW alarm wiring deferred (operator-decision when first non-Conditional-Check mutex error appears). alpha-engine-config#6722: previously proceeded with no degraded flag at all \u2014 now routes through SetMutexAcquireDegradedFlag (Option-A parity with SetDataSpotDegradedFlag/SetDaemonDegradedFlag/SetDeployDriftDegradedFlag) so CheckDegradedOutcome's terminal reflects it.",
           "Next": "SetMutexAcquireDegradedFlag",
           "ResultPath": "$.mutex_error"
         }
@@ -101,7 +101,7 @@
     },
     "SetMutexAcquireDegradedFlag": {
       "Type": "Pass",
-      "Comment": "alpha-engine-config#6722 (Option-A parity with SetDataSpotDegradedFlag/SetDaemonDegradedFlag/SetDeployDriftDegradedFlag, config#6692 shape): threads $.degraded_summary onto the mutex-acquire infra-error fail-open path (DynamoDB outage / IAM drift / transient SDK error — NOT the ConditionalCheckFailedException conflict case, which the separate MutexConflict Fail already handles) WITHOUT changing its fail-open continuation — Next still leads to DeployDriftCheck exactly as before. Last-write-wins if a later stage also degrades (same convention SetDaemonDegradedFlag documents); does not clobber $.mutex_error (set by AcquireMutex's own Catch ResultPath).",
+      "Comment": "alpha-engine-config#6722 (Option-A parity with SetDataSpotDegradedFlag/SetDaemonDegradedFlag/SetDeployDriftDegradedFlag, config#6692 shape): threads $.degraded_summary onto the mutex-acquire infra-error fail-open path (DynamoDB outage / IAM drift / transient SDK error \u2014 NOT the ConditionalCheckFailedException conflict case, which the separate MutexConflict Fail already handles) WITHOUT changing its fail-open continuation \u2014 Next still leads to DeployDriftCheck exactly as before. Last-write-wins if a later stage also degrades (same convention SetDaemonDegradedFlag documents); does not clobber $.mutex_error (set by AcquireMutex's own Catch ResultPath).",
       "Parameters": {
         "degraded": true,
         "reason": "daily_mutex_acquire_fail_open",
@@ -1057,6 +1057,28 @@
         "stage_error.$": "$.daemon_error"
       },
       "ResultPath": "$.degraded_summary",
+      "Next": "PublishDaemonFailureImmediate"
+    },
+    "PublishDaemonFailureImmediate": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I6903: best-effort SNS alert that the daemon restart failed. sf-pipeline-policy.md \u00a75 names this fail-open explicitly \u2014 'the daemon systemd restart must not abort the trading chain (the boot trigger is the daemon's backup); both set the degraded flag \u00a72.3 requires AND page immediately' \u2014 and the second half was never built. Without it the only signal is the terminal, which on a run that degrades early is up to an hour later. That the boot trigger is a backup is the reason this fails OPEN; it is not a reason to stay quiet, because a backup that also failed is exactly what an operator needs to hear about before the open. Catch mirrors the sibling publishes: an SNS failure must not hard-fail a pipeline that deliberately continued.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekday Daemon Restart \u2014 FAILED (fail-open, systemd boot trigger is the backup)",
+        "Message.$": "States.Format('The RunDaemon systemd restart failed; the pipeline continued on the assumption that the boot trigger starts the daemon instead. VERIFY the daemon is running before the open \u2014 if the boot trigger also missed, the book is unmanaged. Detail: {}', States.JsonToString($.daemon_error))"
+      },
+      "ResultPath": "$.daemon_failure_notify",
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "CheckDegradedOutcome"
+        }
+      ],
       "Next": "CheckDegradedOutcome"
     },
     "CheckDegradedOutcome": {
@@ -1107,8 +1129,8 @@
     "DegradedRun": {
       "Type": "Fail",
       "Error": "DegradedRun",
-      "Cause": "Daily preopen pipeline degraded \u2014 see $.degraded_summary in execution input (reason: run_daemon_restart_failed and/or daily_data_spot_fail_open) and the corresponding SNS notification (PublishDataSpotFailureImmediate) in execution history. Per Brian's 2026-07-28 Option-A ruling (alpha-engine-config#2699), ported to this daily SF via alpha-engine-config#6692: a degraded run must FAIL so status-keyed watchers (sf-watch, EventBridge, sf-telegram-notifier) engage with zero new plumbing.",
-      "Comment": "alpha-engine-config#6692: Option-A parity with step_function_eod.json's DegradedRun. The daemon-restart-failure and data-spot fail-open continuation paths remain unconditionally reachable BEFORE this terminal (RunDaemon Catch -> SetDaemonDegradedFlag -> CheckDegradedOutcome; ExtractDataSpotError -> SetDataSpotDegradedFlag -> PublishDataSpotFailureImmediate -> ... -> RunDaemon -> CheckDegradedOutcome) \u2014 the run itself is never aborted mid-pipeline, only the terminal's honesty changes."
+      "CausePath": "States.Format('Preopen pipeline DEGRADED \u2014 reason: {}. Full degraded_summary: {}. Per the 2026-07-28 Option-A ruling (alpha-engine-config#2699), ported to this daily SF via alpha-engine-config#6692: a degraded run must FAIL so status-keyed watchers (sf-watch, EventBridge, sf-telegram-notifier) engage with zero new plumbing. The run was never aborted mid-pipeline \u2014 only the honesty of the terminal changes.', $.degraded_summary.reason, States.JsonToString($.degraded_summary))",
+      "Comment": "alpha-engine-config-I6856: the Cause is DERIVED from $.degraded_summary, never an enumeration of the paths that can reach here. It WAS an enumeration, and it drifted \u2014 5 states set $.degraded_summary in this definition (SetDaemonDegradedFlag, SetDataSpotDegradedFlag, SetDeployDriftDegradedFlag, SetMutexAcquireDegradedFlag, SetScannerDegradedFlag) and the hardcoded string named two. On 2026-08-11 the preopen terminal asserted 'run_daemon_restart_failed and/or daily_data_spot_fail_open' when neither fired; the real reason, daily_scanner_fail_open, appeared nowhere, and the message sent the operator hunting for a PublishDataSpotFailureImmediate event that could not exist on that path. An enumeration that drifts is worse than boilerplate because it reads as specific (sf-pipeline-policy.md \u00a72.3 corollary). $.degraded_summary.reason is dereferenced UNGUARDED on purpose: CheckDegradedOutcome only routes here when degraded is true, every Set*DegradedFlag state sets reason, and tests/test_degraded_terminal_derives_its_cause.py fails the build if a new one does not \u2014 a defensive fallback here would let that guarantee lapse silently. JsonToString takes the WHOLE summary rather than $.degraded_summary.stage_error, which not every path sets."
     },
     "WriteCompletionMarker": {
       "Type": "Task",
@@ -1186,7 +1208,7 @@
     },
     "Scanner": {
       "Type": "Task",
-      "Comment": "Weekday invoke of the SAME standalone scanner Lambda the Saturday SF runs (alpha-engine-research-scanner:live \u2014 ROADMAP L1995 / alpha-engine-config-I6494). Placed AFTER MorningArcticAppend so ArcticDB technicals for the trading day are present, and BEFORE PredictorInference so universe_membership/{date} + factor profiles (+ provenance) are fresh for the membership consumer (I6495). Features are daily-capable (I5360 / research-PR545; SCANNER_FEATURE_SOURCE default arcticdb). Status contract OK / ERROR \u2014 Catch is non-blocking at the SF layer (mirrors Saturday): Catch and Next converge on CheckSkipPredictorInference; a missing/stale membership surfaces at the predictor's own age gate rather than hard-failing preopen. dry_run_llm omitted \u2014 weekday cadence has no Friday-Preflight research_dry shell path.",
+      "Comment": "Weekday invoke of the SAME standalone scanner Lambda the Saturday SF runs (alpha-engine-research-scanner:live \u2014 ROADMAP L1995 / alpha-engine-config-I6494). Placed AFTER MorningArcticAppend so ArcticDB technicals for the trading day are present, and BEFORE PredictorInference so universe_membership/{date} + factor profiles (+ provenance) are fresh for the membership consumer (I6495). Features are daily-capable (I5360 / research-PR545; SCANNER_FEATURE_SOURCE default arcticdb). Status contract OK / ERROR \u2014 Catch is non-blocking at the SF layer (mirrors Saturday): Catch and Next converge on CheckSkipPredictorInference; a missing/stale membership surfaces at the predictor's own age gate rather than hard-failing preopen. dry_run_llm omitted \u2014 weekday cadence has no Friday-Preflight research_dry shell path. alpha-engine-config-I6855: 600 -> 440. The SF budget must sit BELOW the function timeout or it can never bind \u2014 on 2026-08-11 this state declared 600s while alpha-engine-research-scanner carried 300s, so both preopen invocations died at 300s with Sandbox.Timedout and the 600 described nothing. The function is now 450s (crucible-research-PR601, p95 x 1.5); 440 keeps the SF the effective budget, so a scanner overrun surfaces as States.Timeout naming this state rather than as an opaque Lambda error.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-research-scanner:live",
@@ -1194,7 +1216,7 @@
           "run_date.$": "$.run_date"
         }
       },
-      "TimeoutSeconds": 600,
+      "TimeoutSeconds": 440,
       "Retry": [
         {
           "ErrorEquals": [
@@ -1230,6 +1252,28 @@
         "stage_error.$": "$.scanner_error"
       },
       "ResultPath": "$.degraded_summary",
+      "Next": "PublishScannerFailureImmediate"
+    },
+    "PublishScannerFailureImmediate": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I6903: best-effort SNS alert that the Scanner failed \u2014 surfaces the miss at the MOMENT it happens, WITHOUT blocking the trading chain. The Scanner fail-open was the only one of the five degraded paths in this definition with no Publish state, so on 2026-08-11 there were 37 minutes of silence between the second Scanner timeout (05:32 PT) and the terminal (06:09 PT) \u2014 inside the window where an operator could still have rerun it before the 06:30 open. sf-pipeline-policy.md \u00a75 requires weekday fail-opens to set the degraded flag AND page immediately; this is the missing half. Mirrors PublishDataSpotFailureImmediate exactly, including the Catch: an SNS failure must not hard-fail a pipeline that deliberately continued.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekday Scanner \u2014 FAILED (fail-open, pipeline continues)",
+        "Message.$": "States.Format('Weekday Scanner failed but the pipeline continued to predictor inference and daemon start (fail-open, config#6722). Today candidates may be stale and the universe board, membership and leaderboard were not written \u2014 the optimizer runs without per-name ADV (config-I6902). Detail: {}', States.JsonToString($.scanner_error))"
+      },
+      "ResultPath": "$.scanner_failure_notify",
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "CheckSkipPredictorInference"
+        }
+      ],
       "Next": "CheckSkipPredictorInference"
     },
     "CheckSkipPredictorInference": {

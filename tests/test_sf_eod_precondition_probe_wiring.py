@@ -239,7 +239,13 @@ class TestDegradedTerminalState:
         assert states["NormalSucceeded"]["Type"] == "Succeed"
         assert states["DegradedRun"]["Type"] == "Fail"
         assert states["DegradedRun"]["Error"] == "DegradedRun"
-        assert "Cause" in states["DegradedRun"]
+        # config-I6856: the terminal now DERIVES its Cause from
+        # $.degraded_summary instead of carrying a static string. A static
+        # Cause enumerated the paths that could reach it and drifted behind
+        # them — 4 setters, 1 named on this definition. Depth of that guard
+        # lives in tests/test_degraded_terminal_derives_its_cause.py; this
+        # assertion holds only that the terminal still SAYS something.
+        assert "CausePath" in states["DegradedRun"]
 
     def test_a_run_that_never_hits_the_gap_cannot_reach_degraded_run(self, states):
         # Structural sanity: DegradedRun is reachable ONLY via

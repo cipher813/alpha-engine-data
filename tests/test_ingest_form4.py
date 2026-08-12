@@ -15,7 +15,7 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from unittest.mock import MagicMock
 
@@ -403,6 +403,16 @@ class TestS3ParquetWriter:
 # ── Orchestrator (discovery → download → parse → write) ───────────────
 
 
+# config#6923: the discovery path filters by `lookback_days` counted from
+# TODAY, so a fixture pinned to a literal ages out of the window and these
+# tests start failing with `assert 0 == 1` — no code change, on whoever's PR
+# runs CI that day. That is exactly what happened on 2026-08-11: the old
+# `date(2026, 5, 13)` fixtures turned 91 days old against `lookback_days=90`.
+# Anchored to now, comfortably inside the window the tests pass explicitly.
+_DISCOVERY_LOOKBACK_DAYS = 90
+_FILED = date.today() - timedelta(days=30)
+
+
 class TestIngestForTickers:
     def _make_http_mock(self, *, form4_list, xml_by_url):
         """Build a MagicMock http object that responds to:
@@ -464,7 +474,7 @@ class TestIngestForTickers:
             {
                 "form_type": "4",
                 "accession_number": "0000320193-26-000001",
-                "filed_date": date(2026, 5, 13),
+                "filed_date": _FILED,
                 "primary": "form4.xml",
             },
         ]
@@ -501,13 +511,13 @@ class TestIngestForTickers:
             {
                 "form_type": "10-K",  # not form 4
                 "accession_number": "0000320193-26-100001",
-                "filed_date": date(2026, 5, 1),
+                "filed_date": _FILED,
                 "primary": "10k.htm",
             },
             {
                 "form_type": "4",
                 "accession_number": "0000320193-26-100002",
-                "filed_date": date(2026, 5, 13),
+                "filed_date": _FILED,
                 "primary": "form4.xml",
             },
         ]
@@ -533,7 +543,7 @@ class TestIngestForTickers:
         form4_list = [{
             "form_type": "4",
             "accession_number": "abc",
-            "filed_date": date(2026, 5, 13),
+            "filed_date": _FILED,
             "primary": "form4.xml",
         }]
         http = self._make_http_mock(
@@ -561,13 +571,13 @@ class TestIngestForTickers:
             {
                 "form_type": "4",
                 "accession_number": "a",
-                "filed_date": date(2026, 5, 13),
+                "filed_date": _FILED,
                 "primary": "form4.xml",
             },
             {
                 "form_type": "4",
                 "accession_number": "b",
-                "filed_date": date(2026, 5, 13),
+                "filed_date": _FILED,
                 "primary": "missing.xml",  # 404
             },
         ]
@@ -600,3 +610,50 @@ def test_schema_version_on_every_row():
         accession_number="x", filed_date=date(2026, 5, 13),
     )
     assert all(t.schema_version == SCHEMA_VERSION for t in txs)
+
+
+def test_discovery_fixtures_stay_inside_the_lookback_window():
+    """config#6923: the guard that keeps the fixtures above from ageing out.
+
+    `ingest_for_tickers(lookback_days=...)` filters relative to TODAY, so a
+    literal fixture date is a time bomb with a knowable fuse. On 2026-08-11 the
+    previous `date(2026, 5, 13)` fixtures turned 91 days old against a 90-day
+    window and four tests began failing with `assert 0 == 1`, presenting as a
+    discovery bug that did not exist.
+    """
+    age = (date.today() - _FILED).days
+    assert 0 < age < _DISCOVERY_LOOKBACK_DAYS, (
+        f"_FILED is {age}d old, outside the {_DISCOVERY_LOOKBACK_DAYS}d window "
+        f"these tests pass to ingest_for_tickers"
+    )
+
+
+def test_no_orchestrator_fixture_is_dated_by_a_literal():
+    """Guard the CLASS, not just `_FILED` (alpha-engine-config-I6951).
+
+    `test_filed_fixture_stays_inside_the_lookback_window` keeps `_FILED`
+    fresh, which is necessary and not sufficient: it can only vouch for the
+    variable, so a fixture written as a literal is invisible to it. One was.
+    The `10-K` entry in `test_non_form4_filings_skipped_in_discovery` kept
+    `date(2026, 5, 1)` through the config#6923 fix and is, as of 2026-08-12,
+    already ~103 days old against the 90-day window.
+
+    Nothing failed, which is the point. That filing is supposed to be skipped
+    for its FORM TYPE; aged out, it gets skipped for its AGE instead, and the
+    test goes on passing while no longer exercising the form-type filter it
+    is named for. A green test that has quietly stopped asserting its subject
+    is worse than a red one.
+    """
+    import re
+    from pathlib import Path
+
+    src = Path(__file__).read_text()
+    body = src[src.index("class TestIngestForTickers:"):]
+    end = re.search(r"\n(?:def |class )", body)   # stop at the next top-level
+    if end:
+        body = body[: end.start()]
+    literals = re.findall(r"filed_date[\"']?\s*[:=]\s*date\(\d{4},\s*\d+,\s*\d+\)", body)
+    assert not literals, (
+        "orchestrator fixtures run through the lookback filter, so they must "
+        f"be anchored to `_FILED`, not written as a calendar date: {literals}"
+    )

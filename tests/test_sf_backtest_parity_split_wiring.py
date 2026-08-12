@@ -275,8 +275,14 @@ class TestChainOrdering:
         assert states["BacktesterWait"]["Next"] == "BacktesterPollWait"
         assert states["BacktesterPollWait"]["Next"] == "MergeBacktesterPollCount"
         assert states["MergeBacktesterPollCount"]["Next"] == "WaitForBacktester"
+        # config#6938: routed through the liveness gate, which separates a
+        # reclaimed launcher from a Backtester failure.
         assert (
             states["CheckBacktesterStatus"]["Default"]
+            == "BacktesterLivenessGate"
+        )
+        assert (
+            states["BacktesterLivenessGate"]["Default"]
             == "ExtractBacktesterError"
         )
 
@@ -405,6 +411,7 @@ class TestChainOrdering:
             return (
                 name is None
                 or name.startswith("Extract")
+                or name.endswith("LivenessGate")  # config#6938: error-side branch
                 or name.startswith("NormalizeFailureContext")
                 or name.endswith("Wait")
                 or name.endswith("RetryGate")
@@ -438,13 +445,13 @@ class TestChainOrdering:
                     cur = forward[0] if forward else default
             else:
                 cur = st.get("Next")
-            if cur == "Evaluator":
+            if cur == "EvaluatorDiagnostics":
                 order.append(cur)
                 break
         assert "Backtester" in order, order
         assert "ParityParallel" in order, order
         assert "PitParityCompare" in order, order
-        assert "Evaluator" in order, order
+        assert "EvaluatorDiagnostics" in order, order
         assert order.index("Backtester") < order.index("ParityParallel"), (
             "Backtester (backtest stage) must precede the parity family — "
             "the whole point of the split is a parity failure never re-runs "
@@ -454,7 +461,7 @@ class TestChainOrdering:
             "The compare/join must run AFTER the Parallel — each pass alone "
             "produces no usable artifact (the product is the delta)."
         )
-        assert order.index("PitParityCompare") < order.index("Evaluator"), (
+        assert order.index("PitParityCompare") < order.index("EvaluatorDiagnostics"), (
             "The parity family must precede the existing post-backtester "
             "Evaluator — downstream chain ordering is preserved."
         )
@@ -858,7 +865,14 @@ class TestL4472PhaseSplit:
         assert states[wait]["Next"] == f"{label}PollWait"
         assert states[f"{label}PollWait"]["Next"] == f"Merge{label}PollCount"
         assert states[f"Merge{label}PollCount"]["Next"] == f"WaitFor{label}"
-        assert states[check]["Default"].startswith("Extract")
+        # config#6938: the non-Success arm now reaches the normalizer through
+        # a liveness gate that separates a reclaimed launcher from a workload
+        # failure. Assert the route reaches an Extract*, not that the first hop
+        # is one.
+        default = states[check]["Default"]
+        if default.endswith("LivenessGate"):
+            default = states[default]["Default"]
+        assert default.startswith("Extract")
 
     def test_new_states_timeout_matches_backtester(self, states):
         """Each split state gets its own full SSM execution timeout — the

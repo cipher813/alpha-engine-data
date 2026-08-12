@@ -405,7 +405,7 @@
     },
     "WeeklyPreflight": {
       "Type": "Task",
-      "Comment": "I4494: pre-spend gate — runs sf_preflight.py checks against live AWS state before the pipeline spends on any spot or mutex acquisition. Checks: IAM reachability, tool contracts, definition input coherence, Lambda memory headroom. Fail-hard on assertion failure (preflight is cheaper than a Saturday spot run that would die for the same reason). Routes failures through ExtractWeeklyPreflightError → NormalizeFailureContext (the same chokepoint all pre-spend gate failures use), NOT directly to HandleFailure. Reads-only: no writes, no cost, no side effects. <60s target.",
+      "Comment": "I4494: pre-spend gate \u2014 runs sf_preflight.py checks against live AWS state before the pipeline spends on any spot or mutex acquisition. Checks: IAM reachability, tool contracts, definition input coherence, Lambda memory headroom. Fail-hard on assertion failure (preflight is cheaper than a Saturday spot run that would die for the same reason). Routes failures through ExtractWeeklyPreflightError \u2192 NormalizeFailureContext (the same chokepoint all pre-spend gate failures use), NOT directly to HandleFailure. Reads-only: no writes, no cost, no side effects. <60s target.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "TimeoutSeconds": 60,
       "Parameters": {
@@ -440,7 +440,7 @@
     },
     "WeeklyPreflightGate": {
       "Type": "Choice",
-      "Comment": "I4494: hard-fail when the preflight reports any failing check. Stops the pipeline before any spot spend, naming the failing assertion. Routes via ExtractWeeklyPreflightError (NOT straight to HandleFailure), mirroring the other pre-spend gate conventions: a Choice transition does not populate $.error the way a Task Catch (ResultPath $.error) does, and HandleFailure's Message template calls States.JsonToString($.error) — a direct Choice→HandleFailure jump would die with States.Runtime, swallowing the violation list behind an opaque meta-error. config#1819: ExtractWeeklyPreflightError hands off to NormalizeFailureContext, not HandleFailure directly.",
+      "Comment": "I4494: hard-fail when the preflight reports any failing check. Stops the pipeline before any spot spend, naming the failing assertion. Routes via ExtractWeeklyPreflightError (NOT straight to HandleFailure), mirroring the other pre-spend gate conventions: a Choice transition does not populate $.error the way a Task Catch (ResultPath $.error) does, and HandleFailure's Message template calls States.JsonToString($.error) \u2014 a direct Choice\u2192HandleFailure jump would die with States.Runtime, swallowing the violation list behind an opaque meta-error. config#1819: ExtractWeeklyPreflightError hands off to NormalizeFailureContext, not HandleFailure directly.",
       "Choices": [
         {
           "And": [
@@ -453,7 +453,7 @@
               "BooleanEquals": true
             }
           ],
-          "Comment": "Preflight found one or more failing checks — stop before spend. The Payload carries the violation list for the SNS alert.",
+          "Comment": "Preflight found one or more failing checks \u2014 stop before spend. The Payload carries the violation list for the SNS alert.",
           "Next": "ExtractWeeklyPreflightError"
         },
         {
@@ -461,7 +461,7 @@
             "Variable": "$.weekly_preflight_result.Payload.has_violation",
             "IsPresent": true
           },
-          "Comment": "Preflight returned a payload WITHOUT has_violation (partial/malformed result). Fail-closed: a preflight that cannot produce a verdict must not proceed, unlike the advisory gates (LibPinDriftCheck/PipelineContractCheck) which fail-open. The preflight is the last check before spend — failing open here defeats its purpose.",
+          "Comment": "Preflight returned a payload WITHOUT has_violation (partial/malformed result). Fail-closed: a preflight that cannot produce a verdict must not proceed, unlike the advisory gates (LibPinDriftCheck/PipelineContractCheck) which fail-open. The preflight is the last check before spend \u2014 failing open here defeats its purpose.",
           "Next": "ExtractWeeklyPreflightError"
         }
       ],
@@ -469,7 +469,7 @@
     },
     "ExtractWeeklyPreflightError": {
       "Type": "Pass",
-      "Comment": "Normalize a confirmed preflight failure (WeeklyPreflightGate has_violation==true) into $.error for HandleFailure's States.Format/JsonToString template. The gate is a Choice, so — unlike a Task Catch (ResultPath $.error) — it does NOT populate $.error; without this normalizer HandleFailure's States.JsonToString($.error) raises States.Runtime and the SF dies with an opaque meta-error instead of surfacing the preflight failure details. Carries the whole preflight Payload (failures/warnings) so the FAILED SNS alert names the exact check that must pass before redrive. References only $.weekly_preflight_result.Payload — guaranteed present because the gate already dereferenced Payload.has_violation to route here. Mirrors ExtractPipelineContractError's convention.",
+      "Comment": "Normalize a confirmed preflight failure (WeeklyPreflightGate has_violation==true) into $.error for HandleFailure's States.Format/JsonToString template. The gate is a Choice, so \u2014 unlike a Task Catch (ResultPath $.error) \u2014 it does NOT populate $.error; without this normalizer HandleFailure's States.JsonToString($.error) raises States.Runtime and the SF dies with an opaque meta-error instead of surfacing the preflight failure details. Carries the whole preflight Payload (failures/warnings) so the FAILED SNS alert names the exact check that must pass before redrive. References only $.weekly_preflight_result.Payload \u2014 guaranteed present because the gate already dereferenced Payload.has_violation to route here. Mirrors ExtractPipelineContractError's convention.",
       "Parameters": {
         "phase": "WeeklyPreflightGate",
         "source": "WeeklyPreflightGate.has_violation",
@@ -578,7 +578,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block a real trading cadence run. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability' carve-out, the primary deliverable survives a mutex-side failure. The error is captured in $.mutex_error for forensic review. alpha-engine-config#6722: this fail-open previously proceeded with no degraded flag at all — now routes through SetMutexAcquireDegradedFlag (mirrors LibPinGateDegraded/PipelineContractGateDegraded exactly: this IS a pre-spend precondition check, same family as the other two gate-infra fail-opens) so the completion email says so via CheckGateDegradedNotify.",
+          "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block a real trading cadence run. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability' carve-out, the primary deliverable survives a mutex-side failure. The error is captured in $.mutex_error for forensic review. alpha-engine-config#6722: this fail-open previously proceeded with no degraded flag at all \u2014 now routes through SetMutexAcquireDegradedFlag (mirrors LibPinGateDegraded/PipelineContractGateDegraded exactly: this IS a pre-spend precondition check, same family as the other two gate-infra fail-opens) so the completion email says so via CheckGateDegradedNotify.",
           "Next": "SetMutexAcquireDegradedFlag",
           "ResultPath": "$.mutex_error"
         }
@@ -588,7 +588,7 @@
     },
     "SetMutexAcquireDegradedFlag": {
       "Type": "Pass",
-      "Comment": "alpha-engine-config#6722: the mutex-acquire infra-error Catch (DynamoDB outage / IAM drift / transient SDK error — NOT the ConditionalCheckFailedException conflict case, which the separate MutexConflict Fail already handles) previously proceeded to CheckSpotDispatchNeeded with zero visibility. Mirrors LibPinGateDegraded's shape exactly: gate_degraded=true threads into the completion email via CheckGateDegradedNotify, and PublishMutexAcquireDegraded alerts NOW.",
+      "Comment": "alpha-engine-config#6722: the mutex-acquire infra-error Catch (DynamoDB outage / IAM drift / transient SDK error \u2014 NOT the ConditionalCheckFailedException conflict case, which the separate MutexConflict Fail already handles) previously proceeded to CheckSpotDispatchNeeded with zero visibility. Mirrors LibPinGateDegraded's shape exactly: gate_degraded=true threads into the completion email via CheckGateDegradedNotify, and PublishMutexAcquireDegraded alerts NOW.",
       "Result": true,
       "ResultPath": "$.gate_degraded",
       "Next": "PublishMutexAcquireDegraded"
@@ -599,7 +599,7 @@
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekly Pipeline — Mutex Acquire DEGRADED (Proceeding Unchecked)",
+        "Subject": "Alpha Engine Weekly Pipeline \u2014 Mutex Acquire DEGRADED (Proceeding Unchecked)",
         "Message": "AcquireMutex could not complete its DynamoDB conditional PUT (infra error, not a genuine duplicate-run conflict). Proceeding FAIL-OPEN: this run's duplicate-execution protection is unchecked for this run_date. The completion email will carry the gates-degraded marker. View pipeline status: https://console.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.mutex_acquire_degraded_notify",
@@ -608,7 +608,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Best-effort alert — a publish failure must not halt the fail-open path.",
+          "Comment": "Best-effort alert \u2014 a publish failure must not halt the fail-open path.",
           "ResultPath": "$.mutex_acquire_degraded_notify_error",
           "Next": "CheckSpotDispatchNeeded"
         }
@@ -814,8 +814,29 @@
     },
     "MorningEnrichRetryGate": {
       "Type": "Choice",
-      "Comment": "SOTA bounded auto-retry (config#1059): re-issue MorningEnrich ONCE on a polled non-Success SSM status before giving up (idempotent re-run on the same always-on instance). Absent counter => re-issue; counter=1 => give up to ExtractMorningEnrichError.",
+      "Comment": "SOTA bounded auto-retry (config#1059), liveness-branched (config#5688). The launcher is an EPHEMERAL per-execution spot since config#2248 (DispatchWeeklyFreshnessSpot replaced the always-on dashboard box as the $.ec2_instance_id source), so the dominant reason a poll goes non-Success is that the instance is GONE \u2014 and a re-issue of ssm:sendCommand to a terminated instance id can only raise Ssm.InvalidInstanceIdException, burning the retry ladder (5 attempts / ~4m20s measured on execution 158e7fe8-a6ca-4278-b097-c02ca4e34752) on a deterministic no-op. SUBSTRATE LOST (StatusDetails Undeliverable/Terminated) => fail fast to ExtractMorningEnrichSubstrateLostError WITHOUT consuming the re-issue counter, so a later genuine transient workload failure still gets its retry; recovery is the mechanical scripts/weekly_sf_rerun.py, which derives the skip-set from the failed execution. WORKLOAD FAILED on a live instance => the original single idempotent re-issue is correct and unchanged: absent counter => re-issue; counter=1 => give up to ExtractMorningEnrichError.",
       "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.morning_enrich_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.morning_enrich_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.morning_enrich_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractMorningEnrichSubstrateLostError"
+        },
         {
           "And": [
             {
@@ -1004,8 +1025,29 @@
     },
     "DataPhase1RetryGate": {
       "Type": "Choice",
-      "Comment": "SOTA bounded auto-retry (config#1059): a polled non-Success SSM status on this idempotent batch step is retriable, not terminal. Re-issue DataPhase1 ONCE on the same always-on instance ($.ec2_instance_id) before giving up \u2014 re-running is safe (the data job overwrites the same run_date S3 keys). Absent counter => first failure => re-issue; counter present (=1) => second failure => give up to ExtractDataPhase1Error. Keeps the scheduled execution alive through a transient blip so it succeeds first-pass (moves unattended_first_pass_rate).",
+      "Comment": "SOTA bounded auto-retry (config#1059), liveness-branched (config#5688). A polled non-Success SSM status on this idempotent batch step is retriable, not terminal \u2014 but ONLY while the instance is alive. The launcher is an EPHEMERAL per-execution spot since config#2248, so re-issuing to $.ec2_instance_id after substrate loss can only raise Ssm.InvalidInstanceIdException. SUBSTRATE LOST (StatusDetails Undeliverable/Terminated) => fail fast to ExtractDataPhase1SubstrateLostError WITHOUT consuming the re-issue counter; recovery is the mechanical scripts/weekly_sf_rerun.py. WORKLOAD FAILED on a live instance => re-issue DataPhase1 ONCE ($.ec2_instance_id) before giving up \u2014 re-running is safe (the data job overwrites the same run_date S3 keys). Absent counter => first failure => re-issue; counter present (=1) => second failure => give up to ExtractDataPhase1Error. Keeps the scheduled execution alive through a transient blip so it succeeds first-pass (moves unattended_first_pass_rate).",
       "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.data_phase1_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.data_phase1_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.data_phase1_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractDataPhase1SubstrateLostError"
+        },
         {
           "And": [
             {
@@ -1038,7 +1080,7 @@
           "States": {
             "InitResearchDegradedFlag": {
               "Type": "Pass",
-              "Comment": "alpha-engine-config#6722: seeds the branch-local $.research_degraded_local marker every fail-open Catch inside Branch A threads through (the Scanner/RegimeSubstrate/ChallengerShadow/RegimeRetrospectiveEval research-substep group, ThinkTankDegraded's flag, the eval-judge chain, and AggregateCosts's named sf-pipeline-policy.md §5 cost-aggregation carve-out). Must be seeded BEFORE any Mark*Degraded state or BranchAComplete's Parameters.$ extraction would throw States.Runtime on a clean run that never sets it. Folded into the top-level $.research_predictor_degraded at AggregateBranchOutcomes/CheckResearchPredictorDegraded (mirrors CheckParityBranchOutcomes' branch-status fold, alpha-engine-config#6030) since a Parallel branch cannot write an outer-scope JSONPath directly — ASL scopes each branch to its own copy of the state.",
+              "Comment": "alpha-engine-config#6722: seeds the branch-local $.research_degraded_local marker every fail-open Catch inside Branch A threads through (the Scanner/RegimeSubstrate/ChallengerShadow/RegimeRetrospectiveEval research-substep group, ThinkTankDegraded's flag, the eval-judge chain, and AggregateCosts's named sf-pipeline-policy.md \u00a75 cost-aggregation carve-out). Must be seeded BEFORE any Mark*Degraded state or BranchAComplete's Parameters.$ extraction would throw States.Runtime on a clean run that never sets it. Folded into the top-level $.research_predictor_degraded at AggregateBranchOutcomes/CheckResearchPredictorDegraded (mirrors CheckParityBranchOutcomes' branch-status fold, alpha-engine-config#6030) since a Parallel branch cannot write an outer-scope JSONPath directly \u2014 ASL scopes each branch to its own copy of the state.",
               "Result": false,
               "ResultPath": "$.research_degraded_local",
               "Next": "CheckSkipScanner"
@@ -1065,7 +1107,7 @@
             },
             "Scanner": {
               "Type": "Task",
-              "Comment": "Standalone scanner Lambda (ROADMAP L1995 Phase 1 \u2014 alpha-engine-research #235). Reads constituents.json + feature store, runs run_quant_filter, writes the candidates.json universe-board artifact for THIS run_date (crucible-research PR425, merged). alpha-engine-config-I2515 Phase B: this write is now LOAD-BEARING \u2014 SignalsEnvelope, ChallengerShadow, and the relocated (post-RAG) ThinkTankCoverage all read the SAME-DAY board, closing the no-week-old-data invariant (config#1580 ruling). The multi-agent Research graph runner that previously consumed this artifact has been REMOVED from this SF; the champion path is scanner \u2192 predictor direct. Status contract OK / ERROR \u2014 no SKIPPED today (constituents.json + feature store are hard preconditions). dry_run_llm threads the Friday-Preflight shell-run signal so the Lambda boots+imports without S3 read on $.research_dry=true.",
+              "Comment": "Standalone scanner Lambda (ROADMAP L1995 Phase 1 \u2014 alpha-engine-research #235). Reads constituents.json + feature store, runs run_quant_filter, writes the candidates.json universe-board artifact for THIS run_date (crucible-research PR425, merged). alpha-engine-config-I2515 Phase B: this write is now LOAD-BEARING \u2014 SignalsEnvelope, ChallengerShadow, and the relocated (post-RAG) ThinkTankCoverage all read the SAME-DAY board, closing the no-week-old-data invariant (config#1580 ruling). The multi-agent Research graph runner that previously consumed this artifact has been REMOVED from this SF; the champion path is scanner \u2192 predictor direct. Status contract OK / ERROR \u2014 no SKIPPED today (constituents.json + feature store are hard preconditions). dry_run_llm threads the Friday-Preflight shell-run signal so the Lambda boots+imports without S3 read on $.research_dry=true. alpha-engine-config-I6855: 600 -> 440. The SF budget must sit BELOW the function timeout or it can never bind \u2014 on 2026-08-11 this state declared 600s while alpha-engine-research-scanner carried 300s, so both preopen invocations died at 300s with Sandbox.Timedout and the 600 described nothing. The function is now 450s (crucible-research-PR601, p95 x 1.5); 440 keeps the SF the effective budget, so a scanner overrun surfaces as States.Timeout naming this state rather than as an opaque Lambda error.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-scanner:live",
@@ -1074,7 +1116,7 @@
                   "dry_run_llm.$": "$.research_dry"
                 }
               },
-              "TimeoutSeconds": 600,
+              "TimeoutSeconds": 440,
               "Retry": [
                 {
                   "ErrorEquals": [
@@ -1155,7 +1197,7 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "alpha-engine-config#6722: routes through MarkRegimeSubstrateDegraded before converging on CheckSkipSignalsEnvelope — this fail-open previously set no degraded flag.",
+                  "Comment": "alpha-engine-config#6722: routes through MarkRegimeSubstrateDegraded before converging on CheckSkipSignalsEnvelope \u2014 this fail-open previously set no degraded flag.",
                   "Next": "MarkRegimeSubstrateDegraded",
                   "ResultPath": "$.regime_substrate_error"
                 }
@@ -1463,8 +1505,29 @@
             },
             "RAGIngestionRetryGate": {
               "Type": "Choice",
-              "Comment": "SOTA bounded auto-retry (config#1059): re-issue RAGIngestion ONCE on a polled non-Success SSM status before giving up (idempotent re-run on the same always-on instance). Absent counter => re-issue; counter=1 => give up to ExtractRAGIngestionError.",
+              "Comment": "SOTA bounded auto-retry (config#1059), liveness-branched (config#5688). The launcher is an EPHEMERAL per-execution spot since config#2248, so a re-issue to a terminated $.ec2_instance_id can only raise Ssm.InvalidInstanceIdException \u2014 this gate is where that was MEASURED (execution 158e7fe8-a6ca-4278-b097-c02ca4e34752, 2026-07-30: 5 consecutive TaskFailed over 4m20s after the reaper terminated the box 52s before the poll flipped to Undeliverable). SUBSTRATE LOST (StatusDetails Undeliverable/Terminated) => fail fast to ExtractRAGIngestionSubstrateLostError WITHOUT consuming the re-issue counter; recovery is the mechanical scripts/weekly_sf_rerun.py. WORKLOAD FAILED on a live instance => re-issue RAGIngestion ONCE before giving up: absent counter => re-issue; counter=1 => give up to ExtractRAGIngestionError.",
               "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.rag_ingestion_poll.StatusDetails",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.rag_ingestion_poll.StatusDetails",
+                          "StringEquals": "Undeliverable"
+                        },
+                        {
+                          "Variable": "$.rag_ingestion_poll.StatusDetails",
+                          "StringEquals": "Terminated"
+                        }
+                      ]
+                    }
+                  ],
+                  "Next": "ExtractRAGIngestionSubstrateLostError"
+                },
                 {
                   "And": [
                     {
@@ -1494,6 +1557,17 @@
               "Parameters": {
                 "phase": "RAGIngestion",
                 "source": "CheckRAGIngestionStatus.Default",
+                "poll.$": "$.rag_ingestion_poll"
+              },
+              "ResultPath": "$.error",
+              "Next": "PublishResearchFailureImmediate"
+            },
+            "ExtractRAGIngestionSubstrateLostError": {
+              "Type": "Pass",
+              "Comment": "config#5688: the SUBSTRATE-LOST sibling of ExtractRAGIngestionError. Same normalization, distinguishable phase \u2014 the launcher spot was gone (StatusDetails Undeliverable/Terminated) before the workload could report, so this is an infrastructure event, not a RAG failure. The distinct phase reaches the SNS body through the same NormalizeFailureContext chain, which is what makes substrate loss separable from workload failure in failure telemetry instead of both arriving as a bare \"RAGIngestion\" phase. Deliberately does NOT route through RAGIngestionReissue: re-issuing ssm:sendCommand to a terminated instance id is a guaranteed Ssm.InvalidInstanceIdException, and consuming $.rag_ingestion_attempts here would spend the one bounded retry that a genuine transient workload failure needs.",
+              "Parameters": {
+                "phase": "RAGIngestion/SubstrateLost",
+                "source": "RAGIngestionRetryGate.SubstrateLost",
                 "poll.$": "$.rag_ingestion_poll"
               },
               "ResultPath": "$.error",
@@ -1746,8 +1820,29 @@
             },
             "DataPhase2RetryGate": {
               "Type": "Choice",
-              "Comment": "One bounded re-issue, mirroring DataPhase1RetryGate. A second failure is a real failure and takes Branch A down rather than looping: alt data is a model input, and a silent skip would write 0.0 into seven feature-store columns for the whole universe.",
+              "Comment": "One bounded re-issue, mirroring DataPhase1RetryGate, liveness-branched (config#5688). A second failure is a real failure and takes Branch A down rather than looping: alt data is a model input, and a silent skip would write 0.0 into seven feature-store columns for the whole universe. SUBSTRATE LOST (StatusDetails Undeliverable/Terminated) => fail fast to ExtractDataPhase2SubstrateLostError WITHOUT consuming the re-issue counter \u2014 the launcher is an ephemeral spot (config#2248), so re-issuing to a terminated $.ec2_instance_id can only raise Ssm.InvalidInstanceIdException; recovery is the mechanical scripts/weekly_sf_rerun.py. This gate was NOT named in config#5688's three-gate scope; it carries the identical shape and premise, and fixing three of four would have left the class open (engagement-protocol \u00a75).",
               "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.data_phase2_poll.StatusDetails",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.data_phase2_poll.StatusDetails",
+                          "StringEquals": "Undeliverable"
+                        },
+                        {
+                          "Variable": "$.data_phase2_poll.StatusDetails",
+                          "StringEquals": "Terminated"
+                        }
+                      ]
+                    }
+                  ],
+                  "Next": "ExtractDataPhase2SubstrateLostError"
+                },
                 {
                   "And": [
                     {
@@ -1771,6 +1866,17 @@
                 "phase": "DataPhase2",
                 "source": "DataPhase2RetryGate.exhausted",
                 "error": "DataPhase2 SSM command exhausted its retry budget (1 re-issue) without succeeding \u2014 the alternative data collector failed on both attempts."
+              },
+              "ResultPath": "$.error",
+              "Next": "PublishResearchFailureImmediate"
+            },
+            "ExtractDataPhase2SubstrateLostError": {
+              "Type": "Pass",
+              "Comment": "config#5688: the SUBSTRATE-LOST sibling of SetDataPhase2ExhaustedError. Same normalization, distinguishable phase \u2014 the launcher spot was gone (StatusDetails Undeliverable/Terminated) before the workload could report, so this is an infrastructure event, not a DataPhase2 failure, and it is emphatically NOT retry-budget exhaustion (the budget is untouched). Deliberately does NOT route through DataPhase2Reissue: re-issuing ssm:sendCommand to a terminated instance id is a guaranteed Ssm.InvalidInstanceIdException, and consuming $.data_phase2_attempts here would spend the one bounded retry a genuine transient workload failure needs.",
+              "Parameters": {
+                "phase": "DataPhase2/SubstrateLost",
+                "source": "DataPhase2RetryGate.SubstrateLost",
+                "poll.$": "$.data_phase2_poll"
               },
               "ResultPath": "$.error",
               "Next": "PublishResearchFailureImmediate"
@@ -2461,7 +2567,7 @@
           "States": {
             "InitPredictorDegradedFlag": {
               "Type": "Pass",
-              "Comment": "alpha-engine-config#6722: seeds the branch-local $.research_degraded_local marker Branch B's model-zoo rotation fail-open group (ResolveZooSpecs/WaitResolveZoo/ModelZooTrainMap/ModelZooSelect/WaitForModelZoo, all converging on PublishModelZooFailureImmediate) threads through. Must be seeded BEFORE BranchBComplete's Parameters.$ extraction would throw States.Runtime on a clean run that never sets it. Same field name as Branch A's InitResearchDegradedFlag — branches are isolated JSONPath scopes, so no collision — folded into the top-level $.research_predictor_degraded at AggregateBranchOutcomes/CheckResearchPredictorDegraded.",
+              "Comment": "alpha-engine-config#6722: seeds the branch-local $.research_degraded_local marker Branch B's model-zoo rotation fail-open group (ResolveZooSpecs/WaitResolveZoo/ModelZooTrainMap/ModelZooSelect/WaitForModelZoo, all converging on PublishModelZooFailureImmediate) threads through. Must be seeded BEFORE BranchBComplete's Parameters.$ extraction would throw States.Runtime on a clean run that never sets it. Same field name as Branch A's InitResearchDegradedFlag \u2014 branches are isolated JSONPath scopes, so no collision \u2014 folded into the top-level $.research_predictor_degraded at AggregateBranchOutcomes/CheckResearchPredictorDegraded.",
               "Result": false,
               "ResultPath": "$.research_degraded_local",
               "Next": "CheckSkipPredictorTraining"
@@ -2715,7 +2821,7 @@
                   "Next": "PredictorWait"
                 }
               ],
-              "Default": "ExtractPredictorError",
+              "Default": "PredictorTrainingLivenessGate",
               "Comment": "[I5687: poll budget cap=108 via $.predictor_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
             },
             "PredictorWait": {
@@ -2897,7 +3003,7 @@
                   "Next": "ParseZooSpecs"
                 }
               ],
-              "Default": "ExtractModelZooResolveError"
+              "Default": "ModelZooResolveLivenessGate"
             },
             "ExtractModelZooResolveError": {
               "Type": "Pass",
@@ -3279,7 +3385,7 @@
                   "Next": "BranchBComplete"
                 }
               ],
-              "Default": "ExtractModelZooSelectError"
+              "Default": "ModelZooSelectLivenessGate"
             },
             "ExtractModelZooSelectError": {
               "Type": "Pass",
@@ -3404,6 +3510,123 @@
               "InputPath": "$.model_zoo_poll_count.polls",
               "ResultPath": "$.model_zoo_polls",
               "Next": "WaitForModelZoo"
+            },
+            "PredictorTrainingLivenessGate": {
+              "Type": "Choice",
+              "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that PredictorTraining failed. Without this the two are indistinguishable in the alert and the run dies as a PredictorTraining fault \u2014 measured on watch-rerun-2026-08-10-8 (2026-08-11): ResponseCode -1 / Undeliverable, no log shipped, Server.SpotInstanceTermination on neighbouring instances in the same window. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates; recovery is the mechanical scripts/weekly_sf_rerun.py.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.predictor_poll.StatusDetails",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.predictor_poll.StatusDetails",
+                          "StringEquals": "Undeliverable"
+                        },
+                        {
+                          "Variable": "$.predictor_poll.StatusDetails",
+                          "StringEquals": "Terminated"
+                        }
+                      ]
+                    }
+                  ],
+                  "Next": "ExtractPredictorTrainingSubstrateLostError"
+                }
+              ],
+              "Default": "ExtractPredictorError"
+            },
+            "ExtractPredictorTrainingSubstrateLostError": {
+              "Type": "Pass",
+              "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractPredictorError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a PredictorTraining failure without opening the execution history.",
+              "Parameters": {
+                "phase": "PredictorTraining/SubstrateLost",
+                "source": "PredictorTrainingLivenessGate.SubstrateLost",
+                "poll.$": "$.predictor_poll"
+              },
+              "ResultPath": "$.error",
+              "Next": "PublishPredictorFailureImmediate"
+            },
+            "ModelZooResolveLivenessGate": {
+              "Type": "Choice",
+              "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that ModelZooResolve failed. Without this the two are indistinguishable in the alert and the run dies as a ModelZooResolve fault \u2014 measured on watch-rerun-2026-08-10-8 (2026-08-11): ResponseCode -1 / Undeliverable, no log shipped, Server.SpotInstanceTermination on neighbouring instances in the same window. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates; recovery is the mechanical scripts/weekly_sf_rerun.py.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.resolve_zoo_poll.StatusDetails",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.resolve_zoo_poll.StatusDetails",
+                          "StringEquals": "Undeliverable"
+                        },
+                        {
+                          "Variable": "$.resolve_zoo_poll.StatusDetails",
+                          "StringEquals": "Terminated"
+                        }
+                      ]
+                    }
+                  ],
+                  "Next": "ExtractModelZooResolveSubstrateLostError"
+                }
+              ],
+              "Default": "ExtractModelZooResolveError"
+            },
+            "ExtractModelZooResolveSubstrateLostError": {
+              "Type": "Pass",
+              "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractModelZooResolveError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a ModelZooResolve failure without opening the execution history.",
+              "Parameters": {
+                "phase": "ModelZooResolve/SubstrateLost",
+                "source": "ModelZooResolveLivenessGate.SubstrateLost",
+                "poll.$": "$.resolve_zoo_poll"
+              },
+              "ResultPath": "$.error",
+              "Next": "PublishModelZooFailureImmediate"
+            },
+            "ModelZooSelectLivenessGate": {
+              "Type": "Choice",
+              "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that ModelZooSelect failed. Without this the two are indistinguishable in the alert and the run dies as a ModelZooSelect fault \u2014 measured on watch-rerun-2026-08-10-8 (2026-08-11): ResponseCode -1 / Undeliverable, no log shipped, Server.SpotInstanceTermination on neighbouring instances in the same window. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates; recovery is the mechanical scripts/weekly_sf_rerun.py.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.model_zoo_poll.StatusDetails",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.model_zoo_poll.StatusDetails",
+                          "StringEquals": "Undeliverable"
+                        },
+                        {
+                          "Variable": "$.model_zoo_poll.StatusDetails",
+                          "StringEquals": "Terminated"
+                        }
+                      ]
+                    }
+                  ],
+                  "Next": "ExtractModelZooSelectSubstrateLostError"
+                }
+              ],
+              "Default": "ExtractModelZooSelectError"
+            },
+            "ExtractModelZooSelectSubstrateLostError": {
+              "Type": "Pass",
+              "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractModelZooSelectError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a ModelZooSelect failure without opening the execution history.",
+              "Parameters": {
+                "phase": "ModelZooSelect/SubstrateLost",
+                "source": "ModelZooSelectLivenessGate.SubstrateLost",
+                "poll.$": "$.model_zoo_poll"
+              },
+              "ResultPath": "$.error",
+              "Next": "PublishModelZooFailureImmediate"
             }
           }
         }
@@ -3692,7 +3915,7 @@
           "Next": "BacktesterWait"
         }
       ],
-      "Default": "ExtractBacktesterError",
+      "Default": "BacktesterLivenessGate",
       "Comment": "[I5687: poll budget cap=144 via $.backtester_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
     },
     "BacktesterWait": {
@@ -3857,7 +4080,7 @@
           "Next": "PredictorBacktestWait"
         }
       ],
-      "Default": "ExtractPredictorBacktestError",
+      "Default": "PredictorBacktestLivenessGate",
       "Comment": "[I5687: poll budget cap=144 via $.predictor_backtest_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
     },
     "PredictorBacktestWait": {
@@ -4022,7 +4245,7 @@
           "Next": "PortfolioOptimizerBacktestWait"
         }
       ],
-      "Default": "ExtractPortfolioOptimizerBacktestError",
+      "Default": "PortfolioOptimizerBacktestLivenessGate",
       "Comment": "[I5687: poll budget cap=144 via $.portfolio_optimizer_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
     },
     "PortfolioOptimizerBacktestWait": {
@@ -4991,24 +5214,24 @@
           "Next": "CheckSkipPostEval"
         }
       ],
-      "Default": "Evaluator"
+      "Default": "EvaluatorDiagnostics"
     },
-    "Evaluator": {
+    "EvaluatorDiagnostics": {
       "Type": "Task",
-      "Comment": "Evaluator on a separate spot instance (split from Backtester 2026-05-07 \u2014 plan: alpha-engine-docs/private/evaluator-split-260507.md). Reads s3://alpha-engine-research/backtest/{RUN_DATE}/ artifacts produced by the prior Backtester state and runs evaluate.py --mode all --upload, which sends the per-signal grading email and auto-applies optimizer configs. Post I4442/I4497 cutover, invokes its own spot_evaluator.sh (pre-cutover: reused spot_backtest.sh with --no-pit-parity --skip-stages=backtest,parity); the script is the canonical dispatch surface (existing CSV vocabulary). --no-pit-parity added 2026-07-20 (matching the Backtester/PredictorBacktest/PortfolioOptimizerBacktest convention; Parity is pit_parity's designed owner via --pit-parity-enabled=1): it was the one stage NO SF state's skip-stages excluded, so it free-rode in every state and re-ran inside the Evaluator's budget whenever phase markers did not dedupe it \u2014 the config#2871 pit-parity sweep pass (no marker skip) ran a 2h predictor-sim walkforward inside the Evaluator and blew its ceiling twice (watch-rerun-2026-07-18-10/-11). pit_parity is produced by the earlier backtest-family states; the Evaluator only consumes backtest/{RUN_DATE}/pit_parity.json. Full single-producer decomposition: alpha-engine-config-I3112. Live-apply mode by default; for diagnostic-only off-cycle runs, invoke spot_backtest.sh manually with --freeze-evaluator and --skip-stages=backtest,parity. alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script \u2014 the monolith is retained unchanged as the rollback path.",
+      "Comment": "Evaluator FIRST half \u2014 evaluate.py --mode diagnostics (signal quality + component diagnostics), which writes the S3 handoff snapshot the optimize half reads (I3112 deliverable 2, evaluate_handoff.py::write_snapshot). Split from the single Evaluator state by alpha-engine-config-I3112 deliverable 3 (Brian design ruling 2026-07-20): one shared 3600s executionTimeout SIGKILLed the whole bundle mid-work on watch-rerun-2026-07-18-10, no per-task budget was expressible, an hour of 'CheckEvaluatorStatus' showed which internal phase was running, and a failure in one half forced recompute of the other on replay. SIZED FROM MEASUREMENT, not from the estimate it replaces. The old single state carried 7200s against a MEASURED 482s stage wall-clock (CheckSkipEvaluator 06:06:03 -> CheckSkipPostEval 06:14:06 on the 2026-08-08 succeeded execution) \u2014 6.7% utilisation, and sf_budgets.py derived it from an explicitly UNMEASURED 6.9 s/ticker guess that over-predicted the real stage by ~15x. Phase markers over three consecutive weekly runs (2026-07-31 / 08-04 / 08-07): signal_quality 7.85/8.43/9.64s, diagnostics 198.67/231.43/230.18s, optimizers 29.71/33.86/33.82s, assembler+apply_audit+champion+regression ~2s. evaluate.py's own span was 282s; the remaining ~200s of the stage is the spot request, boot, bootstrap, smoke and one 60s poll tick. Budget 1800s = ~3.7x the measured 482s whole-stage figure for the heavier half. Deliberately generous: every budget defect this pipeline has had was an under-size, and this half owns the 230s phase and the snapshot write. TWO SPOT DISPATCHES, deliberately. I3112 deliverable 3 says 'reuse the existing spot box (sequential SSM steps) rather than spinning two boxes', written against a model where the Evaluator ran ON $.ec2_instance_id. It does not: this state sends a command to the weekly dispatch box, and spot_evaluator.sh requests its OWN spot, bootstraps it, and terminates it in a trap (_spot_common.sh has no keep-alive or attach path \u2014 termination is a load-bearing cost-safety property used by every stage). Reusing one box would mean weakening that trap fleet-wide to save the measured ~200s second boot on a ~4h20m pipeline. The boot is paid twice; the trap is not touched. Recorded on alpha-engine-config-I3112. Evaluator on a separate spot instance (split from Backtester 2026-05-07 \u2014 plan: alpha-engine-docs/private/evaluator-split-260507.md). Reads s3://alpha-engine-research/backtest/{RUN_DATE}/ artifacts produced by the prior Backtester state and runs evaluate.py --mode all --upload, which sends the per-signal grading email and auto-applies optimizer configs. Post I4442/I4497 cutover, invokes its own spot_evaluator.sh (pre-cutover: reused spot_backtest.sh with --no-pit-parity --skip-stages=backtest,parity); the script is the canonical dispatch surface (existing CSV vocabulary). --no-pit-parity added 2026-07-20 (matching the Backtester/PredictorBacktest/PortfolioOptimizerBacktest convention; Parity is pit_parity's designed owner via --pit-parity-enabled=1): it was the one stage NO SF state's skip-stages excluded, so it free-rode in every state and re-ran inside the Evaluator's budget whenever phase markers did not dedupe it \u2014 the config#2871 pit-parity sweep pass (no marker skip) ran a 2h predictor-sim walkforward inside the Evaluator and blew its ceiling twice (watch-rerun-2026-07-18-10/-11). pit_parity is produced by the earlier backtest-family states; the Evaluator only consumes backtest/{RUN_DATE}/pit_parity.json. Full single-producer decomposition: alpha-engine-config-I3112. Live-apply mode by default; for diagnostic-only off-cycle runs, invoke spot_backtest.sh manually with --freeze-evaluator and --skip-stages=backtest,parity. alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script \u2014 the monolith is retained unchanged as the rollback path.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
           "executionTimeout": [
-            "7200"
+            "1800"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug evaluator --log /var/log/evaluator.log -- bash infrastructure/spot_evaluator.sh{}',$$.Execution.Name,$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug evaluator-diagnostics --log /var/log/evaluator-diagnostics.log -- bash infrastructure/spot_evaluator.sh --eval-half=diagnostics{}',$$.Execution.Name,$.preflight_args))"
         },
-        "TimeoutSeconds": 7200
+        "TimeoutSeconds": 1800
       },
-      "TimeoutSeconds": 7260,
+      "TimeoutSeconds": 1860,
       "Retry": [
         {
           "ErrorEquals": [
@@ -5043,15 +5266,22 @@
           "ResultPath": "$.error"
         }
       ],
-      "ResultPath": "$.evaluator_result",
-      "Next": "InitEvaluatorPollCount"
+      "ResultPath": "$.evaluator_diagnostics_result",
+      "Next": "InitEvaluatorDiagnosticsPollCount"
     },
-    "WaitForEvaluator": {
+    "InitEvaluatorDiagnosticsPollCount": {
+      "Type": "Pass",
+      "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=36 = ceil(1800s timeout / 60s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
+      "Result": 0,
+      "ResultPath": "$.evaluator_diagnostics_polls",
+      "Next": "WaitForEvaluatorDiagnostics"
+    },
+    "WaitForEvaluatorDiagnostics": {
       "Type": "Task",
       "Comment": "Poll SSM command until evaluator complete",
       "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
       "Parameters": {
-        "CommandId.$": "$.evaluator_result.Command.CommandId",
+        "CommandId.$": "$.evaluator_diagnostics_result.Command.CommandId",
         "InstanceId.$": "$.ec2_instance_id[0]"
       },
       "Retry": [
@@ -5089,54 +5319,250 @@
         "StatusDetails.$": "$.StatusDetails",
         "StandardErrorContent.$": "$.StandardErrorContent"
       },
-      "ResultPath": "$.evaluator_poll",
-      "Next": "CheckEvaluatorStatus"
+      "ResultPath": "$.evaluator_diagnostics_poll",
+      "Next": "CheckEvaluatorDiagnosticsStatus"
     },
-    "CheckEvaluatorStatus": {
+    "CheckEvaluatorDiagnosticsStatus": {
       "Type": "Choice",
       "Choices": [
         {
-          "Variable": "$.evaluator_poll.Status",
+          "Variable": "$.evaluator_diagnostics_poll.Status",
+          "StringEquals": "Success",
+          "Next": "EvaluatorOptimize"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.evaluator_diagnostics_polls",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.evaluator_diagnostics_poll.Status",
+                  "StringEquals": "InProgress"
+                },
+                {
+                  "Variable": "$.evaluator_diagnostics_poll.Status",
+                  "StringEquals": "Pending"
+                }
+              ]
+            },
+            {
+              "Variable": "$.evaluator_diagnostics_polls",
+              "NumericLessThan": 36
+            }
+          ],
+          "Next": "EvaluatorDiagnosticsWait"
+        }
+      ],
+      "Default": "EvaluatorDiagnosticsLivenessGate",
+      "Comment": "[I5687: poll budget cap=36 via $.evaluator_diagnostics_polls = ceil(timeout/60s * 1.2 slack), the DataPhase2/ThinkTank convention applied to this half's own timeout rather than inherited from the merged state; budget exhaustion falls through to the existing Default]"
+    },
+    "EvaluatorDiagnosticsWait": {
+      "Type": "Pass",
+      "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckEvaluatorStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
+      "Parameters": {
+        "polls.$": "States.MathAdd($.evaluator_diagnostics_polls, 1)"
+      },
+      "ResultPath": "$.evaluator_diagnostics_poll_count",
+      "Next": "EvaluatorDiagnosticsPollWait"
+    },
+    "EvaluatorDiagnosticsPollWait": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "MergeEvaluatorDiagnosticsPollCount"
+    },
+    "MergeEvaluatorDiagnosticsPollCount": {
+      "Type": "Pass",
+      "InputPath": "$.evaluator_diagnostics_poll_count.polls",
+      "ResultPath": "$.evaluator_diagnostics_polls",
+      "Next": "WaitForEvaluatorDiagnostics"
+    },
+    "ExtractEvaluatorDiagnosticsError": {
+      "Type": "Pass",
+      "Comment": "Normalize EvaluatorDiagnostics SSM non-Success poll into $.error.",
+      "Parameters": {
+        "phase": "EvaluatorDiagnostics",
+        "source": "CheckEvaluatorDiagnosticsStatus.Default",
+        "poll.$": "$.evaluator_diagnostics_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "EvaluatorOptimize": {
+      "Type": "Task",
+      "Comment": "Evaluator SECOND half \u2014 evaluate.py --mode optimize (optimizers, assembler, apply-audit, champion promotion, regression). Reads the diagnostics snapshot from S3 rather than starting with an empty dict (I3112 deliverable 2, evaluate_handoff.py::load_snapshot); a missing snapshot degrades to the old empty-dict behaviour with a loud warning, a genuine S3 transport failure propagates. Split from the single Evaluator state by alpha-engine-config-I3112 deliverable 3 (Brian design ruling 2026-07-20): one shared 3600s executionTimeout SIGKILLed the whole bundle mid-work on watch-rerun-2026-07-18-10, no per-task budget was expressible, an hour of 'CheckEvaluatorStatus' showed which internal phase was running, and a failure in one half forced recompute of the other on replay. SIZED FROM MEASUREMENT, not from the estimate it replaces. The old single state carried 7200s against a MEASURED 482s stage wall-clock (CheckSkipEvaluator 06:06:03 -> CheckSkipPostEval 06:14:06 on the 2026-08-08 succeeded execution) \u2014 6.7% utilisation, and sf_budgets.py derived it from an explicitly UNMEASURED 6.9 s/ticker guess that over-predicted the real stage by ~15x. Phase markers over three consecutive weekly runs (2026-07-31 / 08-04 / 08-07): signal_quality 7.85/8.43/9.64s, diagnostics 198.67/231.43/230.18s, optimizers 29.71/33.86/33.82s, assembler+apply_audit+champion+regression ~2s. evaluate.py's own span was 282s; the remaining ~200s of the stage is the spot request, boot, bootstrap, smoke and one 60s poll tick. Budget 1200s against ~36s of measured phase work plus the same ~200s boot/bootstrap floor \u2014 the floor, not the work, is what this half's ceiling is made of. TWO SPOT DISPATCHES, deliberately. I3112 deliverable 3 says 'reuse the existing spot box (sequential SSM steps) rather than spinning two boxes', written against a model where the Evaluator ran ON $.ec2_instance_id. It does not: this state sends a command to the weekly dispatch box, and spot_evaluator.sh requests its OWN spot, bootstraps it, and terminates it in a trap (_spot_common.sh has no keep-alive or attach path \u2014 termination is a load-bearing cost-safety property used by every stage). Reusing one box would mean weakening that trap fleet-wide to save the measured ~200s second boot on a ~4h20m pipeline. The boot is paid twice; the trap is not touched. Recorded on alpha-engine-config-I3112. Evaluator on a separate spot instance (split from Backtester 2026-05-07 \u2014 plan: alpha-engine-docs/private/evaluator-split-260507.md). Reads s3://alpha-engine-research/backtest/{RUN_DATE}/ artifacts produced by the prior Backtester state and runs evaluate.py --mode all --upload, which sends the per-signal grading email and auto-applies optimizer configs. Post I4442/I4497 cutover, invokes its own spot_evaluator.sh (pre-cutover: reused spot_backtest.sh with --no-pit-parity --skip-stages=backtest,parity); the script is the canonical dispatch surface (existing CSV vocabulary). --no-pit-parity added 2026-07-20 (matching the Backtester/PredictorBacktest/PortfolioOptimizerBacktest convention; Parity is pit_parity's designed owner via --pit-parity-enabled=1): it was the one stage NO SF state's skip-stages excluded, so it free-rode in every state and re-ran inside the Evaluator's budget whenever phase markers did not dedupe it \u2014 the config#2871 pit-parity sweep pass (no marker skip) ran a 2h predictor-sim walkforward inside the Evaluator and blew its ceiling twice (watch-rerun-2026-07-18-10/-11). pit_parity is produced by the earlier backtest-family states; the Evaluator only consumes backtest/{RUN_DATE}/pit_parity.json. Full single-producer decomposition: alpha-engine-config-I3112. Live-apply mode by default; for diagnostic-only off-cycle runs, invoke spot_backtest.sh manually with --freeze-evaluator and --skip-stages=backtest,parity. alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script \u2014 the monolith is retained unchanged as the rollback path.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "executionTimeout": [
+            "1200"
+          ],
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug evaluator-optimize --log /var/log/evaluator-optimize.log -- bash infrastructure/spot_evaluator.sh --eval-half=optimize{}',$$.Execution.Name,$.preflight_args))"
+        },
+        "TimeoutSeconds": 1200
+      },
+      "TimeoutSeconds": 1260,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "Comment": "config#2279: declared spot-stage sendCommand convention \u2014 the 4+2 jittered ladder (mirrors MorningEnrich/DataPhase1/RAGIngestion, the gold standard). SAFE to widen here: this state's Retry fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) \u2014 BEFORE the launcher command ever ran, so no spot was launched and no partial S3 writes exist; post-delivery outcomes are owned by the WaitFor* poll loop + Check*Status gate, which this ladder never re-enters.",
+          "MaxAttempts": 4,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#2279: catch-all transient tier \u2014 same idempotency argument as the tier above.",
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "NormalizeFailureContext",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.evaluator_optimize_result",
+      "Next": "InitEvaluatorOptimizePollCount"
+    },
+    "InitEvaluatorOptimizePollCount": {
+      "Type": "Pass",
+      "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=24 = ceil(1200s timeout / 60s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
+      "Result": 0,
+      "ResultPath": "$.evaluator_optimize_polls",
+      "Next": "WaitForEvaluatorOptimize"
+    },
+    "WaitForEvaluatorOptimize": {
+      "Type": "Task",
+      "Comment": "Poll SSM command until evaluator complete",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.evaluator_optimize_result.Command.CommandId",
+        "InstanceId.$": "$.ec2_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "NormalizeFailureContext",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
+      "ResultPath": "$.evaluator_optimize_poll",
+      "Next": "CheckEvaluatorOptimizeStatus"
+    },
+    "CheckEvaluatorOptimizeStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.evaluator_optimize_poll.Status",
           "StringEquals": "Success",
           "Next": "CheckSkipPostEval"
         },
         {
           "And": [
             {
-              "Variable": "$.evaluator_polls",
+              "Variable": "$.evaluator_optimize_polls",
               "IsPresent": true
             },
             {
               "Or": [
                 {
-                  "Variable": "$.evaluator_poll.Status",
+                  "Variable": "$.evaluator_optimize_poll.Status",
                   "StringEquals": "InProgress"
                 },
                 {
-                  "Variable": "$.evaluator_poll.Status",
+                  "Variable": "$.evaluator_optimize_poll.Status",
                   "StringEquals": "Pending"
                 }
               ]
             },
             {
-              "Variable": "$.evaluator_polls",
-              "NumericLessThan": 144
+              "Variable": "$.evaluator_optimize_polls",
+              "NumericLessThan": 24
             }
           ],
-          "Next": "EvaluatorWait"
+          "Next": "EvaluatorOptimizeWait"
         }
       ],
-      "Default": "ExtractEvaluatorError",
-      "Comment": "[I5687: poll budget cap=144 via $.evaluator_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
+      "Default": "EvaluatorOptimizeLivenessGate",
+      "Comment": "[I5687: poll budget cap=24 via $.evaluator_optimize_polls = ceil(timeout/60s * 1.2 slack), the DataPhase2/ThinkTank convention applied to this half's own timeout rather than inherited from the merged state; budget exhaustion falls through to the existing Default]"
     },
-    "EvaluatorWait": {
+    "EvaluatorOptimizeWait": {
       "Type": "Pass",
       "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckEvaluatorStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
       "Parameters": {
-        "polls.$": "States.MathAdd($.evaluator_polls, 1)"
+        "polls.$": "States.MathAdd($.evaluator_optimize_polls, 1)"
       },
-      "ResultPath": "$.evaluator_poll_count",
-      "Next": "EvaluatorPollWait"
+      "ResultPath": "$.evaluator_optimize_poll_count",
+      "Next": "EvaluatorOptimizePollWait"
+    },
+    "EvaluatorOptimizePollWait": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "MergeEvaluatorOptimizePollCount"
+    },
+    "MergeEvaluatorOptimizePollCount": {
+      "Type": "Pass",
+      "InputPath": "$.evaluator_optimize_poll_count.polls",
+      "ResultPath": "$.evaluator_optimize_polls",
+      "Next": "WaitForEvaluatorOptimize"
+    },
+    "ExtractEvaluatorOptimizeError": {
+      "Type": "Pass",
+      "Comment": "Normalize EvaluatorOptimize SSM non-Success poll into $.error.",
+      "Parameters": {
+        "phase": "EvaluatorOptimize",
+        "source": "CheckEvaluatorOptimizeStatus.Default",
+        "poll.$": "$.evaluator_optimize_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
     },
     "CheckSkipPostEval": {
       "Type": "Choice",
@@ -5973,12 +6399,34 @@
       "ResultPath": "$.error",
       "Next": "NormalizeFailureContext"
     },
+    "ExtractMorningEnrichSubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#5688: the SUBSTRATE-LOST sibling of ExtractMorningEnrichError. Same normalization, distinguishable phase \u2014 the launcher spot was gone (StatusDetails Undeliverable/Terminated) before the workload could report, so this is an infrastructure event, not a MorningEnrich failure. The distinct phase reaches the SNS body through the same NormalizeFailureContext chain, which is what makes substrate loss separable from workload failure in failure telemetry. Deliberately does NOT route through MorningEnrichReissue: re-issuing ssm:sendCommand to a terminated instance id is a guaranteed Ssm.InvalidInstanceIdException, and consuming $.morning_enrich_attempts here would spend the one bounded retry a genuine transient workload failure needs.",
+      "Parameters": {
+        "phase": "MorningEnrich/SubstrateLost",
+        "source": "MorningEnrichRetryGate.SubstrateLost",
+        "poll.$": "$.morning_enrich_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
     "ExtractDataPhase1Error": {
       "Type": "Pass",
       "Comment": "Normalize DataPhase1 SSM non-Success poll into $.error so HandleFailure's States.Format template has something to serialize (the soft-failure path from CheckDataPhase1Status.Default does not populate $.error \u2014 only Task Catch blocks do).",
       "Parameters": {
         "phase": "DataPhase1",
         "source": "CheckDataPhase1Status.Default",
+        "poll.$": "$.data_phase1_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "ExtractDataPhase1SubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#5688: the SUBSTRATE-LOST sibling of ExtractDataPhase1Error. Same normalization, distinguishable phase \u2014 the launcher spot was gone (StatusDetails Undeliverable/Terminated) before the workload could report, so this is an infrastructure event, not a DataPhase1 failure. The distinct phase reaches the SNS body through the same NormalizeFailureContext chain, which is what makes substrate loss separable from workload failure in failure telemetry. Deliberately does NOT route through DataPhase1Reissue: re-issuing ssm:sendCommand to a terminated instance id is a guaranteed Ssm.InvalidInstanceIdException, and consuming $.data_phase1_attempts here would spend the one bounded retry a genuine transient workload failure needs.",
+      "Parameters": {
+        "phase": "DataPhase1/SubstrateLost",
+        "source": "DataPhase1RetryGate.SubstrateLost",
         "poll.$": "$.data_phase1_poll"
       },
       "ResultPath": "$.error",
@@ -6042,17 +6490,6 @@
         "phase": "PortfolioOptimizerBacktest",
         "source": "CheckPortfolioOptimizerBacktestStatus.Default",
         "poll.$": "$.portfolio_optimizer_poll"
-      },
-      "ResultPath": "$.error",
-      "Next": "NormalizeFailureContext"
-    },
-    "ExtractEvaluatorError": {
-      "Type": "Pass",
-      "Comment": "Normalize Evaluator SSM non-Success poll into $.error.",
-      "Parameters": {
-        "phase": "Evaluator",
-        "source": "CheckEvaluatorStatus.Default",
-        "poll.$": "$.evaluator_poll"
       },
       "ResultPath": "$.error",
       "Next": "NormalizeFailureContext"
@@ -6600,7 +7037,7 @@
           "Next": "WeeklyFreshnessSpotBootstrapWait"
         }
       ],
-      "Default": "ExtractWeeklyFreshnessSpotBootstrapError"
+      "Default": "WeeklyFreshnessSpotBootstrapLivenessGate"
     },
     "WeeklyFreshnessSpotBootstrapWait": {
       "Type": "Pass",
@@ -6723,24 +7160,6 @@
       "ResultPath": "$.portfolio_optimizer_polls",
       "Next": "WaitForPortfolioOptimizerBacktest"
     },
-    "InitEvaluatorPollCount": {
-      "Type": "Pass",
-      "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=144 = ceil(7200s timeout / 60s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
-      "Result": 0,
-      "ResultPath": "$.evaluator_polls",
-      "Next": "WaitForEvaluator"
-    },
-    "EvaluatorPollWait": {
-      "Type": "Wait",
-      "Seconds": 60,
-      "Next": "MergeEvaluatorPollCount"
-    },
-    "MergeEvaluatorPollCount": {
-      "Type": "Pass",
-      "InputPath": "$.evaluator_poll_count.polls",
-      "ResultPath": "$.evaluator_polls",
-      "Next": "WaitForEvaluator"
-    },
     "InitSaturdayHealthCheckPollCount": {
       "Type": "Pass",
       "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=12 = ceil(300s timeout / 30s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
@@ -6847,6 +7266,240 @@
       "Type": "Pass",
       "Comment": "config#6054: success-only witness for the rerun deriver (scripts/weekly_sf_rerun.py). Director's success and every bypass path previously converged on CheckShellRunNotify, so no state uniquely witnessed 'Director actually completed' \u2014 the I6055-class trap: a rerun could mark a bypassed Director complete and skip it. Entered ONLY via Director's success edge.",
       "Next": "CheckShellRunNotify"
+    },
+    "BacktesterLivenessGate": {
+      "Type": "Choice",
+      "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that Backtester failed. Without this the two are indistinguishable in the alert and the run dies as a Backtester fault \u2014 measured on watch-rerun-2026-08-10-8 (2026-08-11): ResponseCode -1 / Undeliverable, no log shipped, Server.SpotInstanceTermination on neighbouring instances in the same window. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates; recovery is the mechanical scripts/weekly_sf_rerun.py.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.backtester_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.backtester_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.backtester_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractBacktesterSubstrateLostError"
+        }
+      ],
+      "Default": "ExtractBacktesterError"
+    },
+    "ExtractBacktesterSubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractBacktesterError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a Backtester failure without opening the execution history.",
+      "Parameters": {
+        "phase": "Backtester/SubstrateLost",
+        "source": "BacktesterLivenessGate.SubstrateLost",
+        "poll.$": "$.backtester_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "PredictorBacktestLivenessGate": {
+      "Type": "Choice",
+      "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that PredictorBacktest failed. Without this the two are indistinguishable in the alert and the run dies as a PredictorBacktest fault \u2014 measured on watch-rerun-2026-08-10-8 (2026-08-11): ResponseCode -1 / Undeliverable, no log shipped, Server.SpotInstanceTermination on neighbouring instances in the same window. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates; recovery is the mechanical scripts/weekly_sf_rerun.py.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.predictor_backtest_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.predictor_backtest_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.predictor_backtest_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractPredictorBacktestSubstrateLostError"
+        }
+      ],
+      "Default": "ExtractPredictorBacktestError"
+    },
+    "ExtractPredictorBacktestSubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractPredictorBacktestError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a PredictorBacktest failure without opening the execution history.",
+      "Parameters": {
+        "phase": "PredictorBacktest/SubstrateLost",
+        "source": "PredictorBacktestLivenessGate.SubstrateLost",
+        "poll.$": "$.predictor_backtest_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "PortfolioOptimizerBacktestLivenessGate": {
+      "Type": "Choice",
+      "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that PortfolioOptimizerBacktest failed. Without this the two are indistinguishable in the alert and the run dies as a PortfolioOptimizerBacktest fault \u2014 measured on watch-rerun-2026-08-10-8 (2026-08-11): ResponseCode -1 / Undeliverable, no log shipped, Server.SpotInstanceTermination on neighbouring instances in the same window. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates; recovery is the mechanical scripts/weekly_sf_rerun.py.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.portfolio_optimizer_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.portfolio_optimizer_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.portfolio_optimizer_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractPortfolioOptimizerBacktestSubstrateLostError"
+        }
+      ],
+      "Default": "ExtractPortfolioOptimizerBacktestError"
+    },
+    "ExtractPortfolioOptimizerBacktestSubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractPortfolioOptimizerBacktestError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a PortfolioOptimizerBacktest failure without opening the execution history.",
+      "Parameters": {
+        "phase": "PortfolioOptimizerBacktest/SubstrateLost",
+        "source": "PortfolioOptimizerBacktestLivenessGate.SubstrateLost",
+        "poll.$": "$.portfolio_optimizer_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "EvaluatorDiagnosticsLivenessGate": {
+      "Type": "Choice",
+      "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that EvaluatorDiagnostics failed. Without this the two are indistinguishable in the alert and the run dies as a EvaluatorDiagnostics fault \u2014 measured on watch-rerun-2026-08-10-8 (2026-08-11): ResponseCode -1 / Undeliverable, no log shipped, Server.SpotInstanceTermination on neighbouring instances in the same window. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates; recovery is the mechanical scripts/weekly_sf_rerun.py.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.evaluator_diagnostics_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.evaluator_diagnostics_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.evaluator_diagnostics_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractEvaluatorDiagnosticsSubstrateLostError"
+        }
+      ],
+      "Default": "ExtractEvaluatorDiagnosticsError"
+    },
+    "ExtractEvaluatorDiagnosticsSubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractEvaluatorDiagnosticsError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a EvaluatorDiagnostics failure without opening the execution history.",
+      "Parameters": {
+        "phase": "EvaluatorDiagnostics/SubstrateLost",
+        "source": "EvaluatorDiagnosticsLivenessGate.SubstrateLost",
+        "poll.$": "$.evaluator_diagnostics_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "EvaluatorOptimizeLivenessGate": {
+      "Type": "Choice",
+      "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that EvaluatorOptimize failed. Without this the two are indistinguishable in the alert and the run dies as a EvaluatorOptimize fault \u2014 measured on watch-rerun-2026-08-10-8 (2026-08-11): ResponseCode -1 / Undeliverable, no log shipped, Server.SpotInstanceTermination on neighbouring instances in the same window. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates; recovery is the mechanical scripts/weekly_sf_rerun.py.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.evaluator_optimize_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.evaluator_optimize_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.evaluator_optimize_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractEvaluatorOptimizeSubstrateLostError"
+        }
+      ],
+      "Default": "ExtractEvaluatorOptimizeError"
+    },
+    "ExtractEvaluatorOptimizeSubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractEvaluatorOptimizeError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a EvaluatorOptimize failure without opening the execution history.",
+      "Parameters": {
+        "phase": "EvaluatorOptimize/SubstrateLost",
+        "source": "EvaluatorOptimizeLivenessGate.SubstrateLost",
+        "poll.$": "$.evaluator_optimize_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "WeeklyFreshnessSpotBootstrapLivenessGate": {
+      "Type": "Choice",
+      "Comment": "config#6938: liveness branch. StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim, the failure mode most expected on this substrate), not that WeeklyFreshnessSpotBootstrap failed. Without this the two are indistinguishable in the alert and the run dies as a WeeklyFreshnessSpotBootstrap fault \u2014 measured on watch-rerun-2026-08-10-8 (2026-08-11): ResponseCode -1 / Undeliverable, no log shipped, Server.SpotInstanceTermination on neighbouring instances in the same window. Fail fast with a distinguishable phase rather than re-issuing: this sendCommand targets $.ec2_instance_id, the SHARED launcher from DispatchWeeklyFreshnessSpot, so when it is reclaimed every remaining stage is equally dead and a per-stage rebind would fix one symptom of a pipeline-wide loss. Mirrors config#5688's four gates; recovery is the mechanical scripts/weekly_sf_rerun.py.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.weekly_freshness_spot_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.weekly_freshness_spot_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.weekly_freshness_spot_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractWeeklyFreshnessSpotBootstrapSubstrateLostError"
+        }
+      ],
+      "Default": "ExtractWeeklyFreshnessSpotBootstrapError"
+    },
+    "ExtractWeeklyFreshnessSpotBootstrapSubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractWeeklyFreshnessSpotBootstrapError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a WeeklyFreshnessSpotBootstrap failure without opening the execution history.",
+      "Parameters": {
+        "phase": "WeeklyFreshnessSpotBootstrap/SubstrateLost",
+        "source": "WeeklyFreshnessSpotBootstrapLivenessGate.SubstrateLost",
+        "poll.$": "$.weekly_freshness_spot_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
     }
   }
 }

@@ -293,8 +293,22 @@ if [ ! -d /home/ec2-user/data/.git ]; then
   git clone --depth 1 --branch "${BRANCH:-main}" https://github.com/nousergon/nousergon-data.git /home/ec2-user/data
 fi
 
-mkdir -p /home/ec2-user/data/config
-aws s3 cp "${S3_STAGING}/config.yaml" "/home/ec2-user/data/config/config.yaml" --region "${AWS_REGION:-us-east-1}" --quiet
+# Destination must be a path weekly_collector.load_config actually searches.
+# It delegates to nousergon_lib.config.resolve_experiment_config("data",
+# "config.yaml", repo_root=<checkout>, repo_local_fallback=Path("config.yaml")),
+# so with the clone at /home/ec2-user/data the candidates are
+# /home/ec2-user/alpha-engine-config/{experiments/reference/,}data/config.yaml
+# plus the CWD-relative config.yaml — /home/ec2-user/data/config/config.yaml is
+# in none of them. The retired spot_data_weekly.sh monolith staged to the
+# alpha-engine-config path below; the per-stage split (#1122) changed the
+# destination and #1269 made that live, so MorningEnrich died on
+# FileNotFoundError (config#6846). No per-stage workload reads the old path —
+# it is dropped rather than written twice. tests/test_spot_bootstrap_config_
+# lands_where_the_resolver_looks.py derives the candidate list from the
+# resolver, so a resolver change fails CI instead of production.
+mkdir -p /home/ec2-user/alpha-engine-config/data
+aws s3 cp "${S3_STAGING}/config.yaml" "/home/ec2-user/alpha-engine-config/data/config.yaml" --region "${AWS_REGION:-us-east-1}" --quiet
+chown -R ec2-user:ec2-user /home/ec2-user/alpha-engine-config
 BOOTSTRAP
 )" 300
   echo "  Bootstrap complete."

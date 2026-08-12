@@ -716,3 +716,86 @@ class TestRerunNaming:
     def test_other_run_dates_do_not_collide(self, mod):
         sf = _FakeSF(["watch-rerun-2026-07-04-2"])
         assert mod.next_rerun_name(sf, "arn:sm", "2026-07-11") == "watch-rerun-2026-07-11-1"
+
+
+# ── Renames must not blind the planner to older histories (config-I3112) ─────
+
+
+class TestHistoricalWorkStateNames:
+    """A work-state rename must keep failure detection working on histories
+    captured BEFORE the rename.
+
+    `derive_plan` attributes a failure by `work in entered`. This script's
+    whole job is to read a PAST execution, so the day a work state is renamed
+    or split, every history older than that change stops matching. The stage
+    silently drops out of `plan.failed`, and the only trace is derive_plan's
+    "no failed or degraded WORK stage identified" warning — which says
+    *pre-workload failure*, i.e. it misattributes a lost signal as a different,
+    benign condition. `tail_stage_failure.json` is a captured real execution
+    from before the config-I3112 Evaluator split and is deliberately NOT
+    rewritten: it is evidence, not a test double.
+    """
+
+    def test_pre_split_history_still_attributes_the_evaluator_failure(self, mod):
+        events = _events("tail_stage_failure")
+        entered = {e["stateEnteredEventDetails"]["name"]
+                   for e in events if "stateEnteredEventDetails" in e}
+        assert "Evaluator" in entered and "EvaluatorDiagnostics" not in entered, (
+            "fixture no longer exercises the pre-split shape — pick another "
+            "captured history rather than rewriting this one"
+        )
+        assert mod.derive_plan(events).failed == ["evaluator"]
+
+    def test_post_split_history_attributes_it_by_the_current_name(self, mod):
+        """The same failure, expressed in the post-split vocabulary."""
+        events = [
+            e for e in _events("tail_stage_failure")
+            if e.get("stateEnteredEventDetails", {}).get("name") != "Evaluator"
+        ]
+        events.append({
+            "type": "TaskStateEntered",
+            "stateEnteredEventDetails": {"name": "EvaluatorDiagnostics"},
+        })
+        assert mod.derive_plan(events).failed == ["evaluator"]
+
+    def test_a_failure_in_the_second_half_is_still_the_evaluator_stage(self, mod):
+        """One Stage row covers both halves.
+
+        EvaluatorDiagnostics is entered on every path that reaches
+        EvaluatorOptimize, and the witness (CheckSkipPostEval) is reached only
+        after both succeed — so a failure in the SECOND half leaves the first
+        entered and the witness un-entered, which is exactly the failed shape.
+        """
+        events = [
+            e for e in _events("tail_stage_failure")
+            if e.get("stateEnteredEventDetails", {}).get("name") != "Evaluator"
+        ]
+        for name in ("EvaluatorDiagnostics", "EvaluatorOptimize"):
+            events.append({
+                "type": "TaskStateEntered",
+                "stateEnteredEventDetails": {"name": name},
+            })
+        plan = mod.derive_plan(events)
+        assert plan.failed == ["evaluator"]
+        assert "skip_evaluator" not in plan.skip_flags, (
+            "a failed evaluator must re-run — the flag gates BOTH halves"
+        )
+
+    def test_every_historical_work_name_is_gone_from_the_live_definition(self, mod):
+        """A historical alias that still exists live is not historical.
+
+        If both names are reachable, `work in entered or historical in entered`
+        double-counts the same stage and the alias silently becomes a second
+        live work state nobody declared.
+        """
+        sf = json.loads(
+            (Path(__file__).resolve().parent.parent
+             / "infrastructure" / "step_function.json").read_text())
+        live = set(sf["States"])
+        for stage in mod.STAGES:
+            overlap = stage.historical_work & live
+            assert not overlap, (
+                f"{stage.name}: historical_work {sorted(overlap)} still exists "
+                f"in step_function.json — remove the alias or the rename is "
+                f"not complete"
+            )
