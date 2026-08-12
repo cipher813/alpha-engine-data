@@ -410,6 +410,12 @@ class CheckResult:
     executions_seen: Optional[int] = None
     alert_emitted: bool = False
     alert_detail: Optional[str] = None
+    # "NEVER_FIRED" | "FIRED_AND_FAILED" | "CLEAR" | None (skipped). Status-
+    # blind counting used to make the first two indistinguishable
+    # (alpha-engine-config-I6991) — this field is what a reader (console,
+    # log grep, test) checks instead of re-deriving it from the message
+    # string.
+    outcome: Optional[str] = None
 
 
 def _is_trading_day_now(now_utc: datetime) -> bool:
@@ -485,22 +491,31 @@ def _pipeline_role(client: object, execution_arn: str) -> Optional[str]:
     return role if isinstance(role, str) and role else None
 
 
-def _count_executions_in_window(
+def _status_counts_in_window(
     sf_arn: str,
     window_seconds: int,
     *,
     client: Optional[object] = None,
     role_filter: Optional[frozenset] = None,
-) -> int:
-    """Return the number of executions that STARTED for ``sf_arn`` in the
-    last ``window_seconds``. Counts ALL terminal statuses + RUNNING; what
-    matters is whether the SF fired, not whether the workload succeeded.
+) -> "dict[str, int]":
+    """Return counts of executions that STARTED for ``sf_arn`` in the last
+    ``window_seconds``, keyed by terminal status (``RUNNING``, ``SUCCEEDED``,
+    ``FAILED``, ``TIMED_OUT``, ``ABORTED``).
+
+    This is the ONE walk implementation — ``_count_executions_in_window``
+    below is a thin sum-of-all wrapper over it, so a status-blind caller and
+    a status-aware caller can never see a different execution set
+    (alpha-engine-config-I6991: a window containing only FAILED executions
+    used to be indistinguishable from a healthy window because the walk
+    only ever produced a single unclassified total).
 
     Uses ``states:ListExecutions`` with paginated startDate filtering —
     AWS does not support a startDate filter on ListExecutions directly,
-    so we page through statusFilter results and apply the time cutoff in
-    Python. maxResults=100 per page; we stop at the first page whose
-    oldest entry is older than the window (lex-sortable by startDate desc).
+    so we page through statusFilter results (which ARE status-exact per
+    AWS's API contract — each page for ``statusFilter=X`` contains only
+    status-X executions) and apply the time cutoff in Python. maxResults=100
+    per page; we stop at the first page whose oldest entry is older than the
+    window (lex-sortable by startDate desc).
 
     ``role_filter`` — count ONLY executions whose ``input.pipeline_role``
     is in the set. Required wherever a state machine carries more than one
@@ -520,7 +535,7 @@ def _count_executions_in_window(
         client = boto3.client("stepfunctions", region_name=REGION)
 
     cutoff_utc = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
-    seen = 0
+    counts: "dict[str, int]" = {}
     described = 0
 
     for status_filter in _STARTED_STATUSES:
@@ -554,7 +569,7 @@ def _count_executions_in_window(
                 )
                 if start_utc >= cutoff_utc:
                     if role_filter is None:
-                        seen += 1
+                        counts[status_filter] = counts.get(status_filter, 0) + 1
                         continue
                     described += 1
                     if described > _MAX_ROLE_DESCRIBES:
@@ -571,7 +586,7 @@ def _count_executions_in_window(
                     if _pipeline_role(client, exec_row.get("executionArn")) in (
                         role_filter
                     ):
-                        seen += 1
+                        counts[status_filter] = counts.get(status_filter, 0) + 1
                 else:
                     # Executions are returned newest-first; once we see one
                     # older than the cutoff we can stop paging this status.
@@ -584,7 +599,26 @@ def _count_executions_in_window(
                 continue
             break  # broke out of inner for-else → stop paging this status
 
-    return seen
+    return counts
+
+
+def _count_executions_in_window(
+    sf_arn: str,
+    window_seconds: int,
+    *,
+    client: Optional[object] = None,
+    role_filter: Optional[frozenset] = None,
+) -> int:
+    """Total executions that STARTED for ``sf_arn`` in the window, across
+    ALL statuses — a thin sum over ``_status_counts_in_window``. Retained
+    for callers that only need "did it fire at all" (none in this file as
+    of I6991; kept as the tested, documented primitive other watchdog code
+    may still want)."""
+    return sum(
+        _status_counts_in_window(
+            sf_arn, window_seconds, client=client, role_filter=role_filter
+        ).values()
+    )
 
 
 def _publish_watchdog_alert(
@@ -663,51 +697,103 @@ def _check_sf(
             skip_reason=skip_reason_if_not_watching,
         )
 
-    seen = _count_executions_in_window(
+    counts = _status_counts_in_window(
         sf_arn, window_seconds, client=client, role_filter=role_filter
     )
-    if seen > 0:
+    seen = sum(counts.values())
+    # "Fired" and "healthy" are separate questions (alpha-engine-config-I6991).
+    # RUNNING counts as healthy-so-far — a still-in-flight execution is not a
+    # failure and must not be reported as one. Only SUCCEEDED/RUNNING clear
+    # the check; a window whose every execution terminated FAILED/TIMED_OUT/
+    # ABORTED is an alert, not a "watchdog clear".
+    healthy_seen = counts.get("SUCCEEDED", 0) + counts.get("RUNNING", 0)
+    window_hours = window_seconds // 3600
+
+    if healthy_seen > 0:
         logger.info(
-            "watchdog clear: sf=%s executions_in_window=%d", sf_label, seen
+            "watchdog clear: sf=%s executions_in_window=%d status_counts=%s",
+            sf_label, seen, dict(counts),
         )
         return CheckResult(
             sf_label=sf_label,
             sf_arn=sf_arn,
             checked=True,
             executions_seen=seen,
+            outcome="CLEAR",
         )
 
-    # 0 executions in window on a watch-day → alert.
-    window_hours = window_seconds // 3600
-    message = (
-        f"{sf_label} has not executed in the last {window_hours}h on a trading-day window"
-        f"{_role_clause(role_filter)}. "
-        f"Expected at least 1 execution since "
-        f"{(datetime.now(timezone.utc) - timedelta(seconds=window_seconds)).isoformat()}. "
-        f"Either the EventBridge schedule did not fire, the SF control plane is wedged, "
-        f"or upstream IAM/permissions are broken. Investigate: "
-        f"`aws stepfunctions list-executions --state-machine-arn {sf_arn} --max-results 10`."
+    if seen == 0:
+        # 0 executions in window on a watch-day → the SF never fired.
+        message = (
+            f"{sf_label} has not executed in the last {window_hours}h on a trading-day window"
+            f"{_role_clause(role_filter)}. "
+            f"Expected at least 1 execution since "
+            f"{(datetime.now(timezone.utc) - timedelta(seconds=window_seconds)).isoformat()}. "
+            f"Either the EventBridge schedule did not fire, the SF control plane is wedged, "
+            f"or upstream IAM/permissions are broken. Investigate: "
+            f"`aws stepfunctions list-executions --state-machine-arn {sf_arn} --max-results 10`."
+        )
+        # Dedup-key collapses repeated daily fires on a persistent outage into
+        # one alert per (SF, date) within the lib's default 60-min window —
+        # extended here to 12h so we don't re-page the operator on the same
+        # already-acknowledged outage.
+        dedup_key = (
+            f"pipeline-watchdog-{sf_label}-{datetime.now(timezone.utc).date().isoformat()}"
+        )
+        alert_detail = _publish_watchdog_alert(
+            message,
+            severity="error",
+            dedup_key=dedup_key,
+            context={"sf_label": sf_label, "sf_arn": sf_arn},
+        )
+        return CheckResult(
+            sf_label=sf_label,
+            sf_arn=sf_arn,
+            checked=True,
+            executions_seen=0,
+            alert_emitted=True,
+            alert_detail=alert_detail,
+            outcome="NEVER_FIRED",
+        )
+
+    # seen > 0 but healthy_seen == 0: every execution in the window fired
+    # and terminated FAILED/TIMED_OUT/ABORTED — status-blind counting used
+    # to report this identically to a clean run (alpha-engine-config-I6991,
+    # measured 2026-08-06: "watchdog clear: sf=Weekday SF
+    # executions_in_window=1" on a run that failed 3.5s after starting).
+    # This is a DIFFERENT operator action from "never fired" — the schedule
+    # and control plane are fine, the workload failed — so the message says
+    # so explicitly and uses a distinct dedup key.
+    status_breakdown = ", ".join(
+        f"{status}={count}" for status, count in sorted(counts.items()) if count
     )
-    # Dedup-key collapses repeated daily fires on a persistent outage into
-    # one alert per (SF, date) within the lib's default 60-min window —
-    # extended here to 12h so we don't re-page the operator on the same
-    # already-acknowledged outage.
+    message = (
+        f"{sf_label} fired and FAILED in the last {window_hours}h window"
+        f"{_role_clause(role_filter)}: {seen} execution(s) started "
+        f"({status_breakdown}), none SUCCEEDED and none still RUNNING. "
+        f"This is NOT a missed-schedule condition — the EventBridge trigger and "
+        f"SF control plane are working; the workload itself failed. Investigate: "
+        f"`aws stepfunctions list-executions --state-machine-arn {sf_arn} "
+        f"--status-filter FAILED --max-results 10`."
+    )
     dedup_key = (
-        f"pipeline-watchdog-{sf_label}-{datetime.now(timezone.utc).date().isoformat()}"
+        f"pipeline-watchdog-fired-failed-{sf_label}-"
+        f"{datetime.now(timezone.utc).date().isoformat()}"
     )
     alert_detail = _publish_watchdog_alert(
         message,
         severity="error",
         dedup_key=dedup_key,
-        context={"sf_label": sf_label, "sf_arn": sf_arn},
+        context={"sf_label": sf_label, "sf_arn": sf_arn, "status_counts": dict(counts)},
     )
     return CheckResult(
         sf_label=sf_label,
         sf_arn=sf_arn,
         checked=True,
-        executions_seen=0,
+        executions_seen=seen,
         alert_emitted=True,
         alert_detail=alert_detail,
+        outcome="FIRED_AND_FAILED",
     )
 
 
@@ -1526,6 +1612,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 "executions_seen": c.executions_seen,
                 "alert_emitted": c.alert_emitted,
                 "alert_detail": c.alert_detail,
+                "outcome": c.outcome,
             }
             for c in (weekday, eod, saturday)
         ],
