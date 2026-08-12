@@ -318,8 +318,12 @@ class TestEvaluatorPollLoops:
 
     @pytest.mark.parametrize("half", HALVES)
     def test_default_extracts_this_half_error(self, states, half):
-        assert (states[f"CheckEvaluator{half}Status"]["Default"]
-                == f"ExtractEvaluator{half}Error")
+        # config#6938: routed through this half's liveness gate, which
+        # separates a reclaimed launcher from an Evaluator failure. Assert the
+        # route reaches this half's normalizer — never the other half's.
+        gate = states[f"CheckEvaluator{half}Status"]["Default"]
+        assert gate == f"Evaluator{half}LivenessGate"
+        assert states[gate]["Default"] == f"ExtractEvaluator{half}Error"
 
     @pytest.mark.parametrize("half,var", [("Diagnostics", "evaluator_diagnostics"),
                                           ("Optimize", "evaluator_optimize")])
