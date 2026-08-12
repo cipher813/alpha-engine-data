@@ -413,15 +413,25 @@ def run(args: argparse.Namespace) -> int:
                 "current_version": current, "at": datetime.now(timezone.utc).isoformat(),
             },
         )
-        notify(
-            outcome="noop_up_to_date", severity="info",
-            text=(
-                f"ArcticDB migration run: nothing pending at head "
-                f"{args.head_migration_number:04d} (already at v{current})."
-            ),
-            dedup_key=f"arctic-migration-noop-{args.head_migration_number}",
-            context=context,
-        )
+        # Deliberately NOT notified (alpha-engine-config-I7123). "Nothing was
+        # pending, so nothing was done" is a no-op, not an event: it carries no
+        # decision, no failure and no state change, and it fires on every run
+        # of a lane that is idle by design most of the time.
+        #
+        # This is a removal of NOTIFICATION, never of OBSERVATION — the run is
+        # still recorded on two durable surfaces, which is what principles.md
+        # #7 actually asks for:
+        #   1. the completion marker written immediately above
+        #      (overseer/_control/completed/arctic-migration-<head>.json),
+        #      carrying state="noop_up_to_date" and current_version;
+        #   2. the lane's own console row — the dispatcher's `publish_lane ok`
+        #      runs on this exit path (config-I7029).
+        # An absent run is therefore still visible as an absent/ageing console
+        # row; silence here does not read as health.
+        #
+        # Every other outcome below still notifies: a migration that APPLIED is
+        # a state change, and a refusal or failure is a decision an operator
+        # has to act on.
         return 0
 
     # ── 3. Apply, strictly in order, abort loud on first failure ───────
