@@ -37,6 +37,7 @@
           "charter": { "type": "string" },
           "concurrency_domain": { "type": "string" },
           "supports_drill": { "type": "boolean" },
+          "triggers": { "$ref": "#/$defs/triggers" },
           "on_concurrent": {
             "enum": ["defer", "skip"],
             "description": "config-#5286 — what the dispatcher does when a concurrency collision is detected. 'defer' schedules a delayed re-invoke (sf-watch defer-not-drop pattern); 'skip' returns concurrent_skip immediately (ci-watch, alert-drain pattern). Must match the executor's actual behavior; the registry test pins this to the executor's literals."
@@ -227,7 +228,8 @@
             "maximum": 10,
             "default": 2,
             "description": "Number of consecutive predicate failures before automatic demotion to T2 + finding filed (overseer-policy.md §6)."
-          }
+          },
+          "triggers": { "$ref": "#/$defs/triggers" }
         }
       }
     },
@@ -264,6 +266,41 @@
     }
   },
   "$defs": {
+    "triggers": {
+      "type": "array",
+      "minItems": 1,
+      "description": "alpha-engine-config-I7056 — the machine-readable form of `wake`. `wake` is prose for a human and cannot be joined; this can. It is what lets infrastructure/overseer/arming.py join a playbook to infrastructure/automation_pause.json and to live AWS, which is the only way to tell a playbook DELIBERATELY paused (Brian ruling 2026-08-07, alpha-engine-config-I6617) from one that is simply broken — both emit nothing, and observability-policy.md §8.3 forbids reporting either as the other. Optional and additive: entries written before this field existed stay schema-valid, but arming.py reports any unit lacking it as `undeclared-no-triggers`, which is loud rather than blank.",
+      "items": {
+        "type": "object",
+        "required": ["surface"],
+        "additionalProperties": false,
+        "properties": {
+          "surface": {
+            "enum": ["events", "scheduler", "github-actions", "event-time", "parent", "none"],
+            "description": "Which trigger plane this leg lives on. `events` (EventBridge rule) and `scheduler` (EventBridge Scheduler schedule) are DIFFERENT APIs, not aliases, and the two names match automation_pause.py's own vocabulary — they are the only surfaces whose live state arming.py can read. Every other value is reported `unjoinable` WITH its reason rather than silently assumed armed."
+          },
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9.-]{0,127}$",
+            "description": "The live AWS resource name. Required in practice for `events`/`scheduler`: this is the exact string automation_pause.json keys on, so the join fails loudly if either side drifts."
+          },
+          "ref": {
+            "type": "string",
+            "minLength": 3,
+            "description": "Pointer for a non-AWS surface: an owner/repo/.github/workflows/x.yml path, a parent playbook key, or a description of an event-time path."
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 20,
+            "description": "Why this leg's arming cannot be read from AWS. An unexplained unjoinable trigger is a blank wearing a value's clothes."
+          },
+          "declared_by": {
+            "type": "string",
+            "description": "Optional: the ruling or issue that decided this leg's state."
+          }
+        }
+      }
+    },
     "liveness_block": {
       "description": "A set of read-only liveness checks the overseer-liveness-probe runs for this playbook (or, at top level, for the cross-cutting intake/dispatcher plane). Each check is a discriminated union on `type`.",
       "type": "object",
