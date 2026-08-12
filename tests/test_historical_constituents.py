@@ -9,6 +9,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+import collectors.historical_constituents as hc
 from collectors.historical_constituents import (
     ADDED,
     REMOVED,
@@ -125,3 +126,82 @@ def test_delisted_ticker_reappears_in_historical_universe():
     changes = [ConstituentChange("2024-06-01", "DELISTED", REMOVED)]
     pit = build_pit_membership(current, changes)
     assert "DELISTED" in pit["2024-06-01"]
+
+
+# ── Source failover (config-I6944) ─────────────────────────────────────────
+#
+# The changes table moved off "List of S&P 500 companies" into its own
+# article on 2026-08-11 and hard-failed DataPhase1 of the weekly SF three
+# hours later. These pin the failover: a candidate that 404s, or that serves
+# a page with no changes table, must fall through to the next one.
+
+
+class _FakeResponse:
+    def __init__(self, text: str, ok: bool = True):
+        self.text = text
+        self._ok = ok
+
+    def raise_for_status(self):
+        if not self._ok:
+            raise RuntimeError("HTTP 404")
+
+
+def _install_fake_fetch(monkeypatch, pages: dict[str, object]):
+    """Map url -> _FakeResponse; read_html returns the tables keyed by text."""
+    tables_by_text: dict[str, list[pd.DataFrame]] = {}
+
+    def fake_get(url, headers=None, timeout=None):
+        entry = pages[url]
+        if isinstance(entry, _FakeResponse):
+            return entry
+        text = f"page:{url}"
+        tables_by_text[text] = entry
+        return _FakeResponse(text)
+
+    monkeypatch.setattr(hc.requests, "get", fake_get)
+    monkeypatch.setattr(hc.pd, "read_html", lambda buf: tables_by_text[buf.getvalue()])
+
+
+def test_fetch_falls_through_to_the_next_url_when_a_page_lacks_the_table(monkeypatch):
+    roster_only = [pd.DataFrame({"Symbol": ["AAPL"], "GICS Sector": ["Tech"]})]
+    _install_fake_fetch(
+        monkeypatch,
+        {"https://a.example/moved": roster_only, "https://b.example/old": [_changes_df()]},
+    )
+    df, url = hc._fetch_changes_table(
+        ("https://a.example/moved", "https://b.example/old")
+    )
+    assert url == "https://b.example/old"
+    assert any("added" in str(c).lower() for c in df.columns)
+
+
+def test_fetch_falls_through_when_a_page_errors(monkeypatch):
+    _install_fake_fetch(
+        monkeypatch,
+        {
+            "https://a.example/gone": _FakeResponse("", ok=False),
+            "https://b.example/old": [_changes_df()],
+        },
+    )
+    _, url = hc._fetch_changes_table(
+        ("https://a.example/gone", "https://b.example/old")
+    )
+    assert url == "https://b.example/old"
+
+
+def test_fetch_raises_naming_every_candidate_when_all_fail(monkeypatch):
+    roster_only = [pd.DataFrame({"Symbol": ["AAPL"]})]
+    _install_fake_fetch(
+        monkeypatch,
+        {"https://a.example/one": roster_only, "https://b.example/two": roster_only},
+    )
+    with pytest.raises(RuntimeError) as exc:
+        hc._fetch_changes_table(("https://a.example/one", "https://b.example/two"))
+    # A failure that names only the last URL tried sends the reader to the
+    # wrong page; both candidates must appear.
+    assert "a.example/one" in str(exc.value) and "b.example/two" in str(exc.value)
+
+
+def test_the_dedicated_article_is_tried_before_the_roster_page():
+    assert hc._SP500_CHANGES_URLS[0].endswith("Historical_components_of_the_S%26P_500")
+    assert "List_of_S%26P_500_companies" in hc._SP500_CHANGES_URLS[1]
