@@ -69,7 +69,18 @@ def test_run_daemon_catch_degraded_flag_shape(daily_states):
     assert st["Type"] == "Pass"
     assert st["Parameters"]["degraded"] is True
     assert st["ResultPath"] == "$.degraded_summary"
-    assert st["Next"] == "CheckDegradedOutcome"
+    # config-I6903: PublishDaemonFailureImmediate now sits between the flag and
+    # the terminal, so the invariant is that the path CONVERGES on
+    # CheckDegradedOutcome, not that it hops there directly. Asserting the
+    # immediate Next forbids ever adding a notification to a fail-open path —
+    # which is the defect I6903 fixed. sf-pipeline-policy.md §5 names this
+    # specific fail-open as one that must page immediately.
+    assert st["Next"] == "PublishDaemonFailureImmediate"
+    publish = daily_states["PublishDaemonFailureImmediate"]
+    assert publish["Next"] == "CheckDegradedOutcome"
+    assert publish["Catch"][0]["Next"] == "CheckDegradedOutcome", (
+        "an SNS failure must not divert a run that deliberately continued"
+    )
 
 
 def test_skip_run_daemon_edge_converges_on_degraded_check(daily_states):
