@@ -511,7 +511,7 @@ class TestIngestForTickers:
             {
                 "form_type": "10-K",  # not form 4
                 "accession_number": "0000320193-26-100001",
-                "filed_date": date(2026, 5, 1),
+                "filed_date": _FILED,
                 "primary": "10k.htm",
             },
             {
@@ -625,4 +625,35 @@ def test_discovery_fixtures_stay_inside_the_lookback_window():
     assert 0 < age < _DISCOVERY_LOOKBACK_DAYS, (
         f"_FILED is {age}d old, outside the {_DISCOVERY_LOOKBACK_DAYS}d window "
         f"these tests pass to ingest_for_tickers"
+    )
+
+
+def test_no_orchestrator_fixture_is_dated_by_a_literal():
+    """Guard the CLASS, not just `_FILED` (alpha-engine-config-I6951).
+
+    `test_filed_fixture_stays_inside_the_lookback_window` keeps `_FILED`
+    fresh, which is necessary and not sufficient: it can only vouch for the
+    variable, so a fixture written as a literal is invisible to it. One was.
+    The `10-K` entry in `test_non_form4_filings_skipped_in_discovery` kept
+    `date(2026, 5, 1)` through the config#6923 fix and is, as of 2026-08-12,
+    already ~103 days old against the 90-day window.
+
+    Nothing failed, which is the point. That filing is supposed to be skipped
+    for its FORM TYPE; aged out, it gets skipped for its AGE instead, and the
+    test goes on passing while no longer exercising the form-type filter it
+    is named for. A green test that has quietly stopped asserting its subject
+    is worse than a red one.
+    """
+    import re
+    from pathlib import Path
+
+    src = Path(__file__).read_text()
+    body = src[src.index("class TestIngestForTickers:"):]
+    end = re.search(r"\n(?:def |class )", body)   # stop at the next top-level
+    if end:
+        body = body[: end.start()]
+    literals = re.findall(r"filed_date[\"']?\s*[:=]\s*date\(\d{4},\s*\d+,\s*\d+\)", body)
+    assert not literals, (
+        "orchestrator fixtures run through the lookback filter, so they must "
+        f"be anchored to `_FILED`, not written as a calendar date: {literals}"
     )
