@@ -33,6 +33,7 @@ import json
 import pathlib
 
 import pytest
+from tests.sf_degraded_summary_helpers import assert_degraded_continuation
 
 _WEEKLY = pathlib.Path(__file__).parent.parent / "infrastructure" / "step_function.json"
 
@@ -185,7 +186,7 @@ def test_branch_degrade_continues_to_compare_not_around_it(states):
     a degraded producer never skips the join (the compare emits the verdict
     as UNKNOWN); jumping straight to CheckSkipEvaluator would silently drop
     the verdict for runs where the OTHER branches completed fine."""
-    assert states["ParityDegraded"]["Next"] == "PublishParityDegraded"
+    assert_degraded_continuation(states, "ParityDegraded", "PublishParityDegraded")
     assert states["PublishParityDegraded"]["Next"] == "CheckSkipPitParityCompare"
 
 

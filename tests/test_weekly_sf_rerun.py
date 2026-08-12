@@ -562,12 +562,29 @@ class TestStageTableLockstep:
         _AGGREGATE_FOLD_EXCLUDED = {
             "CheckResearchPredictorDegraded",
             "SetResearchPredictorDegraded",
+            # alpha-engine-config-I6891 gave this fold a summary sibling too;
+            # it inherits the exclusion for the same reason.
+            "SetResearchPredictorDegradedSummary",
+            # Branch INITIALISERS, surfaced by the substring predicate below.
+            # They set the branch's degraded flag to FALSE at branch start —
+            # entering one says the branch began, never that anything degraded,
+            # so mapping them would make every run re-run the whole branch.
+            "InitResearchDegradedFlag",
+            "InitPredictorDegradedFlag",
         }
+        # alpha-engine-config-I6891: the predicate was `endswith("Degraded")`,
+        # which the Set*DegradedSummary states this issue added would all have
+        # slipped past — a detector whose reach is a NAME SUFFIX goes blind the
+        # first time a state is named with anything after it. Substring match,
+        # with the terminal family excluded by an explicit, reasoned list the
+        # helper itself declares.
+        terminal_family = getattr(mod, "TERMINAL_DEGRADED_FAMILY", frozenset())
         for name in all_states:
             if (
-                name.endswith("Degraded")
+                "Degraded" in name
                 and not name.startswith("Notify")
                 and name not in _AGGREGATE_FOLD_EXCLUDED
+                and name not in terminal_family
             ):
                 assert name in mapped, (
                     f"degraded route {name} is not covered by any STAGES "
@@ -584,9 +601,12 @@ class TestStageTableLockstep:
         ships with alpha-engine-config-I6055; this pins the mapping so the
         guard can never miss it.)"""
         parity = next(s for s in mod.STAGES if s.name == "parity")
-        assert parity.degraded_witness == frozenset(
-            {"ParityDegraded", "PublishParityDegraded"}
-        )
+        # alpha-engine-config-I6891 added the $.degraded_summary sibling that
+        # feeds the DegradedRun terminal; it is on the same fail-open path and
+        # witnesses the same fact, so it belongs to the same row.
+        assert parity.degraded_witness == frozenset({
+            "ParityDegraded", "SetParityDegradedSummary", "PublishParityDegraded",
+        })
         for d in parity.degraded_witness:
             assert d in all_states, (
                 f"parity degraded witness {d} is not a state in "

@@ -76,6 +76,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.sf_degraded_summary_helpers import assert_degraded_continuation
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INFRA = REPO_ROOT / "infrastructure"
@@ -523,7 +524,9 @@ class TestAcquireMutexSemantics:
             # the flag Pass and the former first state.
             assert flag_state["ResultPath"] == "$.gate_degraded"
             assert flag_state["Result"] is True
-            assert flag_state["Next"] == "PublishMutexAcquireDegraded"
+            assert_degraded_continuation(
+                states, "SetMutexAcquireDegradedFlag", "PublishMutexAcquireDegraded",
+            )
             publish = states["PublishMutexAcquireDegraded"]
             assert publish["Next"] == former
             assert all(c["Next"] == former for c in publish["Catch"])

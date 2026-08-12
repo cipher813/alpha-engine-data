@@ -2090,7 +2090,7 @@
     },
     "WriteCompletionMarkerDegraded": {
       "Type": "Task",
-      "Comment": "config#2857: SF-envelope completion marker \u2014 an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine). Written on the degraded outcome, immediately before the DegradedRun Fail terminal (config-I2702 deliverable #4 + Brian's 2026-07-28 Option-A ruling, alpha-engine-config#2699: the marker still fires so the completion artifact exists, but DegradedRun is Type: Fail so status-keyed watchers engage). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_postclose_trading_pipeline (cadence eod_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable \u2014 exactly the ambiguity this feature exists to surface, not mask.",
+      "Comment": "config#2857: SF-envelope completion marker \u2014 an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine). Written on the degraded outcome, immediately before the DegradedRun Fail terminal (config-I2702 deliverable #4 + Brian's 2026-07-28 Option-A ruling, alpha-engine-config#2699: the marker still fires so the completion artifact exists, but DegradedRun is Type: Fail so status-keyed watchers engage). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_postclose_trading_pipeline (cadence eod_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable \u2014 exactly the ambiguity this feature exists to surface, not mask. ResultPath is LOAD-BEARING, not hygiene (alpha-engine-config-I6891): a Task with no ResultPath defaults to $, so the putObject result REPLACES the whole state input and the DegradedRun terminal's CausePath dereference of $.degraded_summary.reason cannot resolve. The execution then fails with States.Runtime instead of DegradedRun \u2014 and Error: DegradedRun is a consumer contract: sf-telegram-notifier's _is_degraded_run() keys its DEGRADED rendering off exactly that string, so every honestly-degraded run rendered as an ordinary crash-red FAILED with a truncated cause. Shipped in both weekday definitions since config#6692/#6722; the weekly one inherited it by mirroring them and it is fixed in all three here.",
       "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
       "Parameters": {
         "Bucket": "alpha-engine-research",
@@ -2098,6 +2098,7 @@
         "ContentType": "application/json",
         "Body.$": "States.Format('\\{\"sf\":\"ne-postclose-trading-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\"\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date)"
       },
+      "ResultPath": "$.degraded_marker_result",
       "TimeoutSeconds": 60,
       "Retry": [
         {

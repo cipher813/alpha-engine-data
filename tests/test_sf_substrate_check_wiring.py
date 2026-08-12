@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from tests.sf_command_utils import extract_commands
+from tests.sf_degraded_summary_helpers import assert_degraded_continuation
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -78,13 +79,9 @@ class TestChainOrdering:
             "If freshness polling fails, the degraded flag must be set — "
             "pre-config#2276 this continued silently."
         )
-        assert (
-            states["SaturdayHealthCheckDegraded"]["Next"]
-            == "WeeklySubstrateHealthCheck"
-        ), (
-            "A degraded freshness check must still run the substrate check — "
-            "they're independent observability paths."
-        )
+        assert_degraded_continuation(
+            states, "SaturdayHealthCheckDegraded", "WeeklySubstrateHealthCheck",
+        )  # a degraded freshness check must still run the substrate check
 
     def test_substrate_check_routes_to_wait_state(self, states):
         # alpha-engine-config-I5687: WeeklySubstrateHealthCheck dispatches
@@ -128,7 +125,7 @@ class TestChainOrdering:
         assert all(
             c["Next"] == "ReportCardDegraded" for c in states["ReportCard"]["Catch"]
         )
-        assert states["ReportCardDegraded"]["Next"] == "PublishReportCardDegraded"
+        assert_degraded_continuation(states, "ReportCardDegraded", "PublishReportCardDegraded")
         assert states["PublishReportCardDegraded"]["Next"] == "CheckShellRunNotify"
         assert states["Director"]["Next"] == "DirectorComplete"
         assert states["DirectorComplete"]["Next"] == "CheckShellRunNotify"
@@ -186,12 +183,12 @@ class TestCatchSemantics:
             assert c["Next"] == "SubstrateHealthCheckDegraded"
 
     def test_substrate_degraded_continues_to_advisory_tail(self, states):
-        degraded = states["SubstrateHealthCheckDegraded"]
-        assert degraded["Type"] == "Pass"
-        assert degraded["Next"] == "CheckSkipReportCard", (
-            "A degraded substrate check must not skip the ReportCard/Director "
-            "Lambda tail — it is independent of the dashboard box. "
-            "(config#6054: the tail entry is the skip gate, Default: ReportCard.)"
+        assert states["SubstrateHealthCheckDegraded"]["Type"] == "Pass"
+        # A degraded substrate check must not skip the ReportCard/Director
+        # Lambda tail — it is independent of the dashboard box. (config#6054:
+        # the tail entry is the skip gate, Default: ReportCard.)
+        assert_degraded_continuation(
+            states, "SubstrateHealthCheckDegraded", "CheckSkipReportCard",
         )
         assert states["CheckSkipReportCard"]["Default"] == "ReportCard"
 

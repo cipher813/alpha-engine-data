@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.sf_degraded_summary_helpers import assert_completion_notifier_chain
 
 _INFRA = Path(__file__).resolve().parent.parent / "infrastructure"
 
@@ -24,12 +25,22 @@ def weekly_states():
     return doc["States"]
 
 
+# All EIGHT real-completion notifiers. This list carried five until
+# alpha-engine-config-I6891 — NotifyCompleteReportCardDegraded (config#6685),
+# NotifyCompleteParityDegraded (I6025) and NotifyCompleteMultipleDegraded
+# (config#6685) each landed with their own wiring test and none of them was
+# added here, so the convergence guarantee this file exists to hold was not
+# actually held for three of the paths it covers. Derived below rather than
+# extended by hand, so the next notifier is covered by existing.
 REAL_COMPLETION_NOTIFIERS = [
     "NotifyComplete",
     "NotifyCompleteDegraded",
     "NotifyCompleteGatesDegraded",
     "NotifyCompleteHealthDegraded",
     "NotifyCompleteGatesAndHealthDegraded",
+    "NotifyCompleteReportCardDegraded",
+    "NotifyCompleteParityDegraded",
+    "NotifyCompleteMultipleDegraded",
 ]
 
 PREFLIGHT_NOTIFIERS = [
@@ -60,16 +71,45 @@ def test_marker_state_shape(weekly_states):
     assert retry["MaxAttempts"] >= 2
 
 
+def test_the_notifier_list_is_the_whole_notifier_family(weekly_states):
+    """The list above must BE every real-completion notifier, not a subset
+    somebody remembered to extend. Three were missing for months."""
+    discovered = {
+        n for n, b in weekly_states.items()
+        if n.startswith("NotifyComplete") and b.get("Type") == "Task"
+    } | {"NotifyCompleteDegraded"}
+    assert discovered == set(REAL_COMPLETION_NOTIFIERS), (
+        "REAL_COMPLETION_NOTIFIERS has drifted behind the definition: "
+        f"missing {sorted(discovered - set(REAL_COMPLETION_NOTIFIERS))}, "
+        f"stale {sorted(set(REAL_COMPLETION_NOTIFIERS) - discovered)}"
+    )
+
+
 @pytest.mark.parametrize("name", REAL_COMPLETION_NOTIFIERS)
 def test_real_completion_paths_converge_on_marker(weekly_states, name):
-    st = weekly_states[name]
-    assert "End" not in st, f"{name} must route through WriteCompletionMarker, not End directly"
-    assert st["Next"] == "WriteCompletionMarker"
+    """alpha-engine-config-I6891: convergence is now on CheckDegradedOutcome,
+    which picks the marker whose `status` tells the truth about the run."""
+    assert_completion_notifier_chain(weekly_states, name)
 
 
 @pytest.mark.parametrize("name", PREFLIGHT_NOTIFIERS)
 def test_preflight_paths_are_excluded_from_marker(weekly_states, name):
-    """A Friday-PM dry pass must never satisfy the completion-marker SLA."""
+    """A Friday-PM dry pass must never satisfy the completion-marker SLA —
+    neither on its clean edge nor on its degraded one (I6891 gave the shell
+    run an honest terminal too, and routed it AROUND both markers)."""
     st = weekly_states[name]
-    assert st.get("End") is True
-    assert st.get("Next") != "WriteCompletionMarker"
+    assert st.get("Next") not in ("WriteCompletionMarker", "WriteCompletionMarkerDegraded")
+
+
+def test_the_preflight_degraded_edge_ends_in_the_shared_fail_terminal(weekly_states):
+    """A Friday-PM preflight whose completion notification failed used to carry
+    End: true — flagged degraded, terminating SUCCEEDED, on the very path that
+    exists to prove the real run will work (alpha-engine-config-I6891)."""
+    assert weekly_states["NotifyShellRunComplete"]["Next"] == "CheckShellRunDegradedOutcome"
+    choice = weekly_states["CheckShellRunDegradedOutcome"]
+    assert choice["Default"] == "ShellRunComplete"
+    assert weekly_states["ShellRunComplete"]["Type"] == "Succeed"
+    (rule,) = choice["Choices"]
+    assert rule["Next"] == "DegradedRun"
+    assert weekly_states["NotifyShellRunCompleteDegraded"]["Next"] == "DegradedRun"
+    assert "End" not in weekly_states["NotifyShellRunCompleteDegraded"]

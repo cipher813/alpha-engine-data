@@ -69,6 +69,10 @@ import re
 from pathlib import Path
 
 import pytest
+from tests.sf_degraded_summary_helpers import (
+    assert_completion_notifier_chain,
+    assert_degraded_continuation,
+)
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -674,7 +678,7 @@ class TestStrictSuperset:
         # config#2857: converges into the SF-envelope completion marker
         # before ending, rather than Ending here directly.
         assert "End" not in nc
-        assert nc["Next"] == "WriteCompletionMarker"
+        assert_completion_notifier_chain(states, "NotifyComplete")
 
     def test_success_notify_gate_default_is_notify_complete(self, states):
         # config#2278: the real-run success edge now passes through the
@@ -986,7 +990,7 @@ class TestConsolidatedNotify:
         report_card = states["ReportCard"]
         assert report_card["Next"] == "CheckSkipDirector"
         assert all(c["Next"] == "ReportCardDegraded" for c in report_card["Catch"])
-        assert states["ReportCardDegraded"]["Next"] == "PublishReportCardDegraded"
+        assert_degraded_continuation(states, "ReportCardDegraded", "PublishReportCardDegraded")
         assert states["PublishReportCardDegraded"]["Next"] == "CheckShellRunNotify"
         assert states["CheckSkipDirector"]["Default"] == "Director"
         director = states["Director"]
@@ -1042,7 +1046,14 @@ class TestConsolidatedNotify:
         )
         assert "SUCCESS" in subject
         assert st["ResultPath"] == "$.notify_result"
-        assert st["End"] is True
+        # alpha-engine-config-I6891: the clean preflight edge ends at an
+        # explicit Succeed instead of End: true, so the DEGRADED edge beside it
+        # has somewhere honest to go. Same outcome for a green preflight — it
+        # still succeeds and still writes no completion marker.
+        assert "End" not in st
+        assert st["Next"] == "CheckShellRunDegradedOutcome"
+        assert states["CheckShellRunDegradedOutcome"]["Default"] == "ShellRunComplete"
+        assert states["ShellRunComplete"]["Type"] == "Succeed"
 
     def test_shell_run_notify_gate_fires_on_true(self, states):
         choices = states["CheckShellRunNotify"]["Choices"]
@@ -1188,6 +1199,12 @@ class TestHappyPathTraversal:
             elif t == "Parallel":
                 cur = st.get("Next")
             elif t in ("Succeed", "Fail"):
+                # alpha-engine-config-I6891: a Succeed terminal is the same end
+                # of the trace as End: true, which is all this walker records.
+                # Without appending it the walk reports the terminal state's
+                # NAME as the last element, and every `order[-1] == "[END]"`
+                # assertion reads as a routing regression.
+                order.append("[END]")
                 break
             else:
                 if st.get("End"):

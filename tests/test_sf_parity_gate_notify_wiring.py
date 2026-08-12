@@ -34,6 +34,10 @@ import json
 import pathlib
 
 import pytest
+from tests.sf_degraded_summary_helpers import (
+    assert_completion_notifier_chain,
+    assert_degraded_continuation,
+)
 
 _WEEKLY = pathlib.Path(__file__).parent.parent / "infrastructure" / "step_function.json"
 
@@ -53,7 +57,7 @@ def test_parity_degraded_pass_shape_and_proceeds_to_publish(states):
     assert st["Type"] == "Pass"
     assert st["Result"] is True
     assert st["ResultPath"] == "$.parity_degraded"
-    assert st["Next"] == "PublishParityDegraded"
+    assert_degraded_continuation(states, "ParityDegraded", "PublishParityDegraded")
 
 
 def test_only_parity_degraded_passes_set_the_flag(states):
@@ -185,7 +189,7 @@ def test_notify_complete_parity_degraded_mirrors_config_1819_shape(states):
     assert "\n" not in subject
     # config#2857: converges into the SF-envelope completion marker.
     assert "End" not in st
-    assert st["Next"] == "WriteCompletionMarker"
+    assert_completion_notifier_chain(states, "NotifyCompleteParityDegraded")
     (catch,) = st["Catch"]
     assert catch["ErrorEquals"] == ["States.ALL"]
     assert catch["Next"] == "NotifyCompleteDegraded"
