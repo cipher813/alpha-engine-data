@@ -1404,7 +1404,7 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Next": "PublishResearchFailureImmediate",
+                  "Next": "NormalizeBranchAFailureContext",
                   "ResultPath": "$.error"
                 }
               ],
@@ -1444,7 +1444,7 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Next": "PublishResearchFailureImmediate",
+                  "Next": "NormalizeBranchAFailureContext",
                   "ResultPath": "$.error"
                 }
               ],
@@ -1560,7 +1560,7 @@
                 "poll.$": "$.rag_ingestion_poll"
               },
               "ResultPath": "$.error",
-              "Next": "PublishResearchFailureImmediate"
+              "Next": "NormalizeBranchAFailureContext"
             },
             "ExtractRAGIngestionSubstrateLostError": {
               "Type": "Pass",
@@ -1571,7 +1571,7 @@
                 "poll.$": "$.rag_ingestion_poll"
               },
               "ResultPath": "$.error",
-              "Next": "PublishResearchFailureImmediate"
+              "Next": "NormalizeBranchAFailureContext"
             },
             "CheckSkipRegimeRetrospectiveEval": {
               "Type": "Choice",
@@ -1868,7 +1868,7 @@
                 "error": "DataPhase2 SSM command exhausted its retry budget (1 re-issue) without succeeding \u2014 the alternative data collector failed on both attempts."
               },
               "ResultPath": "$.error",
-              "Next": "PublishResearchFailureImmediate"
+              "Next": "NormalizeBranchAFailureContext"
             },
             "ExtractDataPhase2SubstrateLostError": {
               "Type": "Pass",
@@ -1879,7 +1879,7 @@
                 "poll.$": "$.data_phase2_poll"
               },
               "ResultPath": "$.error",
-              "Next": "PublishResearchFailureImmediate"
+              "Next": "NormalizeBranchAFailureContext"
             },
             "DataPhase2Reissue": {
               "Type": "Pass",
@@ -2497,6 +2497,15 @@
                 "error.$": "$.error"
               },
               "ResultPath": "$.error",
+              "Next": "NormalizeBranchAFailureContext"
+            },
+            "NormalizeBranchAFailureContext": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I7048 Defect B hardening (2026-08-12): defensive $.error normalizer inserted ahead of PublishResearchFailureImmediate. Every current predecessor (ExtractRAGIngestionError, ExtractRAGIngestionSubstrateLostError, SetDataPhase2ExhaustedError, ExtractDataPhase2SubstrateLostError, ExtractSignalsEnvelopeError, plus RAGIngestion's and WaitForRAGIngestion's own Catch edges) was repointed here from PublishResearchFailureImmediate \u2014 each verified live to already set $.error via ResultPath, so this never overrides real data today. Exists because the 2026-08-01 scheduled run (execution 29056da2-812e-b4a2-28fb-e62eaaf8e917_3188dff4-...) crashed inside PublishResearchFailureImmediate: its States.Format dereferenced $.error, found it absent on the inbound path, and the resulting States.Runtime REPLACED the real branch-A error this state exists to report \u2014 the failure-mode class recorded 2026-08-11 as 'the error handler that destroys its own error'. States.JsonMerge(placeholder, $, false): $ (the second arg) wins on any key it already has, so a real $.error is never touched; only an ABSENT $.error falls back to the placeholder message. Kept PublishResearchFailureImmediate's Task name unchanged (rather than renaming it out) so nousergon_lib.pipeline_status.registry.STATE_TO_ARCHIVE_PAGE needs no companion nousergon-lib PR for this hardening.",
+              "Parameters": {
+                "merged.$": "States.JsonMerge(States.StringToJson('{\"error\":{\"message\":\"no error captured on this branch-A failure path (defensive default \u2014 alpha-engine-config-I7048)\"}}'), $, false)"
+              },
+              "OutputPath": "$.merged",
               "Next": "PublishResearchFailureImmediate"
             },
             "PublishResearchFailureImmediate": {
@@ -2842,6 +2851,15 @@
                 "poll.$": "$.predictor_poll"
               },
               "ResultPath": "$.error",
+              "Next": "NormalizeBranchBFailureContext"
+            },
+            "NormalizeBranchBFailureContext": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I7048 Defect B hardening (2026-08-12): same defensive $.error normalizer as NormalizeBranchAFailureContext, applied to this identical-shape Branch B sibling ahead of PublishPredictorFailureImmediate (both dereference $.error via States.JsonToString; 'same shape, different pipeline' per I7048). Both current predecessors (ExtractPredictorError, ExtractPredictorTrainingSubstrateLostError) were repointed here from PublishPredictorFailureImmediate \u2014 each verified live to set $.error via ResultPath, so this never overrides real data today \u2014 it guards against a FUTURE predecessor being wired in without setting $.error, which is exactly how the sibling PublishResearchFailureImmediate crashed on the 2026-08-01 run. States.JsonMerge(placeholder, $, false): $ (second arg) wins on any key it already has. Kept PublishPredictorFailureImmediate's Task name unchanged so nousergon_lib.pipeline_status.registry.STATE_TO_ARCHIVE_PAGE needs no companion nousergon-lib PR for this hardening.",
+              "Parameters": {
+                "merged.$": "States.JsonMerge(States.StringToJson('{\"error\":{\"message\":\"no error captured on this branch-B failure path (defensive default \u2014 alpha-engine-config-I7048)\"}}'), $, false)"
+              },
+              "OutputPath": "$.merged",
               "Next": "PublishPredictorFailureImmediate"
             },
             "PublishPredictorFailureImmediate": {
@@ -3548,7 +3566,7 @@
                 "poll.$": "$.predictor_poll"
               },
               "ResultPath": "$.error",
-              "Next": "PublishPredictorFailureImmediate"
+              "Next": "NormalizeBranchBFailureContext"
             },
             "ModelZooResolveLivenessGate": {
               "Type": "Choice",
@@ -3580,13 +3598,13 @@
             },
             "ExtractModelZooResolveSubstrateLostError": {
               "Type": "Pass",
-              "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractModelZooResolveError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a ModelZooResolve failure without opening the execution history.",
+              "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractModelZooResolveError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a ModelZooResolve failure without opening the execution history. alpha-engine-config-I7048 (2026-08-12): ResultPath corrected from $.error to $.model_zoo_error \u2014 ExtractModelZooResolveError's own Comment already documents this exact class (config#2160: a direct Choice->Task jump on this edge died with States.Runtime, 'could not be found', masking the real failure) and this SubstrateLost sibling reintroduced it: PublishModelZooFailureImmediate's Message dereferences $.model_zoo_error, not $.error, so a SubstrateLost-during-resolve failure hit the identical States.Runtime crash the config#2160 fix exists to prevent. Never exercised by a healthy run \u2014 caught by static sweep, not by observed failure.",
               "Parameters": {
                 "phase": "ModelZooResolve/SubstrateLost",
                 "source": "ModelZooResolveLivenessGate.SubstrateLost",
                 "poll.$": "$.resolve_zoo_poll"
               },
-              "ResultPath": "$.error",
+              "ResultPath": "$.model_zoo_error",
               "Next": "PublishModelZooFailureImmediate"
             },
             "ModelZooSelectLivenessGate": {
@@ -3619,13 +3637,13 @@
             },
             "ExtractModelZooSelectSubstrateLostError": {
               "Type": "Pass",
-              "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractModelZooSelectError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a ModelZooSelect failure without opening the execution history.",
+              "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractModelZooSelectError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a ModelZooSelect failure without opening the execution history. alpha-engine-config-I7048 (2026-08-12): ResultPath corrected from $.error to $.model_zoo_error \u2014 same class + fix as ExtractModelZooResolveSubstrateLostError; PublishModelZooFailureImmediate's Message dereferences $.model_zoo_error, not $.error, so a SubstrateLost-during-select failure hit the exact States.Runtime crash the config#2160 fix (see ExtractModelZooSelectError's Comment) exists to prevent. Never exercised by a healthy run \u2014 caught by static sweep, not by observed failure.",
               "Parameters": {
                 "phase": "ModelZooSelect/SubstrateLost",
                 "source": "ModelZooSelectLivenessGate.SubstrateLost",
                 "poll.$": "$.model_zoo_poll"
               },
-              "ResultPath": "$.error",
+              "ResultPath": "$.model_zoo_error",
               "Next": "PublishModelZooFailureImmediate"
             }
           }
@@ -5586,20 +5604,13 @@
     },
     "SaturdayHealthCheck": {
       "Type": "Task",
-      "Comment": "Check data freshness after full pipeline \u2014 non-blocking (a failure degrades the completion email, it does not halt). Runs from alpha-engine-dashboard post-2026-04-16 health_checker migration. config#2279: deliberately carries NO Retry ladder (declared class: health-observe) \u2014 it is best-effort observability at the tail of an already-green run; its States.ALL Catch fail-softs into the DEGRADED completion path, so a retry ladder would only delay completion, never protect spend. config#2276 timeout convention (both health-observe states): inner executionTimeout = script runtime budget (agent-enforced; its expiry surfaces as a terminal non-Success status the poll Choice turns into health_check_degraded \u2014 it is a runaway bound, no longer a silent kill-and-skip); SSM Parameters.TimeoutSeconds = 60 uniform (DELIVERY timeout \u2014 time for the agent to PICK UP the command, not to run it); outer Task TimeoutSeconds = executionTimeout + 30 (bounds only the async SendCommand API call, which returns in <1s \u2014 pinned to inner+30 so the relation stays coherent if this ever flips to a .sync integration). Budget: executionTimeout raised 60\u2192300 (config#2276): observed successful health_checker.py runs complete in ~2.7-2.8s (n=2 Success in the 30-day SSM history sampled 2026-07-11 \u2014 most runs FAILED sub-second on git-pull collisions, see CheckSaturdayHealthCheckStatus), so 300s is ~100x observed with headroom for S3-latency-bound freshness scans; under the poll loop a generous budget costs nothing on the happy path.",
+      "Comment": "Check data freshness after full pipeline \u2014 non-blocking (a failure degrades the completion email, it does not halt). Runs from alpha-engine-dashboard post-2026-04-16 health_checker migration. config#2279: deliberately carries NO Retry ladder (declared class: health-observe) \u2014 it is best-effort observability at the tail of an already-green run; its States.ALL Catch fail-softs into the DEGRADED completion path, so a retry ladder would only delay completion, never protect spend. config#2276 timeout convention (both health-observe states): inner executionTimeout = script runtime budget (agent-enforced; its expiry surfaces as a terminal non-Success status the poll Choice turns into health_check_degraded \u2014 it is a runaway bound, no longer a silent kill-and-skip); SSM Parameters.TimeoutSeconds = 60 uniform (DELIVERY timeout \u2014 time for the agent to PICK UP the command, not to run it); outer Task TimeoutSeconds = executionTimeout + 30 (bounds only the async SendCommand API call, which returns in <1s \u2014 pinned to inner+30 so the relation stays coherent if this ever flips to a .sync integration). Budget: executionTimeout raised 60\u2192300 (config#2276): observed successful health_checker.py runs complete in ~2.7-2.8s (n=2 Success in the 30-day SSM history sampled 2026-07-11 \u2014 most runs FAILED sub-second on git-pull collisions, see CheckSaturdayHealthCheckStatus), so 300s is ~100x observed with headroom for S3-latency-bound freshness scans; under the poll loop a generous budget costs nothing on the happy path. alpha-engine-config-I7047 (2026-08-12): migrated off the inline `trap 'aws s3 cp ... EXIT'` log-ship wrapper to krepis.ssm_log_capture (mirrors the 17 other Saturday SF stages) \u2014 the trap collapsed under ASL's States.Array escape semantics on EVERY run using it (`trap: s3: invalid signal specification`, rc=127), which is why the 2026-08-08 scheduled run finished DEGRADED despite every real work stage succeeding with ResponseCode 0. Deliberately does NOT thread $.preflight_args: config#902's shell-run comment states this pair has no skip gate by design and runs for-real (not dry) even under shell_run \u2014 threading preflight_args would pass --preflight-only into a health_checker.py invocation that has no such flag.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands": [
-            "set -eo pipefail",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-dashboard",
-            "source .venv/bin/activate",
-            "trap 'aws s3 cp /var/log/health-check.log \"s3://alpha-engine-research/_ssm_logs/health-check/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "python health_checker.py --alert 2>&1 | tee /var/log/health-check.log"
-          ],
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main','cd /home/ec2-user/alpha-engine-dashboard','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug health-check --log /var/log/health-check.log -- /home/ec2-user/alpha-engine-dashboard/.venv/bin/python health_checker.py --alert',$$.Execution.Name))",
           "executionTimeout": [
             "300"
           ]
@@ -5721,13 +5732,13 @@
     },
     "WeeklySubstrateHealthCheck": {
       "Type": "Task",
-      "Comment": "Phase 2 \u2192 3 transparency-substrate health check. Validates every row of the transparency inventory (alpha-engine-lib transparency_inventory.yaml) \u2014 agent decisions, predictor decisions, trade lineage, risk events, P&L attribution, config changes, data quality, agent quality, pipeline execution. Per-row CloudWatch metrics emit to AlphaEngine/Substrate so individual rows have their own alarms. Non-blocking (a failure degrades the completion email, it does not halt) \u2014 same pattern as SaturdayHealthCheck. The Sat SF passes --cadence weekly which sweeps weekly + daily rows; the weekday EOD SF runs --cadence daily on the daily-only subset (PR #178 \u2014 DailySubstrateHealthCheck state). config#2279: deliberately carries NO Retry ladder (declared class: health-observe) \u2014 best-effort observability at the tail of an already-green run; its States.ALL Catch fail-softs into the DEGRADED completion path, so a retry ladder would only delay completion, never protect spend. config#2276 \u2014 NO runtime pip: the former in-pipeline `pip install --quiet --upgrade -r requirements.txt` (a live PyPI/network dependency inside an observability stage, with --upgrade able to float unpinned transitive deps past tested versions) was removed; the stage relies on the dashboard box's deploy-time venv sync \u2014 infrastructure/deploy-on-merge.sh in crucible-dashboard runs `.venv/bin/pip install -r requirements.txt` on every merge that diffs requirements.txt, and nousergon-lib is TAG-pinned there (@vX.Y.Z), so a lib bump always changes requirements.txt and always refreshes the same /home/ec2-user/alpha-engine-dashboard/.venv this command activates. Timeout convention + budget: see SaturdayHealthCheck's Comment \u2014 inner 240 (observed Success ~19-20s incl. the since-removed pip; ~12x headroom as a runaway bound), delivery 60, outer = inner + 30. The previous 240/180/240 set conflated the delivery timeout with an execution ceiling (inversion flagged by config#2276).",
+      "Comment": "Phase 2 \u2192 3 transparency-substrate health check. Validates every row of the transparency inventory (alpha-engine-lib transparency_inventory.yaml) \u2014 agent decisions, predictor decisions, trade lineage, risk events, P&L attribution, config changes, data quality, agent quality, pipeline execution. Per-row CloudWatch metrics emit to AlphaEngine/Substrate so individual rows have their own alarms. Non-blocking (a failure degrades the completion email, it does not halt) \u2014 same pattern as SaturdayHealthCheck. The Sat SF passes --cadence weekly which sweeps weekly + daily rows; the weekday EOD SF runs --cadence daily on the daily-only subset (PR #178 \u2014 DailySubstrateHealthCheck state). config#2279: deliberately carries NO Retry ladder (declared class: health-observe) \u2014 best-effort observability at the tail of an already-green run; its States.ALL Catch fail-softs into the DEGRADED completion path, so a retry ladder would only delay completion, never protect spend. config#2276 \u2014 NO runtime pip: the former in-pipeline `pip install --quiet --upgrade -r requirements.txt` (a live PyPI/network dependency inside an observability stage, with --upgrade able to float unpinned transitive deps past tested versions) was removed; the stage relies on the dashboard box's deploy-time venv sync \u2014 infrastructure/deploy-on-merge.sh in crucible-dashboard runs `.venv/bin/pip install -r requirements.txt` on every merge that diffs requirements.txt, and nousergon-lib is TAG-pinned there (@vX.Y.Z), so a lib bump always changes requirements.txt and always refreshes the same /home/ec2-user/alpha-engine-dashboard/.venv this command activates. Timeout convention + budget: see SaturdayHealthCheck's Comment \u2014 inner 240 (observed Success ~19-20s incl. the since-removed pip; ~12x headroom as a runaway bound), delivery 60, outer = inner + 30. The previous 240/180/240 set conflated the delivery timeout with an execution ceiling (inversion flagged by config#2276). alpha-engine-config-I7047 (2026-08-12): the three commands are now a single crucible-dashboard infrastructure/substrate_health_check.sh script, invoked through krepis.ssm_log_capture instead of the inline `trap 'aws s3 cp ... EXIT'` wrapper \u2014 that trap's inner single-quote had to be `\\'`-escaped inside this state's States.Array, and ASL does NOT unescape `\\'` to `'` (it passes the backslash through literally), so bash word-split the trap's own command line into signal names (`trap: s3: invalid signal specification`, rc=127) on EVERY run \u2014 the 2026-08-08 scheduled run finished DEGRADED for exactly this reason despite every real work stage succeeding with ResponseCode 0. Mirrors the 17 other Saturday SF stages already on krepis.ssm_log_capture. Deliberately does NOT thread $.preflight_args \u2014 see SaturdayHealthCheck's Comment; this pair has no skip gate by design and runs for-real even under shell_run, and substrate_health_check.sh has no --preflight-only flag to receive it.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main','cd /home/ec2-user/alpha-engine-dashboard','source .venv/bin/activate','trap \\'aws s3 cp /var/log/substrate-health-check.log \"s3://alpha-engine-research/_ssm_logs/substrate-health-check/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true\\' EXIT','python -m nousergon_lib.transparency --cadence weekly --alert 2>&1 | tee /var/log/substrate-health-check.log','echo \\'--- constituents drift check ---\\' | tee -a /var/log/substrate-health-check.log','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data && /home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m validators.constituents_drift_check 2>&1 | tee -a /var/log/substrate-health-check.log','echo \\'--- phase marker sweep ---\\' | tee -a /var/log/substrate-health-check.log',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),'cd /home/ec2-user/alpha-engine-data && /home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m validators.phase_marker_sweep --run-date \"$RUN_DATE\" --alert 2>&1 | tee -a /var/log/substrate-health-check.log')",
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-dashboard','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug substrate-health-check --log /var/log/substrate-health-check.log -- bash infrastructure/substrate_health_check.sh --run-date {}',$$.Execution.Name,$.run_date))",
           "executionTimeout": [
             "240"
           ]
