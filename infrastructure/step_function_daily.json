@@ -835,25 +835,13 @@
     },
     "RunMorningPlanner": {
       "Type": "Task",
-      "Comment": "Run morning order-book planner via SSM",
+      "Comment": "Run morning order-book planner via SSM. alpha-engine-config-I7047 sweep (2026-08-12): migrated off the inline `trap 'aws s3 cp ... EXIT'` log-ship wrapper to krepis.ssm_log_capture — found by the I7047 guard test, which asserts zero occurrences of the anti-pattern in ANY nousergon-data SF definition, not just the two Saturday health-observe stages the issue named. Unlike WeeklySubstrateHealthCheck's instance, this one was a plain `commands` JSON array (not `commands.$`/States.Array), so it was not exhibiting the ASL `\\'`-escape-collapse bug specifically — but it is the same anti-pattern this fleet is retiring in favor of krepis (17+ sibling stages), so it is migrated for consistency rather than left as a second, differently-shaped copy. Behavior-preserving: `source .venv/bin/activate` is kept (subprocess inherits the activated PATH so a bare `python` invocation still resolves to this venv's interpreter) — only the krepis wrapper binary itself is called by absolute path, per fleet convention.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.trading_instance_id",
         "Parameters": {
-          "commands": [
-            "set -eo pipefail",
-            "export FLOW_DOCTOR_ENABLED=1",
-            "export ALPHA_ENGINE_DEPLOYED=1",
-            "export AWS_REGION=us-east-1",
-            "export AWS_DEFAULT_REGION=us-east-1",
-            "cd /home/ec2-user/alpha-engine",
-            "source .venv/bin/activate",
-            "export EXPECTED_EXECUTOR_SHA=\"$(cat /home/ec2-user/.frozen_executor_sha 2>/dev/null || true)\"",
-            "/home/ec2-user/alpha-engine/infrastructure/wait-for-ibgateway.sh",
-            "trap 'aws s3 cp /var/log/executor.log \"s3://alpha-engine-research/_ssm_logs/executor/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "python executor/main.py 2>&1 | tee -a /var/log/executor.log"
-          ],
+          "commands.$": "States.Array('set -eo pipefail','export FLOW_DOCTOR_ENABLED=1','export ALPHA_ENGINE_DEPLOYED=1','export AWS_REGION=us-east-1','export AWS_DEFAULT_REGION=us-east-1','cd /home/ec2-user/alpha-engine','source .venv/bin/activate','export EXPECTED_EXECUTOR_SHA=\"$(cat /home/ec2-user/.frozen_executor_sha 2>/dev/null || true)\"','/home/ec2-user/alpha-engine/infrastructure/wait-for-ibgateway.sh',States.Format('/home/ec2-user/alpha-engine/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug executor --log /var/log/executor.log -- python executor/main.py',$$.Execution.Name))",
           "executionTimeout": [
             "600"
           ]

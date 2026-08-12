@@ -40,6 +40,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from tests.sf_command_utils import extract_commands
+
 _INFRA_DIR = Path(__file__).resolve().parent.parent / "infrastructure"
 _SF_PATH = _INFRA_DIR / "step_function_daily.json"
 _EOD_SF_PATH = _INFRA_DIR / "step_function_eod.json"
@@ -48,7 +50,12 @@ _PIN_FILE = "/home/ec2-user/.frozen_executor_sha"
 
 def _commands(state: str, sf_path: Path = _SF_PATH) -> list[str]:
     doc = json.loads(sf_path.read_text())
-    return doc["States"][state]["Parameters"]["Parameters"]["commands"]
+    # extract_commands() reads through either a static `commands` list or a
+    # `commands.$` States.Array intrinsic — alpha-engine-config-I7047
+    # (2026-08-12) converted RunMorningPlanner to the latter to thread the
+    # krepis.ssm_log_capture correlation id, mirroring the fleet-wide
+    # migration off the inline trap/log-ship wrapper.
+    return extract_commands(doc["States"][state])
 
 
 def test_freshness_gate_freezes_executor_sha_after_verify() -> None:

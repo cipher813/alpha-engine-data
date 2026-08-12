@@ -51,6 +51,17 @@ playbooks:
       - "eventbridge:alpha-engine-saturday-sf-watch-failed (fleet SF terminal failure -> triage Lambda -> router, M2)"
       - "eventbridge:alpha-engine-sf-watch-spot-interruption + alpha-engine-sf-watch-instance-terminated (reclaim/relaunch)"
     cadence: "event-driven only — no scheduled wake"
+    # `wake` above is prose for a human; `triggers` is the same fact in a shape
+    # a reader can JOIN (alpha-engine-config-I7056). Without it, nothing could
+    # tell a playbook paused by Brian's 2026-08-07 ruling from one that is
+    # simply broken — both emit nothing, and observability-policy.md §8.3
+    # forbids reporting either as the other. infrastructure/overseer/arming.py
+    # is the consumer; `surface` must match automation_pause.py's vocabulary
+    # ("events" / "scheduler" are different APIs, not aliases).
+    triggers:
+      - {surface: events, name: alpha-engine-saturday-sf-watch-failed}
+      - {surface: events, name: alpha-engine-sf-watch-spot-interruption}
+      - {surface: events, name: alpha-engine-sf-watch-instance-terminated}
     executor_function: alpha-engine-sf-watch-spot-dispatcher
     executor_lambda_dir: sf-watch-spot-dispatcher
     # Executor verdict `reason` values that are by-design declines — the
@@ -137,6 +148,15 @@ playbooks:
     wake:
       - "gha:nousergon-lib notify-ci-failure.yml -> repository_dispatch -> sf-watch.yml ci-watch-dispatch job -> this router (main-branch CI failure)"
     cadence: "event-driven only — no scheduled wake (deprecation to drain intake tracked: config-I2845)"
+    triggers:
+      - surface: github-actions
+        ref: "nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml"
+        reason: >-
+          repository_dispatch into nousergon-data's sf-watch.yml ci-watch-dispatch
+          job, then the router. GitHub Actions carries no AWS trigger state, so
+          this leg is outside the 2026-08-07 AWS pause entirely and its arming
+          cannot be read from EventBridge.
+      - {surface: scheduler, name: alpha-engine-ci-watch-canary-drill-weekly}
     executor_function: alpha-engine-ci-watch-dispatcher
     executor_lambda_dir: ci-watch-dispatcher
     # signature_repeat_skip (config#2862): a signature marker for (repo,
@@ -192,6 +212,23 @@ playbooks:
       - "scheduler:alpha-engine-alert-drain-0400utc/1000utc/1600utc/2200utc (4x-daily non-urgent queue drain, Brian ruling 2026-07-22)"
       - "event-time: freshness-monitor CRITICAL page -> router (trigger=freshness-critical, config-I3282)"
     cadence: "4x daily 04:00/10:00/16:00/22:00 UTC + event-time on freshness criticals"
+    # The worked example for why arming is a property of a TRIGGER, not of a
+    # playbook. Measured 2026-08-12: all four schedules below are live DISABLED,
+    # and alert-drain still dispatched twice that day — the event-time leg rides
+    # the freshness monitors, which Brian deliberately KEPT enabled. A
+    # playbook-level "paused" boolean would have been simply false.
+    triggers:
+      - {surface: scheduler, name: alpha-engine-alert-drain-0400utc}
+      - {surface: scheduler, name: alpha-engine-alert-drain-1000utc}
+      - {surface: scheduler, name: alpha-engine-alert-drain-1600utc}
+      - {surface: scheduler, name: alpha-engine-alert-drain-2200utc}
+      - surface: event-time
+        ref: "freshness-monitor CRITICAL -> overseer-dispatcher (trigger=freshness-critical)"
+        reason: >-
+          Not an AWS trigger resource of its own — the freshness-monitor Lambdas
+          invoke the router directly (config-I3282). Its arming is the arming of
+          alpha-engine-freshness-monitor-{cron,historical-cron,intraday-cron},
+          all three of which the pause manifest declares KEPT.
     executor_function: alpha-engine-alert-drain-dispatcher
     executor_lambda_dir: alert-drain-dispatcher
     benign_reasons: [concurrent_skip, disabled]
@@ -307,6 +344,13 @@ playbooks:
     # The cadence string documents that sibling probe so the config#4474
     # coverage test's documented-sibling exemption applies.
     cadence: "3x daily fixed crons (+ a weekly Sunday slot) + end-of-SF sweep leg — covered by the dispatcher's own 5-min lane-death + trigger-health reconciler liveness probe (config-I5229/I4988), not a run_window check"
+    triggers:
+      - {surface: scheduler, name: alpha-engine-scheduled-groom-0400-daily}
+      - {surface: scheduler, name: alpha-engine-scheduled-groom-1200-daily}
+      - {surface: scheduler, name: alpha-engine-scheduled-groom-2000-daily}
+      - {surface: scheduler, name: alpha-engine-scheduled-groom-sun0900-weekly}
+      - {surface: scheduler, name: alpha-engine-groom-lane-reconciler-5min}
+      - {surface: events, name: alpha-engine-groom-sf-failure}
     executor_lambda_dir: scheduled-groom-dispatcher
     charter: alpha-engine-config/scripts/groom_run.sh
     concurrency_domain: EC2 tag lock on groom-issue-filter (tier lane; sweep has its own lane).
@@ -382,6 +426,14 @@ playbooks:
     workflow_file: .github/workflows/gate-due-sweep.yml
     repo: alpha-engine-config
     schedule_cron: "30 13 * * *"
+    triggers:
+      - surface: github-actions
+        ref: "nousergon/alpha-engine-config/.github/workflows/gate-due-sweep.yml"
+        reason: >-
+          Pure GitHub Actions cron in a different repo — no Lambda, no
+          EventBridge rule, no Scheduler schedule. It is therefore outside the
+          2026-08-07 AWS pause entirely, and its arming state lives in GitHub's
+          workflow-enabled flag rather than anywhere this module can read.
     charter: alpha-engine-config/scripts/gate_due_sweep.py
     concurrency_domain: >-
       Single GHA concurrency group `gate-due-sweep` (cancel-in-progress:
@@ -432,6 +484,11 @@ playbooks:
     wake:
       - "scheduler:alpha-engine-ci-watch-canary-drill-weekly + alpha-engine-sf-watch-canary-drill-weekly (Wednesday drills; router re-point tracked config-I2832)"
     cadence: "weekly Wednesday drills; liveness tick every 15min (eventbridge:alpha-engine-canary-replay-liveness-probe-tick)"
+    triggers:
+      - {surface: events, name: alpha-engine-canary-replay-thursday}
+      - {surface: events, name: alpha-engine-canary-replay-liveness-probe-tick}
+      - {surface: scheduler, name: alpha-engine-ci-watch-canary-drill-weekly}
+      - {surface: scheduler, name: alpha-engine-sf-watch-canary-drill-weekly}
     executor_lambda_dir: canary-replay-dispatcher
     charter: alpha-engine-config/infrastructure/canary_replay_spot_bootstrap.sh
     concurrency_domain: >-
@@ -468,6 +525,14 @@ playbooks:
     wake:
       - "gha: nousergon-data migrations/ path-filtered workflow on merge (ARCH §120) + manual workflow_dispatch"
     cadence: "event-driven (merge-triggered); no scheduled wake"
+    triggers:
+      - surface: github-actions
+        ref: "nousergon/nousergon-data/.github/workflows/run-arctic-migrations.yml"
+        reason: >-
+          Synchronous `lambda invoke` from a path-filtered merge workflow (plus
+          workflow_dispatch). No EventBridge surface exists to read, so its
+          arming is GitHub's, not AWS's — and the 2026-08-07 pause does not
+          reach it.
     executor_lambda_dir: arctic-migration-dispatcher
     charter: nousergon-data/scripts/run_arctic_migrations.py
     concurrency_domain: >-
@@ -1136,6 +1201,17 @@ t1_automations:
     match:
       alert_class: freshness_monitor_staleness
       severities: [critical]
+    # A T1 automation has no trigger of its own — it runs INSIDE the alert-drain
+    # charter, so its arming is exactly alert-drain's. Declared rather than
+    # inferred: with no `triggers` block at all, arming.py reports
+    # `undeclared-no-triggers`, which is loud on purpose (§8.3 has no blanks).
+    triggers:
+      - surface: parent
+        ref: alert-drain
+        reason: >-
+          Classification shortcut evaluated within the alert-drain run. It has no
+          schedule, no rule and no Lambda; it cannot be armed or disarmed
+          independently of its host.
     remediation_steps:
       - "Read the artifact's `s3_key_template` from `alpha-engine-config/private-docs/ARTIFACT_REGISTRY.yaml` (trust the registry template, not the alert's spelling — some surfaces render `_` as `-`)."
       - "Run `aws s3 ls <artifact_key>` to get the last-modified timestamp."
@@ -1161,6 +1237,13 @@ t1_automations:
     match:
       alert_class: groom_lifecycle_bus_events
       severities: [info]
+    triggers:
+      - surface: parent
+        ref: alert-drain
+        reason: >-
+          Classification shortcut evaluated within the alert-drain run — same
+          shape as freshness-critical-auto-verify above. No independent trigger
+          surface exists.
     remediation_steps:
       - "Verify the event severity is `info` and the message is a lifecycle transition (ONLINE/complete)."
       - "Record as T0 digest-fold with disposition `t1-digest-fold`."
