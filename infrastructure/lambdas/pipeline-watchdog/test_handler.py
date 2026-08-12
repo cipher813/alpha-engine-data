@@ -482,6 +482,217 @@ def test_check_sf_clear_when_executions_seen_does_not_alert():
     assert result.executions_seen and result.executions_seen > 0
     assert result.alert_emitted is False
     _alerts_mod.publish.assert_not_called()
+    assert result.outcome == "CLEAR"
+
+
+# ── status-blind watchdog fix (alpha-engine-config-I6991) ────────────────
+#
+# A window containing only FAILED/TIMED_OUT/ABORTED executions must be an
+# ALERT, not a "watchdog clear" — the exact regression measured 2026-08-06:
+# "watchdog clear: sf=Weekday SF executions_in_window=1" on a run that
+# fired at 05:15:41 PT and failed 3.5s later.
+
+
+def _make_status_filtered_sfn_client(status_to_execs: dict) -> MagicMock:
+    """SFN mock that honors ``statusFilter`` — unlike ``_make_sfn_client``
+    (which returns the same rows for every status and can therefore never
+    exercise a status-aware code path), each status only sees the rows
+    explicitly assigned to it."""
+    client = MagicMock()
+
+    def _list_executions(**kwargs):
+        status = kwargs.get("statusFilter")
+        return {"executions": status_to_execs.get(status, []), "nextToken": None}
+
+    client.list_executions.side_effect = _list_executions
+    client.get_parameter.return_value = {"Parameter": {"Value": "daily"}}
+    return client
+
+
+def _make_status_role_sfn_client(rows: "list[tuple[str, object, object]]") -> MagicMock:
+    """SFN + role-aware mock. ``rows`` is a list of ``(status, startDate,
+    role_or_None)``. Combines the status-filter honoring of
+    ``_make_status_filtered_sfn_client`` with the ``describe_execution``
+    role lookup of ``_make_role_sfn_client``."""
+    client = MagicMock()
+    by_status: "dict[str, list]" = {}
+    inputs: "dict[str, str]" = {}
+    for i, (status, start, role) in enumerate(rows):
+        arn = f"arn:aws:states:us-east-1:1:execution:sf:e{i}"
+        by_status.setdefault(status, []).append({"startDate": start, "executionArn": arn})
+        inputs[arn] = '{"pipeline_role": "%s"}' % role if role is not None else "{}"
+
+    def _list_executions(**kwargs):
+        status = kwargs.get("statusFilter")
+        return {"executions": by_status.get(status, []), "nextToken": None}
+
+    def _describe(**kwargs):
+        return {"input": inputs.get(kwargs.get("executionArn"), "{}")}
+
+    client.list_executions.side_effect = _list_executions
+    client.describe_execution.side_effect = _describe
+    return client
+
+
+def test_status_counts_in_window_buckets_by_status():
+    now = datetime.now(timezone.utc)
+    client = _make_status_filtered_sfn_client(
+        {"FAILED": [{"startDate": now - timedelta(hours=1)}]}
+    )
+    counts = index._status_counts_in_window(WKD_ARN, 24 * 3600, client=client)
+    assert counts == {"FAILED": 1}
+
+
+def test_check_sf_alerts_when_window_has_only_failed_executions():
+    """THE regression. A single FAILED execution must NOT produce
+    'watchdog clear' — it must alert, distinctly from the never-fired case."""
+    now = datetime.now(timezone.utc)
+    client = _make_status_filtered_sfn_client(
+        {"FAILED": [{"startDate": now - timedelta(seconds=4)}]}
+    )
+    result = index._check_sf(
+        sf_label="Weekday SF",
+        sf_arn=WKD_ARN,
+        is_watch_day=True,
+        skip_reason_if_not_watching="(unused)",
+        window_seconds=24 * 3600,
+        client=client,
+    )
+    assert result.checked is True
+    assert result.outcome == "FIRED_AND_FAILED"
+    assert result.alert_emitted is True
+    _alerts_mod.publish.assert_called_once()
+    call_kwargs = _alerts_mod.publish.call_args.kwargs
+    assert "fired and FAILED" in call_kwargs["message"]
+    assert "FAILED=1" in call_kwargs["message"]
+    assert "Weekday SF" in call_kwargs["message"]
+    # Distinct dedup key from the never-fired path, so the two conditions
+    # can never collapse into the same throttled alert.
+    assert "fired-failed" in call_kwargs["dedup_key"]
+
+
+def test_check_sf_timed_out_and_aborted_also_alert_as_fired_and_failed():
+    now = datetime.now(timezone.utc)
+    client = _make_status_filtered_sfn_client(
+        {
+            "TIMED_OUT": [{"startDate": now - timedelta(hours=1)}],
+            "ABORTED": [{"startDate": now - timedelta(hours=2)}],
+        }
+    )
+    result = index._check_sf(
+        sf_label="EOD SF",
+        sf_arn=EOD_ARN,
+        is_watch_day=True,
+        skip_reason_if_not_watching="(unused)",
+        window_seconds=24 * 3600,
+        client=client,
+    )
+    assert result.outcome == "FIRED_AND_FAILED"
+    assert result.alert_emitted is True
+    call_kwargs = _alerts_mod.publish.call_args.kwargs
+    assert "TIMED_OUT=1" in call_kwargs["message"]
+    assert "ABORTED=1" in call_kwargs["message"]
+
+
+def test_check_sf_running_execution_is_healthy_not_a_failure():
+    """A still-in-flight RUNNING execution is not a failure — must not alert."""
+    now = datetime.now(timezone.utc)
+    client = _make_status_filtered_sfn_client(
+        {"RUNNING": [{"startDate": now - timedelta(minutes=5)}]}
+    )
+    result = index._check_sf(
+        sf_label="Weekday SF",
+        sf_arn=WKD_ARN,
+        is_watch_day=True,
+        skip_reason_if_not_watching="(unused)",
+        window_seconds=24 * 3600,
+        client=client,
+    )
+    assert result.outcome == "CLEAR"
+    assert result.alert_emitted is False
+    _alerts_mod.publish.assert_not_called()
+
+
+def test_check_sf_a_later_succeeded_rerun_clears_an_earlier_failure():
+    """A same-window rerun that succeeded is evidence the pipeline is
+    healthy even though an earlier attempt in the window failed."""
+    now = datetime.now(timezone.utc)
+    client = _make_status_filtered_sfn_client(
+        {
+            "FAILED": [{"startDate": now - timedelta(hours=2)}],
+            "SUCCEEDED": [{"startDate": now - timedelta(hours=1)}],
+        }
+    )
+    result = index._check_sf(
+        sf_label="Weekday SF",
+        sf_arn=WKD_ARN,
+        is_watch_day=True,
+        skip_reason_if_not_watching="(unused)",
+        window_seconds=24 * 3600,
+        client=client,
+    )
+    assert result.outcome == "CLEAR"
+    assert result.alert_emitted is False
+
+
+def test_check_sf_zero_executions_is_still_never_fired_not_fired_and_failed():
+    """The never-fired path (config-I6991's other named case) is unchanged
+    by the status-aware rewrite."""
+    client = _make_status_filtered_sfn_client({})
+    result = index._check_sf(
+        sf_label="Weekday SF",
+        sf_arn=WKD_ARN,
+        is_watch_day=True,
+        skip_reason_if_not_watching="(unused)",
+        window_seconds=24 * 3600,
+        client=client,
+    )
+    assert result.outcome == "NEVER_FIRED"
+    assert result.alert_emitted is True
+    call_kwargs = _alerts_mod.publish.call_args.kwargs
+    assert "has not executed" in call_kwargs["message"]
+    assert "fired and FAILED" not in call_kwargs["message"]
+
+
+def test_check_sf_fired_and_failed_applies_to_saturday_with_role_filter():
+    """closes-when requires all THREE covered pipelines, not just Weekday —
+    Saturday SF's role-filtered walk must also classify a failed cadence
+    run as FIRED_AND_FAILED rather than clear."""
+    now = datetime.now(timezone.utc)
+    client = _make_status_role_sfn_client(
+        [("FAILED", now - timedelta(hours=1), "weekly")]
+    )
+    result = index._check_sf(
+        sf_label="Saturday SF",
+        sf_arn=SAT_ARN,
+        is_watch_day=True,
+        skip_reason_if_not_watching="(unused)",
+        window_seconds=index.WINDOW_SECONDS_WEEKLY,
+        client=client,
+        role_filter=index.WEEKLY_CADENCE_ROLES,
+    )
+    assert result.outcome == "FIRED_AND_FAILED"
+    assert result.alert_emitted is True
+
+
+def test_check_sf_fired_and_failed_role_filter_excludes_non_cadence_roles():
+    """A FAILED execution outside the cadence role set is not evidence the
+    cadence fired at all — it must not manufacture a FIRED_AND_FAILED
+    alert for a cron that never actually ran."""
+    now = datetime.now(timezone.utc)
+    client = _make_status_role_sfn_client(
+        [("FAILED", now - timedelta(hours=1), "exercise")]
+    )
+    result = index._check_sf(
+        sf_label="Saturday SF",
+        sf_arn=SAT_ARN,
+        is_watch_day=True,
+        skip_reason_if_not_watching="(unused)",
+        window_seconds=index.WINDOW_SECONDS_WEEKLY,
+        client=client,
+        role_filter=index.WEEKLY_CADENCE_ROLES,
+    )
+    assert result.outcome == "NEVER_FIRED"
 
 
 # ── handler — full integration ──────────────────────────────────────────
