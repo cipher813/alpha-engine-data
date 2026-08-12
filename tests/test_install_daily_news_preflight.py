@@ -23,6 +23,7 @@ exists, the RAG secrets SSM fetch exists and fails loud, and the preflight
 runs before the thing it guards.
 """
 
+import re
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -37,9 +38,27 @@ def test_requirements_carry_the_rag_ingest_deps():
     (psycopg2-binary/pgvector via the lib's [rag] extra) and uses voyageai at
     embed time. Without them the lazy import inside daily_news.py's fail-soft
     try/except degrades silently — the exact #6063 failure."""
-    assert "nousergon-lib[rag,flow_doctor]" in _REQS, (
+    # Asserted on the EXTRAS SET, not on the literal spelling. The previous form
+    # pinned "nousergon-lib[rag,flow_doctor]" exactly, which made this test a
+    # guard for the underscore — the very defect config-I6963 fixes: pip <23.3
+    # does not normalise `_` to `-` in a requested extra, so `[flow_doctor]`
+    # matches nothing against `Provides-Extra: flow-doctor` and is dropped with
+    # a WARNING on a SUCCESSFUL exit. A test asserting the broken spelling would
+    # have to be edited to allow the fix, which is a test certifying a defect.
+    #
+    # PEP 685 normalisation (`_` -> `-`, lowercase) is applied to both sides, so
+    # either spelling passes here and the `lint-extras` job is what requires the
+    # correct one. Two checks, one rule each.
+    _lib_extras = re.search(r"^nousergon-lib\[([^\]]*)\]", _REQS, re.M)
+    assert _lib_extras, "requirements-daily-news.txt must request nousergon-lib with extras"
+    _requested = {e.strip().lower().replace("_", "-") for e in _lib_extras.group(1).split(",")}
+    assert "rag" in _requested, (
         "the slim venv must ride the lib's [rag] extra so psycopg2-binary/"
-        "pgvector stay in lockstep with the lib pin"
+        f"pgvector stay in lockstep with the lib pin — requested extras: {sorted(_requested)}"
+    )
+    assert "flow-doctor" in _requested, (
+        "the daily-news chain needs flow-doctor for krepis.logging's error handler "
+        f"— requested extras: {sorted(_requested)}"
     )
     assert "voyageai>=0.5.0" in _REQS, (
         "voyageai has no lib extra; it mirrors requirements.txt's own pin"
