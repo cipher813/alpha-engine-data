@@ -7,7 +7,7 @@
       "Type": "Pass",
       "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + ec2_instance_id explicitly; manual runs for partial-execution testing often omit sns_topic_arn, which previously caused HandleFailure/NotifyComplete to error on missing JSONPath. States.JsonMerge with user-input as the second arg lets explicit values win. | 2026-05-17: also stamps run_date = date($$.Execution.StartTime) so every spot stage of one execution keys backtest/{date}/ off ONE date (fixes the Backtester=05-17 vs Evaluator=05-18 UTC-midnight split). User-passed run_date still wins. | 2026-05-18 (shell-run keystone): also seeds the dry-path control vars at their NON-DRY identity values \u2014 preflight_args=\"\" (empty spot-command suffix), research_dry=false, data_phase2_dry=false, regime_action=\"produce\". These exist on EVERY run so the spot States.Format / Lambda Payload .$ references always resolve; on the real Saturday run (no shell_run) they hold these identity values, making every spot command string byte-identical to pre-keystone and every Lambda Payload behaviourally identical (handlers default dry_run_llm/dry_run to false; regime action 'produce' is the pre-keystone hardcoded value). ApplyShellRunDefaults (shell_run=true only) overrides them with the dry values. innermost defaults blob is merged UNDER run_date which is merged UNDER sns_topic_arn which is merged UNDER the user input, so user/ApplyShellRunDefaults values always win. PROVENANCE (config#2281): the sns_topic_arn default in the JsonMerge floor hand-carries the account/region literal (arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts) as a FLOOR ONLY \u2014 $$.Execution.Input wins the merge, so the authoritative source is the CALLER: the EventBridge schedule's Input (CFN alpha-engine-orchestration.yaml should pass sns_topic_arn via !Sub/!Ref so account/region live in ONE place \u2014 that Input change rides the CFN file in alpha-engine-config, not this repo) or an operator StartExecution payload. The floor is retained DELIBERATELY: a bare manual console start with no input must still alert instead of dying in HandleFailure on a missing $.sns_topic_arn. tests/test_sf_sns_arn_single_source.py pins that no publish state hardcodes a TopicArn and no NEW copy of the literal can ship outside the two declared floors (here + NormalizeFailureContext).",
       "Parameters": {
-        "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"preflight_args\":\"\",\"skip_weekly_run_day_gate\":false,\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
+        "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"substrate_relaunch_attempts\":0,\"preflight_args\":\"\",\"skip_weekly_run_day_gate\":false,\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
       },
       "OutputPath": "$.merged",
       "Next": "CheckWeeklyRunDayGate"
@@ -6318,7 +6318,7 @@
         "Bucket": "alpha-engine-research",
         "Key.$": "States.Format('_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.run_date)",
         "ContentType": "application/json",
-        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\"\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date)"
+        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"substrate_relaunches\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, $.substrate_relaunch_attempts)"
       },
       "Retry": [
         {
@@ -6421,7 +6421,7 @@
         "poll.$": "$.morning_enrich_poll"
       },
       "ResultPath": "$.error",
-      "Next": "NormalizeFailureContext"
+      "Next": "SubstrateRelaunchGate"
     },
     "ExtractDataPhase1Error": {
       "Type": "Pass",
@@ -6443,7 +6443,7 @@
         "poll.$": "$.data_phase1_poll"
       },
       "ResultPath": "$.error",
-      "Next": "NormalizeFailureContext"
+      "Next": "SubstrateRelaunchGate"
     },
     "ExtractBacktesterError": {
       "Type": "Pass",
@@ -7022,7 +7022,7 @@
         {
           "Variable": "$.weekly_freshness_spot_poll.Status",
           "StringEquals": "Success",
-          "Next": "CheckShellRun"
+          "Next": "RouteAfterBootstrapSuccess"
         },
         {
           "And": [
@@ -7317,7 +7317,7 @@
         "poll.$": "$.backtester_poll"
       },
       "ResultPath": "$.error",
-      "Next": "NormalizeFailureContext"
+      "Next": "SubstrateRelaunchGate"
     },
     "PredictorBacktestLivenessGate": {
       "Type": "Choice",
@@ -7356,7 +7356,7 @@
         "poll.$": "$.predictor_backtest_poll"
       },
       "ResultPath": "$.error",
-      "Next": "NormalizeFailureContext"
+      "Next": "SubstrateRelaunchGate"
     },
     "PortfolioOptimizerBacktestLivenessGate": {
       "Type": "Choice",
@@ -7395,7 +7395,7 @@
         "poll.$": "$.portfolio_optimizer_poll"
       },
       "ResultPath": "$.error",
-      "Next": "NormalizeFailureContext"
+      "Next": "SubstrateRelaunchGate"
     },
     "EvaluatorDiagnosticsLivenessGate": {
       "Type": "Choice",
@@ -7434,7 +7434,7 @@
         "poll.$": "$.evaluator_diagnostics_poll"
       },
       "ResultPath": "$.error",
-      "Next": "NormalizeFailureContext"
+      "Next": "SubstrateRelaunchGate"
     },
     "EvaluatorOptimizeLivenessGate": {
       "Type": "Choice",
@@ -7473,7 +7473,7 @@
         "poll.$": "$.evaluator_optimize_poll"
       },
       "ResultPath": "$.error",
-      "Next": "NormalizeFailureContext"
+      "Next": "SubstrateRelaunchGate"
     },
     "WeeklyFreshnessSpotBootstrapLivenessGate": {
       "Type": "Choice",
@@ -7512,7 +7512,7 @@
         "poll.$": "$.weekly_freshness_spot_poll"
       },
       "ResultPath": "$.error",
-      "Next": "NormalizeFailureContext"
+      "Next": "SubstrateRelaunchGate"
     },
     "SetLibPinGateDegradedSummary": {
       "Type": "Pass",
@@ -7708,6 +7708,233 @@
       "Type": "Fail",
       "Error": "DegradedRun",
       "CausePath": "States.Format('Weekly freshness pipeline DEGRADED \u2014 reason: {}. Full degraded_summary: {}. Per the 2026-07-28 Option-A ruling (alpha-engine-config#2699), ported to this weekly SF via alpha-engine-config-I6891: a degraded run must FAIL so status-keyed watchers (sf-watch, EventBridge, sf-telegram-notifier) engage with zero new plumbing, and so a run that did not really work stops counting as one that did. The run was never aborted mid-pipeline \u2014 every fail-open continuation is unchanged; only the honesty of the terminal changes.', $.degraded_summary.reason, States.JsonToString($.degraded_summary))"
+    },
+    "RouteAfterBootstrapSuccess": {
+      "Type": "Choice",
+      "Comment": "A bootstrapped launcher box means one of two things. First boot: fall through to CheckShellRun and run the pipeline from stage 1. REPLACEMENT box after a substrate loss: resume at the interrupted stage instead -- falling through would re-run every stage the lost box already completed, which for the weekly pipeline means duplicate side effects (config#2252: duplicate model-zoo promotion emails) on top of hours of wasted compute.",
+      "Choices": [
+        {
+          "Variable": "$.substrate_relaunch_attempts",
+          "NumericGreaterThan": 0,
+          "Next": "ResumeAfterSubstrateRelaunch"
+        }
+      ],
+      "Default": "CheckShellRun"
+    },
+    "SubstrateRelaunchGate": {
+      "Type": "Choice",
+      "Comment": "Substrate loss is an INFRASTRUCTURE event, not a workload failure: the ephemeral launcher spot was reclaimed (StatusDetails Undeliverable/Terminated) before the stage could report. Measured 2026-08-12: 3 of 11 recent spot requests in this account died instance-terminated-no-capacity, and one of them killed that day's scheduled weekly run mid-DataPhase1 (resource ids in config-I7118). Failing the execution here made every such reclaim a MANUAL recovery via scripts/weekly_sf_rerun.py -- detected-and-paged, which principles.md #3 counts as partial coverage, not automation. ONE bounded relaunch, forced ON-DEMAND: an on-demand box cannot be reclaimed, so a second substrate loss in the same execution is a genuine anomaly and stays terminal (and stays recoverable by weekly_sf_rerun.py, which is unchanged). The counter is spent per EXECUTION, not per stage, so this can never loop.",
+      "Choices": [
+        {
+          "Variable": "$.substrate_relaunch_attempts",
+          "NumericLessThan": 1,
+          "Next": "RecordSubstrateRelaunchAttempt"
+        }
+      ],
+      "Default": "SetSubstrateRelaunchExhaustedError"
+    },
+    "SetSubstrateRelaunchExhaustedError": {
+      "Type": "Pass",
+      "Comment": "Overwrites $.error rather than passing the stage's own substrate-lost error through: by the time the budget is spent, the operator-relevant fact is that the run lost TWO launcher boxes, which is a capacity event, not a DataPhase1 event. Writing $.error here is also what keeps this path inside the guaranteed-$.error chokepoint HandleFailure's States.JsonToString($.error) depends on.",
+      "Parameters": {
+        "phase": "SubstrateRelaunch/Exhausted",
+        "source": "SubstrateRelaunchGate.Exhausted",
+        "detail": "launcher spot lost again after a forced on-demand relaunch; recover with scripts/weekly_sf_rerun.py",
+        "prior.$": "$.error"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "RecordSubstrateRelaunchAttempt": {
+      "Type": "Pass",
+      "Comment": "Spend the attempt BEFORE launching. If the relaunch or its bootstrap is itself lost, the gate is already exhausted and the execution fails loud instead of relaunching forever.",
+      "Result": 1,
+      "ResultPath": "$.substrate_relaunch_attempts",
+      "Next": "RelaunchWeeklyFreshnessSpot"
+    },
+    "RelaunchWeeklyFreshnessSpot": {
+      "Type": "Task",
+      "Comment": "Replacement launcher box after substrate loss. Identical to DispatchWeeklyFreshnessSpot except (a) force_on_demand=true -- the dispatcher has accepted that flag since config#2248 with the comment 'reserved for a future bounded retry-on-relaunch ... no current caller sets it', and this is that caller; spot-first here would re-enter the same exhausted pool that just reclaimed the box -- and (b) TimeoutSeconds 540 rather than 600, so the SF budget is the SMALLER of the two ceilings and is therefore the one that actually fires (config-I6897: an SF lambda:invoke declares two timeouts and only the smaller binds; DispatchWeeklyFreshnessSpot's own 600-vs-600 race is grandfathered in that issue and is deliberately NOT reproduced here). 540s is ample: the dispatcher fires the SSM bootstrap ASYNCHRONOUSLY and returns without waiting for the multi-minute clone + venv build.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-weekly-freshness-spot-dispatcher",
+        "Payload": {
+          "execution_id.$": "$$.Execution.Id",
+          "force_on_demand": true
+        }
+      },
+      "TimeoutSeconds": 540,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException",
+            "Lambda.SdkClientException"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 15,
+          "BackoffRate": 2.0
+        },
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "Comment": "config#2248: the launcher-box launch itself (spot capacity rotation, SSM-online wait) can transiently fail the same way any other spot dispatch in this fleet does \u2014 one backed-off retry before falling into the fail-loud Catch below.",
+          "MaxAttempts": 1,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ExtractWeeklyFreshnessSpotDispatchError",
+          "ResultPath": "$.weekly_freshness_spot_error"
+        }
+      ],
+      "ResultSelector": {
+        "instance_id.$": "$.Payload.instance_id",
+        "market.$": "$.Payload.market",
+        "command_id.$": "$.Payload.command_id",
+        "run_token.$": "$.Payload.run_token"
+      },
+      "ResultPath": "$.weekly_freshness_spot_result",
+      "Next": "MergeRelaunchedSpotInstanceId"
+    },
+    "MergeRelaunchedSpotInstanceId": {
+      "Type": "Pass",
+      "Comment": "Shallow JsonMerge with the new object second: $.ec2_instance_id is REPLACED, not appended. Every downstream SSM state addresses $.ec2_instance_id, so the replacement box is picked up everywhere at once. Then re-enter the SHARED bootstrap poll loop (InitWeeklyFreshnessSpotBootstrapPollCount) rather than a duplicate one, so a second substrate loss during re-bootstrap is handled by the same WeeklyFreshnessSpotBootstrapLivenessGate that handles the first.",
+      "Parameters": {
+        "merged.$": "States.JsonMerge($, States.StringToJson(States.Format('\\{\"ec2_instance_id\":[\"{}\"]\\}', $.weekly_freshness_spot_result.instance_id)), false)"
+      },
+      "OutputPath": "$.merged",
+      "Next": "InitWeeklyFreshnessSpotBootstrapPollCount"
+    },
+    "ResumeAfterSubstrateRelaunch": {
+      "Type": "Choice",
+      "Comment": "Re-enter the pipeline at the interrupted stage, keyed off the phase label the Extract*SubstrateLostError normalizer already writes to $.error.phase -- the same label that reaches the SNS body, so the recovery path and the failure telemetry cannot drift apart. Each target is the stage's Task state, whose Next is its Init*PollCount state, so the stage's poll counter resets naturally. Every rule IsPresent-guards the path before dereferencing it (config#2275). Default is fail-loud: an unrecognised phase means a stage gained a substrate-lost branch without gaining a resume target, and guessing would silently skip work.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.error.phase",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.error.phase",
+              "StringEquals": "MorningEnrich/SubstrateLost"
+            }
+          ],
+          "Next": "MorningEnrich"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.error.phase",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.error.phase",
+              "StringEquals": "DataPhase1/SubstrateLost"
+            }
+          ],
+          "Next": "DataPhase1"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.error.phase",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.error.phase",
+              "StringEquals": "Backtester/SubstrateLost"
+            }
+          ],
+          "Next": "Backtester"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.error.phase",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.error.phase",
+              "StringEquals": "PredictorBacktest/SubstrateLost"
+            }
+          ],
+          "Next": "PredictorBacktest"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.error.phase",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.error.phase",
+              "StringEquals": "PortfolioOptimizerBacktest/SubstrateLost"
+            }
+          ],
+          "Next": "PortfolioOptimizerBacktest"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.error.phase",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.error.phase",
+              "StringEquals": "EvaluatorDiagnostics/SubstrateLost"
+            }
+          ],
+          "Next": "EvaluatorDiagnostics"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.error.phase",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.error.phase",
+              "StringEquals": "EvaluatorOptimize/SubstrateLost"
+            }
+          ],
+          "Next": "EvaluatorOptimize"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.error.phase",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.error.phase",
+              "StringEquals": "WeeklyFreshnessSpotBootstrap/SubstrateLost"
+            }
+          ],
+          "Next": "CheckShellRun"
+        }
+      ],
+      "Default": "SetSubstrateResumeUnknownPhaseError"
+    },
+    "SetSubstrateResumeUnknownPhaseError": {
+      "Type": "Pass",
+      "Comment": "A relaunched box with no resume target. Unreachable by construction (tests/test_sf_substrate_relaunch_wiring.py derives the phase set from the definition), so reaching it means the definition changed without the wiring test -- fail loud and name that, rather than falling through to a stage and silently skipping the work the lost box never did.",
+      "Parameters": {
+        "phase": "SubstrateRelaunch/UnknownResumePhase",
+        "source": "ResumeAfterSubstrateRelaunch.Default",
+        "detail": "relaunched launcher box has no resume target for this $.error.phase; the stage gained a substrate-lost branch without a resume branch",
+        "prior.$": "$.error"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
     }
   }
 }
