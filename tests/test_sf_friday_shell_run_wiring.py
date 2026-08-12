@@ -671,7 +671,7 @@ class TestStrictSuperset:
         )
         assert nc["Parameters"]["Message"] == (
             "All steps completed successfully. "
-            "View pipeline status: https://console.nousergon.ai/pipeline-status"
+            "View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
         )
         assert nc["Parameters"]["TopicArn.$"] == "$.sns_topic_arn"
         assert nc["ResultPath"] == "$.notify_result"
