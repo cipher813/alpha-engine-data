@@ -282,21 +282,36 @@ def test_no_runtime_pip_install_anywhere_in_definition(states):
 
 
 def test_constituents_drift_step_is_fail_visible(states):
-    # config#2322: commands moved from a static list to a commands.$
-    # States.Array intrinsic (to thread export RUN_DATE for the new
-    # phase-marker-sweep line) — extract_commands() reads through either.
+    # alpha-engine-config-I7047 (2026-08-12): the three inline commands
+    # (transparency sweep, constituents_drift_check, phase_marker_sweep)
+    # moved out of this SF definition into crucible-dashboard
+    # infrastructure/substrate_health_check.sh, invoked here through
+    # krepis.ssm_log_capture (mirrors the 17 other Saturday SF stages) —
+    # the prior inline `trap 'aws s3 cp ... EXIT'` wrapper collapsed under
+    # ASL's States.Array escape semantics (`trap: s3: invalid signal
+    # specification`, rc=127) on every run using it, which is why the
+    # 2026-08-08 scheduled run finished DEGRADED despite every real work
+    # stage succeeding. The "drift check must not swallow its own exit
+    # code with `|| true`" invariant this test used to pin now lives in
+    # crucible-dashboard's own test suite
+    # (tests/test_substrate_health_check_weekly_wiring.py), since the
+    # command itself is no longer visible in this repo's SF JSON. What
+    # THIS repo can still pin: no runtime `pip install` (unchanged
+    # invariant, config#2276) and that the SF invokes the extracted
+    # script through the krepis wrapper rather than any inline command.
     cmds = extract_commands(states["WeeklySubstrateHealthCheck"])
-    (drift_line,) = [c for c in cmds if "constituents_drift_check" in c]
-    assert "|| true" not in drift_line, (
-        "config#2276: the drift check exits 1 on alert-worthy drift (the "
-        "2026-05-23 BNY/P/SN incident surface) — '|| true' swallowed exactly "
-        "that signal; under set -eo pipefail its failure must fail the "
-        "command so the poll Choice degrades the completion email"
+    assert cmds[0] == "set -eo pipefail"
+    assert not any("pip install" in c for c in cmds)
+    assert not any("trap 'aws s3 cp" in c for c in cmds), (
+        "I7047: the inline trap/log-ship anti-pattern must not return to "
+        "this state — krepis.ssm_log_capture is the sole log-capture path"
     )
-    # the log-upload trap's own '|| true' is fine (best-effort log shipping,
-    # inline-commented failure mode) — pin that the drift WORK line is the
-    # only place we assert on.
-    assert cmds[0].startswith("set -eo pipefail")
+    wrapper_line = next(
+        c for c in cmds if "krepis.ssm_log_capture" in c
+    )
+    assert "--slug substrate-health-check" in wrapper_line
+    assert "bash infrastructure/substrate_health_check.sh --run-date" in wrapper_line
+    assert "$$.Execution.Name" in wrapper_line or "correlation-id" in wrapper_line
 
 
 # ---------------------------------------------------------------------------
