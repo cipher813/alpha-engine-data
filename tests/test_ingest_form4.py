@@ -15,7 +15,7 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from unittest.mock import MagicMock
 
@@ -403,6 +403,16 @@ class TestS3ParquetWriter:
 # ── Orchestrator (discovery → download → parse → write) ───────────────
 
 
+# config#6923: the discovery path filters by `lookback_days` counted from
+# TODAY, so a fixture pinned to a literal ages out of the window and these
+# tests start failing with `assert 0 == 1` — no code change, on whoever's PR
+# runs CI that day. That is exactly what happened on 2026-08-11: the old
+# `date(2026, 5, 13)` fixtures turned 91 days old against `lookback_days=90`.
+# Anchored to now, comfortably inside the window the tests pass explicitly.
+_DISCOVERY_LOOKBACK_DAYS = 90
+_FILED = date.today() - timedelta(days=30)
+
+
 class TestIngestForTickers:
     def _make_http_mock(self, *, form4_list, xml_by_url):
         """Build a MagicMock http object that responds to:
@@ -464,7 +474,7 @@ class TestIngestForTickers:
             {
                 "form_type": "4",
                 "accession_number": "0000320193-26-000001",
-                "filed_date": date(2026, 5, 13),
+                "filed_date": _FILED,
                 "primary": "form4.xml",
             },
         ]
@@ -507,7 +517,7 @@ class TestIngestForTickers:
             {
                 "form_type": "4",
                 "accession_number": "0000320193-26-100002",
-                "filed_date": date(2026, 5, 13),
+                "filed_date": _FILED,
                 "primary": "form4.xml",
             },
         ]
@@ -533,7 +543,7 @@ class TestIngestForTickers:
         form4_list = [{
             "form_type": "4",
             "accession_number": "abc",
-            "filed_date": date(2026, 5, 13),
+            "filed_date": _FILED,
             "primary": "form4.xml",
         }]
         http = self._make_http_mock(
@@ -561,13 +571,13 @@ class TestIngestForTickers:
             {
                 "form_type": "4",
                 "accession_number": "a",
-                "filed_date": date(2026, 5, 13),
+                "filed_date": _FILED,
                 "primary": "form4.xml",
             },
             {
                 "form_type": "4",
                 "accession_number": "b",
-                "filed_date": date(2026, 5, 13),
+                "filed_date": _FILED,
                 "primary": "missing.xml",  # 404
             },
         ]
@@ -600,3 +610,19 @@ def test_schema_version_on_every_row():
         accession_number="x", filed_date=date(2026, 5, 13),
     )
     assert all(t.schema_version == SCHEMA_VERSION for t in txs)
+
+
+def test_discovery_fixtures_stay_inside_the_lookback_window():
+    """config#6923: the guard that keeps the fixtures above from ageing out.
+
+    `ingest_for_tickers(lookback_days=...)` filters relative to TODAY, so a
+    literal fixture date is a time bomb with a knowable fuse. On 2026-08-11 the
+    previous `date(2026, 5, 13)` fixtures turned 91 days old against a 90-day
+    window and four tests began failing with `assert 0 == 1`, presenting as a
+    discovery bug that did not exist.
+    """
+    age = (date.today() - _FILED).days
+    assert 0 < age < _DISCOVERY_LOOKBACK_DAYS, (
+        f"_FILED is {age}d old, outside the {_DISCOVERY_LOOKBACK_DAYS}d window "
+        f"these tests pass to ingest_for_tickers"
+    )
