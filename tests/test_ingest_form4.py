@@ -23,6 +23,7 @@ import pandas as pd
 import pytest
 
 from rag.pipelines import _cik_lookup
+from rag.pipelines import ingest_form4 as _ingest_form4_mod
 from rag.pipelines.ingest_form4 import (
     DEFAULT_S3_PREFIX,
     SCHEMA_VERSION,
@@ -42,11 +43,21 @@ def _isolate_cik_file_cache(tmp_path, monkeypatch):
     cache (see ``_cik_lookup.load_cik_map``) when the in-memory
     ``_CIK_CACHE`` is cold. Point every test at a per-test tmp path so
     tests never read/write the real cache file or leak state between
-    runs — this file's tests monkeypatch ``_CIK_CACHE = {}`` specifically
-    to force a fresh fetch through the mocked ``http``, which requires
-    the file cache to also be cold.
+    runs.
+
+    Clears the in-memory ``_CIK_CACHE`` centrally so individual
+    ``TestIngestForTickers`` tests don't each need their own
+    ``monkeypatch.setattr(..., "_CIK_CACHE", {})`` call — the
+    isolations compose rather than competing for the same monkeypatch
+    state (fix for a latent test-ordering sensitivity surfaced
+    2026-08-12 where the CIK lookup ignored the mock HTTP and returned
+    zero filings).
     """
     monkeypatch.setattr(_cik_lookup, "DEFAULT_CACHE_PATH", str(tmp_path / "cik_cache.json"))
+    # Also isolate the in-memory CIK cache from other test modules, so
+    # _get_cik always consults the mock HTTP (via load_cik_map) instead
+    # of finding a pre-populated cache from a prior test.
+    monkeypatch.setattr(_ingest_form4_mod, "_CIK_CACHE", {})
 
 
 # ── In-memory S3 mock (reused pattern from PR A.2 tests) ───────────────
@@ -451,12 +462,9 @@ class TestIngestForTickers:
         return http
 
     def test_end_to_end_writes_parquet_per_filed_date(self, monkeypatch):
-        # Clear CIK cache so http mock is consulted
-        from rag.pipelines import ingest_form4
-        monkeypatch.setattr(ingest_form4, "_CIK_CACHE", {})
         # Disable rate-limit sleeps
         monkeypatch.setattr(
-            ingest_form4, "_INTER_REQUEST_SLEEP_SECONDS", 0,
+            _ingest_form4_mod, "_INTER_REQUEST_SLEEP_SECONDS", 0,
         )
 
         s3 = _InMemoryS3()
@@ -490,10 +498,8 @@ class TestIngestForTickers:
                 "data/insider_transactions/latest.json") in s3.store
 
     def test_non_form4_filings_skipped_in_discovery(self, monkeypatch):
-        from rag.pipelines import ingest_form4
-        monkeypatch.setattr(ingest_form4, "_CIK_CACHE", {})
         monkeypatch.setattr(
-            ingest_form4, "_INTER_REQUEST_SLEEP_SECONDS", 0,
+            _ingest_form4_mod, "_INTER_REQUEST_SLEEP_SECONDS", 0,
         )
 
         # Discovery payload has a mix of forms — only the "4" should be kept
@@ -523,10 +529,8 @@ class TestIngestForTickers:
         assert stats["n_transactions_parsed"] == 1
 
     def test_dry_run_skips_s3_writes(self, monkeypatch):
-        from rag.pipelines import ingest_form4
-        monkeypatch.setattr(ingest_form4, "_CIK_CACHE", {})
         monkeypatch.setattr(
-            ingest_form4, "_INTER_REQUEST_SLEEP_SECONDS", 0,
+            _ingest_form4_mod, "_INTER_REQUEST_SLEEP_SECONDS", 0,
         )
 
         s3 = _InMemoryS3()
@@ -550,10 +554,8 @@ class TestIngestForTickers:
         assert len(s3.store) == 0
 
     def test_download_failure_isolated_per_filing(self, monkeypatch):
-        from rag.pipelines import ingest_form4
-        monkeypatch.setattr(ingest_form4, "_CIK_CACHE", {})
         monkeypatch.setattr(
-            ingest_form4, "_INTER_REQUEST_SLEEP_SECONDS", 0,
+            _ingest_form4_mod, "_INTER_REQUEST_SLEEP_SECONDS", 0,
         )
 
         # 2 filings; one's primary doc is missing from xml_by_url → 404
