@@ -1057,6 +1057,28 @@
         "stage_error.$": "$.daemon_error"
       },
       "ResultPath": "$.degraded_summary",
+      "Next": "PublishDaemonFailureImmediate"
+    },
+    "PublishDaemonFailureImmediate": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I6903: best-effort SNS alert that the daemon restart failed. sf-pipeline-policy.md \u00a75 names this fail-open explicitly \u2014 'the daemon systemd restart must not abort the trading chain (the boot trigger is the daemon's backup); both set the degraded flag \u00a72.3 requires AND page immediately' \u2014 and the second half was never built. Without it the only signal is the terminal, which on a run that degrades early is up to an hour later. That the boot trigger is a backup is the reason this fails OPEN; it is not a reason to stay quiet, because a backup that also failed is exactly what an operator needs to hear about before the open. Catch mirrors the sibling publishes: an SNS failure must not hard-fail a pipeline that deliberately continued.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekday Daemon Restart \u2014 FAILED (fail-open, systemd boot trigger is the backup)",
+        "Message.$": "States.Format('The RunDaemon systemd restart failed; the pipeline continued on the assumption that the boot trigger starts the daemon instead. VERIFY the daemon is running before the open \u2014 if the boot trigger also missed, the book is unmanaged. Detail: {}', States.JsonToString($.daemon_error))"
+      },
+      "ResultPath": "$.daemon_failure_notify",
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "CheckDegradedOutcome"
+        }
+      ],
       "Next": "CheckDegradedOutcome"
     },
     "CheckDegradedOutcome": {
@@ -1230,6 +1252,28 @@
         "stage_error.$": "$.scanner_error"
       },
       "ResultPath": "$.degraded_summary",
+      "Next": "PublishScannerFailureImmediate"
+    },
+    "PublishScannerFailureImmediate": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I6903: best-effort SNS alert that the Scanner failed \u2014 surfaces the miss at the MOMENT it happens, WITHOUT blocking the trading chain. The Scanner fail-open was the only one of the five degraded paths in this definition with no Publish state, so on 2026-08-11 there were 37 minutes of silence between the second Scanner timeout (05:32 PT) and the terminal (06:09 PT) \u2014 inside the window where an operator could still have rerun it before the 06:30 open. sf-pipeline-policy.md \u00a75 requires weekday fail-opens to set the degraded flag AND page immediately; this is the missing half. Mirrors PublishDataSpotFailureImmediate exactly, including the Catch: an SNS failure must not hard-fail a pipeline that deliberately continued.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekday Scanner \u2014 FAILED (fail-open, pipeline continues)",
+        "Message.$": "States.Format('Weekday Scanner failed but the pipeline continued to predictor inference and daemon start (fail-open, config#6722). Today candidates may be stale and the universe board, membership and leaderboard were not written \u2014 the optimizer runs without per-name ADV (config-I6902). Detail: {}', States.JsonToString($.scanner_error))"
+      },
+      "ResultPath": "$.scanner_failure_notify",
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "CheckSkipPredictorInference"
+        }
+      ],
       "Next": "CheckSkipPredictorInference"
     },
     "CheckSkipPredictorInference": {
