@@ -7670,7 +7670,7 @@
     },
     "WriteCompletionMarkerDegraded": {
       "Type": "Task",
-      "Comment": "alpha-engine-config-I6891, the DEGRADED twin of WriteCompletionMarker (shape mirrored from step_function_daily.json per the shared-code rule). Writes the SAME key as the clean marker with status DEGRADED and the full $.degraded_summary embedded, so a marker reader (pipeline-watchdog, sf-telegram-notifier, weekly_sf_recovery_metric) can tell a run that really worked from one that only ended. Deliberately EXCLUDES the Friday-PM preflight paths for the same reason WriteCompletionMarker does. No swallow-all Catch, same as the clean twin: a marker that cannot be written means this execution's own completion is unverifiable, which is the ambiguity the feature exists to surface rather than mask.",
+      "Comment": "alpha-engine-config-I6891, the DEGRADED twin of WriteCompletionMarker (shape mirrored from step_function_daily.json per the shared-code rule). Writes the SAME key as the clean marker with status DEGRADED and the full $.degraded_summary embedded, so a marker reader (pipeline-watchdog, sf-telegram-notifier, weekly_sf_recovery_metric) can tell a run that really worked from one that only ended. Deliberately EXCLUDES the Friday-PM preflight paths for the same reason WriteCompletionMarker does. No swallow-all Catch, same as the clean twin: a marker that cannot be written means this execution's own completion is unverifiable, which is the ambiguity the feature exists to surface rather than mask. ResultPath is LOAD-BEARING, not hygiene (alpha-engine-config-I6891): a Task with no ResultPath defaults to $, so the putObject result REPLACES the whole state input and the DegradedRun terminal's CausePath dereference of $.degraded_summary.reason cannot resolve. The execution then fails with States.Runtime instead of DegradedRun \u2014 and Error: DegradedRun is a consumer contract: sf-telegram-notifier's _is_degraded_run() keys its DEGRADED rendering off exactly that string, so every honestly-degraded run rendered as an ordinary crash-red FAILED with a truncated cause. Shipped in both weekday definitions since config#6692/#6722; the weekly one inherited it by mirroring them and it is fixed in all three here.",
       "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
       "Parameters": {
         "Bucket": "alpha-engine-research",
@@ -7678,6 +7678,7 @@
         "ContentType": "application/json",
         "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"degraded_summary\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, States.JsonToString($.degraded_summary))"
       },
+      "ResultPath": "$.degraded_marker_result",
       "TimeoutSeconds": 60,
       "Retry": [
         {

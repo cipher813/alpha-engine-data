@@ -214,3 +214,64 @@ def test_the_cause_expression_escapes_correctly_for_asl(definition: str) -> None
             f"{definition}::{name} has an apostrophe inside the States.Format literal — "
             "it will truncate the string and fail ASL validation"
         )
+
+
+# ---------------------------------------------------------------------------
+# The terminal can only name a cause that is still THERE when it runs.
+# ---------------------------------------------------------------------------
+
+
+def _paths_dereferenced(cause_path: str) -> set[str]:
+    """Top-level state-data keys a `CausePath` expression reads."""
+    import re
+
+    return {m for m in re.findall(r"\$\.([A-Za-z_][A-Za-z0-9_]*)", cause_path)}
+
+
+@pytest.mark.parametrize("definition", _ALL_DEFS)
+def test_no_state_clobbers_the_summary_on_the_way_to_the_terminal(definition: str) -> None:
+    """A `Task` with no `ResultPath` REPLACES the state input with its result.
+
+    This is the defect the whole `CausePath` design rests on not having, and
+    all three definitions shipped with it. `WriteCompletionMarkerDegraded` is
+    an `s3:putObject` Task routing straight into `DegradedRun`; with the
+    default `ResultPath` of `$`, the putObject result replaces the state data,
+    so the terminal's `$.degraded_summary.reason` dereference cannot resolve
+    and the execution fails with `States.Runtime` instead.
+
+    `Error: DegradedRun` is a consumer contract — `sf-telegram-notifier`'s
+    `_is_degraded_run()` matches that exact string to render DEGRADED rather
+    than a crash-red FAILED — so the visible symptom is not a broken message.
+    It is that a run which degraded honestly is reported as one that crashed,
+    which is the same collapse §2.3 exists to prevent, arriving one state after
+    everything §2.3 asked for was done correctly.
+
+    Measured 2026-08-12 by static analysis of the three definitions;
+    `states:ListExecutions` is denied to the laptop identity, so this is
+    asserted structurally rather than confirmed against a live execution.
+    """
+    states = _load(definition)["States"]
+    terminals = _degraded_terminals(states)
+    if not terminals:
+        pytest.skip(f"{definition} has no DegradedRun terminal")
+
+    for terminal_name, terminal in terminals.items():
+        needed = _paths_dereferenced(terminal["CausePath"])
+        for name, body in states.items():
+            if body.get("Next") != terminal_name:
+                continue
+            if body.get("Type") != "Task":
+                continue  # a Pass/Choice with no ResultPath still carries its input through
+            result_path = body.get("ResultPath")
+            assert result_path is not None, (
+                f"{definition}::{name} routes to {terminal_name} and declares no "
+                f"ResultPath, so its result replaces the state input and the "
+                f"terminal's dereference of {sorted(needed)} throws States.Runtime. "
+                "Give it an explicit ResultPath naming a field the terminal does "
+                "not read."
+            )
+            assert result_path != "$", f"{definition}::{name} ResultPath $ is the same clobber"
+            assert result_path.lstrip("$.").split(".")[0] not in needed, (
+                f"{definition}::{name} writes its result over {result_path}, which "
+                f"the {terminal_name} terminal reads"
+            )

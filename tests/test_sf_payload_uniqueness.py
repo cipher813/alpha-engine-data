@@ -460,6 +460,13 @@ class TestEODSFTopLevelFieldsClosed:
     _EXPECTED_EOD_TOP_LEVEL_FIELDS: frozenset[str] = frozenset(
         {
             # Intermediate ResultPath outputs
+            # alpha-engine-config-I6891: WriteCompletionMarkerDegraded's
+            # putObject result. It needs a ResultPath at all because the
+            # default is $, which replaces the state input — so the
+            # DegradedRun terminal's $.degraded_summary.reason dereference
+            # could not resolve and the run failed States.Runtime instead of
+            # DegradedRun. Named to be read by nothing.
+            "degraded_marker_result",
             "ec2_instance_id",
             "eod_poll",
             "eod_result",
