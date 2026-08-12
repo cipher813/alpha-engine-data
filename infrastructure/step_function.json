@@ -350,7 +350,7 @@
       "Comment": "config#2278: the lib-pin gate could not CHECK (Lambda failure after both retry tiers, or a payload without has_drift). Still fail-open \u2014 availability over gating for a weekly pipeline \u2014 but VISIBLE and rarer: gate_degraded=true threads into the completion email via CheckGateDegradedNotify, and PublishLibPinGateDegraded alerts NOW (mirroring WeeklyRunDayGateFailed's fail-open+alert shape). Proceeds into PipelineContractCheck so a lib-pin-gate infra flake no longer silently skips the SIBLING gate too.",
       "Result": true,
       "ResultPath": "$.gate_degraded",
-      "Next": "PublishLibPinGateDegraded"
+      "Next": "SetLibPinGateDegradedSummary"
     },
     "PublishLibPinGateDegraded": {
       "Type": "Task",
@@ -379,7 +379,7 @@
       "Comment": "config#2278: the pipeline-contract gate could not CHECK (Lambda failure after both retry tiers, or a payload without has_violation). Fail-open, visibly: gate_degraded=true + SNS alert, then proceed to CheckMutexRole. Mirrors LibPinGateDegraded exactly.",
       "Result": true,
       "ResultPath": "$.gate_degraded",
-      "Next": "PublishPipelineContractGateDegraded"
+      "Next": "SetPipelineContractGateDegradedSummary"
     },
     "PublishPipelineContractGateDegraded": {
       "Type": "Task",
@@ -591,7 +591,7 @@
       "Comment": "alpha-engine-config#6722: the mutex-acquire infra-error Catch (DynamoDB outage / IAM drift / transient SDK error \u2014 NOT the ConditionalCheckFailedException conflict case, which the separate MutexConflict Fail already handles) previously proceeded to CheckSpotDispatchNeeded with zero visibility. Mirrors LibPinGateDegraded's shape exactly: gate_degraded=true threads into the completion email via CheckGateDegradedNotify, and PublishMutexAcquireDegraded alerts NOW.",
       "Result": true,
       "ResultPath": "$.gate_degraded",
-      "Next": "PublishMutexAcquireDegraded"
+      "Next": "SetMutexAcquireDegradedFlagSummary"
     },
     "PublishMutexAcquireDegraded": {
       "Type": "Task",
@@ -3726,7 +3726,7 @@
       "Comment": "THE VISIBLE RESEARCH/PREDICTOR DEGRADED FLAG (alpha-engine-config#6722). The SOLE writer of $.research_predictor_degraded (pinned by tests/test_sf_research_predictor_degraded_wiring.py). weekly-sf-policy.md \u00a72.3 honest-degradation: the run CONTINUES to CheckSkipBacktester -> Backtester/Parity/Evaluator \u2014 none of the folded ResearchPredictorParallel substeps are load-bearing preconditions for those downstream stages.",
       "Result": true,
       "ResultPath": "$.research_predictor_degraded",
-      "Next": "CheckSkipBacktester"
+      "Next": "SetResearchPredictorDegradedSummary"
     },
     "ExtractParallelBranchError": {
       "Type": "Pass",
@@ -5172,7 +5172,7 @@
       "Comment": "Fail-open marker for the compare stage itself (alpha-engine-config#6030) \u2014 SSM timeout/crash, send/poll infra failure, or poll-budget exhaustion. Sets the SAME $.parity_degraded flag family as ParityDegraded (the second and last legal writer \u2014 pinned by tests/test_sf_parity_degraded_wiring.py): no pit_parity.json verdict was produced for this run, and absence of a verdict must never render as a clean pass (\u00a72.3a; the ARTIFACT_REGISTRY freshness-monitor SLA also alarms on the missing artifact). The run CONTINUES to Evaluator \u2014 no downstream SF stage consumes parity artifacts (verified dependency audit, alpha-engine-config-I6025).",
       "Result": true,
       "ResultPath": "$.parity_degraded",
-      "Next": "PublishParityCompareDegraded"
+      "Next": "SetParityCompareDegradedSummary"
     },
     "PublishParityCompareDegraded": {
       "Type": "Task",
@@ -5717,7 +5717,7 @@
       "Comment": "config#2276: the freshness health check could not run to Success (send/poll infra failure via Catch, or terminal non-Success command status via CheckSaturdayHealthCheckStatus.Default). Mirrors the LibPinGateDegraded shape (config#2278): an SF-controlled boolean that threads into the completion-email selection (CheckGateDegradedNotify) so the run emails 'SUCCESS (health checks DEGRADED)' instead of the plain real-run SUCCESS. Specifics live on the execution record: $.health_check_error (Catch path) / $.health_check_poll (status path). Continues to the sibling substrate check \u2014 a degraded freshness check must not skip the independent substrate/ReportCard/Director tail.",
       "Result": true,
       "ResultPath": "$.health_check_degraded",
-      "Next": "WeeklySubstrateHealthCheck"
+      "Next": "SetSaturdayHealthCheckDegradedSummary"
     },
     "WeeklySubstrateHealthCheck": {
       "Type": "Task",
@@ -5845,7 +5845,7 @@
       "Comment": "config#2276: the substrate health check (or its constituents-drift sub-step) could not run to Success. Mirrors SaturdayHealthCheckDegraded / the LibPinGateDegraded shape (config#2278) \u2014 SF-controlled boolean into the completion-email selection. Shares $.health_check_degraded with the freshness twin DELIBERATELY (one flag family, one degraded Subject \u2014 which check degraded lives on the execution record: $.substrate_check_error / $.substrate_check_poll vs $.health_check_error / $.health_check_poll \u2014 avoiding a per-check combinatorial notifier explosion). Continues to ReportCard: the advisory Lambda tail is independent of the dashboard box and must not be skipped because an EC2 health command failed.",
       "Result": true,
       "ResultPath": "$.health_check_degraded",
-      "Next": "CheckSkipReportCard"
+      "Next": "SetSubstrateHealthCheckDegradedSummary"
     },
     "ReportCard": {
       "Type": "Task",
@@ -5889,7 +5889,7 @@
       "Comment": "config#6685: ReportCard's Catch(States.ALL) could not run advisory grading \u2014 set report_card_degraded=true (SF-controlled boolean, IsPresent-guarded per config#2275) so it threads into the completion-email selection (CheckGateDegradedNotify) same as $.gate_degraded / $.health_check_degraded. Mirrors LibPinGateDegraded / SaturdayHealthCheckDegraded shape exactly. Proceeds to PublishReportCardDegraded (the immediate PAGE alert, config#2302) unchanged.",
       "Result": true,
       "ResultPath": "$.report_card_degraded",
-      "Next": "PublishReportCardDegraded"
+      "Next": "SetReportCardDegradedSummary"
     },
     "PublishReportCardDegraded": {
       "Type": "Task",
@@ -6187,7 +6187,7 @@
           "Next": "NotifyCompleteDegraded"
         }
       ],
-      "Next": "WriteCompletionMarker"
+      "Next": "CheckDegradedOutcome"
     },
     "NotifyCompleteHealthDegraded": {
       "Type": "Task",
@@ -6209,7 +6209,7 @@
           "Next": "NotifyCompleteDegraded"
         }
       ],
-      "Next": "WriteCompletionMarker"
+      "Next": "CheckDegradedOutcome"
     },
     "NotifyCompleteGatesAndHealthDegraded": {
       "Type": "Task",
@@ -6231,7 +6231,7 @@
           "Next": "NotifyCompleteDegraded"
         }
       ],
-      "Next": "WriteCompletionMarker"
+      "Next": "CheckDegradedOutcome"
     },
     "NotifyCompleteReportCardDegraded": {
       "Type": "Task",
@@ -6253,7 +6253,7 @@
           "Next": "NotifyCompleteDegraded"
         }
       ],
-      "Next": "WriteCompletionMarker"
+      "Next": "CheckDegradedOutcome"
     },
     "NotifyCompleteMultipleDegraded": {
       "Type": "Task",
@@ -6275,7 +6275,7 @@
           "Next": "NotifyCompleteDegraded"
         }
       ],
-      "Next": "WriteCompletionMarker"
+      "Next": "CheckDegradedOutcome"
     },
     "NotifyCompleteParityDegraded": {
       "Type": "Task",
@@ -6297,7 +6297,7 @@
           "Next": "NotifyCompleteDegraded"
         }
       ],
-      "Next": "WriteCompletionMarker"
+      "Next": "CheckDegradedOutcome"
     },
     "WriteCompletionMarker": {
       "Type": "Task",
@@ -6342,18 +6342,19 @@
           "Next": "NotifyShellRunCompleteDegraded"
         }
       ],
-      "End": true
+      "Next": "CheckShellRunDegradedOutcome"
     },
     "NotifyShellRunCompleteDegraded": {
       "Type": "Pass",
-      "Comment": "config#1819 \u2014 records the caught publish failure as execution DATA ($.notify_degraded, visible via GetExecutionHistory / the SF console) so an operator inspecting a degraded-but-SUCCEEDED execution can see why. NOT itself a CloudWatch alarm source: PassStateExited only logs at LoggingConfiguration Level:ALL, and this SF (like the other CFN-managed SFs) deliberately runs Level:ERROR for log volume/cost \u2014 see WeeklyFreshnessLogGroup comment. The real-time alarm signal for this failure class is the TaskFailed event from NotifyShellRunComplete's own Catch (logged at ERROR unconditionally) matched by SnsPublishFailedMetricFilter.",
+      "Comment": "config#1819 \u2014 records the caught publish failure as execution DATA ($.notify_degraded, visible via GetExecutionHistory / the SF console) so an operator inspecting a degraded-but-SUCCEEDED execution can see why. NOT itself a CloudWatch alarm source: PassStateExited only logs at LoggingConfiguration Level:ALL, and this SF (like the other CFN-managed SFs) deliberately runs Level:ERROR for log volume/cost \u2014 see WeeklyFreshnessLogGroup comment. The real-time alarm signal for this failure class is the TaskFailed event from NotifyShellRunComplete's own Catch (logged at ERROR unconditionally) matched by SnsPublishFailedMetricFilter. alpha-engine-config-I6891: this state carried End: true \u2014 a Friday-PM preflight whose completion notification failed terminated SUCCEEDED while flagged degraded, the exact shape the Option-A ruling forbids. Now routes to the shared DegradedRun terminal. It deliberately does NOT pass through WriteCompletionMarkerDegraded: the preflight dry-pass is not a weekly completion, and marking it would let a dry run satisfy the weekly SLA \u2014 the same exclusion WriteCompletionMarker already states.",
       "Parameters": {
         "degraded": true,
-        "source": "NotifyShellRunComplete",
-        "error.$": "$.notify_error"
+        "reason": "weekly_preflight_notify_fail_open",
+        "run_date.$": "$.run_date",
+        "stage_error.$": "$.notify_error"
       },
-      "ResultPath": "$.notify_degraded",
-      "End": true
+      "ResultPath": "$.degraded_summary",
+      "Next": "DegradedRun"
     },
     "NotifyComplete": {
       "Type": "Task",
@@ -6375,18 +6376,19 @@
           "Next": "NotifyCompleteDegraded"
         }
       ],
-      "Next": "WriteCompletionMarker"
+      "Next": "CheckDegradedOutcome"
     },
     "NotifyCompleteDegraded": {
       "Type": "Pass",
-      "Comment": "config#1819 \u2014 records the caught publish failure as execution DATA ($.notify_degraded, visible via GetExecutionHistory / the SF console) so an operator inspecting a degraded-but-SUCCEEDED execution can see why. NOT itself a CloudWatch alarm source: PassStateExited only logs at LoggingConfiguration Level:ALL, and this SF (like the other CFN-managed SFs) deliberately runs Level:ERROR for log volume/cost \u2014 see WeeklyFreshnessLogGroup comment. The real-time alarm signal for this failure class is the TaskFailed event from NotifyComplete's own Catch (logged at ERROR unconditionally) matched by SnsPublishFailedMetricFilter.",
+      "Comment": "config#1819 \u2014 records the caught publish failure as execution DATA ($.notify_degraded, visible via GetExecutionHistory / the SF console) so an operator inspecting a degraded-but-SUCCEEDED execution can see why. NOT itself a CloudWatch alarm source: PassStateExited only logs at LoggingConfiguration Level:ALL, and this SF (like the other CFN-managed SFs) deliberately runs Level:ERROR for log volume/cost \u2014 see WeeklyFreshnessLogGroup comment. The real-time alarm signal for this failure class is the TaskFailed event from NotifyComplete's own Catch (logged at ERROR unconditionally) matched by SnsPublishFailedMetricFilter. alpha-engine-config-I6891: rewritten from ResultPath $.notify_degraded / field `source` to the fleet-wide $.degraded_summary / `reason` shape every other definition uses, so one consumer reads all three. A completion notification that could not publish is a DEGRADED run, not a clean one: nobody was told the run finished, which is precisely the condition the status-keyed watchers exist to cover. It still does not fail the pipeline mid-flight \u2014 the fail-open continuation is unchanged, only the honesty of the terminal.",
       "Parameters": {
         "degraded": true,
-        "source": "NotifyComplete",
-        "error.$": "$.notify_error"
+        "reason": "weekly_completion_notify_fail_open",
+        "run_date.$": "$.run_date",
+        "stage_error.$": "$.notify_error"
       },
-      "ResultPath": "$.notify_degraded",
-      "Next": "WriteCompletionMarker"
+      "ResultPath": "$.degraded_summary",
+      "Next": "CheckDegradedOutcome"
     },
     "ExtractMorningEnrichError": {
       "Type": "Pass",
@@ -6448,7 +6450,7 @@
       "Comment": "THE VISIBLE PARITY DEGRADED FLAG (alpha-engine-config-I6025, restructured by alpha-engine-config#6030). Reached when ANY parity branch recorded DEGRADED (CheckParityBranchOutcomes) or the ParityParallel hit a genuine SF-engine error (its backstop Catch). An SF-controlled flag that (a) pages distinctly via PublishParityDegraded and (b) lands on the execution record ($.parity_degraded=true, per-branch specifics at $.parity_branch_outcomes and the per-branch $.*_poll/$.*_error paths) so a pipeline-status reader can tell 'parity measured clean' from 'parity not fully measured'. One of exactly TWO legal writers of $.parity_degraded (the other: ParityCompareDegraded) \u2014 pinned by tests/test_sf_parity_degraded_wiring.py. weekly-sf-policy \u00a72.3 honest-degradation: the run CONTINUES \u2014 to the PitParityCompare join (which emits verdict UNKNOWN for missing pass artifacts, \u00a72.3a), then Evaluator/ReportCard/Director.",
       "Result": true,
       "ResultPath": "$.parity_degraded",
-      "Next": "PublishParityDegraded"
+      "Next": "SetParityDegradedSummary"
     },
     "PublishParityDegraded": {
       "Type": "Task",
@@ -6645,7 +6647,7 @@
       "Comment": "The evaluator Lambda-SHA gate could not CHECK (Lambda failure after retries, or a payload without has_drift). Fail-open \u2014 availability over gating for a weekly pipeline \u2014 but VISIBLE: gate_degraded=true threads into the completion email, and PublishEvaluatorGateDegraded alerts NOW. Mirrors LibPinGateDegraded/PipelineContractGateDegraded.",
       "Result": true,
       "ResultPath": "$.gate_degraded",
-      "Next": "PublishEvaluatorGateDegraded"
+      "Next": "SetEvaluatorGateDegradedSummary"
     },
     "PublishEvaluatorGateDegraded": {
       "Type": "Task",
@@ -6759,7 +6761,7 @@
       "Comment": "The director Lambda's drift gate could not CHECK. Fail-open + VISIBLE, mirrors EvaluatorGateDegraded.",
       "Result": true,
       "ResultPath": "$.gate_degraded",
-      "Next": "PublishEvaluatorDirectorGateDegraded"
+      "Next": "SetEvaluatorDirectorGateDegradedSummary"
     },
     "PublishEvaluatorDirectorGateDegraded": {
       "Type": "Task",
@@ -7500,6 +7502,200 @@
       },
       "ResultPath": "$.error",
       "Next": "NormalizeFailureContext"
+    },
+    "SetLibPinGateDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state PublishLibPinGateDegraded routed to before. Split from LibPinGateDegraded because a Pass has exactly one ResultPath and LibPinGateDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_lib_pin_gate_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishLibPinGateDegraded"
+    },
+    "SetPipelineContractGateDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state PublishPipelineContractGateDegraded routed to before. Split from PipelineContractGateDegraded because a Pass has exactly one ResultPath and PipelineContractGateDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_pipeline_contract_gate_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishPipelineContractGateDegraded"
+    },
+    "SetMutexAcquireDegradedFlagSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state PublishMutexAcquireDegraded routed to before. Split from SetMutexAcquireDegradedFlag because a Pass has exactly one ResultPath and SetMutexAcquireDegradedFlag's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_mutex_acquire_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishMutexAcquireDegraded"
+    },
+    "SetEvaluatorGateDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state PublishEvaluatorGateDegraded routed to before. Split from EvaluatorGateDegraded because a Pass has exactly one ResultPath and EvaluatorGateDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_evaluator_deploy_drift_gate_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishEvaluatorGateDegraded"
+    },
+    "SetEvaluatorDirectorGateDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state PublishEvaluatorDirectorGateDegraded routed to before. Split from EvaluatorDirectorGateDegraded because a Pass has exactly one ResultPath and EvaluatorDirectorGateDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_evaluator_director_deploy_drift_gate_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishEvaluatorDirectorGateDegraded"
+    },
+    "SetResearchPredictorDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state CheckSkipBacktester routed to before. Split from SetResearchPredictorDegraded because a Pass has exactly one ResultPath and SetResearchPredictorDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_research_predictor_branch_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "CheckSkipBacktester"
+    },
+    "SetParityDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state PublishParityDegraded routed to before. Split from ParityDegraded because a Pass has exactly one ResultPath and ParityDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_parity_verdict_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishParityDegraded"
+    },
+    "SetParityCompareDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state PublishParityCompareDegraded routed to before. Split from ParityCompareDegraded because a Pass has exactly one ResultPath and ParityCompareDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_pit_parity_compare_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishParityCompareDegraded"
+    },
+    "SetSaturdayHealthCheckDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state WeeklySubstrateHealthCheck routed to before. Split from SaturdayHealthCheckDegraded because a Pass has exactly one ResultPath and SaturdayHealthCheckDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_freshness_health_check_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "WeeklySubstrateHealthCheck"
+    },
+    "SetSubstrateHealthCheckDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state CheckSkipReportCard routed to before. Split from SubstrateHealthCheckDegraded because a Pass has exactly one ResultPath and SubstrateHealthCheckDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_substrate_health_check_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "CheckSkipReportCard"
+    },
+    "SetReportCardDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state PublishReportCardDegraded routed to before. Split from ReportCardDegraded because a Pass has exactly one ResultPath and ReportCardDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_report_card_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishReportCardDegraded"
+    },
+    "CheckDegradedOutcome": {
+      "Type": "Choice",
+      "Comment": "Option-A parity for the weekly pipeline (alpha-engine-config-I6891). The 2026-07-28 Option-A ruling (alpha-engine-config#2699) reached both weekday definitions (#6692, #6722) and never reached this one: every degraded weekly run terminated SUCCEEDED and wrote a completion marker claiming status SUCCEEDED, so a run that did not really work counted as one that did. sf-pipeline-policy.md 2.3: a degraded run writes status DEGRADED and ends in a Fail state so status-keyed watchers engage. This is the single chokepoint every real-completion path now passes through, so a fail-open route added later inherits the honest terminal by writing $.degraded_summary and touching nothing here. $.degraded_summary is only assigned on a degraded path \u2014 a fully green run never sets it \u2014 so the IsPresent guard is load-bearing: an unguarded dereference throws States.Runtime at the last state of an otherwise successful weekly run (the config-I2767 shape, mirrored from step_function_daily.json's CheckDegradedOutcome). Absent flag = never degraded = WriteCompletionMarker via Default, which is the semantically exact reading.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.degraded_summary.degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.degraded_summary.degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "WriteCompletionMarkerDegraded"
+        }
+      ],
+      "Default": "WriteCompletionMarker"
+    },
+    "CheckShellRunDegradedOutcome": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I6891: the Friday-PM preflight twin of CheckDegradedOutcome. The shell-run branch leaves CheckShellRunNotify BEFORE CheckGateDegradedNotify, so a preflight run whose gates, health checks, parity verdict or report card degraded previously ended SUCCEEDED with no honest terminal at all \u2014 the same defect as the real-run path, on the path that exists to prove the real run will work. Same IsPresent guard, same DegradedRun terminal; neither edge writes a completion marker, because a preflight dry-pass is not a weekly completion (see WriteCompletionMarker).",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.degraded_summary.degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.degraded_summary.degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "DegradedRun"
+        }
+      ],
+      "Default": "ShellRunComplete"
+    },
+    "ShellRunComplete": {
+      "Type": "Succeed",
+      "Comment": "alpha-engine-config-I6891: the clean Friday-PM preflight terminal. Byte-equivalent in outcome to the End: true NotifyShellRunComplete previously carried \u2014 a green preflight still ends SUCCEEDED and still writes no completion marker; only the degraded edge changed."
+    },
+    "WriteCompletionMarkerDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I6891, the DEGRADED twin of WriteCompletionMarker (shape mirrored from step_function_daily.json per the shared-code rule). Writes the SAME key as the clean marker with status DEGRADED and the full $.degraded_summary embedded, so a marker reader (pipeline-watchdog, sf-telegram-notifier, weekly_sf_recovery_metric) can tell a run that really worked from one that only ended. Deliberately EXCLUDES the Friday-PM preflight paths for the same reason WriteCompletionMarker does. No swallow-all Catch, same as the clean twin: a marker that cannot be written means this execution's own completion is unverifiable, which is the ambiguity the feature exists to surface rather than mask.",
+      "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+      "Parameters": {
+        "Bucket": "alpha-engine-research",
+        "Key.$": "States.Format('_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.run_date)",
+        "ContentType": "application/json",
+        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"degraded_summary\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, States.JsonToString($.degraded_summary))"
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 3,
+          "IntervalSeconds": 2,
+          "BackoffRate": 2.0,
+          "Comment": "Transient S3 fault coverage \u2014 mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
+        }
+      ],
+      "Next": "DegradedRun"
+    },
+    "DegradedRun": {
+      "Type": "Fail",
+      "Error": "DegradedRun",
+      "CausePath": "States.Format('Weekly freshness pipeline DEGRADED \u2014 reason: {}. Full degraded_summary: {}. Per the 2026-07-28 Option-A ruling (alpha-engine-config#2699), ported to this weekly SF via alpha-engine-config-I6891: a degraded run must FAIL so status-keyed watchers (sf-watch, EventBridge, sf-telegram-notifier) engage with zero new plumbing, and so a run that did not really work stops counting as one that did. The run was never aborted mid-pipeline \u2014 every fail-open continuation is unchanged; only the honesty of the terminal changes.', $.degraded_summary.reason, States.JsonToString($.degraded_summary))"
     }
   }
 }

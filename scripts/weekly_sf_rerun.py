@@ -180,6 +180,20 @@ HISTORICAL_DEGRADED_WITNESS: frozenset[str] = frozenset({
     "PublishDirectorDegraded",
 })
 
+# Degraded-named states that belong to the TERMINAL degraded-completion family
+# rather than to any stage (alpha-engine-config-I6891). Entering one says the
+# run ended degraded — which is the whole execution's verdict, not a signal
+# that some stage must be re-run — so mapping them to a Stage would make every
+# degraded run re-run an arbitrary stage. Same reasoning that already excludes
+# the Notify*Degraded family, extended to the terminal states I6891 added.
+TERMINAL_DEGRADED_FAMILY: frozenset[str] = frozenset({
+    "CheckGateDegradedNotify",
+    "CheckDegradedOutcome",
+    "CheckShellRunDegradedOutcome",
+    "WriteCompletionMarkerDegraded",
+    "DegradedRun",
+})
+
 STAGES: tuple[Stage, ...] = (
     Stage(
         "lib_pin_drift_check", "skip_lib_pin_drift_check",
@@ -195,10 +209,13 @@ STAGES: tuple[Stage, ...] = (
         # (emit_skip=False), but the summary must say "degraded", not
         # "completed", when one was hit.
         degraded_witness=frozenset({
-            "LibPinGateDegraded", "PublishLibPinGateDegraded",
-            "PipelineContractGateDegraded", "PublishPipelineContractGateDegraded",
-            "EvaluatorGateDegraded", "PublishEvaluatorGateDegraded",
-            "EvaluatorDirectorGateDegraded", "PublishEvaluatorDirectorGateDegraded",
+            "LibPinGateDegraded", "SetLibPinGateDegradedSummary", "PublishLibPinGateDegraded",
+            "PipelineContractGateDegraded", "SetPipelineContractGateDegradedSummary",
+            "PublishPipelineContractGateDegraded",
+            "EvaluatorGateDegraded", "SetEvaluatorGateDegradedSummary",
+            "PublishEvaluatorGateDegraded",
+            "EvaluatorDirectorGateDegraded", "SetEvaluatorDirectorGateDegradedSummary",
+            "PublishEvaluatorDirectorGateDegraded",
             # alpha-engine-config#6722: AcquireMutex's mutex-acquire
             # infra-error fail-open (DynamoDB outage/IAM drift/transient SDK
             # error — the SEPARATE ConditionalCheckFailedException conflict
@@ -207,7 +224,8 @@ STAGES: tuple[Stage, ...] = (
             # even though it sits later in the chain (after
             # EvaluatorDeployDriftCheck) — folded into this same bucket
             # rather than a new single-purpose Stage row.
-            "SetMutexAcquireDegradedFlag", "PublishMutexAcquireDegraded",
+            "SetMutexAcquireDegradedFlag", "SetMutexAcquireDegradedFlagSummary",
+            "PublishMutexAcquireDegraded",
         }),
         emit_skip=False,
         note=(
@@ -419,7 +437,9 @@ STAGES: tuple[Stage, ...] = (
         # completed), so a compare-degraded or branch-degraded run never
         # emits skip_parity.
         frozenset({"CheckSkipEvaluator"}),
-        degraded_witness=frozenset({"ParityDegraded", "PublishParityDegraded"}),
+        degraded_witness=frozenset({
+            "ParityDegraded", "SetParityDegradedSummary", "PublishParityDegraded",
+        }),
         emit_skip=False,
         detect_failure=False,
         note=(
@@ -459,7 +479,10 @@ STAGES: tuple[Stage, ...] = (
         "pit_parity_compare", "skip_pit_parity_compare",
         "CheckSkipPitParityCompare", "PitParityCompare",
         frozenset({"PitParityCompareComplete"}),
-        degraded_witness=frozenset({"ParityCompareDegraded", "PublishParityCompareDegraded"}),
+        degraded_witness=frozenset({
+            "ParityCompareDegraded", "SetParityCompareDegradedSummary",
+            "PublishParityCompareDegraded",
+        }),
         note=(
             "the compare join emits verdict UNKNOWN (never pass) when a pass"
             " artifact is missing (§2.3a); skipping it on a rerun is only"
@@ -504,7 +527,8 @@ STAGES: tuple[Stage, ...] = (
         # Health-check degraded routes only (config#2276) — ReportCard's
         # and Director's moved to their own rows below (config#6054).
         degraded_witness=frozenset({
-            "SaturdayHealthCheckDegraded", "SubstrateHealthCheckDegraded",
+            "SaturdayHealthCheckDegraded", "SetSaturdayHealthCheckDegradedSummary",
+            "SubstrateHealthCheckDegraded", "SetSubstrateHealthCheckDegradedSummary",
         }),
         emit_skip=False,
         note=(
@@ -529,7 +553,8 @@ STAGES: tuple[Stage, ...] = (
         # Catch routes to FIRST (sets $.report_card_degraded), then
         # PublishReportCardDegraded — degraded overrides witness (I6055).
         degraded_witness=frozenset({
-            "ReportCardDegraded", "PublishReportCardDegraded",
+            "ReportCardDegraded", "SetReportCardDegradedSummary",
+            "PublishReportCardDegraded",
         }),
     ),
     Stage(

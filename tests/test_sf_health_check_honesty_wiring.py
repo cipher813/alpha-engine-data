@@ -40,6 +40,10 @@ import pathlib
 import pytest
 
 from tests.sf_command_utils import extract_commands
+from tests.sf_degraded_summary_helpers import (
+    assert_completion_notifier_chain,
+    assert_degraded_continuation,
+)
 
 _WEEKLY = pathlib.Path(__file__).parent.parent / "infrastructure" / "step_function.json"
 
@@ -94,7 +98,7 @@ def test_send_and_wait_catches_route_through_degraded_pass(
     # Fail-soft: degrade then PROCEED with the rest of the tail — the two
     # checks are independent, and ReportCard/Director are Lambdas that must
     # not be skipped because an EC2 health command failed.
-    assert degraded_state["Next"] == proceed
+    assert_degraded_continuation(states, degraded, proceed)
 
 
 def test_only_health_degraded_passes_set_health_check_degraded(states):
@@ -241,7 +245,7 @@ def test_degraded_notifiers_mirror_config_1819_shape(states, notifier):
     # config#2857: the real-completion path no longer Ends here directly —
     # it converges into the SF-envelope completion marker before ending.
     assert "End" not in st
-    assert st["Next"] == "WriteCompletionMarker"
+    assert_completion_notifier_chain(states, notifier)
     (catch,) = st["Catch"]
     assert catch["ErrorEquals"] == ["States.ALL"]
     assert catch["Next"] == "NotifyCompleteDegraded"  # config#1819 idiom

@@ -39,10 +39,13 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _INFRA = _REPO_ROOT / "infrastructure"
 
-# The two definitions with a DegradedRun terminal. step_function.json (the
-# weekly pipeline) has no degraded terminal today; `test_every_definition_
-# with_degraded_flags_has_a_derived_terminal` is what catches it gaining one.
-_DEFS_WITH_DEGRADED_TERMINAL = ("step_function_daily.json", "step_function_eod.json")
+# Every definition with a DegradedRun terminal. step_function.json joined the
+# set in alpha-engine-config-I6891, which brought the weekly pipeline to
+# Option-A parity — before that it set degraded flags and terminated SUCCEEDED,
+# so a run that did not really work counted as one that did.
+_DEFS_WITH_DEGRADED_TERMINAL = (
+    "step_function.json", "step_function_daily.json", "step_function_eod.json",
+)
 
 _ALL_DEFS = ("step_function.json", "step_function_daily.json", "step_function_eod.json")
 
@@ -150,22 +153,14 @@ def test_every_degraded_setter_writes_the_summary_the_terminal_reads(definition:
         )
 
 
-# The weekly pipeline sets degraded: true in two notify fail-opens and has NO
-# degraded terminal — NotifyShellRunCompleteDegraded carries End: true, so a
-# weekly run whose completion notification fails terminates SUCCEEDED while
-# flagged degraded. Option-A parity (#2699) reached both weekday definitions
-# (#6692, #6722) and never reached this one.
-#
-# NOT fixed here: moving a terminal is a topology change, which
-# sf-pipeline-policy.md §5 reserves to human authors (complexity:ultra).
-# Tracked as alpha-engine-config-I6891, which owns the decision of whether
-# a failed notification should degrade the run at all.
-#
-# Pinned as an exact set rather than skipped: the gap cannot WIDEN while this
-# is open, and the exception cannot outlive the fix without failing loudly.
-_KNOWN_UNTERMINATED_DEGRADED: dict[str, frozenset[str]] = {
-    "step_function.json": frozenset({"NotifyCompleteDegraded", "NotifyShellRunCompleteDegraded"}),
-}
+# alpha-engine-config-I6891 CLOSED this gap: the weekly definition now carries
+# CheckDegradedOutcome -> WriteCompletionMarkerDegraded -> DegradedRun, and
+# every one of its eleven fail-open sites writes the $.degraded_summary the
+# terminal derives its cause from. The exception map is deliberately kept as an
+# EMPTY dict rather than deleted: a definition added later that degrades without
+# a terminal must fail the assertion below rather than land in a file that no
+# longer has an opinion about it.
+_KNOWN_UNTERMINATED_DEGRADED: dict[str, frozenset[str]] = {}
 
 
 @pytest.mark.parametrize("definition", _ALL_DEFS)

@@ -373,10 +373,21 @@ class TestSuccessPathNotifiersAreNonFatal:
             # config#2857: the real-completion pair now converges into the
             # SF-envelope completion marker instead of Ending directly. The
             # Friday-PM preflight (shell_run) pair is deliberately EXCLUDED
-            # from the marker (a dry pass must not satisfy the SLA) and
-            # still Ends here exactly as before.
-            ("NotifyComplete", "NotifyCompleteDegraded", "WriteCompletionMarker"),
-            ("NotifyShellRunComplete", "NotifyShellRunCompleteDegraded", None),
+            # from the marker (a dry pass must not satisfy the SLA).
+            #
+            # alpha-engine-config-I6891 moved BOTH terminals behind a
+            # degraded-outcome Choice. The property this test holds is
+            # unchanged and is the one config#1819 bought: a caught publish
+            # failure never aborts the pipeline mid-flight, and every workload
+            # state still runs to completion. What DID change is the terminal
+            # STATUS on that path — a completion nobody was told about is a
+            # DEGRADED run, not a clean one, and the status-keyed watchers are
+            # the only remaining channel able to say so once the SNS one has
+            # failed. Fail-open is about the CONTINUATION, never about the
+            # honesty of the terminal (sf-pipeline-policy.md §2.3 vs §5).
+            ("NotifyComplete", "NotifyCompleteDegraded", "CheckDegradedOutcome"),
+            ("NotifyShellRunComplete", "NotifyShellRunCompleteDegraded",
+             "CheckShellRunDegradedOutcome"),
         ],
     )
     def test_notifier_catches_and_still_ends_success(
@@ -398,17 +409,27 @@ class TestSuccessPathNotifiersAreNonFatal:
         )
         degraded = weekly_states[degraded_next]
         assert degraded["Type"] == "Pass"
-        if terminal_next:
-            assert "End" not in degraded
-            assert degraded["Next"] == terminal_next, (
-                f"{degraded_next} must still reach the SUCCEEDED completion "
-                f"marker — a caught notify failure must not propagate into a Fail"
-            )
-        else:
-            assert degraded["End"] is True, (
-                f"{degraded_next} must still End the execution as SUCCEEDED — "
-                f"a caught notify failure must not propagate into a Fail"
-            )
+        assert "End" not in degraded
+        assert degraded["ResultPath"] == "$.degraded_summary", (
+            f"{degraded_next} must write the fleet-wide $.degraded_summary "
+            "shape (alpha-engine-config-I6891) — it used to write $.notify_"
+            "degraded with a `source` field no other definition uses, so a "
+            "consumer generalised across the three had to know both"
+        )
+        assert degraded["Parameters"]["reason"], (
+            "the DegradedRun terminal dereferences $.degraded_summary.reason "
+            "unguarded on this path"
+        )
+        assert degraded["Next"] in ("CheckDegradedOutcome", "DegradedRun"), (
+            f"{degraded_next} must reach an honest terminal. The property "
+            "config#1819 bought is that the pipeline is never ABORTED by a "
+            "notify failure — every workload state still ran, and the run is "
+            "still recorded. What it never bought is a green terminal: a "
+            "completion nobody was told about is a DEGRADED run, and once the "
+            "SNS channel has failed the status-keyed watchers are the only "
+            "remaining channel able to say so (sf-pipeline-policy.md §2.3 "
+            "governs the terminal; §5 governs only the continuation)."
+        )
 
     def test_notify_complete_subject_still_bounded(self, weekly_states):
         """NotifyComplete/NotifyShellRunComplete's Subjects are hardcoded

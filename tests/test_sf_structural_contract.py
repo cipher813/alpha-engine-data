@@ -189,6 +189,7 @@ _CATCH_EXEMPT: dict[str, dict[str, str]] = {
     "step_function.json": {
         "WeeklyRunDayGateFailed": "deliberate fail-open notify+proceed (own Comment); a Catch here would need its own Catch",
         "WriteCompletionMarker": "config#2857/config#1724: deliberately UNCAUGHT — a marker write failure must propagate as this execution's own unverifiable-completion signal, not be masked",
+        "WriteCompletionMarkerDegraded": "config#2857/config#1724 (DEGRADED twin, alpha-engine-config-I6891): deliberately UNCAUGHT — a marker write failure must propagate, not be masked",
         "HandleFailure": "terminal failure notifier — routes to FailExecution; the shared failure sink itself, not something to re-catch into",
     },
     "step_function_daily.json": {
