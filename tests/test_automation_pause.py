@@ -473,6 +473,11 @@ def test_check_reports_a_kept_trigger_that_went_disabled(module, monkeypatch):
         return "DISABLED"      # every paused entry is correctly off
 
     monkeypatch.setattr(module, "_live_state", fake)
+    # config-I7174: check() now also reads live alarm-action state, which is an
+    # AWS call. CI runs without credentials by design, so stub it here as the
+    # alarm-aware tests already do — otherwise these two assert a trigger
+    # finding and fail on a CloudWatch NoCredentials error instead.
+    monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: False)
     findings = module.check()
     kinds = {(f["trigger"], f["kind"]) for f in findings}
     assert (kept, "kept-but-disabled") in kinds, (
@@ -489,6 +494,11 @@ def test_check_reports_a_kept_trigger_that_vanished(module, monkeypatch):
         return "DISABLED"
 
     monkeypatch.setattr(module, "_live_state", fake)
+    # config-I7174: check() now also reads live alarm-action state, which is an
+    # AWS call. CI runs without credentials by design, so stub it here as the
+    # alarm-aware tests already do — otherwise these two assert a trigger
+    # finding and fail on a CloudWatch NoCredentials error instead.
+    monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: False)
     findings = module.check()
     kinds = {(f["trigger"], f["kind"]) for f in findings}
     assert (kept, "kept-but-missing") in kinds, (
