@@ -180,15 +180,33 @@ def test_regime_substrate_next_is_signals_envelope() -> None:
 
 
 def test_regime_substrate_timeout_is_reasonable() -> None:
-    """Lambda timeout is 300s (per setup-regime-lambda.sh); SF
-    TimeoutSeconds must be slightly higher to avoid premature
-    timeout-due-to-SF when the Lambda is still working."""
+    """The SF budget must BIND — strictly below the Lambda's own 300s ceiling.
+
+    This assertion was inverted until 2026-08-13. It required
+    ``sf_timeout >= 300`` on the stated reasoning that a higher SF value
+    "avoids premature timeout-due-to-SF when the Lambda is still working."
+    That reasoning does not hold: an SF ``lambda:invoke`` has two ceilings and
+    **only the smaller one ever fires** (alpha-engine-config-I6897). Declaring
+    the SF value above the function's does not give the Lambda room — it
+    guarantees the SF budget never fires at all, so the real ceiling lives in
+    another repo's deploy script and the definition describes nothing.
+
+    The original intent — don't cut the Lambda off early — is served by raising
+    the FUNCTION timeout, never by declaring an SF budget that cannot bind.
+
+    This test and ``test_sf_lambda_timeout_ordering.py`` asserted opposite
+    conventions, so no value for this state could satisfy both. That fork is
+    why ``RegimeSubstrate`` sat in that file's ``_KNOWN_UNBOUND`` set instead of
+    being fixed. ``test_sf_lambda_timeout_ordering.py`` is the normative one —
+    it encodes sf-pipeline-policy.md §4 — and this file now agrees with it.
+    """
     sf = _sf()
     states = _flat_states(sf)
     sf_timeout = states["RegimeSubstrate"]["TimeoutSeconds"]
-    assert sf_timeout >= 300, (
-        f"SF TimeoutSeconds for RegimeSubstrate must be >= Lambda timeout "
-        f"(300s per setup-regime-lambda.sh); got {sf_timeout}"
+    assert sf_timeout < 300, (
+        f"SF TimeoutSeconds for RegimeSubstrate must be STRICTLY BELOW the "
+        f"Lambda's own timeout (300s per setup-regime-lambda.sh) so the "
+        f"declared budget is the one that fires; got {sf_timeout}"
     )
 
 
@@ -327,14 +345,22 @@ def test_regime_retrospective_eval_next_is_data_phase2_skip_gate() -> None:
 
 
 def test_regime_retrospective_eval_timeout_accommodates_smoother_fit() -> None:
-    """Lambda timeout is 600s (per setup-regime-retrospective-eval-lambda.sh)
-    — smoother fit + signals/ archive enumeration is heavier than substrate
-    fit. SF TimeoutSeconds must be slightly above the Lambda's own timeout."""
+    """The SF budget must BIND — strictly below the Lambda's own 600s ceiling.
+
+    Same inversion, same correction, same date as
+    ``test_regime_substrate_timeout_is_reasonable`` above — see its docstring
+    for the reasoning. The workload claim stands (smoother fit + signals/
+    archive enumeration is heavier than substrate fit); what was wrong is the
+    conclusion that a heavier workload justifies an SF value ABOVE the
+    function's. If 600s is genuinely too little, the function timeout is the
+    number to raise.
+    """
     sf = _sf()
     states = _flat_states(sf)
     sf_timeout = states["RegimeRetrospectiveEval"]["TimeoutSeconds"]
-    assert sf_timeout >= 600, (
-        f"SF TimeoutSeconds for RegimeRetrospectiveEval must be >= Lambda "
-        f"timeout (600s per setup-regime-retrospective-eval-lambda.sh); "
-        f"got {sf_timeout}"
+    assert sf_timeout < 600, (
+        f"SF TimeoutSeconds for RegimeRetrospectiveEval must be STRICTLY "
+        f"BELOW the Lambda's own timeout (600s per "
+        f"setup-regime-retrospective-eval-lambda.sh) so the declared budget "
+        f"is the one that fires; got {sf_timeout}"
     )
