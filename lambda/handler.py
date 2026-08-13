@@ -191,15 +191,58 @@ def handler(event, context):
                 "duration_seconds": round(duration, 1),
                 "dry_run": dry_run,
             }
-        elif status in ("ok", "partial", "ok_dry_run"):
+        elif status == "ok_dry_run":
+            # Distinct completion shape from a real run — deliberately does
+            # NOT say "Phase 2 complete: N tickers processed", because no
+            # ticket was processed: this is a validate-only canary
+            # (deploy.sh invokes every deploy with dry_run=true, and since
+            # the SF repoint to EC2-spot weekly_collector.py, PR #1186
+            # 2026-07-31, that canary is the ONLY invoker of this Lambda —
+            # alpha-engine-config-I7041). Reusing "tickers_processed" here
+            # previously defaulted to 0 on every run because the collector's
+            # dry-run branch never populated that key, making a healthy
+            # 903-ticker validation indistinguishable from a real empty run.
+            n_validated = result.get("tickers_validated", 0)
             logger.info(
-                "Phase 2 complete in %.0fs: %s", duration,
-                f"{result.get('tickers_processed', 0)} tickers processed"
+                "Phase 2 dry-run complete in %.0fs: validated %d tickers "
+                "(no writes; dry_run=true)", duration, n_validated,
             )
             return {
                 "status": "OK",
-                "tickers_processed": result.get("tickers_processed", 0),
-                "tickers_failed": result.get("tickers_failed", 0),
+                "dry_run": True,
+                "tickers_validated": n_validated,
+                "duration_seconds": round(duration, 1),
+            }
+        elif status in ("ok", "partial"):
+            n_processed = result.get("tickers_processed", 0)
+            n_failed = result.get("tickers_failed", 0)
+            if n_processed == 0 and n_failed == 0:
+                # Structurally unreachable given collect()'s loop: a
+                # non-empty ticker list always increments succeeded or
+                # failed per ticker. If it happens anyway, treat it as a
+                # defect rather than a silent "complete" — fail-loud
+                # default, producers may not graceful-degrade
+                # (alpha-engine-config-I7041).
+                msg = (
+                    f"Phase 2 returned status={status} with 0 tickers "
+                    f"processed and 0 failed against a {len(tickers)}-ticker "
+                    "work list — should be unreachable; treating as a "
+                    "defect rather than reporting completion."
+                )
+                logger.error(msg)
+                return {
+                    "status": "ERROR",
+                    "error": msg,
+                    "duration_seconds": round(duration, 1),
+                }
+            logger.info(
+                "Phase 2 complete in %.0fs: %d tickers processed",
+                duration, n_processed,
+            )
+            return {
+                "status": "OK",
+                "tickers_processed": n_processed,
+                "tickers_failed": n_failed,
                 "duration_seconds": round(duration, 1),
                 "dry_run": dry_run,
             }

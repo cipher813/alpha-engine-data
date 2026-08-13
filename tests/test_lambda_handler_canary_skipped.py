@@ -113,16 +113,71 @@ def test_dry_run_with_tickers_still_returns_OK():
     """Sanity: dry_run=True + collect=ok_dry_run (tickers present) → OK.
 
     Confirms the new SKIPPED branch doesn't shadow the existing OK path
-    when collect() returns the normal dry-run success status.
+    when collect() returns the normal dry-run success status, and that
+    the validated count round-trips under its own key rather than being
+    silently dropped (alpha-engine-config-I7041: the handler previously
+    read "tickers_processed", which the dry-run branch never populated,
+    so every canary run logged "0 tickers processed" regardless of how
+    many tickers it actually validated).
     """
     result = _invoke_with_collect_result(
-        {"status": "ok_dry_run", "tickers": 25, "ticker_list": ["AAPL", "MSFT"]},
+        {
+            "status": "ok_dry_run",
+            "tickers_validated": 25,
+            "ticker_list": ["AAPL", "MSFT"],
+        },
         dry_run=True,
     )
     assert result["status"] == "OK", (
         f"Canary dry_run=True with tickers must return OK, got: {result}"
     )
     assert result["dry_run"] is True
+    assert result["tickers_validated"] == 25, (
+        f"Dry-run validated count must round-trip, got: {result}"
+    )
+    assert "tickers_processed" not in result, (
+        "A dry-run response must not claim tickers_processed — no writes "
+        f"happened, got: {result}"
+    )
+
+
+def test_dry_run_zero_tickers_validated_is_distinguishable_from_real_zero():
+    """A dry-run that validates 903 tickers must never report 0 processed.
+
+    Regression test for alpha-engine-config-I7041: every canary invocation
+    since the SF repoint (PR #1186, 2026-07-31) logged "Phase 2 complete:
+    0 tickers processed" no matter how many tickers the dry-run actually
+    validated, because the handler read "tickers_processed" — a key the
+    dry-run branch never set. This pins that a healthy validation of a
+    real universe reports its true count under "tickers_validated", not 0.
+    """
+    result = _invoke_with_collect_result(
+        {
+            "status": "ok_dry_run",
+            "tickers_validated": 903,
+            "ticker_list": ["AAPL", "MSFT"],
+        },
+        dry_run=True,
+    )
+    assert result["tickers_validated"] == 903
+
+
+def test_real_run_zero_processed_zero_failed_is_reported_as_ERROR():
+    """A non-dry-run status=ok/partial with 0 processed and 0 failed is a defect.
+
+    Structurally unreachable via collect()'s per-ticker loop against a
+    non-empty ticker list (every ticket increments succeeded or failed) —
+    if it ever happens, the fail-loud default applies: this must not be
+    reported as a completed run (alpha-engine-config-I7041).
+    """
+    result = _invoke_with_collect_result(
+        {"status": "ok", "tickers_processed": 0, "tickers_failed": 0},
+        dry_run=False,
+    )
+    assert result["status"] == "ERROR", (
+        f"0 processed + 0 failed against real tickers must raise, got: {result}"
+    )
+    assert "0 tickers" in result.get("error", "")
 
 
 # ---------------------------------------------------------------------------
