@@ -72,11 +72,39 @@ def test_manifest_history_is_sorted_ascending_by_effective_from(manifest):
     assert dates == sorted(dates)
 
 
-def test_manifest_current_entry_is_daily_unchanged_by_this_change(manifest):
-    """config#6689 changed the MECHANISM, never the cadence itself — the
-    value in force today stays 'daily' (alpha-engine-config#5489, Brian
-    ruling 2026-07-29). I7175 only adds the dated history around it."""
-    assert manifest["exercise_cadence"][-1]["value"] == "daily"
+def test_manifest_current_entry_is_a_declared_value(manifest):
+    """The current entry must be one of the declared values, and carry the
+    ruling that authorised it.
+
+    This USED to assert the literal ``== "daily"``, under the name
+    ``test_manifest_current_entry_is_daily_unchanged_by_this_change`` — correct
+    for the change that introduced it (config#6689 altered the mechanism, not
+    the cadence), but it outlived its purpose: it pinned the knob's POSITION in
+    a test suite whose job is to check the knob WORKS. Six tests in this file
+    hard-coded 'daily', so `weekly_cadence.json`'s stated promise — "flipping
+    daily <-> weekly-only <-> off is a one-line diff" — was false; it was a
+    one-line diff plus six test edits, and every legitimate cadence ruling had
+    to fight its own guard. Brian's 2026-08-13 ruling (daily -> off) was the
+    first to hit it.
+
+    Asserting the property keeps the guard real: an undeclared or typo'd value
+    still fails here, and `test_current_entry_records_its_ruling` below keeps
+    the provenance requirement that made the old assertion feel load-bearing.
+    """
+    current = manifest["exercise_cadence"][-1]
+    assert current["value"] in manifest["allowed_values"]
+
+
+def test_current_entry_records_its_ruling(manifest):
+    """A cadence change is a ruling, not tuning (sf-pipeline-policy §2.6 rule
+    3), so the entry in force must say who decided it and why. This is the
+    half of the old literal-pinning test that was genuinely load-bearing."""
+    current = manifest["exercise_cadence"][-1]
+    why = current.get("_why", "")
+    assert len(why) > 80, "the current cadence entry must carry a substantive _why"
+    assert "ruling" in why.lower() or "brian" in why.lower(), (
+        "the current cadence entry must name the ruling that authorised it"
+    )
 
 
 def test_daily_entry_effective_from_precedes_the_ruling_date(manifest):
@@ -109,8 +137,11 @@ def test_meaning_names_the_ruling_and_the_issue(manifest):
 
 # ── §2: drift script, both directions ───────────────────────────────────────
 
-def test_declared_cadence_returns_the_manifest_value(module):
-    assert module.declared_cadence() == "daily"
+def test_declared_cadence_returns_the_manifest_value(module, manifest):
+    """Reads the manifest rather than a literal — which is what the test's own
+    name always claimed. See test_manifest_current_entry_is_a_declared_value
+    for why the literals were removed."""
+    assert module.declared_cadence() == manifest["exercise_cadence"][-1]["value"]
 
 
 def test_declared_cadence_rejects_an_invalid_value(module, tmp_path):
@@ -147,17 +178,20 @@ def test_check_reports_missing_in_aws_when_param_absent(module, monkeypatch):
     assert findings[0]["kind"] == "missing-in-aws"
 
 
-def test_check_reports_value_mismatch(module, monkeypatch):
-    monkeypatch.setattr(module, "_live_value", lambda: "weekly-only")
+def test_check_reports_value_mismatch(module, monkeypatch, manifest):
+    declared = manifest["exercise_cadence"][-1]["value"]
+    other = next(v for v in manifest["allowed_values"] if v != declared)
+    monkeypatch.setattr(module, "_live_value", lambda: other)
     findings = module.check()
     assert len(findings) == 1
     assert findings[0]["kind"] == "value-mismatch"
-    assert "weekly-only" in findings[0]["detail"]
-    assert "daily" in findings[0]["detail"]
+    assert other in findings[0]["detail"]
+    assert declared in findings[0]["detail"]
 
 
-def test_check_is_clean_when_manifest_matches_live(module, monkeypatch):
-    monkeypatch.setattr(module, "_live_value", lambda: "daily")
+def test_check_is_clean_when_manifest_matches_live(module, monkeypatch, manifest):
+    declared = manifest["exercise_cadence"][-1]["value"]
+    monkeypatch.setattr(module, "_live_value", lambda: declared)
     assert module.check() == []
 
 
@@ -172,9 +206,11 @@ def test_access_denied_is_not_read_as_absence(module, monkeypatch):
         module._live_value()
 
 
-def test_enforce_writes_when_live_differs(module, monkeypatch):
+def test_enforce_writes_when_live_differs(module, monkeypatch, manifest):
+    declared = manifest["exercise_cadence"][-1]["value"]
+    other = next(v for v in manifest["allowed_values"] if v != declared)
     calls = []
-    monkeypatch.setattr(module, "_live_value", lambda: "off")
+    monkeypatch.setattr(module, "_live_value", lambda: other)
 
     def _fake_aws(args):
         calls.append(args)
@@ -184,11 +220,12 @@ def test_enforce_writes_when_live_differs(module, monkeypatch):
     wrote = module.enforce()
     assert wrote is True
     assert calls and calls[0][:2] == ["ssm", "put-parameter"]
-    assert "daily" in calls[0]
+    assert declared in calls[0]
 
 
-def test_enforce_is_a_noop_when_already_in_sync(module, monkeypatch):
-    monkeypatch.setattr(module, "_live_value", lambda: "daily")
+def test_enforce_is_a_noop_when_already_in_sync(module, monkeypatch, manifest):
+    declared = manifest["exercise_cadence"][-1]["value"]
+    monkeypatch.setattr(module, "_live_value", lambda: declared)
     monkeypatch.setattr(module, "_aws", lambda args: pytest.fail("should not call aws when already in sync"))
     assert module.enforce() is False
 

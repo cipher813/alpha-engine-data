@@ -257,7 +257,15 @@ class TestCadenceHistory:
         history = mod.load_cadence_history()
         assert history
         assert history == sorted(history, key=lambda e: e.effective_from)
-        assert history[-1].value == "daily"
+        # Assert the PROPERTY, not today's literal value. This used to pin
+        # ``history[-1].value == "daily"``, which made every legitimate cadence
+        # ruling fail a test whose purpose is "the loader reads the real
+        # manifest" — the current value is incidental to that. Brian's
+        # 2026-08-13 ruling (daily -> off) was the first to hit it. The manifest
+        # is still the source of truth for what is legal, so a typo'd value
+        # still fails here.
+        raw = json.loads(mod.MANIFEST_PATH.read_text())
+        assert history[-1].value in raw["allowed_values"]
 
 
 # ---------------------------------------------------------------------------
