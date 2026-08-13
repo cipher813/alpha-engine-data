@@ -38,6 +38,8 @@
     "events_rules": {
       "alpha-engine-canary-replay-liveness-probe-tick": "overseer canary-replay liveness probe",
       "alpha-engine-canary-replay-thursday": "canary-replay drill dispatcher (spawns work)",
+      "alpha-engine-ci-watch-instance-terminated": "ci-watch-liveness-probe reclaim leg (EC2 instance-terminated) - added alpha-engine-config-I7174. Mirrors alpha-engine-sf-watch-instance-terminated below, which was already declared paused under the same 2026-08-07 ruling for the same reason (its target dispatches into the paused response plane); this twin was missed at that time. `alpha-engine-watch-plane-ci-watch-liveness-probe-invocations-floor`'s `paused_alarms` entry watches this name - without it that alarm's declaration would reference a trigger absent from this manifest.",
+      "alpha-engine-ci-watch-spot-interruption": "ci-watch-liveness-probe reclaim leg (EC2 spot-interruption-warning) - added alpha-engine-config-I7174. Same finding as alpha-engine-ci-watch-instance-terminated above: the second of ci-watch's two reclaim/relaunch wake legs, mirroring alpha-engine-sf-watch-spot-interruption.",
       "alpha-engine-daily-heal": "data-spot heal dispatcher (launches spot). CloudFormation-managed - State: DISABLED in alpha-engine-orchestration.yaml",
       "alpha-engine-eod-success-friday-shell-trigger": "Friday shell-run trigger (spawns work)",
       "alpha-engine-friday-shell-run-report": "Friday shell-run report",
@@ -75,6 +77,45 @@
       "alpha-engine-sf-watch-canary-drill-weekly": "sf-watch canary drill",
       "alpha-engine-sf-watch-liveness-0645-daily": "sf-watch liveness probe",
       "alpha-engine-sf-watch-liveness-1445-daily": "sf-watch liveness probe"
+    }
+  },
+  "paused_alarms": {
+    "_why": "alpha-engine-config-I7174. Nine watch-plane/liveness alarms fire `no datapoints were received ... treated as [Breaching]` for no reason other than that the component they watch is deliberately off under the 2026-08-07/2026-08-12 rulings above - the alarm has no input telling it 'gated off by declaration' from 'upstream died' (sf-pipeline-policy.md 2.6 rule 1). Each entry here names the alarm and the `watches` triggers whose presence in `paused`/`pending` (module.paused_names()) is what JUSTIFIES silencing it - never a free-text trigger name that no checker reads, the exact defect the `_reactive-notifier-rules` prose key already cost this file once. `pause_reconcile.py::alarm_entries()`/`automation_pause.py::alarm_entries()` compute justification live from `watches`, so un-pausing a trigger (removing/moving its entry out of `paused`) makes its alarm's entry here stop being justified on the VERY NEXT read - no second edit, no separate AWS CLI command. `automation_pause.py --enforce` then (a) disables actions on a justified-but-armed alarm and (b) RE-ENABLES actions on an alarm whose entry is no longer justified - (b) is deliberately NOT a mirror of the trigger-enforce asymmetry (`enforce()` never re-enables a paused TRIGGER, because that would restart scheduled work unattended); re-arming an alarm only resumes paging, so the same asymmetry does not apply. Silencing is `disable-alarm-actions`, never `delete-alarms`: history and config survive so coverage can be reconstructed later (property 1). `pause_reconcile.py --check` grades the same two directions read-only and its `--publish` row always lists every currently-justified entry as a declared, bounded gap (property 2) rather than omitting it.",
+    "alpha-engine-watch-plane-alert-drain-liveness-probe-invocations-floor": {
+      "reason": "invocations-floor on the overseer alert-drain liveness probe; treat_missing_data=breaching is correct when alert-drain is supposed to run and wrong while it is declared off (2026-08-07 ruling, response plane paused).",
+      "watches": ["alpha-engine-alert-drain-0400utc", "alpha-engine-alert-drain-1000utc", "alpha-engine-alert-drain-1600utc", "alpha-engine-alert-drain-2200utc"]
+    },
+    "alpha-engine-watch-plane-canary-replay-liveness-probe-invocations-floor": {
+      "reason": "invocations-floor on the overseer canary-replay liveness probe; silenced while alpha-engine-canary-replay-liveness-probe-tick is paused.",
+      "watches": ["alpha-engine-canary-replay-liveness-probe-tick"]
+    },
+    "alpha-engine-watch-plane-ci-watch-liveness-probe-invocations-floor": {
+      "reason": "invocations-floor on the ci-watch-liveness-probe reclaim leg (config#3173, mirrors sf-watch's two reclaim legs); silenced while both ci-watch reclaim rules are paused.",
+      "watches": ["alpha-engine-ci-watch-spot-interruption", "alpha-engine-ci-watch-instance-terminated"]
+    },
+    "alpha-engine-watch-plane-sf-watch-liveness-probe-errors": {
+      "reason": "sf-watch liveness-probe Errors; silenced under Brian's 2026-08-12 ruling (alpha-engine-config-I6984) disabling sf-watch while the three scheduled pipelines are made reliable by hand. Re-exam 2026-09-09, same predicate as the paused sf-watch entries this watches.",
+      "watches": ["alpha-engine-sf-watch-liveness-0645-daily", "alpha-engine-sf-watch-liveness-1445-daily"]
+    },
+    "alpha-engine-watch-plane-sf-watch-liveness-probe-throttles": {
+      "reason": "sf-watch liveness-probe Throttles; same ruling and same watched triggers as alpha-engine-watch-plane-sf-watch-liveness-probe-errors.",
+      "watches": ["alpha-engine-sf-watch-liveness-0645-daily", "alpha-engine-sf-watch-liveness-1445-daily"]
+    },
+    "alpha-engine-ssm-reachability-probe-dead": {
+      "reason": "SSM reachability probe deadman; silenced while alpha-engine-ssm-reachability-probe-5min is paused.",
+      "watches": ["alpha-engine-ssm-reachability-probe-5min"]
+    },
+    "alpha-engine-ssm-reachability-probe-unreachable": {
+      "reason": "SSM reachability probe unreachable-count; same watched trigger as alpha-engine-ssm-reachability-probe-dead.",
+      "watches": ["alpha-engine-ssm-reachability-probe-5min"]
+    },
+    "alpha-engine-watch-plane-overseer-intake-age": {
+      "reason": "overseer intake queue age; a CONSEQUENCE of alert-drain being paused (nothing drains the intake queue the alarm's tap fills), not of its own trigger. Watches the same alert-drain schedules the drain itself needs running.",
+      "watches": ["alpha-engine-alert-drain-0400utc", "alpha-engine-alert-drain-1000utc", "alpha-engine-alert-drain-1600utc", "alpha-engine-alert-drain-2200utc"]
+    },
+    "alpha-engine-watch-plane-overseer-intake-dlq-depth": {
+      "reason": "overseer intake DLQ depth; same consequence and same watched triggers as alpha-engine-watch-plane-overseer-intake-age.",
+      "watches": ["alpha-engine-alert-drain-0400utc", "alpha-engine-alert-drain-1000utc", "alpha-engine-alert-drain-1600utc", "alpha-engine-alert-drain-2200utc"]
     }
   }
 }
