@@ -32,6 +32,7 @@ import logging
 import os
 import traceback
 from dataclasses import asdict
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,10 @@ def handler(event: dict, context) -> dict:
     Returns:
         dict with status, has_violation, and detailed results.
     """
+    # Captured at handler ENTRY: the stage-coverage window must predate any
+    # write this invocation makes, or it would be trivially satisfied by it
+    # (alpha-engine-config-I7214).
+    started = datetime.now(timezone.utc)
     bucket = event.get("bucket", _SF_DEFINITION_BUCKET)
     sf_name = event.get("sf_name", _WEEKLY_SF_NAME)
 
@@ -120,4 +125,29 @@ def handler(event: dict, context) -> dict:
         "skip_count": len(skip_results),
         "ran_count": ran_count,
         "results": result_dicts,
+        "stage_coverage": _assert_stage_coverage("WeeklyPreflight", started),
     }
+
+
+def _assert_stage_coverage(stage: str, started: datetime) -> dict:
+    """Record this stage's own output verdict (alpha-engine-config-I7214).
+
+    `WeeklyPreflight` is an INFRASTRUCTURE/GATE stage: it positively declares
+    in `ARTIFACT_REGISTRY.yaml`'s `pipeline_stages:` that it writes no durable
+    artifact, so the verdict is `COVERED_NO_OUTPUT`. It asserts nothing and
+    still RECORDS that it declared nothing — "declares nothing" and "was never
+    considered" must not be the same absence, which is the whole point of that
+    registry section.
+
+    Never alters the handler's outcome: an observer that can change the stage
+    it observes is a new failure mode bolted onto the one it reports. The
+    ImportError branch is loud rather than silent because the nousergon-lib
+    pin may predate the module, and an inert assertion must be distinguishable
+    from a covered stage.
+    """
+    try:
+        from krepis.stage_coverage import assert_stage_coverage
+    except ImportError as exc:
+        print(f"ERROR: stage-coverage assertion unavailable for {stage}: {exc}")
+        return {"stage": stage, "status": "UNMEASURED", "reason": str(exc)}
+    return assert_stage_coverage(stage, window_start=started)

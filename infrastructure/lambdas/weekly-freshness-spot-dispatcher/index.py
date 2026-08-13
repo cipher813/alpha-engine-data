@@ -393,6 +393,9 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """
     event = event or {}
     force_on_demand = bool(event.get("force_on_demand", False))
+    # Captured at handler ENTRY: the stage-coverage window must predate any
+    # write this invocation makes (alpha-engine-config-I7214).
+    started = datetime.datetime.now(datetime.timezone.utc)
 
     # Per-run identity tags (config#5504): attribute the launcher box to the SF
     # execution so per-run EC2 cost is measurable. Gracefully absent for
@@ -456,4 +459,35 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         "market": market,
         "command_id": command_id,
         "run_token": run_token,
+        # The stage name is DERIVED, never hardcoded: this one Lambda backs two
+        # SF states — DispatchWeeklyFreshnessSpot and, with force_on_demand,
+        # RelaunchWeeklyFreshnessSpot. A file-level constant would file the
+        # relaunch's verdict under the dispatch's name, so a real miss would be
+        # attributed to a stage that was working (alpha-engine-config-I7214).
+        "stage_coverage": _assert_stage_coverage(
+            "RelaunchWeeklyFreshnessSpot" if force_on_demand else "DispatchWeeklyFreshnessSpot",
+            started,
+        ),
     }
+
+
+def _assert_stage_coverage(stage: str, started: datetime.datetime) -> dict:
+    """Record this stage's own output verdict (alpha-engine-config-I7214).
+
+    Both stages this Lambda backs are INFRASTRUCTURE/GATE stages: they
+    positively declare in `ARTIFACT_REGISTRY.yaml`'s `pipeline_stages:` that
+    they write no durable artifact, so the verdict is `COVERED_NO_OUTPUT`.
+    They assert nothing and still RECORD that they declared nothing —
+    "declares nothing" and "was never considered" must not be the same
+    absence.
+
+    Never alters the handler's outcome. The ImportError branch is loud rather
+    than silent because the nousergon-lib pin may predate the module, and an
+    inert assertion must be distinguishable from a covered stage.
+    """
+    try:
+        from krepis.stage_coverage import assert_stage_coverage
+    except ImportError as exc:
+        logger.error("stage-coverage assertion unavailable for %s: %s", stage, exc)
+        return {"stage": stage, "status": "UNMEASURED", "reason": str(exc)}
+    return assert_stage_coverage(stage, window_start=started)
