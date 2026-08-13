@@ -189,6 +189,14 @@ IAM_PROFILE="alpha-engine-executor-profile"
 # the lib — use the full venv path.
 LIB_PYTHON="${LIB_PYTHON:-/home/ec2-user/alpha-engine-dashboard/.venv/bin/python}"
 
+# Stage-coverage window (alpha-engine-config-I7214): the instant this launcher
+# started. An artifact whose LastModified predates it is a leftover from a
+# previous cycle, not this run's output — an existence-only probe cannot tell
+# those apart, which is how a stage that STOPPED writing keeps reading green.
+# Restated here rather than sourced: this script does NOT source
+# _spot_common.sh (it carries its own run_ssm/launch pair, see the header).
+_STAGE_WINDOW_START="${_STAGE_WINDOW_START:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+
 # ── Parse flags ──────────────────────────────────────────────────────────────
 # RUN_MODE values:
 #   full                — phase1 + rag (legacy bundled, manual/adhoc)
@@ -1004,6 +1012,23 @@ PHASE2_ONLY
         --region "${AWS_REGION:-us-east-1}" 2>/dev/null \
         && echo "Heartbeat emitted: data-phase2" \
         || echo "WARNING: Failed to emit heartbeat for data-phase2 (non-fatal)"
+
+    # ── Per-stage output assertion (config-I7214) ───────────────────────────
+    # sf-pipeline-policy.md §2.1: assert THIS stage wrote what it declared, at
+    # the boundary where the fact becomes knowable. The stage name is derived
+    # from RUN_MODE, not hardcoded at the top of the file: this script serves
+    # six modes and only `--phase2-only` is an SF-wired weekly stage, so a
+    # file-level constant would file every other mode's run under DataPhase2
+    # and attribute a miss to a stage that never ran.
+    #
+    # Placed after the PREFLIGHT_ONLY early-exit above, so the Friday
+    # shell-run — which writes nothing by design — never asserts.
+    #
+    # OBSERVE MODE: the CLI exits 0 for every verdict. `|| echo ... >&2`
+    # rather than `|| true` deliberately — a bare `|| true` would make an
+    # unreachable assertion indistinguishable from a covered stage, which is
+    # the exact silence this mechanism exists to remove.
+    "$LIB_PYTHON" -m krepis.stage_coverage assert --stage DataPhase2 --window-start "$_STAGE_WINDOW_START" || echo "WARNING: stage-coverage assertion did not run for DataPhase2 (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
     exit 0
 fi
 

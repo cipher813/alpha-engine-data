@@ -200,4 +200,12 @@ WORKLOAD
 )" "${_RAG_WORKLOAD_TIMEOUT}"
 
 emit_heartbeat
+
+# ── Per-stage output assertion (config-I7214) ────────────────────────────────
+# See spot_morning_enrich.sh for the full rationale. RAGIngestion's PRIMARY
+# product is rows in the pgvector corpus, which is not an S3 key; the registry
+# declares its two registerable artifacts (rag_corpus_freshness,
+# rag_ingestion_progress) and this asserts exactly those. OBSERVE MODE.
+"$LIB_PYTHON" -m krepis.stage_coverage assert --stage RAGIngestion --window-start "$_STAGE_WINDOW_START" || echo "WARNING: stage-coverage assertion did not run for RAGIngestion (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
+
 echo "==> RAG ingestion complete."
