@@ -525,6 +525,16 @@ def orig_spot_cmds() -> dict:
       absent-path change: the real Saturday path now runs two commands where
       it ran one, which is the entire point of the split.
 
+    - **Regenerated 2026-08-13** (alpha-engine-config-I7259): the 3
+      `ParityParallel` branches (`PitParityLookahead`, `PitParityWalkforward`,
+      `ParityReplay`) run concurrently on the same launcher box against the
+      SAME `alpha-engine-backtester` checkout — their `git -C ... pull`
+      commands raced on `FETCH_HEAD` and 2 of 3 died with `fatal: Cannot
+      fast-forward to multiple branches.` on 2026-08-13's weekly rerun. Fix
+      wraps each of the 3 pulls in `flock /var/lock/alpha-engine-backtester-
+      git.lock` so they serialise instead of racing — a deliberate,
+      reviewed absent-path change confined to these 3 keys.
+
     Regenerate ONLY on a deliberate, reviewed change to a spot state's
     absent-path (`preflight_args=""`) command, by re-extracting the
     resolved spot commands from the new `origin/main` SF.
