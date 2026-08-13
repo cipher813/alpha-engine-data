@@ -385,6 +385,18 @@ _NOTIFY_RESOURCE = "arn:aws:states:::sns:publish"
 #     needing its own tracker issue, not a leftover.
 _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
     "step_function.json": {
+        "StageCoverageAssert": (
+            "alpha-engine-config-I7214: this Catch handles the OBSERVER's own "
+            "failure, not a producer's. Degrading the run because the coverage "
+            "assertion could not run would report a harness fault AS a defect "
+            "— always in the alarming direction, and the fastest way to get a "
+            "correct detector switched off. The route writes an explicit "
+            "UNMEASURED verdict to $.stage_coverage_result instead, which is a "
+            "loud value and not silence (principles.md §2.7). The flag this "
+            "stage CAN set, on a real miss, is $.degraded_summary via "
+            "SetStageCoverageDegradedSummary — the existing chokepoint — and "
+            "that path is gated on the enforce knob, not on this Catch."
+        ),
         "WeeklyRunDayGate": (
             "sf-pipeline-policy.md §5 carve-out: 'The weekly run-day gate "
             "fails open — missing a weekly run is worse than a duplicate; "
