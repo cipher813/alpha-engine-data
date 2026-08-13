@@ -473,6 +473,11 @@ def test_check_reports_a_kept_trigger_that_went_disabled(module, monkeypatch):
         return "DISABLED"      # every paused entry is correctly off
 
     monkeypatch.setattr(module, "_live_state", fake)
+    # config-I7174: check() now also reads live alarm-action state, which is an
+    # AWS call. CI runs without credentials by design, so stub it here as the
+    # alarm-aware tests already do — otherwise these two assert a trigger
+    # finding and fail on a CloudWatch NoCredentials error instead.
+    monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: False)
     findings = module.check()
     kinds = {(f["trigger"], f["kind"]) for f in findings}
     assert (kept, "kept-but-disabled") in kinds, (
@@ -489,6 +494,11 @@ def test_check_reports_a_kept_trigger_that_vanished(module, monkeypatch):
         return "DISABLED"
 
     monkeypatch.setattr(module, "_live_state", fake)
+    # config-I7174: check() now also reads live alarm-action state, which is an
+    # AWS call. CI runs without credentials by design, so stub it here as the
+    # alarm-aware tests already do — otherwise these two assert a trigger
+    # finding and fail on a CloudWatch NoCredentials error instead.
+    monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: False)
     findings = module.check()
     kinds = {(f["trigger"], f["kind"]) for f in findings}
     assert (kept, "kept-but-missing") in kinds, (
@@ -500,15 +510,27 @@ def test_check_is_silent_when_kept_triggers_are_enabled(module, monkeypatch):
     monkeypatch.setattr(
         module, "_live_state",
         lambda surface, name: "ENABLED" if name in module.kept_names() else "DISABLED")
+    # Every paused_alarms entry watches only paused/pending triggers (asserted
+    # elsewhere), so it is justified here; matching live state is already
+    # ActionsEnabled=false.
+    monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: False)
     assert module.check() == []
 
 
 def test_enforce_never_touches_a_kept_trigger(module, monkeypatch):
-    # enforce() may only ever DISABLE. If it learned to re-enable, this script
-    # would start scheduled work unattended — the one thing the ruling forbids.
+    # enforce() may only ever DISABLE a trigger. If it learned to re-enable
+    # one, this script would start scheduled work unattended — the one thing
+    # the ruling forbids. (Alarm-action state is a different, safe-to-act-on
+    # asymmetry — see test_enforce_can_both_disable_and_enable_alarm_actions.)
     disabled: list[str] = []
     monkeypatch.setattr(module, "_live_state", lambda surface, name: "ENABLED")
     monkeypatch.setattr(module, "_disable", lambda surface, name: disabled.append(name))
+    # Already matching its justification (True, since watches are declared
+    # paused regardless of the live-state monkeypatch above): no alarm AWS call.
+    monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: False)
+    monkeypatch.setattr(
+        module, "_set_alarm_actions",
+        lambda name, enabled: pytest.fail(f"unexpected alarm mutation on {name}"))
     module.enforce()
     assert not (set(disabled) & module.kept_names()), (
         f"enforce() disabled a deliberately-kept trigger: "
@@ -535,3 +557,176 @@ def test_reconcile_monthly_is_paused_not_pending(manifest, module):
     name = "alpha-engine-expense-collector-reconcile-monthly"
     assert name in manifest["paused"]["scheduler_schedules"]
     assert name not in module.pending_names(manifest)
+
+
+# ── alpha-engine-config-I7174: paused_alarms owns alarm-action state ─────────
+#
+# A paused component's absence-alarm (treat_missing_data: breaching) cannot
+# tell "gated off by declaration" from "upstream died" — nine alarms fired
+# `OVERSEER BACKSTOP` pages on 2026-08-13 for exactly that reason. These tests
+# assert: every declared alarm names a real reason and only checkable trigger
+# names (never a name buried in prose, the `_reactive-notifier-rules` defect
+# repeated); justification is derived live from paused_names(), never cached;
+# check() is bidirectional (unexpectedly-enabled AND stale-disabled); and
+# enforce() can act in BOTH directions for alarms specifically, unlike triggers.
+
+ALARM_NAMES = {
+    "alpha-engine-watch-plane-alert-drain-liveness-probe-invocations-floor",
+    "alpha-engine-watch-plane-canary-replay-liveness-probe-invocations-floor",
+    "alpha-engine-watch-plane-ci-watch-liveness-probe-invocations-floor",
+    "alpha-engine-watch-plane-sf-watch-liveness-probe-errors",
+    "alpha-engine-watch-plane-sf-watch-liveness-probe-throttles",
+    "alpha-engine-ssm-reachability-probe-dead",
+    "alpha-engine-ssm-reachability-probe-unreachable",
+    "alpha-engine-watch-plane-overseer-intake-age",
+    "alpha-engine-watch-plane-overseer-intake-dlq-depth",
+}
+
+
+def test_all_nine_pause_caused_alarms_are_declared(manifest, module):
+    names = {e["name"] for e in module.alarm_entries(manifest)}
+    assert names == ALARM_NAMES, (
+        f"missing: {ALARM_NAMES - names}; unexpected: {names - ALARM_NAMES}"
+    )
+
+
+def test_the_three_deliberately_armed_alarms_are_not_declared(manifest, module):
+    # These are real and unrelated to the pause; declaring them here would
+    # silence an alarm that is correctly paging.
+    armed = {
+        "alpha-engine-dashboard-health-problems",
+        "alpha-engine-eval-quality-regression",
+        "router-degraded-mode-drill-uncovered-class",
+    }
+    names = {e["name"] for e in module.alarm_entries(manifest)}
+    assert not (armed & names), f"an alarm that must stay armed is declared paused: {armed & names}"
+
+
+def test_every_alarm_entry_has_a_reason_and_nonempty_watches(manifest, module):
+    for entry in module.alarm_entries(manifest):
+        assert entry["reason"].strip(), f"{entry['name']} has no reason"
+        assert entry["watches"], (
+            f"{entry['name']} watches nothing — a declaration that names no "
+            "checkable trigger can never be graded"
+        )
+
+
+def test_every_watched_name_is_a_real_manifest_trigger(manifest, module):
+    # Watches must resolve against paused_names() (paused ∪ pending). A name
+    # that resolves against nothing is exactly the `_reactive-notifier-rules`
+    # defect: a trigger name inside a value no checker reads.
+    checkable = module.paused_names(manifest)
+    for entry in module.alarm_entries(manifest):
+        unknown = [w for w in entry["watches"] if w not in checkable]
+        assert not unknown, f"{entry['name']} watches undeclared trigger(s): {unknown}"
+
+
+def test_ci_watch_reclaim_legs_exist_for_its_alarm_to_watch(manifest):
+    # Added by this same change, mirroring sf-watch's identical pair.
+    events = manifest["paused"]["events_rules"]
+    for name in ("alpha-engine-ci-watch-spot-interruption",
+                 "alpha-engine-ci-watch-instance-terminated"):
+        assert name in events, f"{name} missing — the ci-watch alarm entry watches it"
+
+
+def test_alarm_justified_derives_live_from_paused_names_not_a_cached_flag(module):
+    """The core un-pause property: lifting a pause changes the verdict on the
+    NEXT read, with no second field to edit."""
+    entry = {"name": "x", "reason": "r", "watches": ["some-trigger"]}
+    still_paused = {"ruling": {"date": "2026-08-07"}, "not_paused": {}, "pending": {},
+                     "paused": {"events_rules": {"some-trigger": "r"},
+                                "scheduler_schedules": {}}}
+    lifted = {"ruling": {"date": "2026-08-07"}, "not_paused": {}, "pending": {},
+              "paused": {"events_rules": {}, "scheduler_schedules": {}}}
+    assert module.alarm_justified(entry, still_paused) is True
+    assert module.alarm_justified(entry, lifted) is False
+
+
+def test_alarm_justified_requires_ALL_watched_triggers_paused(module):
+    entry = {"name": "x", "reason": "r", "watches": ["a", "b"]}
+    partial = {"ruling": {"date": "2026-08-07"}, "not_paused": {}, "pending": {},
+               "paused": {"events_rules": {"a": "r"}, "scheduler_schedules": {}}}
+    assert module.alarm_justified(entry, partial) is False
+
+
+def test_check_flags_a_justified_alarm_left_armed(module, monkeypatch):
+    """The bug this issue fixes, induced: paused trigger, ActionsEnabled=true."""
+    monkeypatch.setattr(module, "_live_state", lambda surface, name: "DISABLED")
+    monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: True)
+    findings = module.check()
+    kinds = {(f["trigger"], f["kind"]) for f in findings}
+    for name in ALARM_NAMES:
+        assert (name, "alarm-unexpectedly-enabled") in kinds, findings
+
+
+def test_check_flags_a_stale_disabled_alarm_after_its_pause_lifts(module, monkeypatch):
+    """The failure this issue exists to prevent: pause lifted, alarm never re-armed."""
+    lifted = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    del lifted["paused"]["scheduler_schedules"]["alpha-engine-sf-watch-liveness-0645-daily"]
+    del lifted["paused"]["scheduler_schedules"]["alpha-engine-sf-watch-liveness-1445-daily"]
+    monkeypatch.setattr(module, "load_manifest", lambda: lifted)
+    monkeypatch.setattr(module, "_live_state", lambda surface, name: "DISABLED")
+    monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: False)
+    findings = module.check()
+    kinds = {(f["trigger"], f["kind"]) for f in findings}
+    assert ("alpha-engine-watch-plane-sf-watch-liveness-probe-errors",
+            "alarm-stale-disabled") in kinds, findings
+    assert ("alpha-engine-watch-plane-sf-watch-liveness-probe-throttles",
+            "alarm-stale-disabled") in kinds, findings
+
+
+def test_check_is_silent_on_alarms_whose_state_matches_justification(module, monkeypatch):
+    monkeypatch.setattr(module, "_live_state", lambda surface, name: "DISABLED")
+    monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: False)
+    findings = module.check()
+    assert not [f for f in findings if f["surface"] == "cloudwatch"], findings
+
+
+def test_enforce_can_both_disable_and_enable_alarm_actions(module, monkeypatch):
+    """Unlike triggers, enforce() may act in BOTH directions for alarms — this
+    is the mechanism that re-arms an alarm the same run a pause lifts, with no
+    separate AWS CLI command."""
+    lifted = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    del lifted["paused"]["scheduler_schedules"]["alpha-engine-sf-watch-liveness-0645-daily"]
+    del lifted["paused"]["scheduler_schedules"]["alpha-engine-sf-watch-liveness-1445-daily"]
+    monkeypatch.setattr(module, "load_manifest", lambda: lifted)
+    monkeypatch.setattr(module, "_live_state", lambda surface, name: "DISABLED")
+    monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: False)
+    acted: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        module, "_set_alarm_actions",
+        lambda name, enabled: acted.append((name, enabled)))
+    module.enforce(alarms_only=True)
+    acted_names = {n for n, _ in acted}
+    assert "alpha-engine-watch-plane-sf-watch-liveness-probe-errors" in acted_names
+    assert ("alpha-engine-watch-plane-sf-watch-liveness-probe-errors", True) in acted, (
+        "the un-paused entry's alarm must be RE-ENABLED, not disabled again"
+    )
+
+
+def test_enforce_alarms_only_never_disables_a_trigger(module, monkeypatch):
+    disabled: list[str] = []
+    monkeypatch.setattr(module, "_live_state", lambda surface, name: "ENABLED")
+    monkeypatch.setattr(module, "_disable", lambda surface, name: disabled.append(name))
+    monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: False)
+    monkeypatch.setattr(module, "_set_alarm_actions", lambda name, enabled: None)
+    module.enforce(alarms_only=True)
+    assert disabled == [], "enforce(alarms_only=True) touched a trigger"
+
+
+def test_ci_reconciles_alarm_actions_alarms_only(module):
+    wf = WORKFLOW.read_text(encoding="utf-8")
+    assert "automation_pause.py --enforce --alarms-only" in wf, (
+        "the daily/on-push sweep does not reconcile alarm-action state, so an "
+        "un-pause never re-arms its alarm without a hand-run command"
+    )
+
+
+def test_alarms_are_silenced_not_deleted(module):
+    # Property 1: history/config survive. The mutation surface must never
+    # contain a delete verb for an alarm.
+    import inspect
+    src = inspect.getsource(module)
+    assert "delete-alarms" not in src, (
+        "a paused alarm must be silenced (disable-alarm-actions), never deleted"
+    )
