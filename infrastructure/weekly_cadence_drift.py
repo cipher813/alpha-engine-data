@@ -45,6 +45,7 @@ import argparse
 import json
 import subprocess
 import sys
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 MANIFEST = Path(__file__).parent.resolve() / "weekly_cadence.json"
@@ -57,15 +58,62 @@ def load_manifest(path: Path = MANIFEST) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def declared_cadence(manifest: dict | None = None) -> str:
-    m = manifest if manifest is not None else load_manifest()
-    value = m.get("exercise_cadence")
-    if value not in ALLOWED_VALUES:
+def _today() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def _cadence_entries(raw: object) -> list[tuple[date, str]]:
+    """Parse ``exercise_cadence``'s dated-history shape (alpha-engine-config-
+    I7175) into ``(effective_from, value)`` pairs sorted ascending.
+
+    Deliberately a small local duplicate of
+    ``scripts/weekly_sf_silence_deadman.py``'s ``CadenceEntry``/
+    ``_parse_cadence_history`` rather than a cross-import: this script is
+    invoked standalone by ``deploy-infrastructure.sh`` and intentionally
+    carries zero non-stdlib dependencies (see module docstring). Both places
+    parse the same manifest shape; a second real adoption is
+    `policy-shared-code`'s trigger to lift this into ``nousergon_lib`` rather
+    than duplicate a third time.
+    """
+    if not isinstance(raw, list) or not raw:
         raise ValueError(
-            f"infrastructure/weekly_cadence.json exercise_cadence={value!r} is not one of "
-            f"{sorted(ALLOWED_VALUES)}"
+            f"infrastructure/weekly_cadence.json exercise_cadence must be a non-empty list of "
+            f"{{value, effective_from}} entries, got {raw!r}"
         )
-    return value
+    entries: list[tuple[date, str]] = []
+    for item in raw:
+        if not isinstance(item, dict) or "value" not in item or "effective_from" not in item:
+            raise ValueError(f"exercise_cadence entry malformed (needs value + effective_from): {item!r}")
+        value = item["value"]
+        if value not in ALLOWED_VALUES:
+            raise ValueError(
+                f"infrastructure/weekly_cadence.json exercise_cadence entry value={value!r} is not one of "
+                f"{sorted(ALLOWED_VALUES)}"
+            )
+        entries.append((date.fromisoformat(item["effective_from"]), value))
+    entries.sort(key=lambda e: e[0])
+    return entries
+
+
+def declared_cadence(manifest: dict | None = None, today: date | None = None) -> str:
+    """The cadence value in force as of ``today`` (default: real wall-clock
+    today) — the single scalar SSM can hold. Historical entries are not
+    reachable from here; only ``scripts/weekly_sf_silence_deadman.py`` reads
+    the full history, to judge past dates SSM was never asked about."""
+    m = manifest if manifest is not None else load_manifest()
+    entries = _cadence_entries(m.get("exercise_cadence"))
+    as_of = today if today is not None else _today()
+    in_force: str | None = None
+    for effective_from, value in entries:
+        if effective_from <= as_of:
+            in_force = value
+        else:
+            break
+    if in_force is None:
+        raise ValueError(
+            f"infrastructure/weekly_cadence.json: no exercise_cadence entry is in force on {as_of.isoformat()}"
+        )
+    return in_force
 
 
 def _aws(args: list[str]) -> tuple[int, str, str]:
