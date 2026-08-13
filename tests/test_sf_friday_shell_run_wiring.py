@@ -535,6 +535,20 @@ def orig_spot_cmds() -> dict:
       git.lock` so they serialise instead of racing — a deliberate,
       reviewed absent-path change confined to these 3 keys.
 
+    - **Regenerated 2026-08-13 (second pass)**, same incident, two defects in
+      the entry above. (a) `/var/lock` is `0755 root:root` on AL2023, so
+      `sudo -u ec2-user flock /var/lock/<f>` exits 66 `Permission denied` —
+      verified live on i-0fbfe2c1f3d89a835 — which under `set -eo pipefail`
+      would have killed all 3 parity stages on command 0 every week.
+      (b) A per-Parallel lock inode cannot serialise against the concurrent
+      writers OUTSIDE the SF (`boot-pull.service`, `CodeFreshnessGate`,
+      `ChronicGapSelfHeal`), which already lock
+      `/home/ec2-user/.ae-git-sync.lock`. All pulls now use that one inode,
+      and the guard is extended from the 3 ParityParallel branches to ALL 24
+      SF-issued pulls — the race is a property of any two concurrent writers
+      to a checkout, not of the Parallel state that happened to expose it.
+      See `tests/test_sf_git_pull_serialized.py`.
+
     Regenerate ONLY on a deliberate, reviewed change to a spot state's
     absent-path (`preflight_args=""`) command, by re-extracting the
     resolved spot commands from the new `origin/main` SF.
