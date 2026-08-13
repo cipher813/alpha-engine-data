@@ -136,6 +136,32 @@ def test_the_counter_always_exists(states):
     assert '"substrate_relaunch_attempts":0' in blob
 
 
+def test_the_launcher_box_is_on_demand_from_the_first_launch(states):
+    """config-I7120: the FIRST launch is on-demand too, not only the relaunch.
+
+    The launcher box is the single shared substrate every stage addresses via
+    ``$.ec2_instance_id``. ``SubstrateRelaunchGate`` (config-I7119) recovers the
+    8 top-level substrate-lost sites; the 5 inside ``ResearchPredictorParallel``
+    are structurally unreachable from it (a Parallel branch cannot transition to
+    a top-level state) and sit in the LARGEST exposure window of the run. The
+    only measure covering all 13 is removing the reclaim rather than recovering
+    from it.
+
+    This is a deliberate, written deviation from cost-management-policy's
+    interruptible-by-default: the box is a pure orchestrator (the expensive
+    compute runs on the NESTED spots it launches, which stay spot), so the delta
+    is roughly $0.2-0.7 per run against a lost weekly belief-refresh cycle.
+    Flipping it back to spot is a one-key diff and must be a deliberate ruling,
+    which is why it is pinned here rather than left to the definition.
+    """
+    payload = states["DispatchWeeklyFreshnessSpot"]["Parameters"]["Payload"]
+    assert payload.get("force_on_demand") is True, (
+        "the weekly launcher box must launch ON-DEMAND from the start — a "
+        "reclaim of this one box kills the whole execution, and the 5 "
+        "in-Parallel substrate-lost sites have no recovery path (config-I7120)"
+    )
+
+
 def test_relaunch_forces_on_demand(states):
     """Spot-first would re-enter the pool that just reclaimed the box."""
     payload = states["RelaunchWeeklyFreshnessSpot"]["Parameters"]["Payload"]
