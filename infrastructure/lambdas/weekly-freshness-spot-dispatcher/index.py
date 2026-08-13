@@ -127,10 +127,36 @@ DISPATCH_ENABLED = (
 # spot_backtest.sh — same AMI/instance-type family/subnets the nested spots
 # THIS box itself launches already use, so a c5.large-class launcher is
 # consistent with the rest of the fleet's Saturday spend). ───────────────────
+# Widened 4 -> 10 types across 6 families (alpha-engine-config-I7133).
+#
+# The four originals are all 2-vCPU x86 compute/general types of adjacent
+# generations, which is a NARROW capacity surface: `launch_with_fallback`
+# rotates instance_type x subnet, so the number of distinct pools it can fall
+# through is what decides whether a capacity dip is survivable. Measured
+# 2026-08-12: 3 of 11 recent spot requests in this account died
+# `instance-terminated-no-capacity`, one of them mid-DataPhase1 on the
+# scheduled weekly run (config-I7119).
+#
+# I7119 makes a mid-run reclaim RECOVERABLE. This makes it RARER, which is the
+# better half — a recovery still costs a relaunch, a re-bootstrap and the
+# stage's runtime. Recovery is the floor, not the goal.
+#
+# Every addition is x86_64 (the AMI below is x86_64 AL2023 — an arm64 type
+# would fail the architecture check at launch), 2 vCPU, and >= the 4 GiB of
+# the c5.large that already runs this workload successfully; the m/r families
+# are strictly more memory. All 10 verified offered in 5 of the 6 subnets'
+# AZs on 2026-08-12.
+#
+# No IAM change needed: this Lambda's LaunchWeeklyFreshnessSpot statement is
+# `ec2:RunInstances` on `Resource: "*"` with no instance-type Condition, so
+# there is no config#2271-style enumeration to keep in lockstep here (unlike
+# alert-drain-dispatcher / ci-watch-dispatcher, which do enumerate).
 INSTANCE_TYPES = [
     t.strip()
     for t in os.environ.get(
-        "WEEKLY_SPOT_INSTANCE_TYPES", "c5.large,m5.large,c6i.large,c5a.large"
+        "WEEKLY_SPOT_INSTANCE_TYPES",
+        "c5.large,m5.large,c6i.large,c5a.large,m6i.large,"
+        "m5a.large,c6a.large,m6a.large,r5.large,r6i.large",
     ).split(",")
     if t.strip()
 ]
