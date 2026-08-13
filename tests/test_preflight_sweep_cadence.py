@@ -1,0 +1,168 @@
+"""The declared cadence and every surface derived from it cannot disagree
+(alpha-engine-config-I7249, sf-pipeline-policy §2.6).
+
+§2.6's test is: "can an operator, reading ONE named file, answer 'when does
+this run next, and what pages if it doesn't?' If two files must be read, the
+declaration does not exist yet."
+
+``infrastructure/preflight_sweep_cadence.json`` is that file. These tests are
+what stop it from becoming a comment — they assert the CloudFormation
+schedule, the deadman's evaluation window and the console rows' staleness
+threshold are all the SAME value it declares, so the manifest cannot drift
+into being a description of what someone intended.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+
+import pytest
+import yaml
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+CADENCE_PATH = REPO / "infrastructure" / "preflight_sweep_cadence.json"
+CFN_PATH = REPO / "infrastructure" / "cloudformation" / "alpha-engine-orchestration.yaml"
+DESCRIPTOR_PATH = REPO / "registry.d" / "ae-preflight-sweep.yaml"
+
+RULE = "PreflightSweepDailyTrigger"
+ALARM = "PreflightSweepDeadman"
+
+
+@pytest.fixture(scope="module")
+def cadence() -> dict:
+    return json.loads(CADENCE_PATH.read_text())
+
+
+@pytest.fixture(scope="module")
+def template() -> dict:
+    class _Loader(yaml.SafeLoader):
+        pass
+
+    # CloudFormation short forms (!Ref, !GetAtt, !Sub) are not plain YAML.
+    def _tag(loader, node):
+        if isinstance(node, yaml.ScalarNode):
+            return loader.construct_scalar(node)
+        if isinstance(node, yaml.SequenceNode):
+            return loader.construct_sequence(node)
+        return loader.construct_mapping(node)
+
+    for tag in ("!Ref", "!GetAtt", "!Sub", "!Join", "!Select", "!ImportValue", "!Equals",
+                "!If", "!Not", "!And", "!Or", "!FindInMap", "!Split", "!Base64", "!Cidr"):
+        _Loader.add_constructor(tag, _tag)
+    _Loader.add_multi_constructor("!", lambda l, s, n: _tag(l, n))
+    return yaml.load(CFN_PATH.read_text(), Loader=_Loader)
+
+
+def test_the_declaration_is_self_consistent(cadence):
+    assert cadence["sweep_cadence"] in cadence["allowed_values"]
+    assert cadence["cadence_minutes"] > 0
+    assert cadence["staleness_factor"] >= 1
+
+
+def test_the_schedule_does_not_hard_require_the_lambda_to_exist(template):
+    """AWS::Lambda::Permission validates its FunctionName; an Events::Rule
+    target ARN does not. Declaring the permission in this stack would mean an
+    un-bootstrapped Lambda fails the WHOLE orchestration stack update on the
+    next merge — reddening deploy-infrastructure for every unrelated commit.
+    The deadman going red is the correct detector instead."""
+    resources = template["Resources"]
+    permissions = [
+        name
+        for name, body in resources.items()
+        if body.get("Type") == "AWS::Lambda::Permission"
+        and "PreflightSweep" in name
+    ]
+    assert permissions == [], (
+        "the preflight-sweep invoke permission belongs in deploy.sh --bootstrap, "
+        "not in this stack"
+    )
+
+
+def test_the_cloudformation_schedule_is_the_declared_cron(cadence, template):
+    rule = template["Resources"][RULE]["Properties"]
+    assert rule["ScheduleExpression"] == cadence["cron_utc"]
+
+
+def test_a_daily_declaration_means_the_rule_is_enabled(cadence, template):
+    rule = template["Resources"][RULE]["Properties"]
+    if cadence["sweep_cadence"] == "daily":
+        assert rule["State"] == "ENABLED"
+
+
+def test_the_deadman_window_is_derived_from_the_declared_cadence(cadence, template):
+    alarm = template["Resources"][ALARM]["Properties"]
+    assert alarm["Period"] == cadence["cadence_minutes"] * 60
+    # staleness_factor 1.5 rounded up to whole periods = 2. A single late run
+    # must not page; a dead sweep must.
+    assert alarm["EvaluationPeriods"] == 2
+
+
+def test_the_deadman_treats_missing_data_as_breaching(template):
+    """An absence alarm set to notBreaching is blind in the exact direction it
+    exists to watch, and its green is the dangerous reading
+    (observability-policy §9.2a)."""
+    alarm = template["Resources"][ALARM]["Properties"]
+    assert alarm["TreatMissingData"] == "breaching"
+
+
+def test_the_deadman_watches_the_metric_emitted_on_every_terminal_path(template):
+    alarm = template["Resources"][ALARM]["Properties"]
+    assert alarm["Namespace"] == "AlphaEngine"
+    assert alarm["MetricName"] == "PreflightSweepRunCompleted"
+    assert {"Name": "Component", "Value": "ae-preflight-sweep"} in alarm["Dimensions"]
+
+
+def test_recovery_notifies_symmetrically_with_failure(template):
+    """observability-policy §7.2: recovery notifies symmetrically. An alarm
+    that pages on break and goes quiet on repair leaves the operator unable to
+    tell 'fixed' from 'still broken, nobody looked'."""
+    alarm = template["Resources"][ALARM]["Properties"]
+    assert alarm.get("OKActions"), "the deadman must announce its own recovery"
+
+
+def test_the_console_descriptor_declares_the_same_cadence(cadence):
+    descriptor = yaml.safe_load(DESCRIPTOR_PATH.read_text())
+    bindings = [descriptor["runs"], descriptor["metrics"]]
+    for binding in bindings:
+        assert binding["cadence_minutes"] == cadence["cadence_minutes"], (
+            "a console row whose declared cadence differs from the sweep's own "
+            "would render STALE early or late — either way on a threshold "
+            "nobody declared"
+        )
+
+
+def test_the_descriptor_names_the_component_id_every_surface_uses(cadence):
+    descriptor = yaml.safe_load(DESCRIPTOR_PATH.read_text())
+    assert descriptor["component_id"] == "ae-preflight-sweep"
+    assert descriptor["lifecycle"] == "in-service"
+    assert descriptor["owner"]
+
+
+# ── The template must stay deployable ────────────────────────────────────────
+
+# CloudFormation's inline --template-body ceiling. infrastructure/
+# deploy-infrastructure.sh passes `--template-body file://` for BOTH
+# validate-template and create/update-stack, and that workflow runs on EVERY
+# push to main with no path filter — so a template that crosses this ceiling
+# does not fail the PR that did it, it fails every subsequent merge's infra
+# deploy, for changes whose authors have no idea why.
+#
+# Measured 2026-08-13 while adding the preflight-sweep resources: main was
+# already at 48015 of 51200 bytes, under 7% headroom, with nothing anywhere
+# reporting that. The structural fix is to upload the template to S3 and use
+# --template-url (1MB ceiling) — filed separately; this test is the guard that
+# turns a silent deploy break into a merge-time failure in the meantime.
+CFN_INLINE_BODY_LIMIT = 51200
+
+
+def test_the_orchestration_template_still_fits_the_inline_deploy_limit():
+    size = len(CFN_PATH.read_bytes())
+    assert size <= CFN_INLINE_BODY_LIMIT, (
+        f"{CFN_PATH.name} is {size} bytes, over CloudFormation's "
+        f"{CFN_INLINE_BODY_LIMIT}-byte inline --template-body ceiling. "
+        "deploy-infrastructure.sh passes the template inline on EVERY push to "
+        "main, so this breaks the infra deploy for every subsequent merge, not "
+        "just this change. Either trim, or switch deploy-infrastructure.sh to "
+        "an S3 --template-url upload (1MB ceiling)."
+    )

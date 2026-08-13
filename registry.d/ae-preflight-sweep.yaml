@@ -1,0 +1,73 @@
+# Console descriptor for the all-stage weekly-SF preflight sweep.
+#
+# console-policy §2.6: onboarding a module is writing THIS FILE, committed
+# beside the thing it describes and pointing at where the facts ALREADY live.
+# Nothing about the console changes to render this component — no adapter, no
+# template, no config entry keyed on its name.
+#
+# The per-STAGE rows are not declared here on purpose. They are check-result
+# envelopes at ops/checks/ae-preflight-stage-<Stage>/latest.json, read by the
+# existing `checks-envelope` adapter, which derives each row's freshness from
+# the envelope's own ran_at against its cadence_minutes. Enumerating stages in
+# this file would put a hand-maintained list between the pipeline and its own
+# console rows, and that list would drift exactly the way every hand-maintained
+# monitored-things list drifts — invisibly, in the direction of looking
+# complete. The stage set is derived from infrastructure/step_function.json on
+# every run instead, so a stage added to the pipeline appears on the console by
+# itself and a stage with no verdict is counted as UNOBSERVED by the roll-up
+# below rather than omitted from the denominator.
+component_id: ae-preflight-sweep
+owning_repo: nousergon-data
+substrate: eventbridge+ec2-spot
+origin: aws:events:alpha-engine-preflight-sweep-daily
+owner: brian
+lifecycle: in-service
+authority_tier: observe-and-report
+
+# Executions: the dispatcher Lambda that provisions the launcher box and sends
+# the sweep command. Did it run, did it finish, did it miss.
+runs:
+  driver: object-store
+  key: "s3://alpha-engine-research/_preflight_sweep/latest.json"
+  cadence_minutes: 1440
+
+# The sweep's own numbers, read from the structured run report it already
+# writes — addressed by FIELD NAME, never by a pattern over prose.
+metrics:
+  driver: document-fields
+  documents:
+    - key: "s3://alpha-engine-research/_preflight_sweep/latest.json"
+      fields:
+        outcome: {render: text}
+        measured: {render: text}
+        unmeasured_reason: {render: text}
+        stages_declared: {unit: count, render: count}
+        stages_passed: {unit: count, render: count}
+        stages_failed: {unit: count, baseline: 0, render: count}
+        stages_unmeasured: {unit: count, baseline: 0, render: count}
+        stages_unsweepable: {unit: count, baseline: 0, render: count}
+        definition_sha: {render: text}
+    - key: "s3://alpha-engine-research/ops/checks/ae-preflight-sweep/latest.json"
+      fields:
+        stages_expected: {unit: count, render: count}
+        stages_reported: {unit: count, render: count}
+        # The transparency number for this component: stages the pipeline
+        # declares that produced no verdict at all. Published even at zero —
+        # a coverage figure that only appears when non-zero cannot be told
+        # apart from health when it is absent.
+        stages_unobserved: {unit: count, baseline: 0, render: count}
+        declared_cadence: {render: text}
+  cadence_minutes: 1440
+
+produces:
+  - "_preflight_sweep/latest.json"
+  - "_preflight_sweep/last_clean.json"
+  - "ops/checks/ae-preflight-sweep/latest.json"
+
+# The direction that matters: who breaks if this is stale. The sweep reads the
+# live SF definition to derive its own denominator, so a definition change it
+# cannot parse is a sweep that measures the wrong pipeline.
+consumes:
+  - "nousergon-data:infrastructure/step_function.json"
+  - "nousergon-data:infrastructure/preflight_sweep_manifest.json"
+  - "nousergon-data:infrastructure/preflight_sweep_cadence.json"

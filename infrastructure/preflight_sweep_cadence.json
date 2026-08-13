@@ -1,0 +1,18 @@
+{
+  "sweep_cadence": "daily",
+
+  "cron_utc": "cron(0 8 ? * * *)",
+  "cadence_minutes": 1440,
+  "staleness_factor": 1.5,
+
+  "_purpose": "THE single declared cadence parameter for the all-stage --preflight-only sweep (sf-pipeline-policy §2.6: one value, one file, deployed by merge). An operator reading THIS FILE alone can answer 'when does the sweep run next, and what pages if it does not?' — if two files must be read, the declaration does not exist. Every other surface derives from the values above rather than restating them: infrastructure/cloudformation/alpha-engine-orchestration.yaml's PreflightSweepDailyTrigger carries cron_utc, its PreflightSweepDeadman alarm derives its evaluation window from cadence_minutes x staleness_factor, the console's checks-envelope rows carry cadence_minutes so a row older than its own cadence renders STALE rather than as its last verdict, and the dispatcher Lambda re-reads sweep_cadence at invoke time. tests/test_preflight_sweep_cadence.py asserts the CFN template and this manifest cannot disagree.",
+
+  "_meaning": {
+    "daily": "The sweep runs every day at cron_utc. Chosen over 'weekly, ahead of Saturday' because the weekly pipeline's own exercise cadence is currently DAILY (infrastructure/weekly_cadence.json, Brian ruling 2026-07-29) — a weekly precondition check would grade a pipeline that runs five times more often than it. 08:00 UTC is ~10h after the postclose exercise launch and ~13h before the next, so the result is on the console before the operator's morning either way.",
+    "off": "No sweep is expected. The dispatcher returns a DECLARED SKIP with its own metric (PreflightSweepDeclaredOff), which is what keeps 'gated off by declaration' distinguishable from 'the sweep died' on the deadman's surface: the deadman watches for the absence of PreflightSweepRunCompleted, and a declared-off day is expected to be absent. Flipping to 'off' is a ruling, not tuning (sf-pipeline-policy §2.6)."
+  },
+
+  "_deadman": "A day the declared cadence expects a sweep and no sweep exists MUST page. The subject is the CloudWatch metric AlphaEngine/PreflightSweepRunCompleted (Component=ae-preflight-sweep), emitted on EVERY terminal path including a run that could not measure — so its absence means the sweep never reported at all, which is the only condition the alarm fires on. TreatMissingData is 'breaching' (observability-policy §9.2a: an absence alarm that treats missing data as notBreaching is blind in the direction it exists to watch). A run that DID report but could not measure is a separate, louder signal: it publishes its own SNS notification and writes an 'attention' console row; it does not also trip the deadman, so one incident produces one notification (observability-policy §7.2a).",
+
+  "allowed_values": ["daily", "off"]
+}

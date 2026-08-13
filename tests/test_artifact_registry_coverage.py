@@ -89,6 +89,24 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # alpha-engine-config-PR7225; pinned here so this repo's guard is honest
     # about the new PUT site either way.
     "validators/stage_output_sweep.py": 1,
+    # alpha-engine-config-I7249 — the daily all-stage --preflight-only sweep's
+    # own outputs, written by AwsSurface.put_json/put_text from emit():
+    #   _preflight_sweep/{run_id}/report.json   (the run's durable record)
+    #   _preflight_sweep/latest.json            (console + descriptor pointer)
+    #   _preflight_sweep/last_clean.json        (advanced ONLY on an all-pass run)
+    #   _preflight_sweep/{run_id}/stages/*.log  (per-stage evidence)
+    #   ops/checks/ae-preflight-*/latest.json   (one console row per stage)
+    #
+    # Same argument as the stage-output sweep above, on the other axis: this is
+    # the detector for whether each weekly stage CAN START, and a detector whose
+    # own silence goes unnoticed is the defect it exists to catch, one layer up.
+    # Its deadman (alpha-engine-preflight-sweep-no-run, TreatMissingData
+    # breaching) covers total silence; this pin keeps the PUT sites honest.
+    #
+    # 2 = the put_json/put_text call sites the scanner counts, not the number
+    # of objects a run writes: emit() loops one put_json over the per-stage
+    # console rows, and the report/latest/last_clean writes share a call site.
+    "infrastructure/preflight_sweep.py": 2,
     "builders/_price_cache_writeboth.py": 2,
     # universe_freshness.json + weekly/<date>/manifest.json (schema_drift_incidents,
     # config#1150) + feature_store/_freshness.json (ArcticDB freshness-monitor
