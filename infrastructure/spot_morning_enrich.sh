@@ -141,4 +141,20 @@ WORKLOAD
 )" "${MAX_RUNTIME_SECONDS}"
 
 emit_heartbeat
+
+# ── Per-stage output assertion (config-I7214) ────────────────────────────────
+# sf-pipeline-policy.md §2.1: assert THIS stage wrote what it declared, at the
+# boundary where the fact becomes knowable — not three hours later at the
+# pipeline's convergence point, where a miss can no longer be attributed to a
+# stage still in flight. Placed AFTER the workload and after both early-exit
+# paths above, so the Friday preflight-only and smoke-only runs — which write
+# nothing by design — never reach it and never report 43 false misses.
+#
+# OBSERVE MODE: the CLI exits 0 for every verdict. `|| echo ... >&2` rather
+# than `|| true` deliberately — a bare `|| true` would make an unreachable
+# assertion indistinguishable from a covered stage, which is the exact silence
+# this mechanism exists to remove. Promotion to enforcing is one flag
+# (`--enforce`), guarded by tests/test_spot_stage_coverage_assertions.py.
+"$LIB_PYTHON" -m krepis.stage_coverage assert --stage MorningEnrich --window-start "$_STAGE_WINDOW_START" || echo "WARNING: stage-coverage assertion did not run for MorningEnrich (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
+
 echo "==> Morning-enrich complete."

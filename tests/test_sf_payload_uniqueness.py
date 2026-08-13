@@ -126,7 +126,13 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "Counterfactual": frozenset(
         {"dry_run_llm.$", "end_time_iso.$", "max_depth", "window_days"}
     ),
-    "AggregateCosts": frozenset({"date.$", "dry_run_llm.$"}),
+    # `coverage` (config-I7179) is the fan-in declaration: which stages must
+    # have produced a cost record by the time the aggregator reads
+    # _cost_raw/{date}/. It is a nested object rather than a flat key because
+    # the denominator is a SET per stage — the defect it detects (every record
+    # in the prefix coming from one producer that is no longer in this
+    # pipeline) is invisible to any count.
+    "AggregateCosts": frozenset({"date.$", "dry_run_llm.$", "coverage"}),
     # Evaluator Report Card v2 (Layer B) — alpha-engine-evaluator:live. Builds
     # evaluator/{date}/report_card.json; non-fatal (own Catch → notify gate).
     # dry_run.$=$.research_dry → no-write on the Friday preflight (ROADMAP L4504).
