@@ -46,6 +46,7 @@
           "action": "check_weekly_run_day"
         }
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
@@ -553,6 +554,7 @@
         },
         "ConditionExpression": "attribute_not_exists(mutex_key)"
       },
+      "TimeoutSeconds": 30,
       "Retry": [
         {
           "ErrorEquals": [
@@ -1179,7 +1181,7 @@
                   "action.$": "$.regime_action"
                 }
               },
-              "TimeoutSeconds": 360,
+              "TimeoutSeconds": 270,
               "Retry": [
                 {
                   "ErrorEquals": [
@@ -1603,7 +1605,7 @@
                   "action.$": "$.regime_action"
                 }
               },
-              "TimeoutSeconds": 660,
+              "TimeoutSeconds": 570,
               "Retry": [
                 {
                   "ErrorEquals": [
@@ -2155,7 +2157,7 @@
                   "dry_run_llm.$": "$.research_dry"
                 }
               },
-              "TimeoutSeconds": 900,
+              "TimeoutSeconds": 960,
               "Retry": [
                 {
                   "ErrorEquals": [
@@ -2328,7 +2330,7 @@
                   "dry_run_llm.$": "$.research_dry"
                 }
               },
-              "TimeoutSeconds": 900,
+              "TimeoutSeconds": 960,
               "Retry": [
                 {
                   "ErrorEquals": [
@@ -2456,7 +2458,7 @@
                   "dry_run_llm.$": "$.research_dry"
                 }
               },
-              "TimeoutSeconds": 600,
+              "TimeoutSeconds": 270,
               "Retry": [
                 {
                   "ErrorEquals": [
@@ -2630,6 +2632,7 @@
                 "Bucket": "alpha-engine-research",
                 "Key": "predictor/weights/meta/manifest.json"
               },
+              "TimeoutSeconds": 30,
               "ResultSelector": {
                 "manifest_last_modified_date.$": "States.ArrayGetItem(States.StringSplit($.LastModified, 'T'), 0)"
               },
@@ -6320,6 +6323,7 @@
         "ContentType": "application/json",
         "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"substrate_relaunches\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, $.substrate_relaunch_attempts)"
       },
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
