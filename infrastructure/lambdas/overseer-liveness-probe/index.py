@@ -27,6 +27,13 @@ Check types (discriminated union on ``type`` — contract in playbooks.schema.js
                                 dispatcher decision log), an S3 run artifact's
                                 run_start landed in [T, T+ceiling+margin].
   * ``sqs_queue_exists``      — queue (and optional DLQ) exists.
+  * ``sqs_dlq_content``       — non-destructive DLQ content summary (count,
+                                date range, severity histogram, top sources)
+                                shipped to S3 + a CloudWatch metric; every
+                                error/critical body becomes a finding
+                                (alpha-engine-config-I7042 — a depth alarm
+                                answers "is something wrong", this answers
+                                "what was lost").
   * ``scheduler_schedule_exists`` — EventBridge Scheduler schedule (a distinct
                                 resource type from ``eventbridge_rule``) exists
                                 and is ENABLED (alpha-engine-config-I2906).
@@ -174,6 +181,10 @@ def _ec2_client():
 
 def _sqs_client():
     return boto3.client("sqs", region_name=REGION)
+
+
+def _cloudwatch_client():
+    return boto3.client("cloudwatch", region_name=REGION)
 
 
 def _scheduler_client():
@@ -388,6 +399,171 @@ def _queues_to_check(spec: dict) -> list[tuple[str, str]]:
     if spec.get("expect_dlq"):
         out.append((spec["expect_dlq"], "intake DLQ"))
     return out
+
+
+# ── Check: sqs_dlq_content (alpha-engine-config-I7042) ───────────────────────
+# A depth alarm answers "is something wrong"; this answers "what was lost".
+# 138 nousergon.alert.v1 events (incl. 3 CRITICAL freshness pages) sat in
+# nousergon-overseer-intake-dlq for 12 days with no signal but a >=1 depth
+# alarm nobody could read (no groom tier had SQS access — see I7042). This
+# check samples the DLQ NON-DESTRUCTIVELY (short VisibilityTimeout; nothing is
+# ever deleted — receive-only, ReceiveMessage/GetQueueAttributes/GetQueueUrl,
+# never DeleteMessage/PurgeQueue), writes a structured summary to a durable S3
+# location every run (count, date range, severity histogram, top sources), and
+# turns the FULL BODY of every error/critical message into a liveness finding
+# — so new severe content pages via the existing per-problem dedup + Telegram
+# path, and is silent once no severe message is new. A DlqSevereMessageCount
+# CloudWatch metric is also published so an independent CW alarm can watch it.
+_DLQ_SAMPLE_MAX_DEFAULT = 500
+_DLQ_RECEIVE_VISIBILITY_SEC = 5   # short: never mutates redelivery accounting
+_DLQ_SEVERE = {"error", "critical"}
+_DLQ_BODY_TRUNC = 300
+
+
+def _dlq_parse_message(msg: dict) -> dict:
+    """Best-effort parse of one SQS message as the EventBridge nousergon.alert.v1
+    envelope. A message that fails to parse is reported as its own histogram
+    bucket ('unparseable') rather than silently dropped or raising — this
+    check must never itself become the reason a message goes unreported."""
+    raw = msg.get("Body", "")
+    try:
+        env = json.loads(raw)
+        detail = env.get("detail") if isinstance(env, dict) else None
+        if not isinstance(detail, dict):
+            raise ValueError("no 'detail' object")
+        severity = str(detail.get("severity", "unknown")).lower()
+        return {
+            "severity": severity,
+            "source": detail.get("source") or env.get("source") or "unknown",
+            "origin": detail.get("origin", "unknown"),
+            "occurred_at": detail.get("occurred_at"),
+            "body": detail.get("body", ""),
+            "parsed": True,
+        }
+    except Exception:  # noqa: BLE001 — a hostile/malformed body is a FINDING, not a crash
+        return {
+            "severity": "unparseable",
+            "source": "unknown",
+            "origin": "unknown",
+            "occurred_at": None,
+            "body": raw[:_DLQ_BODY_TRUNC],
+            "parsed": False,
+        }
+
+
+def _dlq_sample(sqs, queue_url: str, sample_max: int) -> list[dict]:
+    """Drain-free sample: repeated short-VisibilityTimeout ReceiveMessage calls
+    until either sample_max is reached or two consecutive empty polls (SQS
+    ReceiveMessage is best-effort per call; a single empty response does not
+    mean the queue is empty). Never calls DeleteMessage or PurgeQueue."""
+    out: list[dict] = []
+    consecutive_empty = 0
+    while len(out) < sample_max and consecutive_empty < 2:
+        resp = sqs.receive_message(
+            QueueUrl=queue_url,
+            MaxNumberOfMessages=min(10, sample_max - len(out)),
+            VisibilityTimeout=_DLQ_RECEIVE_VISIBILITY_SEC,
+            WaitTimeSeconds=1,
+            AttributeNames=["SentTimestamp"],
+        )
+        batch = resp.get("Messages", [])
+        if not batch:
+            consecutive_empty += 1
+            continue
+        consecutive_empty = 0
+        out.extend(batch)
+    return out
+
+
+def _check_sqs_dlq_content(spec: dict, now: datetime) -> tuple[list[dict], dict]:
+    """Sample ``dlq_name`` (read-only), summarize content, ship the summary to
+    S3, publish a CloudWatch metric, and surface every error/critical body as
+    a liveness finding. If the queue itself is absent this is silent — queue
+    existence is ``sqs_queue_exists``'s job, not this check's."""
+    dlq_name = spec["dlq_name"]
+    sample_max = int(spec.get("sample_max", _DLQ_SAMPLE_MAX_DEFAULT))
+    report_prefix = spec["report_prefix"].rstrip("/")
+
+    sqs = _sqs_client()
+    try:
+        queue_url = sqs.get_queue_url(QueueName=dlq_name)["QueueUrl"]
+    except Exception as exc:  # noqa: BLE001 — inspect code below; re-raise if unexpected
+        if _error_code(exc) in {"AWS.SimpleQueueService.NonExistentQueue", "QueueDoesNotExist"}:
+            return [], {}
+        raise
+
+    raw_messages = _dlq_sample(sqs, queue_url, sample_max)
+    parsed = [_dlq_parse_message(m) for m in raw_messages]
+    sent_ms = [
+        int(m["Attributes"]["SentTimestamp"])
+        for m in raw_messages
+        if m.get("Attributes", {}).get("SentTimestamp")
+    ]
+
+    severity_histogram: dict[str, int] = {}
+    origin_histogram: dict[str, int] = {}
+    for p in parsed:
+        severity_histogram[p["severity"]] = severity_histogram.get(p["severity"], 0) + 1
+        origin_histogram[p["origin"]] = origin_histogram.get(p["origin"], 0) + 1
+    top_sources = sorted(origin_histogram.items(), key=lambda kv: -kv[1])[:10]
+    severe = [p for p in parsed if p["severity"] in _DLQ_SEVERE]
+
+    summary = {
+        "queue": dlq_name,
+        "sampled_at": now.isoformat(),
+        "count": len(parsed),
+        "date_range": {
+            "earliest": (
+                datetime.fromtimestamp(min(sent_ms) / 1000, tz=timezone.utc).isoformat()
+                if sent_ms else None
+            ),
+            "latest": (
+                datetime.fromtimestamp(max(sent_ms) / 1000, tz=timezone.utc).isoformat()
+                if sent_ms else None
+            ),
+        },
+        "severity_histogram": severity_histogram,
+        "top_origins": [{"origin": o, "count": c} for o, c in top_sources],
+        "severe_messages": [
+            {"severity": p["severity"], "source": p["source"], "origin": p["origin"],
+             "occurred_at": p["occurred_at"], "body": p["body"]}
+            for p in severe
+        ],
+    }
+    report_key = f"{report_prefix}/{now:%Y-%m-%d}.json"
+    s3 = _s3_client()
+    s3.put_object(
+        Bucket=WATCH_BUCKET, Key=report_key,
+        Body=json.dumps(summary, indent=2, sort_keys=True).encode(),
+        ContentType="application/json",
+    )
+
+    cw = _cloudwatch_client()
+    cw.put_metric_data(
+        Namespace="AlphaEngine/Overseer",
+        MetricData=[{
+            "MetricName": "DlqSevereMessageCount",
+            "Dimensions": [{"Name": "QueueName", "Value": dlq_name}],
+            "Value": float(len(severe)),
+            "Unit": "Count",
+        }],
+    )
+
+    if not severe:
+        return [], {}
+
+    lines = [
+        f"[{p['severity'].upper()}] {p['occurred_at'] or '?'}  {p['origin']} — "
+        f"{p['body'][:_DLQ_BODY_TRUNC]}"
+        for p in severe
+    ]
+    finding = _finding(
+        "dlq-content",
+        f"{len(severe)} severe (error/critical) message(s) in DLQ '{dlq_name}' "
+        f"(of {len(parsed)} sampled)",
+        "\n".join(lines) + f"\n\nFull summary: s3://{WATCH_BUCKET}/{report_key}",
+    )
+    return [finding], {}
 
 
 # ── Check: scheduler_schedule_exists ─────────────────────────────────────────
@@ -1302,6 +1478,7 @@ CHECKERS = {
     "state_machines_exist": _check_state_machines_exist,
     "lambda_active": _check_lambda_active,
     "sqs_queue_exists": _check_sqs_queue_exists,
+    "sqs_dlq_content": _check_sqs_dlq_content,
     "run_window": _check_run_window,
     "scheduler_schedule_exists": _check_scheduler_schedule_exists,
     "sf_watch_invocation_success": _check_sf_watch_invocation_success,

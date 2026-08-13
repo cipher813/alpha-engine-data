@@ -567,6 +567,15 @@ watch_plane_liveness:
     - type: sqs_queue_exists
       queue_name: nousergon-overseer-intake
       expect_dlq: nousergon-overseer-intake-dlq
+    # alpha-engine-config-I7042: content, not depth. 138 alerts (3 CRITICAL)
+    # sat in the DLQ 2026-07-30..08-03 undiagnosable for 12 days behind a
+    # >=1 depth alarm and an AccessDenied groom role. Non-destructive sample
+    # -> S3 summary + CloudWatch metric + a liveness finding naming every
+    # severe body.
+    - type: sqs_dlq_content
+      dlq_name: nousergon-overseer-intake-dlq
+      sample_max: 500
+      report_prefix: overseer/dlq_reports/nousergon-overseer-intake-dlq
     - type: eventbridge_rule
       rule_name: overseer-intake-alert-events
       event_bus_name: nousergon-alerts
