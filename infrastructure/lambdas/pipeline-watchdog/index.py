@@ -195,6 +195,7 @@ from nousergon_lib.flow_doctor_fleet import PIPELINE_OBSERVER_TELEGRAM_TOPICS
 # ``main``), so this costs the Lambda no cold-start weight beyond the file.
 try:  # deployed layout: flat next to index.py in /var/task
     from weekly_sf_silence_deadman import (  # noqa: E402
+        _is_gate_noop,
         compute_expected_slots,
         evaluate,
         fetch_execution_records,
@@ -206,6 +207,7 @@ except ModuleNotFoundError:  # in-repo layout (pytest, ci.yml glob runner)
         0, str(Path(__file__).resolve().parents[3] / "scripts")
     )
     from weekly_sf_silence_deadman import (  # noqa: E402
+        _is_gate_noop,
         compute_expected_slots,
         evaluate,
         fetch_execution_records,
@@ -1090,18 +1092,40 @@ def _check_preopen_buffer(
 # visible-degrade terminal, which status-keyed watchers already engage on,
 # config#6692), page. Zero-execution days are deliberately excluded — that
 # is the never-fired case the ``_check_sf`` liveness checks above own.
+#
+# alpha-engine-config-I7036: the weekly SF (``ne-weekly-freshness-pipeline``)
+# joins this check now that ``WriteCompletionMarkerDegraded`` exists for it
+# (alpha-engine-config-I6891 / nousergon-data-PR1319, merged 2026-08-12). Its
+# cadence is NOT weekday-trading-day like the two entries above — the
+# expected cycle day is "day after the week's last trading session" (usually
+# Saturday, Friday/Thursday on a holiday-shortened week per real precedent
+# 2026-07-03), and the SF is ALSO chain-launched daily as a
+# ``pipeline_role=exercise`` dry exercise run and self-gates a 2s
+# ``WeeklyRunDayGateChoice`` SUCCEEDED no-op on every THU/FRI cron firing
+# that isn't the real day. Neither an exercise run nor a gate-skip may be
+# counted as the weekly cycle — see ``_weekly_real_statuses_for_day``, which
+# reuses ``weekly_sf_silence_deadman``'s own role/gate-noop discrimination
+# (``_is_gate_noop``) rather than re-deriving it, so this check and the
+# silence deadman below can never disagree about what a real weekly cycle
+# execution looks like.
 
 MARKER_BUCKET = os.environ.get("COMPLETION_MARKER_BUCKET", "alpha-engine-research")
 
-# (sf_label suffix, SF ARN, marker pipeline segment). Marker keys follow the
-# definitions' WriteCompletionMarker states: the {date} segment is the UTC
-# date-part of $$.Execution.StartTime — for both pipelines every legal start
-# (preopen 12:15 UTC, postclose ~20:15–23:00 UTC incl. the backstop path)
-# lands on the same UTC calendar date as the PT trading date, so a lookup by
-# PT trading date is exact.
+# (sf_label suffix, SF ARN, marker pipeline segment, cadence). Marker keys
+# follow the definitions' WriteCompletionMarker states: the {date} segment
+# is the UTC date-part of $$.Execution.StartTime — for the two
+# ``trading_day``-cadence pipelines every legal start (preopen 12:15 UTC,
+# postclose ~20:15–23:00 UTC incl. the backstop path) lands on the same UTC
+# calendar date as the PT trading date, so a lookup by PT trading day is
+# exact. The ``weekly``-cadence entry's target date is instead derived by
+# ``_last_due_weekly_day`` (the real cycle day, not a trading day) and its
+# execution count comes from ``_weekly_real_statuses_for_day`` instead of
+# the generic ``_statuses_for_day`` — see ``_check_failed_day``'s
+# ``cadence`` branch.
 _FAILED_DAY_PIPELINES = (
-    ("Weekday SF", WEEKDAY_SF_ARN, "ne-preopen-trading-pipeline"),
-    ("EOD SF", EOD_SF_ARN, "ne-postclose-trading-pipeline"),
+    ("Weekday SF", WEEKDAY_SF_ARN, "ne-preopen-trading-pipeline", "trading_day"),
+    ("EOD SF", EOD_SF_ARN, "ne-postclose-trading-pipeline", "trading_day"),
+    ("Weekly SF", SATURDAY_SF_ARN, "ne-weekly-freshness-pipeline", "weekly"),
 )
 
 
@@ -1204,22 +1228,89 @@ def _completion_marker_status(
         return "UNREADABLE"
 
 
+def _last_due_weekly_day(now_utc: datetime) -> Optional[date]:
+    """Most recent weekly-role run-slot day that is fully due, per the
+    silence deadman's own slot derivation (alpha-engine-config-I7036) — the
+    day AFTER the week's last trading session, never assumed to be Saturday
+    (a holiday-shortened week lands the real cycle on Friday or Thursday;
+    real precedent 2026-07-03). ``cadence`` is passed as ``"off"`` here
+    because ``compute_expected_slots`` only uses it to gate EXERCISE slots
+    (never-gated weekly slots per that function's own docstring) — this
+    call cares about weekly slots only, so no SSM read is needed here and
+    this check does not race the separate weekly-silence check's own SSM
+    fetch. Returns ``None`` only if the 14-day lookback contains no weekly
+    slot at all (should not happen in steady state; defensive).
+    """
+    through = last_due_day(now_utc.date())
+    slots = compute_expected_slots(
+        through,
+        cadence="off",
+        window_days=14,
+        is_trading_day=is_trading_day,
+        next_trading_day=next_trading_day,
+    )
+    weekly_days = sorted(s.day for s in slots if s.role == "weekly" and s.day <= through)
+    return weekly_days[-1] if weekly_days else None
+
+
+def _weekly_real_statuses_for_day(client: object, target_date: date) -> "dict[str, int]":
+    """Status counts of REAL (``pipeline_role="weekly"``, non-gate-noop)
+    executions on ``target_date`` (alpha-engine-config-I7036).
+
+    Reuses ``weekly_sf_silence_deadman.fetch_execution_records`` (role read
+    from each execution's own input, never inferred from name — no launch
+    path passes an explicit SF ``Name``) and ``_is_gate_noop`` (excludes a
+    SUCCEEDED execution that finished in under
+    ``GATE_NOOP_MAX_SECONDS`` — ``WeeklyRunDayGateChoice``'s designed ~2s
+    skip on a THU/FRI cron firing that isn't the real cycle day). An
+    ``exercise``-role execution never matches ``role != "weekly"``; a
+    ``shell-run`` (Friday-PM preflight) execution's role normalizes to
+    ``None`` and is excluded the same way. window_days=10 comfortably
+    covers ``target_date`` even on the longest holiday-shortened weeks
+    while capping the ``describe_execution`` fan-out this makes.
+    """
+    since_anchor = target_date + timedelta(days=2)
+    records = fetch_execution_records(client, window_days=10, today=since_anchor)
+    counts: "dict[str, int]" = {}
+    for record in records:
+        if record.role != "weekly":
+            continue
+        if record.start.astimezone(timezone.utc).date() != target_date:
+            continue
+        if _is_gate_noop(record):
+            continue
+        counts[record.status] = counts.get(record.status, 0) + 1
+    return counts
+
+
 def _check_failed_day(
     *,
     sf_label: str,
     sf_arn: str,
     pipeline_name: str,
     target_date: date,
+    cadence: str = "trading_day",
     client: Optional[object] = None,
     s3_client: Optional[object] = None,
 ) -> FailedDayCheckResult:
-    """Page when ``target_date`` (the most recent closed trading day) had
-    executions for this SF but none SUCCEEDED and no DEGRADED marker was
-    written. See the block comment above for why this exists."""
+    """Page when ``target_date`` had executions for this SF but none
+    SUCCEEDED (as a REAL cycle — see ``cadence``) and no DEGRADED marker was
+    written. See the block comment above for why this exists.
+
+    ``cadence="trading_day"`` (Weekday/EOD SFs): ``target_date`` is the most
+    recent closed trading day, and any execution starting that day counts.
+    ``cadence="weekly"`` (Weekly SF, alpha-engine-config-I7036):
+    ``target_date`` is the real weekly cycle day (see
+    ``_last_due_weekly_day``), and only ``pipeline_role="weekly"``,
+    non-gate-noop executions count — see ``_weekly_real_statuses_for_day``.
+    """
     if client is None:  # pragma: no cover — production path
         client = boto3.client("stepfunctions", region_name=REGION)
 
-    counts = _statuses_for_day(client, sf_arn, target_date)
+    if cadence == "weekly":
+        counts = _weekly_real_statuses_for_day(client, target_date)
+    else:
+        counts = _statuses_for_day(client, sf_arn, target_date)
     total = sum(counts.values())
     succeeded = counts.get("SUCCEEDED", 0)
 
@@ -1233,6 +1324,11 @@ def _check_failed_day(
             skip_reason=(
                 "no executions on the target day — never-fired is the "
                 "liveness checks' case, not this one's"
+                if cadence != "weekly"
+                else
+                "no real (non-gate-skip, pipeline_role=weekly) execution on "
+                "the target cycle day — deferred to the weekly-SF silence "
+                "deadman (never-fired), not double-paged here"
             ),
         )
     if succeeded > 0:
@@ -1244,6 +1340,8 @@ def _check_failed_day(
             succeeded_on_day=succeeded,
         )
 
+    day_label = "cycle day" if cadence == "weekly" else "trading day"
+
     running = counts.get("RUNNING", 0)
     if running > 0:
         # A prior-day execution still RUNNING at 14:00 UTC the next day is
@@ -1253,7 +1351,7 @@ def _check_failed_day(
         # silently deferring: an 18h run is itself a hang in the making.
         message = (
             f"{sf_label} ({pipeline_name}) still has {running} RUNNING "
-            f"execution(s) from trading day {target_date} at watchdog time — "
+            f"execution(s) from {day_label} {target_date} at watchdog time — "
             f"no SUCCEEDED execution for that day yet. This is at or beyond "
             f"the definition's top-level timeout horizon; investigate: "
             f"`aws stepfunctions list-executions --state-machine-arn {sf_arn} "
@@ -1302,14 +1400,21 @@ def _check_failed_day(
         "ABSENT": "no completion marker was written",
         "UNREADABLE": "the completion marker could not be read/parsed (UNKNOWN ≠ pass)",
     }.get(marker_status, f"completion marker status={marker_status!r}")
+    rerun_clause = (
+        "Recover with `python scripts/weekly_sf_rerun.py "
+        "--execution-arn <failed execution arn> --dry-run` (then `--start`)"
+        if cadence == "weekly"
+        else
+        "Recover mechanically with the rerun helper: "
+        "`python scripts/weekday_sf_rerun.py "
+        "--execution-arn <failed execution arn> --dry-run` (then `--start`)"
+    )
     message = (
-        f"{sf_label} ({pipeline_name}) FAILED trading day {target_date}: "
+        f"{sf_label} ({pipeline_name}) FAILED {day_label} {target_date}: "
         f"{total} execution(s) started, none SUCCEEDED, and {marker_clause}. "
         f"This is the independent started-but-never-succeeded detector "
         f"(sf-pipeline-policy §4.1, alpha-engine-config#6732) — do not assume "
-        f"the SF's own failure notification fired. Recover mechanically with "
-        f"the rerun helper: `python scripts/weekday_sf_rerun.py "
-        f"--execution-arn <failed execution arn> --dry-run` (then `--start`); "
+        f"the SF's own failure notification fired. {rerun_clause}; "
         f"list candidates: `aws stepfunctions list-executions "
         f"--state-machine-arn {sf_arn} --max-results 10`."
     )
@@ -1579,20 +1684,38 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         is_watch_day=is_trading_today,
     )
 
-    # Prior-day failed-run checks (config#6732). The target is the most
+    # Prior-day failed-run checks (config#6732, extended to the weekly SF by
+    # alpha-engine-config-I7036). The trading_day-cadence target is the most
     # recent CLOSED trading day, which exists on every calendar day — so
     # these run on weekends and holidays too (a Friday failure pages
-    # Saturday 14:00 UTC, not Monday).
-    failed_day_target = last_closed_trading_day(now_utc)
-    failed_day = [
-        _check_failed_day(
+    # Saturday 14:00 UTC, not Monday). The weekly-cadence target is instead
+    # the most recent DUE weekly cycle day (see ``_last_due_weekly_day`` —
+    # not a trading day, and not always Saturday).
+    failed_day_trading_target = last_closed_trading_day(now_utc)
+    failed_day_weekly_target = _last_due_weekly_day(now_utc)
+    failed_day: list = []
+    for label, arn, pipeline, cadence in _FAILED_DAY_PIPELINES:
+        if cadence == "weekly":
+            if failed_day_weekly_target is None:  # pragma: no cover — defensive
+                failed_day.append(FailedDayCheckResult(
+                    sf_label=label,
+                    checked=False,
+                    skip_reason=(
+                        "no weekly run-slot found in the 14-day lookback — "
+                        "cannot derive a target cycle day"
+                    ),
+                ))
+                continue
+            target_date = failed_day_weekly_target
+        else:
+            target_date = failed_day_trading_target
+        failed_day.append(_check_failed_day(
             sf_label=label,
             sf_arn=arn,
             pipeline_name=pipeline,
-            target_date=failed_day_target,
-        )
-        for label, arn, pipeline in _FAILED_DAY_PIPELINES
-    ]
+            target_date=target_date,
+            cadence=cadence,
+        ))
 
     # Weekly-SF silence deadman (config#6738). Runs on EVERY calendar day —
     # its own slot derivation is the trading-calendar gate, so there is no
