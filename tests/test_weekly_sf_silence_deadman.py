@@ -101,6 +101,47 @@ class TestComputeExpectedSlots:
             weekly = [s for s in slots if s.role == "weekly"]
             assert weekly and all(not s.gated_off for s in weekly), cadence
 
+    def test_a_slot_predating_the_first_declared_entry_is_gated_off(self, mod):
+        """alpha-engine-config-I7175: a slot on a date before any
+        exercise_cadence declaration existed is GATED_OFF ('the declaration
+        did not exist yet'), never CRITICAL ('expected and absent') — the
+        two are different states even though both are exit-0/non-paging."""
+        history = [mod.CadenceEntry(value="daily", effective_from=date(2026, 7, 27))]
+        today = date(2026, 7, 20)  # entirely before the only entry
+        slots = mod.compute_expected_slots(today, "daily", 3, is_trading_day, next_trading_day, cadence_history=history)
+        exercise = [s for s in slots if s.role == "exercise"]
+        assert exercise
+        assert all(s.gated_off for s in exercise)
+        results = mod.evaluate(slots, executions=[])
+        assert all(r.classification != "CRITICAL" for r in results if r.slot.role == "exercise")
+        assert all(r.classification == "GATED_OFF" for r in results if r.slot.role == "exercise")
+
+    def test_a_slot_on_or_after_the_first_entry_is_judged_normally(self, mod):
+        history = [
+            mod.CadenceEntry(value="weekly-only", effective_from=date(2026, 1, 1)),
+            mod.CadenceEntry(value="daily", effective_from=date(2026, 7, 27)),
+        ]
+        today = date(2026, 7, 28)
+        slots = mod.compute_expected_slots(today, "daily", 5, is_trading_day, next_trading_day, cadence_history=history)
+        by_day = {s.day: s for s in slots if s.role == "exercise"}
+        # 07-24 (Fri) predates the 'daily' entry -> gated off under weekly-only
+        assert by_day[date(2026, 7, 24)].gated_off is True
+        # 07-27/07-28 are on/after the daily entry -> ungated, a real slot
+        assert by_day[date(2026, 7, 27)].gated_off is False
+        assert by_day[date(2026, 7, 28)].gated_off is False
+        results = {r.slot.day: r.classification for r in mod.evaluate(slots, executions=[])}
+        assert results[date(2026, 7, 24)] == "GATED_OFF"
+        assert results[date(2026, 7, 27)] == "CRITICAL"
+        assert results[date(2026, 7, 28)] == "CRITICAL"
+
+    def test_omitting_cadence_history_preserves_the_flat_cadence_behavior(self, mod):
+        """The pipeline-watchdog Lambda calls compute_expected_slots
+        positionally without this argument — must be indistinguishable from
+        before I7175 when omitted."""
+        today = date(2026, 8, 9)
+        slots = mod.compute_expected_slots(today, "daily", 5, is_trading_day, next_trading_day)
+        assert all(not s.gated_off for s in slots if s.role == "exercise")
+
     def test_weekly_slot_lands_the_day_after_the_last_session(self, mod):
         """Friday 2026-08-07 is the week's last session; the real weekly run
         (WeeklyRunDayGateChoice self-gated true) lands 2026-08-08 (Saturday) —
@@ -177,6 +218,119 @@ class TestEvaluateSlot:
         execs = [mod.ExecutionRecord(name="w1", role="weekly", status="FAILED",
                                       start=start, stop=start + timedelta(hours=1))]
         assert mod.evaluate_slot(slot, execs).classification == "OK"
+
+
+class TestCadenceHistory:
+    """alpha-engine-config-I7175: the dated exercise_cadence history and its
+    date -> value resolver, independent of AWS or the calendar."""
+
+    def test_cadence_for_date_returns_none_before_the_first_entry(self, mod):
+        history = [mod.CadenceEntry(value="daily", effective_from=date(2026, 7, 27))]
+        assert mod.cadence_for_date(history, date(2026, 7, 26)) is None
+
+    def test_cadence_for_date_returns_the_entry_in_force(self, mod):
+        history = [
+            mod.CadenceEntry(value="weekly-only", effective_from=date(2026, 1, 1)),
+            mod.CadenceEntry(value="daily", effective_from=date(2026, 7, 27)),
+        ]
+        assert mod.cadence_for_date(history, date(2026, 7, 26)) == "weekly-only"
+        assert mod.cadence_for_date(history, date(2026, 7, 27)) == "daily"
+        assert mod.cadence_for_date(history, date(2026, 12, 31)) == "daily"
+
+    def test_parse_cadence_history_sorts_out_of_order_entries(self, mod):
+        raw = [
+            {"value": "daily", "effective_from": "2026-07-27"},
+            {"value": "weekly-only", "effective_from": "2026-01-01"},
+        ]
+        entries = mod._parse_cadence_history(raw, "test")
+        assert [e.effective_from for e in entries] == [date(2026, 1, 1), date(2026, 7, 27)]
+
+    def test_parse_cadence_history_rejects_a_bare_scalar(self, mod):
+        with pytest.raises(ValueError):
+            mod._parse_cadence_history("daily", "test")
+
+    def test_parse_cadence_history_rejects_an_empty_list(self, mod):
+        with pytest.raises(ValueError):
+            mod._parse_cadence_history([], "test")
+
+    def test_load_cadence_history_reads_the_real_manifest(self, mod):
+        history = mod.load_cadence_history()
+        assert history
+        assert history == sorted(history, key=lambda e: e.effective_from)
+        assert history[-1].value == "daily"
+
+
+# ---------------------------------------------------------------------------
+# Acceptance regression: the real 45-day window (alpha-engine-config-I7175)
+# ---------------------------------------------------------------------------
+
+class TestMeasuredFortyFiveDayShape:
+    """Replays the exact live run measured 2026-08-13
+    (``--live --no-notify --window-days 45 --through today``): 23 CRITICAL
+    before this fix (19 false positives 2026-06-29..2026-07-24, predating the
+    exercise cadence, plus the 4 real silences), 4 after. Uses the REAL
+    checked-in manifest history, not a synthetic one, so a future edit to
+    ``weekly_cadence.json`` that reintroduces the retroactivity bug fails
+    this test."""
+
+    TODAY = date(2026, 8, 13)
+    REAL_CRITICAL_DAYS = {date(2026, 7, 27), date(2026, 7, 28), date(2026, 8, 5), date(2026, 8, 6)}
+
+    def _executions(self, mod):
+        # Every trading day from the first real exercise run (2026-07-29)
+        # onward EXCEPT the two real silences (08-05/08-06) got a matching
+        # exercise-role execution, per the live output measured 2026-08-13.
+        execs = []
+        d = date(2026, 7, 29)
+        while d <= self.TODAY:
+            if is_trading_day(d) and d not in self.REAL_CRITICAL_DAYS:
+                execs.append(_record(mod, f"e{d.isoformat()}", "exercise", "SUCCEEDED", d))
+            d += timedelta(days=1)
+        # Every weekly-role run that actually landed in this window, per the
+        # live output measured 2026-08-13 — the weekly leg is not itself
+        # silent here and is out of scope for this regression (it is a
+        # separate, unaffected code path: never gated by cadence at all).
+        for w in (
+            date(2026, 7, 3), date(2026, 7, 11), date(2026, 7, 18),
+            date(2026, 7, 25), date(2026, 8, 1), date(2026, 8, 8),
+        ):
+            execs.append(_record(mod, f"w{w.isoformat()}", "weekly", "SUCCEEDED", w, hours=3))
+        return execs
+
+    def test_exactly_four_critical_and_they_are_the_named_four(self, mod):
+        history = mod.load_cadence_history()
+        slots = mod.compute_expected_slots(
+            self.TODAY, "daily", 45, is_trading_day, next_trading_day, cadence_history=history,
+        )
+        results = mod.evaluate(slots, self._executions(mod))
+        critical = [r for r in results if r.classification == "CRITICAL"]
+        assert {r.slot.day for r in critical} == self.REAL_CRITICAL_DAYS
+        assert len(critical) == 4
+
+    def test_pre_cadence_days_are_gated_off_not_critical(self, mod):
+        history = mod.load_cadence_history()
+        slots = mod.compute_expected_slots(
+            self.TODAY, "daily", 45, is_trading_day, next_trading_day, cadence_history=history,
+        )
+        results = mod.evaluate(slots, self._executions(mod))
+        pre_cadence = [
+            r for r in results
+            if r.slot.role == "exercise" and r.slot.day < date(2026, 7, 27)
+        ]
+        assert pre_cadence  # the window does reach back that far
+        assert all(r.classification == "GATED_OFF" for r in pre_cadence)
+
+    def test_2026_07_04_derives_no_weekly_slot(self, mod):
+        """NOT a missed Saturday: NYSE observed July 4th on Friday 07-03, so
+        WeeklyRunDayGate selects 07-03 and the deadman correctly derives no
+        weekly slot for 07-04 at all. Confirmed unchanged by this fix."""
+        history = mod.load_cadence_history()
+        slots = mod.compute_expected_slots(
+            self.TODAY, "daily", 45, is_trading_day, next_trading_day, cadence_history=history,
+        )
+        weekly_days = {s.day for s in slots if s.role == "weekly"}
+        assert date(2026, 7, 4) not in weekly_days
+        assert date(2026, 7, 3) in weekly_days
 
 
 class TestNormalizeRole:
