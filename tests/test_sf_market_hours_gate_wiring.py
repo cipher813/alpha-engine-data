@@ -1,0 +1,455 @@
+"""alpha-engine-config-I7111 — the market-hours boundary on both trading pipelines.
+
+Brian ruled option (c) on 2026-08-13: the "no trading-pipeline start during
+NYSE market hours" boundary belongs to the pipeline, not to one caller.
+
+What it replaces. alpha-engine-config#2932 (2026-07-20) ruled the boundary onto
+``alpha-engine-sf-watch-executor-role``'s ``states:StartExecution`` grant,
+enforced by ``alpha-engine-sf-watch-market-hours-toggler`` — a Lambda flipping
+that role's inline policy between two codified variants on a 5-minute schedule.
+Measured 2026-08-12 in account 711398986525: no such function, no such
+EventBridge rule. The Lambda was written, committed, and never bootstrapped, so
+the boundary was **never once in force** in the three weeks it was believed to
+be. It was also caller-scoped, so even fully deployed it could not have covered
+the in-session operator starts at 09:32 PT on 2026-08-07 or 08:32 PT on
+2026-07-27. IAM has no time-of-day condition key; that absence is why the ruled
+mechanism needed a Lambda to simulate one, and why the simulation could
+silently not exist.
+
+What this pins:
+
+  * the gate is the FIRST thing both pipelines do, ahead of the mutex;
+  * the four verdicts route where the ruling says, and anything else fails
+    closed — ``TestChoiceRouting`` evaluates the real ASL Choice rather than
+    reading them;
+  * the override is refusable-deliberately, not bypassable-accidentally;
+  * the two pipelines' unverified-gate postures differ, on purpose, and the
+    difference is asserted in both directions rather than left to a comment.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+_INFRA = Path(__file__).resolve().parent.parent / "infrastructure"
+_PREOPEN = "step_function_daily.json"
+_POSTCLOSE = "step_function_eod.json"
+_BOTH = [_PREOPEN, _POSTCLOSE]
+
+_GATE_STATES = {
+    "MarketHoursGate",
+    "MarketHoursGateChoice",
+    "RecordMarketHoursOverride",
+    "NotifyMarketHoursBlocked",
+    "MarketHoursBlocked",
+    "NotifyMarketHoursOverrideMalformed",
+    "MarketHoursOverrideMalformed",
+    "NotifyMarketHoursUnverified",
+}
+
+
+def _sf(name: str) -> dict:
+    return json.loads((_INFRA / name).read_text())
+
+
+@pytest.fixture(scope="module")
+def defs() -> dict:
+    return {name: _sf(name) for name in _BOTH}
+
+
+# ---------------------------------------------------------------------------
+# A minimal ASL Choice evaluator.
+#
+# Structural assertions can only say the rules are SHAPED right. The ruling is
+# about what the pipeline DOES with a verdict, so the rules are executed here
+# against the payloads alpha-engine-predictor-inference actually returns
+# (crucible-predictor inference/trading_day_gate.py::check_market_hours,
+# pinned there by tests/test_market_hours_gate.py).
+#
+# Only the operators this Choice uses are implemented — StringEquals and
+# IsPresent. An unimplemented operator raises rather than silently evaluating
+# false, so a future rule using one cannot quietly slip past this harness.
+# ---------------------------------------------------------------------------
+
+_UNSET = object()
+
+
+def _resolve(path: str, doc: dict):
+    assert path.startswith("$."), path
+    cur = doc
+    for part in path[2:].split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return _UNSET
+        cur = cur[part]
+    return cur
+
+
+def _matches(rule: dict, doc: dict) -> bool:
+    if "Not" in rule:
+        return not _matches(rule["Not"], doc)
+    if "And" in rule:
+        return all(_matches(r, doc) for r in rule["And"])
+    if "Or" in rule:
+        return any(_matches(r, doc) for r in rule["Or"])
+
+    value = _resolve(rule["Variable"], doc)
+    ops = [k for k in rule if k not in ("Variable", "Next", "Comment")]
+    assert len(ops) == 1, f"expected exactly one comparator, got {ops}"
+    op = ops[0]
+    if op == "IsPresent":
+        return (value is not _UNSET) is rule[op]
+    if op == "StringEquals":
+        return value == rule[op]
+    raise NotImplementedError(
+        f"{op} is not implemented in this harness — implement it rather than "
+        "letting the rule evaluate as a silent false"
+    )
+
+
+def evaluate(choice: dict, doc: dict) -> str:
+    for rule in choice["Choices"]:
+        if _matches(rule, doc):
+            return rule["Next"]
+    return choice["Default"]
+
+
+def _payload(verdict: str, **extra) -> dict:
+    """The shape the gate Task writes to $.market_hours_gate."""
+    return {"market_hours_gate": {"Payload": {"verdict": verdict, **extra}}}
+
+
+# ---------------------------------------------------------------------------
+# Composition — the gate is the first thing either pipeline does
+# ---------------------------------------------------------------------------
+
+
+class TestGateIsAtTheHead:
+    def test_preopen_entry_state_hands_straight_to_the_gate(self, defs):
+        d = defs[_PREOPEN]
+        assert d["StartAt"] == "InitializeInput"
+        # InitializeInput only layers defaults (it is where $.sns_topic_arn
+        # comes from, which the gate's notify states publish to), so the gate
+        # is the first state that can refuse.
+        assert d["States"]["InitializeInput"]["Type"] == "Pass"
+        assert d["States"]["InitializeInput"]["Next"] == "MarketHoursGate"
+
+    def test_postclose_starts_at_the_gate(self, defs):
+        assert defs[_POSTCLOSE]["StartAt"] == "MarketHoursGate"
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_gate_precedes_the_mutex(self, defs, name):
+        # Ordering is deliberate: a run refused for starting in-session must
+        # not first take a minute-bucket mutex key it will never use.
+        choice = defs[name]["States"]["MarketHoursGateChoice"]
+        assert evaluate(choice, _payload("PROCEED")) == "CheckMutexRole"
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_gate_precedes_every_state_that_spends(self, defs, name):
+        # Nothing between the entry point and the gate may boot a box, send an
+        # SSM command, launch a spot instance or invoke a worker Lambda.
+        states = defs[name]["States"]
+        entry = defs[name]["StartAt"]
+        seen, cur = [], entry
+        while cur != "MarketHoursGate":
+            seen.append(cur)
+            state = states[cur]
+            assert state["Type"] == "Pass", (
+                f"{name}: {cur} runs before MarketHoursGate and is a "
+                f"{state['Type']}, not a Pass — the boundary must be ahead of "
+                "anything that spends"
+            )
+            cur = state["Next"]
+        assert len(seen) <= 1, seen
+
+
+class TestGateTask:
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_gate_invokes_the_calendar_action_on_the_predictor_lambda(self, defs, name):
+        gate = defs[name]["States"]["MarketHoursGate"]
+        assert gate["Type"] == "Task"
+        assert gate["Resource"] == "arn:aws:states:::lambda:invoke"
+        params = gate["Parameters"]
+        assert params["FunctionName"] == "alpha-engine-predictor-inference:live"
+        assert params["Payload"]["action"] == "check_market_hours"
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_verdict_is_judged_on_the_execution_start_not_the_lambda_clock(
+        self, defs, name
+    ):
+        # A property of the execution: deterministic, replayable, and immune to
+        # a slow cold start pushing a refused run past the close.
+        payload = defs[name]["States"]["MarketHoursGate"]["Parameters"]["Payload"]
+        assert payload["now.$"] == "$$.Execution.StartTime"
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_override_is_read_from_the_raw_execution_input(self, defs, name):
+        # Passed WHOLE. An ASL "override.$": "$.market_hours_override"
+        # parameter throws States.Runtime on every run that does not carry one
+        # — i.e. on every normal day.
+        payload = defs[name]["States"]["MarketHoursGate"]["Parameters"]["Payload"]
+        assert payload["execution_input.$"] == "$$.Execution.Input"
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_gate_declares_a_timeout_retry_and_catch(self, defs, name):
+        gate = defs[name]["States"]["MarketHoursGate"]
+        assert gate["TimeoutSeconds"] == 60
+        assert gate["Retry"][0]["MaxAttempts"] == 3
+        assert gate["Catch"][0]["ErrorEquals"] == ["States.ALL"]
+        assert gate["ResultPath"] == "$.market_hours_gate"
+        assert gate["Next"] == "MarketHoursGateChoice"
+
+
+# ---------------------------------------------------------------------------
+# The boundary itself
+# ---------------------------------------------------------------------------
+
+
+class TestChoiceRouting:
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_a_closed_market_proceeds(self, defs, name):
+        choice = defs[name]["States"]["MarketHoursGateChoice"]
+        assert evaluate(choice, _payload("PROCEED")) == "CheckMutexRole"
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_an_in_session_start_is_refused(self, defs, name):
+        states = defs[name]["States"]
+        assert (
+            evaluate(states["MarketHoursGateChoice"], _payload("BLOCKED"))
+            == "NotifyMarketHoursBlocked"
+        )
+        # …and the refusal is announced before it is terminal.
+        notify = states["NotifyMarketHoursBlocked"]
+        assert notify["Resource"] == "arn:aws:states:::sns:publish"
+        assert notify["Next"] == "MarketHoursBlocked"
+        assert states["MarketHoursBlocked"]["Type"] == "Fail"
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_a_refused_run_never_reads_as_a_clean_success(self, defs, name):
+        # sf-pipeline-policy §2.3. A Succeed-shaped skip (the shape
+        # NotifyHolidaySkip legitimately uses for a holiday) would tell every
+        # status-keyed watcher the pipeline ran.
+        states = defs[name]["States"]
+        for terminal in ("MarketHoursBlocked", "MarketHoursOverrideMalformed"):
+            assert states[terminal]["Type"] == "Fail"
+            assert states[terminal].get("End") is not True
+        for notify in ("NotifyMarketHoursBlocked", "NotifyMarketHoursOverrideMalformed"):
+            assert states[notify].get("End") is not True
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_the_two_refusals_carry_distinct_errors(self, defs, name):
+        # They call for different operator actions — wait for the close vs fix
+        # the override — so a watcher must be able to tell them apart from the
+        # Error alone.
+        states = defs[name]["States"]
+        assert states["MarketHoursBlocked"]["Error"] == "MarketHoursBoundary"
+        assert (
+            states["MarketHoursOverrideMalformed"]["Error"]
+            == "MarketHoursOverrideMalformed"
+        )
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_an_absent_verdict_fails_closed(self, defs, name):
+        # config-I2767's lesson, which TradingDayGateChoice already carries: a
+        # gate payload without its verdict is a contract violation by our own
+        # Lambda. Proceeding to trade on an unverifiable answer is the one
+        # outcome that must not happen.
+        choice = defs[name]["States"]["MarketHoursGateChoice"]
+        assert evaluate(choice, {}) == "HandleFailure"
+        assert evaluate(choice, {"market_hours_gate": {"Payload": {}}}) == "HandleFailure"
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_an_unrecognised_verdict_fails_closed(self, defs, name):
+        choice = defs[name]["States"]["MarketHoursGateChoice"]
+        for junk in ("proceed", "PROCEED ", "OK", "", "MAYBE"):
+            assert evaluate(choice, _payload(junk)) == "HandleFailure", junk
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_every_verdict_the_lambda_can_emit_is_routed(self, defs, name):
+        # The producer's four verdicts, enumerated in crucible-predictor
+        # inference/trading_day_gate.py::check_market_hours. A fifth added
+        # there without a rule here would land on Default (fail closed) — safe,
+        # but this asserts the four known ones are each explicitly handled
+        # rather than falling through.
+        choice = defs[name]["States"]["MarketHoursGateChoice"]
+        handled = {
+            c["StringEquals"] for c in choice["Choices"] if "StringEquals" in c
+        }
+        assert handled == {
+            "PROCEED",
+            "PROCEED_OVERRIDE",
+            "BLOCKED",
+            "OVERRIDE_MALFORMED",
+        }
+
+
+class TestOverrideIsRecorded:
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_an_authorised_in_session_start_proceeds_through_a_notify(self, defs, name):
+        states = defs[name]["States"]
+        assert (
+            evaluate(states["MarketHoursGateChoice"], _payload("PROCEED_OVERRIDE"))
+            == "RecordMarketHoursOverride"
+        )
+        record = states["RecordMarketHoursOverride"]
+        assert record["Resource"] == "arn:aws:states:::sns:publish"
+        assert record["Next"] == "CheckMutexRole"
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_the_record_carries_the_whole_gate_payload(self, defs, name):
+        # Who authorised it, why, and until when — not just "overridden".
+        message = defs[name]["States"]["RecordMarketHoursOverride"]["Parameters"][
+            "Message.$"
+        ]
+        assert "States.JsonToString($.market_hours_gate.Payload)" in message
+        assert "$$.Execution.Id" in message
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_a_notify_failure_does_not_convert_an_approval_into_a_refusal(
+        self, defs, name
+    ):
+        # The authorisation was validated and is already in execution history;
+        # SNS is the announcement, not the record.
+        catch = defs[name]["States"]["RecordMarketHoursOverride"]["Catch"][0]
+        assert catch["Next"] == "CheckMutexRole"
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_a_rejected_override_is_announced_before_it_is_terminal(self, defs, name):
+        states = defs[name]["States"]
+        assert (
+            evaluate(states["MarketHoursGateChoice"], _payload("OVERRIDE_MALFORMED"))
+            == "NotifyMarketHoursOverrideMalformed"
+        )
+        notify = states["NotifyMarketHoursOverrideMalformed"]
+        assert notify["Resource"] == "arn:aws:states:::sns:publish"
+        assert notify["Next"] == "MarketHoursOverrideMalformed"
+        assert notify["Catch"][0]["Next"] == "MarketHoursOverrideMalformed"
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_both_refusal_messages_state_how_to_authorise_one_start(self, defs, name):
+        # An operator who hits the boundary at 09:32 on a broken morning
+        # should not have to find the runbook.
+        states = defs[name]["States"]
+        for notify in ("NotifyMarketHoursBlocked", "NotifyMarketHoursOverrideMalformed"):
+            msg = states[notify]["Parameters"]["Message.$"]
+            assert "market_hours_override" in msg
+            assert "reason" in msg and "authorized_by" in msg and "expires_at" in msg
+            assert "24h" in msg
+
+
+class TestUnverifiedPostureDiffersOnPurpose:
+    """The two pipelines take OPPOSITE routes when the gate cannot be
+    evaluated. Asserted in both directions so neither can be "made
+    consistent" with the other by a later sweep without reading why."""
+
+    def test_preopen_fails_closed(self, defs):
+        states = defs[_PREOPEN]["States"]
+        assert (
+            states["MarketHoursGate"]["Catch"][0]["Next"]
+            == "NotifyMarketHoursUnverified"
+        )
+        assert states["NotifyMarketHoursUnverified"]["Next"] == "MarketHoursUnverified"
+        assert states["MarketHoursUnverified"]["Type"] == "Fail"
+        assert states["MarketHoursUnverified"]["Error"] == "MarketHoursGateUnverified"
+
+    def test_preopen_fail_closed_costs_no_day_that_was_not_already_lost(self, defs):
+        # The load-bearing fact, asserted rather than asserted-in-prose: the
+        # gate and PredictorInference are the SAME Lambda. If it cannot answer
+        # the gate it cannot produce predictions either, so refusing here
+        # forfeits nothing — and it keeps the boundary from evaporating
+        # whenever its evaluator is down, which is precisely the failure class
+        # I7111 was filed for.
+        states = defs[_PREOPEN]["States"]
+        gate_fn = states["MarketHoursGate"]["Parameters"]["FunctionName"]
+        inference_fn = states["PredictorInference"]["Parameters"]["FunctionName"]
+        assert gate_fn.split(":")[0] == inference_fn.split(":")[0]
+
+    def test_postclose_fails_open_degraded(self, defs):
+        # sf-pipeline-policy §1.3: NAV continuity is non-negotiable — every
+        # trading day terminates with a postclose completion marker and an
+        # eod_pnl.csv row. Nothing else in this pipeline touches the predictor
+        # Lambda, so refusing here would newly break settlement on an outage
+        # otherwise irrelevant to it.
+        states = defs[_POSTCLOSE]["States"]
+        assert (
+            states["MarketHoursGate"]["Catch"][0]["Next"]
+            == "SetMarketHoursUnverifiedDegraded"
+        )
+        degraded = states["SetMarketHoursUnverifiedDegraded"]
+        assert degraded["Type"] == "Pass"
+        assert degraded["ResultPath"] == "$.degraded_summary"
+        assert degraded["Parameters"]["degraded"] is True
+        assert degraded["Next"] == "NotifyMarketHoursUnverified"
+        assert states["NotifyMarketHoursUnverified"]["Next"] == "CheckMutexRole"
+
+    def test_postclose_degradation_reaches_the_terminal_selector(self, defs):
+        # A settlement run that could not verify its own start boundary is not
+        # a clean success. $.degraded_summary is the exact path
+        # CheckDegradedOutcome dereferences.
+        states = defs[_POSTCLOSE]["States"]
+        variables = {
+            c["Variable"]
+            for rule in states["CheckDegradedOutcome"]["Choices"]
+            for c in rule.get("And", [rule])
+            if "Variable" in c
+        }
+        assert any(v.startswith("$.degraded_summary") for v in variables)
+
+    def test_postclose_has_no_unverified_fail_state(self, defs):
+        assert "MarketHoursUnverified" not in defs[_POSTCLOSE]["States"]
+
+    def test_preopen_has_no_unverified_degraded_state(self, defs):
+        assert "SetMarketHoursUnverifiedDegraded" not in defs[_PREOPEN]["States"]
+
+
+class TestNotifyStatesAreSafe:
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_every_gate_notify_declares_a_timeout_and_a_catch(self, defs, name):
+        states = defs[name]["States"]
+        for state_name, state in states.items():
+            if state_name not in _GATE_STATES or state.get("Type") != "Task":
+                continue
+            assert state["TimeoutSeconds"] == 60, state_name
+            assert state["Catch"][0]["ErrorEquals"] == ["States.ALL"], state_name
+
+    def test_postclose_notifies_a_hardcoded_topic(self, defs):
+        # Mirrors HandleFailure in the same file: the EOD SF is started by the
+        # daemon and by operators with hand-written input, so a malformed
+        # sns_topic_arn field must never be able to silence a refusal.
+        for name in _GATE_STATES:
+            state = defs[_POSTCLOSE]["States"].get(name, {})
+            if state.get("Resource") != "arn:aws:states:::sns:publish":
+                continue
+            assert state["Parameters"]["TopicArn"].endswith(":alpha-engine-alerts")
+            assert "TopicArn.$" not in state["Parameters"]
+
+    def test_preopen_notifies_the_layered_topic(self, defs):
+        # InitializeInput guarantees $.sns_topic_arn before the gate runs, so
+        # the preopen gate uses it the way TradingDayGateFailed does.
+        for name in _GATE_STATES:
+            state = defs[_PREOPEN]["States"].get(name, {})
+            if state.get("Resource") != "arn:aws:states:::sns:publish":
+                continue
+            assert state["Parameters"]["TopicArn.$"] == "$.sns_topic_arn"
+
+
+class TestNoOtherGuardAlreadyCoveredThis:
+    """Recorded as assertions because both guards were, at different points in
+    the I7111 analysis, assumed to cover the time-of-day case. Neither does."""
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_the_mutex_is_a_same_minute_guard_not_a_session_guard(self, defs, name):
+        key = defs[name]["States"]["AcquireMutex"]["Parameters"]["Item"]["mutex_key"][
+            "S.$"
+        ]
+        # Keyed on the execution's UTC minute bucket — two runs a minute apart
+        # both acquire, whatever the ET clock says.
+        assert "$$.Execution.StartTime" in key
+        assert "market" not in key.lower()
+
+    def test_the_trading_day_gate_is_a_calendar_day_guard(self, defs):
+        params = defs[_PREOPEN]["States"]["TradingDayGate"]["Parameters"]
+        assert params["Payload"]["action"] == "check_trading_day"
+        assert params["Payload"].get("now") is None
