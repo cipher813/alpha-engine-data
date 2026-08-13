@@ -1,0 +1,948 @@
+"""
+validators/stage_output_sweep.py — stage-level OUTPUT assertion for a
+scheduled Step Functions run (alpha-engine-config-I7167).
+
+## The class this exists to catch
+
+The weekly pipeline had **no stage-level output assertion**. A stage that
+runs, exits 0 and writes nothing was indistinguishable from one that did its
+job, because the only thing any surface read was the stage's own exit status.
+
+A full artifact-freshness audit of the scheduled 2026-08-08 run — which
+terminated ``SUCCEEDED`` — found FIVE stages that produced no output for that
+run, none of them visible anywhere. Five different root causes (a shell trap
+that died at line 5, a caller/contract disagreement, a fresh sibling masking a
+dead key, a 900s wall-kill, a prefix cutover) produced **one identical
+observable: nothing**. Fixing five producers leaves the sixth undetectable, so
+the deliverable is the assertion, and the five fixes are its first sweep
+(``engagement-protocol-policy.md`` §5 — the fix survives the class).
+
+It is ``sf-pipeline-policy.md`` §2.3a's decorative-verdict test applied to DATA
+artifacts, and ``principles.md`` §2.7: a stage emitting nothing is not healthy,
+it is **unobserved**, and *no data* is never rendered green.
+
+## Where the declaration lives — deliberately not here
+
+The stage→artifact mapping is ``ARTIFACT_REGISTRY.yaml``'s ``produced_by:``
+(``alpha-engine-config``, config-I7180), read here from the S3 mirror the
+config repo publishes at ``_freshness_monitor/ARTIFACT_REGISTRY.yaml``. This
+module owns **no** artifact declarations of its own. A second registry beside
+one that already exists, already carries producer rows, and is already read by
+the freshness monitor is ``policy-shared-code``'s duplication failure one layer
+up, and I7167 names that trap explicitly.
+
+The division of labour against the freshness monitor is worth stating, because
+the two look similar and answer different questions:
+
+  * the **freshness monitor** asks *"is this key younger than its CADENCE
+    clock?"* — a standing, run-agnostic SLA sweep;
+  * this sweep asks *"did the stage that ran in THIS EXECUTION write the key it
+    declares?"* — an execution-scoped, producer-anchored assertion.
+
+A weekly stage that stopped writing can hide from the first behind a daily
+producer of the same prefix, or behind a grace period wide enough to cover the
+gap. It cannot hide from the second, because the second is anchored to an
+execution start time rather than to a calendar.
+
+## Verdicts, and why "could not measure" is its own answer
+
+This fleet has shipped detectors that report a HARNESS FAULT as a FINDING, and
+always in the alarming direction. The verdict set keeps the two apart:
+
+  ``wrote``       the declared key exists and was written at/after the
+                  execution start — the stage did its job
+  ``stale``       the key exists but PREDATES this execution — the silent-stage
+                  signature. This is the 2026-08-08 observable for the
+                  ``Backtester`` second artifact (87 days old) and
+                  ``ParityReplay`` (3+ weeks old)
+  ``missing``     no object at the declared key at all
+  ``unmeasured``  the check could NOT answer — S3 denied/errored, the key
+                  template carries a placeholder this run cannot resolve, or no
+                  execution window was supplied so staleness is undecidable.
+                  **Never** folded into ``wrote`` and never into ``missing``:
+                  a check that cannot run is not evidence of health and is not
+                  evidence of a defect either
+  ``unresolved``  the registry row declares ``stage: UNRESOLVED`` — the
+                  artifact is real but its producing stage was never
+                  established (config-I7180's published, ratcheted gap). Not a
+                  defect of this run; counted separately so it can never be
+                  quietly absorbed into the green number
+  ``skipped``     the declaring stage did not enter this execution. Only
+                  reachable when an entered-stage set is supplied; without one
+                  no stage is ever declared skipped, because "I don't know
+                  which stages ran" must not become "the stage was allowed not
+                  to run"
+
+``unmeasured`` is deliberately NOT silent. Absence of a measurement is a
+first-class finding with its own exit code and its own alert, because the
+alternative — a sweep that reports 0 defects because it could not look — is the
+exact failure it was written to end.
+
+## Absence is measurable without a window; staleness is not
+
+If no ``--execution-start`` is supplied the sweep still runs, and a
+``missing`` key is still a defect: an object that does not exist did not get
+written by anybody, whatever the window. What becomes undecidable is
+``stale`` — an existing key cannot be attributed to this run or a previous one
+— so every present key degrades to ``unmeasured`` rather than to ``wrote``.
+That degradation is honest and it is loud, and it is what the sweep does on the
+deployment path where the SF has not yet been taught to pass its start time.
+
+## Observe-first, and why enforcement is a separate flip
+
+``alpha-engine-config-I6891`` routes any degraded weekly run through
+``CheckDegradedOutcome`` → ``WriteCompletionMarkerDegraded`` → ``DegradedRun``,
+a **Fail** state. That is correct and must not be undone — but it means any
+non-zero exit from this sweep, invoked as it is from
+``WeeklySubstrateHealthCheck``, terminates a four-hour run as FAILED.
+
+Three of the five instances I7167 records are still open today. Shipping this
+enforcing would therefore hard-fail the next scheduled run for defects that
+were already there — punishing the pipeline for the detector arriving, which is
+exactly the shape ``ruling_detect_before_enforcing_when_the_floor_is_unmeasured``
+(Brian, 2026-08-11) forbids.
+
+So the default is ``observe``: findings ALERT, are written to a durable verdict
+artifact, and the process exits 0. ``--enforce`` makes findings exit non-zero.
+The flip is one flag, and its precondition is one measured number — the first
+scheduled run's finding count. Observe mode is not silent mode: it is loud on
+every surface except the one that kills the run.
+
+The sweep's own verdict artifact
+(``_stage_outputs/{pipeline}/{run_date}.json``) carries a row in
+``ARTIFACT_REGISTRY.yaml``, so this detector going quiet is itself detected —
+``principles.md`` §2.7 applied to the detector rather than only by it.
+
+## Usage
+
+  python -m validators.stage_output_sweep --run-date 2026-08-08 \\
+      --execution-start 2026-08-08T09:00:49Z
+  python -m validators.stage_output_sweep --run-date 2026-08-08 --enforce
+  python -m validators.stage_output_sweep --run-date 2026-08-08 \\
+      --registry ./ARTIFACT_REGISTRY.yaml --no-alert --no-publish
+
+Exit codes:
+  0  no defect found (or observe mode, whatever was found)
+  1  ENFORCE mode and at least one ``missing``/``stale`` verdict
+  2  sweep-infra failure: the registry could not be read, or ENFORCE mode with
+     at least one ``unmeasured`` verdict. Distinct from 1 on purpose — the
+     alert text and the operator's next move differ, and collapsing them is
+     how a harness fault gets filed as a data defect
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import re
+import sys
+from datetime import datetime, timezone
+from typing import Any, Callable, Iterable, Optional, Sequence
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_BUCKET = "alpha-engine-research"
+DEFAULT_PIPELINE = "ne-weekly-freshness-pipeline"
+
+# The config repo mirrors ARTIFACT_REGISTRY.yaml here on merge
+# (.github/workflows/sync-artifact-registry.yml). Reading the mirror rather
+# than a checked-out copy is what lets this run on the dashboard box, which
+# does not clone the private config repo.
+REGISTRY_KEY = "_freshness_monitor/ARTIFACT_REGISTRY.yaml"
+
+# Where this sweep's own verdict lands. Registered in ARTIFACT_REGISTRY.yaml so
+# the detector's SILENCE is detectable — a sweep that stops running must not
+# read as a pipeline with nothing to report.
+VERDICT_KEY_TEMPLATE = "_stage_outputs/{pipeline}/{run_date}.json"
+
+UNRESOLVED_PRODUCER_STAGE = "UNRESOLVED"
+
+# Verdicts. Ordered worst-first for reporting; the ordering is not a severity
+# ladder used for suppression — every non-`wrote` verdict is reported.
+WROTE = "wrote"
+STALE = "stale"
+MISSING = "missing"
+UNMEASURED = "unmeasured"
+UNRESOLVED = "unresolved"
+SKIPPED = "skipped"
+
+#: Verdicts that mean "this run has a data defect".
+DEFECT_VERDICTS = frozenset({MISSING, STALE})
+
+#: Verdicts that mean "the check could not answer". Never merged into
+#: :data:`DEFECT_VERDICTS` — see the module docstring.
+UNMEASURED_VERDICTS = frozenset({UNMEASURED})
+
+_PLACEHOLDER_RE = re.compile(r"\{([a-z_]+)\}")
+
+# Truncate finding lists in the alert body so a worst-case
+# every-stage-silent run does not blow the SNS subject/body limits.
+_ALERT_PREVIEW_LIMIT = 12
+
+
+#: Execution-history event types that mean "this state was entered". Only the
+#: ENTERED events are read: an ``*StateExited`` filter would silently excuse
+#: every stage that entered and died, which is the exact population this sweep
+#: exists to catch.
+_ENTERED_EVENT_SUFFIX = "StateEntered"
+
+
+class ExecutionContext:
+    """What the sweep could establish about the execution it is asserting over.
+
+    Both fields degrade INDEPENDENTLY and honestly. A denied
+    ``GetExecutionHistory`` must not take the start time down with it, and
+    neither failure may be reported as a fact about the pipeline.
+    """
+
+    __slots__ = ("start", "entered_stages", "notes")
+
+    def __init__(
+        self,
+        start: datetime | None = None,
+        entered_stages: frozenset[str] | None = None,
+        notes: list[str] | None = None,
+    ) -> None:
+        self.start = start
+        self.entered_stages = entered_stages
+        self.notes = notes or []
+
+
+def read_execution_context(
+    execution_arn: str,
+    *,
+    sfn_client: Any = None,
+) -> ExecutionContext:
+    """Read this execution's start time and entered-stage set.
+
+    Why this is worth an API call rather than an SF-threaded parameter: a
+    gated-out weekly run terminates ``SUCCEEDED`` in about five seconds
+    (``WeeklyRunDayGate``), and roughly two of every three firings are such
+    runs. Asserting a full artifact set against one of those would report ~30
+    missing artifacts on a run that was correct to do nothing — a detector that
+    cries wolf twice a week is a detector that gets muted, and then the real
+    silent stage goes with it.
+
+    The entered-stage set is what separates "the stage ran and wrote nothing"
+    from "the stage never ran". Only the first is a defect.
+
+    Both halves fail soft into ``None``, which the caller renders as
+    ``unmeasured`` / no-stage-excused rather than as health. The
+    ``alpha-engine-dashboard-role`` already carries ``states:DescribeExecution``
+    and ``states:GetExecutionHistory`` on
+    ``execution:ne-weekly-freshness-pipeline:*`` (policy
+    ``alpha-engine-dashboard-sfn-read``, measured 2026-08-13), so this needs no
+    new grant — but it is written to survive losing one.
+    """
+    context = ExecutionContext()
+    if sfn_client is None:
+        try:
+            import boto3  # noqa: PLC0415
+
+            sfn_client = boto3.client("stepfunctions")
+        except Exception as exc:  # noqa: BLE001
+            context.notes.append(f"stepfunctions client unavailable: {exc}")
+            return context
+
+    try:
+        described = sfn_client.describe_execution(executionArn=execution_arn)
+        start = described.get("startDate")
+        if isinstance(start, datetime):
+            context.start = _utc(start)
+        else:
+            context.notes.append("describe_execution returned no usable startDate")
+    except Exception as exc:  # noqa: BLE001
+        context.notes.append(
+            f"describe_execution failed ({type(exc).__name__}: {exc}) — staleness "
+            f"is undecidable for this run"
+        )
+
+    try:
+        entered: set[str] = set()
+        token = None
+        while True:
+            kwargs = {"executionArn": execution_arn, "maxResults": 1000}
+            if token:
+                kwargs["nextToken"] = token
+            page = sfn_client.get_execution_history(**kwargs)
+            for event in page.get("events", []):
+                event_type = event.get("type", "")
+                if not event_type.endswith(_ENTERED_EVENT_SUFFIX):
+                    continue
+                details = event.get("stateEnteredEventDetails") or {}
+                name = details.get("name")
+                if name:
+                    entered.add(name)
+            token = page.get("nextToken")
+            if not token:
+                break
+        context.entered_stages = frozenset(entered)
+    except Exception as exc:  # noqa: BLE001
+        context.notes.append(
+            f"get_execution_history failed ({type(exc).__name__}: {exc}) — the "
+            f"entered-stage set is UNKNOWN, so no stage is excused as skipped"
+        )
+    return context
+
+
+class RegistryUnreadable(RuntimeError):
+    """The registry could not be read or parsed.
+
+    Raised rather than returned-as-empty: an empty producer set makes every
+    assertion vacuously pass, which is a detector that cannot fail wearing the
+    clothes of a clean run.
+    """
+
+
+def _utc(value: datetime) -> datetime:
+    """Normalise to timezone-aware UTC. Naive input is ASSUMED UTC."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def parse_execution_start(raw: str) -> datetime:
+    """Parse an ISO-8601 execution start, accepting the trailing ``Z`` that
+    Step Functions' ``$$.Execution.StartTime`` emits.
+
+    ``datetime.fromisoformat`` gained ``Z`` support only in 3.11; the dashboard
+    box's venv is pinned below that on at least one fleet host, so the suffix is
+    normalised here rather than relied upon.
+    """
+    text = raw.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    return _utc(datetime.fromisoformat(text))
+
+
+def resolve_cycle_date(run_date: str) -> str | None:
+    """The CYCLE date the registry's key templates are written against.
+
+    This is not the SF's ``$.run_date`` and conflating the two is the single
+    most expensive mistake available here. Measured on the 2026-08-08 run:
+    ``$.run_date`` was ``2026-08-08`` (the calendar Saturday), while every
+    artifact that run produced landed under ``2026-08-07`` — ``backtest/
+    2026-08-08/`` does not exist at all, and ``backtest/2026-08-07/report.md``
+    carries ``LastModified 2026-08-08T06:13``. Resolving ``{date}`` to the run
+    date produced **28 confident false MISSING verdicts** against a run that had
+    written almost everything.
+
+    That is this sweep's own failure mode turned on itself — a detector
+    reporting a harness fault as a finding about the system, in the alarming
+    direction — and it is why this function exists rather than a string
+    substitution at the call site.
+
+    ``krepis.dates.expected_last_close`` is the fleet's canonical resolver and
+    the same notion of "cycle tick" that
+    ``nousergon_lib.artifact_freshness._format_key`` substitutes; it is used
+    here rather than re-derived so the two cannot drift.
+
+    Returns ``None`` when the resolver is unavailable, which the caller renders
+    as ``unmeasured``. Guessing (weekday arithmetic, "probably yesterday")
+    would reintroduce exactly the 28-false-positive failure with no way to see
+    it had happened.
+    """
+    try:
+        from krepis.dates import expected_last_close  # noqa: PLC0415
+
+        return expected_last_close(run_date).isoformat()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Cycle-date resolution failed (%s) — every dated key will report "
+            "unmeasured rather than be checked against a guessed date", exc,
+        )
+        return None
+
+
+def resolve_key(
+    template: str, *, run_date: str, cycle_date: str | None
+) -> str | None:
+    """Resolve a registry ``s3_key_template`` for this run.
+
+    ``{date}`` and ``{trading_day}`` both resolve to ``cycle_date`` — they are
+    aliases in the registry convention and in
+    ``artifact_freshness._format_key``, the second being a semantic name for
+    the same tick. ``{run_date}`` resolves to the SF's own ``$.run_date``.
+
+    Returns ``None`` — meaning ``unmeasured``, never ``missing`` — when the
+    template needs a cycle date that could not be resolved, or carries any
+    OTHER placeholder (``{cycle_label}``, an hour bucket, anything added
+    later). Head-ing a literal key containing braces would 404 every time and
+    report a confident, permanent, entirely false ``missing``: the most
+    convincing wrong finding this sweep could produce.
+    """
+    resolved = template
+    for name in set(_PLACEHOLDER_RE.findall(template)):
+        if name in ("date", "trading_day"):
+            if cycle_date is None:
+                return None
+            resolved = resolved.replace("{" + name + "}", cycle_date)
+        elif name == "run_date":
+            resolved = resolved.replace("{run_date}", run_date)
+        else:
+            return None
+    if "{" in resolved or "}" in resolved:
+        return None
+    return resolved
+
+
+def load_registry_rows(
+    *,
+    bucket: str = DEFAULT_BUCKET,
+    registry_path: str | None = None,
+    s3_client: Any = None,
+) -> list[dict]:
+    """Load the artifact registry rows, from a local path or the S3 mirror.
+
+    Raises:
+        RegistryUnreadable: on any read/parse failure, or when the parsed
+            document carries no ``artifacts`` list. Never returns ``[]`` for a
+            failure — see the class docstring.
+    """
+    try:
+        import yaml  # noqa: PLC0415 — optional at import time, required here
+    except ImportError as exc:  # pragma: no cover - environment gap
+        raise RegistryUnreadable(f"PyYAML unavailable: {exc}") from exc
+
+    try:
+        if registry_path:
+            with open(registry_path, "rb") as handle:
+                raw = handle.read()
+        else:
+            if s3_client is None:
+                import boto3  # noqa: PLC0415
+
+                s3_client = boto3.client("s3")
+            raw = s3_client.get_object(Bucket=bucket, Key=REGISTRY_KEY)["Body"].read()
+    except Exception as exc:  # noqa: BLE001 - any read failure is unreadable
+        raise RegistryUnreadable(
+            f"could not read registry "
+            f"({registry_path or f's3://{bucket}/{REGISTRY_KEY}'}): {exc}"
+        ) from exc
+
+    try:
+        document = yaml.safe_load(raw)
+    except Exception as exc:  # noqa: BLE001
+        raise RegistryUnreadable(f"registry is not parseable YAML: {exc}") from exc
+
+    rows = (document or {}).get("artifacts") if isinstance(document, dict) else None
+    if not isinstance(rows, list) or not rows:
+        raise RegistryUnreadable(
+            "registry carries no non-empty 'artifacts' list — refusing to sweep "
+            "against an empty producer set (an assertion over nothing always "
+            "passes)"
+        )
+    return rows
+
+
+def declared_outputs(
+    rows: Iterable[dict],
+    *,
+    pipeline: str,
+    default_bucket: str = DEFAULT_BUCKET,
+) -> list[dict]:
+    """Invert the registry into ``[{stage, artifact_id, bucket, template}]``
+    for one pipeline.
+
+    A row with two real producers (the Scanner artifacts are written by BOTH
+    the weekday preopen SF and the weekly SF) contributes one entry per
+    matching producer — which is the whole point of ``produced_by`` being a
+    list, and the reason a stopped weekly stage stops hiding behind a live
+    daily one.
+    """
+    out: list[dict] = []
+    for row in rows:
+        for producer in row.get("produced_by") or []:
+            if producer.get("pipeline") != pipeline:
+                continue
+            out.append(
+                {
+                    "stage": producer.get("stage") or UNRESOLVED_PRODUCER_STAGE,
+                    "artifact_id": row.get("artifact_id"),
+                    "bucket": row.get("s3_bucket") or default_bucket,
+                    "s3_key_template": row.get("s3_key_template"),
+                    "severity": row.get("severity", "warning"),
+                }
+            )
+    return out
+
+
+def _head(s3_client: Any, bucket: str, key: str) -> tuple[str, Any]:
+    """HEAD one key.
+
+    Returns ``("found", last_modified)``, ``("absent", None)``, or
+    ``("error", reason)``. The three-way return is the whole point: a 403 or a
+    503 is NOT an absent object, and rendering it as one manufactures a defect
+    out of a permissions gap.
+    """
+    try:
+        response = s3_client.head_object(Bucket=bucket, Key=key)
+    except Exception as exc:  # noqa: BLE001
+        code = ""
+        response_meta = getattr(exc, "response", None)
+        if isinstance(response_meta, dict):
+            code = str(response_meta.get("Error", {}).get("Code", ""))
+            status = response_meta.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if code in ("404", "NoSuchKey", "NotFound") or status == 404:
+                return "absent", None
+        return "error", f"{type(exc).__name__}: {code or exc}"
+    return "found", response.get("LastModified")
+
+
+def evaluate(
+    declarations: Sequence[dict],
+    *,
+    run_date: str,
+    execution_start: datetime | None,
+    head: Callable[[str, str], tuple[str, Any]],
+    entered_stages: frozenset[str] | None = None,
+    cycle_date: str | None = None,
+) -> list[dict]:
+    """Assign a verdict to every declared (stage, artifact) pair.
+
+    Args:
+        declarations: output of :func:`declared_outputs`.
+        run_date: the SF-stamped ``$.run_date``, used to resolve key templates.
+        execution_start: this execution's start. ``None`` means staleness is
+            undecidable, so every PRESENT key is ``unmeasured`` rather than
+            ``wrote`` — see the module docstring.
+        head: ``(bucket, key) -> (state, detail)``, injected so the decision
+            logic is testable without S3 and so the failing branch can actually
+            be exercised.
+        entered_stages: the stages that actually entered this execution, when
+            known. ``None`` means unknown, and then NO stage is marked
+            ``skipped`` — "I don't know which stages ran" must never become
+            "the stage was allowed not to run". When supplied, a declaring
+            stage absent from it is ``skipped`` (a degraded run legitimately
+            skips stages, and a detector that cries wolf on those is a detector
+            that gets turned off).
+    """
+    findings: list[dict] = []
+    for declaration in declarations:
+        stage = declaration["stage"]
+        finding = {
+            "stage": stage,
+            "artifact_id": declaration["artifact_id"],
+            "s3_key_template": declaration["s3_key_template"],
+            "bucket": declaration["bucket"],
+            "severity": declaration.get("severity", "warning"),
+            "key": None,
+            "last_modified": None,
+            "detail": None,
+        }
+
+        if stage == UNRESOLVED_PRODUCER_STAGE:
+            finding["verdict"] = UNRESOLVED
+            finding["detail"] = (
+                "registry row declares produced_by stage=UNRESOLVED (config-I7180 "
+                "ratcheted gap) — this artifact cannot be attributed to a stage, "
+                "so this run cannot be held to it"
+            )
+            findings.append(finding)
+            continue
+
+        if entered_stages is not None and stage not in entered_stages:
+            finding["verdict"] = SKIPPED
+            finding["detail"] = "stage did not enter this execution"
+            findings.append(finding)
+            continue
+
+        template = declaration["s3_key_template"] or ""
+        key = resolve_key(template, run_date=run_date, cycle_date=cycle_date)
+        if key is None:
+            finding["verdict"] = UNMEASURED
+            finding["detail"] = (
+                f"key template {template!r} carries a placeholder this sweep "
+                f"could not resolve"
+                + ("" if cycle_date else " (cycle date unresolved)")
+            )
+            findings.append(finding)
+            continue
+
+        finding["key"] = key
+        state, detail = head(declaration["bucket"], key)
+
+        if state == "error":
+            finding["verdict"] = UNMEASURED
+            finding["detail"] = f"S3 head_object could not answer: {detail}"
+        elif state == "absent":
+            finding["verdict"] = MISSING
+            finding["detail"] = "no object at the declared key"
+        else:
+            last_modified = _utc(detail) if isinstance(detail, datetime) else None
+            finding["last_modified"] = (
+                last_modified.isoformat() if last_modified else None
+            )
+            if last_modified is None:
+                finding["verdict"] = UNMEASURED
+                finding["detail"] = (
+                    "object exists but S3 returned no usable LastModified — "
+                    "presence alone cannot distinguish this run's write from a "
+                    "previous one"
+                )
+            elif execution_start is None:
+                finding["verdict"] = UNMEASURED
+                finding["detail"] = (
+                    "object exists but no execution start was supplied, so it "
+                    "cannot be attributed to THIS run"
+                )
+            elif last_modified >= execution_start:
+                finding["verdict"] = WROTE
+            else:
+                age = execution_start - last_modified
+                finding["verdict"] = STALE
+                finding["detail"] = (
+                    f"object predates this execution by {age.days}d "
+                    f"{age.seconds // 3600}h — the declaring stage did not write "
+                    f"it on this run"
+                )
+        findings.append(finding)
+
+    return findings
+
+
+def summarise(findings: Sequence[dict]) -> dict:
+    """Reduce findings to counts plus the two lists that decide the exit code."""
+    counts: dict[str, int] = {}
+    for finding in findings:
+        counts[finding["verdict"]] = counts.get(finding["verdict"], 0) + 1
+    defects = [f for f in findings if f["verdict"] in DEFECT_VERDICTS]
+    unmeasured = [f for f in findings if f["verdict"] in UNMEASURED_VERDICTS]
+    if defects:
+        status = "stage_output_missing"
+    elif unmeasured:
+        status = "stage_output_unmeasured"
+    else:
+        status = "ok"
+    return {
+        "status": status,
+        "counts": counts,
+        "checked": len(findings),
+        "defects": defects,
+        "unmeasured": unmeasured,
+    }
+
+
+def sweep(
+    *,
+    run_date: str,
+    pipeline: str = DEFAULT_PIPELINE,
+    execution_start: datetime | None = None,
+    entered_stages: frozenset[str] | None = None,
+    bucket: str = DEFAULT_BUCKET,
+    registry_path: str | None = None,
+    s3_client: Any = None,
+    execution_arn: str | None = None,
+    sfn_client: Any = None,
+    cycle_date: str | None = None,
+    alert: bool = True,
+    publish: bool = True,
+    enforce: bool = False,
+) -> dict:
+    """Assert every artifact this pipeline's stages declare was written by this
+    run. Returns the full verdict document; never raises for a finding.
+    """
+    if cycle_date is None:
+        cycle_date = resolve_cycle_date(run_date)
+    context_notes: list[str] = []
+    if execution_arn:
+        context = read_execution_context(execution_arn, sfn_client=sfn_client)
+        context_notes = context.notes
+        # An explicitly-passed value wins over the API read: the caller may be
+        # replaying a historical run whose ARN no longer resolves.
+        if execution_start is None:
+            execution_start = context.start
+        if entered_stages is None:
+            entered_stages = context.entered_stages
+        for note in context_notes:
+            logger.warning("Execution context degraded: %s", note)
+
+    try:
+        rows = load_registry_rows(
+            bucket=bucket, registry_path=registry_path, s3_client=s3_client
+        )
+    except RegistryUnreadable as exc:
+        logger.error("Stage-output sweep could not read the registry: %s", exc)
+        return {
+            "schema": "stage_output_sweep-1.0.0",
+            "status": "registry_unreadable",
+            "pipeline": pipeline,
+            "run_date": run_date,
+            "enforce": enforce,
+            "error": str(exc),
+            "checked": 0,
+            "counts": {},
+            "findings": [],
+            "defects": [],
+            "unmeasured": [],
+        }
+
+    if s3_client is None:
+        import boto3  # noqa: PLC0415
+
+        s3_client = boto3.client("s3")
+
+    declarations = declared_outputs(rows, pipeline=pipeline, default_bucket=bucket)
+    findings = evaluate(
+        declarations,
+        run_date=run_date,
+        execution_start=execution_start,
+        head=lambda b, k: _head(s3_client, b, k),
+        entered_stages=entered_stages,
+        cycle_date=cycle_date,
+    )
+    summary = summarise(findings)
+
+    document = {
+        "schema": "stage_output_sweep-1.0.0",
+        "status": summary["status"],
+        "pipeline": pipeline,
+        "run_date": run_date,
+        "cycle_date": cycle_date,
+        "enforce": enforce,
+        "execution_start": (
+            execution_start.isoformat() if execution_start else None
+        ),
+        "entered_stages_known": entered_stages is not None,
+        "entered_stage_count": len(entered_stages) if entered_stages is not None else None,
+        "execution_arn": execution_arn,
+        "context_notes": context_notes,
+        "declared_stages": sorted(
+            {d["stage"] for d in declarations if d["stage"] != UNRESOLVED_PRODUCER_STAGE}
+        ),
+        "checked": summary["checked"],
+        "counts": summary["counts"],
+        "findings": findings,
+        "defects": summary["defects"],
+        "unmeasured": summary["unmeasured"],
+    }
+
+    logger.info(
+        "Stage-output sweep pipeline=%s run_date=%s enforce=%s: %s",
+        pipeline, run_date, enforce, summary["counts"],
+    )
+
+    if publish:
+        _publish_verdict(s3_client, bucket, document)
+    if alert and summary["status"] != "ok":
+        _alert(document)
+
+    return document
+
+
+def _publish_verdict(s3_client: Any, bucket: str, document: dict) -> None:
+    """Write the verdict artifact.
+
+    Failure to publish is logged and swallowed rather than raised — (a) the
+    failure mode swallowed is an S3 write fault on the REPORTING path, (b) the
+    primary deliverable (the alert and the exit code) has already been decided
+    from the in-memory document and survives intact, (c) the recording surface
+    is this ERROR log line plus the registry row on the verdict key, which goes
+    stale and pages when this write stops landing. An exception here would
+    convert a reporting fault into a pipeline failure — the reporter destroying
+    the thing it reports, a class this fleet has already shipped twice.
+    """
+    key = VERDICT_KEY_TEMPLATE.format(
+        pipeline=document["pipeline"], run_date=document["run_date"]
+    )
+    try:
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(document, indent=2, default=str).encode(),
+            ContentType="application/json",
+        )
+        logger.info("Stage-output verdict written to s3://%s/%s", bucket, key)
+    except Exception as exc:  # noqa: BLE001 - see docstring (a)/(b)/(c)
+        logger.error(
+            "Stage-output verdict publish FAILED for s3://%s/%s: %s — the sweep "
+            "verdict below is still authoritative, but the durable record of it "
+            "is missing and the registry row on this key will go stale",
+            bucket, key, exc,
+        )
+
+
+def _describe(findings: Sequence[dict]) -> str:
+    preview = "; ".join(
+        f"{f['stage']}→{f['artifact_id']} ({f['verdict']})"
+        for f in findings[:_ALERT_PREVIEW_LIMIT]
+    )
+    if len(findings) > _ALERT_PREVIEW_LIMIT:
+        preview += f" ... +{len(findings) - _ALERT_PREVIEW_LIMIT} more"
+    return preview
+
+
+def _alert(document: dict) -> None:
+    """Publish the finding. Loud in observe mode — that is the whole design."""
+    try:
+        from nousergon_lib import alerts  # noqa: PLC0415
+    except ImportError as exc:
+        logger.warning(
+            "Stage-output alert skipped — nousergon_lib.alerts unavailable: %s", exc
+        )
+        return
+
+    defects = document["defects"]
+    unmeasured = document["unmeasured"]
+    mode = "ENFORCE" if document["enforce"] else "OBSERVE (exit 0 by design)"
+
+    parts = [
+        f"Stage-output sweep [{mode}] {document['pipeline']} "
+        f"run_date={document['run_date']}: "
+        f"{len(defects)} stage(s) produced NO output for this run, "
+        f"{len(unmeasured)} could NOT be measured."
+    ]
+    if defects:
+        parts.append(f"DEFECT (stage ran, key absent or predates the run): {_describe(defects)}.")
+    if unmeasured:
+        parts.append(
+            f"UNMEASURED (the check could not answer — NOT evidence of health "
+            f"and NOT evidence of a defect): {_describe(unmeasured)}."
+        )
+    if not document.get("entered_stages_known"):
+        parts.append(
+            "Entered-stage set unknown, so no stage was excused as skipped; a "
+            "legitimately-skipped stage on a degraded run will appear here."
+        )
+    parts.append(f"Full verdict: s3://alpha-engine-research/"
+                 f"{VERDICT_KEY_TEMPLATE.format(**{k: document[k] for k in ('pipeline', 'run_date')})}"
+                 " (alpha-engine-config-I7167).")
+
+    severity = "error" if defects else "warn"
+    try:
+        result = alerts.publish(
+            " ".join(parts),
+            severity=severity,
+            source="alpha-engine-data/validators/stage_output_sweep.py",
+            dedup_key=f"stage_output_sweep_{document['pipeline']}_{document['run_date']}",
+            dedup_window_min=720,
+        )
+        logger.info("Stage-output alert publish: any_ok=%s", result.any_ok)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Stage-output alert publish failed: %s", exc)
+
+
+def exit_code(document: dict) -> int:
+    """Map a verdict document to a process exit code.
+
+    Observe mode is 0 for findings but NOT for an unreadable registry: that is
+    a fault in the sweep itself, and a sweep that cannot run must not report
+    the same exit status as a sweep that ran and found nothing.
+    """
+    if document["status"] == "registry_unreadable":
+        return 2
+    if not document["enforce"]:
+        return 0
+    if document["defects"]:
+        return 1
+    if document["unmeasured"]:
+        return 2
+    return 0
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Stage-level output assertion for a scheduled SF run "
+                    "(alpha-engine-config-I7167)",
+    )
+    parser.add_argument("--run-date", required=True,
+                        help="SF-stamped $.run_date, e.g. 2026-08-08")
+    parser.add_argument("--pipeline", default=DEFAULT_PIPELINE)
+    parser.add_argument(
+        "--execution-start", default=None,
+        help="ISO-8601 execution start ($$.Execution.StartTime). Omitted ⇒ "
+             "staleness is undecidable and every present key reports unmeasured",
+    )
+    parser.add_argument(
+        "--entered-stage", action="append", default=None, dest="entered_stages",
+        help="repeatable; a stage that entered this execution. Omitted entirely "
+             "⇒ the entered set is UNKNOWN and no stage is excused as skipped",
+    )
+    parser.add_argument(
+        "--execution-arn", default=None,
+        help="this execution's ARN ($$.Execution.Id). Supplies BOTH the start "
+             "time and the entered-stage set, so a gated-out run that did no "
+             "work is not asserted against a full artifact set",
+    )
+    parser.add_argument(
+        "--cycle-date", default=None,
+        help="the date the registry's {date}/{trading_day} templates are keyed "
+             "by. Defaults to krepis.dates.expected_last_close(run_date) — NOT "
+             "run_date itself; see resolve_cycle_date()",
+    )
+    parser.add_argument("--bucket", default=DEFAULT_BUCKET)
+    parser.add_argument("--registry", default=None,
+                        help="local ARTIFACT_REGISTRY.yaml (default: the S3 mirror)")
+    parser.add_argument(
+        "--enforce", action="store_true",
+        help="findings exit non-zero. Default is OBSERVE — see the module "
+             "docstring on the I6891 degraded-run blast radius",
+    )
+    parser.add_argument("--no-alert", action="store_true")
+    parser.add_argument("--no-publish", action="store_true",
+                        help="skip writing the verdict artifact")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+
+    execution_start = None
+    if args.execution_start:
+        try:
+            execution_start = parse_execution_start(args.execution_start)
+        except ValueError as exc:
+            logger.error(
+                "--execution-start %r is not ISO-8601 (%s). Refusing to fall back "
+                "to 'no window': a mis-typed timestamp would silently turn every "
+                "assertion into unmeasured.",
+                args.execution_start, exc,
+            )
+            return 2
+
+    document = sweep(
+        run_date=args.run_date,
+        pipeline=args.pipeline,
+        execution_start=execution_start,
+        entered_stages=(
+            frozenset(args.entered_stages) if args.entered_stages else None
+        ),
+        bucket=args.bucket,
+        registry_path=args.registry,
+        execution_arn=args.execution_arn,
+        cycle_date=args.cycle_date,
+        alert=not args.no_alert,
+        publish=not args.no_publish,
+        enforce=args.enforce,
+    )
+
+    code = exit_code(document)
+    if document["status"] == "registry_unreadable":
+        logger.error("Stage-output sweep COULD NOT RUN: %s", document["error"])
+    elif document["defects"]:
+        logger.error(
+            "STAGE OUTPUT MISSING: %d declared artifact(s) absent or stale for "
+            "run_date=%s: %s%s",
+            len(document["defects"]), args.run_date,
+            _describe(document["defects"]),
+            "" if args.enforce else " [OBSERVE mode — exiting 0 by design]",
+        )
+    elif document["unmeasured"]:
+        logger.error(
+            "STAGE OUTPUT UNMEASURED: %d declared artifact(s) could not be "
+            "checked for run_date=%s: %s",
+            len(document["unmeasured"]), args.run_date,
+            _describe(document["unmeasured"]),
+        )
+    else:
+        logger.info(
+            "Stage-output sweep OK: %d declared artifact(s) written by this run",
+            document["checked"],
+        )
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
