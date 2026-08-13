@@ -59,7 +59,7 @@
   ],
   "ParityReplay": [
     "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock /var/lock/alpha-engine-backtester-git.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
@@ -77,7 +77,7 @@
   ],
   "PitParityLookahead": [
     "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock /var/lock/alpha-engine-backtester-git.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
@@ -86,7 +86,7 @@
   ],
   "PitParityWalkforward": [
     "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock /var/lock/alpha-engine-backtester-git.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
