@@ -137,12 +137,20 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # dry_run.$=$.research_dry → no-Opus / no-write probe on the preflight (L4504).
     "Director": frozenset({"date.$", "dry_run.$"}),
     # config#2248: launches the launcher spot that replaces the always-on
-    # dashboard box as the $.ec2_instance_id source. Empty Payload — this
-    # Lambda takes no execution-input-derived args today (force_on_demand
-    # is reserved for a future retry loop, not currently threaded from the
-    # SF); it reads its own config entirely from Lambda env vars.
+    # dashboard box as the $.ec2_instance_id source. It reads the rest of its
+    # config from Lambda env vars.
     # config#5504: per-run identity threading for cost attribution.
     "DispatchWeeklyFreshnessSpot": frozenset({"execution_id.$"}),
+    # config-I7119: the SAME dispatcher, invoked to replace a launcher box that
+    # was reclaimed mid-run. force_on_demand was added to the dispatcher in
+    # config#2248 and documented there as "reserved for a future bounded
+    # retry-on-relaunch ... no current caller sets it" — this is that caller,
+    # so the two states differ by exactly that one key. A literal `true`, not a
+    # `.$` path: the decision is structural (we only reach this state after a
+    # reclaim), never execution input.
+    "RelaunchWeeklyFreshnessSpot": frozenset(
+        {"execution_id.$", "force_on_demand"}
+    ),
 }
 
 # config#1811: the liveness-aware SSM poll iteration — one shared payload
