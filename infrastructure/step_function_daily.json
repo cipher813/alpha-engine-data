@@ -10,7 +10,184 @@
         "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
       },
       "OutputPath": "$.merged",
+      "Next": "MarketHoursGate"
+    },
+    "MarketHoursGate": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I7111 (Brian ruling 2026-08-13, option c) \u2014 the \"no trading-pipeline start during NYSE market hours\" boundary, sited on the PIPELINE rather than on one caller's IAM role. alpha-engine-config#2932 ruled it onto alpha-engine-sf-watch-executor-role, enforced by a Lambda flipping that role's inline policy every 5 minutes between two codified variants. The Lambda never existed in account 711398986525 (measured 2026-08-12: no function, no EventBridge rule), so the boundary was never once in force \u2014 and being caller-scoped it could not have covered the in-session operator starts at 09:32 PT on 2026-08-07 or 08:32 PT on 2026-07-27 either. IAM has NO time-of-day condition key; that absence is why the ruled mechanism needed a Lambda to simulate one, and why the simulation could silently not exist for three weeks. A guard state binds every principal: the scheduler, the Overseer's overseer-sf-watch lane, and the operator. Neither existing guard covers this \u2014 AcquireMutex keys on the same UTC MINUTE and TradingDayGate on the calendar DAY; neither is a time-of-day boundary. Same zero-infra posture as TradingDayGate: pure calendar math on alpha-engine-predictor-inference, returning BEFORE PredictorPreflight is constructed, so no S3/ArcticDB/model problem can take out the boundary. `now` is $$.Execution.StartTime rather than the Lambda's own clock, so the verdict is a property of the execution: deterministic, replayable, and immune to a slow cold start pushing a refused run past the close. `execution_input` is passed whole because an ASL \"override.$\": \"$.market_hours_override\" parameter throws States.Runtime on every run that does not carry one.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-predictor-inference:live",
+        "Payload": {
+          "action": "check_market_hours",
+          "now.$": "$$.Execution.StartTime",
+          "execution_input.$": "$$.Execution.Input"
+        }
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "NotifyMarketHoursUnverified",
+          "ResultPath": "$.market_hours_gate_error"
+        }
+      ],
+      "ResultPath": "$.market_hours_gate",
+      "Next": "MarketHoursGateChoice"
+    },
+    "MarketHoursGateChoice": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I7111 \u2014 the boundary itself. Keys on the gate's verdict, which is enumerated EXHAUSTIVELY: an absent or unrecognised verdict is a contract violation by our own Lambda and fails CLOSED via Default rather than proceeding to trade on an unverifiable answer (the config-I2767 lesson TradingDayGateChoice already carries). PROCEED_OVERRIDE is the ruling's second requirement \u2014 the boundary must be refusable deliberately, never bypassable accidentally \u2014 and it routes through a notify state so a crossed boundary is announced rather than silent.",
+      "Choices": [
+        {
+          "Variable": "$.market_hours_gate.Payload.verdict",
+          "StringEquals": "PROCEED",
+          "Comment": "Market closed. The scheduled trigger of both pipelines lands here every day: preopen at 05:15 PT (pre-open) and postclose at 13:00:0x PT, which is 16:00:0x ET \u2014 the session window is half-open [09:30, 16:00) so the close instant itself is already outside it.",
+          "Next": "CheckMutexRole"
+        },
+        {
+          "Variable": "$.market_hours_gate.Payload.verdict",
+          "StringEquals": "PROCEED_OVERRIDE",
+          "Comment": "In-session start with a complete, authored, unexpired, bounded override. Announced and recorded, never silent.",
+          "Next": "RecordMarketHoursOverride"
+        },
+        {
+          "Variable": "$.market_hours_gate.Payload.verdict",
+          "StringEquals": "BLOCKED",
+          "Comment": "In-session start with no override \u2014 the boundary doing its job.",
+          "Next": "NotifyMarketHoursBlocked"
+        },
+        {
+          "Variable": "$.market_hours_gate.Payload.verdict",
+          "StringEquals": "OVERRIDE_MALFORMED",
+          "Comment": "An override was offered and is not usable. Fails closed whether or not the market is open: a typo'd override is a mis-authorisation, and surfacing it on the quiet run is the only way it is not discovered on the run that matters.",
+          "Next": "NotifyMarketHoursOverrideMalformed"
+        }
+      ],
+      "Default": "HandleFailure"
+    },
+    "RecordMarketHoursOverride": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I7111 \u2014 the override's audit surface. A crossed boundary is announced on the alert topic AND left in execution history with who authorised it, why, and until when. Catch continues to the pipeline: the authorisation was already validated and recorded, so a notify-side failure must not silently convert an approved recovery into a refusal.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekday Pipeline \u2014 market-hours boundary OVERRIDDEN (authorised in-session start)",
+        "Message.$": "States.Format('An execution started INSIDE the NYSE regular session under an explicit market-hours override (alpha-engine-config-I7111). Execution: {}. Gate verdict: {}. This is a deliberate, time-boxed authorisation, not a bypass \u2014 the same record is in $.market_hours_gate in execution history.', $$.Execution.Id, States.JsonToString($.market_hours_gate.Payload))"
+      },
+      "TimeoutSeconds": 60,
+      "ResultPath": "$.market_hours_override_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "SNS delivery is the announcement, not the record \u2014 the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
+          "ResultPath": "$.market_hours_notify_error",
+          "Next": "CheckMutexRole"
+        }
+      ],
       "Next": "CheckMutexRole"
+    },
+    "NotifyMarketHoursBlocked": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I7111 \u2014 a refusal is loud. sf-pipeline-policy \u00a72.3: a run that did not do its work must not read as a clean success to a status-keyed watcher, so this notifies and then ends in a Fail rather than a Succeed-skip. The message carries the exact override shape so the operator does not have to find it.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekday Pipeline \u2014 REFUSED (start inside NYSE market hours)",
+        "Message.$": "States.Format('Refused to start a trading pipeline inside the NYSE regular session (alpha-engine-config-I7111). Execution: {}. Gate: {}. To authorise one in-session start, add a market_hours_override object to the execution input carrying reason, authorized_by and expires_at. All three are required and non-blank; expires_at must be an ISO-8601 instant AFTER the execution start and no more than 24h after it, so a line pasted into a runbook stops working instead of standing forever.', $$.Execution.Id, States.JsonToString($.market_hours_gate.Payload))"
+      },
+      "TimeoutSeconds": 60,
+      "ResultPath": "$.market_hours_blocked_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "SNS delivery is the announcement, not the record \u2014 the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
+          "ResultPath": "$.market_hours_notify_error",
+          "Next": "MarketHoursBlocked"
+        }
+      ],
+      "Next": "MarketHoursBlocked"
+    },
+    "MarketHoursBlocked": {
+      "Type": "Fail",
+      "Error": "MarketHoursBoundary",
+      "Cause": "alpha-engine-config-I7111: this execution's start time falls inside the NYSE regular session ([09:30, 16:00) ET on a trading day) and carried no market-hours override. Trading pipelines do not start in-session \u2014 the preopen chain boots the trading box and starts the order-placing daemon, and the postclose chain stops the box and reconciles the book; either one, mid-session, acts on a stale plan against a live market. The verdict, the ET clock it was judged against, and the override shape are in $.market_hours_gate and in the SNS alert. To authorise one in-session start, re-run with market_hours_override {reason, authorized_by, expires_at}."
+    },
+    "NotifyMarketHoursOverrideMalformed": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I7111 \u2014 a rejected override is its own terminal, distinct from MarketHoursBlocked, because it calls for a different operator action: fix the override, not wait for the close. Kept separate rather than folded in so a status-keyed watcher can tell the two apart from the Error alone.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekday Pipeline \u2014 REFUSED (market-hours override is not usable)",
+        "Message.$": "States.Format('A market-hours override was offered and rejected (alpha-engine-config-I7111). Execution: {}. Gate: {}. To authorise one in-session start, add a market_hours_override object to the execution input carrying reason, authorized_by and expires_at. All three are required and non-blank; expires_at must be an ISO-8601 instant AFTER the execution start and no more than 24h after it, so a line pasted into a runbook stops working instead of standing forever.', $$.Execution.Id, States.JsonToString($.market_hours_gate.Payload))"
+      },
+      "TimeoutSeconds": 60,
+      "ResultPath": "$.market_hours_override_malformed_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "SNS delivery is the announcement, not the record \u2014 the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
+          "ResultPath": "$.market_hours_notify_error",
+          "Next": "MarketHoursOverrideMalformed"
+        }
+      ],
+      "Next": "MarketHoursOverrideMalformed"
+    },
+    "MarketHoursOverrideMalformed": {
+      "Type": "Fail",
+      "Error": "MarketHoursOverrideMalformed",
+      "Cause": "alpha-engine-config-I7111: the execution input carried a market_hours_override that is not a usable authorisation \u2014 missing or blank reason/authorized_by/expires_at, a non-object, an unparseable expires_at, an expires_at at or before the execution start, or one more than 24h after it. The specific rejection is in $.market_hours_gate.Payload.override.rejection. Deliberately fails closed even when the market is shut: a half-typed override is a mis-authorisation, and it is better found on the run where it did not matter."
+    },
+    "NotifyMarketHoursUnverified": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I7111 \u2014 the preopen gate fails CLOSED when it cannot be evaluated. sf-pipeline-policy \u00a71.2 makes the cost of NOT trading a first-class input, and that is exactly why this is safe here: alpha-engine-predictor-inference is also the PredictorInference stage of this same pipeline, so its unavailability already means no predictions and no planner. There is nothing left for a fail-open to rescue, and a boundary that disappears whenever a Lambda is down repeats the failure class I7111 was filed for.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekday Pipeline \u2014 REFUSED (market-hours gate could not be evaluated)",
+        "Message.$": "States.Format('The market-hours gate Lambda failed after retries, so this execution cannot establish that it is starting outside the NYSE session (alpha-engine-config-I7111). Refusing to start. Execution: {}. Error: {}. Note that PredictorInference invokes the SAME Lambda later in this pipeline, so a run admitted here could not have produced predictions anyway \u2014 failing closed at the gate costs no trading day that was not already lost, and keeps the boundary from evaporating whenever its evaluator is unavailable.', $$.Execution.Id, States.JsonToString($.market_hours_gate_error))"
+      },
+      "TimeoutSeconds": 60,
+      "ResultPath": "$.market_hours_unverified_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "SNS delivery is the announcement, not the record \u2014 the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
+          "ResultPath": "$.market_hours_notify_error",
+          "Next": "MarketHoursUnverified"
+        }
+      ],
+      "Next": "MarketHoursUnverified"
+    },
+    "MarketHoursUnverified": {
+      "Type": "Fail",
+      "Error": "MarketHoursGateUnverified",
+      "Cause": "alpha-engine-config-I7111: alpha-engine-predictor-inference did not answer action=check_market_hours after 3 retries, so this execution cannot establish that it is starting outside the NYSE session. The invoke error is in $.market_hours_gate_error. The same Lambda serves PredictorInference downstream, so this is an alert about the Lambda, not about the boundary."
     },
     "CheckMutexRole": {
       "Type": "Choice",

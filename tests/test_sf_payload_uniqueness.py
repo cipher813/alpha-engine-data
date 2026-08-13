@@ -181,6 +181,17 @@ _WEEKDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # predictor-inference Lambda and run BEFORE StartExecutorEC2 (replaces the
     # cold-box SSM trading_calendar check whose stdout was unreliably captured).
     "TradingDayGate": frozenset({"action"}),
+    # alpha-engine-config-I7111: the NYSE market-hours boundary, the first
+    # state of both trading pipelines. Unlike every other gate here it passes
+    # two context fields as well as the action. `now.$` is
+    # $$.Execution.StartTime, so the verdict is a property of the execution
+    # rather than of the Lambda's clock — deterministic, replayable, and
+    # immune to a slow cold start pushing a refused run past the close.
+    # `execution_input.$` is $$.Execution.Input passed WHOLE, because an
+    # "override.$": "$.market_hours_override" parameter would throw
+    # States.Runtime on every run that carries no override, i.e. every
+    # normal day.
+    "MarketHoursGate": frozenset({"action", "now.$", "execution_input.$"}),
     "PredictorInference": frozenset({"action"}),
     "CheckPredictorCoverage": frozenset({"action"}),
     "ReinvokePredictor": frozenset({"action", "tickers.$"}),
@@ -475,6 +486,24 @@ class TestEODSFTopLevelFieldsClosed:
             # could not resolve and the run failed States.Runtime instead of
             # DegradedRun. Named to be read by nothing.
             "degraded_marker_result",
+            # alpha-engine-config-I7111 — the MarketHoursGate namespace. The
+            # gate's own ResultPath ($.market_hours_gate) and its Catch's
+            # ($.market_hours_gate_error) are the two load-bearing ones: the
+            # first is what MarketHoursGateChoice keys on and what the notify
+            # states render; the second is what
+            # SetMarketHoursUnverifiedDegraded threads into
+            # $.degraded_summary.stage_error. The four *_notify paths are
+            # sns:publish results, named to be read by nothing (same
+            # convention as degraded_marker_result above) — they exist only so
+            # a publish result cannot replace the state input the way the
+            # I6891 incident did.
+            "market_hours_gate",
+            "market_hours_gate_error",
+            "market_hours_blocked_notify",
+            "market_hours_notify_error",
+            "market_hours_override_malformed_notify",
+            "market_hours_override_notify",
+            "market_hours_unverified_notify",
             "ec2_instance_id",
             "eod_poll",
             "eod_result",
