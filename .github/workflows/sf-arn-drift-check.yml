@@ -90,6 +90,29 @@ jobs:
       - name: Scheduled-automation pause still holds (live)
         run: python3 infrastructure/automation_pause.py --check
 
+      # alpha-engine-config-I7174. A paused component's absence-alarm
+      # (treat_missing_data: breaching) cannot tell "gated off by declaration"
+      # from "upstream died" — nine watch-plane/liveness alarms fired
+      # `OVERSEER BACKSTOP` pages on 2026-08-13 for exactly that reason. The
+      # manifest's `paused_alarms` block declares which alarms exist only
+      # because a paused trigger is off; `--alarms-only` reconciles live
+      # CloudWatch alarm-action state to match, in BOTH directions, driven
+      # purely from the manifest each run — un-pausing a trigger (removing/
+      # moving its entry out of `paused`) re-arms the alarm on the NEXT run of
+      # this same step, no separate AWS CLI command. `--alarms-only` never
+      # disables or enables a trigger — enable-alarm-actions only resumes
+      # paging, so it carries none of the risk that keeps automation_pause.py
+      # from ever re-enabling a paused TRIGGER unattended.
+      # Needs cloudwatch:DescribeAlarms + EnableAlarmActions +
+      # DisableAlarmActions on this role — granted in a companion
+      # crucible-executor change (alpha-engine-config-I7188). AccessDenied
+      # here means that grant has not landed yet; `continue-on-error` is soft
+      # only until then — same form-3 pattern as the exercise-cadence step
+      # below. Remove continue-on-error in the PR that lands I7188.
+      - name: Paused-component alarm actions reconciled with the manifest (live)
+        continue-on-error: true
+        run: python3 infrastructure/automation_pause.py --enforce --alarms-only
+
       # alpha-engine-config-I7056. The step above asks "is the pause intact".
       # This one asks the question nothing asked before it: for each of the
       # NINE Overseer components, is it armed, or is it off because someone

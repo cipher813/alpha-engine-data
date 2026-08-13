@@ -109,9 +109,69 @@ def _validate_cadence(value: object, source: str) -> str:
     return value  # type: ignore[return-value]
 
 
-def load_cadence_from_manifest(path: Path = MANIFEST_PATH) -> str:
+@dataclass(frozen=True)
+class CadenceEntry:
+    """One dated declaration in ``weekly_cadence.json``'s ``exercise_cadence``
+    history (alpha-engine-config-I7175). ``effective_from`` is the first date
+    the value is IN FORCE, inclusive."""
+    value: str
+    effective_from: date
+    why: str = ""
+
+
+def _parse_cadence_history(raw: object, source: str) -> list[CadenceEntry]:
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(
+            f"{source} exercise_cadence must be a non-empty list of "
+            f"{{value, effective_from}} entries, got {raw!r}"
+        )
+    entries: list[CadenceEntry] = []
+    for item in raw:
+        if not isinstance(item, dict) or "value" not in item or "effective_from" not in item:
+            raise ValueError(f"{source} exercise_cadence entry malformed (needs value + effective_from): {item!r}")
+        value = _validate_cadence(item["value"], source)
+        try:
+            effective_from = date.fromisoformat(item["effective_from"])
+        except ValueError as exc:
+            raise ValueError(
+                f"{source} exercise_cadence entry has an invalid effective_from: {item['effective_from']!r}"
+            ) from exc
+        entries.append(CadenceEntry(value=value, effective_from=effective_from, why=item.get("_why", "")))
+    entries.sort(key=lambda e: e.effective_from)
+    return entries
+
+
+def cadence_for_date(history: list[CadenceEntry], d: date) -> str | None:
+    """The cadence value in force on ``d``, or ``None`` if ``d`` precedes the
+    first declared entry — "the declaration did not exist yet" is a distinct
+    state from "the run was expected and absent" (alpha-engine-config-I7175,
+    sf-pipeline-policy.md §2.6 rule 1's GATED_OFF/CRITICAL distinction)."""
+    in_force: str | None = None
+    for entry in history:  # history is sorted ascending by _parse_cadence_history
+        if entry.effective_from <= d:
+            in_force = entry.value
+        else:
+            break
+    return in_force
+
+
+def load_cadence_history(path: Path = MANIFEST_PATH) -> list[CadenceEntry]:
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    return _validate_cadence(manifest.get("exercise_cadence"), str(path))
+    return _parse_cadence_history(manifest.get("exercise_cadence"), str(path))
+
+
+def load_cadence_from_manifest(path: Path = MANIFEST_PATH) -> str:
+    """The value in force TODAY (real wall-clock today), i.e. the manifest
+    history's last entry as of now — used only for the CLI header/JSON
+    display and as the non-``--live`` current-cadence source. Per-day
+    classification never calls this; it calls ``cadence_for_date`` against
+    the full history instead (see ``compute_expected_slots``)."""
+    history = load_cadence_history(path)
+    today = _today()
+    value = cadence_for_date(history, today)
+    if value is None:
+        raise ValueError(f"{path}: no exercise_cadence entry is in force on {today.isoformat()}")
+    return value
 
 
 def load_cadence_from_ssm(ssm_client) -> str:
@@ -175,32 +235,63 @@ def compute_expected_slots(
     window_days: int,
     is_trading_day: Callable[[date], bool],
     next_trading_day: Callable[[date], date],
+    cadence_history: list[CadenceEntry] | None = None,
 ) -> list[ExpectedSlot]:
     """Derive every run-slot expected in [today - window_days, today].
 
-    Exercise slots: one per trading day in the window, gated_off when
-    ``cadence != "daily"`` — LaunchWeeklyExerciseRun's CheckExerciseCadence
-    only fires the launch on 'daily' (step_function_eod.json).
+    Exercise slots: one per trading day in the window.
+
+    ``cadence_history`` — when given, EVERY exercise day is resolved against
+    it via ``cadence_for_date`` instead of the flat ``cadence`` scalar, so a
+    day before the declaration's first entry is ``GATED_OFF`` rather than
+    judged against a cadence that did not exist yet on that day
+    (alpha-engine-config-I7175). ``None`` (the default) preserves the
+    original flat-``cadence`` behavior unchanged — the pipeline-watchdog
+    Lambda calls this positionally without it and must keep working; it only
+    ever evaluates a window anchored at "now", never retroactively, so the
+    distinction does not apply to it. A day gated on either path is skipped
+    when ``cadence != "daily"`` — LaunchWeeklyExerciseRun's
+    CheckExerciseCadence only fires the launch on 'daily'
+    (step_function_eod.json).
 
     Weekly slots: one per week whose last-trading-session-plus-one-day run
-    date falls within the window. NEVER gated by ``cadence`` — the Saturday
-    cron is a separate trigger this knob deliberately does not touch.
+    date falls within the window. NEVER gated by cadence (declared or
+    historical) — the Saturday cron is a separate trigger this knob
+    deliberately does not touch.
     """
     slots: list[ExpectedSlot] = []
     d = today - timedelta(days=window_days)
     while d <= today:
         if is_trading_day(d):
-            gated = cadence != "daily"
-            slots.append(ExpectedSlot(
-                day=d,
-                role="exercise",
-                gated_off=gated,
-                note=(
-                    f"cadence={cadence} — LaunchWeeklyExerciseRun is skipped on trading days"
-                    if gated else
-                    f"cadence={cadence} — LaunchWeeklyExerciseRun fires after this trading day's postclose"
-                ),
-            ))
+            if cadence_history is not None:
+                day_cadence = cadence_for_date(cadence_history, d)
+            else:
+                day_cadence = cadence
+            if day_cadence is None:
+                first_entry = cadence_history[0]  # non-empty by _parse_cadence_history
+                slots.append(ExpectedSlot(
+                    day=d,
+                    role="exercise",
+                    gated_off=True,
+                    note=(
+                        f"no exercise_cadence declaration was in force on {d.isoformat()} — "
+                        f"the earliest entry takes effect {first_entry.effective_from.isoformat()}. "
+                        "GATED_OFF, not CRITICAL: the declaration did not exist yet, which is a "
+                        "different state from 'expected and absent'."
+                    ),
+                ))
+            else:
+                gated = day_cadence != "daily"
+                slots.append(ExpectedSlot(
+                    day=d,
+                    role="exercise",
+                    gated_off=gated,
+                    note=(
+                        f"cadence={day_cadence} — LaunchWeeklyExerciseRun is skipped on trading days"
+                        if gated else
+                        f"cadence={day_cadence} — LaunchWeeklyExerciseRun fires after this trading day's postclose"
+                    ),
+                ))
         if _is_last_session_of_week(d, is_trading_day, next_trading_day):
             run_day = d + timedelta(days=1)
             if today - timedelta(days=window_days) <= run_day <= today:
@@ -401,10 +492,23 @@ def main(argv: list[str] | None = None) -> int:
     else:
         cadence = load_cadence_from_manifest()
 
+    # The dated history is always read from the repo manifest, --live or not:
+    # SSM holds a single current scalar and structurally cannot answer "what
+    # was declared on 2026-07-15" (alpha-engine-config-I7175). `cadence`
+    # above stays the display/JSON value of TODAY's declaration (live SSM
+    # when --live, else the manifest's current entry); `cadence_history`
+    # drives per-day classification for every day in the window, including
+    # today, so a manifest edit not yet deployed can never desync what the
+    # deadman expects from what --live merely displays.
+    cadence_history = load_cadence_history()
+
     today = _today()
     through = today if args.through == "today" else last_due_day(today)
     executions = fetch_execution_records(sf, args.window_days, today=today)
-    slots = compute_expected_slots(through, cadence, args.window_days, is_trading_day, next_trading_day)
+    slots = compute_expected_slots(
+        through, cadence, args.window_days, is_trading_day, next_trading_day,
+        cadence_history=cadence_history,
+    )
     results = evaluate(slots, executions)
     critical = [r for r in results if r.classification == "CRITICAL"]
 
