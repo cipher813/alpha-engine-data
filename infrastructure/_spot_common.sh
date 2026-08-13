@@ -119,39 +119,22 @@ _spot_failure_reason() {
   local rc="$1"
   if [ "$rc" -eq 64 ]; then echo "launch-capacity-exhausted"; return 0; fi
   [ -z "$_INSTANCE_ID" ] && return 1
-  # `|| _decide_rc=$?` is LOAD-BEARING. `relaunch-decision` signals "hold" by
-  # EXIT CODE (NO_RELAUNCH_EXIT_CODE = 75) — the designed answer for every
-  # failure that is not an AWS spot reclaim, i.e. nearly all of them. Under
-  # `set -e`, an unguarded `VAR="$(cmd)"` is a simple command whose status IS
-  # the substitution's, so that ordinary answer is an errexit trigger.
-  #
-  # This copy did NOT leak an instance, and the reason is worth stating because
-  # it is not a property of this function: the sole caller writes
-  # `reason="$(_spot_failure_reason "$rc")" || reason=""`, and bash suppresses
-  # errexit for the whole dynamic extent of a command on the left of `||` —
-  # including inside a function it invokes. Measured 2026-08-12 with a harness
-  # reproducing both shapes: the trap-body shape (crucible-predictor,
-  # crucible-backtester, crucible-dashboard) aborts the EXIT trap silently and
-  # skips `terminate-instances`; this shape completes and returns correctly.
-  #
-  # So the guard here is not a repair, it is the removal of a dependency on a
-  # caller convention that nothing enforces. One `||` deleted at the call site,
-  # or one second caller written without it, converts this into the live defect
-  # the other three repos had — with no test failure to announce it, because
-  # the leak is only visible in CloudTrail. Sibling fixes:
-  # crucible-predictor-PR467, and the same change in crucible-backtester and
-  # crucible-dashboard.
-  local _decide_out="" _decide_rc=0
-  _decide_out="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
+  # See alpha-engine-config-I7009 — migrated off the exit-code contract to --json.
+  local _decide_json="" _decide_rc=0
+  _decide_json="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
     --instance-id "$_INSTANCE_ID" \
     --region "$AWS_REGION" \
     --attempt "$SPOT_ATTEMPT" \
     --max-attempts "$MAX_SPOT_ATTEMPTS" \
     ${SF_EXECUTION_TIMEOUT:+--sf-execution-timeout "$SF_EXECUTION_TIMEOUT" --per-attempt-seconds "$MAX_RUNTIME_SECONDS"} \
+    --json \
     2>/dev/null)" || _decide_rc=$?
-  echo "  spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): rc=$_decide_rc ${_decide_out:+[$_decide_out]}" >&2
-  [ "$_decide_rc" -eq 0 ] || return 1
-  echo "confirmed-reclaim${_decide_out:+ ($_decide_out)}"
+  [ "$_decide_rc" -eq 0 ] || return 1   # CLI failed to answer -> treat as hold (do not relaunch)
+  local _relaunch=""
+  _relaunch="$(printf '%s' "$_decide_json" | "$LIB_PYTHON" -c 'import json,sys; print("1" if json.load(sys.stdin).get("relaunch") else "0")')"
+  echo "  spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): $_decide_json" >&2
+  [ "$_relaunch" = "1" ] || return 1
+  echo "confirmed-reclaim${_decide_json:+ ($_decide_json)}"
 }
 
 # ── EXIT handler (classification + cleanup + optional relaunch) ──────────────
