@@ -10,7 +10,14 @@ WorkingDirectory=/home/ec2-user/alpha-engine-data
 # emit dies with "You must specify a region" (seen live 2026-08-09).
 Environment=AWS_REGION=us-east-1
 Environment=AWS_DEFAULT_REGION=us-east-1
-ExecStart=/home/ec2-user/alpha-engine-data/.venv/bin/python /home/ec2-user/alpha-engine-data/infrastructure/systemd/check-systemd-unit-drift.py --report --metric --codified-root /home/ec2-user/alpha-engine-data/infrastructure/systemd --codified-root /home/ec2-user/alpha-engine-dashboard/infrastructure/systemd --codified-root /home/ec2-user/metron-ops/infrastructure/systemd --codified-root /home/ec2-user/telos-ops/infrastructure/systemd --codified-root /home/ec2-user/alpha-engine-dashboard/infrastructure --codified-root /home/ec2-user/alpha-engine-dashboard/live/infrastructure --codified-root /home/ec2-user/nousergon-auth/infrastructure --codified-root /home/ec2-user/nousergon-console/infrastructure --codified-root /home/ec2-user/the-cyphering-ops/infrastructure --codified-root /home/ec2-user/vires/infrastructure --codified-root /home/ec2-user/nous-ergon-ops/alpha-engine-dashboard/live/infrastructure/systemd
+# NO --codified-root list here. This ONE unit file installs on every box, and
+# the list it used to carry was the dashboard box's checkouts — so on the
+# trading box the check compared against eleven directories that box does not
+# have, missed /home/ec2-user/alpha-engine/infrastructure/systemd entirely, and
+# reported six correctly-codified trading units as "codified nowhere" every day
+# (alpha-engine-config-I6960). The roots are discovered per-box now; a list in a
+# shared file cannot be right on two boxes at once.
+ExecStart=/home/ec2-user/alpha-engine-data/.venv/bin/python /home/ec2-user/alpha-engine-data/infrastructure/systemd/check-systemd-unit-drift.py --report --metric
 # Reads /etc/systemd/system/*, no writes — runs as ec2-user like the units
 # it checks, not root.
 StandardOutput=journal

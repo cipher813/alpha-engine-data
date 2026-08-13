@@ -621,12 +621,23 @@ def test_every_watched_name_is_a_real_manifest_trigger(manifest, module):
         assert not unknown, f"{entry['name']} watches undeclared trigger(s): {unknown}"
 
 
-def test_ci_watch_reclaim_legs_exist_for_its_alarm_to_watch(manifest):
-    # Added by this same change, mirroring sf-watch's identical pair.
-    events = manifest["paused"]["events_rules"]
+def test_ci_watch_reclaim_legs_are_declared_for_its_alarm_to_watch(manifest, module):
+    # The property is that both legs are DECLARED somewhere the alarm's
+    # justification resolves — paused_names() is paused ∪ pending — not that
+    # they sit in one particular block. Which block is a fact about AWS, and
+    # it changed: measured 2026-08-13, neither rule exists live (the whole
+    # ci-watch-liveness-probe component is codified in its deploy.sh and never
+    # bootstrapped), so `paused` would make --check red with [missing-in-aws]
+    # forever. `pending` is the block for exactly that, and pinning the
+    # earlier block here turned a correct manifest correction into a red test.
+    declared = module.paused_names(manifest)
     for name in ("alpha-engine-ci-watch-spot-interruption",
                  "alpha-engine-ci-watch-instance-terminated"):
-        assert name in events, f"{name} missing — the ci-watch alarm entry watches it"
+        assert name in declared, (
+            f"{name} is declared in neither `paused` nor `pending` — the "
+            f"ci-watch alarm entry watches it, so its silencing would rest on "
+            f"a name no checker reads"
+        )
 
 
 def test_alarm_justified_derives_live_from_paused_names_not_a_cached_flag(module):
