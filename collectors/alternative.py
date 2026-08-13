@@ -173,6 +173,71 @@ def _validate_alt_payload(
     return blocking, warning
 
 
+def _emit_dry_run_validated_metric(n_validated: int) -> None:
+    """Emit ``AlphaEngine/Data/phase2_dry_run_tickers_validated``.
+
+    Best-effort: CloudWatch errors WARN but don't fail the collector.
+    Every real invocation of this Lambda since the SF's DataPhase2 state
+    was repointed to EC2-spot ``weekly_collector.py`` (PR #1186,
+    2026-07-31) has been ``deploy.sh``'s dry-run canary — there is no
+    other invoker (alpha-engine-config-I7041). A canary that silently
+    validates 0 (or a collapsed) universe was previously invisible: it
+    logged the same "Phase 2 complete" shape as a real run and there was
+    no metric to alarm on. This is that metric.
+    """
+    try:
+        cw = boto3.client("cloudwatch")
+        cw.put_metric_data(
+            Namespace="AlphaEngine/Data",
+            MetricData=[{
+                "MetricName": "phase2_dry_run_tickers_validated",
+                "Value": float(n_validated),
+                "Unit": "Count",
+            }],
+        )
+    except Exception as exc:
+        logger.warning(
+            "CloudWatch phase2_dry_run_tickers_validated metric failed: %s. "
+            "Not blocking — the dry-run log line is the fallback surface.",
+            exc,
+        )
+
+
+def _emit_tickers_processed_metric(n_processed: int, n_requested: int) -> None:
+    """Emit ``AlphaEngine/Data/phase2_tickers_processed`` for a real run.
+
+    Best-effort: CloudWatch errors WARN but don't fail the collector.
+    Distinguishes a real (non-dry-run) invocation's actual write count
+    from the dry-run validation count above — same gap this closes
+    (alpha-engine-config-I7041): before this, no metric existed for
+    tickers actually processed by this code path at all, only the
+    per-source quality-gate counters.
+    """
+    try:
+        cw = boto3.client("cloudwatch")
+        cw.put_metric_data(
+            Namespace="AlphaEngine/Data",
+            MetricData=[
+                {
+                    "MetricName": "phase2_tickers_processed",
+                    "Value": float(n_processed),
+                    "Unit": "Count",
+                },
+                {
+                    "MetricName": "phase2_tickers_requested",
+                    "Value": float(n_requested),
+                    "Unit": "Count",
+                },
+            ],
+        )
+    except Exception as exc:
+        logger.warning(
+            "CloudWatch phase2_tickers_processed metric failed: %s. Not "
+            "blocking — the manifest.json write is the load-bearing record.",
+            exc,
+        )
+
+
 def _emit_quality_gate_metrics(
     counts_by_type: dict[str, int], n_blocked: int, n_warned: int
 ) -> None:
@@ -612,9 +677,27 @@ def collect(
     _assert_scope_stable(s3, bucket, s3_prefix, run_date, len(tickers))
 
     if dry_run:
+        # A dry-run canary makes zero writes by design (deploy.sh invokes
+        # this branch with dry_run=true after every deploy) — that is a
+        # legitimate no-op, but only when it validated the real universe.
+        # The dry-run branch previously returned the validated count under
+        # the key "tickers", never "tickers_processed"; handler.py's
+        # completion log unconditionally reads "tickers_processed" and
+        # defaulted to 0, so every canary run — one that validated the
+        # full 903-ticker universe — logged "Phase 2 complete: 0 tickers
+        # processed", indistinguishable from a genuine empty-work-list
+        # failure (alpha-engine-config-I7041). Name the count explicitly
+        # as "validated" so no consumer can mistake it for real writes,
+        # and emit a metric so a canary that validates 0 (or a collapsed
+        # universe) is machine-readable rather than a log substring.
+        logger.info(
+            "Phase 2 dry-run validated %d tickers (no writes; dry_run=true)",
+            len(tickers),
+        )
+        _emit_dry_run_validated_metric(len(tickers))
         return {
             "status": "ok_dry_run",
-            "tickers": len(tickers),
+            "tickers_validated": len(tickers),
             "ticker_list": tickers[:10],
         }
 
@@ -831,6 +914,10 @@ def collect(
             "payload that would degrade the research scoring layer."
         )
         logger.error(msg)
+        # Failure path writes the same telemetry as success — the metric
+        # lands even though the run is being rejected (observability-policy
+        # §"the failure path writes the same telemetry as the success path").
+        _emit_tickers_processed_metric(succeeded, n_total)
         return {
             "status": "error",
             "error": msg,
@@ -850,6 +937,7 @@ def collect(
         n_total,
         ", ".join(f"{k}={source_ratios[k]:.0%}" for k in _HAS_DATA_PREDICATES),
     )
+    _emit_tickers_processed_metric(succeeded, n_total)
     return {
         "status": status,
         "tickers_processed": succeeded,
