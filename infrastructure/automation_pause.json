@@ -32,14 +32,14 @@
   "pending": {
     "_why": "Triggers that do not exist live yet but MUST be created DISABLED when they first appear. Brian's ruling covers 'everything else', which includes automation that lands after 2026-08-07 \u2014 but automation_pause.py --check requires every `paused` entry to exist live, so a not-yet-created name cannot go there without turning the check red. pause_state() reads BOTH blocks; --check requires existence only for `paused`. Move an entry up to `paused` once it exists live. Found by alpha-engine-config-I6620: nousergon-data#1207 declares three schedules that its (currently broken) deploy would have created ENABLED mid-pause.",
     "alpha-engine-sf-watch-reclaim-sweep-0645-daily": "nousergon-data#1207; codified in sf-watch-reclaim-sweep-handler/deploy.sh, never created live",
-    "alpha-engine-sf-watch-reclaim-sweep-1445-daily": "nousergon-data#1207; codified in sf-watch-reclaim-sweep-handler/deploy.sh, never created live"
+    "alpha-engine-sf-watch-reclaim-sweep-1445-daily": "nousergon-data#1207; codified in sf-watch-reclaim-sweep-handler/deploy.sh, never created live",
+    "alpha-engine-ci-watch-instance-terminated": "ci-watch-liveness-probe reclaim leg (EC2 instance-terminated). Codified in lambdas/ci-watch-liveness-probe/deploy.sh, never created live — moved here from `paused` on 2026-08-13 after `--check` reported it [missing-in-aws]. Measured that day: `events describe-rule` 404s for this name and for its twin, while the sf-watch equivalents (alpha-engine-sf-watch-instance-terminated / -spot-interruption) both exist DISABLED; the whole ci-watch-liveness-probe component is codified-but-never-bootstrapped, alongside its IAM role in the nous-ergon-ops IAM drift report. Same situation as the sf-watch-reclaim-sweep pair above, so the same block.",
+    "alpha-engine-ci-watch-spot-interruption": "ci-watch-liveness-probe reclaim leg (EC2 spot-interruption-warning). Codified in lambdas/ci-watch-liveness-probe/deploy.sh, never created live — the second of ci-watch's two reclaim wake legs; see the entry above."
   },
   "paused": {
     "events_rules": {
       "alpha-engine-canary-replay-liveness-probe-tick": "overseer canary-replay liveness probe",
       "alpha-engine-canary-replay-thursday": "canary-replay drill dispatcher (spawns work)",
-      "alpha-engine-ci-watch-instance-terminated": "ci-watch-liveness-probe reclaim leg (EC2 instance-terminated) - added alpha-engine-config-I7174. Mirrors alpha-engine-sf-watch-instance-terminated below, which was already declared paused under the same 2026-08-07 ruling for the same reason (its target dispatches into the paused response plane); this twin was missed at that time. `alpha-engine-watch-plane-ci-watch-liveness-probe-invocations-floor`'s `paused_alarms` entry watches this name - without it that alarm's declaration would reference a trigger absent from this manifest.",
-      "alpha-engine-ci-watch-spot-interruption": "ci-watch-liveness-probe reclaim leg (EC2 spot-interruption-warning) - added alpha-engine-config-I7174. Same finding as alpha-engine-ci-watch-instance-terminated above: the second of ci-watch's two reclaim/relaunch wake legs, mirroring alpha-engine-sf-watch-spot-interruption.",
       "alpha-engine-daily-heal": "data-spot heal dispatcher (launches spot). CloudFormation-managed - State: DISABLED in alpha-engine-orchestration.yaml",
       "alpha-engine-eod-success-friday-shell-trigger": "Friday shell-run trigger (spawns work)",
       "alpha-engine-friday-shell-run-report": "Friday shell-run report",
