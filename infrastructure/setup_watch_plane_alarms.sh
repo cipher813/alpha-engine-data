@@ -95,6 +95,16 @@ BACKSTOP_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:${BACKSTOP_TOPIC_NAME}"
 # (mid-run spot-reclaim checkers for the ci-watch and alert-drain families,
 # mirroring sf-watch-reclaim-sweep-handler's config#2270 mechanism) — onboarded in
 # the SAME PR that ships them, per this file's own header convention.
+# sf-watch-liveness-probe added alpha-engine-config-I7045: it was NEVER in
+# this roster despite being Active and scheduled twice daily 06:45/14:45 UTC
+# -- the exact onboarding-checklist miss this file's header warns about.
+# Without this entry the Invocations-floor alarm (section 3, config-I5567)
+# and the slow-cadence override (section 2, config#4477) both silently
+# skipped it, so a dead sf-watch-liveness-probe schedule read identically to
+# a healthy one -- measured live 2026-08-12: no report since 2026-08-07,
+# every alarm still OK. (Comment kept OUT of the array literal below so the
+# tests/test_watch_plane_alarms_script.py block-parser isn't confused by a
+# stray `)` inside the block.)
 declare -A WATCH_PLANE_FUNCTIONS=(
   ["saturday-sf-watch-dispatcher"]="alpha-engine-saturday-sf-watch-dispatcher"
   ["sf-watch-spot-dispatcher"]="alpha-engine-sf-watch-spot-dispatcher"
@@ -102,6 +112,7 @@ declare -A WATCH_PLANE_FUNCTIONS=(
   ["ci-watch-liveness-probe"]="alpha-engine-ci-watch-liveness-probe"
   ["sf-watch-reclaim-sweep-handler"]="alpha-engine-sf-watch-reclaim-sweep-handler"
   ["overseer-liveness-probe"]="alpha-engine-overseer-liveness-probe"
+  ["sf-watch-liveness-probe"]="alpha-engine-sf-watch-liveness-probe"
   ["overseer-dispatcher"]="alpha-engine-overseer-dispatcher"
   ["alert-drain-dispatcher"]="alpha-engine-alert-drain-dispatcher"
   ["alert-drain-liveness-probe"]="alpha-engine-alert-drain-liveness-probe"
@@ -160,6 +171,14 @@ declare -A _LAMBDA_CADENCE_SECONDS=(
   # (dead EventBridge schedule, deleted Lambda, IAM blackout) pages as ALARM
   # within 8h instead of reading OK indefinitely while failing every invocation.
   ["overseer-liveness-probe"]=28800
+  # alpha-engine-sf-watch-liveness-probe: same twice-daily cadence as the
+  # overseer probe above, 06:45 / 14:45 UTC, ~8h apart -- added
+  # alpha-engine-config-I7045 alongside the WATCH_PLANE_FUNCTIONS entry.
+  # Without this override the default 300s/notBreaching Errors/Throttles
+  # alarms cannot distinguish "ran clean" from "has not run in five days",
+  # which is the exact silent-green condition config-I7045 measured live on
+  # 2026-08-12: last report 2026-08-07, every alarm still OK.
+  ["sf-watch-liveness-probe"]=28800
 )
 
 DEFAULT_ALARM_PERIOD=300
