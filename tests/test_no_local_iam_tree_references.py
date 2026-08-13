@@ -58,11 +58,16 @@ SHELL_SCRIPTS = sorted(INFRA.rglob("*.sh"))
 _IAM_PATH_RE = re.compile(r"[\w${}./\"-]*\biam/[\w.${}-]+\.(?:json|yaml|yml)")
 
 # Reading the OPS repo's iam tree through an explicit external-checkout variable
-# is the sanctioned post-consolidation pattern, not a violation — e.g.
-# `infrastructure/lambdas/sf-watch-market-hours-toggler/deploy.sh` reads
-# "${IAM_REPO}/infrastructure/iam/sf-watch-executor-role-policy.json". What this
-# test forbids is a path resolving INSIDE this repo ($SCRIPT_DIR/iam/…,
+# is the sanctioned post-consolidation pattern, not a violation: a path built
+# from "${IAM_REPO}/infrastructure/iam/<doc>.json" resolves in another checkout.
+# What this test forbids is a path resolving INSIDE this repo ($SCRIPT_DIR/iam/…,
 # infrastructure/iam/…), not any mention of an iam tree anywhere.
+#
+# The marker has no consumer in the tree today. Its only one was
+# `infrastructure/lambdas/sf-watch-market-hours-toggler/deploy.sh`, deleted
+# 2026-08-12 with the toggler (`alpha-engine-config-I7111`). The allowance stays
+# because the pattern it sanctions is still the correct one for the next
+# cross-repo reader; it is not evidence that a reader exists.
 _EXTERNAL_REPO_MARKERS = ("IAM_REPO",)
 
 
