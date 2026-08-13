@@ -401,28 +401,29 @@ class TestCoverageAccounting:
                 f"— a baselined unit is exempt from drift verification"
             )
 
-    def test_the_unit_passes_every_measured_codified_root_and_metric(self):
-        """The roots live in the unit's ExecStart, not in the script — dropping
-        one there silently re-baselines that repo's units on the next deploy."""
+    def test_the_unit_carries_no_hardcoded_root_list(self):
+        """The root list is NOT in the unit any more (alpha-engine-config-I6960).
+
+        It used to be, and this file used to assert its eleven entries were
+        present — which is why the defect survived: the list was the dashboard
+        box's checkouts, the SAME unit file installs on the trading box, and a
+        test pinning the list could only ever confirm the wrong list was
+        faithfully deployed to both. A per-box fact cannot live in a file that
+        is byte-identical on every box; roots are discovered now.
+        """
         unit = (_REPO_ROOT / "infrastructure" / "systemd" / "systemd-unit-drift-check.service").read_text()
         exec_lines = [l for l in unit.splitlines() if l.startswith("ExecStart=")]
         assert len(exec_lines) == 1
         line = exec_lines[0]
         assert "--metric" in line, "coverage counts must be emitted every run"
-        for root in (
-            "/home/ec2-user/alpha-engine-data/infrastructure/systemd",
-            "/home/ec2-user/alpha-engine-dashboard/infrastructure/systemd",
-            "/home/ec2-user/metron-ops/infrastructure/systemd",
-            "/home/ec2-user/telos-ops/infrastructure/systemd",
-            "/home/ec2-user/alpha-engine-dashboard/infrastructure",
-            "/home/ec2-user/alpha-engine-dashboard/live/infrastructure",
-            "/home/ec2-user/nousergon-auth/infrastructure",
-            "/home/ec2-user/nousergon-console/infrastructure",
-            "/home/ec2-user/the-cyphering-ops/infrastructure",
-            "/home/ec2-user/vires/infrastructure",
-            "/home/ec2-user/nous-ergon-ops/alpha-engine-dashboard/live/infrastructure/systemd",
-        ):
-            assert f"--codified-root {root}" in line, f"missing codified root {root}"
+        assert "--report" in line, "a finding must reach an alert, not only the journal"
+        assert "--codified-root" not in line, (
+            "a hardcoded root list in a unit file shared by every box is I6960; "
+            "roots are discovered per-box"
+        )
+        assert "--no-discover-roots" not in line, (
+            "disabling discovery in the shipped unit restores the defect"
+        )
         # boto3 does not infer region from IMDS: without these, --metric dies
         # with "You must specify a region" (seen live 2026-08-09).
         assert "Environment=AWS_REGION=us-east-1" in unit
@@ -479,3 +480,130 @@ class TestUnreadableUnit:
         assert "unreadable=1" in cap.out
         assert "[clean] daily-news.timer" in cap.out
         assert "nousergon-console.service" in cap.err
+
+
+class TestCodifiedRootDiscovery:
+    """Roots are found by walking the box, not read from a list
+    (alpha-engine-config-I6960).
+
+    The regression this closes: on the trading box, six units WERE codified in
+    `/home/ec2-user/alpha-engine/infrastructure/systemd` and the check reported
+    them as "installed but codified nowhere" every day, because that directory
+    was not among the eleven the shared unit file named. A check that cannot
+    see where a unit is codified reports a codification gap — the harness fault
+    arriving dressed as the finding.
+    """
+
+    def _box(self, tmp_path):
+        """A miniature of the real layout: repos under a home, units in both
+        `infrastructure/systemd/` and bare `infrastructure/`."""
+        home = tmp_path / "home" / "ec2-user"
+        (home / "alpha-engine" / "infrastructure" / "systemd").mkdir(parents=True)
+        (home / "alpha-engine-dashboard" / "infrastructure").mkdir(parents=True)
+        (home / "nous-ergon-ops" / "alpha-engine-dashboard" / "live" / "infrastructure" / "systemd").mkdir(parents=True)
+        return home
+
+    def test_discovers_both_layouts_at_every_real_depth(self, cd, tmp_path):
+        module, _, _ = cd
+        home = self._box(tmp_path)
+
+        roots = module.discover_codified_roots(bases=[home])
+
+        assert home / "alpha-engine" / "infrastructure" / "systemd" in roots, (
+            "the trading box's codified root — the one I6960 was missing"
+        )
+        assert home / "alpha-engine" / "infrastructure" in roots
+        assert home / "alpha-engine-dashboard" / "infrastructure" in roots
+        assert home / "nous-ergon-ops" / "alpha-engine-dashboard" / "live" / "infrastructure" / "systemd" in roots, (
+            "depth-4 root: the deepest real one on either box"
+        )
+
+    def test_a_new_checkout_is_covered_with_no_edit_anywhere(self, cd, tmp_path):
+        """The whole point. A repo that lands on a box is compared the same day,
+        rather than on the next time somebody remembers to extend a list."""
+        module, _, _ = cd
+        home = self._box(tmp_path)
+        newcomer = home / "some-new-repo" / "infrastructure" / "systemd"
+        newcomer.mkdir(parents=True)
+
+        assert newcomer in module.discover_codified_roots(bases=[home])
+
+    def test_a_unit_codified_in_a_discovered_root_reads_clean_not_uncodified(
+        self, cd, tmp_path, monkeypatch, capsys
+    ):
+        """End to end, in the exact shape of the live finding."""
+        module, script_dir, installed_dir = cd
+        home = self._box(tmp_path)
+        codified = home / "alpha-engine" / "infrastructure" / "systemd" / "ibgateway.service"
+        codified.write_text("UNIT IBGW\n")
+        (installed_dir / "ibgateway.service").write_text("UNIT IBGW\n")
+
+        monkeypatch.setattr(module, "CODIFIED_SEARCH_BASES", (home,))
+        monkeypatch.setattr("sys.argv", ["check-systemd-unit-drift.py"])
+        code = module.main()
+        cap = capsys.readouterr()
+
+        assert code == 0
+        assert "[clean] ibgateway.service" in cap.out
+        assert "uncodified=0" in cap.out
+
+    def test_prune_keeps_the_walk_off_git_and_venvs(self, cd, tmp_path):
+        module, _, _ = cd
+        home = tmp_path / "home"
+        buried = home / "repo" / ".git" / "modules" / "infrastructure"
+        buried.mkdir(parents=True)
+        venv = home / "repo" / ".venv" / "infrastructure"
+        venv.mkdir(parents=True)
+
+        roots = module.discover_codified_roots(bases=[home])
+
+        assert buried not in roots
+        assert venv not in roots
+
+    def test_explicit_roots_are_additive_never_a_replacement(self, cd, tmp_path, monkeypatch, capsys):
+        """`--codified-root` narrowing coverage back to a hand-written list is
+        how I6960 would return through the flag instead of the unit file."""
+        module, script_dir, installed_dir = cd
+        home = self._box(tmp_path)
+        (home / "alpha-engine" / "infrastructure" / "systemd" / "xvfb.service").write_text("X\n")
+        (installed_dir / "xvfb.service").write_text("X\n")
+        extra = tmp_path / "outside-the-bases"
+        extra.mkdir()
+        (extra / "daily-news.timer").write_text("D\n")
+        (installed_dir / "daily-news.timer").write_text("D\n")
+
+        monkeypatch.setattr(module, "CODIFIED_SEARCH_BASES", (home,))
+        monkeypatch.setattr("sys.argv", ["check-systemd-unit-drift.py", "--codified-root", str(extra)])
+        code = module.main()
+        cap = capsys.readouterr()
+
+        assert code == 0
+        assert "[clean] xvfb.service" in cap.out, "discovered root dropped when a flag was passed"
+        assert "[clean] daily-news.timer" in cap.out, "explicit root ignored"
+
+    def test_disagreeing_copies_are_reported_and_the_installed_one_wins(
+        self, cd, tmp_path, monkeypatch, capsys
+    ):
+        """Two checkouts can codify the same unit name differently once roots
+        are wide. Preferring the copy that matches the box keeps the verdict
+        from depending on iteration order; the disagreement is still said out
+        loud, because one of the two repos is stale."""
+        module, script_dir, installed_dir = cd
+        home = tmp_path / "home"
+        a = home / "repo-a" / "infrastructure" / "systemd"
+        b = home / "repo-b" / "infrastructure" / "systemd"
+        a.mkdir(parents=True)
+        b.mkdir(parents=True)
+        (a / "ibgateway.service").write_text("STALE\n")
+        (b / "ibgateway.service").write_text("LIVE\n")
+        (installed_dir / "ibgateway.service").write_text("LIVE\n")
+
+        monkeypatch.setattr(module, "CODIFIED_SEARCH_BASES", (home,))
+        monkeypatch.setattr("sys.argv", ["check-systemd-unit-drift.py"])
+        code = module.main()
+        cap = capsys.readouterr()
+
+        assert code == 0, "a box running the correctly-codified unit is not drifted"
+        assert "[clean] ibgateway.service" in cap.out
+        assert "disagreeing copies" in cap.out
+        assert "ambiguous=1" in cap.out
