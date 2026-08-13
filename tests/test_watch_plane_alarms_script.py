@@ -2,7 +2,12 @@
 extended to 8 functions + an intake-queue age alarm by config-I2900/I2910;
 extended to 9 functions by alpha-engine-config-I3242's arctic-migration-
 dispatcher onboarding; extended to 11 functions by config#3173's
-ci-watch-liveness-probe + alert-drain-liveness-probe onboarding).
+ci-watch-liveness-probe + alert-drain-liveness-probe onboarding; extended to
+12 functions by alpha-engine-config-I7045's sf-watch-liveness-probe
+onboarding — it was Active and scheduled twice daily but had never been added
+to this roster, so its dead-schedule condition (measured live 2026-08-12: no
+report since 2026-08-07, every alarm still OK) was invisible to both the
+Errors/Throttles cadence override and the Invocations-floor alarm below).
 
 setup_watch_plane_alarms.sh puts CloudWatch Errors + Throttles alarms on each
 of the watch-plane Lambdas — the components whose job is to notice fleet
@@ -91,6 +96,9 @@ class TestWatchPlaneCoverage:
             # ArcticDB migration runner — onboarded in the SAME PR that ships it,
             # per this file's own header convention.
             "alpha-engine-arctic-migration-dispatcher",
+            # Added alpha-engine-config-I7045: was Active and scheduled twice
+            # daily, never onboarded — see module docstring.
+            "alpha-engine-sf-watch-liveness-probe",
         ],
     )
     def test_lambda_is_present(self, script_text, fn_name):
@@ -105,7 +113,7 @@ class TestWatchPlaneCoverage:
                 ")", script_text.find("declare -A WATCH_PLANE_FUNCTIONS=(")
             )
         ]
-        assert block.count('"alpha-engine-') == 16
+        assert block.count('"alpha-engine-') == 17
 
     def test_both_errors_and_throttles_alarmed(self, script_text):
         assert "for metric in Errors Throttles" in script_text
@@ -300,7 +308,7 @@ class TestLivenessInvocationsFloorAlarms:
         dec_end = script_text.find(")", dec_start)
         dec_block = script_text[dec_start:dec_end]
         liveness_labels = [line for line in dec_block.split("\n") if "liveness" in line]
-        assert len(liveness_labels) >= 4, f"Expected >=4 liveness labels, found {len(liveness_labels)}"
+        assert len(liveness_labels) >= 5, f"Expected >=5 liveness labels, found {len(liveness_labels)}"
         # Verify the for loop exists with *liveness* pattern (catches all at runtime).
         invoc_block = script_text[script_text.find("Per-liveness-probe Invocations-floor"):]
         assert "for label in \"${!WATCH_PLANE_FUNCTIONS[@]}\"" in invoc_block
@@ -308,6 +316,35 @@ class TestLivenessInvocationsFloorAlarms:
         assert "put-metric-alarm" in invoc_block
         # Verify uniqueness: the alarm name uses ${label} so each iteration creates a distinct name.
         assert 'alpha-engine-watch-plane-${label}-invocations-floor' in invoc_block
+
+
+class TestSlowCadenceOverrideCoversBothLivenessSchedulers:
+    """alpha-engine-config-I7045: the overseer probe got the slow-cadence
+    breaching override (config#4477, 2026-07-29) but sf-watch-liveness-probe
+    — same twice-daily schedule shape — never did, so its Errors/Throttles
+    alarms stayed on the default notBreaching/300s shape and could not
+    distinguish a dead schedule from a clean run. A probe emitting nothing
+    must not evaluate to the same alarm shape as a probe emitting only
+    successes; this pins that both liveness probes get the breaching
+    override, not just one of them."""
+
+    def test_both_liveness_probes_have_cadence_override(self, script_text):
+        block_start = script_text.find("declare -A _LAMBDA_CADENCE_SECONDS=(")
+        # The block's comment lines legitimately contain parenthesised asides
+        # (e.g. "(5 min)"), so a naive search for the first ")" closes too
+        # early — the array literal's actual close is a ")" alone on its own
+        # line, same gotcha the WATCH_PLANE_FUNCTIONS block documents.
+        block_end = script_text.find("\n)", block_start)
+        block = script_text[block_start:block_end]
+        assert '["overseer-liveness-probe"]=28800' in block
+        assert '["sf-watch-liveness-probe"]=28800' in block
+
+    def test_override_period_within_cloudwatch_cap(self, script_text):
+        # #7024: EvaluationPeriods * Period must be <= 604800 for any alarm
+        # with period >= 3600. Both overrides use a single evaluation period
+        # (_effective_evals returns "1" whenever a cadence override is set),
+        # so 28800 * 1 is comfortably under the weekly cap.
+        assert 28800 * 1 <= 604800
 
 
 class TestOverseerIntakeDlqAlarm:
