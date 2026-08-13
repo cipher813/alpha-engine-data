@@ -28,7 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 INFRA = REPO_ROOT / "infrastructure"
 MODULE_PATH = INFRA / "pause_reconcile.py"
 MANIFEST_PATH = INFRA / "automation_pause.json"
-WORKFLOW = REPO_ROOT / ".github" / "workflows" / "sf-arn-drift-check.yml"
+WORKFLOW = REPO_ROOT / ".github" / "workflows" / "pause-reconcile.yml"
 
 
 def _load():

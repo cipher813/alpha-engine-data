@@ -76,13 +76,6 @@ jobs:
           role-to-assume: arn:aws:iam::711398986525:role/github-actions-iam-drift-check
           aws-region: us-east-1
 
-      # pause_reconcile.py --publish writes its own console row through the
-      # canonical envelope builder rather than a second hand-rolled JSON shape
-      # (shared-code-policy: one shape, every call site). Same pin as
-      # requirements.txt, for the reason deploy-infrastructure.yml states.
-      - name: Install nousergon-lib (envelope builder for the console row)
-        run: pip install "nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.49"
-
       # Brian ruling 2026-08-07: all scheduled automation paused except the
       # weekly/preopen/postclose SFs and the 24/7 box. This asserts the pause
       # still holds — the opposite direction from every other check here, and
@@ -119,38 +112,6 @@ jobs:
       # scheduler:GetSchedule this role already holds.
       - name: Overseer playbook arming (declared pause vs live, live)
         run: python3 infrastructure/overseer/arming.py --check
-
-      # alpha-engine-config-I7118. The step above asks "does the pause hold for
-      # the names the manifest lists". This one asks the question nothing asked
-      # before it, in the two directions that list cannot reach:
-      #
-      #   * a trigger that is DARK and that NEITHER register declares off —
-      #     neither automation_pause.json nor its observability registry row.
-      #     The manifest's own coverage was hand-listed, which is
-      #     observability-policy.md §2.2's defect one level up from the one the
-      #     manifest fixes; this enumerates the account instead, so a trigger
-      #     nobody named is a finding by construction. It found
-      #     `alpha-research-openrouter-shadow-weekly` on the first run — ENABLED
-      #     weekly work under the pause, in neither block and in no registry row.
-      #   * a registry row asserting `lifecycle: disabled` while its trigger is
-      #     live, or while quoting a manifest entry that no longer exists. Those
-      #     declarations are hand-copied claims about a file in ANOTHER repo, and
-      #     a row saying DISABLED renders green-adjacent, is excluded from
-      #     staleness_honesty's violation set and is exempt from ABSENT
-      #     candidacy — so a component running again behind one is silent
-      #     everywhere. That is worse than the UNREPORTED it replaced, because
-      #     UNREPORTED is loud.
-      #
-      # Detect-only, and structurally so: tests/test_pause_reconcile.py asserts
-      # the module contains no mutating verb. Editing a lifecycle declaration
-      # because a manifest entry moved would INFER a decision from a file diff.
-      #
-      # The registry is read from s3://alpha-engine-research/ops/registry/
-      # observability.d/, the copy observability-registry-publish.yml syncs on
-      # every merge that changes it and the same copy the console reads — no
-      # cross-repo checkout, no second credential, no second schedule.
-      - name: Pause manifest vs observability registry vs live AWS
-        run: python3 infrastructure/pause_reconcile.py --check --publish
 
       # The record itself, on every run, so the verdict for all nine is
       # readable without re-deriving it — including when every one of them is
