@@ -55,14 +55,40 @@ def module():
 
 # ── §1: manifest shape ──────────────────────────────────────────────────────
 
-def test_manifest_declares_an_allowed_value(manifest):
-    assert manifest["exercise_cadence"] in ALLOWED_VALUES
+def test_manifest_declares_a_dated_cadence_history(manifest):
+    """alpha-engine-config-I7175: exercise_cadence is a dated history, not a
+    bare scalar, so a backward-looking reader can tell 'not declared yet'
+    from 'declared and silent'."""
+    history = manifest["exercise_cadence"]
+    assert isinstance(history, list) and history
+    for entry in history:
+        assert entry["value"] in ALLOWED_VALUES
+        # raises if malformed
+        __import__("datetime").date.fromisoformat(entry["effective_from"])
 
 
-def test_manifest_declares_daily_unchanged_by_this_change(manifest):
-    """config#6689 changes the MECHANISM, never the cadence itself — the
-    value stays 'daily' (alpha-engine-config#5489, Brian ruling 2026-07-29)."""
-    assert manifest["exercise_cadence"] == "daily"
+def test_manifest_history_is_sorted_ascending_by_effective_from(manifest):
+    dates = [e["effective_from"] for e in manifest["exercise_cadence"]]
+    assert dates == sorted(dates)
+
+
+def test_manifest_current_entry_is_daily_unchanged_by_this_change(manifest):
+    """config#6689 changed the MECHANISM, never the cadence itself — the
+    value in force today stays 'daily' (alpha-engine-config#5489, Brian
+    ruling 2026-07-29). I7175 only adds the dated history around it."""
+    assert manifest["exercise_cadence"][-1]["value"] == "daily"
+
+
+def test_daily_entry_effective_from_precedes_the_ruling_date(manifest):
+    """Measured live 2026-08-13 (alpha-engine-config-I7175): postclose FAILED
+    before reaching LaunchWeeklyExerciseRun on 2026-07-27/07-28 — two real
+    silent exercise slots — while the ruling recorded in #5489 is dated
+    2026-07-29. effective_from must be <= 2026-07-27 or those two real
+    silences reclassify as GATED_OFF, which is the opposite of what this
+    issue exists to fix."""
+    daily_entries = [e for e in manifest["exercise_cadence"] if e["value"] == "daily"]
+    assert daily_entries
+    assert daily_entries[0]["effective_from"] <= "2026-07-27"
 
 
 def test_allowed_values_field_matches_the_real_allowed_set(manifest):
@@ -92,6 +118,26 @@ def test_declared_cadence_rejects_an_invalid_value(module, tmp_path):
     bad.write_text(json.dumps({"exercise_cadence": "hourly"}), encoding="utf-8")
     with pytest.raises(ValueError):
         module.declared_cadence(module.load_manifest(bad))
+
+
+def test_declared_cadence_resolves_the_entry_in_force_on_a_given_today(module):
+    from datetime import date
+    history = {
+        "exercise_cadence": [
+            {"value": "weekly-only", "effective_from": "2026-01-01"},
+            {"value": "daily", "effective_from": "2026-07-27"},
+        ]
+    }
+    assert module.declared_cadence(history, today=date(2026, 7, 20)) == "weekly-only"
+    assert module.declared_cadence(history, today=date(2026, 7, 27)) == "daily"
+    assert module.declared_cadence(history, today=date(2026, 8, 13)) == "daily"
+
+
+def test_declared_cadence_raises_when_today_precedes_the_first_entry(module):
+    from datetime import date
+    history = {"exercise_cadence": [{"value": "daily", "effective_from": "2026-07-27"}]}
+    with pytest.raises(ValueError):
+        module.declared_cadence(history, today=date(2026, 1, 1))
 
 
 def test_check_reports_missing_in_aws_when_param_absent(module, monkeypatch):
