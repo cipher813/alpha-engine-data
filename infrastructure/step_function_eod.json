@@ -47,6 +47,14 @@
       "Comment": "alpha-engine-config-I7111 \u2014 the boundary itself. Keys on the gate's verdict, which is enumerated EXHAUSTIVELY: an absent or unrecognised verdict is a contract violation by our own Lambda and fails CLOSED via Default rather than proceeding to trade on an unverifiable answer (the config-I2767 lesson TradingDayGateChoice already carries). PROCEED_OVERRIDE is the ruling's second requirement \u2014 the boundary must be refusable deliberately, never bypassable accidentally \u2014 and it routes through a notify state so a crossed boundary is announced rather than silent.",
       "Choices": [
         {
+          "Not": {
+            "Variable": "$.market_hours_gate.Payload.verdict",
+            "IsPresent": true
+          },
+          "Comment": "alpha-engine-config-I7165: gate Lambda returned a payload WITHOUT Payload.verdict (same class as the live 2026-08-13 preopen failure, execution 59c0ce46-d366-45dd-8cd3-acbdc06638c1 \u2014 alpha-engine-predictor-inference:live frozen on v455, no check_market_hours action, fell through to its default predict branch and returned a bare 200). Unguarded, this dereference throws an UNCATCHABLE States.Runtime one state after the Task's own Catch, which only fires on Task failure. Route through the malformed-payload floor into SetMarketHoursUnverifiedDegraded \u2014 the same fail-open, DEGRADED path the Catch above already uses for this Lambda's failure.",
+          "Next": "MarketHoursGatePayloadMalformed"
+        },
+        {
           "Variable": "$.market_hours_gate.Payload.verdict",
           "StringEquals": "PROCEED",
           "Comment": "Market closed. The scheduled trigger of both pipelines lands here every day: preopen at 05:15 PT (pre-open) and postclose at 13:00:0x PT, which is 16:00:0x ET \u2014 the session window is half-open [09:30, 16:00) so the close instant itself is already outside it.",
@@ -72,6 +80,16 @@
         }
       ],
       "Default": "HandleFailure"
+    },
+    "MarketHoursGatePayloadMalformed": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I7165 \u2014 floors $.market_hours_gate_error before SetMarketHoursUnverifiedDegraded, which threads it onward as $.degraded_summary.stage_error, and before NotifyMarketHoursUnverified, whose Message.$ calls States.JsonToString($.market_hours_gate_error); that field is otherwise written only by MarketHoursGate's Catch ResultPath and would itself throw States.Runtime on this path were it absent. Mirrors WeeklyRunDayGateMalformed in step_function.json for the identical hazard, adapted to this pipeline's fail-open-degraded posture for the market-hours gate (unlike preopen's fail-closed).",
+      "Result": {
+        "Error": "MarketHoursGateMalformedPayload",
+        "Cause": "check_market_hours returned a payload without Payload.verdict \u2014 the gate could not be evaluated; proceeding fail-open DEGRADED (mirrors the gate's own Catch posture for this pipeline)."
+      },
+      "ResultPath": "$.market_hours_gate_error",
+      "Next": "SetMarketHoursUnverifiedDegraded"
     },
     "RecordMarketHoursOverride": {
       "Type": "Task",

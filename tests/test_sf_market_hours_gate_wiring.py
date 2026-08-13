@@ -251,14 +251,27 @@ class TestChoiceRouting:
         )
 
     @pytest.mark.parametrize("name", _BOTH)
-    def test_an_absent_verdict_fails_closed(self, defs, name):
-        # config-I2767's lesson, which TradingDayGateChoice already carries: a
-        # gate payload without its verdict is a contract violation by our own
-        # Lambda. Proceeding to trade on an unverifiable answer is the one
-        # outcome that must not happen.
+    def test_an_absent_verdict_routes_to_the_malformed_payload_floor(self, defs, name):
+        # alpha-engine-config-I7165 (measured live 2026-08-13, execution
+        # 59c0ce46-d366-45dd-8cd3-acbdc06638c1): a gate payload without its
+        # verdict is a contract violation by our own Lambda, and this
+        # harness's evaluate() previously asserted it landed on Default
+        # ("HandleFailure") — which is NOT what real ASL does. A raw
+        # StringEquals comparison against an absent Variable throws an
+        # UNCATCHABLE States.Runtime in AWS (Choice states carry no Catch),
+        # which is exactly what happened live: no HandleFailure, no SNS
+        # alert, just an unannounced ExecutionFailed 48s in. The fix is a
+        # LEADING presence guard (`Not`/`IsPresent`) ahead of every
+        # StringEquals rule, routing an absent verdict to
+        # MarketHoursGatePayloadMalformed before any comparison that could
+        # crash is ever evaluated — see test_sf_market_hours_gate_payload_
+        # guard.py for the structural proof this can't regress silently.
         choice = defs[name]["States"]["MarketHoursGateChoice"]
-        assert evaluate(choice, {}) == "HandleFailure"
-        assert evaluate(choice, {"market_hours_gate": {"Payload": {}}}) == "HandleFailure"
+        assert evaluate(choice, {}) == "MarketHoursGatePayloadMalformed"
+        assert (
+            evaluate(choice, {"market_hours_gate": {"Payload": {}}})
+            == "MarketHoursGatePayloadMalformed"
+        )
 
     @pytest.mark.parametrize("name", _BOTH)
     def test_an_unrecognised_verdict_fails_closed(self, defs, name):
