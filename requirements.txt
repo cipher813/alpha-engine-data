@@ -1,15 +1,15 @@
-boto3>=1.43.59
+boto3>=1.43.70
 pandas>=2.0
 openpyxl>=3.1.5
 pyarrow>=25.0.0
-yfinance>=1.5.2
+yfinance>=1.6.0
 requests>=2.34.2
 pyyaml>=6.0.3
 # setuptools floor for PYSEC-2026-3447 (newly disclosed; CI's pip-audit gate
 # started failing 2026-07-14 against the default 79.0.1 bundled by the
 # GH Actions Python 3.11 image). Not a build-backend requirement here — direct
 # pin exists solely to satisfy the security-audit gate.
-setuptools>=83.0.0
+setuptools>=84.0.0
 # Bitcoin HD-wallet (xpub/ypub/zpub) derivation for the crypto-balances producer
 # (collectors/crypto_balances.py). Pure-Python-capable (ships a prebuilt linux libsecp256k1
 # + a pure fallback) → Lambda-safe, no platform wheels. metron-ops#111.
@@ -90,4 +90,4 @@ nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nouse
 # cannot run the commands the SF emits. 0.18.8 is also the version that made
 # the correlation id MANDATORY (`run` exits 2 without it), so this floor pins
 # both halves of the same contract. See tests/test_sf_krepis_correlation_id.py.
-krepis==0.24.2  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
+krepis==0.56.0  # pinned per §139 — first-party/fast-moving deps are pinned, never floored; alpha-engine-config-I7009 (relaunch-decision --json)

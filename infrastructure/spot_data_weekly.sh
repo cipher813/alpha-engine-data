@@ -419,9 +419,10 @@ cleanup() {
 # subtly different counter/threshold convention than the backtester's and
 # predictor's copies. The lib now owns the classify (describe-instances,
 # run while the instance still exists) + the
-# MAX_SPOT_ATTEMPTS/SF_EXECUTION_TIMEOUT-bounded decision (exit 0 =
-# relaunch; NO_RELAUNCH_EXIT_CODE 75 = hold) so all three launchers share
-# one convention instead of three divergent ones.
+# MAX_SPOT_ATTEMPTS/SF_EXECUTION_TIMEOUT-bounded decision (--json puts the
+# verdict on a `relaunch` field and exits 0 whenever it reached ANY decision,
+# hold included — alpha-engine-config-I7009) so all three launchers share one
+# convention instead of three divergent ones.
 _spot_failure_reason() {
     local rc="$1"
     # Launch-time exhaustion across all combinations (ec2_spot exit 64) —
@@ -433,18 +434,22 @@ _spot_failure_reason() {
     if [ "$rc" -eq 64 ]; then echo "launch-capacity-exhausted"; return 0; fi
     # Nothing launched and not a clean exit → unclassifiable, treat hard.
     [ -z "$INSTANCE_ID" ] && return 1
-    local _decide_out _decide_rc
-    _decide_out="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
+    # See alpha-engine-config-I7009 — migrated off the exit-code contract to --json.
+    local _decide_json="" _decide_rc=0
+    _decide_json="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
         --instance-id "$INSTANCE_ID" \
         --region "$AWS_REGION" \
         --attempt "$SPOT_ATTEMPT" \
         --max-attempts "$MAX_SPOT_ATTEMPTS" \
         ${SF_EXECUTION_TIMEOUT:+--sf-execution-timeout "$SF_EXECUTION_TIMEOUT" --per-attempt-seconds "$MAX_RUNTIME_SECONDS"} \
-        2>/dev/null)"
-    _decide_rc=$?
-    echo "  spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): rc=$_decide_rc ${_decide_out:+[$_decide_out]}" >&2
-    [ "$_decide_rc" -eq 0 ] || return 1
-    echo "confirmed-reclaim${_decide_out:+ ($_decide_out)}"
+        --json \
+        2>/dev/null)" || _decide_rc=$?
+    [ "$_decide_rc" -eq 0 ] || return 1   # CLI failed to answer -> treat as hold (do not relaunch)
+    local _relaunch=""
+    _relaunch="$(printf '%s' "$_decide_json" | "$LIB_PYTHON" -c 'import json,sys; print("1" if json.load(sys.stdin).get("relaunch") else "0")')"
+    echo "  spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): $_decide_json" >&2
+    [ "$_relaunch" = "1" ] || return 1
+    echo "confirmed-reclaim${_decide_json:+ ($_decide_json)}"
 }
 
 on_exit() {

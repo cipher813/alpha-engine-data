@@ -25,11 +25,20 @@ Which direction is correct is not symmetric:
                    An overrun surfaces as States.Timeout naming the state.
   SF == function   RACE. Whichever fires first is undefined, so the error
                    type an operator sees is not reproducible.
-  SF >  function   DEFECT. The declaration is decorative; the function's
-                   ceiling silently governs.
+  SF >  function   DEFECT *unless* the function sits at Lambda's 900s
+                   SERVICE MAXIMUM. Normally the declaration is decorative
+                   and the function's ceiling silently governs. But when the
+                   function is already at 900 there is no larger value to
+                   give it, and the choice inverts: SF slightly ABOVE 900
+                   makes the LAMBDA's timeout fire first, which yields a
+                   REPORT line with a duration and the function's logs.
+                   SF below 900 makes States.Timeout abort the state while
+                   the function keeps running — billed, orphaned, and
+                   silent. A guard band above a service-max function is a
+                   deliberate choice, not a decorative declaration.
 
 So this file asserts `TimeoutSeconds < function timeout`, and that one is
-declared at all.
+declared at all — with `_SERVICE_MAX_GUARD_BAND` carved out below.
 
 WHY THE FUNCTION TIMEOUTS ARE CODIFIED HERE rather than read from AWS: this
 runs in CI without credentials, and the functions are deployed from four
@@ -91,30 +100,53 @@ _FUNCTION_TIMEOUTS_SEC: dict[str, int] = {
 # an entry cannot outlive its fix without failing.
 _KNOWN_UNBOUND: frozenset[tuple[str, str]] = frozenset(
     {
-        ("step_function.json", "WeeklyRunDayGate"),  # no TimeoutSeconds at all
         ("step_function.json", "SignalsEnvelope"),
         ("step_function.json", "ChallengerShadow"),
         ("step_function.json", "EvalJudgeSubmitFirstSaturday"),
         ("step_function.json", "EvalJudgeSubmitWeekly"),
         ("step_function.json", "EvalJudgePoll"),
-        ("step_function.json", "EvalJudgeProcess"),
         ("step_function.json", "EvalRollingMean"),
         ("step_function.json", "RationaleClustering"),
-        ("step_function.json", "ReplayConcordance"),
         ("step_function.json", "Counterfactual"),
         ("step_function.json", "ReportCard"),
         ("step_function.json", "DispatchWeeklyFreshnessSpot"),
-        # SF > function: the declaration is decorative, the function governs.
-        ("step_function.json", "RegimeSubstrate"),
-        ("step_function.json", "RegimeRetrospectiveEval"),
-        ("step_function.json", "AggregateCosts"),
-        ("step_function.json", "Director"),
         ("step_function_daily.json", "PredictorInference"),
         ("step_function_daily.json", "ReinvokePredictor"),
         ("step_function_eod.json", "ProbeEODReconcilePrecondition"),
         ("step_function_eod.json", "HealReProbe"),
     }
 )
+
+
+# Lambda's hard service maximum. A function AT this value cannot be raised, so
+# the SF-vs-function ordering rule inverts for it — see the module docstring.
+_LAMBDA_SERVICE_MAX_SEC = 900
+
+# States deliberately declaring a guard band ABOVE a service-max function.
+# Not exceptions to the rule; instances of the rule's second branch.
+_SERVICE_MAX_GUARD_BAND: dict[tuple[str, str], int] = {
+    # alpha-engine-evaluator-director is pinned at the 900s service maximum
+    # (crucible-evaluator-PR196, 2026-08-13: the measured requirement is ~195s
+    # and the real defect was multiplicative retry loops, not call size —
+    # 2 transport x 2 krepis body-level x 3 evaluator = up to 12 model calls
+    # against a budget funding 2). 930 gives the function 30s to time out and
+    # emit its REPORT line before the state would abort it.
+    ("step_function.json", "Director"): 930,
+    # alpha-engine-replay-concordance and alpha-engine-research-eval-judge-process
+    # are both at the 900s maximum AND are now self-deadlining: their loops ask
+    # before each item whether one more fits, then stop and return a PARTIAL with
+    # the residue recorded (crucible-backtester#633 for concordance, measured live
+    # 2026-08-11 returning at 622s with "141 of 150 artifacts not replayed";
+    # crucible-research-PR613 for the judge). A self-deadlining function's clock
+    # starts at INVOKE; the SF clock starts at SCHEDULE, earlier by dispatch plus
+    # cold start. An equal ceiling therefore guarantees the SF fires first and
+    # pre-empts the graceful partial return -- the state would be killed at the
+    # wall precisely because the function learned not to be. 60s over the measured
+    # 2.0-3.0s Init Duration, rounded an order of magnitude so a cold-start
+    # regression cannot recreate the race. alpha-engine-config-I7181.
+    ("step_function.json", "ReplayConcordance"): 960,
+    ("step_function.json", "EvalJudgeProcess"): 960,
+}
 
 
 def _lambda_invoke_states(states: dict) -> Iterator[tuple[str, str, int | None]]:
@@ -173,6 +205,22 @@ def test_the_declared_stage_timeout_is_the_one_that_binds(definition: str) -> No
             continue  # covered by test_every_invoked_function_has_a_codified_timeout
         if timeout is None:
             continue  # covered by test_every_lambda_invoke_declares_a_timeout
+        band = _SERVICE_MAX_GUARD_BAND.get((definition, name))
+        if band is not None:
+            # The rule's second branch: the function is at Lambda's service
+            # maximum and cannot be raised, so the guard band is deliberate.
+            # Still pinned to an exact value — a band is a declared number, and
+            # a drifting one is back to being decorative.
+            assert fn_timeout == _LAMBDA_SERVICE_MAX_SEC, (
+                f"{name} is carved out as a service-max guard band, but {fn} "
+                f"is {fn_timeout}s, not the {_LAMBDA_SERVICE_MAX_SEC}s maximum "
+                f"— raise the function instead, and drop the carve-out"
+            )
+            assert timeout == band, (
+                f"{name}: TimeoutSeconds={timeout}, expected the declared "
+                f"guard band {band}"
+            )
+            continue
         if timeout >= fn_timeout:
             violations.append(
                 f"{name}: TimeoutSeconds={timeout} >= {fn}'s own {fn_timeout}s "

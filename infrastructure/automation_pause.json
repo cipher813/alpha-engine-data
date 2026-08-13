@@ -18,7 +18,6 @@
     "alpha-engine-freshness-monitor-cron": "artifact freshness monitor, daily 12:00 UTC - un-paused per Brian ruling 2026-08-10 (config#6792). It is the ONLY automatic detector for a load-bearing artifact that stopped being produced by a pipeline that still SUCCEEDS. The 8/5-8/6 preopen outage was caught by the watchdog (the pipeline failed), but the class the watchdog cannot see is a green pipeline whose stage silently stopped writing - `universe_membership_latest` (severity critical, cadence weekday_sf, SLA 45min) is exactly that row, and with this cron off nothing reads it. Publishes via krepis.alerts, which is a live path since config#6751/I551.",
     "alpha-engine-freshness-monitor-historical-cron": "artifact freshness monitor, historical 04:00 UTC - un-paused with its two siblings per Brian ruling 2026-08-10 (config#6792). Same Lambda, same registry, different scan window; leaving it paused would have left the backfill/history rows unevaluated while the daily rows were watched, which reads as coverage the registry does not actually have.",
     "alpha-engine-freshness-monitor-intraday-cron": "artifact freshness monitor, intraday every 30min 14-21 UTC Mon-Fri - un-paused with its two siblings per Brian ruling 2026-08-10 (config#6792). This is the one that catches a same-session miss inside the trading day rather than the next morning; the daily cron alone would have reported the 8/5 miss on 8/6.",
-    "alpha-research-thinktank-daily": "Think Tank daily spot dispatcher (14:30 UTC) - un-paused per Brian ruling 2026-08-10 (config#6830): the Think Tank runs ACTIVELY IN SHADOW MODE. Observe-only - its theses and challenger selections are recorded and graded, never routed into a live trading decision - and deliberately NOT part of the weekly SF (the ThinkTankCoverage chain was removed from step_function.json in the same change). This daily cadence is now the ONLY producer of thinktank_challenger_selection, which the champion/challenger loop counts as an arm: with the rule disabled that arm is a silent MISS every day. Launches one self-terminating spot box per day, bounded by THINKTANK_RUN_BUDGET_SECONDS.",
     "alpha-engine-expense-collector-twicedaily": "provider-balance + spend collector, twice daily - un-paused per Brian ruling 2026-08-11 (config#6613). Named exception to the 2026-08-07 pause: it is the only guard against the credit exhaustion that took every autonomous lane dark for three days (2026-08-05/06/07), and a guard that does not run is not a guard. Read-only against provider billing APIs; spawns no work and launches no compute. Prior reason for pausing it: expense collector",
     "alpha-engine-sf-status-change": "EventPattern rule, no schedule to remove. Carries the SF terminal-status signal for the kept pipelines; with the drain and dispatchers paused it only notifies and records. Promoted from the `_reactive-notifier-rules` prose key to a real, CHECKED key on 2026-08-12 (alpha-engine-config-I7056) - verified live ENABLED at promotion.",
     "alpha-engine-groom-sf-failure": "EventPattern rule, no schedule to remove. Same family as alpha-engine-sf-status-change. Promoted from prose to a real, CHECKED key 2026-08-12 (alpha-engine-config-I7056) - verified live ENABLED at promotion.",
@@ -32,7 +31,9 @@
   "pending": {
     "_why": "Triggers that do not exist live yet but MUST be created DISABLED when they first appear. Brian's ruling covers 'everything else', which includes automation that lands after 2026-08-07 \u2014 but automation_pause.py --check requires every `paused` entry to exist live, so a not-yet-created name cannot go there without turning the check red. pause_state() reads BOTH blocks; --check requires existence only for `paused`. Move an entry up to `paused` once it exists live. Found by alpha-engine-config-I6620: nousergon-data#1207 declares three schedules that its (currently broken) deploy would have created ENABLED mid-pause.",
     "alpha-engine-sf-watch-reclaim-sweep-0645-daily": "nousergon-data#1207; codified in sf-watch-reclaim-sweep-handler/deploy.sh, never created live",
-    "alpha-engine-sf-watch-reclaim-sweep-1445-daily": "nousergon-data#1207; codified in sf-watch-reclaim-sweep-handler/deploy.sh, never created live"
+    "alpha-engine-sf-watch-reclaim-sweep-1445-daily": "nousergon-data#1207; codified in sf-watch-reclaim-sweep-handler/deploy.sh, never created live",
+    "alpha-engine-ci-watch-instance-terminated": "ci-watch-liveness-probe reclaim leg (EC2 instance-terminated). Codified in lambdas/ci-watch-liveness-probe/deploy.sh, never created live \u2014 moved here from `paused` on 2026-08-13 after `--check` reported it [missing-in-aws]. Measured that day: `events describe-rule` 404s for this name and for its twin, while the sf-watch equivalents (alpha-engine-sf-watch-instance-terminated / -spot-interruption) both exist DISABLED; the whole ci-watch-liveness-probe component is codified-but-never-bootstrapped, alongside its IAM role in the nous-ergon-ops IAM drift report. Same situation as the sf-watch-reclaim-sweep pair above, so the same block.",
+    "alpha-engine-ci-watch-spot-interruption": "ci-watch-liveness-probe reclaim leg (EC2 spot-interruption-warning). Codified in lambdas/ci-watch-liveness-probe/deploy.sh, never created live \u2014 the second of ci-watch's two reclaim wake legs; see the entry above."
   },
   "paused": {
     "events_rules": {
@@ -45,13 +46,14 @@
       "alpha-engine-predictor-health-check": "predictor health check. CloudFormation-managed - State: DISABLED in alpha-engine-orchestration.yaml",
       "alpha-engine-saturday-integrity-monday": "Saturday-run integrity sentinel",
       "alpha-engine-saturday-sf-watch-failed": "EventPattern rule, but its target dispatches an autonomous remediation agent on weekly-SF failure - paused with the rest of the response plane",
-      "alpha-engine-sf-watch-spot-interruption": "Brian ruling 2026-08-12: \"the sf watch should be temporarily disabled as we focus on making sure that crucible is working properly.\" This SUPERSEDES the FLAG FOR BRIAN question raised on this entry the same evening - the answer is that it stays disabled, deliberately, and the disabled state is now DECLARED rather than transcribed. Re-exam: 2026-09-09, or earlier on the predicate below. Re-enable predicate: alpha-engine-config-I6967 clause 1 holds - all three scheduled pipelines complete on their own trigger with zero manual reruns for four consecutive weeks. sf-watch exists to diagnose and relaunch after a spot reclaim; while the pipelines are being made reliable by hand, its dispatches compete with that work rather than supporting it. Owner: Brian. PRIOR NOTE: EventPattern rule. Measured live DISABLED 2026-08-12 (alpha-engine-config-I7056) while the `_reactive-notifier-rules` prose key claimed it was kept - nothing checked either way, because the name sat inside a prose VALUE. Recorded here as paused rather than kept because this is TRANSCRIPTION of the 2026-08-07 ruling, not a new decision: playbooks.yaml lists this rule in sf-watch's `wake` alongside alpha-engine-saturday-sf-watch-failed, which is already paused for exactly the stated reason ('its target dispatches an autonomous remediation agent'). Whoever executed the pause disabled all three and recorded one. Previously flagged: if the intent was to keep the reclaim/relaunch legs armed while the diagnose-and-fix leg was paused, move this entry to `not_paused` and re-enable.",
       "alpha-engine-sf-watch-instance-terminated": "Brian ruling 2026-08-12: \"the sf watch should be temporarily disabled as we focus on making sure that crucible is working properly.\" This SUPERSEDES the FLAG FOR BRIAN question raised on this entry the same evening - the answer is that it stays disabled, deliberately, and the disabled state is now DECLARED rather than transcribed. Re-exam: 2026-09-09, or earlier on the predicate below. Re-enable predicate: alpha-engine-config-I6967 clause 1 holds - all three scheduled pipelines complete on their own trigger with zero manual reruns for four consecutive weeks. sf-watch exists to diagnose and relaunch after a spot reclaim; while the pipelines are being made reliable by hand, its dispatches compete with that work rather than supporting it. Owner: Brian. PRIOR NOTE: EventPattern rule. Same finding, same date, same reasoning as alpha-engine-sf-watch-spot-interruption above - the second of sf-watch's two reclaim/relaunch wake legs.",
-      "overseer-intake-cw-alarm-state": "Brian ruling 2026-08-12 covers sf-watch explicitly; this entry is recorded as paused under the ORIGINAL 2026-08-07 ruling, whose scope is the entire Overseer response plane including the alert-drain that consumes this tap. Stated as an assumption rather than an inference: Brian's 2026-08-12 words named sf-watch, not this rule, and it is declared paused here because its consumer is paused, not because it was named. If that is wrong, this is the entry to correct. Re-exam: 2026-09-09. The CloudWatch-alarm-state-change tap into the overseer intake queue. Measured live DISABLED 2026-08-12 (alpha-engine-config-I7056) while the `_reactive-notifier-rules` prose key claimed it was kept. Paused with its consumer: the alert-drain that reads the intake queue is itself paused, so the tap only fills a queue nothing drains. NOTE the coverage consequence while this stands: CloudWatch alarm state changes reach the response plane not at all, which is the `intake: none` condition overseer-policy.md 2 forbids without a declared reason - this entry is that reason, and it expires when the drain is un-paused.",
+      "alpha-engine-sf-watch-spot-interruption": "Brian ruling 2026-08-12: \"the sf watch should be temporarily disabled as we focus on making sure that crucible is working properly.\" This SUPERSEDES the FLAG FOR BRIAN question raised on this entry the same evening - the answer is that it stays disabled, deliberately, and the disabled state is now DECLARED rather than transcribed. Re-exam: 2026-09-09, or earlier on the predicate below. Re-enable predicate: alpha-engine-config-I6967 clause 1 holds - all three scheduled pipelines complete on their own trigger with zero manual reruns for four consecutive weeks. sf-watch exists to diagnose and relaunch after a spot reclaim; while the pipelines are being made reliable by hand, its dispatches compete with that work rather than supporting it. Owner: Brian. PRIOR NOTE: EventPattern rule. Measured live DISABLED 2026-08-12 (alpha-engine-config-I7056) while the `_reactive-notifier-rules` prose key claimed it was kept - nothing checked either way, because the name sat inside a prose VALUE. Recorded here as paused rather than kept because this is TRANSCRIPTION of the 2026-08-07 ruling, not a new decision: playbooks.yaml lists this rule in sf-watch's `wake` alongside alpha-engine-saturday-sf-watch-failed, which is already paused for exactly the stated reason ('its target dispatches an autonomous remediation agent'). Whoever executed the pause disabled all three and recorded one. Previously flagged: if the intent was to keep the reclaim/relaunch legs armed while the diagnose-and-fix leg was paused, move this entry to `not_paused` and re-enable.",
       "alpha-engine-spot-interruption-recorder-tick": "spot-interruption recorder poll (the EventPattern half stays enabled - it records real interruptions on the kept pipelines)",
       "alpha-engine-ssm-reachability-probe-5min": "SSM reachability probe",
       "alpha-engine-sweep-artifact-monitor": "EventPattern rule whose target monitors sweep artifacts; the sweep itself is paused",
-      "alpha-research-alerts": "intraday research alerts. CloudFormation-managed - State: DISABLED in alpha-engine-orchestration.yaml"
+      "alpha-research-alerts": "intraday research alerts. CloudFormation-managed - State: DISABLED in alpha-engine-orchestration.yaml",
+      "alpha-research-thinktank-daily": "Think Tank daily spot dispatcher (14:30 UTC) - PAUSED per Brian ruling 2026-08-13: the Think Tank sweep is paused alongside the groomer while the priority is fixing Crucible. Re-enable is one command (see below); this entry is the toggle. It was also already dead: every run since 2026-08-11 aborted with `BadRequestError 400 - This response_format type is unavailable now` because the `sweep` tier declares structured_outputs: true while EVERY member of the `low` model group it addresses declares structured_outputs: false (alpha-engine-config-I7232). Pausing does not mask that - the contradiction is static and tracked; it means no effort is spent re-routing a tier that is not on Crucible's path. NOTE the freshness row `thinktank_challenger_selection` (severity critical, sole_end_to_end_signal) declares `producer_trigger: events:alpha-research-thinktank-daily`, so disabling this rule makes the monitor render `producer disabled` with alert_suppressed: true rather than paging - BUT that suppression lapses after PRODUCER_SUPPRESSION_MAX_DAYS (14), i.e. 2026-08-27, at which point it pages again by design: a pause this long is a decision the operator owes, not a state. Re-enable: `aws events enable-rule --name alpha-research-thinktank-daily` AND move this key back to `not_paused`, in the same change - the manifest is the declaration and the rule state is the fact; they must not disagree.",
+      "overseer-intake-cw-alarm-state": "Brian ruling 2026-08-12 covers sf-watch explicitly; this entry is recorded as paused under the ORIGINAL 2026-08-07 ruling, whose scope is the entire Overseer response plane including the alert-drain that consumes this tap. Stated as an assumption rather than an inference: Brian's 2026-08-12 words named sf-watch, not this rule, and it is declared paused here because its consumer is paused, not because it was named. If that is wrong, this is the entry to correct. Re-exam: 2026-09-09. The CloudWatch-alarm-state-change tap into the overseer intake queue. Measured live DISABLED 2026-08-12 (alpha-engine-config-I7056) while the `_reactive-notifier-rules` prose key claimed it was kept. Paused with its consumer: the alert-drain that reads the intake queue is itself paused, so the tap only fills a queue nothing drains. NOTE the coverage consequence while this stands: CloudWatch alarm state changes reach the response plane not at all, which is the `intake: none` condition overseer-policy.md 2 forbids without a declared reason - this entry is that reason, and it expires when the drain is un-paused."
     },
     "scheduler_schedules": {
       "alpha-engine-alert-drain-0400utc": "overseer alert drain",
@@ -75,6 +77,75 @@
       "alpha-engine-sf-watch-canary-drill-weekly": "sf-watch canary drill",
       "alpha-engine-sf-watch-liveness-0645-daily": "sf-watch liveness probe",
       "alpha-engine-sf-watch-liveness-1445-daily": "sf-watch liveness probe"
+    }
+  },
+  "paused_alarms": {
+    "_why": "alpha-engine-config-I7174. Nine watch-plane/liveness alarms fire `no datapoints were received ... treated as [Breaching]` for no reason other than that the component they watch is deliberately off under the 2026-08-07/2026-08-12 rulings above - the alarm has no input telling it 'gated off by declaration' from 'upstream died' (sf-pipeline-policy.md 2.6 rule 1). Each entry here names the alarm and the `watches` triggers whose presence in `paused`/`pending` (module.paused_names()) is what JUSTIFIES silencing it - never a free-text trigger name that no checker reads, the exact defect the `_reactive-notifier-rules` prose key already cost this file once. `pause_reconcile.py::alarm_entries()`/`automation_pause.py::alarm_entries()` compute justification live from `watches`, so un-pausing a trigger (removing/moving its entry out of `paused`) makes its alarm's entry here stop being justified on the VERY NEXT read - no second edit, no separate AWS CLI command. `automation_pause.py --enforce` then (a) disables actions on a justified-but-armed alarm and (b) RE-ENABLES actions on an alarm whose entry is no longer justified - (b) is deliberately NOT a mirror of the trigger-enforce asymmetry (`enforce()` never re-enables a paused TRIGGER, because that would restart scheduled work unattended); re-arming an alarm only resumes paging, so the same asymmetry does not apply. Silencing is `disable-alarm-actions`, never `delete-alarms`: history and config survive so coverage can be reconstructed later (property 1). `pause_reconcile.py --check` grades the same two directions read-only and its `--publish` row always lists every currently-justified entry as a declared, bounded gap (property 2) rather than omitting it.",
+    "alpha-engine-watch-plane-alert-drain-liveness-probe-invocations-floor": {
+      "reason": "invocations-floor on the overseer alert-drain liveness probe; treat_missing_data=breaching is correct when alert-drain is supposed to run and wrong while it is declared off (2026-08-07 ruling, response plane paused).",
+      "watches": [
+        "alpha-engine-alert-drain-0400utc",
+        "alpha-engine-alert-drain-1000utc",
+        "alpha-engine-alert-drain-1600utc",
+        "alpha-engine-alert-drain-2200utc"
+      ]
+    },
+    "alpha-engine-watch-plane-canary-replay-liveness-probe-invocations-floor": {
+      "reason": "invocations-floor on the overseer canary-replay liveness probe; silenced while alpha-engine-canary-replay-liveness-probe-tick is paused.",
+      "watches": [
+        "alpha-engine-canary-replay-liveness-probe-tick"
+      ]
+    },
+    "alpha-engine-watch-plane-ci-watch-liveness-probe-invocations-floor": {
+      "reason": "invocations-floor on the ci-watch-liveness-probe reclaim leg (config#3173, mirrors sf-watch's two reclaim legs); silenced while both ci-watch reclaim rules are paused.",
+      "watches": [
+        "alpha-engine-ci-watch-spot-interruption",
+        "alpha-engine-ci-watch-instance-terminated"
+      ]
+    },
+    "alpha-engine-watch-plane-sf-watch-liveness-probe-errors": {
+      "reason": "sf-watch liveness-probe Errors; silenced under Brian's 2026-08-12 ruling (alpha-engine-config-I6984) disabling sf-watch while the three scheduled pipelines are made reliable by hand. Re-exam 2026-09-09, same predicate as the paused sf-watch entries this watches.",
+      "watches": [
+        "alpha-engine-sf-watch-liveness-0645-daily",
+        "alpha-engine-sf-watch-liveness-1445-daily"
+      ]
+    },
+    "alpha-engine-watch-plane-sf-watch-liveness-probe-throttles": {
+      "reason": "sf-watch liveness-probe Throttles; same ruling and same watched triggers as alpha-engine-watch-plane-sf-watch-liveness-probe-errors.",
+      "watches": [
+        "alpha-engine-sf-watch-liveness-0645-daily",
+        "alpha-engine-sf-watch-liveness-1445-daily"
+      ]
+    },
+    "alpha-engine-ssm-reachability-probe-dead": {
+      "reason": "SSM reachability probe deadman; silenced while alpha-engine-ssm-reachability-probe-5min is paused.",
+      "watches": [
+        "alpha-engine-ssm-reachability-probe-5min"
+      ]
+    },
+    "alpha-engine-ssm-reachability-probe-unreachable": {
+      "reason": "SSM reachability probe unreachable-count; same watched trigger as alpha-engine-ssm-reachability-probe-dead.",
+      "watches": [
+        "alpha-engine-ssm-reachability-probe-5min"
+      ]
+    },
+    "alpha-engine-watch-plane-overseer-intake-age": {
+      "reason": "overseer intake queue age; a CONSEQUENCE of alert-drain being paused (nothing drains the intake queue the alarm's tap fills), not of its own trigger. Watches the same alert-drain schedules the drain itself needs running.",
+      "watches": [
+        "alpha-engine-alert-drain-0400utc",
+        "alpha-engine-alert-drain-1000utc",
+        "alpha-engine-alert-drain-1600utc",
+        "alpha-engine-alert-drain-2200utc"
+      ]
+    },
+    "alpha-engine-watch-plane-overseer-intake-dlq-depth": {
+      "reason": "overseer intake DLQ depth; same consequence and same watched triggers as alpha-engine-watch-plane-overseer-intake-age.",
+      "watches": [
+        "alpha-engine-alert-drain-0400utc",
+        "alpha-engine-alert-drain-1000utc",
+        "alpha-engine-alert-drain-1600utc",
+        "alpha-engine-alert-drain-2200utc"
+      ]
     }
   }
 }
