@@ -56,6 +56,14 @@
       "Comment": "alpha-engine-config-I7111 \u2014 the boundary itself. Keys on the gate's verdict, which is enumerated EXHAUSTIVELY: an absent or unrecognised verdict is a contract violation by our own Lambda and fails CLOSED via Default rather than proceeding to trade on an unverifiable answer (the config-I2767 lesson TradingDayGateChoice already carries). PROCEED_OVERRIDE is the ruling's second requirement \u2014 the boundary must be refusable deliberately, never bypassable accidentally \u2014 and it routes through a notify state so a crossed boundary is announced rather than silent.",
       "Choices": [
         {
+          "Not": {
+            "Variable": "$.market_hours_gate.Payload.verdict",
+            "IsPresent": true
+          },
+          "Comment": "alpha-engine-config-I7111 / config-I2767, added 2026-08-13. This rule must come FIRST and must be IsPresent-guarded. A Choice rule comparing a path that does not exist raises States.Runtime \u2014 it does NOT fall through to Default \u2014 so this Choice's own comment claiming an absent verdict 'fails CLOSED via Default' described behaviour ASL does not have. The 2026-08-13 preopen run proved it: verdict absent, States.Runtime at this state, execution dead 48s in with no SNS alert of any kind and no orders placed. Matching here short-circuits before any StringEquals touches the missing path, which is exactly how TradingDayGateChoice has been written since config-I2767.",
+          "Next": "StampMarketHoursVerdictMissing"
+        },
+        {
           "Variable": "$.market_hours_gate.Payload.verdict",
           "StringEquals": "PROCEED",
           "Comment": "Market closed. The scheduled trigger of both pipelines lands here every day: preopen at 05:15 PT (pre-open) and postclose at 13:00:0x PT, which is 16:00:0x ET \u2014 the session window is half-open [09:30, 16:00) so the close instant itself is already outside it.",
@@ -81,6 +89,16 @@
         }
       ],
       "Default": "HandleFailure"
+    },
+    "StampMarketHoursVerdictMissing": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I7111. Preopen posture: an unevaluable gate REFUSES. Routes into the existing unverified pair, which ends in the MarketHoursUnverified Fail. Stamping $.market_hours_gate_error is what makes that reachable: NotifyMarketHoursUnverified formats it with States.JsonToString, and on a missing path that call would itself raise States.Runtime \u2014 replacing one silent runtime death with another.",
+      "Result": {
+        "Error": "MarketHoursGateContractViolation",
+        "Cause": "alpha-engine-config-I7111: the market-hours gate Lambda returned successfully but its payload carried no `verdict` key, so this execution cannot establish that it is starting outside the NYSE session. This is a contract violation by our own producer, not an invoke failure, so the Task's Catch never fires and $.market_hours_gate_error would otherwise be absent. Measured 2026-08-13 (execution 59c0ce46): the `live` alias of alpha-engine-predictor-inference was frozen at a version predating action=check_market_hours, so the invoke fell through to the default predict branch and answered the gate with {statusCode, body}. The full payload received is in $.market_hours_gate."
+      },
+      "ResultPath": "$.market_hours_gate_error",
+      "Next": "NotifyMarketHoursUnverified"
     },
     "RecordMarketHoursOverride": {
       "Type": "Task",
@@ -1012,7 +1030,7 @@
     },
     "RunMorningPlanner": {
       "Type": "Task",
-      "Comment": "Run morning order-book planner via SSM. alpha-engine-config-I7047 sweep (2026-08-12): migrated off the inline `trap 'aws s3 cp ... EXIT'` log-ship wrapper to krepis.ssm_log_capture — found by the I7047 guard test, which asserts zero occurrences of the anti-pattern in ANY nousergon-data SF definition, not just the two Saturday health-observe stages the issue named. Unlike WeeklySubstrateHealthCheck's instance, this one was a plain `commands` JSON array (not `commands.$`/States.Array), so it was not exhibiting the ASL `\\'`-escape-collapse bug specifically — but it is the same anti-pattern this fleet is retiring in favor of krepis (17+ sibling stages), so it is migrated for consistency rather than left as a second, differently-shaped copy. Behavior-preserving: `source .venv/bin/activate` is kept (subprocess inherits the activated PATH so a bare `python` invocation still resolves to this venv's interpreter) — only the krepis wrapper binary itself is called by absolute path, per fleet convention.",
+      "Comment": "Run morning order-book planner via SSM. alpha-engine-config-I7047 sweep (2026-08-12): migrated off the inline `trap 'aws s3 cp ... EXIT'` log-ship wrapper to krepis.ssm_log_capture \u2014 found by the I7047 guard test, which asserts zero occurrences of the anti-pattern in ANY nousergon-data SF definition, not just the two Saturday health-observe stages the issue named. Unlike WeeklySubstrateHealthCheck's instance, this one was a plain `commands` JSON array (not `commands.$`/States.Array), so it was not exhibiting the ASL `\\'`-escape-collapse bug specifically \u2014 but it is the same anti-pattern this fleet is retiring in favor of krepis (17+ sibling stages), so it is migrated for consistency rather than left as a second, differently-shaped copy. Behavior-preserving: `source .venv/bin/activate` is kept (subprocess inherits the activated PATH so a bare `python` invocation still resolves to this venv's interpreter) \u2014 only the krepis wrapper binary itself is called by absolute path, per fleet convention.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
