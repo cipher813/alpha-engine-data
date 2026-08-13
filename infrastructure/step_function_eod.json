@@ -47,6 +47,14 @@
       "Comment": "alpha-engine-config-I7111 \u2014 the boundary itself. Keys on the gate's verdict, which is enumerated EXHAUSTIVELY: an absent or unrecognised verdict is a contract violation by our own Lambda and fails CLOSED via Default rather than proceeding to trade on an unverifiable answer (the config-I2767 lesson TradingDayGateChoice already carries). PROCEED_OVERRIDE is the ruling's second requirement \u2014 the boundary must be refusable deliberately, never bypassable accidentally \u2014 and it routes through a notify state so a crossed boundary is announced rather than silent.",
       "Choices": [
         {
+          "Not": {
+            "Variable": "$.market_hours_gate.Payload.verdict",
+            "IsPresent": true
+          },
+          "Comment": "alpha-engine-config-I7111 / config-I2767, added 2026-08-13. This rule must come FIRST and must be IsPresent-guarded. A Choice rule comparing a path that does not exist raises States.Runtime \u2014 it does NOT fall through to Default \u2014 so this Choice's own comment claiming an absent verdict 'fails CLOSED via Default' described behaviour ASL does not have. The 2026-08-13 preopen run proved it: verdict absent, States.Runtime at this state, execution dead 48s in with no SNS alert of any kind and no orders placed. Matching here short-circuits before any StringEquals touches the missing path, which is exactly how TradingDayGateChoice has been written since config-I2767.",
+          "Next": "StampMarketHoursVerdictMissing"
+        },
+        {
           "Variable": "$.market_hours_gate.Payload.verdict",
           "StringEquals": "PROCEED",
           "Comment": "Market closed. The scheduled trigger of both pipelines lands here every day: preopen at 05:15 PT (pre-open) and postclose at 13:00:0x PT, which is 16:00:0x ET \u2014 the session window is half-open [09:30, 16:00) so the close instant itself is already outside it.",
@@ -72,6 +80,16 @@
         }
       ],
       "Default": "HandleFailure"
+    },
+    "StampMarketHoursVerdictMissing": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I7111. Postclose posture: an unevaluable gate proceeds DEGRADED \u2014 settlement and reconciliation must still happen, and the boundary's job at 16:00 ET is already satisfied by the schedule. Routes into the existing degraded pair rather than the preopen refusal, preserving the asymmetry the two pipelines already declare. Stamping $.market_hours_gate_error is required: both SetMarketHoursUnverifiedDegraded and NotifyMarketHoursUnverified read it.",
+      "Result": {
+        "Error": "MarketHoursGateContractViolation",
+        "Cause": "alpha-engine-config-I7111: the market-hours gate Lambda returned successfully but its payload carried no `verdict` key, so this execution cannot establish that it is starting outside the NYSE session. This is a contract violation by our own producer, not an invoke failure, so the Task's Catch never fires and $.market_hours_gate_error would otherwise be absent. Measured 2026-08-13 (execution 59c0ce46): the `live` alias of alpha-engine-predictor-inference was frozen at a version predating action=check_market_hours, so the invoke fell through to the default predict branch and answered the gate with {statusCode, body}. The full payload received is in $.market_hours_gate."
+      },
+      "ResultPath": "$.market_hours_gate_error",
+      "Next": "SetMarketHoursUnverifiedDegraded"
     },
     "RecordMarketHoursOverride": {
       "Type": "Task",

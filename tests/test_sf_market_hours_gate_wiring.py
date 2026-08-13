@@ -87,6 +87,20 @@ def _resolve(path: str, doc: dict):
     return cur
 
 
+class StatesRuntime(Exception):
+    """What real ASL raises when a comparator's path does not resolve.
+
+    This harness previously modelled that case as "the rule does not match",
+    so an absent verdict fell through to Default and
+    test_an_absent_verdict_fails_closed passed — asserting a fail-closed
+    behaviour the deployed pipeline did not have. On 2026-08-13 the preopen
+    execution took that path for real: verdict absent, States.Runtime at
+    MarketHoursGateChoice, execution dead 48s in with no SNS alert and no
+    orders placed. `Default` catches an unrecognised verdict, never a missing
+    one; only an IsPresent-guarded rule ordered ahead of the comparators does.
+    """
+
+
 def _matches(rule: dict, doc: dict) -> bool:
     if "Not" in rule:
         return not _matches(rule["Not"], doc)
@@ -100,7 +114,13 @@ def _matches(rule: dict, doc: dict) -> bool:
     assert len(ops) == 1, f"expected exactly one comparator, got {ops}"
     op = ops[0]
     if op == "IsPresent":
+        # The one operator defined on an absent path — that is its whole job.
         return (value is not _UNSET) is rule[op]
+    if value is _UNSET:
+        raise StatesRuntime(
+            f"Invalid path '{rule['Variable']}': The choice state's condition "
+            f"path references an invalid value."
+        )
     if op == "StringEquals":
         return value == rule[op]
     raise NotImplementedError(
@@ -251,14 +271,89 @@ class TestChoiceRouting:
         )
 
     @pytest.mark.parametrize("name", _BOTH)
-    def test_an_absent_verdict_fails_closed(self, defs, name):
+    def test_an_absent_verdict_routes_to_the_unverified_path(self, defs, name):
         # config-I2767's lesson, which TradingDayGateChoice already carries: a
         # gate payload without its verdict is a contract violation by our own
         # Lambda. Proceeding to trade on an unverifiable answer is the one
         # outcome that must not happen.
+        #
+        # It must route through StampMarketHoursVerdictMissing rather than
+        # Default: Default is unreachable on an absent path (real ASL raises
+        # States.Runtime before it), and the states that report an unevaluable
+        # gate all format $.market_hours_gate_error, which nothing sets on this
+        # path because the Task's Catch never fired — the invoke SUCCEEDED.
         choice = defs[name]["States"]["MarketHoursGateChoice"]
-        assert evaluate(choice, {}) == "HandleFailure"
-        assert evaluate(choice, {"market_hours_gate": {"Payload": {}}}) == "HandleFailure"
+        assert evaluate(choice, {}) == "StampMarketHoursVerdictMissing"
+        assert (
+            evaluate(choice, {"market_hours_gate": {"Payload": {}}})
+            == "StampMarketHoursVerdictMissing"
+        )
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_the_missing_verdict_guard_is_ordered_first(self, defs, name):
+        # Order is the whole mechanism: ASL evaluates rules in sequence and a
+        # StringEquals against an unresolvable path raises immediately, so a
+        # guard placed after the comparators never runs.
+        first = defs[name]["States"]["MarketHoursGateChoice"]["Choices"][0]
+        assert first["Not"]["IsPresent"] is True, first
+        assert first["Not"]["Variable"] == "$.market_hours_gate.Payload.verdict"
+        assert first["Next"] == "StampMarketHoursVerdictMissing"
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_the_stamp_state_supplies_what_the_unverified_states_format(
+        self, defs, name
+    ):
+        # The reason the guard cannot simply point at NotifyMarketHoursUnverified:
+        # that state formats States.JsonToString($.market_hours_gate_error), and
+        # on a missing path that call raises States.Runtime itself — swapping one
+        # silent runtime death for another.
+        states = defs[name]["States"]
+        stamp = states["StampMarketHoursVerdictMissing"]
+        assert stamp["Type"] == "Pass"
+        assert stamp["ResultPath"] == "$.market_hours_gate_error"
+        assert stamp["Result"]["Error"] == "MarketHoursGateContractViolation"
+        assert stamp["Result"]["Cause"]
+        # And it must hand off to a state that already exists in this pipeline.
+        assert stamp["Next"] in states
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_an_absent_verdict_reaches_this_pipelines_declared_posture(
+        self, defs, name
+    ):
+        # The two pipelines answer an unevaluable gate differently and both
+        # answers are deliberate: preopen REFUSES (a stale plan against a live
+        # market), postclose proceeds DEGRADED (settlement must still happen).
+        # An absent verdict must land on the same posture as a failed invoke,
+        # not on a generic failure that ignores the distinction.
+        states = defs[name]["States"]
+        nxt = states["StampMarketHoursVerdictMissing"]["Next"]
+        if name.endswith("daily.json"):
+            assert nxt == "NotifyMarketHoursUnverified"
+            assert states[nxt]["Next"] == "MarketHoursUnverified"
+            assert states["MarketHoursUnverified"]["Type"] == "Fail"
+        else:
+            assert nxt == "SetMarketHoursUnverifiedDegraded"
+            assert states[nxt]["Next"] == "NotifyMarketHoursUnverified"
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_harness_raises_on_an_unguarded_comparator_like_real_asl(
+        self, defs, name
+    ):
+        # Pins the harness fidelity this suite lacked. Without it, the absent
+        # -verdict test above passes against a definition that dies with
+        # States.Runtime in production — which is precisely what shipped.
+        unguarded = {
+            "Choices": [
+                {
+                    "Variable": "$.market_hours_gate.Payload.verdict",
+                    "StringEquals": "PROCEED",
+                    "Next": "CheckMutexRole",
+                }
+            ],
+            "Default": "HandleFailure",
+        }
+        with pytest.raises(StatesRuntime, match="references an invalid value"):
+            evaluate(unguarded, {"market_hours_gate": {"Payload": {}}})
 
     @pytest.mark.parametrize("name", _BOTH)
     def test_an_unrecognised_verdict_fails_closed(self, defs, name):
