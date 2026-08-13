@@ -4359,7 +4359,7 @@
                   "executionTimeout": [
                     "5400"
                   ],
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug pit-lookahead --log /var/log/pit-lookahead.log -- bash infrastructure/spot_pit_lookahead.sh{}',$$.Execution.Name,$.preflight_args))"
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock /var/lock/alpha-engine-backtester-git.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug pit-lookahead --log /var/log/pit-lookahead.log -- bash infrastructure/spot_pit_lookahead.sh{}',$$.Execution.Name,$.preflight_args))"
                 },
                 "TimeoutSeconds": 5400
               },
@@ -4575,7 +4575,7 @@
                   "executionTimeout": [
                     "5400"
                   ],
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug pit-walkforward --log /var/log/pit-walkforward.log -- bash infrastructure/spot_pit_walkforward.sh{}',$$.Execution.Name,$.preflight_args))"
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock /var/lock/alpha-engine-backtester-git.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug pit-walkforward --log /var/log/pit-walkforward.log -- bash infrastructure/spot_pit_walkforward.sh{}',$$.Execution.Name,$.preflight_args))"
                 },
                 "TimeoutSeconds": 5400
               },
@@ -4791,7 +4791,7 @@
                   "executionTimeout": [
                     "2700"
                   ],
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug parity-replay --log /var/log/parity-replay.log -- bash infrastructure/spot_parity_replay.sh{}',$$.Execution.Name,$.preflight_args))"
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock /var/lock/alpha-engine-backtester-git.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug parity-replay --log /var/log/parity-replay.log -- bash infrastructure/spot_parity_replay.sh{}',$$.Execution.Name,$.preflight_args))"
                 },
                 "TimeoutSeconds": 2700
               },
