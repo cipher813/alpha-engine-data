@@ -76,6 +76,19 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # separate PR there — pinned here first so this repo's guard is honest
     # about the new PUT site either way.
     "scripts/fault_injection_run.py": 1,
+    # alpha-engine-config-I7167 — the stage-output assertion's own verdict,
+    # s3://alpha-engine-research/_stage_outputs/{pipeline}/{run_date}.json.
+    # One PUT per weekly run, from the health-observe tail.
+    #
+    # Freshness-relevant, so it is a registry row rather than a grandfathered
+    # prefix: this sweep is what catches a weekly stage that ran, exited 0 and
+    # wrote nothing (five such stages on the 2026-08-08 run, which terminated
+    # SUCCEEDED with none of them visible anywhere). A detector whose own
+    # silence is undetected is that same defect one layer up, so its verdict
+    # key is watched exactly like any other producer's output. The row rides
+    # alpha-engine-config-PR7225; pinned here so this repo's guard is honest
+    # about the new PUT site either way.
+    "validators/stage_output_sweep.py": 1,
     "builders/_price_cache_writeboth.py": 2,
     # universe_freshness.json + weekly/<date>/manifest.json (schema_drift_incidents,
     # config#1150) + feature_store/_freshness.json (ArcticDB freshness-monitor
