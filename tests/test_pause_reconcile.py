@@ -64,12 +64,14 @@ def _manifest(paused: dict | None = None, kept: dict | None = None) -> dict:
     }
 
 
-def _reconcile(mod, *, manifest, rows, triggers, targets=None, sf=None, ran=None):
+def _reconcile(mod, *, manifest, rows, triggers, targets=None, sf=None, ran=None,
+                alarm_actions_of=None):
     return mod.reconcile(
         manifest=manifest, rows=rows, triggers=triggers,
         targets_of=(lambda t: (targets or {}).get(t["name"], [])),
         sf_invoked=sf or set(),
         invocations_of=(lambda cid: (ran or {}).get(cid, 0)),
+        alarm_actions_of=alarm_actions_of,
     )
 
 
@@ -257,3 +259,118 @@ def test_non_service_lifecycles_match_the_registry(mod):
     in-service, and the reconciler would silently under-report."""
     assert mod.NON_SERVICE_LIFECYCLES == frozenset(
         {"disabled", "deprecated", "retired"})
+
+
+# ── alpha-engine-config-I7174: read-only alarm-action grading ────────────────
+#
+# `pause_reconcile.py` never mutates (test_the_module_cannot_write_anything
+# above) — it only GRADES `paused_alarms` against live CloudWatch state,
+# mirroring `automation_pause.py`'s own bidirectional check. The mutation
+# itself lives only in automation_pause.py's enforce(), consistent with this
+# module's documented invariant.
+
+def _manifest_with_alarm(watches: dict[str, str] | None = None,
+                          alarm_watches: list[str] | None = None,
+                          reason: str = "r") -> dict:
+    m = _manifest(paused=watches or {})
+    m["paused_alarms"] = {
+        "_why": "prose, must be skipped",
+        "probe-alarm": {"reason": reason, "watches": alarm_watches or []},
+    }
+    return m
+
+
+def test_alarm_unexpectedly_enabled_fires_when_armed_despite_justification(mod):
+    m = _manifest_with_alarm(watches={"tick": "ruled off"}, alarm_watches=["tick"])
+    findings = _reconcile(
+        mod, manifest=m, rows={},
+        triggers=[{"surface": "events", "name": "tick", "state": "DISABLED"}],
+        alarm_actions_of=lambda name: True,
+    )
+    assert [(f["kind"], f["trigger"]) for f in findings
+            if f["surface"] == "cloudwatch"] == [("alarm-unexpectedly-enabled", "probe-alarm")]
+
+
+def test_alarm_stale_disabled_fires_after_its_watched_trigger_is_unpaused(mod):
+    """The re-arm property, read-only: the trigger left `paused` (un-paused),
+    the alarm is still silenced — check must flag it."""
+    m = _manifest_with_alarm(watches={}, alarm_watches=["tick"])  # tick no longer paused
+    findings = _reconcile(
+        mod, manifest=m, rows={},
+        triggers=[{"surface": "events", "name": "tick", "state": "ENABLED"}],
+        alarm_actions_of=lambda name: False,
+    )
+    assert [(f["kind"], f["trigger"]) for f in findings
+            if f["surface"] == "cloudwatch"] == [("alarm-stale-disabled", "probe-alarm")]
+
+
+def test_alarm_grading_is_silent_when_state_matches_justification(mod):
+    m = _manifest_with_alarm(watches={"tick": "ruled off"}, alarm_watches=["tick"])
+    findings = _reconcile(
+        mod, manifest=m, rows={},
+        triggers=[{"surface": "events", "name": "tick", "state": "DISABLED"}],
+        alarm_actions_of=lambda name: False,
+    )
+    assert not [f for f in findings if f["surface"] == "cloudwatch"]
+
+
+def test_alarm_missing_in_aws_fires_when_the_alarm_does_not_exist(mod):
+    m = _manifest_with_alarm(watches={"tick": "ruled off"}, alarm_watches=["tick"])
+    findings = _reconcile(
+        mod, manifest=m, rows={},
+        triggers=[{"surface": "events", "name": "tick", "state": "DISABLED"}],
+        alarm_actions_of=lambda name: None,
+    )
+    assert [(f["kind"], f["trigger"]) for f in findings
+            if f["surface"] == "cloudwatch"] == [("alarm-missing-in-aws", "probe-alarm")]
+
+
+def test_declared_alarm_gaps_lists_only_currently_justified_entries(mod):
+    still_watched = _manifest_with_alarm(watches={"tick": "ruled off"}, alarm_watches=["tick"],
+                                          reason="watches tick")
+    gaps = mod.declared_alarm_gaps(still_watched)
+    assert [g["id"] for g in gaps] == ["probe-alarm"]
+    assert "watches tick" in gaps[0]["detail"]
+
+    lifted = _manifest_with_alarm(watches={}, alarm_watches=["tick"])
+    assert mod.declared_alarm_gaps(lifted) == []
+
+
+def test_declared_alarm_gaps_are_not_findings_and_do_not_flip_status(mod):
+    """Property 2: the gap always renders, but never makes a correctly-paused
+    run look like drift. A permanently-red row on a working pause is the exact
+    page-on-compliance class this issue exists to remove."""
+    m = _manifest_with_alarm(watches={"tick": "ruled off"}, alarm_watches=["tick"])
+    findings = _reconcile(
+        mod, manifest=m, rows={},
+        triggers=[{"surface": "events", "name": "tick", "state": "DISABLED"}],
+        alarm_actions_of=lambda name: False,
+    )
+    assert findings == []
+    assert mod.declared_alarm_gaps(m) != []
+
+
+def test_publish_renders_declared_gaps_without_forcing_attention_status(mod, monkeypatch):
+    captured = {}
+
+    class _FakeFcr:
+        STATUS_OK = "ok"
+        STATUS_ATTENTION = "attention"
+
+        @staticmethod
+        def build(**kw):
+            captured.update(kw)
+            return kw
+
+        @staticmethod
+        def emit(env, dry_run=False):
+            return "emitted"
+
+    import sys
+    monkeypatch.setitem(sys.modules, "nousergon_lib", type(sys)("nousergon_lib"))
+    monkeypatch.setattr(sys.modules["nousergon_lib"], "fleet_check_result", _FakeFcr, raising=False)
+
+    gap = {"id": "probe-alarm", "kind": "declared-silenced-alarm", "detail": "watches tick"}
+    mod.publish([], checked=3, declared_gaps=[gap])
+    assert captured["status"] == "ok", "a declared gap alone must not flip status to attention"
+    assert gap in captured["findings"], "the declared gap must still render on the console row"

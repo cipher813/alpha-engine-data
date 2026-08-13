@@ -330,12 +330,16 @@ def reconcile(
     targets_of=None,
     sf_invoked: set[str] | None = None,
     invocations_of=None,
+    alarm_actions_of=None,
 ) -> list[dict]:
     """Every disagreement between the three registers.
 
     Arguments are injectable so tests exercise the whole comparison without AWS
     and without the network — the same convention `automation_pause.check()`
-    uses for `_live_state`.
+    uses for `_live_state`. `alarm_actions_of` mirrors that for the
+    `paused_alarms` direction (alpha-engine-config-I7174): a callable
+    `alarm_name -> bool | None` (live `ActionsEnabled`, or `None` if the alarm
+    does not exist), defaulting to `automation_pause._alarm_actions_enabled`.
     """
     m = manifest if manifest is not None else ap.load_manifest()
     reg = rows if rows is not None else load_registry()
@@ -344,6 +348,7 @@ def reconcile(
     sf_live = sf_invoked if sf_invoked is not None else sf_invoked_functions()
     since = window_start(m)
     invocations_of = invocations_of or (lambda cid: lambda_invocations(cid, since=since))
+    alarm_actions_of = alarm_actions_of or ap._alarm_actions_enabled
 
     paused = ap.paused_names(m)          # paused + pending
     kept = ap.kept_names(m)
@@ -483,20 +488,91 @@ def reconcile(
             ),
         })
 
+    # ── direction D: paused_alarms vs live CloudWatch, both directions ──────
+    # Read-only mirror of `automation_pause.alarm_findings()`: justification is
+    # RE-DERIVED here from `m` and `paused_names(m)`, never trusted from a
+    # cached field, so an un-pause (a trigger's entry removed from `paused`)
+    # changes what this direction reports on its very next read.
+    for entry in ap.alarm_entries(m):
+        name = entry["name"]
+        justified = ap.alarm_justified(entry, m)
+        live = alarm_actions_of(name)
+        if live is None:
+            findings.append({
+                "kind": "alarm-missing-in-aws", "trigger": name, "surface": "cloudwatch",
+                "detail": (
+                    "declared in paused_alarms but no such CloudWatch alarm exists live."
+                ),
+            })
+        elif justified and live:
+            findings.append({
+                "kind": "alarm-unexpectedly-enabled", "trigger": name, "surface": "cloudwatch",
+                "detail": (
+                    f"watches {', '.join(entry['watches'])}, all still paused, but "
+                    f"ActionsEnabled=true — the pause-caused page this entry exists to "
+                    f"silence is live. Fix: automation_pause.py --enforce --alarms-only"
+                ),
+            })
+        elif not justified and not live:
+            findings.append({
+                "kind": "alarm-stale-disabled", "trigger": name, "surface": "cloudwatch",
+                "detail": (
+                    f"watches {', '.join(entry['watches']) or 'nothing'}, no longer all "
+                    f"paused, but ActionsEnabled=false — a pause lifted and this alarm "
+                    f"was not re-armed. Fix: automation_pause.py --enforce --alarms-only"
+                ),
+            })
+
     return sorted(findings, key=lambda f: (f["kind"], f["trigger"]))
+
+
+def declared_alarm_gaps(manifest: dict | None = None) -> list[dict]:
+    """Every currently-justified `paused_alarms` entry, as a declared gap.
+
+    Property 2 of alpha-engine-config-I7174: a paused component's silenced
+    alarm must render AS a declared, bounded gap on the coverage surface, never
+    be omitted. These rows are NOT drift — `reconcile()` does not return them
+    and they never affect the check's exit code — they are always-present
+    documentation of what is intentionally not paging right now, so the console
+    row stays informative on every green run instead of going silent about the
+    one thing worth knowing while the 2026-08-07/08-12 pause holds.
+    """
+    m = manifest if manifest is not None else ap.load_manifest()
+    return [
+        {
+            "id": entry["name"], "kind": "declared-silenced-alarm",
+            "detail": (
+                f"silenced because {', '.join(entry['watches'])} "
+                f"{'is' if len(entry['watches']) == 1 else 'are'} paused. {entry['reason']}"
+            ),
+        }
+        for entry in ap.alarm_entries(m)
+        if ap.alarm_justified(entry, m)
+    ]
 
 
 # ── the console row ──────────────────────────────────────────────────────────
 
-def publish(findings: list[dict], checked: int, dry_run: bool = False) -> str | None:
+def publish(findings: list[dict], checked: int, dry_run: bool = False,
+            declared_gaps: list[dict] | None = None) -> str | None:
     """This detector's own row on the console (observability-policy.md §2.2).
 
     A detector that reports nowhere is unobserved, and a green run is exactly as
     load-bearing as a red one: the row is written on EVERY run, so silence from
     this check is visible as staleness on its own row rather than as absence.
+
+    `declared_gaps` (alpha-engine-config-I7174 property 2) are appended to the
+    rendered findings but taken OUT of the status/summary computation: they are
+    the currently-justified `paused_alarms` entries, expected to be non-empty
+    for the whole duration of the 2026-08-07/08-12 pause, and counting them as
+    ATTENTION would make this row permanently red for a state that is correct
+    — the exact page-on-compliance failure I7174 exists to stop. They still
+    render, because a declared gap that is invisible unless something is ALSO
+    broken is an omission, not a declaration.
     """
     from nousergon_lib import fleet_check_result as fcr
 
+    gaps = declared_gaps or []
     status = fcr.STATUS_OK if not findings else fcr.STATUS_ATTENTION
     if findings:
         by_kind: dict[str, int] = {}
@@ -511,11 +587,13 @@ def publish(findings: list[dict], checked: int, dry_run: bool = False) -> str | 
             f"{checked} live trigger(s); every off trigger is declared off by the pause "
             "manifest or by its registry lifecycle, and no declaration is orphaned"
         )
+    if gaps:
+        summary += f"; {len(gaps)} alarm(s) declared silenced by the pause"
     env = fcr.build(
         check_id=CHECK_ID, label=CHECK_LABEL, status=status, summary=summary,
         cadence_minutes=CADENCE_MINUTES,
         findings=[{"id": f["trigger"], "kind": f["kind"], "detail": f["detail"]}
-                  for f in findings],
+                  for f in findings] + gaps,
         deep_link=(
             "https://github.com/nousergon/nousergon-data/blob/main/"
             "infrastructure/pause_reconcile.py"
@@ -542,6 +620,7 @@ def main() -> int:
         triggers = live_triggers()
         rows = load_registry(args.registry_dir)
         findings = reconcile(rows=rows, triggers=triggers)
+        gaps = declared_alarm_gaps()
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
@@ -550,21 +629,25 @@ def main() -> int:
         # Publishing is best-effort by construction (`fcr.emit` never raises):
         # a check must not go red because its telemetry did. The verdict below
         # is unaffected either way.
-        publish(findings, checked=len(triggers), dry_run=args.dry_run)
+        publish(findings, checked=len(triggers), dry_run=args.dry_run, declared_gaps=gaps)
 
     if args.json:
         print(json.dumps({"checked": len(triggers), "registry_rows": len(rows),
-                          "findings": findings}, indent=2))
+                          "findings": findings, "declared_alarm_gaps": gaps}, indent=2))
     else:
         print(f"pause reconcile — {len(triggers)} live trigger(s) vs "
-              f"{len(rows)} registry row(s)")
+              f"{len(rows)} registry row(s), {len(gaps)} alarm(s) declared silenced")
         if not findings:
             print("  ✓ every off trigger is declared off by one of the two registers")
             print("  ✓ no lifecycle declaration cites a manifest entry that is gone")
             print("  ✓ no component runs while its row declares it off")
+            print("  ✓ every paused_alarms entry's ActionsEnabled matches its justification")
         for f in findings:
             print(f"  ✗ [{f['kind']}] {f['surface']}:{f['trigger']}")
             print(f"      {f['detail']}")
+        for g in gaps:
+            print(f"  · [declared gap] {g['id']}")
+            print(f"      {g['detail']}")
     return 1 if findings else 0
 
 
