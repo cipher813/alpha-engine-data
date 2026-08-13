@@ -2,7 +2,7 @@ boto3>=1.43.59
 pandas>=2.0
 openpyxl>=3.1.5
 pyarrow>=25.0.0
-yfinance>=1.5.2
+yfinance>=1.6.0
 requests>=2.34.2
 pyyaml>=6.0.3
 # setuptools floor for PYSEC-2026-3447 (newly disclosed; CI's pip-audit gate
@@ -90,4 +90,4 @@ nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nouse
 # cannot run the commands the SF emits. 0.18.8 is also the version that made
 # the correlation id MANDATORY (`run` exits 2 without it), so this floor pins
 # both halves of the same contract. See tests/test_sf_krepis_correlation_id.py.
-krepis==0.51.0  # pinned per §139 — first-party/fast-moving deps are pinned, never floored; alpha-engine-config-I7009 (relaunch-decision --json)
+krepis==0.56.0  # pinned per §139 — first-party/fast-moving deps are pinned, never floored; alpha-engine-config-I7009 (relaunch-decision --json)
