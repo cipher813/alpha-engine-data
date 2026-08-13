@@ -70,15 +70,6 @@ def _flatten_states(sf_doc: dict) -> dict:
 #
 # Saturday SF — alpha-engine-research + alpha-engine-data Lambdas
 _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
-    # alpha-engine-config-I7214: the post-stage coverage assertion, hosted as a
-    # second `action` on the weekly-preflight Lambda (a new function would need
-    # a new role, and role creation is an operator-gated bootstrap step). The
-    # `enforce` literal is the promotion knob and is deliberately part of the
-    # closed key set: flipping it to true is a diff this registry sees.
-    "StageCoverageAssert": frozenset({
-        "action", "run_date.$", "execution_start_time.$",
-        "execution_input.$", "enforce",
-    }),
     # config#2249: fast pre-dispatch substrate health gate, immediately
     # before MorningEnrich (alpha-engine-substrate-health-gate Lambda).
     "SubstrateHealthGate": frozenset({"instance_id.$"}),

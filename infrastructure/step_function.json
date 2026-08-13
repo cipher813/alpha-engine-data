@@ -5985,7 +5985,7 @@
     },
     "CheckShellRunNotify": {
       "Type": "Choice",
-      "Comment": "Consolidated Friday-PM shell-run result notify. Reuses the EXISTING NotifyComplete SNS-publish substrate (same alpha-engine-alerts topic, same arn:aws:states:::sns:publish Resource) with a shell_run-tagged Subject/Message so the operator can tell a Friday dry-pass result apart from a real Saturday SUCCESS in their inbox. shell_run absent/false \u2192 NotifyComplete (BYTE-IDENTICAL to pre-spine). shell_run=true \u2192 NotifyShellRunComplete. No new SNS topic / Lambda / infra \u2014 the consolidated per-state pass/fail report (ROADMAP design point 5) is a scoped follow-on; the spine delivers a single shell-run-tagged success signal by reusing NotifyComplete's pattern. config-I7214: the Default edge now passes through StageCoverageAssert before CheckGateDegradedNotify. Placed HERE, on the non-shell-run branch only, because this is the single point every REAL completion path converges on before the notifiers, and because the Friday-PM shell run is a dry pass that writes nothing by design \u2014 asserting coverage on it would report 43 misses every Friday. Inserting one state at the convergence point rather than 43 post-stage states is also the whole reason this is shippable against a fragile pipeline: it changes one edge.",
+      "Comment": "Consolidated Friday-PM shell-run result notify. Reuses the EXISTING NotifyComplete SNS-publish substrate (same alpha-engine-alerts topic, same arn:aws:states:::sns:publish Resource) with a shell_run-tagged Subject/Message so the operator can tell a Friday dry-pass result apart from a real Saturday SUCCESS in their inbox. shell_run absent/false \u2192 NotifyComplete (BYTE-IDENTICAL to pre-spine). shell_run=true \u2192 NotifyShellRunComplete. No new SNS topic / Lambda / infra \u2014 the consolidated per-state pass/fail report (ROADMAP design point 5) is a scoped follow-on; the spine delivers a single shell-run-tagged success signal by reusing NotifyComplete's pattern.",
       "Choices": [
         {
           "And": [
@@ -6001,7 +6001,7 @@
           "Next": "NotifyShellRunComplete"
         }
       ],
-      "Default": "StageCoverageAssert"
+      "Default": "CheckGateDegradedNotify"
     },
     "CheckGateDegradedNotify": {
       "Type": "Choice",
@@ -7958,93 +7958,6 @@
       },
       "ResultPath": "$.error",
       "Next": "NormalizeFailureContext"
-    },
-    "StageCoverageAssert": {
-      "Type": "Task",
-      "Comment": "alpha-engine-config-I7214 \u2014 post-stage coverage assertion. For every weekly-SF stage that was not skipped by execution input, asserts that the artifact the stage DECLARES in ARTIFACT_REGISTRY.yaml's pipeline_stages section exists AND that its LastModified falls inside this execution's window. The second half is the load-bearing one: an artifact left over from a previous cycle satisfies every existence-only probe while the consumer reads last week's belief. Motivation: 5 stages produced no output on the 2026-08-08 run while it reported SUCCEEDED (config-I7167) \u2014 SF asserts a stage did not THROW; nothing asserted it WROTE. SHIPS IN OBSERVE MODE: enforce=false, so this state computes and returns the full verdict and CheckStageCoverageOutcome routes straight past the degraded summary. Promotion to enforcing is the single literal below flipped to true, after one clean cycle has shown what a healthy verdict looks like \u2014 enforcing a threshold whose distribution nobody has seen is how a correct detector gets turned off in week one (sf-pipeline-policy.md \u00a77: a withheld guarantee beats a failed run). Runs on the alpha-engine-weekly-preflight Lambda as a second action rather than a new function: a new function needs a new role, and role creation is an operator-gated bootstrap step, which would put a human between the merge and the assertion working (pull-request-policy.md \u00a74.2). NO IAM CHANGE SHIPS WITH THIS \u2014 the existing role's s3:GetObject on alpha-engine-research/* plus s3:ListBucket is exactly what reading the synced registry and HEADing the declared keys needs. Catch(States.ALL) routes to StageCoverageUnmeasured: this observer must not be able to fail the run it observes, and its own death is UNMEASURED, never a pass (\u00a72.3a rule 2).",
-      "Resource": "arn:aws:states:::lambda:invoke",
-      "Parameters": {
-        "FunctionName": "alpha-engine-weekly-preflight",
-        "Payload": {
-          "action": "assert_stage_coverage",
-          "run_date.$": "$.run_date",
-          "execution_start_time.$": "$$.Execution.StartTime",
-          "execution_input.$": "$",
-          "enforce": false
-        }
-      },
-      "ResultSelector": {
-        "stage_coverage.$": "$.Payload"
-      },
-      "ResultPath": "$.stage_coverage_result",
-      "TimeoutSeconds": 90,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Lambda.ServiceException",
-            "Lambda.TooManyRequestsException"
-          ],
-          "MaxAttempts": 1,
-          "IntervalSeconds": 15,
-          "BackoffRate": 1.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Comment": "The observer's own failure is UNMEASURED, never a pass, and never a reason to fail the run (config-I7214).",
-          "ResultPath": "$.stage_coverage_error",
-          "Next": "StageCoverageUnmeasured"
-        }
-      ],
-      "Next": "CheckStageCoverageOutcome"
-    },
-    "StageCoverageUnmeasured": {
-      "Type": "Pass",
-      "Comment": "config-I7214: the assertion could not run. Records UNMEASURED explicitly and continues. `no data` is never rendered as green (principles.md \u00a72.7) \u2014 but an unmeasured verdict is also not evidence of a defect, so it never degrades the run even under enforce. Degrading on the observer's own fault would report a harness failure AS a producer failure, always in the alarming direction.",
-      "Result": {
-        "stage_coverage": {
-          "pipeline": "ne-weekly-freshness-pipeline",
-          "status": "UNMEASURED",
-          "degrade": false,
-          "error": "StageCoverageAssert did not complete; see $.stage_coverage_error"
-        }
-      },
-      "ResultPath": "$.stage_coverage_result",
-      "Next": "CheckGateDegradedNotify"
-    },
-    "CheckStageCoverageOutcome": {
-      "Type": "Choice",
-      "Comment": "config-I7214: routes on the assertion's `degrade` field, which the Lambda sets true ONLY when enforce=true AND the status is a real MISSING. Reading one derived boolean rather than re-deriving `enforce AND status` here keeps the promotion a one-literal change in StageCoverageAssert's payload and stops the definition and the Lambda from disagreeing about what enforcement means. IsPresent-guarded per the config-I2767 shape: an unguarded dereference throws States.Runtime at the tail of an otherwise successful weekly run.",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.stage_coverage_result.stage_coverage.degrade",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.stage_coverage_result.stage_coverage.degrade",
-              "BooleanEquals": true
-            }
-          ],
-          "Next": "SetStageCoverageDegradedSummary"
-        }
-      ],
-      "Default": "CheckGateDegradedNotify"
-    },
-    "SetStageCoverageDegradedSummary": {
-      "Type": "Pass",
-      "Comment": "config-I7214: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal already read \u2014 the EXISTING chokepoint, not a second mechanism. A fail-open route added later inherits the honest terminal by writing this path and touching nothing else (see CheckDegradedOutcome's own comment). Unreachable while StageCoverageAssert ships enforce=false; it is wired now so that promotion is one literal rather than a topology change against a fragile pipeline. Carries no stage_error, for the same reason every sibling setter does not: this state is reachable only from a Choice, which writes no $.<stage>_error, so an unguarded stage_error.$ would throw States.Runtime (tests/test_degraded_terminal_derives_its_cause.py).",
-      "Parameters": {
-        "degraded": true,
-        "reason": "weekly_stage_coverage_incomplete",
-        "run_date.$": "$.run_date"
-      },
-      "ResultPath": "$.degraded_summary",
-      "Next": "CheckGateDegradedNotify"
     }
   }
 }

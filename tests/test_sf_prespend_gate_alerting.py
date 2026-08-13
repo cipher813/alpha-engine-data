@@ -144,14 +144,7 @@ def test_malformed_gate_payload_routes_to_degraded_chain(states, gate, field, de
 
 
 def test_gate_degraded_threads_into_completion_email(states):
-    # alpha-engine-config-I7214: the Default now passes through the
-    # post-stage coverage assertion before reaching the notifier selector.
-    # Asserted as a two-hop chain rather than relaxed to "reaches
-    # CheckGateDegradedNotify eventually": a test that stops caring about
-    # the shape of the edge stops catching the next change to it.
-    assert states["CheckShellRunNotify"]["Default"] == "StageCoverageAssert"
-    assert states["StageCoverageAssert"]["Next"] == "CheckStageCoverageOutcome"
-    assert states["CheckStageCoverageOutcome"]["Default"] == "CheckGateDegradedNotify"
+    assert states["CheckShellRunNotify"]["Default"] == "CheckGateDegradedNotify"
 
     choice = states["CheckGateDegradedNotify"]
     # config#2276 extended this Choice with health_check_degraded rules

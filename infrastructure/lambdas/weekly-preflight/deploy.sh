@@ -60,11 +60,6 @@ run() {
 
 python3 -c "import ast; ast.parse(open('${SCRIPT_DIR}/index.py').read()); print('index.py syntax OK')"
 python3 -c "import ast; ast.parse(open('${REPO_ROOT}/sf_preflight.py').read()); print('sf_preflight.py syntax OK')"
-# config-I7214 — the coverage-assertion module the `assert_stage_coverage`
-# action imports. Bundled here for the same reason sf_preflight.py is: the
-# handler imports it by name at request time, so a missing file is a runtime
-# ImportError on the live weekly run, not a deploy failure.
-python3 -c "import ast; ast.parse(open('${REPO_ROOT}/sf_stage_coverage.py').read()); print('sf_stage_coverage.py syntax OK')"
 
 # ----- Handler unit tests (shared gate) -------------------------------------
 source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
@@ -82,8 +77,6 @@ trap "rm -rf '$PKG'" EXIT
 # Copy sf_preflight.py from the repo root — this is the core check logic.
 echo "Copying sf_preflight.py to package..."
 cp "${REPO_ROOT}/sf_preflight.py" "${PKG}/sf_preflight.py"
-echo "Copying sf_stage_coverage.py to package..."
-cp "${REPO_ROOT}/sf_stage_coverage.py" "${PKG}/sf_stage_coverage.py"
 
 echo "Installing deps into ${PKG}..."
 python3 -m pip install --quiet --target "${PKG}" --upgrade -r "${SCRIPT_DIR}/requirements.txt"

@@ -683,14 +683,7 @@ class TestStrictSuperset:
     def test_success_notify_gate_default_is_notify_complete(self, states):
         # config#2278: the real-run success edge now passes through the
         # gate-degraded completion Choice before NotifyComplete.
-        # alpha-engine-config-I7214: the Default now passes through the
-        # post-stage coverage assertion before reaching the notifier selector.
-        # Asserted as a two-hop chain rather than relaxed to "reaches
-        # CheckGateDegradedNotify eventually": a test that stops caring about
-        # the shape of the edge stops catching the next change to it.
-        assert states["CheckShellRunNotify"]["Default"] == "StageCoverageAssert"
-        assert states["StageCoverageAssert"]["Next"] == "CheckStageCoverageOutcome"
-        assert states["CheckStageCoverageOutcome"]["Default"] == "CheckGateDegradedNotify"
+        assert states["CheckShellRunNotify"]["Default"] == "CheckGateDegradedNotify"
         assert states["CheckGateDegradedNotify"]["Default"] == "NotifyComplete"
 
 

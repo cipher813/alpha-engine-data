@@ -17,10 +17,3 @@
 # needing more is reported status="skip" rather than executed.
 aws-assume-role-lib
 nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.53
-
-# config-I7214 — the stage-coverage assertion parses ARTIFACT_REGISTRY.yaml,
-# read from s3://alpha-engine-research/_freshness_monitor/. Not a transitive of
-# anything above; the freshness-monitor Lambda pins it explicitly for the same
-# reason. Absent, the assertion returns UNMEASURED on every run — loud, but
-# useless.
-pyyaml>=6.0
