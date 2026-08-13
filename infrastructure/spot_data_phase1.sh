@@ -146,4 +146,11 @@ WORKLOAD
 )" "${MAX_RUNTIME_SECONDS}"
 
 emit_heartbeat
+
+# ── Per-stage output assertion (config-I7214) ────────────────────────────────
+# See spot_morning_enrich.sh for the full rationale. OBSERVE MODE — the CLI
+# exits 0 for every verdict, and `|| echo ... >&2` rather than `|| true` keeps
+# an unreachable assertion distinguishable from a covered stage.
+"$LIB_PYTHON" -m krepis.stage_coverage assert --stage DataPhase1 --window-start "$_STAGE_WINDOW_START" || echo "WARNING: stage-coverage assertion did not run for DataPhase1 (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
+
 echo "==> DataPhase1 complete."

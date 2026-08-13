@@ -69,6 +69,14 @@ _SSM_SLUG="${_SSM_SLUG:-}"
 _PROCESS_NAME="${_PROCESS_NAME:-}"
 MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-}"
 
+# Stage-coverage window (alpha-engine-config-I7214): the instant this launcher
+# started. An artifact whose LastModified predates it is a leftover from a
+# previous cycle, not this run's output — an existence-only probe cannot tell
+# those apart, which is how a stage that STOPPED writing keeps reading green.
+# Captured here rather than at assertion time because the workload runs in
+# between: a window taken after the write would be trivially satisfied by it.
+_STAGE_WINDOW_START="${_STAGE_WINDOW_START:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+
 # Derived at launch time
 _INSTANCE_ID=""
 _S3_STAGING_PREFIX=""
