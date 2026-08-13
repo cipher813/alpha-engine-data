@@ -91,7 +91,6 @@ _FUNCTION_TIMEOUTS_SEC: dict[str, int] = {
 # an entry cannot outlive its fix without failing.
 _KNOWN_UNBOUND: frozenset[tuple[str, str]] = frozenset(
     {
-        ("step_function.json", "WeeklyRunDayGate"),  # no TimeoutSeconds at all
         ("step_function.json", "SignalsEnvelope"),
         ("step_function.json", "ChallengerShadow"),
         ("step_function.json", "EvalJudgeSubmitFirstSaturday"),
@@ -105,9 +104,6 @@ _KNOWN_UNBOUND: frozenset[tuple[str, str]] = frozenset(
         ("step_function.json", "ReportCard"),
         ("step_function.json", "DispatchWeeklyFreshnessSpot"),
         # SF > function: the declaration is decorative, the function governs.
-        ("step_function.json", "RegimeSubstrate"),
-        ("step_function.json", "RegimeRetrospectiveEval"),
-        ("step_function.json", "AggregateCosts"),
         ("step_function.json", "Director"),
         ("step_function_daily.json", "PredictorInference"),
         ("step_function_daily.json", "ReinvokePredictor"),
