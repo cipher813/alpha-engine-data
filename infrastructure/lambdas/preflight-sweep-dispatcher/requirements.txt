@@ -1,0 +1,9 @@
+# boto3 is provided by the Lambda python3.12 runtime; pinned for reproducible builds.
+boto3>=1.34.0
+# No other third-party import: index.py's only non-stdlib dependency is
+# boto3. It does NOT import nousergon_lib.spot_dispatch — unlike
+# weekly-freshness-spot-dispatcher (which owns the launch), this Lambda
+# reuses that launcher via a plain lambda:InvokeFunction call and only
+# subsequently drives ssm.send_command / ec2.create_tags / ec2.terminate_
+# instances directly, so it carries none of the spot-provisioning chokepoint
+# and needs no lockstep pin here.

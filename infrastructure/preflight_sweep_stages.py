@@ -417,6 +417,60 @@ def load_manifest(path: str | os.PathLike[str] = DEFAULT_MANIFEST) -> dict:
         return json.load(fh)
 
 
+# Execution-input references only. The negative lookbehind is load-bearing:
+# `$$.Execution.Name` contains the literal `$.Execution`, so without it every
+# stage that stamps a correlation id would be reported as needing an
+# undeclared `Execution` binding — a coverage finding manufactured by the
+# scanner rather than by the definition.
+_INPUT_REF_RE = re.compile(r"(?<!\$)\$\.([A-Za-z_][\w.]*)")
+
+
+def derive_required_map_bindings(
+    definition: dict, base_bindings: dict[str, Any]
+) -> set[str]:
+    """Execution-input references no derived binding can supply.
+
+    These are the Map-scoped variables (``$.spec_id`` and friends) that exist
+    only per iteration. Derived by scanning the sendCommand states' own command
+    expressions, so a new one appears here the moment it is added to the
+    definition — and, being absent from the manifest, fails the agreement check.
+    """
+    required: set[str] = set()
+    for _name, state in _iter_send_command_states(definition["States"]):
+        for ref in _INPUT_REF_RE.findall(_raw_commands_expression(state)):
+            root = ref.split(".")[0]
+            if root not in base_bindings:
+                required.add(root)
+    return required
+
+
+def apply_map_bindings(bindings: dict[str, Any], manifest: dict) -> dict[str, Any]:
+    """``bindings`` plus the manifest's declared Map-scoped values."""
+    merged = dict(bindings)
+    for key, entry in (manifest.get("map_bindings") or {}).items():
+        merged[key] = entry["value"]
+    return merged
+
+
+def map_binding_disagreement(required: set[str], manifest: dict) -> list[str]:
+    """Differences between the Map-scoped bindings the definition needs and the
+    ones the manifest declares. Empty list means they agree."""
+    declared = set((manifest.get("map_bindings") or {}).keys())
+    findings: list[str] = []
+    for key in sorted(required - declared):
+        findings.append(
+            f"stage command references $.{key}, which no derived binding supplies and "
+            "the manifest does not declare — the stage cannot be rendered and the "
+            "sweep would drop it; declare a map_bindings value with a written reason"
+        )
+    for key in sorted(declared - required):
+        findings.append(
+            f"manifest declares map_bindings.{key}, but no stage command references "
+            "$.%s any more — drop the stale entry" % key
+        )
+    return findings
+
+
 def manifest_disagreement(stages: list[Stage], manifest: dict) -> list[str]:
     """Differences between the derived no-dry-path set and the manifest.
 

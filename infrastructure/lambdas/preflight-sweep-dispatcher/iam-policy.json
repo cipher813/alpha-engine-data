@@ -1,0 +1,67 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-preflight-sweep-dispatcher:*"
+    },
+    {
+      "Sid": "InvokeWeeklyLauncherBoxDispatcherOnly",
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-weekly-freshness-spot-dispatcher"
+    },
+    {
+      "Sid": "SendSweepCommandViaRunShellScript",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": [
+        "arn:aws:ssm:us-east-1::document/AWS-RunShellScript",
+        "arn:aws:ec2:us-east-1:711398986525:instance/*"
+      ]
+    },
+    {
+      "Sid": "RetagWatchdogDeadlineOnSweepBox",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": "arn:aws:ec2:us-east-1:711398986525:instance/*"
+    },
+    {
+      "Sid": "TerminateSweepBoxOnSendCommandFailure",
+      "Effect": "Allow",
+      "Action": "ec2:TerminateInstances",
+      "Resource": "arn:aws:ec2:us-east-1:711398986525:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:ResourceTag/pipeline_role": "preflight-sweep"
+        }
+      }
+    },
+    {
+      "Sid": "PutMetricDataUnderAlphaEngineNamespaceOnly",
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "AlphaEngine"
+        }
+      }
+    },
+    {
+      "Sid": "WriteConsoleUnmeasuredRow",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research/_preflight_sweep/*",
+        "arn:aws:s3:::alpha-engine-research/ops/checks/ae-preflight-sweep/*"
+      ]
+    }
+  ]
+}

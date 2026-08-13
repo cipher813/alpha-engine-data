@@ -1,0 +1,306 @@
+"""The sweep's DENOMINATOR is derived from the live SF definition, and it
+cannot shrink quietly (alpha-engine-config-I7249).
+
+Two obligations shape this file:
+
+1. **A stage added to the pipeline must not reduce coverage.** Either it is
+   picked up automatically, or it FAILS. Both halves are tested here against
+   the real ``infrastructure/step_function.json``, not a fixture — a
+   derivation test that only ever sees its own fixture proves the parser
+   works and nothing about the pipeline it is supposed to be tracking.
+
+2. **The classifier must be PROVEN able to fail.** This fleet has shipped
+   detectors that could not. Every classification has a test that produces
+   it, including the three ways a stage becomes ``unsweepable``.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+
+import pytest
+
+from infrastructure.preflight_sweep_stages import (
+    NO_DRY_PATH,
+    SWEEPABLE,
+    UNSWEEPABLE,
+    apply_map_bindings,
+    derive_required_map_bindings,
+    derive_shell_run_bindings,
+    derive_stages,
+    load_manifest,
+    manifest_disagreement,
+    map_binding_disagreement,
+)
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+SF_PATH = REPO / "infrastructure" / "step_function.json"
+MANIFEST_PATH = REPO / "infrastructure" / "preflight_sweep_manifest.json"
+CONTEXT = {"Execution": {"Name": "preflight-sweep-test", "Id": "arn:test"}}
+
+
+@pytest.fixture(scope="module")
+def definition() -> dict:
+    return json.loads(SF_PATH.read_text())
+
+
+@pytest.fixture(scope="module")
+def manifest() -> dict:
+    return load_manifest(MANIFEST_PATH)
+
+
+@pytest.fixture(scope="module")
+def bindings(definition, manifest) -> dict:
+    base = derive_shell_run_bindings(definition)
+    merged = apply_map_bindings(base, manifest)
+    merged.setdefault("run_date", "2026-08-12")
+    return merged
+
+
+@pytest.fixture(scope="module")
+def stages(definition, bindings):
+    # checkout_root deliberately absent: this asserts the DERIVATION, which
+    # must work anywhere. Launcher-on-disk checks are exercised separately.
+    return derive_stages(definition, bindings, CONTEXT, checkout_root="/nonexistent")
+
+
+# ── Bindings come from the definition, not from this file ────────────────────
+
+
+def test_shell_run_bindings_are_read_out_of_the_definition(definition):
+    b = derive_shell_run_bindings(definition)
+    assert b["preflight_args"] == " --preflight-only"
+    # ApplyShellRunDefaults' overrides must win over InitializeInput's seeds,
+    # which is the precedence States.JsonMerge($, shellDefaults, false) has
+    # live. Getting this backwards is what made the 2026-05-22 shell-run
+    # execute full-fat instead of dry.
+    assert b["research_dry"] is True
+    assert b["data_phase2_dry"] is True
+    assert b["regime_action"] == "dry_run"
+
+
+def test_a_definition_that_stops_declaring_the_dry_flag_fails_loud(definition):
+    """The sweep's whole contract with 21 launchers is that one value. If the
+    definition stops setting it, the sweep must refuse rather than assume."""
+    broken = json.loads(json.dumps(definition))
+    params = broken["States"]["ApplyShellRunDefaults"]["Parameters"]
+    key = next(iter(params))
+    params[key] = params[key].replace(" --preflight-only", " --some-other-flag")
+    with pytest.raises(ValueError, match="preflight_args"):
+        derive_shell_run_bindings(broken)
+
+
+def test_a_missing_shell_run_state_fails_loud(definition):
+    broken = json.loads(json.dumps(definition))
+    del broken["States"]["ApplyShellRunDefaults"]
+    with pytest.raises(KeyError):
+        derive_shell_run_bindings(broken)
+
+
+# ── The live pipeline's stage set ────────────────────────────────────────────
+
+
+def test_the_derivation_finds_the_pipeline_s_send_command_stages(stages):
+    names = {s.name for s in stages}
+    # Spot-check the three nesting shapes the walker has to handle: a
+    # top-level stage, a Parallel-branch stage, and a second Parallel.
+    assert "DataPhase1" in names
+    assert "ResearchPredictorParallel.PredictorTraining" in names
+    assert "ParityParallel.ParityReplay" in names
+
+
+def test_every_stage_lands_in_exactly_one_classification(stages):
+    for stage in stages:
+        assert stage.classification in {SWEEPABLE, UNSWEEPABLE, NO_DRY_PATH}
+
+
+def test_the_preflight_capable_stages_carry_a_launcher_and_a_working_directory(
+    definition, bindings
+):
+    stages = derive_stages(definition, bindings, CONTEXT, checkout_root="/nonexistent")
+    capable = [
+        s
+        for s in stages
+        # With a nonexistent checkout every capable stage is UNSWEEPABLE for
+        # the on-disk reason; what is asserted here is that the derivation
+        # still extracted both anchors from the definition.
+        if s.classification is UNSWEEPABLE and "not present in the checkout" in (s.reason or "")
+    ]
+    assert capable, "expected the live definition to declare preflight-capable stages"
+    for stage in capable:
+        assert stage.launcher and stage.launcher.endswith(".sh")
+        assert stage.box_dir and stage.box_dir.startswith("alpha-engine-")
+
+
+def test_rendered_commands_carry_the_dry_flag_and_no_unresolved_placeholder(stages):
+    for stage in stages:
+        if stage.classification is NO_DRY_PATH or not stage.commands:
+            continue
+        joined = "\n".join(stage.commands)
+        assert "--preflight-only" in joined, stage.name
+        # An unrendered placeholder would be shipped to the box verbatim.
+        assert "{}" not in joined, stage.name
+        assert "States.Format" not in joined, stage.name
+
+
+# ── Coverage cannot shrink quietly ───────────────────────────────────────────
+
+
+def test_the_manifest_and_the_definition_agree_today(stages, manifest):
+    """THE regression guard. A stage added to the pipeline without a dry path
+    lands in the derived no-dry-path set, disagrees with the manifest, and
+    fails HERE — at merge time, not on the next nightly sweep."""
+    assert manifest_disagreement(stages, manifest) == []
+
+
+def test_map_bindings_and_the_definition_agree_today(definition, manifest):
+    base = derive_shell_run_bindings(definition)
+    # run_date is supplied by the runner (see sweep()), not by a Map iteration.
+    base["run_date"] = "2026-08-12"
+    required = derive_required_map_bindings(definition, base)
+    assert map_binding_disagreement(required, manifest) == []
+
+
+def test_an_unacknowledged_no_dry_path_stage_is_a_finding(stages, manifest):
+    stripped = {"no_dry_path_stages": [], "map_bindings": manifest["map_bindings"]}
+    findings = manifest_disagreement(stages, stripped)
+    assert findings, "a stage with no dry path must not pass unacknowledged"
+    assert any("denominator" in f for f in findings)
+
+
+def test_a_stale_manifest_entry_is_also_a_finding(stages, manifest):
+    inflated = {
+        "no_dry_path_stages": manifest["no_dry_path_stages"]
+        + [{"stage": "StageThatNoLongerExists", "reason": "x"}],
+        "map_bindings": manifest["map_bindings"],
+    }
+    findings = manifest_disagreement(stages, inflated)
+    assert any("StageThatNoLongerExists" in f for f in findings)
+
+
+def test_an_undeclared_map_binding_is_a_finding(definition, manifest):
+    base = derive_shell_run_bindings(definition)
+    base["run_date"] = "2026-08-12"
+    required = derive_required_map_bindings(definition, base)
+    assert required, "expected the live definition to carry a Map-scoped binding"
+    findings = map_binding_disagreement(required, {"map_bindings": {}})
+    assert findings and all("map_bindings" in f for f in findings)
+
+
+def test_a_new_stage_without_a_dry_path_fails_rather_than_being_dropped(
+    definition, bindings, manifest
+):
+    """Simulates the actual regression: somebody adds a sendCommand stage and
+    does not give it --preflight-only. It must not vanish from the count."""
+    mutated = json.loads(json.dumps(definition))
+    mutated["States"]["BrandNewStage"] = {
+        "Type": "Task",
+        "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+        "Parameters": {
+            "DocumentName": "AWS-RunShellScript",
+            "InstanceIds.$": "$.ec2_instance_id",
+            "Parameters": {
+                "executionTimeout": ["600"],
+                "commands.$": (
+                    "States.Array('set -eo pipefail',"
+                    "'cd /home/ec2-user/alpha-engine-data',"
+                    "'bash infrastructure/spot_brand_new.sh')"
+                ),
+            },
+        },
+        "End": True,
+    }
+    stages = derive_stages(mutated, bindings, CONTEXT, checkout_root="/nonexistent")
+    new = next(s for s in stages if s.name == "BrandNewStage")
+    assert new.classification is NO_DRY_PATH
+    assert any("BrandNewStage" in f for f in manifest_disagreement(stages, manifest))
+
+
+def test_a_stage_threading_the_flag_at_a_missing_launcher_is_unsweepable(
+    definition, bindings
+):
+    mutated = json.loads(json.dumps(definition))
+    mutated["States"]["GhostStage"] = {
+        "Type": "Task",
+        "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+        "Parameters": {
+            "DocumentName": "AWS-RunShellScript",
+            "InstanceIds.$": "$.ec2_instance_id",
+            "Parameters": {
+                "executionTimeout": ["600"],
+                "commands.$": (
+                    "States.Array('set -eo pipefail',"
+                    "'cd /home/ec2-user/alpha-engine-data',"
+                    "States.Format('bash infrastructure/does_not_exist.sh{}',$.preflight_args))"
+                ),
+            },
+        },
+        "End": True,
+    }
+    stages = derive_stages(mutated, bindings, CONTEXT, checkout_root="/nonexistent")
+    ghost = next(s for s in stages if s.name == "GhostStage")
+    assert ghost.classification is UNSWEEPABLE
+    assert "not present in the checkout" in ghost.reason
+
+
+def test_a_launcher_without_the_flag_is_unsweepable_not_a_pass(
+    definition, bindings, tmp_path
+):
+    """The quiet failure this guards: the stage passes --preflight-only, the
+    launcher does not implement it, and the flag is ignored or rejected. Either
+    way the sweep must not report the stage as checked."""
+    box = tmp_path / "alpha-engine-data" / "infrastructure"
+    box.mkdir(parents=True)
+    (box / "no_flag.sh").write_text("#!/usr/bin/env bash\necho hello\n")
+    mutated = json.loads(json.dumps(definition))
+    mutated["States"] = {
+        "FlaglessStage": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+            "Parameters": {
+                "DocumentName": "AWS-RunShellScript",
+                "InstanceIds.$": "$.ec2_instance_id",
+                "Parameters": {
+                    "executionTimeout": ["600"],
+                    "commands.$": (
+                        "States.Array('cd /home/ec2-user/alpha-engine-data',"
+                        "States.Format('bash infrastructure/no_flag.sh{}',$.preflight_args))"
+                    ),
+                },
+            },
+            "End": True,
+        }
+    }
+    stages = derive_stages(mutated, bindings, CONTEXT, checkout_root=str(tmp_path))
+    stage = stages[0]
+    assert stage.classification is UNSWEEPABLE
+    assert "does not implement --preflight-only" in stage.reason
+
+
+def test_a_stage_whose_command_cannot_be_rendered_is_unsweepable(definition, bindings):
+    """Definition drift — a JSONPath no binding covers. The sweep must refuse
+    to claim the stage, never substitute a blank and run something else."""
+    mutated = json.loads(json.dumps(definition))
+    mutated["States"] = {
+        "DriftedStage": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+            "Parameters": {
+                "DocumentName": "AWS-RunShellScript",
+                "InstanceIds.$": "$.ec2_instance_id",
+                "Parameters": {
+                    "executionTimeout": ["600"],
+                    "commands.$": (
+                        "States.Array('cd /home/ec2-user/alpha-engine-data',"
+                        "States.Format('bash infrastructure/spot_data_weekly.sh --x {}{}',"
+                        "$.a_field_nobody_declared,$.preflight_args))"
+                    ),
+                },
+            },
+            "End": True,
+        }
+    }
+    stages = derive_stages(mutated, bindings, CONTEXT, checkout_root="/nonexistent")
+    assert stages[0].classification is UNSWEEPABLE
+    assert "could not be rendered" in stages[0].reason

@@ -1,0 +1,29 @@
+{
+  "_purpose": "Declared supplements to the nightly preflight sweep's DERIVED stage list. The stage list itself is derived from infrastructure/step_function.json by infrastructure/preflight_sweep_stages.py and is never enumerated here. This file holds only the two things derivation cannot supply on its own — an acknowledgement for each stage that has NO dry path, and a value for each Map-scoped binding that exists only per-iteration at execution time. Both are checked for exact agreement with the definition by tests/test_preflight_sweep_stages.py, so a stage added to the pipeline fails CI at merge time rather than quietly shrinking the sweep's denominator.",
+
+  "no_dry_path_stages": [
+    {
+      "stage": "ResearchPredictorParallel.ResolveZooSpecs",
+      "reason": "Runs the model-zoo spec RESOLVER on the launcher box itself — a pure read of the zoo spec registry that launches no spot, spends nothing and writes nothing. It threads no $.preflight_args because there is no expensive path to short-circuit: the stage IS its own preflight. A substrate defect that would break it (missing repo, broken venv, unreadable spec file) breaks PredictorTraining and ModelZooSelect first, both of which the sweep does cover.",
+      "acknowledged": "2026-08-13"
+    },
+    {
+      "stage": "SaturdayHealthCheck",
+      "reason": "Post-workload observability producer (health_checker.py --alert) on the launcher box. It is a CONSUMER of the run's outputs, not a precondition of them — running it dry before the run would assert nothing about whether the run can start. sf-pipeline-policy §5 already classes it as a fail-open secondary-observability stage.",
+      "acknowledged": "2026-08-13"
+    },
+    {
+      "stage": "WeeklySubstrateHealthCheck",
+      "reason": "Post-workload substrate/artifact assertion on the launcher box (infrastructure/substrate_health_check.sh), same consumer-not-precondition argument as SaturdayHealthCheck. Its own dry path would be a no-op: it grades artifacts that only exist after the stages ran.",
+      "acknowledged": "2026-08-13"
+    }
+  ],
+
+  "map_bindings": {
+    "spec_id": {
+      "value": "preflight-sweep-synthetic-spec",
+      "reason": "ResearchPredictorParallel.ModelZooTrainMap.TrainSpecDispatch is Map-scoped: $.spec_id is supplied per iteration from the resolved zoo spec array and has no value outside an execution. The sweep exercises the stage's BOOTSTRAP-CLASS preconditions (clone, venv, lib pin, imports, dispatcher-side file checks), all of which spot_train_spec_dispatch.sh asserts before the spec id is ever read — its --preflight-only path exits 0 ahead of any spec-dependent work, so the value is a placeholder and never selects real work. If that ordering ever changes, the stage's preflight would fail loudly against a spec that does not exist, which is the correct outcome and not a silent pass.",
+      "acknowledged": "2026-08-13"
+    }
+  }
+}
