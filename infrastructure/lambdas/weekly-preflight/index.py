@@ -52,6 +52,35 @@ def handler(event: dict, context) -> dict:
     Returns:
         dict with status, has_violation, and detailed results.
     """
+    # config-I7214 — second mode: the post-stage coverage assertion.
+    #
+    # It lives in THIS Lambda rather than a new one for a reason that is not
+    # convenience: a new function needs a new role, and creating a role is an
+    # operator-gated `--bootstrap` step (see this repo's AGENTS.md and
+    # deploy.sh's `--apply-iam` note). That would put a human action between the
+    # merge and the assertion working — the shape `pull-request-policy.md` §4.2
+    # forbids. This role already holds `s3:GetObject` on
+    # `alpha-engine-research/*` and `s3:ListBucket`, which is exactly and only
+    # what the assertion needs: read the synced registry, HEAD the declared
+    # keys. **No IAM change ships with this feature.** The mode dispatch mirrors
+    # `alpha-engine-predictor-inference`, which hosts three gate modes the same
+    # way.
+    action = event.get("action")
+    if action == "assert_stage_coverage":
+        try:
+            import sf_stage_coverage  # type: ignore[import-untyped]
+        except ImportError as exc:
+            # Import failure is UNMEASURED, never a pass — and never a raise,
+            # because this state must not be able to fail the weekly run.
+            return {
+                "status": "UNMEASURED",
+                "degrade": False,
+                "enforce": bool(event.get("enforce", False)),
+                "error": f"sf_stage_coverage import failed: {exc}",
+                "traceback": traceback.format_exc(),
+            }
+        return sf_stage_coverage.handle(event)
+
     bucket = event.get("bucket", _SF_DEFINITION_BUCKET)
     sf_name = event.get("sf_name", _WEEKLY_SF_NAME)
 

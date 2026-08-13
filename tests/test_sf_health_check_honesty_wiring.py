@@ -200,7 +200,22 @@ def _notify_target(states, data: dict) -> str:
         return data[var] == rule["BooleanEquals"]
 
     cur = "CheckShellRunNotify"
-    while states[cur]["Type"] == "Choice":
+    # config-I7214: the walk now steps THROUGH non-Choice states as well.
+    # StageCoverageAssert (a Task) and its Choice sit between
+    # CheckShellRunNotify and CheckGateDegradedNotify; a walker that stopped at
+    # the first non-Choice would report the assertion state as the notifier and
+    # certify a defect it invented. Coverage never degrades in observe mode, so
+    # the notifier selected for a given flag combination is unchanged — which is
+    # exactly what these parametrized cases still assert.
+    # Stepping through non-Choice states is scoped BY NAME to the coverage
+    # states. A blanket "follow Next on any Task" would walk straight past
+    # NotifyComplete — itself a Task with a Next — and return the completion
+    # marker instead of the notifier, i.e. it would answer a different question
+    # while still passing.
+    while states[cur]["Type"] == "Choice" or cur.startswith("StageCoverage"):
+        if states[cur]["Type"] != "Choice":
+            cur = states[cur]["Next"]
+            continue
         for rule in states[cur]["Choices"]:
             if eval_rule(rule):
                 cur = rule["Next"]

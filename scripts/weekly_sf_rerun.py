@@ -192,6 +192,16 @@ TERMINAL_DEGRADED_FAMILY: frozenset[str] = frozenset({
     "CheckShellRunDegradedOutcome",
     "WriteCompletionMarkerDegraded",
     "DegradedRun",
+    # alpha-engine-config-I7214: the stage-coverage verdict is a claim about
+    # the RUN AS A WHOLE, evaluated once after every stage has finished — not a
+    # per-stage rerun witness. Mapping it to any one stage would be wrong in
+    # both directions: a rerun would re-run that stage for a miss owned by a
+    # different one, and would skip the stage that actually missed. The
+    # rerun-actionable signal is the per-stage Mark*Degraded / *Degraded routes
+    # that are already mapped; this state is always causally downstream of the
+    # producer's own miss, and the verdict it carries names the offending
+    # stages explicitly in $.stage_coverage_result.
+    "SetStageCoverageDegradedSummary",
 })
 
 STAGES: tuple[Stage, ...] = (
