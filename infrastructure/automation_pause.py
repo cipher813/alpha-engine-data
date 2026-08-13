@@ -33,14 +33,39 @@ The check is deliberately two-directional. A pause that silently lifted and a
 manifest entry for a rule that no longer exists are both findings: an entry that
 can never fail is not a record, it is a comment.
 
+**Alarm-action ownership (alpha-engine-config-I7174).** A paused component's
+absence-alarm (``treat_missing_data: breaching``) cannot tell "gated off by
+declaration" from "upstream died" — it has no input saying which case it is
+in, because the pause manifest and the alarm configuration were not connected.
+The ``paused_alarms`` block in ``automation_pause.json`` closes that: each
+entry names a watch-plane/liveness CloudWatch alarm and the trigger name(s) it
+``watches``. The alarm is JUSTIFIED — i.e. its actions should be silenced — for
+exactly as long as every name in ``watches`` is itself in ``paused_names()``.
+That is computed live on every read, never cached in a second field, so lifting
+a pause (deleting/moving the watched trigger's entry out of ``paused``) makes
+the alarm's justification lapse on the very next ``--check``/``--enforce`` —
+the SAME manifest edit that restores the trigger's schedule, no separate AWS
+CLI command. ``enforce()`` disables actions on a justified-but-armed alarm and
+RE-ENABLES actions on an alarm whose justification has lapsed; alarms are
+silenced with ``disable-alarm-actions``, never deleted, so their history and
+configuration survive for later reconstruction. Re-enabling an alarm is NOT
+the trigger-reenable asymmetry below — it only resumes paging, it starts no
+scheduled work, so it is safe for ``enforce()`` to do unattended.
+
 Usage:
   ./infrastructure/automation_pause.py --check     # verify; exit 1 on any finding
-  ./infrastructure/automation_pause.py --enforce   # re-disable anything that came back
+  ./infrastructure/automation_pause.py --enforce   # re-disable anything that came back,
+                                                    # and reconcile alarm-action state
+  ./infrastructure/automation_pause.py --enforce --alarms-only  # touch ONLY alarm actions;
+                                                    # never disables/enables a trigger
   ./infrastructure/automation_pause.py --check --json
 
-``--check`` needs ``events:DescribeRule`` + ``scheduler:GetSchedule``; ``--enforce``
-additionally needs ``events:DisableRule`` + ``scheduler:UpdateSchedule``. CI runs
-``--check`` only, under the read-only ``github-actions-iam-drift-check`` role.
+``--check`` needs ``events:DescribeRule`` + ``scheduler:GetSchedule`` +
+``cloudwatch:DescribeAlarms``; ``--enforce`` additionally needs
+``events:DisableRule`` + ``scheduler:UpdateSchedule`` +
+``cloudwatch:EnableAlarmActions`` + ``cloudwatch:DisableAlarmActions``. CI runs
+``--check`` (read-only) and ``--enforce --alarms-only`` (alarm actions only)
+under the ``github-actions-iam-drift-check`` role.
 """
 
 from __future__ import annotations
@@ -116,6 +141,42 @@ def paused_names(manifest: dict | None = None) -> set[str]:
     return {name for _, name, _ in paused_entries(manifest)} | pending_names(manifest)
 
 
+def alarm_entries(manifest: dict | None = None) -> list[dict]:
+    """Every declared ``paused_alarms`` entry: ``{name, reason, watches}``.
+
+    ``_``-prefixed keys (``_why``) are prose, exactly the convention
+    ``pending``/``not_paused`` already use, and are skipped here for the same
+    reason: a prose value is invisible to every checker that iterates keys, so
+    nothing that must be checked may live inside one.
+    """
+    m = manifest if manifest is not None else load_manifest()
+    out: list[dict] = []
+    for name, entry in sorted(m.get("paused_alarms", {}).items()):
+        if name.startswith("_"):
+            continue
+        out.append({
+            "name": name,
+            "reason": entry.get("reason", ""),
+            "watches": list(entry.get("watches", [])),
+        })
+    return out
+
+
+def alarm_justified(entry: dict, manifest: dict | None = None) -> bool:
+    """Is silencing ``entry`` still justified by the manifest, right now?
+
+    True iff EVERY trigger it ``watches`` is currently in ``paused_names()``.
+    An entry with an empty ``watches`` list is never justified — a declaration
+    that names nothing to watch cannot be graded, and grading it as justified
+    would silence an alarm on a claim nobody can verify.
+    """
+    watches = entry.get("watches") or []
+    if not watches:
+        return False
+    names = paused_names(manifest)
+    return all(w in names for w in watches)
+
+
 def _aws(args: list[str]) -> tuple[int, str, str]:
     proc = subprocess.run(
         ["aws"] + args + ["--region", REGION], capture_output=True, text=True, check=False
@@ -165,6 +226,31 @@ def _disable(surface: str, name: str) -> None:
     rc, _, err = _aws(["scheduler", "update-schedule", "--cli-input-json", json.dumps(spec)])
     if rc != 0:
         raise RuntimeError(f"aws scheduler update-schedule --name {name}: {err}")
+
+
+def _alarm_actions_enabled(name: str) -> bool | None:
+    """Live ``ActionsEnabled`` for a CloudWatch alarm, or None if it does not exist.
+
+    Same not-found-vs-raise posture as ``_live_state``: an access error read as
+    "alarm does not exist" would let this check grade itself green by losing
+    its own permission, rather than reporting the AccessDenied.
+    """
+    rc, out, err = _aws([
+        "cloudwatch", "describe-alarms", "--alarm-names", name,
+        "--query", "MetricAlarms[0].ActionsEnabled", "--output", "text",
+    ])
+    if rc != 0:
+        raise RuntimeError(f"aws cloudwatch describe-alarms --alarm-names {name}: {err}")
+    if out in ("None", ""):
+        return None
+    return out == "True"
+
+
+def _set_alarm_actions(name: str, enabled: bool) -> None:
+    verb = "enable-alarm-actions" if enabled else "disable-alarm-actions"
+    rc, _, err = _aws(["cloudwatch", verb, "--alarm-names", name])
+    if rc != 0:
+        raise RuntimeError(f"aws cloudwatch {verb} --alarm-names {name}: {err}")
 
 
 def check() -> list[dict]:
@@ -235,16 +321,87 @@ def check() -> list[dict]:
                         f"scheduled work unattended is what the pause forbids."
                     ),
                 })
+
+    # ── alarm-action state, both directions (alpha-engine-config-I7174) ─────
+    #
+    # Unlike the trigger halves above, BOTH directions here are actionable by
+    # `enforce()` — re-enabling an alarm's actions only resumes paging, it
+    # starts no scheduled work, so it carries none of the risk that keeps
+    # `enforce()` from ever re-enabling a kept-but-disabled TRIGGER.
+    findings.extend(alarm_findings())
     return findings
 
 
-def enforce() -> list[str]:
+def alarm_findings() -> list[dict]:
+    """Every disagreement between ``paused_alarms`` and live CloudWatch state."""
+    out: list[dict] = []
+    for entry in alarm_entries():
+        name = entry["name"]
+        justified = alarm_justified(entry)
+        live = _alarm_actions_enabled(name)
+        if live is None:
+            out.append({
+                "trigger": name, "surface": "cloudwatch", "kind": "alarm-missing-in-aws",
+                "detail": (
+                    "declared in paused_alarms but no such CloudWatch alarm exists live — "
+                    "it was deleted or renamed. Remove or correct the entry."
+                ),
+            })
+        elif justified and live:
+            out.append({
+                "trigger": name, "surface": "cloudwatch", "kind": "alarm-unexpectedly-enabled",
+                "detail": (
+                    f"every trigger it watches ({', '.join(entry['watches'])}) is still "
+                    f"paused, so this alarm should be silenced, but ActionsEnabled=true — "
+                    f"the pause-caused page this entry exists to stop is live. "
+                    f"Fix: ./infrastructure/automation_pause.py --enforce --alarms-only"
+                ),
+            })
+        elif not justified and not live:
+            out.append({
+                "trigger": name, "surface": "cloudwatch", "kind": "alarm-stale-disabled",
+                "detail": (
+                    f"the trigger(s) it watches ({', '.join(entry['watches']) or 'none'}) "
+                    f"are no longer all paused, so silencing is no longer justified, but "
+                    f"ActionsEnabled=false — a pause was lifted and this alarm was not "
+                    f"re-armed. Fix: ./infrastructure/automation_pause.py --enforce "
+                    f"--alarms-only (re-enables it), then remove the stale paused_alarms "
+                    f"entry."
+                ),
+            })
+    return out
+
+
+def enforce(alarms_only: bool = False) -> list[str]:
+    """Drive live AWS to match the manifest.
+
+    ``alarms_only`` restricts this to CloudWatch alarm-action state — never
+    disables or enables a trigger. That is the mode safe to run unattended and
+    on a schedule (see the CI wiring in sf-arn-drift-check.yml): touching only
+    alarm actions cannot start scheduled work, the one thing full ``enforce()``
+    deliberately never does automatically for a KEPT trigger.
+    """
     acted: list[str] = []
-    for surface, name, _ in paused_entries():
-        state = _live_state(surface, name)
-        if state is not None and state != "DISABLED":
-            _disable(surface, name)
-            acted.append(f"{surface}:{name}")
+    if not alarms_only:
+        for surface, name, _ in paused_entries():
+            state = _live_state(surface, name)
+            if state is not None and state != "DISABLED":
+                _disable(surface, name)
+                acted.append(f"{surface}:{name}")
+
+    for entry in alarm_entries():
+        name = entry["name"]
+        justified = alarm_justified(entry)
+        live = _alarm_actions_enabled(name)
+        if live is None:
+            continue  # reported by alarm_findings(); nothing to act on
+        if justified and live:
+            _set_alarm_actions(name, enabled=False)
+            acted.append(f"cloudwatch:{name}:disabled")
+        elif not justified and not live:
+            _set_alarm_actions(name, enabled=True)
+            acted.append(f"cloudwatch:{name}:enabled")
+
     return acted
 
 
@@ -254,13 +411,18 @@ def main() -> int:
     mode.add_argument("--check", action="store_true", help="verify the pause holds")
     mode.add_argument("--enforce", action="store_true", help="re-disable anything enabled")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--alarms-only", action="store_true",
+                     help="with --enforce, touch ONLY CloudWatch alarm-action state; "
+                          "never disable or enable a trigger")
     args = ap.parse_args()
+    if args.alarms_only and not args.enforce:
+        ap.error("--alarms-only only makes sense with --enforce")
 
     entries = paused_entries()
 
     try:
         if args.enforce:
-            acted = enforce()
+            acted = enforce(alarms_only=args.alarms_only)
             if args.json:
                 print(json.dumps({"re_disabled": acted}, indent=2))
             else:
@@ -279,13 +441,17 @@ def main() -> int:
     if args.json:
         print(json.dumps({"checked": len(entries),
                           "kept_checked": len(kept_names()),
+                          "alarms_checked": len(alarm_entries()),
                           "findings": findings}, indent=2))
     else:
         kept = kept_names()
-        print(f"automation pause — {len(entries)} paused / {len(kept)} kept trigger(s) checked")
+        alarms = alarm_entries()
+        print(f"automation pause — {len(entries)} paused / {len(kept)} kept trigger(s), "
+              f"{len(alarms)} declared alarm(s) checked")
         if not findings:
             print("  ✓ every paused trigger exists live and is DISABLED")
             print("  ✓ every kept trigger exists live and is ENABLED")
+            print("  ✓ every declared alarm's ActionsEnabled matches its current justification")
         for f in findings:
             print(f"  ✗ [{f['kind']}] {f['surface']}:{f['trigger']}")
             print(f"      {f['detail']}")
