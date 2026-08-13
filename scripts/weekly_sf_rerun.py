@@ -617,8 +617,43 @@ class RerunPlan:
     warnings: list = field(default_factory=list)
     notes: list = field(default_factory=list)
 
+    # skip_* keys inherited from the source execution's own input, dropped by
+    # rerun_input() and reported by the plan printer. See its docstring.
+    dropped_inherited_skips: list = field(default_factory=list)
+
     def rerun_input(self) -> dict:
-        out = dict(self.original_input)
+        """The emitted StartExecution input.
+
+        Non-``skip_*`` keys pass through from the source execution
+        (``sns_topic_arn``, ``ec2_instance_id``, …). Every ``skip_*`` key does
+        NOT: the skip set is *derived* from what the source execution actually
+        completed, and that derivation is the whole product of this script.
+
+        Inheriting them was a silent stage-disabler (alpha-engine-config-I7259,
+        observed 2026-08-13). ``watch-rerun-2026-08-13-3``'s input carried
+        ``skip_pit_parity_compare: true``; the derivation did NOT produce that
+        flag — ``pit_parity_compare`` appears in neither the completed nor the
+        degraded set — yet ``dict(self.original_input)`` carried it into
+        ``-4``'s input. The plan printed *"3 parity passes re-run"* while the
+        emitted input disabled the compare stage that consumes them, and the
+        printed ``derived skips`` line did not mention it, so the operator had
+        no way to see it from the plan. Because each rerun starts from the
+        previous rerun's input, one such flag survives every subsequent
+        recovery indefinitely.
+
+        Derived flags are ADDITIVE — they only ever set True — so they could
+        never clear an inherited one. Dropping them is what makes the emitted
+        input equal the printed plan. A skip the operator genuinely wants is
+        re-passed explicitly, which is also the only form that leaves a record.
+        """
+        out = {
+            k: v for k, v in self.original_input.items()
+            if not k.startswith("skip_")
+        }
+        self.dropped_inherited_skips = sorted(
+            k for k in self.original_input
+            if k.startswith("skip_") and k not in self.skip_flags
+        )
         out["run_date"] = self.run_date
         out["pipeline_role"] = EMITTED_ROLE
         out.update(self.skip_flags)
@@ -757,7 +792,10 @@ def derive_plan(events: list[dict], start_time: datetime | None = None) -> Rerun
             "already-written artifacts) instead of re-burning it. config#2362."
         )
 
-    reachable = _simulate_reachable_works(plan.skip_flags, original_input)
+    # Simulate the EMITTED input, not the source input. rerun_input() drops
+    # inherited skip_* keys, so passing original_input here would check a
+    # different flag set than the one actually started (config-I7259).
+    reachable = _simulate_reachable_works(plan.skip_flags, {})
     unreachable = [f for f in must_rerun if f not in reachable]
     if unreachable:
         raise SystemExit(
@@ -933,17 +971,25 @@ def _print_plan(plan: RerunPlan, source_arn: str, source_status: str, name: str,
     print(f"degraded stages  : {', '.join(plan.degraded) or '(none)'}")
     print(f"failed stages    : {', '.join(plan.failed) or '(none identified)'}")
     print(f"derived skips    : {', '.join(sorted(plan.skip_flags)) or '(none)'}")
+    # Populates plan.dropped_inherited_skips as a side effect; call before
+    # reporting them.
+    _emitted = plan.rerun_input()
+    if plan.dropped_inherited_skips:
+        print(
+            f"dropped skips    : {', '.join(plan.dropped_inherited_skips)} "
+            "[carried by the source execution's own input, NOT derived from "
+            "what it completed — re-pass explicitly if still wanted]"
+        )
     for n in plan.notes:
         print(f"NOTE : {n}")
     for w in plan.warnings:
         print(f"WARN : {w}", file=sys.stderr)
-    rerun_input = json.dumps(plan.rerun_input(), indent=2, sort_keys=True)
     print("\nStartExecution input:")
-    print(rerun_input)
+    print(json.dumps(_emitted, indent=2, sort_keys=True))
     print("\nequivalent CLI:")
     print(
         f"aws stepfunctions start-execution --state-machine-arn {sm_arn} "
-        f"--name {name} --input '{json.dumps(plan.rerun_input(), sort_keys=True)}'"
+        f"--name {name} --input '{json.dumps(_emitted, sort_keys=True)}'"
     )
 
 

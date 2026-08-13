@@ -205,17 +205,77 @@ class TestDerivePlan:
         assert plan.run_date == "2026-07-11"
         assert "FALLBACK" in plan.run_date_provenance
 
-    def test_refuses_to_skip_a_failed_stage(self, mod):
-        """Anti-swallow guard: if the preserved original input carries a
-        skip flag whose route would bypass a stage that FAILED, the helper
-        must refuse rather than emit an input that silently skips it."""
+    def test_inherited_skip_of_a_failed_stage_is_dropped_not_carried(self, mod):
+        """A skip flag on the SOURCE execution's own input never reaches the
+        emitted input (alpha-engine-config-I7259).
+
+        This previously raised ``SystemExit(... unreachable ...)``: the helper
+        preserved the source input wholesale, so an inherited
+        ``skip_backtester`` would have bypassed a stage that must re-run, and
+        refusing was the only safe answer. Dropping inherited skips removes the
+        condition rather than detecting it — dropping a skip can only cause
+        MORE stages to run, never fewer, so it can never strand a must-rerun
+        stage. The reachability guard is retained for DERIVED skips, where an
+        overshadowing route is still possible (see the
+        ``skip_backtester`` -> ``skip_backtester_stage_only`` demotion).
+
+        The motivating instance was quieter than this one and is why detection
+        was not enough: ``watch-rerun-2026-08-13-3`` carried
+        ``skip_pit_parity_compare``, which the derivation never produced.
+        ``pit_parity_compare`` was neither failed nor degraded, so it was not
+        in ``must_rerun`` and the guard above could not see it — the flag rode
+        into the next rerun's input, disabling the stage that consumes the
+        three parity passes that same rerun existed to recompute.
+        """
         events = _events("tail_stage_failure")
         started = next(e for e in events if "executionStartedEventDetails" in e)
         inp = json.loads(started["executionStartedEventDetails"]["input"])
         inp["skip_backtester"] = True  # would jump the degraded branch's gate
         started["executionStartedEventDetails"]["input"] = json.dumps(inp)
-        with pytest.raises(SystemExit, match="unreachable"):
-            mod.derive_plan(events)
+
+        plan = mod.derive_plan(events)
+        emitted = plan.rerun_input()
+
+        assert emitted.get("skip_backtester") is not True, (
+            "an inherited skip_backtester reached the emitted input — it would "
+            "bypass a stage that must re-run"
+        )
+        assert "skip_backtester" in plan.dropped_inherited_skips, (
+            "the dropped flag is not reported, so the operator cannot see that "
+            "the emitted input differs from the source input"
+        )
+
+    def test_dropped_inherited_skips_excludes_derived_ones(self, mod):
+        """A flag that is BOTH inherited and derived is emitted, and is not
+        reported as dropped — it belongs to the plan on its own merit."""
+        events = _events("tail_stage_failure")
+        started = next(e for e in events if "executionStartedEventDetails" in e)
+        inp = json.loads(started["executionStartedEventDetails"]["input"])
+        plan = mod.derive_plan(events)
+        derived = sorted(plan.skip_flags)
+        assert derived, "fixture derived no skips — test would be vacuous"
+        inp[derived[0]] = True
+        started["executionStartedEventDetails"]["input"] = json.dumps(inp)
+
+        plan = mod.derive_plan(events)
+        emitted = plan.rerun_input()
+        assert emitted[derived[0]] is True
+        assert derived[0] not in plan.dropped_inherited_skips
+
+    def test_non_skip_keys_still_pass_through(self, mod):
+        """Only ``skip_*`` is dropped. ``sns_topic_arn`` / ``ec2_instance_id``
+        passthrough is the reason the emitted input starts from the source
+        input at all."""
+        events = _events("tail_stage_failure")
+        started = next(e for e in events if "executionStartedEventDetails" in e)
+        inp = json.loads(started["executionStartedEventDetails"]["input"])
+        inp["sns_topic_arn"] = "arn:aws:sns:us-east-1:1:topic"
+        inp["ec2_instance_id"] = "i-abc123"
+        started["executionStartedEventDetails"]["input"] = json.dumps(inp)
+
+        emitted = mod.derive_plan(events).rerun_input()
+        assert emitted["sns_topic_arn"] == "arn:aws:sns:us-east-1:1:topic"
+        assert emitted["ec2_instance_id"] == "i-abc123"
 
     def test_degraded_tail_is_rerun_not_skipped(self, mod):
         """alpha-engine-config-I6055: a stage that DEGRADED (ran, failed,
