@@ -2157,7 +2157,7 @@
                   "dry_run_llm.$": "$.research_dry"
                 }
               },
-              "TimeoutSeconds": 900,
+              "TimeoutSeconds": 960,
               "Retry": [
                 {
                   "ErrorEquals": [
@@ -2330,7 +2330,7 @@
                   "dry_run_llm.$": "$.research_dry"
                 }
               },
-              "TimeoutSeconds": 900,
+              "TimeoutSeconds": 960,
               "Retry": [
                 {
                   "ErrorEquals": [
