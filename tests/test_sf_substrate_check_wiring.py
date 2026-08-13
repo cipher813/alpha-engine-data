@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from tests.sf_command_utils import extract_commands
+from tests.sf_degraded_summary_helpers import assert_degraded_continuation
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -78,13 +79,9 @@ class TestChainOrdering:
             "If freshness polling fails, the degraded flag must be set — "
             "pre-config#2276 this continued silently."
         )
-        assert (
-            states["SaturdayHealthCheckDegraded"]["Next"]
-            == "WeeklySubstrateHealthCheck"
-        ), (
-            "A degraded freshness check must still run the substrate check — "
-            "they're independent observability paths."
-        )
+        assert_degraded_continuation(
+            states, "SaturdayHealthCheckDegraded", "WeeklySubstrateHealthCheck",
+        )  # a degraded freshness check must still run the substrate check
 
     def test_substrate_check_routes_to_wait_state(self, states):
         # alpha-engine-config-I5687: WeeklySubstrateHealthCheck dispatches
@@ -128,7 +125,7 @@ class TestChainOrdering:
         assert all(
             c["Next"] == "ReportCardDegraded" for c in states["ReportCard"]["Catch"]
         )
-        assert states["ReportCardDegraded"]["Next"] == "PublishReportCardDegraded"
+        assert_degraded_continuation(states, "ReportCardDegraded", "PublishReportCardDegraded")
         assert states["PublishReportCardDegraded"]["Next"] == "CheckShellRunNotify"
         assert states["Director"]["Next"] == "DirectorComplete"
         assert states["DirectorComplete"]["Next"] == "CheckShellRunNotify"
@@ -186,49 +183,55 @@ class TestCatchSemantics:
             assert c["Next"] == "SubstrateHealthCheckDegraded"
 
     def test_substrate_degraded_continues_to_advisory_tail(self, states):
-        degraded = states["SubstrateHealthCheckDegraded"]
-        assert degraded["Type"] == "Pass"
-        assert degraded["Next"] == "CheckSkipReportCard", (
-            "A degraded substrate check must not skip the ReportCard/Director "
-            "Lambda tail — it is independent of the dashboard box. "
-            "(config#6054: the tail entry is the skip gate, Default: ReportCard.)"
+        assert states["SubstrateHealthCheckDegraded"]["Type"] == "Pass"
+        # A degraded substrate check must not skip the ReportCard/Director
+        # Lambda tail — it is independent of the dashboard box. (config#6054:
+        # the tail entry is the skip gate, Default: ReportCard.)
+        assert_degraded_continuation(
+            states, "SubstrateHealthCheckDegraded", "CheckSkipReportCard",
         )
         assert states["CheckSkipReportCard"]["Default"] == "ReportCard"
 
 
 class TestCommandShape:
-    """The SSM command must invoke the lib CLI with --cadence weekly --alert.
+    """alpha-engine-config-I7047 (2026-08-12): the three inline commands
+    (transparency sweep --cadence weekly --alert, constituents_drift_check,
+    phase_marker_sweep --run-date --alert) moved out of this SF definition
+    into crucible-dashboard infrastructure/substrate_health_check.sh,
+    invoked here through krepis.ssm_log_capture — mirrors the 17 other
+    Saturday SF stages already on that wrapper instead of the inline
+    `trap 'aws s3 cp ... EXIT'` pattern, which collapsed under ASL's
+    States.Array escape semantics on every run using it (`trap: s3: invalid
+    signal specification`, rc=127 — the 2026-08-08 scheduled run finished
+    DEGRADED for exactly this reason despite every real work stage
+    succeeding).
 
-    Drops here would silently neuter the check (e.g. dropping --alert
-    suppresses SNS without changing exit code; dropping --cadence flips
-    to argparse error).
-
-    config#2322: the commands array was converted from a static ``commands``
-    list to a ``commands.$`` ASL intrinsic (``States.Array(...)``) so the
-    phase-marker-sweep command can thread ``export RUN_DATE.$=$.run_date``
-    (same shape as the Backtester/Parity/Evaluator spot stages —
-    tests/test_sf_run_date_threading.py) — extract_commands() reads through
-    either shape.
+    Content-level assertions on the three checks themselves (module names,
+    --cadence/--alert flags, ordering, run-date threading) now live in
+    crucible-dashboard tests/test_substrate_health_check_weekly_wiring.py,
+    the repo that actually owns that content. What THIS repo can still pin
+    is the *wiring*: the SF dispatches through the krepis wrapper to the
+    extracted script, on the dashboard box, with no runtime pip.
     """
 
     @pytest.fixture
     def commands(self, states) -> list[str]:
         return extract_commands(states["WeeklySubstrateHealthCheck"])
 
-    def test_invokes_transparency_module(self, commands):
-        assert any(
-            "python -m nousergon_lib.transparency" in cmd for cmd in commands
+    def test_no_inline_trap_anti_pattern(self, commands):
+        joined = " ".join(commands)
+        assert "trap 'aws s3 cp" not in joined, (
+            "I7047: the inline trap/log-ship anti-pattern must not return — "
+            "krepis.ssm_log_capture is the sole log-capture path"
         )
 
-    def test_passes_cadence_weekly(self, commands):
-        joined = " ".join(commands)
-        assert "--cadence weekly" in joined
+    def test_invokes_krepis_log_capture_wrapper(self, commands):
+        assert any("krepis.ssm_log_capture" in cmd for cmd in commands)
 
-    def test_passes_alert_flag(self, commands):
-        joined = " ".join(commands)
-        assert "--alert" in joined, (
-            "Without --alert, row-level failures emit metrics but no SNS. "
-            "Removing this flag silently degrades the gate."
+    def test_invokes_extracted_script_with_run_date(self, commands):
+        assert any(
+            "bash infrastructure/substrate_health_check.sh --run-date" in cmd
+            for cmd in commands
         )
 
     def test_runs_on_dashboard_ec2(self, commands):
@@ -236,10 +239,16 @@ class TestCommandShape:
         joined = " ".join(commands)
         assert "alpha-engine-dashboard" in joined
 
-    def test_pulls_latest_dashboard_main_before_running(self, commands):
-        # Stale repo on the dispatcher would run an outdated lib pin.
+    def test_pulls_latest_dashboard_and_data_main_before_running(self, commands):
+        # Stale repo on the dispatcher would run an outdated lib pin or an
+        # outdated substrate_health_check.sh. The script itself needs BOTH
+        # alpha-engine-dashboard (transparency module + the script) and
+        # alpha-engine-data (validators.*) checked out fresh — the SF's own
+        # command array pulls both before invoking the script, mirroring
+        # MorningEnrich's convention.
         joined = " ".join(commands)
-        assert "git" in joined and "pull" in joined
+        assert "git -C /home/ec2-user/alpha-engine-dashboard pull" in joined
+        assert "git -C /home/ec2-user/alpha-engine-data pull" in joined
 
     def test_no_runtime_pip_install(self, commands):
         # config#2276: deps are synced at deploy time (crucible-dashboard
@@ -249,63 +258,17 @@ class TestCommandShape:
         joined = " ".join(commands)
         assert "pip install" not in joined
 
-
-class TestPhaseMarkerSweep:
-    """config#2322: post-run phase-marker sweep must run after the
-    constituents-drift check, on the same run_date the backtest chain
-    wrote its `.phases/` markers under, and must not be able to abort the
-    SF (the existing States.ALL Catch on this state already makes any
-    non-zero exit non-blocking — see TestCatchSemantics)."""
-
-    @pytest.fixture
-    def commands(self, states) -> list[str]:
-        return extract_commands(states["WeeklySubstrateHealthCheck"])
-
-    def test_invokes_phase_marker_sweep_module(self, commands):
-        assert any(
-            "python -m validators.phase_marker_sweep" in cmd for cmd in commands
-        )
-
-    def test_phase_marker_sweep_passes_alert_flag(self, commands):
-        sweep_cmd = next(
-            c for c in commands if "validators.phase_marker_sweep" in c
-        )
-        assert "--alert" in sweep_cmd
-
-    def test_phase_marker_sweep_runs_after_constituents_drift(self, commands):
-        drift_idx = next(
-            i for i, c in enumerate(commands)
-            if "validators.constituents_drift_check" in c
-        )
-        sweep_idx = next(
-            i for i, c in enumerate(commands)
-            if "validators.phase_marker_sweep" in c
-        )
-        assert drift_idx < sweep_idx
-
-    def test_run_date_exported_before_phase_marker_sweep(self, commands):
-        rd_idx = next(
-            i for i, c in enumerate(commands)
-            if c.startswith("export RUN_DATE=")
-        )
-        sweep_idx = next(
-            i for i, c in enumerate(commands)
-            if "validators.phase_marker_sweep" in c
-        )
-        assert rd_idx < sweep_idx
-
-    def test_phase_marker_sweep_reads_exported_run_date(self, commands):
-        sweep_cmd = next(
-            c for c in commands if "validators.phase_marker_sweep" in c
-        )
-        assert '--run-date "$RUN_DATE"' in sweep_cmd
-
     def test_run_date_threaded_from_sf_run_date(self, states):
-        # value is threaded from the SF-stamped $.run_date (States.Format),
-        # same contract as tests/test_sf_run_date_threading.py's spot stages.
+        # value is threaded from the SF-stamped $.run_date into the
+        # krepis-wrapped script invocation via States.Format, same contract
+        # as tests/test_sf_run_date_threading.py's spot stages.
         raw_expr = states["WeeklySubstrateHealthCheck"]["Parameters"]["Parameters"]["commands.$"]
-        assert "States.Format('export RUN_DATE=" in raw_expr
         assert "$.run_date" in raw_expr
+        assert "$$.Execution.Name" in raw_expr, (
+            "krepis.ssm_log_capture's --correlation-id must be the SF "
+            "execution name, per the 17-sibling-stage convention (§116 "
+            "rule 6 chokepoint)."
+        )
 
 
 class TestResultPathIsolation:

@@ -341,8 +341,10 @@ class TestBranchAContents:
         assert "SetDataPhase2ExhaustedError" in [
             c["Next"] for c in branch_a["DataPhase2RetryGate"]["Choices"]
         ]
+        # alpha-engine-config-I7048 (2026-08-12): targets the defensive
+        # $.error-normalizer chokepoint ahead of PublishResearchFailureImmediate.
         assert branch_a["SetDataPhase2ExhaustedError"]["Next"] == (
-            "PublishResearchFailureImmediate"
+            "NormalizeBranchAFailureContext"
         )
         assert branch_a["SetDataPhase2ExhaustedError"]["ResultPath"] == "$.error"
         assert branch_a["SetDataPhase2ExhaustedError"]["Parameters"]["phase"] == "DataPhase2"
@@ -796,16 +798,26 @@ class TestPerBranchErrorIsolation:
         ExtractSignalsEnvelopeError (renamed from ExtractResearchError) →
         PublishResearchFailureImmediate (the fast-SNS-alert state added
         2026-05-24, shared with RAGIngestion failures) → BranchAFailed —
-        NO non-blocking Catch-to-continue, unlike ChallengerShadow."""
+        NO non-blocking Catch-to-continue, unlike ChallengerShadow.
+
+        alpha-engine-config-I7048 (2026-08-12): ExtractSignalsEnvelopeError now
+        targets NormalizeBranchAFailureContext, a defensive $.error-normalizer
+        Pass chokepoint inserted ahead of PublishResearchFailureImmediate
+        (whose own name/Type/Resource are UNCHANGED — kept off a rename so
+        the nousergon_lib.pipeline_status.registry entry stays valid without
+        a companion nousergon-lib PR)."""
         catch_targets = [
             c["Next"] for c in branch_a["SignalsEnvelope"]["Catch"]
         ]
         assert catch_targets == ["ExtractSignalsEnvelopeError"]
-        # ExtractError → PublishImmediate → BranchAFailed
+        # ExtractError → normalizer → PublishResearchFailureImmediate → BranchAFailed
         assert (
             branch_a["ExtractSignalsEnvelopeError"]["Next"]
-            == "PublishResearchFailureImmediate"
+            == "NormalizeBranchAFailureContext"
         )
+        normalizer = branch_a["NormalizeBranchAFailureContext"]
+        assert normalizer["Type"] == "Pass"
+        assert normalizer["Next"] == "PublishResearchFailureImmediate"
         publish = branch_a["PublishResearchFailureImmediate"]
         assert publish["Type"] == "Task"
         assert publish["Resource"] == "arn:aws:states:::sns:publish"
@@ -889,8 +901,16 @@ class TestPerBranchErrorIsolation:
         ] == ["BranchBFailed"]
         assert (
             branch_b["ExtractPredictorError"]["Next"]
-            == "PublishPredictorFailureImmediate"
+            == "NormalizeBranchBFailureContext"
         )
+        # alpha-engine-config-I7048 (2026-08-12): ExtractPredictorError now
+        # targets NormalizeBranchBFailureContext, a defensive $.error
+        # normalizer Pass chokepoint mirroring NormalizeBranchAFailureContext,
+        # inserted ahead of PublishPredictorFailureImmediate (name/Type/
+        # Resource unchanged — no registry companion PR needed).
+        normalizer = branch_b["NormalizeBranchBFailureContext"]
+        assert normalizer["Type"] == "Pass"
+        assert normalizer["Next"] == "PublishPredictorFailureImmediate"
         publish = branch_b["PublishPredictorFailureImmediate"]
         assert publish["Type"] == "Task"
         assert publish["Resource"] == "arn:aws:states:::sns:publish"
@@ -1072,14 +1092,21 @@ class TestInboundRewireAndDownstreamUnchanged:
         ExtractSignalsEnvelopeError — a branch state pointing at the
         non-branch HandleFailure is an invalid ASL transition AND would re-introduce
         cross-branch cancellation."""
+        # alpha-engine-config-I7048 (2026-08-12): these edges now target
+        # NormalizeBranchAFailureContext, the defensive $.error-normalizer
+        # Pass chokepoint inserted ahead of PublishResearchFailureImmediate.
         assert [c["Next"] for c in branch_a["RAGIngestion"]["Catch"]] == [
-            "PublishResearchFailureImmediate"
+            "NormalizeBranchAFailureContext"
         ]
         assert [
             c["Next"] for c in branch_a["WaitForRAGIngestion"]["Catch"]
-        ] == ["PublishResearchFailureImmediate"]
+        ] == ["NormalizeBranchAFailureContext"]
         assert (
             branch_a["ExtractRAGIngestionError"]["Next"]
+            == "NormalizeBranchAFailureContext"
+        )
+        assert (
+            branch_a["NormalizeBranchAFailureContext"]["Next"]
             == "PublishResearchFailureImmediate"
         )
         assert (

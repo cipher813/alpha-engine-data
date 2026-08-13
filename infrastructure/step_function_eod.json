@@ -1,8 +1,191 @@
 {
   "Comment": "Alpha Engine EOD Pipeline \u2014 post-market data capture, snapshot capture, reconciliation, daily substrate health check, instance shutdown. Triggered by daemon shutdown on trading EC2.",
-  "StartAt": "CheckMutexRole",
+  "StartAt": "MarketHoursGate",
   "TimeoutSeconds": 64800,
   "States": {
+    "MarketHoursGate": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I7111 (Brian ruling 2026-08-13, option c) \u2014 the \"no trading-pipeline start during NYSE market hours\" boundary, sited on the PIPELINE rather than on one caller's IAM role. alpha-engine-config#2932 ruled it onto alpha-engine-sf-watch-executor-role, enforced by a Lambda flipping that role's inline policy every 5 minutes between two codified variants. The Lambda never existed in account 711398986525 (measured 2026-08-12: no function, no EventBridge rule), so the boundary was never once in force \u2014 and being caller-scoped it could not have covered the in-session operator starts at 09:32 PT on 2026-08-07 or 08:32 PT on 2026-07-27 either. IAM has NO time-of-day condition key; that absence is why the ruled mechanism needed a Lambda to simulate one, and why the simulation could silently not exist for three weeks. A guard state binds every principal: the scheduler, the Overseer's overseer-sf-watch lane, and the operator. Neither existing guard covers this \u2014 AcquireMutex keys on the same UTC MINUTE and TradingDayGate on the calendar DAY; neither is a time-of-day boundary. Same zero-infra posture as TradingDayGate: pure calendar math on alpha-engine-predictor-inference, returning BEFORE PredictorPreflight is constructed, so no S3/ArcticDB/model problem can take out the boundary. `now` is $$.Execution.StartTime rather than the Lambda's own clock, so the verdict is a property of the execution: deterministic, replayable, and immune to a slow cold start pushing a refused run past the close. `execution_input` is passed whole because an ASL \"override.$\": \"$.market_hours_override\" parameter throws States.Runtime on every run that does not carry one.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-predictor-inference:live",
+        "Payload": {
+          "action": "check_market_hours",
+          "now.$": "$$.Execution.StartTime",
+          "execution_input.$": "$$.Execution.Input"
+        }
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SetMarketHoursUnverifiedDegraded",
+          "ResultPath": "$.market_hours_gate_error"
+        }
+      ],
+      "ResultPath": "$.market_hours_gate",
+      "Next": "MarketHoursGateChoice"
+    },
+    "MarketHoursGateChoice": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I7111 \u2014 the boundary itself. Keys on the gate's verdict, which is enumerated EXHAUSTIVELY: an absent or unrecognised verdict is a contract violation by our own Lambda and fails CLOSED via Default rather than proceeding to trade on an unverifiable answer (the config-I2767 lesson TradingDayGateChoice already carries). PROCEED_OVERRIDE is the ruling's second requirement \u2014 the boundary must be refusable deliberately, never bypassable accidentally \u2014 and it routes through a notify state so a crossed boundary is announced rather than silent.",
+      "Choices": [
+        {
+          "Variable": "$.market_hours_gate.Payload.verdict",
+          "StringEquals": "PROCEED",
+          "Comment": "Market closed. The scheduled trigger of both pipelines lands here every day: preopen at 05:15 PT (pre-open) and postclose at 13:00:0x PT, which is 16:00:0x ET \u2014 the session window is half-open [09:30, 16:00) so the close instant itself is already outside it.",
+          "Next": "CheckMutexRole"
+        },
+        {
+          "Variable": "$.market_hours_gate.Payload.verdict",
+          "StringEquals": "PROCEED_OVERRIDE",
+          "Comment": "In-session start with a complete, authored, unexpired, bounded override. Announced and recorded, never silent.",
+          "Next": "RecordMarketHoursOverride"
+        },
+        {
+          "Variable": "$.market_hours_gate.Payload.verdict",
+          "StringEquals": "BLOCKED",
+          "Comment": "In-session start with no override \u2014 the boundary doing its job.",
+          "Next": "NotifyMarketHoursBlocked"
+        },
+        {
+          "Variable": "$.market_hours_gate.Payload.verdict",
+          "StringEquals": "OVERRIDE_MALFORMED",
+          "Comment": "An override was offered and is not usable. Fails closed whether or not the market is open: a typo'd override is a mis-authorisation, and surfacing it on the quiet run is the only way it is not discovered on the run that matters.",
+          "Next": "NotifyMarketHoursOverrideMalformed"
+        }
+      ],
+      "Default": "HandleFailure"
+    },
+    "RecordMarketHoursOverride": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I7111 \u2014 the override's audit surface. A crossed boundary is announced on the alert topic AND left in execution history with who authorised it, why, and until when. Catch continues to the pipeline: the authorisation was already validated and recorded, so a notify-side failure must not silently convert an approved recovery into a refusal.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Pipeline \u2014 market-hours boundary OVERRIDDEN (authorised in-session start)",
+        "Message.$": "States.Format('An execution started INSIDE the NYSE regular session under an explicit market-hours override (alpha-engine-config-I7111). Execution: {}. Gate verdict: {}. This is a deliberate, time-boxed authorisation, not a bypass \u2014 the same record is in $.market_hours_gate in execution history.', $$.Execution.Id, States.JsonToString($.market_hours_gate.Payload))"
+      },
+      "TimeoutSeconds": 60,
+      "ResultPath": "$.market_hours_override_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "SNS delivery is the announcement, not the record \u2014 the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
+          "ResultPath": "$.market_hours_notify_error",
+          "Next": "CheckMutexRole"
+        }
+      ],
+      "Next": "CheckMutexRole"
+    },
+    "NotifyMarketHoursBlocked": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I7111 \u2014 a refusal is loud. sf-pipeline-policy \u00a72.3: a run that did not do its work must not read as a clean success to a status-keyed watcher, so this notifies and then ends in a Fail rather than a Succeed-skip. The message carries the exact override shape so the operator does not have to find it.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Pipeline \u2014 REFUSED (start inside NYSE market hours)",
+        "Message.$": "States.Format('Refused to start a trading pipeline inside the NYSE regular session (alpha-engine-config-I7111). Execution: {}. Gate: {}. To authorise one in-session start, add a market_hours_override object to the execution input carrying reason, authorized_by and expires_at. All three are required and non-blank; expires_at must be an ISO-8601 instant AFTER the execution start and no more than 24h after it, so a line pasted into a runbook stops working instead of standing forever.', $$.Execution.Id, States.JsonToString($.market_hours_gate.Payload))"
+      },
+      "TimeoutSeconds": 60,
+      "ResultPath": "$.market_hours_blocked_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "SNS delivery is the announcement, not the record \u2014 the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
+          "ResultPath": "$.market_hours_notify_error",
+          "Next": "MarketHoursBlocked"
+        }
+      ],
+      "Next": "MarketHoursBlocked"
+    },
+    "MarketHoursBlocked": {
+      "Type": "Fail",
+      "Error": "MarketHoursBoundary",
+      "Cause": "alpha-engine-config-I7111: this execution's start time falls inside the NYSE regular session ([09:30, 16:00) ET on a trading day) and carried no market-hours override. Trading pipelines do not start in-session \u2014 the preopen chain boots the trading box and starts the order-placing daemon, and the postclose chain stops the box and reconciles the book; either one, mid-session, acts on a stale plan against a live market. The verdict, the ET clock it was judged against, and the override shape are in $.market_hours_gate and in the SNS alert. To authorise one in-session start, re-run with market_hours_override {reason, authorized_by, expires_at}."
+    },
+    "NotifyMarketHoursOverrideMalformed": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I7111 \u2014 a rejected override is its own terminal, distinct from MarketHoursBlocked, because it calls for a different operator action: fix the override, not wait for the close. Kept separate rather than folded in so a status-keyed watcher can tell the two apart from the Error alone.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Pipeline \u2014 REFUSED (market-hours override is not usable)",
+        "Message.$": "States.Format('A market-hours override was offered and rejected (alpha-engine-config-I7111). Execution: {}. Gate: {}. To authorise one in-session start, add a market_hours_override object to the execution input carrying reason, authorized_by and expires_at. All three are required and non-blank; expires_at must be an ISO-8601 instant AFTER the execution start and no more than 24h after it, so a line pasted into a runbook stops working instead of standing forever.', $$.Execution.Id, States.JsonToString($.market_hours_gate.Payload))"
+      },
+      "TimeoutSeconds": 60,
+      "ResultPath": "$.market_hours_override_malformed_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "SNS delivery is the announcement, not the record \u2014 the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
+          "ResultPath": "$.market_hours_notify_error",
+          "Next": "MarketHoursOverrideMalformed"
+        }
+      ],
+      "Next": "MarketHoursOverrideMalformed"
+    },
+    "MarketHoursOverrideMalformed": {
+      "Type": "Fail",
+      "Error": "MarketHoursOverrideMalformed",
+      "Cause": "alpha-engine-config-I7111: the execution input carried a market_hours_override that is not a usable authorisation \u2014 missing or blank reason/authorized_by/expires_at, a non-object, an unparseable expires_at, an expires_at at or before the execution start, or one more than 24h after it. The specific rejection is in $.market_hours_gate.Payload.override.rejection. Deliberately fails closed even when the market is shut: a half-typed override is a mis-authorisation, and it is better found on the run where it did not matter."
+    },
+    "NotifyMarketHoursUnverified": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I7111 \u2014 the postclose gate fails OPEN, DEGRADED, where the preopen gate fails closed. Three measured reasons, not a preference: (1) sf-pipeline-policy \u00a71.3 makes NAV continuity non-negotiable \u2014 every trading day terminates with a postclose completion marker and an eod_pnl.csv row, including days the morning failed; (2) unlike preopen, nothing else in this pipeline touches alpha-engine-predictor-inference, so refusing here would newly break settlement on an outage that is otherwise irrelevant to it; (3) the only automated caller \u2014 the daemon at executor/daemon.py, `market_opened and not is_market_hours()` \u2014 applies the IDENTICAL predicate before calling StartExecution, and applies it strictly earlier, which is why every observed eod-* execution starts at 16:00:0x ET. The residual is real and stated: while this Lambda is down, an OPERATOR could start postclose in-session and the gate would not stop them \u2014 it would say so, loudly, and the run would terminate DEGRADED.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Pipeline \u2014 DEGRADED (market-hours gate could not be evaluated; settlement proceeds)",
+        "Message.$": "States.Format('The market-hours gate Lambda failed after retries (alpha-engine-config-I7111). This execution proceeds DEGRADED rather than refusing. Execution: {}. Error: {}.', $$.Execution.Id, States.JsonToString($.market_hours_gate_error))"
+      },
+      "TimeoutSeconds": 60,
+      "ResultPath": "$.market_hours_unverified_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "SNS delivery is the announcement, not the record \u2014 the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
+          "ResultPath": "$.market_hours_notify_error",
+          "Next": "CheckMutexRole"
+        }
+      ],
+      "Next": "CheckMutexRole"
+    },
+    "SetMarketHoursUnverifiedDegraded": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I7111 \u2014 Option-A parity with SetDataSpotDegradedFlag/SetDegradedFlag (config#6692/config-I2702 shape): threads $.degraded_summary onto the market-hours fail-open path WITHOUT changing its continuation, so CheckDegradedOutcome routes this execution's terminal to WriteCompletionMarkerDegraded/DegradedRun. A settlement run that could not verify its own start boundary is not a clean success. Last-write-wins if a later stage also degrades.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "eod_market_hours_gate_unverified",
+        "stage_error.$": "$.market_hours_gate_error"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "NotifyMarketHoursUnverified"
+    },
     "CheckMutexRole": {
       "Type": "Choice",
       "Comment": "L274 SF MutualExclusionGuard \u2014 gate at SF entry point. Allowlist all unattended cadence-roles (currently: daily / weekly / eod / shell-run / exercise) acquire the DynamoDB mutex; absent/operator/recovery/smoke/backfill/operator-replay roles bypass entirely (operator-initiated runs are deliberately concurrent with cadence runs). Daemon-triggered EOD launches set pipeline_role='eod' (executor/daemon.py:1092); operator-launched replays MUST set their own pipeline_role per the taxonomy in pipeline-reporting-revamp-260524.md \u00a76. Closes the architectural hole the L286a/b producer-side universe_writer_lock covers for manual daily_append invocations \u2014 that lock guards the data writer; this Choice guards the SF entry point. Together they cover both halves of single-writer-per-cadence-cell.",
@@ -1898,7 +2081,7 @@
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
         "Subject": "Alpha Engine \u2014 weekly exercise-cadence read DEGRADED (defaulted to daily)",
-        "Message": "ReadExerciseCadence could not read /alpha-engine/weekly-sf/exercise-cadence from SSM (permission not yet granted \u2014 see alpha-engine-config#6689 \u2014 throttling, or a transient SSM fault). Proceeding FAIL-OPEN as cadence=daily: the exercise launch is NOT skipped. If the declared cadence is actually weekly-only or off, this run launched the exercise anyway; investigate the SSM read path before trusting any cadence flip. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "ReadExerciseCadence could not read /alpha-engine/weekly-sf/exercise-cadence from SSM (permission not yet granted \u2014 see alpha-engine-config#6689 \u2014 throttling, or a transient SSM fault). Proceeding FAIL-OPEN as cadence=daily: the exercise launch is NOT skipped. If the declared cadence is actually weekly-only or off, this run launched the exercise anyway; investigate the SSM read path before trusting any cadence flip. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.exercise_cadence_degraded_notify",
       "Catch": [
@@ -2090,7 +2273,7 @@
     },
     "WriteCompletionMarkerDegraded": {
       "Type": "Task",
-      "Comment": "config#2857: SF-envelope completion marker \u2014 an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine). Written on the degraded outcome, immediately before the DegradedRun Fail terminal (config-I2702 deliverable #4 + Brian's 2026-07-28 Option-A ruling, alpha-engine-config#2699: the marker still fires so the completion artifact exists, but DegradedRun is Type: Fail so status-keyed watchers engage). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_postclose_trading_pipeline (cadence eod_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable \u2014 exactly the ambiguity this feature exists to surface, not mask.",
+      "Comment": "config#2857: SF-envelope completion marker \u2014 an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine). Written on the degraded outcome, immediately before the DegradedRun Fail terminal (config-I2702 deliverable #4 + Brian's 2026-07-28 Option-A ruling, alpha-engine-config#2699: the marker still fires so the completion artifact exists, but DegradedRun is Type: Fail so status-keyed watchers engage). Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_postclose_trading_pipeline (cadence eod_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable \u2014 exactly the ambiguity this feature exists to surface, not mask. ResultPath is LOAD-BEARING, not hygiene (alpha-engine-config-I6891): a Task with no ResultPath defaults to $, so the putObject result REPLACES the whole state input and the DegradedRun terminal's CausePath dereference of $.degraded_summary.reason cannot resolve. The execution then fails with States.Runtime instead of DegradedRun \u2014 and Error: DegradedRun is a consumer contract: sf-telegram-notifier's _is_degraded_run() keys its DEGRADED rendering off exactly that string, so every honestly-degraded run rendered as an ordinary crash-red FAILED with a truncated cause. Shipped in both weekday definitions since config#6692/#6722; the weekly one inherited it by mirroring them and it is fixed in all three here.",
       "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
       "Parameters": {
         "Bucket": "alpha-engine-research",
@@ -2098,6 +2281,7 @@
         "ContentType": "application/json",
         "Body.$": "States.Format('\\{\"sf\":\"ne-postclose-trading-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\"\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date)"
       },
+      "ResultPath": "$.degraded_marker_result",
       "TimeoutSeconds": 60,
       "Retry": [
         {
@@ -2125,7 +2309,7 @@
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
         "Subject": "Alpha Engine EOD Pipeline \u2014 FAILED",
-        "Message.$": "States.Format('EOD pipeline failed. Error: {}. View the failing state + per-state detail at https://console.nousergon.ai/pipeline-status', States.JsonToString($.error))"
+        "Message.$": "States.Format('EOD pipeline failed. Error: {}. View the failing state + per-state detail at https://dashboard.nousergon.ai/pipeline-status', States.JsonToString($.error))"
       },
       "ResultPath": "$.failure_notify",
       "TimeoutSeconds": 60,

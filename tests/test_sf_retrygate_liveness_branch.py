@@ -81,6 +81,28 @@ def _leaf_conditions(rule):
     yield rule
 
 
+def _reaches(scope: dict, start: str | None, target: str) -> bool:
+    """Is ``target`` reachable from ``start`` within a single ASL scope?
+
+    Scope-local by design: a Parallel branch cannot transition out to a
+    top-level state, so a cross-scope "reachability" claim would be false.
+    """
+    seen, stack = set(), [start] if start else []
+    while stack:
+        cur = stack.pop()
+        if cur == target:
+            return True
+        if cur in seen or cur not in scope:
+            continue
+        seen.add(cur)
+        st = scope[cur]
+        nxt = [st.get("Next"), st.get("Default")]
+        nxt += [c.get("Next") for c in st.get("Choices", []) or []]
+        nxt += [c.get("Next") for c in st.get("Catch", []) or []]
+        stack += [n for n in nxt if isinstance(n, str)]
+    return False
+
+
 def _gate_ids():
     return [name for name, _, _ in _gate_scopes()]
 
@@ -186,10 +208,18 @@ def test_substrate_lost_branch_is_distinguishable_and_reaches_the_notifier(gate_
             f"{target} must write $.error — HandleFailure's "
             f"States.JsonToString($.error) throws States.Runtime otherwise"
         )
-        assert state.get("Next") == sibling.get("Next"), (
-            f"{target} hands off to {state.get('Next')!r} but {gate_name}'s "
-            f"non-substrate error route hands off to {sibling.get('Next')!r}; "
-            f"both must join the same failure-notification chain"
+        # Both routes must still converge on the same failure-notification
+        # chain, but config-I7119 interposes a RECOVERY path on the substrate
+        # side: one bounded forced-on-demand relaunch of the launcher box, and
+        # only if that budget is already spent does the run fail. So the
+        # handoff is now reachability, not identity — a substrate-lost site
+        # that could never reach the notifier would still be the bug this
+        # assertion was written to catch.
+        chain_entry = sibling.get("Next")
+        assert _reaches(scope, state.get("Next"), chain_entry), (
+            f"{target} hands off to {state.get('Next')!r}, from which "
+            f"{gate_name}'s non-substrate chain entry {chain_entry!r} is "
+            f"UNREACHABLE; both must join the same failure-notification chain"
         )
 
 

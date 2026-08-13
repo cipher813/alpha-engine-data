@@ -30,6 +30,10 @@ import json
 import pathlib
 
 import pytest
+from tests.sf_degraded_summary_helpers import (
+    assert_completion_notifier_chain,
+    assert_degraded_continuation,
+)
 
 _WEEKLY = pathlib.Path(__file__).parent.parent / "infrastructure" / "step_function.json"
 
@@ -86,7 +90,7 @@ def test_gate_catch_routes_through_degraded_alert_chain(
     assert degraded_state["Type"] == "Pass"
     assert degraded_state["Result"] is True
     assert degraded_state["ResultPath"] == "$.gate_degraded"
-    assert degraded_state["Next"] == publish
+    assert_degraded_continuation(states, degraded, publish)
 
     publish_state = states[publish]
     assert publish_state["Resource"] == "arn:aws:states:::sns:publish"
@@ -168,7 +172,7 @@ def test_gate_degraded_threads_into_completion_email(states):
     # config#2857: converges into the SF-envelope completion marker before
     # ending, rather than Ending here directly.
     assert "End" not in notify
-    assert notify["Next"] == "WriteCompletionMarker"
+    assert_completion_notifier_chain(states, "NotifyCompleteGatesDegraded")
     (catch,) = notify["Catch"]
     assert catch["Next"] == "NotifyCompleteDegraded"  # config#1819 idiom
 

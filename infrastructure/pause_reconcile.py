@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""pause_reconcile.py — reconcile three registers that each claim a trigger is off.
+
+**The gap this closes (alpha-engine-config-I7118).**
+
+Three artifacts make claims about whether a scheduled trigger is running, and
+until this module nothing compared them:
+
+  1. ``infrastructure/automation_pause.json`` — Brian's rulings. Names what is
+     deliberately off (``paused``/``pending``) and what is deliberately on
+     (``not_paused``).
+  2. The fleet observability registry, ``nous-ergon-ops/governance/
+     observability.d/*.yaml``, read here from the copy
+     ``observability-registry-publish.yml`` syncs to
+     ``s3://alpha-engine-research/ops/registry/observability.d/`` on every merge
+     that changes it. Each row declares a ``lifecycle`` — ``in-service`` or one
+     of the three non-service states (``disabled``/``deprecated``/``retired``),
+     which ``observability-policy.md`` §8.3 requires be DECLARED, never inferred.
+  3. Live AWS — the actual ``State`` of every EventBridge rule and EventBridge
+     Scheduler schedule in the account.
+
+``automation_pause.py --check`` already reconciles (1) against (3), but only for
+the names (1) happens to list: its coverage is **hand-listed**, which is the
+``observability-policy.md`` §2.2 defect one level up from the one it fixes. And
+nothing at all reconciled (2) against (1): a registry row saying ``lifecycle:
+disabled`` because a manifest entry said so is a hand-copied assertion about a
+file in a different repository, and when the manifest entry is deleted the row
+keeps saying "deliberately off" while the component runs again. A component
+quietly running while its row says it is off is WORSE than the ``UNREPORTED``
+state the declaration replaced, because ``UNREPORTED`` is loud and ``DISABLED``
+is not.
+
+**The join, stated once.** A trigger's off-ness is DECLARED if either register
+declares it — the pause manifest naming it, or its observability row carrying a
+non-service ``lifecycle``. The union is the declaration surface, and it is
+derived from the account rather than from either list, so a trigger nobody named
+in either place is a finding by construction instead of an omission nobody sees.
+
+**Where this lives, and why (I7118 deliverable 3).** The two files are in
+different repos, so one of them has to be read across a boundary. The options
+were an unauthenticated raw-GitHub fetch of a private repo (rejected: it cannot
+work without a credential, and adding one to reach a file we already publish is
+a second copy of an existing path), a cross-repo source checkout under a scoped
+deploy key or a GitHub App token (rejected: a new credential and a new IAM
+identity to read something already in S3), or reading the registry from the
+place the console already reads it. The last one costs nothing: the registry is
+pushed to S3 by the same merge that changes it, so this copy is never staler
+than the last registry change, and this module needs no second identity and no
+second schedule. The manifest stays in the repo that owns it and this module
+sits beside it.
+
+**This module never acts.** It reads three registers and prints a verdict. It
+cannot enable, disable, edit a manifest entry or edit a lifecycle declaration.
+Deleting a ``lifecycle: disabled`` declaration because a manifest entry vanished
+would INFER a decision from a file diff, which is the thing §8.3 forbids and the
+reason I7118 specifies detect-only.
+
+Usage:
+  ./infrastructure/pause_reconcile.py --check          # exit 1 on any finding
+  ./infrastructure/pause_reconcile.py --check --json
+  ./infrastructure/pause_reconcile.py --check --publish # + the console row
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import yaml
+
+HERE = Path(__file__).parent.resolve()
+sys.path.insert(0, str(HERE))
+import automation_pause as ap  # noqa: E402
+
+REGION = ap.REGION
+REGISTRY_BUCKET = "alpha-engine-research"
+REGISTRY_PREFIX = "ops/registry/observability.d/"
+
+#: `observability_registry.py::LIFECYCLE_NEEDS_REASON` — the three states that
+#: declare a component is not expected to run. Duplicated as a literal rather
+#: than imported because that module lives in another repository; the guard is
+#: `tests/test_pause_reconcile.py::test_non_service_lifecycles_match_the_registry`,
+#: which reads the published rows and fails if a fourth state appears.
+NON_SERVICE_LIFECYCLES = frozenset({"disabled", "deprecated", "retired"})
+
+#: Component ids that are never joinable to a trigger name. AWS-managed rules
+#: carry no fleet row and never will.
+_AWS_MANAGED_PREFIX = "DO-NOT-DELETE-"
+
+CHECK_ID = "automation-pause-reconcile"
+CHECK_LABEL = "automation pause: manifest vs registry vs live AWS"
+CADENCE_MINUTES = 1440  # the daily sf-arn-drift-check sweep
+
+
+# ── register 3: live AWS ─────────────────────────────────────────────────────
+
+def _aws_json(args: list[str]) -> dict:
+    proc = subprocess.run(
+        ["aws"] + args + ["--region", REGION, "--output", "json"],
+        capture_output=True, text=True, check=False,
+    )
+    if proc.returncode != 0:
+        # RAISE, never return empty. An AccessDenied read as "no triggers
+        # exist" would let this check grade itself green by losing its own
+        # access — the posture automation_pause._live_state already takes.
+        raise RuntimeError(f"aws {' '.join(args)}: {proc.stderr.strip()}")
+    return json.loads(proc.stdout)
+
+
+def live_triggers() -> list[dict]:
+    """Every trigger in the account, both surfaces, with its live state.
+
+    `aws events list-rule*` and `aws scheduler list-schedules` are DISJOINT
+    APIs over disjoint resources, not aliases (alpha-engine-config-I6842: a
+    Scheduler-triggered Lambda reads as untriggered when only the first is
+    queried). Both are enumerated here or the sweep has a blind surface.
+    """
+    out: list[dict] = []
+    for page in _paginate(["events", "list-rules"], "Rules"):
+        out.append({"surface": "events", "name": page["Name"],
+                    "state": page.get("State")})
+    for page in _paginate(["scheduler", "list-schedules"], "Schedules"):
+        out.append({"surface": "scheduler", "name": page["Name"],
+                    "state": page.get("State")})
+    return sorted(out, key=lambda t: (t["surface"], t["name"]))
+
+
+def _paginate(cmd: list[str], key: str):
+    token: str | None = None
+    while True:
+        args = list(cmd)
+        if token:
+            args += ["--next-token", token]
+        page = _aws_json(args)
+        yield from page.get(key, [])
+        token = page.get("NextToken")
+        if not token:
+            return
+
+
+def sf_invoked_functions() -> set[str]:
+    """Every Lambda any live Step Functions definition invokes.
+
+    A pipeline stage is an invocation path that no EventBridge or Scheduler
+    enumeration can see: `alpha-engine-predictor-inference` and
+    `alpha-engine-research-runner` have only DEPRECATED rules of their own and
+    are nonetheless invoked on every weekly and preopen run. Without this
+    register, direction C below reports both as dark, and acting on that report
+    would declare two live Crucible stages deliberately off. That is not a
+    hypothetical: measured 2026-08-12, this register is the difference between
+    seven findings and four, and the three it removes are all correct.
+
+    `alpha-engine-config-I7117`'s gotcha states the mechanism — a definition
+    names its Lambdas by `FunctionName` in the state body, not by an ARN a regex
+    over `arn:aws:lambda` alone would find, so both forms are matched here.
+    """
+    import re
+    names: set[str] = set()
+    for sm in _aws_json(["stepfunctions", "list-state-machines"]).get("stateMachines", []):
+        body = _aws_json([
+            "stepfunctions", "describe-state-machine",
+            "--state-machine-arn", sm["stateMachineArn"],
+        ])["definition"]
+        names |= set(re.findall(r'"FunctionName"\s*:\s*"([^"]+)"', body))
+        names |= set(re.findall(
+            r"arn:aws:lambda:[^\":]+:\d+:function:([A-Za-z0-9_-]+)", body))
+    # `:live` and numeric versions are aliases OF a function; a registry row is
+    # about the function, so the qualifier is stripped to match `_rows_for_target`.
+    return {n.split(":")[0] for n in names}
+
+
+INVOCATION_WINDOW_DAYS = 14
+
+
+def window_start(manifest: dict, days: int = INVOCATION_WINDOW_DAYS):
+    """The earliest instant an invocation may count as evidence.
+
+    **A trailing window alone is wrong, and measurably so.** The declarations
+    being graded were made under the 2026-08-07 ruling; a flat 14-day window on
+    2026-08-12 reaches back to 2026-07-29 and counts nine PRE-ruling days as
+    evidence that a component is running in defiance of it. Measured: that
+    produced eleven `running-while-declared-off` findings, of which ten were
+    invocations from before the pause — `alpha-engine-crypto-balances` scored
+    853 and has not run once since 2026-08-07. Exactly one survives a
+    post-ruling window, and it is a real defect.
+
+    So the window opens at the LATER of the trailing bound and the day after
+    the ruling this manifest records. It moves on its own when Brian issues a
+    new ruling, because it reads the ruling's date out of the manifest rather
+    than carrying a literal — the failure mode a fixed date literal inside a
+    relative lookback always ends in.
+    """
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc)
+    trailing = now - datetime.timedelta(days=days)
+    ruled = datetime.datetime.fromisoformat(
+        manifest["ruling"]["date"]).replace(tzinfo=datetime.timezone.utc)
+    return max(trailing, ruled + datetime.timedelta(days=1))
+
+
+def lambda_invocations(function_name: str, since=None) -> float:
+    """AWS/Lambda Invocations for a function over the trailing window.
+
+    **This is why direction C is not a trigger-map inference.** Measured
+    2026-08-12, three of the four components whose every EventBridge and
+    Scheduler trigger is dark were nonetheless invoking every day —
+    `alpha-engine-sf-watch-liveness-probe` 18-52 times daily,
+    `alpha-engine-overseer-dispatcher` 1-15, `alpha-engine-canary-replay-
+    dispatcher` 4-12 — through cross-Lambda and event-time paths no trigger
+    enumeration can see (`arming.py` documents one of them: alert-drain's
+    freshness-CRITICAL path runs off the freshness monitors, which Brian kept
+    enabled). A detector that declared those three `disabled` from the trigger
+    map alone would have written three false decisions into the registry, which
+    is worse than the gap it was closing.
+
+    So the predicate is trigger-darkness AND invocation-silence, and the
+    evidence for `disabled` stays what `alpha-engine-config-I7117` requires: the
+    paused entry plus the live DISABLED, never the absence of a complaint.
+    """
+    import datetime
+    end = datetime.datetime.now(datetime.timezone.utc)
+    start = since or (end - datetime.timedelta(days=INVOCATION_WINDOW_DAYS))
+    got = _aws_json([
+        "cloudwatch", "get-metric-statistics",
+        "--namespace", "AWS/Lambda", "--metric-name", "Invocations",
+        "--dimensions", f"Name=FunctionName,Value={function_name}",
+        "--start-time", start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "--end-time", end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "--period", "86400", "--statistics", "Sum",
+    ])
+    return sum(float(d.get("Sum") or 0) for d in got.get("Datapoints", []))
+
+
+def trigger_targets(trigger: dict) -> list[str]:
+    """The ARNs a trigger invokes. Empty is a legitimate answer (a rule whose
+    targets were removed), and is reported as such rather than skipped."""
+    if trigger["surface"] == "events":
+        got = _aws_json(["events", "list-targets-by-rule", "--rule", trigger["name"]])
+        return [t["Arn"] for t in got.get("Targets", [])]
+    got = _aws_json(["scheduler", "get-schedule", "--name", trigger["name"]])
+    arn = (got.get("Target") or {}).get("Arn")
+    return [arn] if arn else []
+
+
+# ── register 2: the published observability registry ─────────────────────────
+
+def load_registry(local_dir: Path | None = None) -> dict[str, dict]:
+    """component_id -> row, from S3 (or a local directory, for tests).
+
+    Reads the SAME copy the console reads. A local checkout of
+    `nous-ergon-ops/governance/observability.d/` is deliberately NOT the default:
+    this runs in CI for `nousergon-data`, where that checkout does not exist, and
+    an optional local path that silently wins when present is how two readers of
+    "the registry" end up grading different content.
+    """
+    if local_dir is not None:
+        blobs = {p.name: p.read_text(encoding="utf-8") for p in sorted(local_dir.glob("*.yaml"))}
+    else:
+        blobs = _fetch_registry_from_s3()
+    rows: dict[str, dict] = {}
+    for name, text in blobs.items():
+        row = yaml.safe_load(text)
+        if not isinstance(row, dict) or not row.get("component_id"):
+            raise RuntimeError(f"registry object {name} has no component_id")
+        rows[row["component_id"]] = row
+    if not rows:
+        raise RuntimeError(
+            f"the published registry at s3://{REGISTRY_BUCKET}/{REGISTRY_PREFIX} is "
+            "empty — grading a trigger's declaration against an empty registry "
+            "would report every component as undeclared, so this raises instead"
+        )
+    return rows
+
+
+def _fetch_registry_from_s3() -> dict[str, str]:
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = subprocess.run(
+            ["aws", "s3", "sync", f"s3://{REGISTRY_BUCKET}/{REGISTRY_PREFIX}", tmp,
+             "--exclude", "*", "--include", "*.yaml", "--region", REGION],
+            capture_output=True, text=True, check=False,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"aws s3 sync of the published registry: {proc.stderr.strip()}")
+        return {p.name: p.read_text(encoding="utf-8")
+                for p in sorted(Path(tmp).glob("*.yaml"))}
+
+
+def _lifecycle(row: dict | None) -> str | None:
+    return (row or {}).get("lifecycle")
+
+
+def _declares_off(row: dict | None) -> bool:
+    return _lifecycle(row) in NON_SERVICE_LIFECYCLES
+
+
+def _cites_the_manifest(row: dict | None) -> bool:
+    return "automation_pause" in str((row or {}).get("lifecycle_reason") or "")
+
+
+def _rows_for_target(rows: dict[str, dict], arn: str) -> list[dict]:
+    """Registry rows whose component IS the thing this ARN names.
+
+    Joined on the resource name at the tail of the ARN — the registry's
+    `component_id` for a Lambda is its function name — with the qualifier
+    (`:live`, a version) stripped, because a row is about the function, not
+    about an alias of it.
+    """
+    if not arn or ":" not in arn:
+        return []
+    tail = arn.split(":")
+    if "function" in tail:
+        idx = tail.index("function")
+        name = tail[idx + 1] if len(tail) > idx + 1 else ""
+    else:
+        name = tail[-1]
+    row = rows.get(name)
+    return [row] if row else []
+
+
+# ── the reconciliation ───────────────────────────────────────────────────────
+
+def reconcile(
+    manifest: dict | None = None,
+    rows: dict[str, dict] | None = None,
+    triggers: list[dict] | None = None,
+    targets_of=None,
+    sf_invoked: set[str] | None = None,
+    invocations_of=None,
+) -> list[dict]:
+    """Every disagreement between the three registers.
+
+    Arguments are injectable so tests exercise the whole comparison without AWS
+    and without the network — the same convention `automation_pause.check()`
+    uses for `_live_state`.
+    """
+    m = manifest if manifest is not None else ap.load_manifest()
+    reg = rows if rows is not None else load_registry()
+    trigs = triggers if triggers is not None else live_triggers()
+    targets_of = targets_of or trigger_targets
+    sf_live = sf_invoked if sf_invoked is not None else sf_invoked_functions()
+    since = window_start(m)
+    invocations_of = invocations_of or (lambda cid: lambda_invocations(cid, since=since))
+
+    paused = ap.paused_names(m)          # paused + pending
+    kept = ap.kept_names(m)
+    findings: list[dict] = []
+
+    # ── direction A: a live trigger nobody's register accounts for ──────────
+    for t in trigs:
+        name, state = t["name"], t["state"]
+        if name.startswith(_AWS_MANAGED_PREFIX):
+            continue
+        row = reg.get(name)
+        declared_off = name in paused or _declares_off(row)
+        if state != "ENABLED":
+            if not declared_off:
+                findings.append({
+                    "kind": "undeclared-dark", "trigger": name, "surface": t["surface"],
+                    "detail": (
+                        f"live State={state}, but no register declares it off: it is not "
+                        f"named in automation_pause.json and its observability row says "
+                        f"lifecycle={_lifecycle(row) or 'NO ROW'}. A component off with "
+                        "nobody's decision behind it is indistinguishable from a broken "
+                        "one, which is the collapse observability-policy.md §8.3 forbids. "
+                        "Fix by DECLARING it — a manifest entry if it is a paused "
+                        "decision, or lifecycle: deprecated/retired on its registry row "
+                        "if it is superseded. Never by re-enabling it to clear this."
+                    ),
+                })
+        else:
+            # ENABLED. `unexpectedly-enabled` (manifest says paused) is
+            # automation_pause.check()'s finding and is not repeated here. This
+            # is the OTHER half, and the one I7118 Finding 2 is about: a row
+            # asserting the component is deliberately off while it runs.
+            if _declares_off(row):
+                findings.append({
+                    "kind": "running-while-declared-off", "trigger": name,
+                    "surface": t["surface"],
+                    "detail": (
+                        f"live State=ENABLED while its observability row declares "
+                        f"lifecycle={_lifecycle(row)}. A row saying DISABLED renders "
+                        "green-adjacent, is excluded from staleness_honesty's violation "
+                        "set and is exempt from ABSENT candidacy — so a component running "
+                        "again behind that declaration is silent in every surface. Either "
+                        "the re-enable was intended and the row must be re-declared "
+                        "in-service, or it was not and the trigger goes back off."
+                    ),
+                })
+            elif name not in kept and row is None:
+                findings.append({
+                    "kind": "undeclared-enabled", "trigger": name, "surface": t["surface"],
+                    "detail": (
+                        "live State=ENABLED, named in neither automation_pause.json nor "
+                        "the observability registry. Scheduled work is running that no "
+                        "register accounts for; under the 2026-08-07 ruling that is "
+                        "either an un-pause nobody recorded or a trigger created mid-pause."
+                    ),
+                })
+
+    # ── direction B: a declaration whose manifest entry is gone ─────────────
+    live_names = {t["name"] for t in trigs}
+    for cid, row in sorted(reg.items()):
+        if not (_declares_off(row) and _cites_the_manifest(row)):
+            continue
+        # The row's own trigger, when the row IS a trigger.
+        if row.get("substrate") in ("eventbridge",) and cid in live_names:
+            if cid not in paused:
+                findings.append({
+                    "kind": "orphaned-lifecycle-declaration", "trigger": cid,
+                    "surface": "registry",
+                    "detail": (
+                        f"observability.d/{cid}.yaml declares lifecycle="
+                        f"{_lifecycle(row)} and cites automation_pause.json, but the "
+                        "manifest no longer names it. The declaration is now a claim "
+                        "about a file that does not say what it quotes. Re-derive it: "
+                        "either the entry was deleted on an un-pause (the row goes "
+                        "in-service) or the entry was renamed (the reason must be "
+                        "restated against the current entry)."
+                    ),
+                })
+
+    # ── direction C: a paused trigger whose sole target is still in-service ─
+    # This is `alpha-engine-config-I7117`'s rule, generalised: it is derived from
+    # the live target map rather than from a hand-built table of five, so it
+    # holds for every component that acquires the property later.
+    target_rows: dict[str, set[str]] = {}
+    for t in trigs:
+        if t["name"].startswith(_AWS_MANAGED_PREFIX):
+            continue
+        for arn in targets_of(t):
+            for row in _rows_for_target(reg, arn):
+                target_rows.setdefault(row["component_id"], set()).add(t["name"])
+    live_states = {t["name"]: t["state"] for t in trigs}
+    for cid, trigger_names in sorted(target_rows.items()):
+        row = reg[cid]
+        if cid in sf_live:
+            continue  # a live pipeline stage — see sf_invoked_functions()
+        all_dark = all(live_states.get(n) != "ENABLED" for n in trigger_names)
+        if not all_dark:
+            continue
+        # The measured half. A row's lifecycle claim is graded against whether
+        # the component RAN, never against the trigger map alone.
+        ran = invocations_of(cid)
+        if _declares_off(row):
+            # NOT a finding, however many times it ran. Brian's ruling is
+            # explicit that a paused component keeps its manual path — "everything
+            # else has its schedule removed - MANUAL INVOCATION ONLY" — so
+            # invocations behind a declared-off row are the intended state, not a
+            # breach of it. Measured 2026-08-12: the one component this branch
+            # flagged on a post-ruling window, `alpha-engine-predictor-health-check`,
+            # shows 10 invocations at irregular single-call hours, which is the
+            # signature of hand invocation, and its own EventBridge rule is
+            # correctly DISABLED. Firing here would page on the ruling working.
+            #
+            # The unambiguous form of "running while declared off" is a LIVE
+            # TRIGGER behind a declared-off row, and that is graded in direction A
+            # above, where the evidence is the trigger's State rather than a
+            # count that cannot tell a schedule from a human.
+            continue
+        if ran > 0:
+            # in-service, and it IS in service. The row is telling the truth,
+            # so this reconciler has nothing to say. That the trigger map does
+            # not explain WHAT wakes it is a real gap and a different clause —
+            # the registry's own wake/trigger declaration — filed separately as
+            # alpha-engine-config-I7126, not smuggled in as a lifecycle finding.
+            continue
+        findings.append({
+            "kind": "dark-and-undeclared-component", "trigger": cid,
+            "surface": "registry",
+            "detail": (
+                f"every trigger that invokes it is off ({', '.join(sorted(trigger_names))}), "
+                f"it was invoked 0 times since {since:%Y-%m-%d}, and its "
+                f"row still declares lifecycle={_lifecycle(row)}. It renders as whatever its "
+                "last invocation produced and becomes a fresh UNREPORTED the moment it falls "
+                "out of the console's window. Declare the lifecycle from the evidence (the "
+                "paused entry plus the live DISABLED plus this silence), or record the live "
+                "invocation path that keeps it in-service. Step Functions lambda:invoke is "
+                "already covered here (sf_invoked_functions)."
+            ),
+        })
+
+    return sorted(findings, key=lambda f: (f["kind"], f["trigger"]))
+
+
+# ── the console row ──────────────────────────────────────────────────────────
+
+def publish(findings: list[dict], checked: int, dry_run: bool = False) -> str | None:
+    """This detector's own row on the console (observability-policy.md §2.2).
+
+    A detector that reports nowhere is unobserved, and a green run is exactly as
+    load-bearing as a red one: the row is written on EVERY run, so silence from
+    this check is visible as staleness on its own row rather than as absence.
+    """
+    from nousergon_lib import fleet_check_result as fcr
+
+    status = fcr.STATUS_OK if not findings else fcr.STATUS_ATTENTION
+    if findings:
+        by_kind: dict[str, int] = {}
+        for f in findings:
+            by_kind[f["kind"]] = by_kind.get(f["kind"], 0) + 1
+        summary = (
+            f"{len(findings)} disagreement(s) across {checked} live trigger(s): "
+            + ", ".join(f"{k}={v}" for k, v in sorted(by_kind.items()))
+        )
+    else:
+        summary = (
+            f"{checked} live trigger(s); every off trigger is declared off by the pause "
+            "manifest or by its registry lifecycle, and no declaration is orphaned"
+        )
+    env = fcr.build(
+        check_id=CHECK_ID, label=CHECK_LABEL, status=status, summary=summary,
+        cadence_minutes=CADENCE_MINUTES,
+        findings=[{"id": f["trigger"], "kind": f["kind"], "detail": f["detail"]}
+                  for f in findings],
+        deep_link=(
+            "https://github.com/nousergon/nousergon-data/blob/main/"
+            "infrastructure/pause_reconcile.py"
+        ),
+    )
+    return fcr.emit(env, dry_run=dry_run)
+
+
+def main() -> int:
+    ap_ = argparse.ArgumentParser(
+        description="reconcile the pause manifest, the observability registry and live AWS")
+    ap_.add_argument("--check", action="store_true", required=True,
+                     help="report every disagreement; exit 1 if there is one")
+    ap_.add_argument("--json", action="store_true", help="machine-readable output")
+    ap_.add_argument("--publish", action="store_true",
+                     help="also write this check's own console row")
+    ap_.add_argument("--dry-run", action="store_true",
+                     help="with --publish, print the envelope instead of writing it")
+    ap_.add_argument("--registry-dir", type=Path, default=None,
+                     help="read the registry from a local directory instead of S3")
+    args = ap_.parse_args()
+
+    try:
+        triggers = live_triggers()
+        rows = load_registry(args.registry_dir)
+        findings = reconcile(rows=rows, triggers=triggers)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    if args.publish:
+        # Publishing is best-effort by construction (`fcr.emit` never raises):
+        # a check must not go red because its telemetry did. The verdict below
+        # is unaffected either way.
+        publish(findings, checked=len(triggers), dry_run=args.dry_run)
+
+    if args.json:
+        print(json.dumps({"checked": len(triggers), "registry_rows": len(rows),
+                          "findings": findings}, indent=2))
+    else:
+        print(f"pause reconcile — {len(triggers)} live trigger(s) vs "
+              f"{len(rows)} registry row(s)")
+        if not findings:
+            print("  ✓ every off trigger is declared off by one of the two registers")
+            print("  ✓ no lifecycle declaration cites a manifest entry that is gone")
+            print("  ✓ no component runs while its row declares it off")
+        for f in findings:
+            print(f"  ✗ [{f['kind']}] {f['surface']}:{f['trigger']}")
+            print(f"      {f['detail']}")
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

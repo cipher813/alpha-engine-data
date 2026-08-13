@@ -52,7 +52,11 @@ This test pins:
   ``MutexConflict``) with correct Type + Resource; the weekly SF
   additionally carries ``ComputeMutexTtl`` (JSONata Pass) between
   ``CheckMutexRole`` and ``AcquireMutex``.
-- Wiring: ``InitializeInput.Next`` (or ``StartAt`` for EOD) → ``CheckMutexRole``;
+- Wiring: ``InitializeInput.Next`` (or ``StartAt`` for EOD) → the
+  ``MarketHoursGate`` pre-spend gate, whose PROCEED branch is
+  ``CheckMutexRole`` (alpha-engine-config-I7111 — a run refused for
+  starting inside the NYSE session must not take a mutex key it will
+  never use);
   ``CheckMutexRole.Default`` → former-first-state;
   ``AcquireMutex.Next`` → former-first-state.
 - ``CheckMutexRole`` gates on ``$.pipeline_role`` in the cadence allowlist.
@@ -76,6 +80,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.sf_degraded_summary_helpers import assert_degraded_continuation
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INFRA = REPO_ROOT / "infrastructure"
@@ -244,6 +249,22 @@ class TestMutexStatesPresent:
 # Wiring — entry-point reroute, Choice default, Acquire next-state
 # ---------------------------------------------------------------------------
 
+def _market_hours_proceed_target(states: dict) -> str:
+    """The state a clean (market-closed) verdict routes to.
+
+    alpha-engine-config-I7111. Read out of the Choice rather than hardcoded so
+    this file asserts the mutex is downstream of the gate without also pinning
+    the gate's internal rule order — that contract is owned by
+    tests/test_sf_market_hours_gate_wiring.py.
+    """
+    choice = states["MarketHoursGateChoice"]
+    proceed = [
+        c["Next"] for c in choice["Choices"] if c.get("StringEquals") == "PROCEED"
+    ]
+    assert len(proceed) == 1, proceed
+    return proceed[0]
+
+
 class TestMutexWiring:
     """The mutex chain must sit BETWEEN the SF's entry point and the
     former-first-state, on both the gated path (cadence role acquires)
@@ -281,13 +302,26 @@ class TestMutexWiring:
         assert saturday_sf["States"]["WeeklyPreflightGate"]["Default"] == "CheckMutexRole"
 
     def test_weekday_initialize_input_routes_to_check_mutex_role(self, weekday_sf):
-        assert weekday_sf["States"]["InitializeInput"]["Next"] == "CheckMutexRole"
+        # alpha-engine-config-I7111: MarketHoursGate is now composed ahead of
+        # the mutex on both trading pipelines — deliberately, so a run refused
+        # for starting inside the NYSE session never takes a mutex key it will
+        # not use. The mutex is still the entry point's next gate-free state,
+        # one gate further down, the same way the Saturday SF's four pre-spend
+        # gates sit ahead of it above.
+        states = weekday_sf["States"]
+        assert states["InitializeInput"]["Next"] == "MarketHoursGate"
+        assert states["MarketHoursGate"]["Next"] == "MarketHoursGateChoice"
+        assert _market_hours_proceed_target(states) == "CheckMutexRole"
 
     def test_eod_start_at_routes_to_check_mutex_role(self, eod_sf):
-        assert eod_sf["StartAt"] == "CheckMutexRole", (
-            "EOD SF has no InitializeInput state, so the mutex chain "
-            "must be reachable via StartAt directly."
+        # I7111, same composition: the EOD SF has no InitializeInput, so the
+        # gate IS its StartAt and the mutex chain hangs off the gate's
+        # PROCEED branch.
+        assert eod_sf["StartAt"] == "MarketHoursGate", (
+            "EOD SF has no InitializeInput state, so the market-hours gate "
+            "in front of the mutex chain must be StartAt directly."
         )
+        assert _market_hours_proceed_target(eod_sf["States"]) == "CheckMutexRole"
 
     @pytest.mark.parametrize("sf_name", list(FORMER_FIRST_STATE_BY_SF))
     def test_check_mutex_role_default_routes_to_former_first_state(
@@ -523,7 +557,9 @@ class TestAcquireMutexSemantics:
             # the flag Pass and the former first state.
             assert flag_state["ResultPath"] == "$.gate_degraded"
             assert flag_state["Result"] is True
-            assert flag_state["Next"] == "PublishMutexAcquireDegraded"
+            assert_degraded_continuation(
+                states, "SetMutexAcquireDegradedFlag", "PublishMutexAcquireDegraded",
+            )
             publish = states["PublishMutexAcquireDegraded"]
             assert publish["Next"] == former
             assert all(c["Next"] == former for c in publish["Catch"])

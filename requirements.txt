@@ -61,7 +61,18 @@ arcticdb>=6.20.0
 # nousergon-lib#226 registered the 9 states this repo's SF JSONs were
 # missing (2 Saturday + 7 EOD) and shipped in v0.124.8 — bumped to that tag
 # here (was v0.124.6) to unblock the new source-check test.
-nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.49
+# alpha-engine-config-I7111: MarketHoursGate + its four notify/record states
+# are new substantive Task states in BOTH weekday definitions, so the SAME
+# source-check requires their registry entries to exist in the pinned lib.
+# nousergon-lib-PR311 adds all five and MUST merge first; v0.124.53 is the
+# patch autobump that merge produces from today's 0.124.52
+# (auto-version-bump.yml is the single version writer). If another lib PR
+# merges between, this pin moves to whatever tag PR311's merge actually
+# produced — the source-check is what tells you, and it is the guard against
+# merging the SF JSON ahead of the registry entry.
+# (Superseded: alpha-engine-config-I7119 / nousergon-lib-PR310, merged as
+# v0.124.51, which registered RelaunchWeeklyFreshnessSpot.)
+nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.53
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,

@@ -161,36 +161,46 @@ def test_preflight_state_precedes_every_send_command(states):
     if not send_command_states:
         pytest.skip("No sendCommand states found in SF")
 
-    # BFS from InitializeInput — does every path to a sendCommand state
-    # go through WeeklyPreflight?
-    def _paths_through_preflight(
-        current: str, visited: set[str], found_violation: bool
-    ) -> bool:
-        """Returns True if the current path reaches a sendCommand state
-        WITHOUT passing through WeeklyPreflight (a violation)."""
-        if current in visited:
-            return False  # cycle, not a violation
+    # Reachability over (state, has-passed-WeeklyPreflight) pairs, memoised.
+    #
+    # This walk used to enumerate PATHS — the visited set was carried per
+    # branch, so a converging graph re-explored the same subgraph once per
+    # distinct route into it. That is exponential in the number of joins, and
+    # the weekly definition is nothing but joins: adding one convergence state
+    # (alpha-engine-config-I6891's CheckDegradedOutcome, which eight completion
+    # paths now pass through) moved this test from slow to effectively
+    # non-terminating. It also ran the identical whole-graph search once per
+    # sendCommand state and appended the LOOP VARIABLE on success, so the
+    # reported violation list named every sendCommand state whenever any one of
+    # them was reachable, and named the wrong ones.
+    #
+    # The question is per-state and has only two carried bits, so the state
+    # space is 2*|States| and one pass answers it for every sendCommand at once.
+    seen: set[tuple[str, bool]] = set()
+    frontier = [("InitializeInput", False)]
+    violations: set[str] = set()
+    while frontier:
+        current, passed_preflight = frontier.pop()
+        if (current, passed_preflight) in seen:
+            continue
+        seen.add((current, passed_preflight))
         if current == "WeeklyPreflight":
-            found_violation = True
+            passed_preflight = True
         if current in send_command_states:
-            return not found_violation  # violation = reached sendCommand without preflight
-
-        visited = visited | {current}
+            if not passed_preflight:
+                violations.add(current)
+            # Do not descend past a sendCommand state — the question is how it
+            # was REACHED, and expanding it would attribute its successors'
+            # reachability to a path that already spent.
+            continue
         for next_state in transitions.get(current, []):
             if next_state == current:
                 continue
-            if _paths_through_preflight(next_state, visited, found_violation):
-                return True
-        return False
-
-    violations = []
-    for sc in send_command_states:
-        if _paths_through_preflight("InitializeInput", set(), False):
-            violations.append(sc)
+            frontier.append((next_state, passed_preflight))
 
     assert not violations, (
         f"sendCommand state(s) reachable without passing through WeeklyPreflight: "
-        f"{violations}"
+        f"{sorted(violations)}"
     )
 
 

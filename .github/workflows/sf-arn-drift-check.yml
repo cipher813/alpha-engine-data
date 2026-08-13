@@ -51,6 +51,8 @@ on:
       - 'infrastructure/scheduler/**'
       - 'infrastructure/automation_pause.json'
       - 'infrastructure/automation_pause.py'
+      - 'infrastructure/overseer/arming.py'
+      - 'infrastructure/overseer/playbooks.yaml'
       - 'infrastructure/weekly_cadence.json'
       - 'infrastructure/weekly_cadence_drift.py'
       - '.github/workflows/sf-arn-drift-check.yml'
@@ -87,6 +89,37 @@ jobs:
       # scheduler:GetSchedule this role already holds.
       - name: Scheduled-automation pause still holds (live)
         run: python3 infrastructure/automation_pause.py --check
+
+      # alpha-engine-config-I7056. The step above asks "is the pause intact".
+      # This one asks the question nothing asked before it: for each of the
+      # NINE Overseer components, is it armed, or is it off because someone
+      # DECIDED it is off? Both look identical from run telemetry — a paused
+      # playbook and a broken one each emit exactly nothing — and
+      # observability-policy.md §8.3 forbids rendering either as the other.
+      #
+      # It goes red only on `undeclared-dark` and `trigger-absent`: a trigger
+      # off with no recorded decision, or one that no longer exists. A declared
+      # pause is NOT a finding (overseer-policy.md §7 — a kill switch is state,
+      # surfaced everywhere, never alerted), so this step stays green for the
+      # whole duration of the 2026-08-07 ruling and goes red the moment
+      # something goes dark that nobody ruled on.
+      #
+      # This workflow is the right host precisely because it is a GitHub
+      # Actions cron: it is outside the AWS pause entirely, so the observer
+      # cannot be disarmed by the ruling it observes (overseer-policy.md
+      # invariant 1 — the watcher sits outside its subject's dependency cone).
+      # Read-only; needs nothing beyond the events:DescribeRule +
+      # scheduler:GetSchedule this role already holds.
+      - name: Overseer playbook arming (declared pause vs live, live)
+        run: python3 infrastructure/overseer/arming.py --check
+
+      # The record itself, on every run, so the verdict for all nine is
+      # readable without re-deriving it — including when every one of them is
+      # correctly silent. `always()` because the arming state is most worth
+      # reading on the run where something above it failed.
+      - name: Publish the arming record
+        if: always()
+        run: python3 infrastructure/overseer/arming.py --report --json | tee -a "$GITHUB_STEP_SUMMARY"
 
       # config#6701 deliverable 3-wiring: the declared weekly exercise-cadence
       # manifest vs the live SSM parameter, out-of-band of deploys (the deploy

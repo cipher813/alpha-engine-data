@@ -189,6 +189,7 @@ _CATCH_EXEMPT: dict[str, dict[str, str]] = {
     "step_function.json": {
         "WeeklyRunDayGateFailed": "deliberate fail-open notify+proceed (own Comment); a Catch here would need its own Catch",
         "WriteCompletionMarker": "config#2857/config#1724: deliberately UNCAUGHT — a marker write failure must propagate as this execution's own unverifiable-completion signal, not be masked",
+        "WriteCompletionMarkerDegraded": "config#2857/config#1724 (DEGRADED twin, alpha-engine-config-I6891): deliberately UNCAUGHT — a marker write failure must propagate, not be masked",
         "HandleFailure": "terminal failure notifier — routes to FailExecution; the shared failure sink itself, not something to re-catch into",
     },
     "step_function_daily.json": {
@@ -289,11 +290,35 @@ _FAILURE_FAMILY: dict[str, frozenset[str]] = {
             "MutexConflict",
         }
     ),
+    # alpha-engine-config-I7111 adds three more real Fail-type terminals to
+    # the two trading pipelines: MarketHoursBlocked (started inside the NYSE
+    # session with no override), MarketHoursOverrideMalformed (an override was
+    # offered and is not usable) and — preopen only — MarketHoursUnverified
+    # (the gate Lambda did not answer, and preopen fails CLOSED there because
+    # PredictorInference invokes the same Lambda downstream, so nothing was
+    # left to rescue). They are enumerated here for the same reason
+    # MutexConflict is: a Catch reaching one of them fails LOUD, so the route
+    # is not "fail-open to a silent SUCCESS" and needs no degraded flag. The
+    # postclose pipeline deliberately has NO MarketHoursUnverified — its
+    # unverified route is a genuine fail-open and sets $.degraded_summary.
     "step_function_daily.json": frozenset(
-        {"HandleFailure", "FailExecution", "MutexConflict"}
+        {
+            "HandleFailure",
+            "FailExecution",
+            "MutexConflict",
+            "MarketHoursBlocked",
+            "MarketHoursOverrideMalformed",
+            "MarketHoursUnverified",
+        }
     ),
     "step_function_eod.json": frozenset(
-        {"HandleFailure", "FailExecution", "MutexConflict"}
+        {
+            "HandleFailure",
+            "FailExecution",
+            "MutexConflict",
+            "MarketHoursBlocked",
+            "MarketHoursOverrideMalformed",
+        }
     ),
 }
 

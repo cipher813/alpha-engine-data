@@ -39,10 +39,13 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _INFRA = _REPO_ROOT / "infrastructure"
 
-# The two definitions with a DegradedRun terminal. step_function.json (the
-# weekly pipeline) has no degraded terminal today; `test_every_definition_
-# with_degraded_flags_has_a_derived_terminal` is what catches it gaining one.
-_DEFS_WITH_DEGRADED_TERMINAL = ("step_function_daily.json", "step_function_eod.json")
+# Every definition with a DegradedRun terminal. step_function.json joined the
+# set in alpha-engine-config-I6891, which brought the weekly pipeline to
+# Option-A parity — before that it set degraded flags and terminated SUCCEEDED,
+# so a run that did not really work counted as one that did.
+_DEFS_WITH_DEGRADED_TERMINAL = (
+    "step_function.json", "step_function_daily.json", "step_function_eod.json",
+)
 
 _ALL_DEFS = ("step_function.json", "step_function_daily.json", "step_function_eod.json")
 
@@ -150,22 +153,14 @@ def test_every_degraded_setter_writes_the_summary_the_terminal_reads(definition:
         )
 
 
-# The weekly pipeline sets degraded: true in two notify fail-opens and has NO
-# degraded terminal — NotifyShellRunCompleteDegraded carries End: true, so a
-# weekly run whose completion notification fails terminates SUCCEEDED while
-# flagged degraded. Option-A parity (#2699) reached both weekday definitions
-# (#6692, #6722) and never reached this one.
-#
-# NOT fixed here: moving a terminal is a topology change, which
-# sf-pipeline-policy.md §5 reserves to human authors (complexity:ultra).
-# Tracked as alpha-engine-config-I6891, which owns the decision of whether
-# a failed notification should degrade the run at all.
-#
-# Pinned as an exact set rather than skipped: the gap cannot WIDEN while this
-# is open, and the exception cannot outlive the fix without failing loudly.
-_KNOWN_UNTERMINATED_DEGRADED: dict[str, frozenset[str]] = {
-    "step_function.json": frozenset({"NotifyCompleteDegraded", "NotifyShellRunCompleteDegraded"}),
-}
+# alpha-engine-config-I6891 CLOSED this gap: the weekly definition now carries
+# CheckDegradedOutcome -> WriteCompletionMarkerDegraded -> DegradedRun, and
+# every one of its eleven fail-open sites writes the $.degraded_summary the
+# terminal derives its cause from. The exception map is deliberately kept as an
+# EMPTY dict rather than deleted: a definition added later that degrades without
+# a terminal must fail the assertion below rather than land in a file that no
+# longer has an opinion about it.
+_KNOWN_UNTERMINATED_DEGRADED: dict[str, frozenset[str]] = {}
 
 
 @pytest.mark.parametrize("definition", _ALL_DEFS)
@@ -219,3 +214,64 @@ def test_the_cause_expression_escapes_correctly_for_asl(definition: str) -> None
             f"{definition}::{name} has an apostrophe inside the States.Format literal — "
             "it will truncate the string and fail ASL validation"
         )
+
+
+# ---------------------------------------------------------------------------
+# The terminal can only name a cause that is still THERE when it runs.
+# ---------------------------------------------------------------------------
+
+
+def _paths_dereferenced(cause_path: str) -> set[str]:
+    """Top-level state-data keys a `CausePath` expression reads."""
+    import re
+
+    return {m for m in re.findall(r"\$\.([A-Za-z_][A-Za-z0-9_]*)", cause_path)}
+
+
+@pytest.mark.parametrize("definition", _ALL_DEFS)
+def test_no_state_clobbers_the_summary_on_the_way_to_the_terminal(definition: str) -> None:
+    """A `Task` with no `ResultPath` REPLACES the state input with its result.
+
+    This is the defect the whole `CausePath` design rests on not having, and
+    all three definitions shipped with it. `WriteCompletionMarkerDegraded` is
+    an `s3:putObject` Task routing straight into `DegradedRun`; with the
+    default `ResultPath` of `$`, the putObject result replaces the state data,
+    so the terminal's `$.degraded_summary.reason` dereference cannot resolve
+    and the execution fails with `States.Runtime` instead.
+
+    `Error: DegradedRun` is a consumer contract — `sf-telegram-notifier`'s
+    `_is_degraded_run()` matches that exact string to render DEGRADED rather
+    than a crash-red FAILED — so the visible symptom is not a broken message.
+    It is that a run which degraded honestly is reported as one that crashed,
+    which is the same collapse §2.3 exists to prevent, arriving one state after
+    everything §2.3 asked for was done correctly.
+
+    Measured 2026-08-12 by static analysis of the three definitions;
+    `states:ListExecutions` is denied to the laptop identity, so this is
+    asserted structurally rather than confirmed against a live execution.
+    """
+    states = _load(definition)["States"]
+    terminals = _degraded_terminals(states)
+    if not terminals:
+        pytest.skip(f"{definition} has no DegradedRun terminal")
+
+    for terminal_name, terminal in terminals.items():
+        needed = _paths_dereferenced(terminal["CausePath"])
+        for name, body in states.items():
+            if body.get("Next") != terminal_name:
+                continue
+            if body.get("Type") != "Task":
+                continue  # a Pass/Choice with no ResultPath still carries its input through
+            result_path = body.get("ResultPath")
+            assert result_path is not None, (
+                f"{definition}::{name} routes to {terminal_name} and declares no "
+                f"ResultPath, so its result replaces the state input and the "
+                f"terminal's dereference of {sorted(needed)} throws States.Runtime. "
+                "Give it an explicit ResultPath naming a field the terminal does "
+                "not read."
+            )
+            assert result_path != "$", f"{definition}::{name} ResultPath $ is the same clobber"
+            assert result_path.lstrip("$.").split(".")[0] not in needed, (
+                f"{definition}::{name} writes its result over {result_path}, which "
+                f"the {terminal_name} terminal reads"
+            )

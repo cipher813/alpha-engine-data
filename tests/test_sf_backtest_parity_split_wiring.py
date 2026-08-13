@@ -84,6 +84,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.sf_degraded_summary_helpers import assert_degraded_continuation
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -687,7 +688,7 @@ class TestCatchSemantics:
         assert states["ParityDegraded"]["Type"] == "Pass"
         assert states["ParityDegraded"]["Result"] is True
         assert states["ParityDegraded"]["ResultPath"] == "$.parity_degraded"
-        assert states["ParityDegraded"]["Next"] == "PublishParityDegraded"
+        assert_degraded_continuation(states, "ParityDegraded", "PublishParityDegraded")
         assert states["PublishParityDegraded"]["Next"] == "CheckSkipPitParityCompare"
         assert states["PublishParityDegraded"]["Catch"][0]["Next"] == "CheckSkipPitParityCompare"
 
@@ -695,7 +696,9 @@ class TestCatchSemantics:
         assert states["ParityCompareDegraded"]["Type"] == "Pass"
         assert states["ParityCompareDegraded"]["Result"] is True
         assert states["ParityCompareDegraded"]["ResultPath"] == "$.parity_degraded"
-        assert states["ParityCompareDegraded"]["Next"] == "PublishParityCompareDegraded"
+        assert_degraded_continuation(
+            states, "ParityCompareDegraded", "PublishParityCompareDegraded",
+        )
         assert states["PublishParityCompareDegraded"]["Next"] == "CheckSkipEvaluator"
         assert states["PublishParityCompareDegraded"]["Catch"][0]["Next"] == "CheckSkipEvaluator"
 

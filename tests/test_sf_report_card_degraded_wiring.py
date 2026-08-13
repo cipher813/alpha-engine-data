@@ -49,6 +49,10 @@ import json
 import pathlib
 
 import pytest
+from tests.sf_degraded_summary_helpers import (
+    assert_completion_notifier_chain,
+    assert_degraded_continuation,
+)
 
 _WEEKLY = pathlib.Path(__file__).parent.parent / "infrastructure" / "step_function.json"
 
@@ -81,7 +85,7 @@ def test_report_card_degraded_pass_shape_and_proceeds_to_publish(states):
     assert st["ResultPath"] == "$.report_card_degraded"
     # Fail-soft: set the flag, then proceed to the existing PAGE alert
     # (config#2302) unchanged.
-    assert st["Next"] == "PublishReportCardDegraded"
+    assert_degraded_continuation(states, "ReportCardDegraded", "PublishReportCardDegraded")
 
 
 def test_only_report_card_degraded_pass_sets_the_flag(states):
@@ -195,7 +199,7 @@ def test_new_notifiers_mirror_config_1819_shape(states, notifier):
     assert "\n" not in subject
     # config#2857: converges into the SF-envelope completion marker.
     assert "End" not in st
-    assert st["Next"] == "WriteCompletionMarker"
+    assert_completion_notifier_chain(states, notifier)
     (catch,) = st["Catch"]
     assert catch["ErrorEquals"] == ["States.ALL"]
     assert catch["Next"] == "NotifyCompleteDegraded"

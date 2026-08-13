@@ -53,6 +53,7 @@ import json
 import pathlib
 
 import pytest
+from tests.sf_degraded_summary_helpers import assert_degraded_continuation
 
 _WEEKLY = pathlib.Path(__file__).parent.parent / "infrastructure" / "step_function.json"
 
@@ -295,7 +296,7 @@ def test_set_research_predictor_degraded_shape(states):
     assert st["Type"] == "Pass"
     assert st["Result"] is True
     assert st["ResultPath"] == "$.research_predictor_degraded"
-    assert st["Next"] == "CheckSkipBacktester"
+    assert_degraded_continuation(states, "SetResearchPredictorDegraded", "CheckSkipBacktester")
 
 
 def test_only_set_research_predictor_degraded_writes_the_flag(states):

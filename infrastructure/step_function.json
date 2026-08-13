@@ -7,7 +7,7 @@
       "Type": "Pass",
       "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + ec2_instance_id explicitly; manual runs for partial-execution testing often omit sns_topic_arn, which previously caused HandleFailure/NotifyComplete to error on missing JSONPath. States.JsonMerge with user-input as the second arg lets explicit values win. | 2026-05-17: also stamps run_date = date($$.Execution.StartTime) so every spot stage of one execution keys backtest/{date}/ off ONE date (fixes the Backtester=05-17 vs Evaluator=05-18 UTC-midnight split). User-passed run_date still wins. | 2026-05-18 (shell-run keystone): also seeds the dry-path control vars at their NON-DRY identity values \u2014 preflight_args=\"\" (empty spot-command suffix), research_dry=false, data_phase2_dry=false, regime_action=\"produce\". These exist on EVERY run so the spot States.Format / Lambda Payload .$ references always resolve; on the real Saturday run (no shell_run) they hold these identity values, making every spot command string byte-identical to pre-keystone and every Lambda Payload behaviourally identical (handlers default dry_run_llm/dry_run to false; regime action 'produce' is the pre-keystone hardcoded value). ApplyShellRunDefaults (shell_run=true only) overrides them with the dry values. innermost defaults blob is merged UNDER run_date which is merged UNDER sns_topic_arn which is merged UNDER the user input, so user/ApplyShellRunDefaults values always win. PROVENANCE (config#2281): the sns_topic_arn default in the JsonMerge floor hand-carries the account/region literal (arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts) as a FLOOR ONLY \u2014 $$.Execution.Input wins the merge, so the authoritative source is the CALLER: the EventBridge schedule's Input (CFN alpha-engine-orchestration.yaml should pass sns_topic_arn via !Sub/!Ref so account/region live in ONE place \u2014 that Input change rides the CFN file in alpha-engine-config, not this repo) or an operator StartExecution payload. The floor is retained DELIBERATELY: a bare manual console start with no input must still alert instead of dying in HandleFailure on a missing $.sns_topic_arn. tests/test_sf_sns_arn_single_source.py pins that no publish state hardcodes a TopicArn and no NEW copy of the literal can ship outside the two declared floors (here + NormalizeFailureContext).",
       "Parameters": {
-        "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"preflight_args\":\"\",\"skip_weekly_run_day_gate\":false,\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
+        "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"substrate_relaunch_attempts\":0,\"preflight_args\":\"\",\"skip_weekly_run_day_gate\":false,\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
       },
       "OutputPath": "$.merged",
       "Next": "CheckWeeklyRunDayGate"
@@ -350,7 +350,7 @@
       "Comment": "config#2278: the lib-pin gate could not CHECK (Lambda failure after both retry tiers, or a payload without has_drift). Still fail-open \u2014 availability over gating for a weekly pipeline \u2014 but VISIBLE and rarer: gate_degraded=true threads into the completion email via CheckGateDegradedNotify, and PublishLibPinGateDegraded alerts NOW (mirroring WeeklyRunDayGateFailed's fail-open+alert shape). Proceeds into PipelineContractCheck so a lib-pin-gate infra flake no longer silently skips the SIBLING gate too.",
       "Result": true,
       "ResultPath": "$.gate_degraded",
-      "Next": "PublishLibPinGateDegraded"
+      "Next": "SetLibPinGateDegradedSummary"
     },
     "PublishLibPinGateDegraded": {
       "Type": "Task",
@@ -359,7 +359,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekly Pipeline \u2014 Lib-Pin Gate DEGRADED (Proceeding Unchecked)",
-        "Message": "LibPinDriftCheck could not verify cross-repo pin parity (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN: this run's spot spend is NOT protected against the co-install break this gate exists to catch. The completion email will carry the gates-degraded marker. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "LibPinDriftCheck could not verify cross-repo pin parity (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN: this run's spot spend is NOT protected against the co-install break this gate exists to catch. The completion email will carry the gates-degraded marker. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.libpin_gate_degraded_notify",
       "Catch": [
@@ -379,7 +379,7 @@
       "Comment": "config#2278: the pipeline-contract gate could not CHECK (Lambda failure after both retry tiers, or a payload without has_violation). Fail-open, visibly: gate_degraded=true + SNS alert, then proceed to CheckMutexRole. Mirrors LibPinGateDegraded exactly.",
       "Result": true,
       "ResultPath": "$.gate_degraded",
-      "Next": "PublishPipelineContractGateDegraded"
+      "Next": "SetPipelineContractGateDegradedSummary"
     },
     "PublishPipelineContractGateDegraded": {
       "Type": "Task",
@@ -388,7 +388,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekly Pipeline \u2014 Contract Gate DEGRADED (Proceeding Unchecked)",
-        "Message": "PipelineContractCheck could not verify PIPELINE_CONTRACT.yaml self-consistency (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN: this run's spot spend is NOT protected against the contract break this gate exists to catch. The completion email will carry the gates-degraded marker. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "PipelineContractCheck could not verify PIPELINE_CONTRACT.yaml self-consistency (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN: this run's spot spend is NOT protected against the contract break this gate exists to catch. The completion email will carry the gates-degraded marker. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.pipeline_contract_gate_degraded_notify",
       "Catch": [
@@ -591,7 +591,7 @@
       "Comment": "alpha-engine-config#6722: the mutex-acquire infra-error Catch (DynamoDB outage / IAM drift / transient SDK error \u2014 NOT the ConditionalCheckFailedException conflict case, which the separate MutexConflict Fail already handles) previously proceeded to CheckSpotDispatchNeeded with zero visibility. Mirrors LibPinGateDegraded's shape exactly: gate_degraded=true threads into the completion email via CheckGateDegradedNotify, and PublishMutexAcquireDegraded alerts NOW.",
       "Result": true,
       "ResultPath": "$.gate_degraded",
-      "Next": "PublishMutexAcquireDegraded"
+      "Next": "SetMutexAcquireDegradedFlagSummary"
     },
     "PublishMutexAcquireDegraded": {
       "Type": "Task",
@@ -600,7 +600,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekly Pipeline \u2014 Mutex Acquire DEGRADED (Proceeding Unchecked)",
-        "Message": "AcquireMutex could not complete its DynamoDB conditional PUT (infra error, not a genuine duplicate-run conflict). Proceeding FAIL-OPEN: this run's duplicate-execution protection is unchecked for this run_date. The completion email will carry the gates-degraded marker. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "AcquireMutex could not complete its DynamoDB conditional PUT (infra error, not a genuine duplicate-run conflict). Proceeding FAIL-OPEN: this run's duplicate-execution protection is unchecked for this run_date. The completion email will carry the gates-degraded marker. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.mutex_acquire_degraded_notify",
       "Catch": [
@@ -1404,7 +1404,7 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Next": "PublishResearchFailureImmediate",
+                  "Next": "NormalizeBranchAFailureContext",
                   "ResultPath": "$.error"
                 }
               ],
@@ -1444,7 +1444,7 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Next": "PublishResearchFailureImmediate",
+                  "Next": "NormalizeBranchAFailureContext",
                   "ResultPath": "$.error"
                 }
               ],
@@ -1560,7 +1560,7 @@
                 "poll.$": "$.rag_ingestion_poll"
               },
               "ResultPath": "$.error",
-              "Next": "PublishResearchFailureImmediate"
+              "Next": "NormalizeBranchAFailureContext"
             },
             "ExtractRAGIngestionSubstrateLostError": {
               "Type": "Pass",
@@ -1571,7 +1571,7 @@
                 "poll.$": "$.rag_ingestion_poll"
               },
               "ResultPath": "$.error",
-              "Next": "PublishResearchFailureImmediate"
+              "Next": "NormalizeBranchAFailureContext"
             },
             "CheckSkipRegimeRetrospectiveEval": {
               "Type": "Choice",
@@ -1868,7 +1868,7 @@
                 "error": "DataPhase2 SSM command exhausted its retry budget (1 re-issue) without succeeding \u2014 the alternative data collector failed on both attempts."
               },
               "ResultPath": "$.error",
-              "Next": "PublishResearchFailureImmediate"
+              "Next": "NormalizeBranchAFailureContext"
             },
             "ExtractDataPhase2SubstrateLostError": {
               "Type": "Pass",
@@ -1879,7 +1879,7 @@
                 "poll.$": "$.data_phase2_poll"
               },
               "ResultPath": "$.error",
-              "Next": "PublishResearchFailureImmediate"
+              "Next": "NormalizeBranchAFailureContext"
             },
             "DataPhase2Reissue": {
               "Type": "Pass",
@@ -2497,6 +2497,15 @@
                 "error.$": "$.error"
               },
               "ResultPath": "$.error",
+              "Next": "NormalizeBranchAFailureContext"
+            },
+            "NormalizeBranchAFailureContext": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I7048 Defect B hardening (2026-08-12): defensive $.error normalizer inserted ahead of PublishResearchFailureImmediate. Every current predecessor (ExtractRAGIngestionError, ExtractRAGIngestionSubstrateLostError, SetDataPhase2ExhaustedError, ExtractDataPhase2SubstrateLostError, ExtractSignalsEnvelopeError, plus RAGIngestion's and WaitForRAGIngestion's own Catch edges) was repointed here from PublishResearchFailureImmediate \u2014 each verified live to already set $.error via ResultPath, so this never overrides real data today. Exists because the 2026-08-01 scheduled run (execution 29056da2-812e-b4a2-28fb-e62eaaf8e917_3188dff4-...) crashed inside PublishResearchFailureImmediate: its States.Format dereferenced $.error, found it absent on the inbound path, and the resulting States.Runtime REPLACED the real branch-A error this state exists to report \u2014 the failure-mode class recorded 2026-08-11 as 'the error handler that destroys its own error'. States.JsonMerge(placeholder, $, false): $ (the second arg) wins on any key it already has, so a real $.error is never touched; only an ABSENT $.error falls back to the placeholder message. Kept PublishResearchFailureImmediate's Task name unchanged (rather than renaming it out) so nousergon_lib.pipeline_status.registry.STATE_TO_ARCHIVE_PAGE needs no companion nousergon-lib PR for this hardening.",
+              "Parameters": {
+                "merged.$": "States.JsonMerge(States.StringToJson('{\"error\":{\"message\":\"no error captured on this branch-A failure path (defensive default \u2014 alpha-engine-config-I7048)\"}}'), $, false)"
+              },
+              "OutputPath": "$.merged",
               "Next": "PublishResearchFailureImmediate"
             },
             "PublishResearchFailureImmediate": {
@@ -2842,6 +2851,15 @@
                 "poll.$": "$.predictor_poll"
               },
               "ResultPath": "$.error",
+              "Next": "NormalizeBranchBFailureContext"
+            },
+            "NormalizeBranchBFailureContext": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I7048 Defect B hardening (2026-08-12): same defensive $.error normalizer as NormalizeBranchAFailureContext, applied to this identical-shape Branch B sibling ahead of PublishPredictorFailureImmediate (both dereference $.error via States.JsonToString; 'same shape, different pipeline' per I7048). Both current predecessors (ExtractPredictorError, ExtractPredictorTrainingSubstrateLostError) were repointed here from PublishPredictorFailureImmediate \u2014 each verified live to set $.error via ResultPath, so this never overrides real data today \u2014 it guards against a FUTURE predecessor being wired in without setting $.error, which is exactly how the sibling PublishResearchFailureImmediate crashed on the 2026-08-01 run. States.JsonMerge(placeholder, $, false): $ (second arg) wins on any key it already has. Kept PublishPredictorFailureImmediate's Task name unchanged so nousergon_lib.pipeline_status.registry.STATE_TO_ARCHIVE_PAGE needs no companion nousergon-lib PR for this hardening.",
+              "Parameters": {
+                "merged.$": "States.JsonMerge(States.StringToJson('{\"error\":{\"message\":\"no error captured on this branch-B failure path (defensive default \u2014 alpha-engine-config-I7048)\"}}'), $, false)"
+              },
+              "OutputPath": "$.merged",
               "Next": "PublishPredictorFailureImmediate"
             },
             "PublishPredictorFailureImmediate": {
@@ -3548,7 +3566,7 @@
                 "poll.$": "$.predictor_poll"
               },
               "ResultPath": "$.error",
-              "Next": "PublishPredictorFailureImmediate"
+              "Next": "NormalizeBranchBFailureContext"
             },
             "ModelZooResolveLivenessGate": {
               "Type": "Choice",
@@ -3580,13 +3598,13 @@
             },
             "ExtractModelZooResolveSubstrateLostError": {
               "Type": "Pass",
-              "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractModelZooResolveError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a ModelZooResolve failure without opening the execution history.",
+              "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractModelZooResolveError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a ModelZooResolve failure without opening the execution history. alpha-engine-config-I7048 (2026-08-12): ResultPath corrected from $.error to $.model_zoo_error \u2014 ExtractModelZooResolveError's own Comment already documents this exact class (config#2160: a direct Choice->Task jump on this edge died with States.Runtime, 'could not be found', masking the real failure) and this SubstrateLost sibling reintroduced it: PublishModelZooFailureImmediate's Message dereferences $.model_zoo_error, not $.error, so a SubstrateLost-during-resolve failure hit the identical States.Runtime crash the config#2160 fix exists to prevent. Never exercised by a healthy run \u2014 caught by static sweep, not by observed failure.",
               "Parameters": {
                 "phase": "ModelZooResolve/SubstrateLost",
                 "source": "ModelZooResolveLivenessGate.SubstrateLost",
                 "poll.$": "$.resolve_zoo_poll"
               },
-              "ResultPath": "$.error",
+              "ResultPath": "$.model_zoo_error",
               "Next": "PublishModelZooFailureImmediate"
             },
             "ModelZooSelectLivenessGate": {
@@ -3619,13 +3637,13 @@
             },
             "ExtractModelZooSelectSubstrateLostError": {
               "Type": "Pass",
-              "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractModelZooSelectError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a ModelZooSelect failure without opening the execution history.",
+              "Comment": "config#6938: the SUBSTRATE-LOST sibling of ExtractModelZooSelectError. Same normalization, distinguishable phase, same downstream hand-off \u2014 so an operator can tell a reclaimed box from a ModelZooSelect failure without opening the execution history. alpha-engine-config-I7048 (2026-08-12): ResultPath corrected from $.error to $.model_zoo_error \u2014 same class + fix as ExtractModelZooResolveSubstrateLostError; PublishModelZooFailureImmediate's Message dereferences $.model_zoo_error, not $.error, so a SubstrateLost-during-select failure hit the exact States.Runtime crash the config#2160 fix (see ExtractModelZooSelectError's Comment) exists to prevent. Never exercised by a healthy run \u2014 caught by static sweep, not by observed failure.",
               "Parameters": {
                 "phase": "ModelZooSelect/SubstrateLost",
                 "source": "ModelZooSelectLivenessGate.SubstrateLost",
                 "poll.$": "$.model_zoo_poll"
               },
-              "ResultPath": "$.error",
+              "ResultPath": "$.model_zoo_error",
               "Next": "PublishModelZooFailureImmediate"
             }
           }
@@ -3726,7 +3744,7 @@
       "Comment": "THE VISIBLE RESEARCH/PREDICTOR DEGRADED FLAG (alpha-engine-config#6722). The SOLE writer of $.research_predictor_degraded (pinned by tests/test_sf_research_predictor_degraded_wiring.py). weekly-sf-policy.md \u00a72.3 honest-degradation: the run CONTINUES to CheckSkipBacktester -> Backtester/Parity/Evaluator \u2014 none of the folded ResearchPredictorParallel substeps are load-bearing preconditions for those downstream stages.",
       "Result": true,
       "ResultPath": "$.research_predictor_degraded",
-      "Next": "CheckSkipBacktester"
+      "Next": "SetResearchPredictorDegradedSummary"
     },
     "ExtractParallelBranchError": {
       "Type": "Pass",
@@ -5172,7 +5190,7 @@
       "Comment": "Fail-open marker for the compare stage itself (alpha-engine-config#6030) \u2014 SSM timeout/crash, send/poll infra failure, or poll-budget exhaustion. Sets the SAME $.parity_degraded flag family as ParityDegraded (the second and last legal writer \u2014 pinned by tests/test_sf_parity_degraded_wiring.py): no pit_parity.json verdict was produced for this run, and absence of a verdict must never render as a clean pass (\u00a72.3a; the ARTIFACT_REGISTRY freshness-monitor SLA also alarms on the missing artifact). The run CONTINUES to Evaluator \u2014 no downstream SF stage consumes parity artifacts (verified dependency audit, alpha-engine-config-I6025).",
       "Result": true,
       "ResultPath": "$.parity_degraded",
-      "Next": "PublishParityCompareDegraded"
+      "Next": "SetParityCompareDegradedSummary"
     },
     "PublishParityCompareDegraded": {
       "Type": "Task",
@@ -5181,7 +5199,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekly Pipeline \u2014 PitParityCompare DEGRADED (continuing to Evaluator)",
-        "Message": "The PitParityCompare stage (join of the split pit_parity passes \u2014 computes delta_pit_minus_current and writes backtest/{run_date}/pit_parity.json) did not complete \u2014 SSM timeout, crash, or dispatch/poll failure. NON-FATAL: the weekly run continues to Evaluator/ReportCard/Director, but this run produced NO parity verdict; absence of a verdict must NOT be read as a clean pass (sf-pipeline-policy \u00a72.3a). The per-pass artifacts parity/{run_date}/pit_stats_*.json may exist and can be compared on a rerun without re-running the passes (skip_pit_parity_lookahead/skip_pit_parity_walkforward + skip_parity_replay, or scripts/weekly_sf_rerun.py --dry-run). Specifics on the execution record: $.pit_parity_compare_poll / $.pit_parity_compare_error. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "The PitParityCompare stage (join of the split pit_parity passes \u2014 computes delta_pit_minus_current and writes backtest/{run_date}/pit_parity.json) did not complete \u2014 SSM timeout, crash, or dispatch/poll failure. NON-FATAL: the weekly run continues to Evaluator/ReportCard/Director, but this run produced NO parity verdict; absence of a verdict must NOT be read as a clean pass (sf-pipeline-policy \u00a72.3a). The per-pass artifacts parity/{run_date}/pit_stats_*.json may exist and can be compared on a rerun without re-running the passes (skip_pit_parity_lookahead/skip_pit_parity_walkforward + skip_parity_replay, or scripts/weekly_sf_rerun.py --dry-run). Specifics on the execution record: $.pit_parity_compare_poll / $.pit_parity_compare_error. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.parity_compare_degraded_notify",
       "Catch": [
@@ -5586,20 +5604,13 @@
     },
     "SaturdayHealthCheck": {
       "Type": "Task",
-      "Comment": "Check data freshness after full pipeline \u2014 non-blocking (a failure degrades the completion email, it does not halt). Runs from alpha-engine-dashboard post-2026-04-16 health_checker migration. config#2279: deliberately carries NO Retry ladder (declared class: health-observe) \u2014 it is best-effort observability at the tail of an already-green run; its States.ALL Catch fail-softs into the DEGRADED completion path, so a retry ladder would only delay completion, never protect spend. config#2276 timeout convention (both health-observe states): inner executionTimeout = script runtime budget (agent-enforced; its expiry surfaces as a terminal non-Success status the poll Choice turns into health_check_degraded \u2014 it is a runaway bound, no longer a silent kill-and-skip); SSM Parameters.TimeoutSeconds = 60 uniform (DELIVERY timeout \u2014 time for the agent to PICK UP the command, not to run it); outer Task TimeoutSeconds = executionTimeout + 30 (bounds only the async SendCommand API call, which returns in <1s \u2014 pinned to inner+30 so the relation stays coherent if this ever flips to a .sync integration). Budget: executionTimeout raised 60\u2192300 (config#2276): observed successful health_checker.py runs complete in ~2.7-2.8s (n=2 Success in the 30-day SSM history sampled 2026-07-11 \u2014 most runs FAILED sub-second on git-pull collisions, see CheckSaturdayHealthCheckStatus), so 300s is ~100x observed with headroom for S3-latency-bound freshness scans; under the poll loop a generous budget costs nothing on the happy path.",
+      "Comment": "Check data freshness after full pipeline \u2014 non-blocking (a failure degrades the completion email, it does not halt). Runs from alpha-engine-dashboard post-2026-04-16 health_checker migration. config#2279: deliberately carries NO Retry ladder (declared class: health-observe) \u2014 it is best-effort observability at the tail of an already-green run; its States.ALL Catch fail-softs into the DEGRADED completion path, so a retry ladder would only delay completion, never protect spend. config#2276 timeout convention (both health-observe states): inner executionTimeout = script runtime budget (agent-enforced; its expiry surfaces as a terminal non-Success status the poll Choice turns into health_check_degraded \u2014 it is a runaway bound, no longer a silent kill-and-skip); SSM Parameters.TimeoutSeconds = 60 uniform (DELIVERY timeout \u2014 time for the agent to PICK UP the command, not to run it); outer Task TimeoutSeconds = executionTimeout + 30 (bounds only the async SendCommand API call, which returns in <1s \u2014 pinned to inner+30 so the relation stays coherent if this ever flips to a .sync integration). Budget: executionTimeout raised 60\u2192300 (config#2276): observed successful health_checker.py runs complete in ~2.7-2.8s (n=2 Success in the 30-day SSM history sampled 2026-07-11 \u2014 most runs FAILED sub-second on git-pull collisions, see CheckSaturdayHealthCheckStatus), so 300s is ~100x observed with headroom for S3-latency-bound freshness scans; under the poll loop a generous budget costs nothing on the happy path. alpha-engine-config-I7047 (2026-08-12): migrated off the inline `trap 'aws s3 cp ... EXIT'` log-ship wrapper to krepis.ssm_log_capture (mirrors the 17 other Saturday SF stages) \u2014 the trap collapsed under ASL's States.Array escape semantics on EVERY run using it (`trap: s3: invalid signal specification`, rc=127), which is why the 2026-08-08 scheduled run finished DEGRADED despite every real work stage succeeding with ResponseCode 0. Deliberately does NOT thread $.preflight_args: config#902's shell-run comment states this pair has no skip gate by design and runs for-real (not dry) even under shell_run \u2014 threading preflight_args would pass --preflight-only into a health_checker.py invocation that has no such flag.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands": [
-            "set -eo pipefail",
-            "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main",
-            "cd /home/ec2-user/alpha-engine-dashboard",
-            "source .venv/bin/activate",
-            "trap 'aws s3 cp /var/log/health-check.log \"s3://alpha-engine-research/_ssm_logs/health-check/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true' EXIT",
-            "python health_checker.py --alert 2>&1 | tee /var/log/health-check.log"
-          ],
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main','cd /home/ec2-user/alpha-engine-dashboard','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug health-check --log /var/log/health-check.log -- /home/ec2-user/alpha-engine-dashboard/.venv/bin/python health_checker.py --alert',$$.Execution.Name))",
           "executionTimeout": [
             "300"
           ]
@@ -5717,17 +5728,17 @@
       "Comment": "config#2276: the freshness health check could not run to Success (send/poll infra failure via Catch, or terminal non-Success command status via CheckSaturdayHealthCheckStatus.Default). Mirrors the LibPinGateDegraded shape (config#2278): an SF-controlled boolean that threads into the completion-email selection (CheckGateDegradedNotify) so the run emails 'SUCCESS (health checks DEGRADED)' instead of the plain real-run SUCCESS. Specifics live on the execution record: $.health_check_error (Catch path) / $.health_check_poll (status path). Continues to the sibling substrate check \u2014 a degraded freshness check must not skip the independent substrate/ReportCard/Director tail.",
       "Result": true,
       "ResultPath": "$.health_check_degraded",
-      "Next": "WeeklySubstrateHealthCheck"
+      "Next": "SetSaturdayHealthCheckDegradedSummary"
     },
     "WeeklySubstrateHealthCheck": {
       "Type": "Task",
-      "Comment": "Phase 2 \u2192 3 transparency-substrate health check. Validates every row of the transparency inventory (alpha-engine-lib transparency_inventory.yaml) \u2014 agent decisions, predictor decisions, trade lineage, risk events, P&L attribution, config changes, data quality, agent quality, pipeline execution. Per-row CloudWatch metrics emit to AlphaEngine/Substrate so individual rows have their own alarms. Non-blocking (a failure degrades the completion email, it does not halt) \u2014 same pattern as SaturdayHealthCheck. The Sat SF passes --cadence weekly which sweeps weekly + daily rows; the weekday EOD SF runs --cadence daily on the daily-only subset (PR #178 \u2014 DailySubstrateHealthCheck state). config#2279: deliberately carries NO Retry ladder (declared class: health-observe) \u2014 best-effort observability at the tail of an already-green run; its States.ALL Catch fail-softs into the DEGRADED completion path, so a retry ladder would only delay completion, never protect spend. config#2276 \u2014 NO runtime pip: the former in-pipeline `pip install --quiet --upgrade -r requirements.txt` (a live PyPI/network dependency inside an observability stage, with --upgrade able to float unpinned transitive deps past tested versions) was removed; the stage relies on the dashboard box's deploy-time venv sync \u2014 infrastructure/deploy-on-merge.sh in crucible-dashboard runs `.venv/bin/pip install -r requirements.txt` on every merge that diffs requirements.txt, and nousergon-lib is TAG-pinned there (@vX.Y.Z), so a lib bump always changes requirements.txt and always refreshes the same /home/ec2-user/alpha-engine-dashboard/.venv this command activates. Timeout convention + budget: see SaturdayHealthCheck's Comment \u2014 inner 240 (observed Success ~19-20s incl. the since-removed pip; ~12x headroom as a runaway bound), delivery 60, outer = inner + 30. The previous 240/180/240 set conflated the delivery timeout with an execution ceiling (inversion flagged by config#2276).",
+      "Comment": "Phase 2 \u2192 3 transparency-substrate health check. Validates every row of the transparency inventory (alpha-engine-lib transparency_inventory.yaml) \u2014 agent decisions, predictor decisions, trade lineage, risk events, P&L attribution, config changes, data quality, agent quality, pipeline execution. Per-row CloudWatch metrics emit to AlphaEngine/Substrate so individual rows have their own alarms. Non-blocking (a failure degrades the completion email, it does not halt) \u2014 same pattern as SaturdayHealthCheck. The Sat SF passes --cadence weekly which sweeps weekly + daily rows; the weekday EOD SF runs --cadence daily on the daily-only subset (PR #178 \u2014 DailySubstrateHealthCheck state). config#2279: deliberately carries NO Retry ladder (declared class: health-observe) \u2014 best-effort observability at the tail of an already-green run; its States.ALL Catch fail-softs into the DEGRADED completion path, so a retry ladder would only delay completion, never protect spend. config#2276 \u2014 NO runtime pip: the former in-pipeline `pip install --quiet --upgrade -r requirements.txt` (a live PyPI/network dependency inside an observability stage, with --upgrade able to float unpinned transitive deps past tested versions) was removed; the stage relies on the dashboard box's deploy-time venv sync \u2014 infrastructure/deploy-on-merge.sh in crucible-dashboard runs `.venv/bin/pip install -r requirements.txt` on every merge that diffs requirements.txt, and nousergon-lib is TAG-pinned there (@vX.Y.Z), so a lib bump always changes requirements.txt and always refreshes the same /home/ec2-user/alpha-engine-dashboard/.venv this command activates. Timeout convention + budget: see SaturdayHealthCheck's Comment \u2014 inner 240 (observed Success ~19-20s incl. the since-removed pip; ~12x headroom as a runaway bound), delivery 60, outer = inner + 30. The previous 240/180/240 set conflated the delivery timeout with an execution ceiling (inversion flagged by config#2276). alpha-engine-config-I7047 (2026-08-12): the three commands are now a single crucible-dashboard infrastructure/substrate_health_check.sh script, invoked through krepis.ssm_log_capture instead of the inline `trap 'aws s3 cp ... EXIT'` wrapper \u2014 that trap's inner single-quote had to be `\\'`-escaped inside this state's States.Array, and ASL does NOT unescape `\\'` to `'` (it passes the backslash through literally), so bash word-split the trap's own command line into signal names (`trap: s3: invalid signal specification`, rc=127) on EVERY run \u2014 the 2026-08-08 scheduled run finished DEGRADED for exactly this reason despite every real work stage succeeding with ResponseCode 0. Mirrors the 17 other Saturday SF stages already on krepis.ssm_log_capture. Deliberately does NOT thread $.preflight_args \u2014 see SaturdayHealthCheck's Comment; this pair has no skip gate by design and runs for-real even under shell_run, and substrate_health_check.sh has no --preflight-only flag to receive it.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main','cd /home/ec2-user/alpha-engine-dashboard','source .venv/bin/activate','trap \\'aws s3 cp /var/log/substrate-health-check.log \"s3://alpha-engine-research/_ssm_logs/substrate-health-check/$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%SZ).log\" --only-show-errors || true\\' EXIT','python -m nousergon_lib.transparency --cadence weekly --alert 2>&1 | tee /var/log/substrate-health-check.log','echo \\'--- constituents drift check ---\\' | tee -a /var/log/substrate-health-check.log','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data && /home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m validators.constituents_drift_check 2>&1 | tee -a /var/log/substrate-health-check.log','echo \\'--- phase marker sweep ---\\' | tee -a /var/log/substrate-health-check.log',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),'cd /home/ec2-user/alpha-engine-data && /home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m validators.phase_marker_sweep --run-date \"$RUN_DATE\" --alert 2>&1 | tee -a /var/log/substrate-health-check.log')",
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main','sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-dashboard','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug substrate-health-check --log /var/log/substrate-health-check.log -- bash infrastructure/substrate_health_check.sh --run-date {}',$$.Execution.Name,$.run_date))",
           "executionTimeout": [
             "240"
           ]
@@ -5845,7 +5856,7 @@
       "Comment": "config#2276: the substrate health check (or its constituents-drift sub-step) could not run to Success. Mirrors SaturdayHealthCheckDegraded / the LibPinGateDegraded shape (config#2278) \u2014 SF-controlled boolean into the completion-email selection. Shares $.health_check_degraded with the freshness twin DELIBERATELY (one flag family, one degraded Subject \u2014 which check degraded lives on the execution record: $.substrate_check_error / $.substrate_check_poll vs $.health_check_error / $.health_check_poll \u2014 avoiding a per-check combinatorial notifier explosion). Continues to ReportCard: the advisory Lambda tail is independent of the dashboard box and must not be skipped because an EC2 health command failed.",
       "Result": true,
       "ResultPath": "$.health_check_degraded",
-      "Next": "CheckSkipReportCard"
+      "Next": "SetSubstrateHealthCheckDegradedSummary"
     },
     "ReportCard": {
       "Type": "Task",
@@ -5889,7 +5900,7 @@
       "Comment": "config#6685: ReportCard's Catch(States.ALL) could not run advisory grading \u2014 set report_card_degraded=true (SF-controlled boolean, IsPresent-guarded per config#2275) so it threads into the completion-email selection (CheckGateDegradedNotify) same as $.gate_degraded / $.health_check_degraded. Mirrors LibPinGateDegraded / SaturdayHealthCheckDegraded shape exactly. Proceeds to PublishReportCardDegraded (the immediate PAGE alert, config#2302) unchanged.",
       "Result": true,
       "ResultPath": "$.report_card_degraded",
-      "Next": "PublishReportCardDegraded"
+      "Next": "SetReportCardDegradedSummary"
     },
     "PublishReportCardDegraded": {
       "Type": "Task",
@@ -5898,7 +5909,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekly Pipeline \u2014 ReportCard WARNING (Advisory Grading Degraded)",
-        "Message": "ReportCard (the Evaluator Report Card v2 Lambda) failed \u2014 see $.report_card_error on the execution record for detail. This is NON-FATAL: the weekly run's real trading artifacts are unaffected, but the advisory grading layer (report_card.json, and downstream Director) did not run. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "ReportCard (the Evaluator Report Card v2 Lambda) failed \u2014 see $.report_card_error on the execution record for detail. This is NON-FATAL: the weekly run's real trading artifacts are unaffected, but the advisory grading layer (report_card.json, and downstream Director) did not run. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.report_card_degraded_notify",
       "Catch": [
@@ -6174,7 +6185,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (pre-spend gates DEGRADED)",
-        "Message": "All steps completed successfully \u2014 BUT one or both pre-spend gates (LibPinDriftCheck / PipelineContractCheck) could not check and failed OPEN; a gate-degraded alert fired earlier in this run. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "All steps completed successfully \u2014 BUT one or both pre-spend gates (LibPinDriftCheck / PipelineContractCheck) could not check and failed OPEN; a gate-degraded alert fired earlier in this run. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6187,7 +6198,7 @@
           "Next": "NotifyCompleteDegraded"
         }
       ],
-      "Next": "WriteCompletionMarker"
+      "Next": "CheckDegradedOutcome"
     },
     "NotifyCompleteHealthDegraded": {
       "Type": "Task",
@@ -6196,7 +6207,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (health checks DEGRADED)",
-        "Message": "All steps completed successfully \u2014 BUT a post-pipeline health check (SaturdayHealthCheck freshness and/or WeeklySubstrateHealthCheck substrate/constituents-drift) could not run to Success; the run's freshness validation is NOT confirmed. Which check degraded is on the execution record: $.health_check_error / $.health_check_poll (freshness) vs $.substrate_check_error / $.substrate_check_poll (substrate). View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "All steps completed successfully \u2014 BUT a post-pipeline health check (SaturdayHealthCheck freshness and/or WeeklySubstrateHealthCheck substrate/constituents-drift) could not run to Success; the run's freshness validation is NOT confirmed. Which check degraded is on the execution record: $.health_check_error / $.health_check_poll (freshness) vs $.substrate_check_error / $.substrate_check_poll (substrate). View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6209,7 +6220,7 @@
           "Next": "NotifyCompleteDegraded"
         }
       ],
-      "Next": "WriteCompletionMarker"
+      "Next": "CheckDegradedOutcome"
     },
     "NotifyCompleteGatesAndHealthDegraded": {
       "Type": "Task",
@@ -6218,7 +6229,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (gates + health checks DEGRADED)",
-        "Message": "All steps completed successfully \u2014 BUT (1) one or both pre-spend gates (LibPinDriftCheck / PipelineContractCheck) could not check and failed OPEN (a gate-degraded alert fired earlier in this run), AND (2) a post-pipeline health check (SaturdayHealthCheck freshness and/or WeeklySubstrateHealthCheck substrate/constituents-drift) could not run to Success. Specifics are on the execution record: $.health_check_error / $.health_check_poll / $.substrate_check_error / $.substrate_check_poll. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "All steps completed successfully \u2014 BUT (1) one or both pre-spend gates (LibPinDriftCheck / PipelineContractCheck) could not check and failed OPEN (a gate-degraded alert fired earlier in this run), AND (2) a post-pipeline health check (SaturdayHealthCheck freshness and/or WeeklySubstrateHealthCheck substrate/constituents-drift) could not run to Success. Specifics are on the execution record: $.health_check_error / $.health_check_poll / $.substrate_check_error / $.substrate_check_poll. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6231,7 +6242,7 @@
           "Next": "NotifyCompleteDegraded"
         }
       ],
-      "Next": "WriteCompletionMarker"
+      "Next": "CheckDegradedOutcome"
     },
     "NotifyCompleteReportCardDegraded": {
       "Type": "Task",
@@ -6240,7 +6251,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (report card DEGRADED)",
-        "Message": "All steps completed successfully \u2014 BUT ReportCard (the Evaluator Report Card v2 Lambda, advisory grading) failed and did not run; a report-card-degraded alert fired earlier in this run. See $.report_card_error on the execution record for detail. The weekly run's real trading artifacts are unaffected; only the advisory grading layer (report_card.json, and downstream Director) did not run. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "All steps completed successfully \u2014 BUT ReportCard (the Evaluator Report Card v2 Lambda, advisory grading) failed and did not run; a report-card-degraded alert fired earlier in this run. See $.report_card_error on the execution record for detail. The weekly run's real trading artifacts are unaffected; only the advisory grading layer (report_card.json, and downstream Director) did not run. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6253,7 +6264,7 @@
           "Next": "NotifyCompleteDegraded"
         }
       ],
-      "Next": "WriteCompletionMarker"
+      "Next": "CheckDegradedOutcome"
     },
     "NotifyCompleteMultipleDegraded": {
       "Type": "Task",
@@ -6262,7 +6273,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (run DEGRADED)",
-        "Message": "All steps completed successfully \u2014 BUT one or more of the following degraded on this run: the pre-spend gates (LibPinDriftCheck/PipelineContractCheck/AcquireMutex), the tail health checks (SaturdayHealthCheck/WeeklySubstrateHealthCheck), the report card advisory grading (ReportCard Lambda), the Parity verdict (pit_parity/replay \u2014 absence of a verdict must NOT be read as a clean pass), and/or an internal ResearchPredictorParallel fail-open (Scanner/RegimeSubstrate/ChallengerShadow/ThinkTank/the eval-judge chain/cost aggregation/the model-zoo rotation). Exact combination is on the execution record: $.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded / $.research_predictor_degraded, with detail at $.report_card_error and (if set) $.health_check_error / $.substrate_check_error / $.parity_error / $.branch_outcomes. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "All steps completed successfully \u2014 BUT one or more of the following degraded on this run: the pre-spend gates (LibPinDriftCheck/PipelineContractCheck/AcquireMutex), the tail health checks (SaturdayHealthCheck/WeeklySubstrateHealthCheck), the report card advisory grading (ReportCard Lambda), the Parity verdict (pit_parity/replay \u2014 absence of a verdict must NOT be read as a clean pass), and/or an internal ResearchPredictorParallel fail-open (Scanner/RegimeSubstrate/ChallengerShadow/ThinkTank/the eval-judge chain/cost aggregation/the model-zoo rotation). Exact combination is on the execution record: $.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded / $.research_predictor_degraded, with detail at $.report_card_error and (if set) $.health_check_error / $.substrate_check_error / $.parity_error / $.branch_outcomes. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6275,7 +6286,7 @@
           "Next": "NotifyCompleteDegraded"
         }
       ],
-      "Next": "WriteCompletionMarker"
+      "Next": "CheckDegradedOutcome"
     },
     "NotifyCompleteParityDegraded": {
       "Type": "Task",
@@ -6284,7 +6295,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (parity DEGRADED)",
-        "Message": "All steps completed successfully \u2014 BUT the Parity stage (pit_parity look-ahead/walk-forward contamination check + backtester\u2194executor replay) did not complete; a parity-degraded alert fired earlier in this run. This run produced NO parity verdict \u2014 absence of a verdict must NOT be read as a clean pass. See $.parity_poll / $.parity_error on the execution record for detail. The weekly run's real trading artifacts are unaffected; only the parity verdict is missing. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "All steps completed successfully \u2014 BUT the Parity stage (pit_parity look-ahead/walk-forward contamination check + backtester\u2194executor replay) did not complete; a parity-degraded alert fired earlier in this run. This run produced NO parity verdict \u2014 absence of a verdict must NOT be read as a clean pass. See $.parity_poll / $.parity_error on the execution record for detail. The weekly run's real trading artifacts are unaffected; only the parity verdict is missing. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6297,7 +6308,7 @@
           "Next": "NotifyCompleteDegraded"
         }
       ],
-      "Next": "WriteCompletionMarker"
+      "Next": "CheckDegradedOutcome"
     },
     "WriteCompletionMarker": {
       "Type": "Task",
@@ -6307,7 +6318,7 @@
         "Bucket": "alpha-engine-research",
         "Key.$": "States.Format('_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.run_date)",
         "ContentType": "application/json",
-        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\"\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date)"
+        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"substrate_relaunches\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, $.substrate_relaunch_attempts)"
       },
       "Retry": [
         {
@@ -6329,7 +6340,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Preflight Pipeline \u2014 SUCCESS",
-        "Message": "Friday-PM Preflight Pipeline of the Saturday SF completed: all workload states ran in --preflight-only / dry mode, health/substrate checks ran. No Saturday-fatal bootstrap break detected for tomorrow's 02:00 PT real run. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "Friday-PM Preflight Pipeline of the Saturday SF completed: all workload states ran in --preflight-only / dry mode, health/substrate checks ran. No Saturday-fatal bootstrap break detected for tomorrow's 02:00 PT real run. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6342,18 +6353,19 @@
           "Next": "NotifyShellRunCompleteDegraded"
         }
       ],
-      "End": true
+      "Next": "CheckShellRunDegradedOutcome"
     },
     "NotifyShellRunCompleteDegraded": {
       "Type": "Pass",
-      "Comment": "config#1819 \u2014 records the caught publish failure as execution DATA ($.notify_degraded, visible via GetExecutionHistory / the SF console) so an operator inspecting a degraded-but-SUCCEEDED execution can see why. NOT itself a CloudWatch alarm source: PassStateExited only logs at LoggingConfiguration Level:ALL, and this SF (like the other CFN-managed SFs) deliberately runs Level:ERROR for log volume/cost \u2014 see WeeklyFreshnessLogGroup comment. The real-time alarm signal for this failure class is the TaskFailed event from NotifyShellRunComplete's own Catch (logged at ERROR unconditionally) matched by SnsPublishFailedMetricFilter.",
+      "Comment": "config#1819 \u2014 records the caught publish failure as execution DATA ($.notify_degraded, visible via GetExecutionHistory / the SF console) so an operator inspecting a degraded-but-SUCCEEDED execution can see why. NOT itself a CloudWatch alarm source: PassStateExited only logs at LoggingConfiguration Level:ALL, and this SF (like the other CFN-managed SFs) deliberately runs Level:ERROR for log volume/cost \u2014 see WeeklyFreshnessLogGroup comment. The real-time alarm signal for this failure class is the TaskFailed event from NotifyShellRunComplete's own Catch (logged at ERROR unconditionally) matched by SnsPublishFailedMetricFilter. alpha-engine-config-I6891: this state carried End: true \u2014 a Friday-PM preflight whose completion notification failed terminated SUCCEEDED while flagged degraded, the exact shape the Option-A ruling forbids. Now routes to the shared DegradedRun terminal. It deliberately does NOT pass through WriteCompletionMarkerDegraded: the preflight dry-pass is not a weekly completion, and marking it would let a dry run satisfy the weekly SLA \u2014 the same exclusion WriteCompletionMarker already states.",
       "Parameters": {
         "degraded": true,
-        "source": "NotifyShellRunComplete",
-        "error.$": "$.notify_error"
+        "reason": "weekly_preflight_notify_fail_open",
+        "run_date.$": "$.run_date",
+        "stage_error.$": "$.notify_error"
       },
-      "ResultPath": "$.notify_degraded",
-      "End": true
+      "ResultPath": "$.degraded_summary",
+      "Next": "DegradedRun"
     },
     "NotifyComplete": {
       "Type": "Task",
@@ -6362,7 +6374,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS",
-        "Message": "All steps completed successfully. View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "All steps completed successfully. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6375,18 +6387,19 @@
           "Next": "NotifyCompleteDegraded"
         }
       ],
-      "Next": "WriteCompletionMarker"
+      "Next": "CheckDegradedOutcome"
     },
     "NotifyCompleteDegraded": {
       "Type": "Pass",
-      "Comment": "config#1819 \u2014 records the caught publish failure as execution DATA ($.notify_degraded, visible via GetExecutionHistory / the SF console) so an operator inspecting a degraded-but-SUCCEEDED execution can see why. NOT itself a CloudWatch alarm source: PassStateExited only logs at LoggingConfiguration Level:ALL, and this SF (like the other CFN-managed SFs) deliberately runs Level:ERROR for log volume/cost \u2014 see WeeklyFreshnessLogGroup comment. The real-time alarm signal for this failure class is the TaskFailed event from NotifyComplete's own Catch (logged at ERROR unconditionally) matched by SnsPublishFailedMetricFilter.",
+      "Comment": "config#1819 \u2014 records the caught publish failure as execution DATA ($.notify_degraded, visible via GetExecutionHistory / the SF console) so an operator inspecting a degraded-but-SUCCEEDED execution can see why. NOT itself a CloudWatch alarm source: PassStateExited only logs at LoggingConfiguration Level:ALL, and this SF (like the other CFN-managed SFs) deliberately runs Level:ERROR for log volume/cost \u2014 see WeeklyFreshnessLogGroup comment. The real-time alarm signal for this failure class is the TaskFailed event from NotifyComplete's own Catch (logged at ERROR unconditionally) matched by SnsPublishFailedMetricFilter. alpha-engine-config-I6891: rewritten from ResultPath $.notify_degraded / field `source` to the fleet-wide $.degraded_summary / `reason` shape every other definition uses, so one consumer reads all three. A completion notification that could not publish is a DEGRADED run, not a clean one: nobody was told the run finished, which is precisely the condition the status-keyed watchers exist to cover. It still does not fail the pipeline mid-flight \u2014 the fail-open continuation is unchanged, only the honesty of the terminal.",
       "Parameters": {
         "degraded": true,
-        "source": "NotifyComplete",
-        "error.$": "$.notify_error"
+        "reason": "weekly_completion_notify_fail_open",
+        "run_date.$": "$.run_date",
+        "stage_error.$": "$.notify_error"
       },
-      "ResultPath": "$.notify_degraded",
-      "Next": "WriteCompletionMarker"
+      "ResultPath": "$.degraded_summary",
+      "Next": "CheckDegradedOutcome"
     },
     "ExtractMorningEnrichError": {
       "Type": "Pass",
@@ -6408,7 +6421,7 @@
         "poll.$": "$.morning_enrich_poll"
       },
       "ResultPath": "$.error",
-      "Next": "NormalizeFailureContext"
+      "Next": "SubstrateRelaunchGate"
     },
     "ExtractDataPhase1Error": {
       "Type": "Pass",
@@ -6430,7 +6443,7 @@
         "poll.$": "$.data_phase1_poll"
       },
       "ResultPath": "$.error",
-      "Next": "NormalizeFailureContext"
+      "Next": "SubstrateRelaunchGate"
     },
     "ExtractBacktesterError": {
       "Type": "Pass",
@@ -6448,7 +6461,7 @@
       "Comment": "THE VISIBLE PARITY DEGRADED FLAG (alpha-engine-config-I6025, restructured by alpha-engine-config#6030). Reached when ANY parity branch recorded DEGRADED (CheckParityBranchOutcomes) or the ParityParallel hit a genuine SF-engine error (its backstop Catch). An SF-controlled flag that (a) pages distinctly via PublishParityDegraded and (b) lands on the execution record ($.parity_degraded=true, per-branch specifics at $.parity_branch_outcomes and the per-branch $.*_poll/$.*_error paths) so a pipeline-status reader can tell 'parity measured clean' from 'parity not fully measured'. One of exactly TWO legal writers of $.parity_degraded (the other: ParityCompareDegraded) \u2014 pinned by tests/test_sf_parity_degraded_wiring.py. weekly-sf-policy \u00a72.3 honest-degradation: the run CONTINUES \u2014 to the PitParityCompare join (which emits verdict UNKNOWN for missing pass artifacts, \u00a72.3a), then Evaluator/ReportCard/Director.",
       "Result": true,
       "ResultPath": "$.parity_degraded",
-      "Next": "PublishParityDegraded"
+      "Next": "SetParityDegradedSummary"
     },
     "PublishParityDegraded": {
       "Type": "Task",
@@ -6457,7 +6470,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekly Pipeline \u2014 Parity branch DEGRADED (compare will emit UNKNOWN)",
-        "Message": "One or more parity branches (PitParityLookahead / PitParityWalkforward / ParityReplay) did not complete \u2014 SSM timeout, crash, dispatch/poll failure, or poll-budget exhaustion. NON-FATAL and sibling-isolated: the other branches finished independently, and the weekly run continues to PitParityCompare \u2192 Evaluator/ReportCard/Director. The compare will emit the parity verdict as UNKNOWN for any missing pass artifact \u2014 absence of a verdict must NOT be read as a clean pass (sf-pipeline-policy \u00a72.3a). Which branch: $.parity_branch_outcomes on the execution record (per-branch specifics at $.pit_parity_lookahead_poll / $.pit_parity_walkforward_poll / $.parity_replay_poll and *_error). Rerun ONLY the failed branch via scripts/weekly_sf_rerun.py --dry-run (it derives skip flags for the completed branches). View pipeline status: https://console.nousergon.ai/pipeline-status"
+        "Message": "One or more parity branches (PitParityLookahead / PitParityWalkforward / ParityReplay) did not complete \u2014 SSM timeout, crash, dispatch/poll failure, or poll-budget exhaustion. NON-FATAL and sibling-isolated: the other branches finished independently, and the weekly run continues to PitParityCompare \u2192 Evaluator/ReportCard/Director. The compare will emit the parity verdict as UNKNOWN for any missing pass artifact \u2014 absence of a verdict must NOT be read as a clean pass (sf-pipeline-policy \u00a72.3a). Which branch: $.parity_branch_outcomes on the execution record (per-branch specifics at $.pit_parity_lookahead_poll / $.pit_parity_walkforward_poll / $.parity_replay_poll and *_error). Rerun ONLY the failed branch via scripts/weekly_sf_rerun.py --dry-run (it derives skip flags for the completed branches). View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.parity_degraded_notify",
       "Catch": [
@@ -6544,7 +6557,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject.$": "States.Format('Alpha Engine Saturday{} Pipeline \u2014 FAILED', $.pipeline_label)",
-        "Message.$": "States.Format('Saturday{} Pipeline failed. Error: {}. View the failing state + per-state detail at https://console.nousergon.ai/pipeline-status  (redrive-execution is a no-op on this pipeline: every Task Catch routes to this shared FailExecution state, so redrive just re-enters FailExecution and re-fails immediately with no retry. To retry MECHANICALLY: from a nousergon-data checkout run  python3 scripts/weekly_sf_rerun.py --dry-run  -- it derives the original run_date + the correct skip_* set from this failed execution and handles the run-slot mutex; review, then rerun with --start. Manual fallback: start a fresh execution with skip_* input flags set true for stages already completed, e.g. skip_morning_enrich / skip_data_phase1 / skip_backtester -- see infrastructure/README.md for the full flag list and rationale.)', $.pipeline_label, States.JsonToString($.error))"
+        "Message.$": "States.Format('Saturday{} Pipeline failed. Error: {}. View the failing state + per-state detail at https://dashboard.nousergon.ai/pipeline-status  (redrive-execution is a no-op on this pipeline: every Task Catch routes to this shared FailExecution state, so redrive just re-enters FailExecution and re-fails immediately with no retry. To retry MECHANICALLY: from a nousergon-data checkout run  python3 scripts/weekly_sf_rerun.py --dry-run  -- it derives the original run_date + the correct skip_* set from this failed execution and handles the run-slot mutex; review, then rerun with --start. Manual fallback: start a fresh execution with skip_* input flags set true for stages already completed, e.g. skip_morning_enrich / skip_data_phase1 / skip_backtester -- see infrastructure/README.md for the full flag list and rationale.)', $.pipeline_label, States.JsonToString($.error))"
       },
       "ResultPath": "$.failure_notify",
       "Next": "FailExecution"
@@ -6645,7 +6658,7 @@
       "Comment": "The evaluator Lambda-SHA gate could not CHECK (Lambda failure after retries, or a payload without has_drift). Fail-open \u2014 availability over gating for a weekly pipeline \u2014 but VISIBLE: gate_degraded=true threads into the completion email, and PublishEvaluatorGateDegraded alerts NOW. Mirrors LibPinGateDegraded/PipelineContractGateDegraded.",
       "Result": true,
       "ResultPath": "$.gate_degraded",
-      "Next": "PublishEvaluatorGateDegraded"
+      "Next": "SetEvaluatorGateDegradedSummary"
     },
     "PublishEvaluatorGateDegraded": {
       "Type": "Task",
@@ -6759,7 +6772,7 @@
       "Comment": "The director Lambda's drift gate could not CHECK. Fail-open + VISIBLE, mirrors EvaluatorGateDegraded.",
       "Result": true,
       "ResultPath": "$.gate_degraded",
-      "Next": "PublishEvaluatorDirectorGateDegraded"
+      "Next": "SetEvaluatorDirectorGateDegradedSummary"
     },
     "PublishEvaluatorDirectorGateDegraded": {
       "Type": "Task",
@@ -7009,7 +7022,7 @@
         {
           "Variable": "$.weekly_freshness_spot_poll.Status",
           "StringEquals": "Success",
-          "Next": "CheckShellRun"
+          "Next": "RouteAfterBootstrapSuccess"
         },
         {
           "And": [
@@ -7304,7 +7317,7 @@
         "poll.$": "$.backtester_poll"
       },
       "ResultPath": "$.error",
-      "Next": "NormalizeFailureContext"
+      "Next": "SubstrateRelaunchGate"
     },
     "PredictorBacktestLivenessGate": {
       "Type": "Choice",
@@ -7343,7 +7356,7 @@
         "poll.$": "$.predictor_backtest_poll"
       },
       "ResultPath": "$.error",
-      "Next": "NormalizeFailureContext"
+      "Next": "SubstrateRelaunchGate"
     },
     "PortfolioOptimizerBacktestLivenessGate": {
       "Type": "Choice",
@@ -7382,7 +7395,7 @@
         "poll.$": "$.portfolio_optimizer_poll"
       },
       "ResultPath": "$.error",
-      "Next": "NormalizeFailureContext"
+      "Next": "SubstrateRelaunchGate"
     },
     "EvaluatorDiagnosticsLivenessGate": {
       "Type": "Choice",
@@ -7421,7 +7434,7 @@
         "poll.$": "$.evaluator_diagnostics_poll"
       },
       "ResultPath": "$.error",
-      "Next": "NormalizeFailureContext"
+      "Next": "SubstrateRelaunchGate"
     },
     "EvaluatorOptimizeLivenessGate": {
       "Type": "Choice",
@@ -7460,7 +7473,7 @@
         "poll.$": "$.evaluator_optimize_poll"
       },
       "ResultPath": "$.error",
-      "Next": "NormalizeFailureContext"
+      "Next": "SubstrateRelaunchGate"
     },
     "WeeklyFreshnessSpotBootstrapLivenessGate": {
       "Type": "Choice",
@@ -7497,6 +7510,428 @@
         "phase": "WeeklyFreshnessSpotBootstrap/SubstrateLost",
         "source": "WeeklyFreshnessSpotBootstrapLivenessGate.SubstrateLost",
         "poll.$": "$.weekly_freshness_spot_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "SubstrateRelaunchGate"
+    },
+    "SetLibPinGateDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state PublishLibPinGateDegraded routed to before. Split from LibPinGateDegraded because a Pass has exactly one ResultPath and LibPinGateDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_lib_pin_gate_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishLibPinGateDegraded"
+    },
+    "SetPipelineContractGateDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state PublishPipelineContractGateDegraded routed to before. Split from PipelineContractGateDegraded because a Pass has exactly one ResultPath and PipelineContractGateDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_pipeline_contract_gate_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishPipelineContractGateDegraded"
+    },
+    "SetMutexAcquireDegradedFlagSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state PublishMutexAcquireDegraded routed to before. Split from SetMutexAcquireDegradedFlag because a Pass has exactly one ResultPath and SetMutexAcquireDegradedFlag's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_mutex_acquire_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishMutexAcquireDegraded"
+    },
+    "SetEvaluatorGateDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state PublishEvaluatorGateDegraded routed to before. Split from EvaluatorGateDegraded because a Pass has exactly one ResultPath and EvaluatorGateDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_evaluator_deploy_drift_gate_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishEvaluatorGateDegraded"
+    },
+    "SetEvaluatorDirectorGateDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state PublishEvaluatorDirectorGateDegraded routed to before. Split from EvaluatorDirectorGateDegraded because a Pass has exactly one ResultPath and EvaluatorDirectorGateDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_evaluator_director_deploy_drift_gate_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishEvaluatorDirectorGateDegraded"
+    },
+    "SetResearchPredictorDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state CheckSkipBacktester routed to before. Split from SetResearchPredictorDegraded because a Pass has exactly one ResultPath and SetResearchPredictorDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_research_predictor_branch_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "CheckSkipBacktester"
+    },
+    "SetParityDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state PublishParityDegraded routed to before. Split from ParityDegraded because a Pass has exactly one ResultPath and ParityDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_parity_verdict_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishParityDegraded"
+    },
+    "SetParityCompareDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state PublishParityCompareDegraded routed to before. Split from ParityCompareDegraded because a Pass has exactly one ResultPath and ParityCompareDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_pit_parity_compare_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishParityCompareDegraded"
+    },
+    "SetSaturdayHealthCheckDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state WeeklySubstrateHealthCheck routed to before. Split from SaturdayHealthCheckDegraded because a Pass has exactly one ResultPath and SaturdayHealthCheckDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_freshness_health_check_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "WeeklySubstrateHealthCheck"
+    },
+    "SetSubstrateHealthCheckDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state CheckSkipReportCard routed to before. Split from SubstrateHealthCheckDegraded because a Pass has exactly one ResultPath and SubstrateHealthCheckDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_substrate_health_check_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "CheckSkipReportCard"
+    },
+    "SetReportCardDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state PublishReportCardDegraded routed to before. Split from ReportCardDegraded because a Pass has exactly one ResultPath and ReportCardDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_report_card_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishReportCardDegraded"
+    },
+    "CheckDegradedOutcome": {
+      "Type": "Choice",
+      "Comment": "Option-A parity for the weekly pipeline (alpha-engine-config-I6891). The 2026-07-28 Option-A ruling (alpha-engine-config#2699) reached both weekday definitions (#6692, #6722) and never reached this one: every degraded weekly run terminated SUCCEEDED and wrote a completion marker claiming status SUCCEEDED, so a run that did not really work counted as one that did. sf-pipeline-policy.md 2.3: a degraded run writes status DEGRADED and ends in a Fail state so status-keyed watchers engage. This is the single chokepoint every real-completion path now passes through, so a fail-open route added later inherits the honest terminal by writing $.degraded_summary and touching nothing here. $.degraded_summary is only assigned on a degraded path \u2014 a fully green run never sets it \u2014 so the IsPresent guard is load-bearing: an unguarded dereference throws States.Runtime at the last state of an otherwise successful weekly run (the config-I2767 shape, mirrored from step_function_daily.json's CheckDegradedOutcome). Absent flag = never degraded = WriteCompletionMarker via Default, which is the semantically exact reading.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.degraded_summary.degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.degraded_summary.degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "WriteCompletionMarkerDegraded"
+        }
+      ],
+      "Default": "WriteCompletionMarker"
+    },
+    "CheckShellRunDegradedOutcome": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I6891: the Friday-PM preflight twin of CheckDegradedOutcome. The shell-run branch leaves CheckShellRunNotify BEFORE CheckGateDegradedNotify, so a preflight run whose gates, health checks, parity verdict or report card degraded previously ended SUCCEEDED with no honest terminal at all \u2014 the same defect as the real-run path, on the path that exists to prove the real run will work. Same IsPresent guard, same DegradedRun terminal; neither edge writes a completion marker, because a preflight dry-pass is not a weekly completion (see WriteCompletionMarker).",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.degraded_summary.degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.degraded_summary.degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "DegradedRun"
+        }
+      ],
+      "Default": "ShellRunComplete"
+    },
+    "ShellRunComplete": {
+      "Type": "Succeed",
+      "Comment": "alpha-engine-config-I6891: the clean Friday-PM preflight terminal. Byte-equivalent in outcome to the End: true NotifyShellRunComplete previously carried \u2014 a green preflight still ends SUCCEEDED and still writes no completion marker; only the degraded edge changed."
+    },
+    "WriteCompletionMarkerDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I6891, the DEGRADED twin of WriteCompletionMarker (shape mirrored from step_function_daily.json per the shared-code rule). Writes the SAME key as the clean marker with status DEGRADED and the full $.degraded_summary embedded, so a marker reader (pipeline-watchdog, sf-telegram-notifier, weekly_sf_recovery_metric) can tell a run that really worked from one that only ended. Deliberately EXCLUDES the Friday-PM preflight paths for the same reason WriteCompletionMarker does. No swallow-all Catch, same as the clean twin: a marker that cannot be written means this execution's own completion is unverifiable, which is the ambiguity the feature exists to surface rather than mask. ResultPath is LOAD-BEARING, not hygiene (alpha-engine-config-I6891): a Task with no ResultPath defaults to $, so the putObject result REPLACES the whole state input and the DegradedRun terminal's CausePath dereference of $.degraded_summary.reason cannot resolve. The execution then fails with States.Runtime instead of DegradedRun \u2014 and Error: DegradedRun is a consumer contract: sf-telegram-notifier's _is_degraded_run() keys its DEGRADED rendering off exactly that string, so every honestly-degraded run rendered as an ordinary crash-red FAILED with a truncated cause. Shipped in both weekday definitions since config#6692/#6722; the weekly one inherited it by mirroring them and it is fixed in all three here.",
+      "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+      "Parameters": {
+        "Bucket": "alpha-engine-research",
+        "Key.$": "States.Format('_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.run_date)",
+        "ContentType": "application/json",
+        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"degraded_summary\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, States.JsonToString($.degraded_summary))"
+      },
+      "ResultPath": "$.degraded_marker_result",
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 3,
+          "IntervalSeconds": 2,
+          "BackoffRate": 2.0,
+          "Comment": "Transient S3 fault coverage \u2014 mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
+        }
+      ],
+      "Next": "DegradedRun"
+    },
+    "DegradedRun": {
+      "Type": "Fail",
+      "Error": "DegradedRun",
+      "CausePath": "States.Format('Weekly freshness pipeline DEGRADED \u2014 reason: {}. Full degraded_summary: {}. Per the 2026-07-28 Option-A ruling (alpha-engine-config#2699), ported to this weekly SF via alpha-engine-config-I6891: a degraded run must FAIL so status-keyed watchers (sf-watch, EventBridge, sf-telegram-notifier) engage with zero new plumbing, and so a run that did not really work stops counting as one that did. The run was never aborted mid-pipeline \u2014 every fail-open continuation is unchanged; only the honesty of the terminal changes.', $.degraded_summary.reason, States.JsonToString($.degraded_summary))"
+    },
+    "RouteAfterBootstrapSuccess": {
+      "Type": "Choice",
+      "Comment": "A bootstrapped launcher box means one of two things. First boot: fall through to CheckShellRun and run the pipeline from stage 1. REPLACEMENT box after a substrate loss: resume at the interrupted stage instead -- falling through would re-run every stage the lost box already completed, which for the weekly pipeline means duplicate side effects (config#2252: duplicate model-zoo promotion emails) on top of hours of wasted compute.",
+      "Choices": [
+        {
+          "Variable": "$.substrate_relaunch_attempts",
+          "NumericGreaterThan": 0,
+          "Next": "ResumeAfterSubstrateRelaunch"
+        }
+      ],
+      "Default": "CheckShellRun"
+    },
+    "SubstrateRelaunchGate": {
+      "Type": "Choice",
+      "Comment": "Substrate loss is an INFRASTRUCTURE event, not a workload failure: the ephemeral launcher spot was reclaimed (StatusDetails Undeliverable/Terminated) before the stage could report. Measured 2026-08-12: 3 of 11 recent spot requests in this account died instance-terminated-no-capacity, and one of them killed that day's scheduled weekly run mid-DataPhase1 (resource ids in config-I7119). Failing the execution here made every such reclaim a MANUAL recovery via scripts/weekly_sf_rerun.py -- detected-and-paged, which principles.md #3 counts as partial coverage, not automation. ONE bounded relaunch, forced ON-DEMAND: an on-demand box cannot be reclaimed, so a second substrate loss in the same execution is a genuine anomaly and stays terminal (and stays recoverable by weekly_sf_rerun.py, which is unchanged). The counter is spent per EXECUTION, not per stage, so this can never loop.",
+      "Choices": [
+        {
+          "Variable": "$.substrate_relaunch_attempts",
+          "NumericLessThan": 1,
+          "Next": "RecordSubstrateRelaunchAttempt"
+        }
+      ],
+      "Default": "SetSubstrateRelaunchExhaustedError"
+    },
+    "SetSubstrateRelaunchExhaustedError": {
+      "Type": "Pass",
+      "Comment": "Overwrites $.error rather than passing the stage's own substrate-lost error through: by the time the budget is spent, the operator-relevant fact is that the run lost TWO launcher boxes, which is a capacity event, not a DataPhase1 event. Writing $.error here is also what keeps this path inside the guaranteed-$.error chokepoint HandleFailure's States.JsonToString($.error) depends on.",
+      "Parameters": {
+        "phase": "SubstrateRelaunch/Exhausted",
+        "source": "SubstrateRelaunchGate.Exhausted",
+        "detail": "launcher spot lost again after a forced on-demand relaunch; recover with scripts/weekly_sf_rerun.py",
+        "prior.$": "$.error"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "RecordSubstrateRelaunchAttempt": {
+      "Type": "Pass",
+      "Comment": "Spend the attempt BEFORE launching. If the relaunch or its bootstrap is itself lost, the gate is already exhausted and the execution fails loud instead of relaunching forever.",
+      "Result": 1,
+      "ResultPath": "$.substrate_relaunch_attempts",
+      "Next": "RelaunchWeeklyFreshnessSpot"
+    },
+    "RelaunchWeeklyFreshnessSpot": {
+      "Type": "Task",
+      "Comment": "Replacement launcher box after substrate loss. Identical to DispatchWeeklyFreshnessSpot except (a) force_on_demand=true -- the dispatcher has accepted that flag since config#2248 with the comment 'reserved for a future bounded retry-on-relaunch ... no current caller sets it', and this is that caller; spot-first here would re-enter the same exhausted pool that just reclaimed the box -- and (b) TimeoutSeconds 540 rather than 600, so the SF budget is the SMALLER of the two ceilings and is therefore the one that actually fires (config-I6897: an SF lambda:invoke declares two timeouts and only the smaller binds; DispatchWeeklyFreshnessSpot's own 600-vs-600 race is grandfathered in that issue and is deliberately NOT reproduced here). 540s is ample: the dispatcher fires the SSM bootstrap ASYNCHRONOUSLY and returns without waiting for the multi-minute clone + venv build.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-weekly-freshness-spot-dispatcher",
+        "Payload": {
+          "execution_id.$": "$$.Execution.Id",
+          "force_on_demand": true
+        }
+      },
+      "TimeoutSeconds": 540,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException",
+            "Lambda.SdkClientException"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 15,
+          "BackoffRate": 2.0
+        },
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "Comment": "config#2248: the launcher-box launch itself (spot capacity rotation, SSM-online wait) can transiently fail the same way any other spot dispatch in this fleet does \u2014 one backed-off retry before falling into the fail-loud Catch below.",
+          "MaxAttempts": 1,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ExtractWeeklyFreshnessSpotDispatchError",
+          "ResultPath": "$.weekly_freshness_spot_error"
+        }
+      ],
+      "ResultSelector": {
+        "instance_id.$": "$.Payload.instance_id",
+        "market.$": "$.Payload.market",
+        "command_id.$": "$.Payload.command_id",
+        "run_token.$": "$.Payload.run_token"
+      },
+      "ResultPath": "$.weekly_freshness_spot_result",
+      "Next": "MergeRelaunchedSpotInstanceId"
+    },
+    "MergeRelaunchedSpotInstanceId": {
+      "Type": "Pass",
+      "Comment": "Shallow JsonMerge with the new object second: $.ec2_instance_id is REPLACED, not appended. Every downstream SSM state addresses $.ec2_instance_id, so the replacement box is picked up everywhere at once. Then re-enter the SHARED bootstrap poll loop (InitWeeklyFreshnessSpotBootstrapPollCount) rather than a duplicate one, so a second substrate loss during re-bootstrap is handled by the same WeeklyFreshnessSpotBootstrapLivenessGate that handles the first.",
+      "Parameters": {
+        "merged.$": "States.JsonMerge($, States.StringToJson(States.Format('\\{\"ec2_instance_id\":[\"{}\"]\\}', $.weekly_freshness_spot_result.instance_id)), false)"
+      },
+      "OutputPath": "$.merged",
+      "Next": "InitWeeklyFreshnessSpotBootstrapPollCount"
+    },
+    "ResumeAfterSubstrateRelaunch": {
+      "Type": "Choice",
+      "Comment": "Re-enter the pipeline at the interrupted stage, keyed off the phase label the Extract*SubstrateLostError normalizer already writes to $.error.phase -- the same label that reaches the SNS body, so the recovery path and the failure telemetry cannot drift apart. Each target is the stage's Task state, whose Next is its Init*PollCount state, so the stage's poll counter resets naturally. Every rule IsPresent-guards the path before dereferencing it (config#2275). Default is fail-loud: an unrecognised phase means a stage gained a substrate-lost branch without gaining a resume target, and guessing would silently skip work.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.error.phase",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.error.phase",
+              "StringEquals": "MorningEnrich/SubstrateLost"
+            }
+          ],
+          "Next": "MorningEnrich"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.error.phase",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.error.phase",
+              "StringEquals": "DataPhase1/SubstrateLost"
+            }
+          ],
+          "Next": "DataPhase1"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.error.phase",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.error.phase",
+              "StringEquals": "Backtester/SubstrateLost"
+            }
+          ],
+          "Next": "Backtester"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.error.phase",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.error.phase",
+              "StringEquals": "PredictorBacktest/SubstrateLost"
+            }
+          ],
+          "Next": "PredictorBacktest"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.error.phase",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.error.phase",
+              "StringEquals": "PortfolioOptimizerBacktest/SubstrateLost"
+            }
+          ],
+          "Next": "PortfolioOptimizerBacktest"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.error.phase",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.error.phase",
+              "StringEquals": "EvaluatorDiagnostics/SubstrateLost"
+            }
+          ],
+          "Next": "EvaluatorDiagnostics"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.error.phase",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.error.phase",
+              "StringEquals": "EvaluatorOptimize/SubstrateLost"
+            }
+          ],
+          "Next": "EvaluatorOptimize"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.error.phase",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.error.phase",
+              "StringEquals": "WeeklyFreshnessSpotBootstrap/SubstrateLost"
+            }
+          ],
+          "Next": "CheckShellRun"
+        }
+      ],
+      "Default": "SetSubstrateResumeUnknownPhaseError"
+    },
+    "SetSubstrateResumeUnknownPhaseError": {
+      "Type": "Pass",
+      "Comment": "A relaunched box with no resume target. Unreachable by construction (tests/test_sf_substrate_relaunch_wiring.py derives the phase set from the definition), so reaching it means the definition changed without the wiring test -- fail loud and name that, rather than falling through to a stage and silently skipping the work the lost box never did.",
+      "Parameters": {
+        "phase": "SubstrateRelaunch/UnknownResumePhase",
+        "source": "ResumeAfterSubstrateRelaunch.Default",
+        "detail": "relaunched launcher box has no resume target for this $.error.phase; the stage gained a substrate-lost branch without a resume branch",
+        "prior.$": "$.error"
       },
       "ResultPath": "$.error",
       "Next": "NormalizeFailureContext"

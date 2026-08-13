@@ -1,0 +1,103 @@
+name: Pause Reconcile
+
+# alpha-engine-config-I7118. Three registers each claim whether a scheduled
+# trigger is off, and until this workflow nothing compared them:
+#
+#   1. infrastructure/automation_pause.json — Brian's rulings.
+#   2. The fleet observability registry's `lifecycle` declarations, read from
+#      s3://alpha-engine-research/ops/registry/observability.d/ — the copy
+#      nous-ergon-ops/.github/workflows/observability-registry-publish.yml syncs
+#      on every merge that changes it, and the same copy the console reads.
+#   3. Live AWS — every EventBridge rule and Scheduler schedule in the account.
+#
+# sf-arn-drift-check.yml's `automation_pause.py --check` step already grades (1)
+# against (3), but only for the names (1) happens to list: its coverage is
+# HAND-LISTED, which is observability-policy.md §2.2's defect one level up from
+# the one the manifest fixes. This enumerates the account instead, so a trigger
+# nobody named is a finding by construction. It also grades (2) against (1),
+# which nothing did at all — a registry row saying `lifecycle: disabled` because
+# a manifest entry said so is a hand-copied assertion about a file in another
+# repository, and a row saying DISABLED renders green-adjacent, is excluded from
+# staleness_honesty's violation set and is exempt from ABSENT candidacy. A
+# component running again behind one is silent in every surface, which is worse
+# than the UNREPORTED it replaced, because UNREPORTED is loud.
+#
+# WHY ITS OWN WORKFLOW RATHER THAN A STEP IN sf-arn-drift-check.yml. It publishes
+# its own console row, so it is its own COMPONENT, and a component's identity on
+# the `repos` substrate is derived from the workflow file that runs it
+# (`observability_registry.py::discover`). As a step it was reported ABSENT —
+# the row existed, the discoverer found only `nousergon-data-sf-arn-drift-check`,
+# and the two could not join. Sharing a workflow would also make this check's
+# failure indistinguishable from any other step's on that workflow's row.
+#
+# NOT a pull_request check, for the reason sf-arn-drift-check.yml states at
+# length: every comparison here is CODIFIED-or-DECLARED vs LIVE, which says
+# nothing about a PR's diff and would put a red X on PRs that did not cause it
+# and cannot clear it. Graded post-merge and daily out of band.
+#
+# It is a GitHub Actions cron by design: outside the AWS pause entirely, so the
+# observer cannot be disarmed by the ruling it observes (overseer-policy.md
+# invariant 1 — the watcher sits outside its subject's dependency cone).
+#
+# DETECT-ONLY, structurally. tests/test_pause_reconcile.py asserts the module
+# contains no mutating verb. Editing a lifecycle declaration because a manifest
+# entry moved would INFER a decision from a file diff, which
+# observability-policy.md §8.3 forbids.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/automation_pause.json'
+      - 'infrastructure/automation_pause.py'
+      - 'infrastructure/pause_reconcile.py'
+      - '.github/workflows/pause-reconcile.yml'
+  schedule:
+    - cron: '50 9 * * *'   # daily, after the 09:30 SF-ARN sweep and the 09:35 IAM one
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # --publish writes the console row through the canonical envelope builder
+      # rather than a second hand-rolled JSON shape (shared-code-policy: one
+      # shape, every call site). Same pin as requirements.txt, for the reason
+      # deploy-infrastructure.yml states.
+      - name: Install nousergon-lib (envelope builder for the console row)
+        run: pip install "nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.49"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-iam-drift-check
+          aws-region: us-east-1
+
+      # No `if:` — the invariant is about live state, so it is graded on every
+      # trigger this workflow has. tests/test_pause_reconcile.py::
+      # test_ci_runs_the_reconcile pins that, the same reachability regression
+      # test_ci_runs_the_pause_check exists to prevent.
+      #
+      # --publish is best-effort by construction (fleet_check_result.emit never
+      # raises): a check must not go red because its telemetry did. The verdict
+      # is the exit code, and it is unaffected either way.
+      - name: Pause manifest vs observability registry vs live AWS
+        run: python3 infrastructure/pause_reconcile.py --check --publish
+
+      # The record on every run, green ones included, so the verdict is readable
+      # without re-deriving it. `always()` because it is most worth reading on
+      # the run where the step above failed.
+      - name: Publish the reconcile record to the run summary
+        if: always()
+        run: python3 infrastructure/pause_reconcile.py --check --json | tee -a "$GITHUB_STEP_SUMMARY"
