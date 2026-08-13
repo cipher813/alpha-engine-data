@@ -477,11 +477,32 @@ class TestEvalJudgeProcessContract:
             == "$.eval_judge_submit.Payload.plan_s3_key"
         )
 
-    def test_process_timeout_matches_lambda_cap(self, states):
-        # Process Lambda has the 15-min ceiling — covers streaming
-        # results + the synchronous Sonnet-escalation tail (typically
-        # 1-3 calls × 5-8s each, well inside the cap).
-        assert states["EvalJudgeProcess"]["TimeoutSeconds"] == 900
+    def test_process_timeout_is_a_guard_band_above_the_lambda_cap(self, states):
+        """960, deliberately ABOVE the Lambda's own 900s (config-I7181).
+
+        This asserted `== 900` until 2026-08-13, on the reasoning quoted
+        below — that the escalation tail is "typically 1-3 calls x 5-8s
+        each, well inside the cap." Measured, it is not: the tail has NO
+        cap at all and its cardinality is data-dependent, and the
+        parse-retry tail's `_PARSE_RETRY_CAP = 40` was justified as
+        "40 x <=8s" against a measured 45-105s apiece. 9 of 28 real runs
+        were killed at the wall, all nine inside that tail.
+
+        `crucible-research-PR613` makes the loops self-deadlining: each
+        asks, before every item, whether one more fits, then stops and
+        returns a PARTIAL with the residue recorded. A self-deadlining
+        function's clock starts at INVOKE; the SF clock starts at
+        SCHEDULE, earlier by dispatch plus cold start. An equal ceiling
+        therefore guarantees the SF fires first and pre-empts the
+        graceful return -- the state killed at the wall precisely
+        because the function learned not to be.
+
+        Pinned in one place: tests/test_sf_lambda_timeout_ordering.py's
+        _SERVICE_MAX_GUARD_BAND, which asserts both that the function is
+        really at Lambda's 900s service maximum and that the band is
+        exactly this number.
+        """
+        assert states["EvalJudgeProcess"]["TimeoutSeconds"] == 960
 
     def test_process_routes_to_rolling_mean_on_success(self, states):
         assert states["EvalJudgeProcess"]["Next"] == "EvalRollingMean"
@@ -680,8 +701,17 @@ class TestReplayConcordance:
         assert payload["window_days"] == 56
         assert payload["max_artifacts"] == 150
 
-    def test_timeout_matches_lambda_cap(self, states):
-        assert states["ReplayConcordance"]["TimeoutSeconds"] == 900
+    def test_timeout_is_a_guard_band_above_the_lambda_cap(self, states):
+        """960, deliberately ABOVE the Lambda's own 900s (config-I7181).
+
+        Same second branch of the ordering rule as EvalJudgeProcess above
+        -- see that docstring. Concordance was the worse instance: killed
+        at the wall in 22 of 38 real runs, the MODAL outcome. Made
+        self-deadlining by crucible-backtester#633, measured live
+        2026-08-11 returning at 622s with "stopping early on budget:
+        141 of 150 artifacts not replayed" instead of dying at 900.
+        """
+        assert states["ReplayConcordance"]["TimeoutSeconds"] == 960
 
     def test_success_continues_to_counterfactual_gate(self, states):
         # Concordance converges to CheckSkipCounterfactual rather than

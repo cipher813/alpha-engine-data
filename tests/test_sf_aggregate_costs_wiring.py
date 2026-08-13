@@ -227,7 +227,25 @@ class TestResultPaths:
 
 class TestTimeout:
     def test_timeout_is_bounded(self, states):
-        # The handler's expected wallclock is ~minutes for thousands
-        # of small S3 reads + one parquet write. 600s (10 min) gives
-        # generous headroom while still tripping a hung run.
-        assert states["AggregateCosts"]["TimeoutSeconds"] == 600
+        # The handler's expected wallclock is ~minutes for thousands of small
+        # S3 reads + one parquet write; observed p95 is 6.2s over n=35.
+        #
+        # Was pinned to exactly 600 until 2026-08-13. That value could never
+        # fire: alpha-engine-research-aggregate-costs carries its OWN 300s
+        # function timeout, and an SF lambda:invoke has two ceilings of which
+        # only the SMALLER ever fires (alpha-engine-config-I6897). So the 600
+        # described nothing and the real ceiling was 300, declared in another
+        # repo's deploy script.
+        #
+        # Asserted as a RANGE rather than an equality: an exact pin makes any
+        # future re-baselining a test edit, which is how the stale 600 survived
+        # in the first place. The binding property is what matters.
+        sf_timeout = states["AggregateCosts"]["TimeoutSeconds"]
+        assert sf_timeout < 300, (
+            f"AggregateCosts TimeoutSeconds must be STRICTLY BELOW the "
+            f"Lambda's own 300s ceiling so the declared budget is the one "
+            f"that fires; got {sf_timeout}"
+        )
+        assert sf_timeout >= 60, (
+            f"...and comfortably above the observed p95 of ~6s; got {sf_timeout}"
+        )
