@@ -378,9 +378,15 @@ def _terminate_instance(instance_id: str) -> None:
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """Step Function handler — launch the weekly pipeline's launcher spot box.
 
-    `event` carries `{"force_on_demand": bool}` (reserved for a future bounded
-    retry-on-relaunch, mirroring the daily/EOD data-spot pattern; no current
-    caller sets it — defaults False). Returns:
+    `event` carries `{"force_on_demand": bool}` (defaults False). BOTH SF
+    callers set it true today, for two different reasons:
+    `RelaunchWeeklyFreshnessSpot` (config-I7119) because spot-first would
+    re-enter the pool that just reclaimed the box, and
+    `DispatchWeeklyFreshnessSpot` (config-I7120) because this ONE box is the
+    shared substrate all 13 stage-liveness gates address via
+    `$.ec2_instance_id` and 5 of those sites — the ones inside
+    `ResearchPredictorParallel` — have no recovery path at all. The False
+    default is retained for operator off-cycle invocations. Returns:
 
       {"instance_id": "i-...", "command_id": "...", "market": "spot"|"on-demand",
        "run_token": "..."}

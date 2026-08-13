@@ -140,14 +140,21 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # dashboard box as the $.ec2_instance_id source. It reads the rest of its
     # config from Lambda env vars.
     # config#5504: per-run identity threading for cost attribution.
-    "DispatchWeeklyFreshnessSpot": frozenset({"execution_id.$"}),
+    # config-I7120: force_on_demand on the FIRST launch too. This one box is the
+    # shared substrate all 13 stage-liveness gates address via $.ec2_instance_id;
+    # config-I7119's SubstrateRelaunchGate recovers only the 8 top-level sites,
+    # and the 5 inside ResearchPredictorParallel are unreachable from it by ASL
+    # scoping. Removing the reclaim is the only measure covering all 13.
+    "DispatchWeeklyFreshnessSpot": frozenset(
+        {"execution_id.$", "force_on_demand"}
+    ),
     # config-I7119: the SAME dispatcher, invoked to replace a launcher box that
     # was reclaimed mid-run. force_on_demand was added to the dispatcher in
     # config#2248 and documented there as "reserved for a future bounded
-    # retry-on-relaunch ... no current caller sets it" — this is that caller,
-    # so the two states differ by exactly that one key. A literal `true`, not a
-    # `.$` path: the decision is structural (we only reach this state after a
-    # reclaim), never execution input.
+    # retry-on-relaunch ... no current caller sets it" — this state was the
+    # first caller and config-I7120 made the initial dispatch the second, so the
+    # two payloads are now identical. A literal `true`, not a `.$` path: the
+    # decision is structural, never execution input.
     "RelaunchWeeklyFreshnessSpot": frozenset(
         {"execution_id.$", "force_on_demand"}
     ),
