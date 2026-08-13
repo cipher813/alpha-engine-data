@@ -49,6 +49,16 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
 # role — an operator must run `deploy.sh --apply-iam` or `--bootstrap` to
 # pick it up.
 #
+# I7042 (2026-08-12): added the `sqs_dlq_content` check (non-destructive DLQ
+# content sample -> S3 summary + CloudWatch metric + a finding per
+# error/critical body). New IAM grants: sqs:GetQueueAttributes +
+# sqs:ReceiveMessage scoped to nousergon-overseer-intake-dlq only (read-only —
+# no DeleteMessage/PurgeQueue anywhere in this policy), s3:PutObject on
+# overseer/dlq_reports/*, cloudwatch:PutMetricData namespace-scoped to
+# AlphaEngine/Overseer. Applied in-session via `deploy.sh --apply-iam` ahead
+# of the PR merging (this Lambda's own convention: merging has zero live
+# effect until an operator re-runs bootstrap/apply-iam).
+#
 # Cadence (UTC): twice daily, offset from the slimmed sf-watch probe's sweep
 # cadence (06:45/14:45) purely to avoid simultaneous invocation — this is a
 # config-drift + run-window check, not tied to any pipeline's own schedule:

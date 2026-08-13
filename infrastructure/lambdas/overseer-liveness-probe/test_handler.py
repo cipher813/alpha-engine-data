@@ -402,6 +402,152 @@ def test_sqs_unexpected_error_raises():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# sqs_dlq_content (alpha-engine-config-I7042)
+# ══════════════════════════════════════════════════════════════════════════
+
+_DLQ_SPEC = {
+    "type": "sqs_dlq_content",
+    "dlq_name": "nousergon-overseer-intake-dlq",
+    "sample_max": 500,
+    "report_prefix": "overseer/dlq_reports/nousergon-overseer-intake-dlq",
+}
+
+
+def _dlq_envelope(severity, origin="flow-doctor:scheduled-groom-dispatcher", body="stale"):
+    return json.dumps({
+        "detail-type": "nousergon.alert.v1",
+        "source": "nousergon.krepis",
+        "detail": {
+            "severity": severity, "source": "nousergon.krepis", "origin": origin,
+            "occurred_at": "2026-08-03T12:00:34Z", "body": body,
+        },
+    })
+
+
+def _dlq_msg(body: str, sent_ms: int = 1785873600000):
+    return {"Body": body, "Attributes": {"SentTimestamp": str(sent_ms)}}
+
+
+def test_dlq_content_queue_missing_is_silent():
+    sqs = MagicMock()
+    sqs.get_queue_url.side_effect = FakeClientError("AWS.SimpleQueueService.NonExistentQueue")
+    with patch("index.boto3.client", side_effect=_client_factory(sqs=sqs)):
+        problems, ks = index._check_sqs_dlq_content(_DLQ_SPEC, NOW)
+    assert problems == [] and ks == {}
+    sqs.receive_message.assert_not_called()
+
+
+def test_dlq_content_unexpected_get_queue_url_error_raises():
+    sqs = MagicMock()
+    sqs.get_queue_url.side_effect = FakeClientError("AccessDenied")
+    with patch("index.boto3.client", side_effect=_client_factory(sqs=sqs)):
+        with pytest.raises(FakeClientError):
+            index._check_sqs_dlq_content(_DLQ_SPEC, NOW)
+
+
+def test_dlq_content_empty_queue_no_finding_but_still_reports():
+    sqs = MagicMock()
+    sqs.get_queue_url.return_value = {"QueueUrl": "https://x"}
+    sqs.receive_message.return_value = {"Messages": []}
+    s3 = MagicMock()
+    cw = MagicMock()
+    with patch("index.boto3.client", side_effect=_client_factory(sqs=sqs, s3=s3, cloudwatch=cw)):
+        problems, ks = index._check_sqs_dlq_content(_DLQ_SPEC, NOW)
+    assert problems == [] and ks == {}
+    # even an empty sample ships a summary + metric — the surface must never
+    # go silent because it found nothing (bugclass_absence_alarms).
+    s3.put_object.assert_called_once()
+    cw.put_metric_data.assert_called_once()
+    summary = json.loads(s3.put_object.call_args.kwargs["Body"])
+    assert summary["count"] == 0
+
+
+def test_dlq_content_severe_messages_become_a_finding_with_full_bodies():
+    sqs = MagicMock()
+    sqs.get_queue_url.return_value = {"QueueUrl": "https://x"}
+    critical_body = (
+        "research_scorecard_latest STALE, "
+        "research/last_week_scorecard/latest.json, SLA violated by 4271 min"
+    )
+    batch = [
+        _dlq_msg(_dlq_envelope("critical", body=critical_body)),
+        _dlq_msg(_dlq_envelope("warning", body="minor")),
+        _dlq_msg(_dlq_envelope("error", origin="box-health", body="MemoryHigh 156x")),
+    ]
+    sqs.receive_message.side_effect = [{"Messages": batch}, {"Messages": []}, {"Messages": []}]
+    s3 = MagicMock()
+    cw = MagicMock()
+    with patch("index.boto3.client", side_effect=_client_factory(sqs=sqs, s3=s3, cloudwatch=cw)):
+        problems, ks = index._check_sqs_dlq_content(_DLQ_SPEC, NOW)
+    assert ks == {}
+    assert len(problems) == 1
+    finding = problems[0]
+    assert "2 severe" in finding["headline"] and "of 3 sampled" in finding["headline"]
+    assert critical_body in finding["detail"]
+    assert "MemoryHigh 156x" in finding["detail"]
+    assert "minor" not in finding["detail"]  # the warning never appears
+
+    summary = json.loads(s3.put_object.call_args.kwargs["Body"])
+    assert summary["count"] == 3
+    assert summary["severity_histogram"] == {"critical": 1, "warning": 1, "error": 1}
+    assert len(summary["severe_messages"]) == 2
+
+    metric_call = cw.put_metric_data.call_args.kwargs
+    assert metric_call["Namespace"] == "AlphaEngine/Overseer"
+    assert metric_call["MetricData"][0]["MetricName"] == "DlqSevereMessageCount"
+    assert metric_call["MetricData"][0]["Value"] == 2.0
+
+
+def test_dlq_content_unparseable_body_is_a_histogram_bucket_not_a_crash():
+    sqs = MagicMock()
+    sqs.get_queue_url.return_value = {"QueueUrl": "https://x"}
+    batch = [_dlq_msg("not json at all")]
+    sqs.receive_message.side_effect = [{"Messages": batch}, {"Messages": []}, {"Messages": []}]
+    s3 = MagicMock()
+    cw = MagicMock()
+    with patch("index.boto3.client", side_effect=_client_factory(sqs=sqs, s3=s3, cloudwatch=cw)):
+        problems, ks = index._check_sqs_dlq_content(_DLQ_SPEC, NOW)
+    assert problems == [] and ks == {}
+    summary = json.loads(s3.put_object.call_args.kwargs["Body"])
+    assert summary["severity_histogram"] == {"unparseable": 1}
+
+
+def test_dlq_content_never_deletes_or_purges():
+    """The one invariant that matters most: this check is read-only. It must
+    never call DeleteMessage / DeleteMessageBatch / PurgeQueue under any
+    input, including a queue full of severe messages."""
+    sqs = MagicMock()
+    sqs.get_queue_url.return_value = {"QueueUrl": "https://x"}
+    batch = [_dlq_msg(_dlq_envelope("critical")) for _ in range(3)]
+    sqs.receive_message.side_effect = [{"Messages": batch}, {"Messages": []}, {"Messages": []}]
+    s3 = MagicMock()
+    cw = MagicMock()
+    with patch("index.boto3.client", side_effect=_client_factory(sqs=sqs, s3=s3, cloudwatch=cw)):
+        index._check_sqs_dlq_content(_DLQ_SPEC, NOW)
+    sqs.delete_message.assert_not_called()
+    sqs.delete_message_batch.assert_not_called()
+    sqs.purge_queue.assert_not_called()
+
+
+def test_dlq_content_receive_uses_short_visibility_timeout_and_stops_on_two_empty_polls():
+    sqs = MagicMock()
+    sqs.get_queue_url.return_value = {"QueueUrl": "https://x"}
+    sqs.receive_message.side_effect = [{"Messages": []}, {"Messages": []}]
+    s3 = MagicMock()
+    cw = MagicMock()
+    with patch("index.boto3.client", side_effect=_client_factory(sqs=sqs, s3=s3, cloudwatch=cw)):
+        index._check_sqs_dlq_content(_DLQ_SPEC, NOW)
+    assert sqs.receive_message.call_count == 2
+    kwargs = sqs.receive_message.call_args.kwargs
+    assert kwargs["VisibilityTimeout"] == 5
+    assert kwargs["QueueUrl"] == "https://x"
+
+
+def test_dlq_content_registered_in_checkers_table():
+    assert index.CHECKERS["sqs_dlq_content"] is index._check_sqs_dlq_content
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # run_window (ported groom accounting)
 # ══════════════════════════════════════════════════════════════════════════
 

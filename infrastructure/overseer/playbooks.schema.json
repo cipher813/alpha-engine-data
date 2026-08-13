@@ -377,6 +377,16 @@
         },
         {
           "additionalProperties": false,
+          "required": ["type", "dlq_name", "report_prefix"],
+          "properties": {
+            "type": { "const": "sqs_dlq_content" },
+            "dlq_name": { "type": "string", "minLength": 1 },
+            "sample_max": { "type": "integer", "minimum": 1 },
+            "report_prefix": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "additionalProperties": false,
           "required": [
             "type", "label", "artifact_prefix",
             "ceiling_min", "margin_min", "lookback_hours", "schedule"

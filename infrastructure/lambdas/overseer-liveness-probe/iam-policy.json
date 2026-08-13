@@ -137,6 +137,34 @@
       ]
     },
     {
+      "Sid": "SampleDlqContentReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:GetQueueAttributes",
+        "sqs:ReceiveMessage"
+      ],
+      "Resource": "arn:aws:sqs:us-east-1:711398986525:nousergon-overseer-intake-dlq"
+    },
+    {
+      "Sid": "DlqContentReportWrite",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research/overseer/dlq_reports/*"
+    },
+    {
+      "Sid": "DlqSevereMessageMetric",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricData"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "cloudwatch:namespace": "AlphaEngine/Overseer" }
+      }
+    },
+    {
       "Sid": "LivenessDedupState",
       "Effect": "Allow",
       "Action": [

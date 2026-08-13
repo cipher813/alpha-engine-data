@@ -30,6 +30,7 @@ Check types (contract in `playbooks.schema.json`, a discriminated union on `type
 | `lambda_active` | function `Active` + `LastUpdateStatus` `Successful`; optional kill-switch **reported** (never alerted) + optional launch-config (AMI/SG/subnet) existence |
 | `run_window` | per mature expected trigger (fixed-cron **union** the dispatcher decision log), an S3 run artifact's `run_start` landed in `[T, T+ceiling+margin]` |
 | `sqs_queue_exists` | intake queue (+ optional DLQ) exists |
+| `sqs_dlq_content` | non-destructive DLQ sample -> S3 content summary (count, date range, severity histogram, top sources) + `AlphaEngine/Overseer DlqSevereMessageCount` metric; every error/critical body becomes a finding (alpha-engine-config-I7042) |
 
 **Kill-switch REPORTED, never alerted:** a deliberate operator disable
 (`SF_WATCH_DISPATCH_ENABLED` etc.) is state, not an incident — it is logged and
