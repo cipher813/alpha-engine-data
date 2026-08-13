@@ -26,6 +26,16 @@
 # are added the first time the checker runs there and names them, which is
 # exactly what the `uncodified-NEW` bucket is for. Until then this file is
 # incomplete by construction, and says so rather than implying coverage.
+#
+# 2026-08-13 (alpha-engine-config-I6960): the trading box duly named seven,
+# and SIX of them were codified all along in
+# /home/ec2-user/alpha-engine/infrastructure/systemd (crucible-executor) —
+# a directory the checker was never pointed at, because the root list lived
+# in a shared unit file carrying only the dashboard box's checkouts. They are
+# NOT added here: adding a codified unit to the work queue would have made a
+# checker defect permanent as a data entry, which is the failure mode this
+# file's "should only ever get shorter" rule is meant to prevent. Roots are
+# discovered now. Only `boot-pull.service` was genuinely codified nowhere.
 
 # ── alpha-engine / dashboard box services ──────────────────────────────────
 
@@ -39,6 +49,14 @@
 # ── metron ─────────────────────────────────────────────────────────────────
 
 # ── other products co-tenant on this box ───────────────────────────────────
+
+# ── trading box (i-018eb3307a21329bf) ──────────────────────────────────────
+# Found live 2026-08-13 (I6960). Its ExecStart is
+# /home/ec2-user/alpha-engine/infrastructure/boot-pull.sh — the SCRIPT is
+# codified in crucible-executor, the UNIT that runs it was not, so the boot
+# path could be repointed on the box with nothing noticing. Codified by
+# crucible-executor-PR#<n>; this line goes once that lands and the box pulls.
+boot-pull.service # crucible-executor
 
 # ── shared infrastructure ──────────────────────────────────────────────────
 amazon-cloudwatch-agent.service # vendor-installed; likely never codified here

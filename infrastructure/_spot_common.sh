@@ -39,11 +39,35 @@ SPOT_ATTEMPT="${SPOT_ATTEMPT:-1}"
 SF_EXECUTION_TIMEOUT="${SF_EXECUTION_TIMEOUT:-}"
 SPOT_RETRY_BACKOFF_SECONDS="${SPOT_RETRY_BACKOFF_SECONDS:-20}"
 
-# Per-stage overrides
-_SPOT_NAME="${_SPOT_NAME:-data-weekly}"
-_SSM_SLUG="${_SSM_SLUG:-spot-data}"
-_PROCESS_NAME="${_PROCESS_NAME:-data-weekly}"
-MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-5400}"
+# Per-stage identity — DECLARED HERE, NEVER DEFAULTED HERE.
+#
+# This block used to carry `data-weekly` / `spot-data` defaults, and all three
+# per-stage scripts then set their own with the SAME `${VAR:-...}` form AFTER
+# sourcing this file — where the parameter is already non-empty, so the
+# expansion is a NO-OP and the stage identity silently stayed whatever this
+# file said. spot_morning_enrich.sh asks for `morning-enrich`, spot_data_
+# phase1.sh for `data-phase1`, spot_rag_ingestion.sh for `rag-ingestion`, and
+# every one of them ran as `data-weekly`: the instance Name tag, the
+# `Process` dimension on the CloudWatch `Heartbeat` metric, the `Process`
+# dimension on `SpotInterruptionRetry`, and the `run_ssm` command description
+# all carried the wrong stage. Three stages, one identity — so a heartbeat
+# gap could not be attributed and a retry could not be counted per stage.
+#
+# crucible-predictor hit and fixed the identical defect in its twin of this
+# file (measured on `watch-rerun-2026-08-10-9`, 2026-08-11: the heartbeat
+# emitted under slug `spot-spot-training` although the launcher asked for
+# `spot-full-training`). This is the mirror, per alpha-engine-config-I6922 —
+# the same no-op class, unported until now.
+#
+# Declared EMPTY so `set -u` is satisfied at source time and the per-stage
+# `${VAR:-<stage default>}` lines are load-bearing again (an explicit env
+# override still wins, because it is set before this file runs). `spot_launch`
+# asserts all four are non-empty before any instance exists, so a stage that
+# forgets one fails loud and free rather than inheriting a sibling's identity.
+_SPOT_NAME="${_SPOT_NAME:-}"
+_SSM_SLUG="${_SSM_SLUG:-}"
+_PROCESS_NAME="${_PROCESS_NAME:-}"
+MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-}"
 
 # Derived at launch time
 _INSTANCE_ID=""
@@ -60,6 +84,20 @@ fi
 # ── Spot launch (capacity-resilient) ─────────────────────────────────────────
 
 spot_launch() {
+  # Stage identity must be real BEFORE anything is billable. See the
+  # "Per-stage identity" block above for why these can no longer be defaulted
+  # in this file: a default here silently swallows the per-stage assignment.
+  local _unset=""
+  [ -n "$_SPOT_NAME" ] || _unset="${_unset} _SPOT_NAME"
+  [ -n "$_SSM_SLUG" ] || _unset="${_unset} _SSM_SLUG"
+  [ -n "$_PROCESS_NAME" ] || _unset="${_unset} _PROCESS_NAME"
+  [ -n "$MAX_RUNTIME_SECONDS" ] || _unset="${_unset} MAX_RUNTIME_SECONDS"
+  if [ -n "$_unset" ]; then
+    echo "ERROR: per-stage variable(s) unset before spot_launch:${_unset}" >&2
+    echo "       Set them AFTER sourcing _spot_common.sh — see its header." >&2
+    exit 2
+  fi
+
   echo "==> Requesting spot instance (lib CLI rotation: types=[$INSTANCE_TYPES], subnets=[$SUBNETS])..."
 
   _INSTANCE_ID=$("$LIB_PYTHON" -m krepis.ec2_spot launch \
@@ -321,13 +359,49 @@ BOOTSTRAP
 # ── Dependency installation ──────────────────────────────────────────────────
 
 install_deps() {
+  # config-I6949 / config-I6963, ported from crucible-predictor per
+  # alpha-engine-config-I6922: this step used to pipe pip through `tail -1`,
+  # so a run that exited 0 having silently skipped an extra was
+  # indistinguishable from a clean one — and pip reports a dropped extra as a
+  # WARNING on a SUCCESSFUL exit, which is precisely the line `tail -1` could
+  # not keep. The fleet copy is krepis.spot_bootstrap.render_install_deps;
+  # keep the three in step (tests/test_spot_bootstrap_invariants.py).
   echo "==> Installing python deps..."
   run_ssm "deps" "$(cat <<'DEPS'
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
 cd /home/ec2-user/data
 command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
-$PY -m pip install --quiet --no-warn-script-location -r requirements.txt 2>&1 | tail -1
+_pip_log=/tmp/pip-install-deps.log
+if ! $PY -m pip install --no-warn-script-location -r requirements.txt > "$_pip_log" 2>&1; then
+  echo "ERROR: pip install -r requirements.txt failed" >&2
+  tail -80 "$_pip_log" >&2
+  exit 1
+fi
+grep -E "^Successfully installed" "$_pip_log" || true
+# A dropped extra is a BROKEN ENVIRONMENT, not a note. pip reports it as a
+# WARNING on a SUCCESSFUL exit, so nothing downstream fails until an import
+# does — in another process, minutes later, with the install log long gone.
+# That is exactly how config#6963 reached production in the predictor: the
+# training smoke died on `ModuleNotFoundError: No module named 'flow_doctor'`
+# out of krepis.logging.setup_logging, from an install pip had called a
+# success. This repo's requirements.txt requests four extras on one line
+# (nousergon-lib[arcticdb,flow-doctor,rag,contracts]), and AL2023 ships pip
+# 23.2.1, which predates PEP 685 extras normalisation (measured boundary:
+# 23.2.1 drops, 23.3.2 honours) — so this bootstrap sits on the broken side
+# by default and cannot rely on the resolver to be strict. Fail here, where
+# the log is still in hand and the cause is one line.
+if grep -E "^WARNING: .*does not provide the extra" "$_pip_log" >&2; then
+  echo "ERROR: pip dropped a requested extra (above) — the environment is incomplete." >&2
+  echo "       Extras must be HYPHENATED; pip <23.3 does not normalise '_' to '-'." >&2
+  exit 1
+fi
+# Non-fatal on purpose: an inconsistent environment is reported, not raised.
+# (a) The failure mode left unraised is a pre-existing AMI-baked conflict
+# unrelated to this checkout, which would otherwise fail every stage on every
+# run. (b) It is recorded on stdout of this SSM step, captured with the rest
+# of the deps output.
+$PY -m pip check || echo "WARNING: pip check reports an inconsistent environment (above)"
 DEPS
 )" 600
   echo "  Deps installed."

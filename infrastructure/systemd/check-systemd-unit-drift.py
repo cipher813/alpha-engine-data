@@ -78,18 +78,39 @@ Three rules follow:
     inline), so unreadable means both a convention violation and a hole in
     the coverage claim — it exits 1 until the mode is fixed.
 
-"Codified" means a file of the same name under a `--codified-root`
-(repeatable; default: this script's directory). The unit passes one root per
-repo checkout on the box that is today-authoritative for its units per
-`infrastructure-ownership-policy` §5 — measured 2026-08-09, byte-identical
-for every covered unit: `alpha-engine-dashboard` (21 units), `metron-ops`
-(10), `telos-ops` (1), plus this repo's 6. The roots do NOT decide
-ownership — `infrastructure-ownership-policy` does; they verify hashes
-wherever a unit is already codified, and the baseline remains the register
-of units codified NOWHERE (22 as of 2026-08-09). The original 2026-08-08
-baseline mislabeled the 21 dashboard-owned units "codified in no known
-root" because this script only read its own directory — a coverage gap in
-the checker, not in the codification.
+"Codified" means a file of the same name under a codified root. The roots do
+NOT decide ownership — `infrastructure-ownership-policy` does; they verify
+hashes wherever a unit is already codified, and the baseline remains the
+register of units codified NOWHERE. The original 2026-08-08 baseline
+mislabeled the 21 dashboard-owned units "codified in no known root" because
+this script only read its own directory — a coverage gap in the checker, not
+in the codification.
+
+**Roots are DISCOVERED, not listed (2026-08-13, alpha-engine-config-I6960).**
+They used to be a hand-written `--codified-root` list baked into
+`systemd-unit-drift-check.service` — one unit file, installed on every box,
+carrying only the DASHBOARD box's checkouts. On the trading box that list
+named eleven directories, none of which was
+`/home/ec2-user/alpha-engine/infrastructure/systemd`, where six of the seven
+units the check reported as "installed but codified nowhere" were codified
+all along:
+
+    alpha-engine-daemon.service, alpha-engine-morning.service,
+    ibgateway.service, upstream-gate-dryrun-validation.{service,timer},
+    xvfb.service
+
+So the check reported a CODIFICATION gap while looking at the wrong
+directories — it could not measure, and said it had found a defect. That is
+the failure shape the `unreadable` bucket exists to prevent, arriving through
+the roots instead of through the units.
+
+A hardcoded list cannot be right on two boxes at once, and a third box would
+have inherited the same wrong list. Roots are therefore found by walking
+`CODIFIED_SEARCH_BASES` for `<repo>/infrastructure/systemd/` and
+`<repo>/infrastructure/` — the only two shapes any repo in the fleet uses —
+so a checkout that lands on a box is covered the day it lands, with nothing
+to remember to edit. `--codified-root` still works and is ADDITIVE, for a
+tree outside the search bases.
 """
 
 from __future__ import annotations
@@ -106,6 +127,27 @@ INSTALLED_DIR = Path("/etc/systemd/system")
 UNCODIFIED_BASELINE_FILE = SCRIPT_DIR / "uncodified-units-baseline.txt"
 
 UNIT_SUFFIXES = (".service", ".timer")
+
+#: Where repo checkouts live on a fleet box. Both the dashboard box and the
+#: trading box put every checkout directly under the login user's home, so one
+#: base covers both; a box that ever differs adds its own rather than editing
+#: a per-box list into a shared unit file (which is exactly what I6960 was).
+CODIFIED_SEARCH_BASES: tuple[Path, ...] = (Path("/home/ec2-user"),)
+
+#: How deep below a search base a codified root can sit. Four is measured, not
+#: guessed: the deepest real one on either box is
+#: `nous-ergon-ops/alpha-engine-dashboard/live/infrastructure/systemd`, which is
+#: depth 4. Bounding the walk keeps a stray checkout of a monorepo from turning
+#: a read-only check into a full-disk crawl on every run.
+CODIFIED_SEARCH_MAX_DEPTH = 4
+
+#: Directory names never worth descending into. `.git` alone holds thousands of
+#: entries with no unit file among them, and a virtualenv's `site-packages`
+#: ships vendored `.service` samples that are not this fleet's units.
+_SEARCH_PRUNE = frozenset({
+    ".git", "node_modules", "__pycache__", "site-packages", "lib", "lib64",
+    "share", "data", ".venv", ".venv-intraday", ".mypy_cache", ".pytest_cache",
+})
 
 #: CloudWatch namespace for the coverage counts. Shares box-health's actual
 #: namespace deliberately — coverage of the unit set is a property of the box,
@@ -155,6 +197,60 @@ def installed_units(installed_dir: Path | None = None) -> list[str]:
     )
 
 
+def discover_codified_roots(
+    bases: tuple[Path, ...] | list[Path] | None = None,
+    max_depth: int = CODIFIED_SEARCH_MAX_DEPTH,
+) -> list[Path]:
+    """Every `infrastructure/` and `infrastructure/systemd/` dir under `bases`.
+
+    The two shapes are the only ones any repo in the fleet uses, so matching on
+    the directory NAME rather than on a list of repo names is what makes a new
+    checkout covered on arrival instead of on the next time somebody remembers
+    to edit a unit file.
+
+    Read-only and best-effort per directory: a base that does not exist (this
+    script also runs in CI and on a laptop, where `/home/ec2-user` does not) is
+    simply not a source of roots, and one unreadable subtree does not cost the
+    coverage of its siblings. A root that cannot be READ still surfaces — as
+    `unreadable` on the unit, which is a finding.
+    """
+    found: list[Path] = []
+    for base in (bases if bases is not None else CODIFIED_SEARCH_BASES):
+        base = Path(base)
+        if not base.is_dir():
+            continue
+        stack: list[tuple[Path, int]] = [(base, 0)]
+        while stack:
+            current, depth = stack.pop()
+            if depth >= max_depth:
+                continue
+            try:
+                entries = [p for p in current.iterdir() if p.is_dir() and not p.is_symlink()]
+            except (PermissionError, OSError):
+                # Recorded, not swallowed: a subtree we cannot list is a subtree
+                # whose units we cannot claim to have compared.
+                print(
+                    f"[check-systemd-unit-drift] could not list {current} while "
+                    f"discovering codified roots — any unit codified only there "
+                    f"will read as uncodified",
+                    file=sys.stderr,
+                )
+                continue
+            for entry in entries:
+                if entry.name in _SEARCH_PRUNE or entry.name.startswith("."):
+                    continue
+                if entry.name == "infrastructure":
+                    found.append(entry)
+                    systemd_dir = entry / "systemd"
+                    if systemd_dir.is_dir():
+                        found.append(systemd_dir)
+                    # No descent below an `infrastructure/` dir: both shapes are
+                    # already captured, and its subdirs are IaC, not units.
+                    continue
+                stack.append((entry, depth + 1))
+    return sorted(set(found))
+
+
 def codified_units(roots: list[Path] | None = None) -> list[str]:
     """Every unit file present in the codified roots, sorted."""
     rs = roots or [SCRIPT_DIR]
@@ -178,12 +274,37 @@ def load_baseline(path: Path | None = None) -> set[str]:
     return out
 
 
-def codified_path(name: str, roots: list[Path] | None = None) -> Path | None:
-    for root in (roots or [SCRIPT_DIR]):
-        candidate = root / name
-        if candidate.is_file():
-            return candidate
-    return None
+def codified_paths(name: str, roots: list[Path] | None = None) -> list[Path]:
+    """Every codified copy of `name`, in root order."""
+    return [root / name for root in (roots or [SCRIPT_DIR]) if (root / name).is_file()]
+
+
+def codified_path(
+    name: str,
+    roots: list[Path] | None = None,
+    installed_hash: str | None = None,
+) -> Path | None:
+    """The codified copy to compare against, or None.
+
+    With one copy this is that copy. With SEVERAL — possible since roots became
+    discovered rather than listed — first-root-wins would make the verdict
+    depend on directory iteration order, so a copy whose hash MATCHES what is
+    installed is preferred. That is not a way of hiding disagreement: the
+    disagreement is reported separately by `check_unit`, and preferring the
+    match only ensures a box running a correctly-codified unit is never called
+    drifted because an unrelated checkout happened to sort first.
+    """
+    candidates = codified_paths(name, roots)
+    if not candidates:
+        return None
+    if installed_hash is not None:
+        for candidate in candidates:
+            try:
+                if _sha256(candidate) == installed_hash:
+                    return candidate
+            except PermissionError:
+                continue
+    return candidates[0]
 
 
 def check_unit(
@@ -218,7 +339,7 @@ def check_unit(
             f"EnvironmentFile or SSM, never inline); drift is unverifiable "
             f"until the mode is fixed"
         )
-    repo_path = codified_path(name, roots)
+    repo_path = codified_path(name, roots, installed_hash)
 
     if installed_hash is None:
         if repo_path is None:
@@ -290,11 +411,34 @@ def main() -> int:
         "--codified-root",
         action="append",
         default=None,
-        help="directory holding codified unit files (repeatable; default: this script's directory)",
+        help="ADDITIONAL directory holding codified unit files (repeatable); "
+             "added to the discovered roots, never replacing them",
+    )
+    parser.add_argument(
+        "--no-discover-roots",
+        action="store_true",
+        help="do not walk the search bases for codified roots (compare only "
+             "against --codified-root and this script's directory)",
     )
     args = parser.parse_args()
 
-    roots = [Path(r).resolve() for r in args.codified_root] if args.codified_root else [SCRIPT_DIR]
+    # Discovered ∪ explicit ∪ this script's own directory. `--codified-root` is
+    # ADDITIVE rather than a replacement: it exists for a tree outside the
+    # search bases, and a flag that silently narrowed coverage back to a
+    # hand-written list would reintroduce I6960 the first time somebody passed
+    # one. `--no-discover-roots` is the explicit way to ask for the old
+    # behaviour, and it says so in the output rather than looking identical.
+    roots: list[Path] = [] if args.no_discover_roots else discover_codified_roots()
+    roots += [Path(r).resolve() for r in (args.codified_root or [])]
+    if SCRIPT_DIR not in roots:
+        roots.append(SCRIPT_DIR)
+    # Deduplicate, keeping order — a root named explicitly AND discovered would
+    # otherwise make every unit in it look ambiguous with itself.
+    roots = list(dict.fromkeys(roots))
+    print(
+        f"[roots] comparing against {len(roots)} codified root(s)"
+        + (" (discovery DISABLED)" if args.no_discover_roots else "")
+    )
     baseline = load_baseline()
 
     if args.unit:
@@ -316,6 +460,32 @@ def main() -> int:
         label = "uncodified-NEW" if (status == "uncodified" and name not in baseline) else status
         print(f"[{label}] {detail}")
 
+    # Widening the roots makes it possible for one unit name to be codified in
+    # two checkouts that DISAGREE. `codified_path` then prefers the copy
+    # matching what is installed, which is the right verdict for this box and
+    # the wrong thing to leave unsaid — one of the two repos is stale, and
+    # nothing else on the box is looking.
+    #
+    # Reported as a NOTICE, exit 0, deliberately: this bucket has never been
+    # measured on either box, and shipping an unmeasured new failure condition
+    # onto a check whose whole problem was false pages would repeat the defect
+    # in the other direction. It becomes a finding once the count is known to
+    # be zero — tracked on alpha-engine-config-I6960.
+    ambiguous: list[str] = []
+    for name in names:
+        hashes = set()
+        for path in codified_paths(name, roots):
+            try:
+                digest = _sha256(path)
+            except PermissionError:
+                continue
+            if digest is not None:
+                hashes.add(digest)
+        if len(hashes) > 1:
+            where = ", ".join(str(p) for p in codified_paths(name, roots))
+            ambiguous.append(name)
+            print(f"[notice] {name}: codified in {len(hashes)} disagreeing copies — {where}")
+
     uncodified = buckets["uncodified"]
     uncodified_new = [n for n in uncodified if n not in baseline]
     unreadable = buckets["unreadable"]
@@ -331,7 +501,9 @@ def main() -> int:
         f"uncodified={len(uncodified)} "
         f"uncodified_new={len(uncodified_new)} "
         f"unreadable={len(unreadable)} "
-        f"codified_not_installed={len(buckets['not-installed'])}"
+        f"codified_not_installed={len(buckets['not-installed'])} "
+        f"ambiguous={len(ambiguous)} "
+        f"roots={len(roots)}"
     )
 
     if args.metric:
@@ -342,6 +514,8 @@ def main() -> int:
             "Uncodified": len(uncodified),
             "UncodifiedNew": len(uncodified_new),
             "Unreadable": len(unreadable),
+            "Ambiguous": len(ambiguous),
+            "CodifiedRoots": len(roots),
         })
 
     exit_code = 0
