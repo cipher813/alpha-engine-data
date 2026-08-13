@@ -1,7 +1,7 @@
 {
   "Backtester": [
     "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
@@ -10,22 +10,22 @@
   ],
   "DataPhase1": [
     "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-data",
     "export HOME=/home/ec2-user",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug data-weekly --log /var/log/data-weekly.log -- bash infrastructure/spot_data_phase1.sh"
   ],
   "DataPhase2": [
     "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-data",
     "export HOME=/home/ec2-user",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug data-phase2 --log /var/log/data-phase2.log -- bash infrastructure/spot_data_weekly.sh --phase2-only"
   ],
   "DriftDetection": [
     "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-data",
     "export HOME=/home/ec2-user",
     "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
@@ -33,7 +33,7 @@
   ],
   "EvaluatorDiagnostics": [
     "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
@@ -42,7 +42,7 @@
   ],
   "EvaluatorOptimize": [
     "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
@@ -51,15 +51,15 @@
   ],
   "MorningEnrich": [
     "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-data",
     "export HOME=/home/ec2-user",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug morning-enrich --log /var/log/morning-enrich.log -- bash infrastructure/spot_morning_enrich.sh"
   ],
   "ParityReplay": [
     "set -eo pipefail",
-    "sudo -u ec2-user flock /var/lock/alpha-engine-backtester-git.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
@@ -68,7 +68,7 @@
   ],
   "PitParityCompare": [
     "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
@@ -77,7 +77,7 @@
   ],
   "PitParityLookahead": [
     "set -eo pipefail",
-    "sudo -u ec2-user flock /var/lock/alpha-engine-backtester-git.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
@@ -86,7 +86,7 @@
   ],
   "PitParityWalkforward": [
     "set -eo pipefail",
-    "sudo -u ec2-user flock /var/lock/alpha-engine-backtester-git.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
@@ -95,7 +95,7 @@
   ],
   "PortfolioOptimizerBacktest": [
     "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
@@ -104,7 +104,7 @@
   ],
   "PredictorBacktest": [
     "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
@@ -113,8 +113,8 @@
   ],
   "PredictorTraining": [
     "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
     "sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml",
     "cd /home/ec2-user/alpha-engine-predictor",
     "export HOME=/home/ec2-user",
@@ -125,7 +125,7 @@
   ],
   "RAGIngestion": [
     "set -eo pipefail",
-    "sudo -u ec2-user git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-data",
     "export HOME=/home/ec2-user",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug rag-ingestion --log /var/log/rag-ingestion.log -- bash infrastructure/spot_rag_ingestion.sh"

@@ -200,13 +200,34 @@ def test_parity_parallel_branches_are_reachable_by_the_walker():
 
 def test_parity_parallel_pulls_are_flock_wrapped():
     """Direct pin of the fix shape: every ParityParallel branch's
-    backtester-checkout git pull must be wrapped in
-    ``flock /var/lock/alpha-engine-backtester-git.lock``. This is a tighter,
-    file-specific companion to the generic collision walker above — it pins
-    the EXACT lock path so a future edit that locks against a
-    differently-named file (still serialising this Parallel, but drifting
-    the literal used across the 3 branches, or by ResearchPredictorParallel's
-    unrelated backtester-adjacent stages outside this Parallel) is caught."""
+    backtester-checkout git pull must be wrapped in ``flock`` on
+    ``/home/ec2-user/.ae-git-sync.lock``. This is a tighter, file-specific
+    companion to the generic collision walker above — it pins the EXACT lock
+    path so a future edit that locks against a differently-named file (still
+    serialising this Parallel, but drifting the literal used across the 3
+    branches, or by ResearchPredictorParallel's unrelated
+    backtester-adjacent stages outside this Parallel) is caught.
+
+    The lock path moved off ``/var/lock/alpha-engine-backtester-git.lock``
+    (the first form of this fix) for two measured reasons:
+
+    1. ``/var/lock`` is a symlink to ``/run/lock``, mode ``0755 root:root``
+       on AL2023. ``sudo -u ec2-user flock /var/lock/<f>`` therefore exits
+       **66** with ``flock: cannot open lock file ...: Permission denied``
+       (verified live on i-0fbfe2c1f3d89a835, 2026-08-13). As command 0
+       under ``set -eo pipefail`` that kills the stage before it does any
+       work — the same 0.5s death the fix was written to prevent, only now
+       deterministic for all 3 branches instead of 2 of 3.
+    2. The SF's Parallel branches are not the only concurrent writers to
+       these checkouts. ``boot-pull.service`` and the daily SF's
+       ``CodeFreshnessGate``/``ChronicGapSelfHeal`` already serialise on
+       ``/home/ec2-user/.ae-git-sync.lock``. A second lock inode over the
+       same repo serialises nothing against them, so the race survives the
+       fix from outside the Parallel. One repo, one lock inode.
+
+    ``test_sf_git_pull_serialized.py`` enforces both properties across every
+    SF-issued pull, not just this Parallel's three.
+    """
     definition = _load("step_function.json")
     matches = [
         st
@@ -221,7 +242,7 @@ def test_parity_parallel_pulls_are_flock_wrapped():
             if "git -C /home/ec2-user/alpha-engine-backtester pull" in cmd:
                 seen_branches += 1
                 assert (
-                    "flock /var/lock/alpha-engine-backtester-git.lock "
+                    "flock -w 150 /home/ec2-user/.ae-git-sync.lock "
                     "git -C /home/ec2-user/alpha-engine-backtester pull"
                     in cmd
                 ), f"unlocked backtester pull found in a ParityParallel branch: {cmd!r}"
