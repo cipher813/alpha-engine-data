@@ -679,7 +679,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/opt/nousergon/bin/lib-python -m krepis.ssm_log_capture run --correlation-id {} --slug morning-enrich --log /var/log/morning-enrich.log -- bash infrastructure/spot_morning_enrich.sh{}',$$.Execution.Name,$.preflight_args))",
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug morning-enrich --log /var/log/morning-enrich.log -- bash infrastructure/spot_morning_enrich.sh{}',$$.Execution.Name,$.preflight_args))",
           "executionTimeout": [
             "5400"
           ]
@@ -890,7 +890,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/opt/nousergon/bin/lib-python -m krepis.ssm_log_capture run --correlation-id {} --slug data-weekly --log /var/log/data-weekly.log -- bash infrastructure/spot_data_phase1.sh{}',$$.Execution.Name,$.preflight_args))",
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug data-weekly --log /var/log/data-weekly.log -- bash infrastructure/spot_data_phase1.sh{}',$$.Execution.Name,$.preflight_args))",
           "executionTimeout": [
             "5400"
           ]
@@ -1370,7 +1370,7 @@
                 "DocumentName": "AWS-RunShellScript",
                 "InstanceIds.$": "$.ec2_instance_id",
                 "Parameters": {
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/opt/nousergon/bin/lib-python -m krepis.ssm_log_capture run --correlation-id {} --slug rag-ingestion --log /var/log/rag-ingestion.log -- bash infrastructure/spot_rag_ingestion.sh{}',$$.Execution.Name,$.preflight_args))",
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug rag-ingestion --log /var/log/rag-ingestion.log -- bash infrastructure/spot_rag_ingestion.sh{}',$$.Execution.Name,$.preflight_args))",
                   "executionTimeout": [
                     "21600"
                   ]
@@ -1665,7 +1665,7 @@
                 "DocumentName": "AWS-RunShellScript",
                 "InstanceIds.$": "$.ec2_instance_id",
                 "Parameters": {
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/opt/nousergon/bin/lib-python -m krepis.ssm_log_capture run --correlation-id {} --slug data-phase2 --log /var/log/data-phase2.log -- bash infrastructure/spot_data_weekly.sh --phase2-only{}',$$.Execution.Name,$.preflight_args))",
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug data-phase2 --log /var/log/data-phase2.log -- bash infrastructure/spot_data_weekly.sh --phase2-only{}',$$.Execution.Name,$.preflight_args))",
                   "executionTimeout": [
                     "5400"
                   ]
@@ -2731,7 +2731,7 @@
                 "DocumentName": "AWS-RunShellScript",
                 "InstanceIds.$": "$.ec2_instance_id",
                 "Parameters": {
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference','export PREDICTOR_DEFER_TRAINING_EMAIL=1',States.Format('/opt/nousergon/bin/lib-python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-training --log /var/log/predictor-training.log -- bash infrastructure/spot_predictor_training.sh{}',$$.Execution.Name,$.preflight_args))",
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference','export PREDICTOR_DEFER_TRAINING_EMAIL=1',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-training --log /var/log/predictor-training.log -- bash infrastructure/spot_predictor_training.sh{}',$$.Execution.Name,$.preflight_args))",
                   "executionTimeout": [
                     "5400"
                   ]
@@ -3103,7 +3103,7 @@
                       "DocumentName": "AWS-RunShellScript",
                       "InstanceIds.$": "$.ec2_instance_id",
                       "Parameters": {
-                        "commands.$": "States.Array('set -eo pipefail','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference',States.Format('/opt/nousergon/bin/lib-python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-model-zoo-spec --log /var/log/predictor-model-zoo-spec.log -- bash infrastructure/spot_train_spec_dispatch.sh --spec-id {}{}',$$.Execution.Name,$.spec_id,$.preflight_args))",
+                        "commands.$": "States.Array('set -eo pipefail','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-model-zoo-spec --log /var/log/predictor-model-zoo-spec.log -- bash infrastructure/spot_train_spec_dispatch.sh --spec-id {}{}',$$.Execution.Name,$.spec_id,$.preflight_args))",
                         "executionTimeout": [
                           "5400"
                         ]
@@ -3301,7 +3301,7 @@
                 "DocumentName": "AWS-RunShellScript",
                 "InstanceIds.$": "$.ec2_instance_id",
                 "Parameters": {
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference',States.Format('/opt/nousergon/bin/lib-python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-model-zoo-select --log /var/log/predictor-model-zoo-select.log -- bash infrastructure/spot_model_zoo_select.sh --select-only{}',$$.Execution.Name,$.preflight_args))",
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml','cd /home/ec2-user/alpha-engine-predictor','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','export ALPHA_ENGINE_EXPERIMENT_ID=reference',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-model-zoo-select --log /var/log/predictor-model-zoo-select.log -- bash infrastructure/spot_model_zoo_select.sh --select-only{}',$$.Execution.Name,$.preflight_args))",
                   "executionTimeout": [
                     "5400"
                   ]
@@ -3837,7 +3837,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/opt/nousergon/bin/lib-python -m krepis.ssm_log_capture run --correlation-id {} --slug backtester --log /var/log/backtester.log -- bash infrastructure/spot_backtester.sh{}',$$.Execution.Name,$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug backtester --log /var/log/backtester.log -- bash infrastructure/spot_backtester.sh{}',$$.Execution.Name,$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -4002,7 +4002,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/opt/nousergon/bin/lib-python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-backtest --log /var/log/predictor-backtest.log -- bash infrastructure/spot_predictor_backtest.sh{}',$$.Execution.Name,$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug predictor-backtest --log /var/log/predictor-backtest.log -- bash infrastructure/spot_predictor_backtest.sh{}',$$.Execution.Name,$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -4167,7 +4167,7 @@
           "executionTimeout": [
             "7200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/opt/nousergon/bin/lib-python -m krepis.ssm_log_capture run --correlation-id {} --slug portfolio-optimizer --log /var/log/portfolio-optimizer.log -- bash infrastructure/spot_portfolio_optimizer_backtest.sh{}',$$.Execution.Name,$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug portfolio-optimizer --log /var/log/portfolio-optimizer.log -- bash infrastructure/spot_portfolio_optimizer_backtest.sh{}',$$.Execution.Name,$.preflight_args))"
         },
         "TimeoutSeconds": 7200
       },
@@ -4359,7 +4359,7 @@
                   "executionTimeout": [
                     "5400"
                   ],
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/opt/nousergon/bin/lib-python -m krepis.ssm_log_capture run --correlation-id {} --slug pit-lookahead --log /var/log/pit-lookahead.log -- bash infrastructure/spot_pit_lookahead.sh{}',$$.Execution.Name,$.preflight_args))"
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug pit-lookahead --log /var/log/pit-lookahead.log -- bash infrastructure/spot_pit_lookahead.sh{}',$$.Execution.Name,$.preflight_args))"
                 },
                 "TimeoutSeconds": 5400
               },
@@ -4575,7 +4575,7 @@
                   "executionTimeout": [
                     "5400"
                   ],
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/opt/nousergon/bin/lib-python -m krepis.ssm_log_capture run --correlation-id {} --slug pit-walkforward --log /var/log/pit-walkforward.log -- bash infrastructure/spot_pit_walkforward.sh{}',$$.Execution.Name,$.preflight_args))"
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug pit-walkforward --log /var/log/pit-walkforward.log -- bash infrastructure/spot_pit_walkforward.sh{}',$$.Execution.Name,$.preflight_args))"
                 },
                 "TimeoutSeconds": 5400
               },
@@ -4791,7 +4791,7 @@
                   "executionTimeout": [
                     "2700"
                   ],
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/opt/nousergon/bin/lib-python -m krepis.ssm_log_capture run --correlation-id {} --slug parity-replay --log /var/log/parity-replay.log -- bash infrastructure/spot_parity_replay.sh{}',$$.Execution.Name,$.preflight_args))"
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug parity-replay --log /var/log/parity-replay.log -- bash infrastructure/spot_parity_replay.sh{}',$$.Execution.Name,$.preflight_args))"
                 },
                 "TimeoutSeconds": 2700
               },
@@ -5053,7 +5053,7 @@
           "executionTimeout": [
             "2700"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/opt/nousergon/bin/lib-python -m krepis.ssm_log_capture run --correlation-id {} --slug parity-compare --log /var/log/parity-compare.log -- bash infrastructure/spot_parity_compare.sh{}',$$.Execution.Name,$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug parity-compare --log /var/log/parity-compare.log -- bash infrastructure/spot_parity_compare.sh{}',$$.Execution.Name,$.preflight_args))"
         },
         "TimeoutSeconds": 2700
       },
@@ -5271,7 +5271,7 @@
           "executionTimeout": [
             "1800"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/opt/nousergon/bin/lib-python -m krepis.ssm_log_capture run --correlation-id {} --slug evaluator-diagnostics --log /var/log/evaluator-diagnostics.log -- bash infrastructure/spot_evaluator.sh --eval-half=diagnostics{}',$$.Execution.Name,$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug evaluator-diagnostics --log /var/log/evaluator-diagnostics.log -- bash infrastructure/spot_evaluator.sh --eval-half=diagnostics{}',$$.Execution.Name,$.preflight_args))"
         },
         "TimeoutSeconds": 1800
       },
@@ -5445,7 +5445,7 @@
           "executionTimeout": [
             "1200"
           ],
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/opt/nousergon/bin/lib-python -m krepis.ssm_log_capture run --correlation-id {} --slug evaluator-optimize --log /var/log/evaluator-optimize.log -- bash infrastructure/spot_evaluator.sh --eval-half=optimize{}',$$.Execution.Name,$.preflight_args))"
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug evaluator-optimize --log /var/log/evaluator-optimize.log -- bash infrastructure/spot_evaluator.sh --eval-half=optimize{}',$$.Execution.Name,$.preflight_args))"
         },
         "TimeoutSeconds": 1200
       },
@@ -5636,7 +5636,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main','cd /home/ec2-user/alpha-engine-dashboard','export HOME=/home/ec2-user',States.Format('/opt/nousergon/bin/lib-python -m krepis.ssm_log_capture run --correlation-id {} --slug health-check --log /var/log/health-check.log -- /home/ec2-user/alpha-engine-dashboard/.venv/bin/python health_checker.py --alert',$$.Execution.Name))",
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main','cd /home/ec2-user/alpha-engine-dashboard','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug health-check --log /var/log/health-check.log -- /home/ec2-user/alpha-engine-dashboard/.venv/bin/python health_checker.py --alert',$$.Execution.Name))",
           "executionTimeout": [
             "300"
           ]
@@ -5764,7 +5764,7 @@
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds.$": "$.ec2_instance_id",
         "Parameters": {
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-dashboard','export HOME=/home/ec2-user',States.Format('/opt/nousergon/bin/lib-python -m krepis.ssm_log_capture run --correlation-id {} --slug substrate-health-check --log /var/log/substrate-health-check.log -- bash infrastructure/substrate_health_check.sh --run-date {} --execution-arn {}',$$.Execution.Name,$.run_date,$$.Execution.Id))",
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-dashboard pull --ff-only origin main','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','cd /home/ec2-user/alpha-engine-dashboard','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug substrate-health-check --log /var/log/substrate-health-check.log -- bash infrastructure/substrate_health_check.sh --run-date {} --execution-arn {}',$$.Execution.Name,$.run_date,$$.Execution.Id))",
           "executionTimeout": [
             "240"
           ]

@@ -560,6 +560,23 @@ def orig_spot_cmds() -> dict:
       15 keys here changed (all except `DriftDetection`, a stale key with no
       corresponding live SF state).
 
+    - **Regenerated again the same day** (alpha-engine-config-I7382): the
+      same 14 keys moved BACK to the co-tenant venv. `I7343`'s guard is
+      correct for the LAUNCHER SCRIPTS, which run on the dashboard box where
+      `install-box-config.sh` provisions `/opt/nousergon/bin/lib-python`.
+      These 14 commands do not run there — they are `ssm:sendCommand`
+      payloads delivered to `$.ec2_instance_id`, the ephemeral
+      weekly-freshness spot, whose bootstrap
+      (`infrastructure/lambdas/weekly-freshness-spot-dispatcher/index.py`,
+      `_bootstrap_command`) builds
+      `/home/ec2-user/alpha-engine-dashboard/.venv` and never creates
+      `/opt/nousergon`. Measured: execution
+      `friday-shell-2026-08-14-verify-i7376-b`, instance
+      `i-07e65950cfeb6405b`, MorningEnrich — `No such file or directory`,
+      exit 127, on both the initial attempt and the re-issue. Every spot
+      stage of the weekly pipeline was broken between the two merges.
+      Tracked SOTA close: alpha-engine-config-I7383.
+
     Regenerate ONLY on a deliberate, reviewed change to a spot state's
     absent-path (`preflight_args=""`) command, by re-extracting the
     resolved spot commands from the new `origin/main` SF.
@@ -925,6 +942,20 @@ class TestByteIdenticalAbsentPath:
         2026-08-14 (alpha-engine-config-I7364): the interpreter token moved
         from the crucible-dashboard co-tenant venv to the ops-owned guard
         `/opt/nousergon/bin/lib-python`; everything after it is unchanged.
+
+        2026-08-14, same day (alpha-engine-config-I7382): moved BACK. These
+        commands execute on the ephemeral weekly-freshness spot, and the guard
+        is installed only on the dashboard box —
+        `weekly-freshness-spot-dispatcher`'s `_bootstrap_command` builds
+        `/home/ec2-user/alpha-engine-dashboard/.venv` and never creates
+        `/opt/nousergon`. Measured on execution
+        `friday-shell-2026-08-14-verify-i7376-b`, instance
+        `i-07e65950cfeb6405b`, state MorningEnrich: `No such file or
+        directory`, exit 127. Every spot stage of the weekly pipeline was
+        broken for the ~10 hours between the two merges. The SOTA close —
+        install the guard on the spot as part of its bootstrap, so I7364's
+        declared floor holds there too — is tracked as
+        alpha-engine-config-I7383.
         """
         token, log = _SPOT_STATES[name]
         slug = Path(log).stem
@@ -933,7 +964,7 @@ class TestByteIdenticalAbsentPath:
         )
         final = cmds[-1]
         expected = (
-            "/opt/nousergon/bin/lib-python "
+            "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python "
             "-m krepis.ssm_log_capture run "
             f"--correlation-id {_CONTEXT_OBJECT['Execution.Name']} "
             f"--slug {slug} --log {log} -- "
