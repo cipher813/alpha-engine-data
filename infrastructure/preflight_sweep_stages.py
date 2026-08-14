@@ -82,6 +82,8 @@ __all__ = [
     "derive_stages",
     "load_manifest",
     "manifest_disagreement",
+    "upstream_dependencies",
+    "upstream_dependency_disagreement",
 ]
 
 # ── Stage classification (closed vocabulary; add by PR) ──────────────────────
@@ -468,6 +470,96 @@ def map_binding_disagreement(required: set[str], manifest: dict) -> list[str]:
             f"manifest declares map_bindings.{key}, but no stage command references "
             "$.%s any more — drop the stale entry" % key
         )
+    return findings
+
+
+_REQUIRED_UPSTREAM_FIELDS = ("stage", "produced_by", "prefix", "reason")
+
+
+def upstream_dependencies(manifest: dict) -> dict[str, dict]:
+    """The DECLARED same-day upstream artifact dependency of each stage.
+
+    Keyed by stage name. This is the ONLY place a stage's preflight failure may
+    be reclassified from ``failed`` to ``unsweepable`` — the decision is never
+    taken from the launcher's stderr text, so rewording an error message cannot
+    turn a real failure into a "could not measure". Adding a dependency is a
+    reviewed diff against this manifest.
+
+    An entry missing a required field is dropped and reported by
+    ``upstream_dependency_disagreement`` rather than half-applied: a declaration
+    the sweep cannot act on must not silently arm a reclassification.
+    """
+    out: dict[str, dict] = {}
+    for entry in manifest.get("upstream_artifact_dependencies", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        if any(not entry.get(f) for f in _REQUIRED_UPSTREAM_FIELDS):
+            continue
+        out[entry["stage"]] = entry
+    return out
+
+
+def upstream_dependency_disagreement(stages: list[Stage], manifest: dict) -> list[str]:
+    """Differences between the declared upstream dependencies and the pipeline.
+
+    Only the stale direction is derivable: nothing in ``step_function.json``
+    says a stage reads a same-day upstream artifact — that lives in the
+    launcher's own preflight — so the sweep cannot detect a MISSING declaration
+    here. It is detected the other way instead, at run time: an undeclared
+    upstream failure stays ``failed`` and pages, which is the safe direction.
+
+    What IS checked, in both stale directions:
+
+    * a declaration for a stage the definition no longer has, or that no longer
+      threads ``$.preflight_args`` — the acknowledgement went stale and would
+      arm a reclassification for nothing. Checked against the DEFINITION-level
+      classification only: whether the launcher happens to be present in this
+      particular checkout is a fact about the checkout, and treating that as a
+      stale declaration would make the check fire everywhere the repo is not
+      deployed;
+    * a declaration naming a producing stage that is not in the definition —
+      the reason line points at a stage that does not exist;
+    * a malformed declaration (missing a required field), which
+      ``upstream_dependencies`` drops.
+    """
+    by_name = {s.name: s for s in stages}
+    has_dry_path = {s.name for s in stages if s.classification != NO_DRY_PATH}
+    findings: list[str] = []
+    for entry in manifest.get("upstream_artifact_dependencies", []) or []:
+        if not isinstance(entry, dict):
+            findings.append(
+                "upstream_artifact_dependencies contains a non-object entry "
+                f"({entry!r}) — it declares nothing and arms nothing"
+            )
+            continue
+        name = entry.get("stage") or "<unnamed>"
+        missing = [f for f in _REQUIRED_UPSTREAM_FIELDS if not entry.get(f)]
+        if missing:
+            findings.append(
+                f"upstream_artifact_dependencies entry for {name!r} is missing "
+                f"{', '.join(missing)} — it is DROPPED, so the stage would still be "
+                "reported as a real failure when its upstream is simply absent"
+            )
+            continue
+        if name not in by_name:
+            findings.append(
+                f"manifest declares an upstream dependency for stage {name!r}, which the "
+                "definition does not contain (renamed or removed) — drop the stale entry"
+            )
+            continue
+        if name not in has_dry_path:
+            findings.append(
+                f"manifest declares an upstream dependency for stage {name!r}, but that "
+                f"stage is classified {NO_DRY_PATH!r} — it is never exercised at all, so "
+                "the declaration can never apply; drop it or give the stage a dry path"
+            )
+        producer = entry["produced_by"]
+        if producer not in by_name:
+            findings.append(
+                f"upstream dependency for {name!r} names produced_by={producer!r}, which is "
+                "not a stage in the definition — the reason an operator reads would point "
+                "at a stage that does not exist"
+            )
     return findings
 
 

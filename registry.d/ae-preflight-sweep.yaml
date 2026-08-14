@@ -46,6 +46,19 @@ metrics:
         stages_failed: {unit: count, baseline: 0, render: count}
         stages_unmeasured: {unit: count, baseline: 0, render: count}
         stages_unsweepable: {unit: count, baseline: 0, render: count}
+        # The two kinds of unsweepable, rendered apart. A coverage defect means
+        # a stage that SHOULD be monitored is not; an upstream-pending stage is
+        # simply not measurable until its producer has run for real, which is
+        # the ordinary state on the ~6 non-Saturday days of any week. Collapsing
+        # them is what made the sweep's first run email "2 failed" (config#7323).
+        stages_unsweepable_coverage_defect: {unit: count, baseline: 0, render: count}
+        stages_unsweepable_upstream_pending: {unit: count, render: count}
+        # Published at zero as well: a stage the pipeline declares and the
+        # sweep never exercises is a coverage gap whose absence from the surface
+        # is indistinguishable from health (config#7324).
+        stages_no_dry_path: {unit: count, render: count}
+        stages_not_attempted: {unit: count, baseline: 0, render: count}
+        unsweepable_streak_state: {render: text}
         definition_sha: {render: text}
     - key: "s3://alpha-engine-research/ops/checks/ae-preflight-sweep/latest.json"
       fields:
@@ -56,12 +69,20 @@ metrics:
         # a coverage figure that only appears when non-zero cannot be told
         # apart from health when it is absent.
         stages_unobserved: {unit: count, baseline: 0, render: count}
+        # Findings, split by whether they mean the sweep's own denominator is
+        # WRONG (blocking) or that a declared gap exists (named, acknowledged).
+        coverage_findings_blocking: {unit: count, baseline: 0, render: count}
+        # Named, never counted: which stages have no dry path, and which are
+        # waiting on a same-day upstream this run.
+        no_dry_path_stages: {render: text}
+        upstream_pending_stages: {render: text}
         declared_cadence: {render: text}
   cadence_minutes: 1440
 
 produces:
   - "_preflight_sweep/latest.json"
   - "_preflight_sweep/last_clean.json"
+  - "_preflight_sweep/unsweepable_streaks.json"
   - "ops/checks/ae-preflight-sweep/latest.json"
 
 # The direction that matters: who breaks if this is stale. The sweep reads the
