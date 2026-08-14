@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.nousergon.ai/alpha-engine/sf_gate_state/v1",
+  "title": "sf_gate_state-1.0.0",
+  "description": "The weekly Step Function's correctness-gate state, threaded into the ReportCard and Director Lambda payloads (alpha-engine-config-I7282, sf-pipeline-policy.md 2.3a rule 3). PRODUCER: nousergon-data/infrastructure/step_function.json (states ReportCard and Director). CONSUMER: crucible-evaluator grading/pipeline_gates.py::read_gate_state. This file is duplicated verbatim in both repos; each repo pins its copy by sha256 in its own contract test so a one-sided edit fails loudly (the copies cannot be checked against each other from inside one repo's CI).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "gate_degraded",
+    "health_check_degraded",
+    "parity_degraded",
+    "research_predictor_degraded",
+    "lib_pin_drift",
+    "pipeline_contract"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "description": "Bumped only on a breaking change to this object."
+    },
+    "gate_degraded": {
+      "type": "boolean",
+      "description": "The SF pre-spend gate family fail-opened. Seeded false at InitializeInput and set true by exactly one Pass state, so it is present in BOTH polarities."
+    },
+    "health_check_degraded": {
+      "type": "boolean",
+      "description": "The SF tail health-check family fail-opened. Present in both polarities."
+    },
+    "parity_degraded": {
+      "type": "boolean",
+      "description": "The parity verdict was absent or could not be established. Present in both polarities."
+    },
+    "research_predictor_degraded": {
+      "type": "boolean",
+      "description": "A ResearchPredictorParallel internal fail-open route fired. Present in both polarities."
+    },
+    "lib_pin_drift": {
+      "$ref": "#/$defs/probe",
+      "description": "LibPinDriftCheck's payload (crucible-predictor inference/lib_pin_drift.py). status=UNKNOWN OMITS has_drift and offenders."
+    },
+    "pipeline_contract": {
+      "$ref": "#/$defs/probe",
+      "description": "PipelineContractCheck's payload (crucible-predictor inference/pipeline_contract_check.py). status=UNKNOWN OMITS has_violation and violations."
+    }
+  },
+  "$defs": {
+    "probe": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "enum": ["MEASURED", "UNKNOWN"],
+          "description": "The producer's closed vocabulary (crucible-predictor#489, alpha-engine-config-I7277). UNKNOWN is not a verdict: consumers must key on this field, never on the presence or emptiness of the evidence list."
+        },
+        "reason": {
+          "type": ["string", "null"],
+          "description": "Why the probe could not measure. Required in spirit on UNKNOWN; not schema-required because the SF's InitializeInput floor supplies its own."
+        }
+      }
+    }
+  }
+}
