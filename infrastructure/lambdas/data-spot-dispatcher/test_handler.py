@@ -26,6 +26,13 @@ import types
 
 import pytest
 
+# The REAL renderer, captured before any stub replaces the `krepis` package
+# below. krepis.spot_bootstrap is a pure function of its spec — no AWS, no
+# clock, no environment reads — which is why the bootstrap was moved into it
+# (alpha-engine-config-I7372); stubbing it would leave the rendered script,
+# the only thing this Lambda actually sends, untested.
+import krepis.spot_bootstrap as _REAL_SPOT_BOOTSTRAP  # noqa: E402
+
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -64,6 +71,9 @@ def _install_stubs(launch_impl, boto_clients, publish_impl=None):
     krepis_mod.alerts = krepis_alerts_mod
     sys.modules["krepis"] = krepis_mod
     sys.modules["krepis.alerts"] = krepis_alerts_mod
+    # NOT stubbed — see the module-level import.
+    krepis_mod.spot_bootstrap = _REAL_SPOT_BOOTSTRAP
+    sys.modules["krepis.spot_bootstrap"] = _REAL_SPOT_BOOTSTRAP
 
     boto3_mod = types.ModuleType("boto3")
     boto3_mod.client = lambda name, **kw: boto_clients[name]
@@ -196,3 +206,28 @@ def test_kill_switch_short_circuits(monkeypatch):
     result = index.handler({"workload": "morning-enrich"}, None)
 
     assert result == {"data_spot": {"launched": False, "reason": "disabled", "workload": "morning-enrich"}}
+
+
+def test_bootstrap_is_the_shared_renderers_output(monkeypatch):
+    """alpha-engine-config-I7372 — asserted by containment, never restated."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    cmd = index._bootstrap_command(
+        "morning-enrich", "python weekly_collector.py --morning-enrich", "tok"
+    )
+    assert _REAL_SPOT_BOOTSTRAP.render_bootstrap(index._bootstrap_spec()) in cmd
+    # The silent interpreter fallback this handler carried, and the
+    # SSM-liveness watchdog it never had.
+    assert "PYTHON_BIN" not in cmd
+    assert "ec2-spot-watchdog" in cmd
+
+
+def test_the_pat_reaches_only_the_private_repo(monkeypatch):
+    """nousergon-data is public and was already cloned without a credential;
+    alpha-engine-config is the one that needs the PAT, read on the BOX."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    cmd = index._bootstrap_command(
+        "morning-enrich", "python weekly_collector.py --morning-enrich", "tok"
+    )
+    authed = [ln for ln in cmd.splitlines() if "x-access-token" in ln]
+    assert len(authed) == 1, authed
+    assert index.CONFIG_REPO in authed[0]

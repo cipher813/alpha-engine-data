@@ -62,6 +62,13 @@ it firing. `InstanceInitiatedShutdownBehavior=terminate` (set by
 spot_dispatch.launch_with_fallback's `shutdown_behavior="terminate"`) so the
 watchdog's `shutdown -h now` actually TERMINATES the box, not just stops it.
 
+That timer, the interpreter install and the four PUBLIC repo clones are all
+rendered by `krepis.spot_bootstrap` since alpha-engine-config-I7372 — see
+`_bootstrap_spec()` / `_bootstrap_command()`. The cutover also adds the
+`ec2-spot-watchdog` unit this box never had: it answers "the SSM agent died
+and nothing can ever reach this box again", which for a launcher driven
+ENTIRELY over SSM is the failure mode that strands the whole weekly run.
+
 IAM: reuses `alpha-engine-executor-profile` (-> `alpha-engine-executor-role`,
 home repo `alpha-engine`) — the SAME profile `spot_data_weekly.sh` /
 `spot_backtest.sh` grant their Saturday spots, and the SAME profile
@@ -106,6 +113,7 @@ import logging
 import os
 import uuid
 
+from krepis.spot_bootstrap import Clone, SpotBootstrapSpec, render_bootstrap
 from nousergon_lib import spot_dispatch
 from nousergon_lib.spot_dispatch import SpotLaunchError
 
@@ -223,71 +231,125 @@ CW_LOG_GROUP = os.environ.get("WEEKLY_SPOT_CW_LOG_GROUP", "/alpha-engine/weekly-
 WATCHDOG_SECONDS = int(os.environ.get("WEEKLY_SPOT_WATCHDOG_SECONDS", "46800"))
 
 
+def _bootstrap_spec() -> SpotBootstrapSpec:
+    """Everything about this box's provisioning that krepis renders.
+
+    Only ``alpha-engine-config`` is a private repo (measured 2026-08-14 with
+    ``gh repo view --json visibility``: PUBLIC for nousergon-data,
+    crucible-backtester, crucible-predictor and crucible-dashboard; PRIVATE
+    for alpha-engine-config). The four public ones were being cloned through
+    a PAT-bearing URL they never needed, which put the fleet token in the
+    box's ``git clone`` argv and in ``.git/config`` for four checkouts. They
+    move here as plain literals; the private one stays in the tail below,
+    where the PAT is read on the BOX from SSM and never leaves it.
+
+    The renderer bakes URLs and branches in as launcher-side literals, so a
+    ``${PAT}`` clone cannot be expressed through it — and must not be, because
+    expressing it would mean this Lambda reading the secret and embedding it
+    in an SSM document. The credential's location is unchanged by this PR; the
+    number of places carrying it drops from four to one.
+    """
+    return SpotBootstrapSpec(
+        repo_url=f"https://github.com/{DATA_REPO}.git",
+        checkout="/home/ec2-user/alpha-engine-data",
+        branch=DATA_BRANCH,
+        region=REGION,
+        extra_clones=(
+            Clone(
+                repo_url=f"https://github.com/{BACKTESTER_REPO}.git",
+                checkout="/home/ec2-user/alpha-engine-backtester",
+                branch=BACKTESTER_BRANCH,
+            ),
+            Clone(
+                repo_url=f"https://github.com/{PREDICTOR_REPO}.git",
+                checkout="/home/ec2-user/alpha-engine-predictor",
+                branch=PREDICTOR_BRANCH,
+            ),
+            Clone(
+                repo_url=f"https://github.com/{DASHBOARD_REPO}.git",
+                checkout="/home/ec2-user/alpha-engine-dashboard",
+                branch=DASHBOARD_BRANCH,
+            ),
+        ),
+        # Orphan-prevention backstop, unchanged in value and meaning — the
+        # renderer emits the same transient `systemd-run --on-active` timer
+        # this function used to write by hand. It now ABORTS the bootstrap if
+        # the timer cannot be armed, where the hand-written copy ended in
+        # `|| true`: "the cap could not be armed" is exactly the condition
+        # under which a box that must not outlive the SF should not start.
+        max_runtime_seconds=WATCHDOG_SECONDS,
+        # The renderer's preamble sets XDG_CACHE_HOME=/tmp; exports are emitted
+        # after it, so this preserves the cache path this box used before.
+        exports={"XDG_CACHE_HOME": "/home/ec2-user/.cache"},
+    )
+
+
 def _bootstrap_command(run_token: str) -> str:
-    """The async SSM RunShellScript body: install runtime, clone all four
-    repos the 14 downstream SF states' `git -C ... pull --ff-only` commands
-    expect at their dashboard-box paths, build the dashboard venv, arm the
-    long-lived watchdog. Runs as root; the repos land under /home/ec2-user so
-    the downstream states' `sudo -u ec2-user git -C ... pull` succeeds
-    unchanged (they pull, not clone — this bootstrap does the initial clone).
+    """The async SSM RunShellScript body: install the runtime, clone the repos
+    the 14 downstream SF states' `git -C ... pull --ff-only` commands expect at
+    their dashboard-box paths, build the dashboard venv, arm the long-lived
+    watchdog. Runs as root; the repos land under /home/ec2-user so the
+    downstream states' `sudo -u ec2-user git -C ... pull` succeeds unchanged
+    (they pull, not clone — this bootstrap does the initial clone).
 
     Deliberately does NOT run any workload itself (unlike data-spot-
     dispatcher's/scheduled-groom-dispatcher's bootstrap, which execs straight
     into the actual job) — this box's job IS the clone+venv setup; the 14
     consumer states drive the actual work via their own separate sendCommand
     calls once the SF's poll loop observes this command reach Success.
+
+    ## Composition (alpha-engine-config-I7372)
+
+    Three parts, in order:
+
+    1. a PRELUDE this Lambda owns — the tee'd log, ``fail()``, an EXIT trap;
+    2. ``krepis.spot_bootstrap.render_bootstrap()`` — the watchdog unit, the
+       hard-timeout timer, the interpreter, the four public clones;
+    3. a TAIL this Lambda owns — the private config clone, the ownership
+       fixes and the dashboard venv, none of which the renderer can express.
+
+    This function used to render all of it inline and carried its own copy of
+    three things the fleet had already paid for elsewhere: the silent
+    interpreter fallback (``command -v python3.12 ... || PYTHON_BIN=python3``,
+    which resolves a different wheel set and says nothing), a hand-written
+    timer, and no SSM-liveness watchdog at all — the unit that answers "the
+    SSM agent died and nothing can ever reach this box again", which is the
+    one failure mode a launcher box driven ENTIRELY over SSM cannot survive.
+    The fleet's fork scanner is Bash-only, so none of it was visible to the
+    sweep that found the shell copies.
+
+    The EXIT trap is new and load-bearing: the rendered block runs under
+    ``set -e`` (the renderer's contract), so a failure inside it aborts the
+    script rather than reaching a ``|| fail``. Without the trap that abort
+    would skip the log upload and leave the box idling until the 13h watchdog.
+    The tail keeps ``set -uo pipefail`` + explicit ``|| fail``, its posture
+    before this change.
     """
     log = f"/var/log/weekly-freshness-spot-bootstrap-{run_token}.log"
     s3_log = (
         f"s3://alpha-engine-research/_ssm_logs/weekly-freshness-spot/bootstrap/"
         f"$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%S)-{run_token}.log"
     )
-    return f"""set -uo pipefail
-export HOME=/home/ec2-user
-export XDG_CACHE_HOME=/home/ec2-user/.cache
-export AWS_REGION={REGION}
-export AWS_DEFAULT_REGION={REGION}
-fail() {{ echo "[weekly-freshness-spot-bootstrap] FATAL: $1"; aws s3 cp {log} "{s3_log}" --region {REGION} --quiet || true; shutdown -h now; exit 1; }}
+    prelude = f"""set -uo pipefail
 mkdir -p "$(dirname {log})"
 exec > >(tee -a {log}) 2>&1
-# Long-lived orphan-prevention watchdog (NOT the happy-path stop mechanism —
-# this box stays up for the whole weekly SF run, unlike the nested spots it
-# launches, which self-terminate per-workload). Sized to comfortably exceed
-# the SF's own 43200s (12h) top-level TimeoutSeconds.
-systemd-run --on-active={WATCHDOG_SECONDS} --unit=alpha-engine-weekly-freshness-watchdog \\
-  --description='alpha-engine weekly-freshness-spot orphan-prevention watchdog' /sbin/shutdown -h now || true
-dnf install -y -q python3.12 python3.12-pip python3.12-devel git gcc >/dev/null 2>&1 \\
-  || dnf install -y -q python3 python3-pip python3-devel git gcc >/dev/null 2>&1 \\
-  || fail "runtime install failed"
-command -v python3.12 >/dev/null && PYTHON_BIN=python3.12 || PYTHON_BIN=python3
+fail() {{ trap - EXIT; echo "[weekly-freshness-spot-bootstrap] FATAL: $1"; aws s3 cp {log} "{s3_log}" --region {REGION} --quiet || true; shutdown -h now; exit 1; }}
+trap 'rc=$?; [ "$rc" -eq 0 ] || fail "bootstrap aborted (rc=$rc)"' EXIT
+"""
+    tail = f"""set +e
+set -uo pipefail
 git config --global --add safe.directory '*' || true
+# alpha-engine-config is the one PRIVATE repo of the five. The PAT is read
+# HERE, on the box, from SSM via the instance profile — it is never known to
+# this Lambda and never appears in the SSM document.
 PAT=$(aws ssm get-parameter --name {GH_PAT_SSM} --with-decryption \\
   --query Parameter.Value --output text --region {REGION}) || fail "PAT read failed"
 [ -n "$PAT" ] || fail "PAT empty"
-echo "[weekly-freshness-spot-bootstrap] cloning alpha-engine-data..."
-rm -rf /home/ec2-user/alpha-engine-data
-git clone --depth 1 --branch {DATA_BRANCH} \\
-  https://github.com/{DATA_REPO}.git /home/ec2-user/alpha-engine-data || fail "alpha-engine-data clone failed"
 echo "[weekly-freshness-spot-bootstrap] cloning alpha-engine-config..."
 rm -rf /home/ec2-user/alpha-engine-config
 git clone --depth 1 --branch {CONFIG_BRANCH} \\
   "https://x-access-token:${{PAT}}@github.com/{CONFIG_REPO}.git" \\
   /home/ec2-user/alpha-engine-config || fail "alpha-engine-config clone failed"
-echo "[weekly-freshness-spot-bootstrap] cloning alpha-engine-backtester..."
-rm -rf /home/ec2-user/alpha-engine-backtester
-git clone --depth 1 --branch {BACKTESTER_BRANCH} \\
-  "https://x-access-token:${{PAT}}@github.com/{BACKTESTER_REPO}.git" \\
-  /home/ec2-user/alpha-engine-backtester || fail "alpha-engine-backtester clone failed"
-echo "[weekly-freshness-spot-bootstrap] cloning alpha-engine-predictor..."
-rm -rf /home/ec2-user/alpha-engine-predictor
-git clone --depth 1 --branch {PREDICTOR_BRANCH} \\
-  "https://x-access-token:${{PAT}}@github.com/{PREDICTOR_REPO}.git" \\
-  /home/ec2-user/alpha-engine-predictor || fail "alpha-engine-predictor clone failed"
-echo "[weekly-freshness-spot-bootstrap] cloning alpha-engine-dashboard..."
-rm -rf /home/ec2-user/alpha-engine-dashboard
-git clone --depth 1 --branch {DASHBOARD_BRANCH} \\
-  "https://x-access-token:${{PAT}}@github.com/{DASHBOARD_REPO}.git" \\
-  /home/ec2-user/alpha-engine-dashboard || fail "alpha-engine-dashboard clone failed"
 chown -R ec2-user:ec2-user /home/ec2-user/alpha-engine-data /home/ec2-user/alpha-engine-config \\
   /home/ec2-user/alpha-engine-backtester /home/ec2-user/alpha-engine-dashboard \\
   /home/ec2-user/alpha-engine-predictor || fail "chown failed"
@@ -305,7 +367,9 @@ ln -sfn /home/ec2-user/alpha-engine-config/backtester/config.yaml \\
 chown -h ec2-user:ec2-user /home/ec2-user/alpha-engine-backtester/config.yaml || fail "config.yaml chown failed"
 echo "[weekly-freshness-spot-bootstrap] building alpha-engine-dashboard venv..."
 cd /home/ec2-user/alpha-engine-dashboard
-"$PYTHON_BIN" -m venv .venv || fail "venv create failed"
+# python3.12 literally, matching the renderer: it has already installed and
+# ASSERTED the interpreter, so there is nothing left to select between.
+python3.12 -m venv .venv || fail "venv create failed"
 source .venv/bin/activate
 pip install --upgrade pip -q || fail "pip upgrade failed"
 if [ -f requirements.txt ]; then
@@ -314,9 +378,11 @@ fi
 # numpy<2 pin to match every other spot workload (pyarrow compiled against 1.x).
 pip install -q 'numpy<2' || fail "numpy pin failed"
 chown -R ec2-user:ec2-user /home/ec2-user/alpha-engine-dashboard/.venv || fail "venv chown failed"
+trap - EXIT
 aws s3 cp {log} "{s3_log}" --region {REGION} --quiet || true
 echo "[weekly-freshness-spot-bootstrap] complete — launcher box ready"
 """
+    return prelude + "\n" + render_bootstrap(_bootstrap_spec()) + "\n" + tail
 
 
 def _launch_instance(

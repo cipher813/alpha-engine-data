@@ -187,3 +187,56 @@ class TestBootstrapCommand:
         index.handler({}, None)
         kwargs = sd.send_async_command.call_args.kwargs
         assert kwargs["execution_timeout_seconds"] == index.BOOTSTRAP_TIMEOUT_SECONDS
+
+
+class TestRenderedBootstrap:
+    """alpha-engine-config-I7372 — the bootstrap is the shared renderer's output.
+
+    Asserted by CONTAINMENT of ``render_bootstrap(_bootstrap_spec())`` rather
+    than by restating any of its text: restating it here would be a second copy
+    of the invariant, drifting exactly as the shell heredocs did.
+    """
+
+    def test_the_command_contains_the_rendered_bootstrap_verbatim(self, index_mod):
+        from krepis.spot_bootstrap import render_bootstrap
+
+        index, sd = index_mod
+        index.handler({}, None)
+        cmd = sd.send_async_command.call_args.args[1]
+        assert render_bootstrap(index._bootstrap_spec()) in cmd
+
+    def test_no_interpreter_selection_survives_in_this_handler(self, index_mod):
+        """The defect the Bash-only fleet scanner could not see here."""
+        index, sd = index_mod
+        index.handler({}, None)
+        cmd = sd.send_async_command.call_args.args[1]
+        assert "PYTHON_BIN" not in cmd
+        assert "|| PYTHON_BIN=python3" not in cmd
+
+    def test_the_pat_reaches_only_the_one_private_repo(self, index_mod):
+        """Four of the five repos are public and needed no credential.
+
+        Measured 2026-08-14: nousergon-data, crucible-backtester,
+        crucible-predictor and crucible-dashboard are PUBLIC; only
+        alpha-engine-config is PRIVATE. Cloning the public four through a
+        PAT-bearing URL put the fleet token in four ``git clone`` argv lines
+        and four ``.git/config`` files for no access it bought.
+        """
+        index, sd = index_mod
+        index.handler({}, None)
+        cmd = sd.send_async_command.call_args.args[1]
+        authed = [ln for ln in cmd.splitlines() if "x-access-token" in ln]
+        assert len(authed) == 1, authed
+        assert index.CONFIG_REPO in authed[0]
+
+    def test_the_ssm_liveness_watchdog_is_installed(self, index_mod):
+        """The guarantee this box never had.
+
+        The hand-written bootstrap armed a hard-timeout timer only. The unit
+        answers a different failure — the SSM agent dying — which for a
+        launcher driven entirely over SSM strands the whole weekly run.
+        """
+        index, sd = index_mod
+        index.handler({}, None)
+        cmd = sd.send_async_command.call_args.args[1]
+        assert "ec2-spot-watchdog" in cmd

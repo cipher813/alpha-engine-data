@@ -647,11 +647,30 @@ class TestDispatcherLambdaAndIam:
         # weekly_collector.load_config resolves experiments/reference/data/config.yaml
         # from a shallow alpha-engine-config clone (2026-07-08 EOD: missing clone →
         # FileNotFoundError on the first live spot path after the CLI-flag fix).
+        # The PAT read and the private-repo clone stay in this file (the
+        # renderer bakes URLs in as launcher-side literals and so cannot
+        # express a ${PAT} URL — see _bootstrap_spec()'s docstring). The
+        # exports moved into the SPEC when the bootstrap was cut over to
+        # krepis.spot_bootstrap (alpha-engine-config-I7372), so that one is
+        # asserted against the RENDERED script rather than the source text —
+        # reading the source for it is how a cut-over dispatcher reads as
+        # having dropped an export it still emits.
         src = (_DISPATCHER / "index.py").read_text()
         assert "alpha-engine-config" in src
         assert "ssm get-parameter" in src
         assert "/alpha-engine/saturday_sf_watch/github_pat" in src
-        assert "ALPHA_ENGINE_EXPERIMENT_ID=reference" in src
+
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "_data_spot_index_for_test", _DISPATCHER / "index.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        rendered = module._bootstrap_command(
+            "morning-enrich", "python weekly_collector.py --morning-enrich", "tok"
+        )
+        assert "ALPHA_ENGINE_EXPERIMENT_ID=reference" in rendered
 
     def test_dispatcher_uses_executor_profile_no_ib_exposure(self):
         # Deliverable #3: the spot reuses the Saturday spot's Arctic-write/S3

@@ -79,6 +79,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
+from krepis.spot_bootstrap import SpotBootstrapSpec, render_bootstrap
 from nousergon_lib import spot_dispatch
 from nousergon_lib.spot_dispatch import (
     SpotCapacityExhausted,
@@ -414,12 +415,61 @@ def _handle_deferred(fields: dict, defer_generation: int, context) -> dict:
     # Fall through to the normal launch path below.
     return None  # signal to handler: proceed with normal launch
 
+def _bootstrap_spec() -> SpotBootstrapSpec:
+    """The part of this box's provisioning krepis renders.
+
+    ``MIGRATION_REPO`` (``nousergon-data``) is PUBLIC — measured 2026-08-14
+    with ``gh repo view --json visibility``. It was nevertheless cloned through
+    a ``https://x-access-token:${PAT}@…`` URL, which put the fleet token in the
+    box's ``git clone`` argv (readable in ``ps``) and in ``.git/config`` on
+    disk for the life of the box, for no access it needed. The clone here is a
+    plain literal, so the token now reaches the box for exactly one purpose:
+    ``GH_TOKEN`` for the P1-on-crash ``gh issue`` filing in the tail. That is a
+    reduction in credential surface, not a relocation — the PAT is still read
+    on the BOX from SSM and is never known to this Lambda.
+
+    The renderer bakes URLs and branches in as launcher-side literals, so a
+    ``${PAT}`` URL could not have been expressed here in any case; doing so
+    would have required this Lambda to read the secret and embed it in an SSM
+    document.
+
+    The exact-SHA guarantee is unchanged and still lives in the tail: the
+    renderer clones the branch tip, then ``git fetch``/``git checkout`` of
+    ``merged_sha`` pins the tree to precisely the code that was merged. That
+    was already the shape — the previous clone was a branch clone too.
+    """
+    return SpotBootstrapSpec(
+        repo_url=f"https://github.com/{MIGRATION_REPO}.git",
+        checkout="/home/ec2-user/nousergon-data",
+        region=REGION,
+        # Same value and meaning as the hand-written timer it replaces; now
+        # fatal when it cannot be armed, where the old copy ended in `|| true`.
+        max_runtime_seconds=MAX_RUNTIME_SECONDS,
+        exports={"XDG_CACHE_HOME": "/home/ec2-user/.cache"},
+    )
+
+
 def _bootstrap_command(fields: dict) -> str:
-    """The async SSM RunShellScript body: fetch PAT, clone nousergon-data at
-    the EXACT merged SHA (never a branch tip — the runner must migrate
-    precisely the code that was merged, and main may have moved on by the
-    time the box boots), build a venv, run the migration runner script,
-    self-terminate on any prelude failure so a botched launch never idles."""
+    """The async SSM RunShellScript body: clone nousergon-data, pin it to the
+    EXACT merged SHA (never a branch tip — the runner must migrate precisely
+    the code that was merged, and main may have moved on by the time the box
+    boots), build a venv, run the migration runner script, self-terminate on
+    any prelude failure so a botched launch never idles.
+
+    Composed (alpha-engine-config-I7372) as a PRELUDE this Lambda owns (the
+    lane-telemetry publisher, ``fail()``, an EXIT trap), then
+    ``krepis.spot_bootstrap.render_bootstrap()`` (watchdog unit, hard-timeout
+    timer, interpreter, clone), then a TAIL (the ``gh`` install, the PAT read,
+    the SHA pin, the venv and the runner). It used to render all of it inline,
+    carrying its own silent interpreter fallback and hand-written timer and no
+    SSM-liveness watchdog — invisible to the fleet's Bash-only fork scanner
+    because this is a ``.py`` file.
+
+    The EXIT trap is load-bearing: the rendered block runs under ``set -e``, so
+    an abort inside it never reaches a ``|| fail``, and this lane's whole
+    failure contract (publish an ``error`` row, ship the log, terminate) hangs
+    off ``fail()``.
+    """
     merged_sha = fields["merged_sha"]
     head = fields["head_migration_number"]
     log = "/var/log/arctic-migration.log"
@@ -427,11 +477,7 @@ def _bootstrap_command(fields: dict) -> str:
         f"s3://alpha-engine-research/_ssm_logs/arctic-migration/"
         f"$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%S)-{merged_sha[:12]}.log"
     )
-    return f"""set -uo pipefail
-export HOME=/home/ec2-user
-export XDG_CACHE_HOME=/home/ec2-user/.cache
-export AWS_REGION={REGION}
-export AWS_DEFAULT_REGION={REGION}
+    prelude = f"""set -uo pipefail
 # The lane's own console row (alpha-engine-config-I7029). Guarded on the file
 # existing, because `fail()` is reachable BEFORE the clone — and a prelude that
 # died before cloning is exactly why the DISPATCHER publishes an `attention`
@@ -440,41 +486,43 @@ publish_lane() {{ [ -f /home/ec2-user/nousergon-data/scripts/publish_lane_result
   && (cd /home/ec2-user/nousergon-data && .venv/bin/python scripts/publish_lane_result.py \\
        --status "$1" --summary "$2" --deep-link "{s3_log}" >/dev/null 2>&1) \\
   || echo "[arctic-migration] lane telemetry publish skipped/failed"; }}
-fail() {{ echo "[arctic-migration-prelude] FATAL: $1"; publish_lane error "FAILED on $(hostname -s): $1 — no migration was marked complete"; aws s3 cp {log} "{s3_log}" --region {REGION} --quiet || true; shutdown -h now; exit 1; }}
-systemd-run --on-active={MAX_RUNTIME_SECONDS} --unit=alpha-engine-arctic-migration-watchdog \\
-  --description='alpha-engine arctic-migration spot hard-timeout' /sbin/shutdown -h now || true
-dnf install -y -q python3.12 python3.12-pip python3.12-devel git gcc >/dev/null 2>&1 \\
-  || dnf install -y -q python3 python3-pip python3-devel git gcc >/dev/null 2>&1 \\
-  || fail "runtime install failed"
-command -v python3.12 >/dev/null && PYTHON_BIN=python3.12 || PYTHON_BIN=python3
+fail() {{ trap - EXIT; echo "[arctic-migration-prelude] FATAL: $1"; publish_lane error "FAILED on $(hostname -s): $1 — no migration was marked complete"; aws s3 cp {log} "{s3_log}" --region {REGION} --quiet || true; shutdown -h now; exit 1; }}
+trap 'rc=$?; [ "$rc" -eq 0 ] || fail "bootstrap aborted (rc=$rc)"' EXIT
+"""
+    tail = f"""set +e
+set -uo pipefail
 command -v gh >/dev/null 2>&1 || {{ dnf install -y 'dnf-command(config-manager)' >/dev/null 2>&1 || true; dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo >/dev/null 2>&1 || true; dnf install -y -q gh >/dev/null 2>&1 || echo "[arctic-migration-prelude] WARN: gh install failed (P1-on-crash filing will no-op)"; }}
 git config --global --add safe.directory '*' || true
+# The PAT is read HERE, on the box, from SSM via the instance profile — never
+# known to this Lambda. It is needed for GH_TOKEN below (the P1-on-crash
+# filing), NOT for the clone: MIGRATION_REPO is public.
 PAT=$(aws ssm get-parameter --name {GH_PAT_SSM} --with-decryption \\
   --query Parameter.Value --output text --region {REGION}) || fail "PAT read failed"
 [ -n "$PAT" ] || fail "PAT empty"
-rm -rf /home/ec2-user/nousergon-data
-git clone --quiet "https://x-access-token:${{PAT}}@github.com/{MIGRATION_REPO}.git" \\
-  /home/ec2-user/nousergon-data || fail "clone failed"
 cd /home/ec2-user/nousergon-data
+# Pin to the merged SHA. The renderer cloned the branch tip; main may have
+# moved on since the merge, and this lane must migrate exactly what merged.
 git fetch --quiet --depth 1 origin {merged_sha} || fail "fetch of merged_sha failed"
 git checkout --quiet {merged_sha} || fail "checkout of merged_sha failed"
-"$PYTHON_BIN" -m venv .venv || fail "venv create failed"
+# python3.12 literally, matching the renderer, which has already installed and
+# ASSERTED it.
+python3.12 -m venv .venv || fail "venv create failed"
 source .venv/bin/activate
 pip install --upgrade pip -q || fail "pip upgrade failed"
 pip install -q -r requirements.txt || fail "deps install failed"
 pip install -q 'numpy<2' || fail "numpy pin failed"
 export GH_TOKEN="$PAT"
 mkdir -p "$(dirname {log})"
-set +e
 python scripts/run_arctic_migrations.py --merged-sha {merged_sha} \\
   --head-migration-number {head} 2>&1 | tee -a {log}
 rc=${{PIPESTATUS[0]}}
-set -e
+trap - EXIT
 aws s3 cp {log} "{s3_log}" --region {REGION} --quiet || true
 [ "$rc" -eq 0 ] || fail "migration runner exited $rc"
 publish_lane ok "completed head {head} at merged_sha {merged_sha[:12]} on $(hostname -s)"
 echo "[arctic-migration] head {head} complete"
 """
+    return prelude + "\n" + render_bootstrap(_bootstrap_spec()) + "\n" + tail
 
 
 def _launch_instance() -> tuple[str, str]:
