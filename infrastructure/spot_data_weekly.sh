@@ -620,52 +620,93 @@ run_ssm() {
 # us-east-1 (matches this file's own ${AWS_REGION:-us-east-1} defaults).
 # Origin: 2026-05-16 Saturday SF DataPhase1 preflight failure.
 #
-# PYTHON_BIN is set per-block via `command -v python3.12 || command -v
-# python3` so downstream bash scripts (rag/pipelines/run_weekly_ingestion.sh)
-# inherit the interpreter that bootstrap installed. AL2023 spots install
-# python3.12 but have no bare `python` symlink — the RAG script's
-# `python -m ...` fails without this. Origin: 2026-04-17 Saturday SF
-# failure in RAG step-0 preflight.
+# PYTHON_BIN is exported per-block so downstream bash scripts
+# (rag/pipelines/run_weekly_ingestion.sh) inherit the interpreter the
+# bootstrap installed. AL2023 spots install python3.12 but have no bare
+# `python` symlink — the RAG script's `python -m ...` fails without this.
+# Origin: 2026-04-17 Saturday SF failure in RAG step-0 preflight.
+#
+# STRICT resolution, never a fallback (alpha-engine-config-I7372). This block
+# used to read
+#
+#     command -v python3.12 >/dev/null && PYTHON_BIN=python3.12 || PYTHON_BIN=python3
+#
+# and it is included in EVERY run_ssm step in this file, not only the
+# bootstrap — so a box where the python3.12 install failed did not fail the
+# bootstrap, it silently ran the whole weekly workload on the AMI's python3.
+# requirements.txt is resolved against 3.12; a different interpreter resolves
+# different wheels, and the first symptom is an ImportError or a subtly
+# different numpy/pyarrow several steps later. The bootstrap now INSTALLS and
+# ASSERTS python3.12 (krepis.spot_bootstrap's interpreter block exits 1 when
+# it is absent after the install), so by the time any of these steps runs the
+# interpreter is a guarantee — and if that guarantee is ever broken, this
+# fails loudly here rather than degrading quietly.
 read -r -d '' ENV_SOURCE <<'ENV_EOF' || true
 export HOME=/home/ec2-user
 export XDG_CACHE_HOME=/tmp
 export AWS_REGION=us-east-1
 export AWS_DEFAULT_REGION=us-east-1
-command -v python3.12 >/dev/null && PYTHON_BIN=python3.12 || PYTHON_BIN=python3
+if ! command -v python3.12 >/dev/null 2>&1; then
+    echo "ERROR: python3.12 not found on this spot — the bootstrap installs and asserts it. Refusing to fall back to the AMI python3: requirements.txt is resolved against 3.12 and the wheels differ (alpha-engine-config-I7372)." >&2
+    exit 1
+fi
+PYTHON_BIN=python3.12
 export PYTHON_BIN
 ENV_EOF
 
 # ── Bootstrap spot: watchdog + python + git + clone + config ────────────────
-# Single SSM call covering: spot-side hard-timeout watchdog,
-# python3.12/git install, repo clone, and config.yaml fetch from the
-# dispatcher's S3 staging prefix. Watchdog rationale: dispatcher-side
-# `trap cleanup EXIT` only fires when THIS script exits cleanly. If the
-# dispatcher SSM command is cancelled, the dispatcher EC2 is stopped
-# mid-run, or the shell gets SIGKILLed, the trap never runs and the spot
-# orphans until manually terminated. Hit 3 times in April 2026 (~$20
-# orphan each). systemd-run shuts the box down after MAX_RUNTIME_SECONDS
-# regardless of dispatcher state. AL2023's
+# Rendered by krepis.spot_bootstrap (alpha-engine-config-I6922 / I7372), not
+# built as an inline heredoc. This file was the LAST shell copy of the fleet's
+# spot bootstrap in this repo; `_spot_common.sh` cut over in #1388 and this
+# one is the retired monolith path, still maintained as the manual-rerun and
+# --phase2-only entry point, so a divergence here is a divergence nobody
+# exercises until the week they need it.
+#
+# The two copies were forks of each other's failure modes, which is the exact
+# shape the shared renderer ends:
+#   - THIS file armed a transient `systemd-run --on-active` hard-timeout timer
+#     and never installed the `ec2-spot-watchdog` UNIT, so it was uncovered
+#     against "the SSM agent died and nothing can ever reach this box again".
+#   - `_spot_common.sh` installed the unit and never armed a timer, so it was
+#     uncovered against "the workload itself hung".
+# The renderer emits BOTH, always together (they are separate guarantees, not
+# alternatives), so this cutover GAINS the SSM-liveness watchdog while keeping
+# the hard cap `--max-runtime-seconds "$MAX_RUNTIME_SECONDS"` arms below. The
+# timer's unit name changes `alpha-engine-watchdog` -> `ec2-spot-hard-timeout`
+# (the fleet name); nothing in this repo or the SF definitions reads it.
+#
+# Two behaviour changes worth naming, both deliberate hardening:
+#   1. Arming the timer is now FATAL if `systemd-run` fails. It used to run
+#      bare under `set -e` (so a failure did abort) but the renderer makes the
+#      message explicit — "the cap could not be armed" is precisely the state
+#      in which an uncapped spot must not start.
+#   2. The interpreter is installed and then ASSERTED: `command -v python3.12`
+#      absent after the install exits 1, instead of the old silent slide onto
+#      the AMI's python3 via `$PYTHON_BIN` (see the ENV_SOURCE block above).
+#
+# Watchdog rationale, unchanged: dispatcher-side `trap cleanup EXIT` only
+# fires when THIS script exits cleanly. If the dispatcher SSM command is
+# cancelled, the dispatcher EC2 is stopped mid-run, or the shell gets
+# SIGKILLed, the trap never runs and the spot orphans until manually
+# terminated. Hit 3 times in April 2026 (~$20 orphan each). AL2023's
 # InstanceInitiatedShutdownBehavior for spots defaults to terminate, so
 # shutdown = instance goes away.
-echo "==> Bootstrapping spot (watchdog, python, clone, config)..."
-run_ssm "bootstrap" 600 <<BOOTSTRAP
-set -eo pipefail
-${ENV_SOURCE}
-
-# Spot-side hard-timeout watchdog (see bootstrap-step rationale above).
-systemd-run --on-active=${MAX_RUNTIME_SECONDS} --unit=alpha-engine-watchdog \
-    --description='alpha-engine spot hard-timeout' /sbin/shutdown -h now
-
-dnf install -y -q python3.12 python3.12-pip python3.12-devel git gcc 2>/dev/null || \
-    dnf install -y -q python3 python3-pip python3-devel git gcc
-echo "Using: \$(\$PYTHON_BIN --version)"
-
-git clone --depth 1 --branch ${BRANCH} https://github.com/nousergon/nousergon-data.git /home/ec2-user/alpha-engine-data
-
-mkdir -p /home/ec2-user/alpha-engine-config/data
-aws s3 cp ${S3_STAGING}/config.yaml /home/ec2-user/alpha-engine-config/data/config.yaml --region ${AWS_REGION} --quiet
-echo "Bootstrap complete: repo cloned, config.yaml fetched from ${S3_STAGING}/config.yaml."
-BOOTSTRAP
+#
+# Repo URL, branch and region are passed as LAUNCHER-SIDE LITERALS rather than
+# left for the remote shell to expand — the class that cost
+# crucible-predictor#463 (`git clone --branch ${BRANCH} ${REPO_URL}` where the
+# value was interpolated into the heredoc but never exported, so the clone ran
+# against an empty string) cannot occur when the value is baked in.
+echo "==> Bootstrapping spot (watchdog, hard timeout, python, clone, config)..."
+_BOOTSTRAP_SCRIPT="$("$LIB_PYTHON" -m krepis.spot_bootstrap render \
+    --repo-url https://github.com/nousergon/nousergon-data.git \
+    --checkout /home/ec2-user/alpha-engine-data \
+    --branch "${BRANCH:-main}" \
+    --region "${AWS_REGION:-us-east-1}" \
+    --max-runtime-seconds "$MAX_RUNTIME_SECONDS" \
+    --export "S3_STAGING=${S3_STAGING}" \
+    --config-copy config.yaml:/home/ec2-user/alpha-engine-config/data/config.yaml)"
+printf '%s\n' "$_BOOTSTRAP_SCRIPT" | run_ssm "bootstrap" 600
 
 # ── Install python deps ─────────────────────────────────────────────────────
 echo "==> Installing Python dependencies..."
