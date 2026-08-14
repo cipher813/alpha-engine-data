@@ -22,7 +22,10 @@ bounded things:
   2. **Attempts ONE recovery**, once per alarm per cooldown window, from a
      hardcoded reviewed allowlist: re-invoke the liveness probe, or re-dispatch
      one playbook through the router. Nothing else exists in the map, and an
-     unmapped alarm reports without acting.
+     unmapped alarm reports without acting. It also declines to act when the
+     target component's triggers are ALL paused in `automation_pause.json` —
+     restarting automation an operator deliberately turned off is not recovery
+     (alpha-engine-config-I7330).
   3. **Escalates on the second firing** inside the window — the attempt did not
      work, a human is needed now, and retrying would be a loop.
 
@@ -67,6 +70,7 @@ import os
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import boto3
 
@@ -105,32 +109,81 @@ TELEGRAM_CHAT_PARAM = os.environ.get(
 # `redispatch` payloads mirror what the scheduler sends, minus the run id (the
 # executor mints its own). `is_drill` is always false: a drill would prove the
 # pipe works while leaving the real backlog untouched.
+#
+# `triggers` names every schedule/rule the action's TARGET component runs on. It
+# is what makes the pause check below possible: recovering a component whose own
+# triggers an operator deliberately disabled is not recovery, it is restarting
+# paused automation (alpha-engine-config-I7330). Names are pinned against
+# automation_pause.json by test_handler.py — a typo here would silently disable
+# the gate rather than fail it.
 ALARM_ACTIONS: dict[str, dict] = {
     "alpha-engine-watch-plane-overseer-intake-age": {
         "action": "redispatch",
         "playbook": "alert-drain",
         "payload": {"trigger": "backstop-recovery", "is_drill": "false"},
         "rationale": "queue ageing means the drain is not draining — one dispatch",
+        "component": "alert-drain",
+        "triggers": [
+            "alpha-engine-alert-drain-0400utc",
+            "alpha-engine-alert-drain-1000utc",
+            "alpha-engine-alert-drain-1600utc",
+            "alpha-engine-alert-drain-2200utc",
+        ],
     },
     "alpha-engine-watch-plane-overseer-intake-depth": {
         "action": "redispatch",
         "playbook": "alert-drain",
         "payload": {"trigger": "backstop-recovery", "is_drill": "false"},
         "rationale": "queue depth means the drain is not draining — one dispatch",
+        "component": "alert-drain",
+        "triggers": [
+            "alpha-engine-alert-drain-0400utc",
+            "alpha-engine-alert-drain-1000utc",
+            "alpha-engine-alert-drain-1600utc",
+            "alpha-engine-alert-drain-2200utc",
+        ],
     },
     "alpha-engine-watch-plane-overseer-liveness-probe-errors": {
         "action": "invoke_probe",
         "rationale": "a probe erroring every invocation blinds the whole plane",
+        "component": "overseer-liveness-probe",
+        "triggers": [
+            "alpha-engine-overseer-liveness-0650-daily",
+            "alpha-engine-overseer-liveness-1450-daily",
+        ],
     },
 }
 
-# Kill switches to report. Component -> (function name, env var).
-KILL_SWITCHES = [
+# Per-component dispatch flags to report. Component -> (function, variable).
+#
+# NOTE THE POLARITY. Every variable here is named `*_DISPATCH_ENABLED`, so
+# `true` means the component WILL dispatch — it is an enable flag, not a kill
+# switch, and the two read as exact opposites. This block was previously
+# rendered under the heading "kill switches", which made `router: true` read as
+# "the router is stopped" when it means "the router is running". On 2026-08-14
+# that line was taken as proof the overseer plane was off and a P1 was filed
+# against the wrong component (alpha-engine-config-I7330). `_dispatch_state()`
+# now renders the semantic state and carries the raw variable alongside it, so
+# the value can never disagree with its label again.
+DISPATCH_FLAGS = [
     ("router", ROUTER_FUNCTION, "OVERSEER_DISPATCH_ENABLED"),
     ("alert-drain", "alpha-engine-alert-drain-dispatcher", "ALERT_DRAIN_DISPATCH_ENABLED"),
     ("ci-watch", "alpha-engine-ci-watch-dispatcher", "CI_WATCH_DISPATCH_ENABLED"),
     ("sf-watch", "alpha-engine-sf-watch-spot-dispatcher", "SF_WATCH_DISPATCH_ENABLED"),
 ]
+
+# The automation pause manifest, bundled into the deploy package by deploy.sh.
+#
+# Read from disk, never from the network: this Lambda must not acquire a runtime
+# dependency on the plane it rescues (see WHAT IT DELIBERATELY IS NOT, above).
+# It mirrors overseer-liveness-probe/deploy.sh, which bundles playbooks.yaml for
+# the same reason — a registry edit ships through the normal code path.
+#
+# Staleness is already covered: infrastructure/automation_pause.py --check runs
+# in the daily drift sweep and fails in BOTH directions when the manifest and
+# live AWS disagree, so a bundled copy that has drifted is a red check rather
+# than a silent wrong answer here.
+PAUSE_MANIFEST = Path(__file__).parent / "automation_pause.json"
 
 # Playbook -> S3 prefix whose newest object proves the playbook last completed.
 LEDGER_PREFIXES = {
@@ -146,18 +199,72 @@ def _utcnow() -> datetime:
 # ── Evidence gathering — every step degrades to a string, never raises ───────
 
 
-def _kill_switch_state() -> dict[str, str]:
+def _dispatch_state() -> dict[str, str]:
+    """Per-component dispatch state, rendered so the value agrees with the label.
+
+    Returns e.g. ``{"router": "ENABLED (OVERSEER_DISPATCH_ENABLED=true)"}``. The
+    raw variable stays in the string because it names the thing an operator would
+    actually flip; the leading word is what the reader acts on. See the polarity
+    note on DISPATCH_FLAGS for why this is not a raw boolean.
+    """
     out: dict[str, str] = {}
     lam = boto3.client("lambda", region_name=REGION)
-    for label, function, var in KILL_SWITCHES:
+    for label, function, var in DISPATCH_FLAGS:
         try:
             cfg = lam.get_function_configuration(FunctionName=function)
-            out[label] = cfg.get("Environment", {}).get("Variables", {}).get(
-                var, "(unset — defaults to enabled)"
-            )
+            raw = cfg.get("Environment", {}).get("Variables", {}).get(var)
+            if raw is None:
+                out[label] = f"ENABLED ({var} unset — defaults to enabled)"
+            elif str(raw).strip().lower() == "true":
+                out[label] = f"ENABLED ({var}={raw})"
+            else:
+                out[label] = f"STOPPED ({var}={raw})"
         except Exception as exc:  # noqa: BLE001 — see FAILURE POSTURE
             out[label] = f"UNREADABLE: {type(exc).__name__}"
     return out
+
+
+def _paused_trigger_names() -> set[str] | None:
+    """Every trigger name the pause manifest says is deliberately off.
+
+    Returns None when the manifest cannot be read or parsed. None means UNKNOWN,
+    not "nothing is paused" — the caller acts and says so in the page, because a
+    backstop that silently stops acting because it could not read a file is the
+    failure mode this Lambda exists to survive. Both blocks count: ``paused`` is
+    what is off now, ``pending`` is what must be born off.
+    """
+    try:
+        manifest = json.loads(PAUSE_MANIFEST.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 — see FAILURE POSTURE
+        print(f"WARN: pause manifest unreadable ({type(exc).__name__}) — the "
+              f"pause check cannot run; actions proceed and the page says so")
+        return None
+    names: set[str] = set()
+    for surface in ("events_rules", "scheduler_schedules"):
+        names |= set(manifest.get("paused", {}).get(surface, {}))
+    names |= {k for k in manifest.get("pending", {}) if not k.startswith("_")}
+    return names
+
+
+def _pause_verdict(spec: dict) -> str | None:
+    """Return a skip reason when the action's target component is fully paused.
+
+    ALL of the component's triggers must be paused. A component with even one
+    live trigger is still running on its own cadence, so a recovery dispatch is
+    still the right response to its alarm — it is only when an operator has
+    turned every trigger off that acting means restarting paused automation.
+    """
+    triggers = spec.get("triggers") or []
+    if not triggers:
+        return None
+    paused = _paused_trigger_names()
+    if paused is None:
+        return None
+    if all(t in paused for t in triggers):
+        component = spec.get("component") or spec["action"]
+        return (f"{component} is paused in automation_pause.json "
+                f"({len(triggers)} trigger(s), all disabled) — reporting only")
+    return None
 
 
 def _queue_age_seconds(queue_name: str) -> int | None:
@@ -443,8 +550,8 @@ def _render(alarm: str, reason: str, evidence: dict, outcome: dict) -> str:
     lines.append("  last ledger:")
     for k, v in evidence["ledgers"].items():
         lines.append(f"    {k}: {v}")
-    lines.append("  kill switches:")
-    for k, v in evidence["kill_switches"].items():
+    lines.append("  dispatch flags:")
+    for k, v in evidence["dispatch"].items():
         lines.append(f"    {k}: {v}")
     lines += ["", "RECOVERY"]
     if outcome.get("escalated"):
@@ -478,19 +585,25 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         reason = f"(could not parse SNS message: {type(exc).__name__})"
 
     evidence = {
-        "kill_switches": _kill_switch_state(),
+        "dispatch": _dispatch_state(),
         "queues": _queue_state(),
         "ledgers": _last_ledger_ages(),
         "probe": _probe_health(),
     }
 
     spec = ALARM_ACTIONS.get(alarm)
+    pause_skip = _pause_verdict(spec) if spec else None
     if spec is None:
         outcome = {"skipped": "alarm has no entry in the reviewed action "
                               "allowlist — reporting only"}
     elif not RECOVERY_ENABLED:
         outcome = {"skipped": "BACKSTOP_RECOVERY_ENABLED=false (operator "
                               "kill switch) — reporting only"}
+    elif pause_skip is not None:
+        # Checked BEFORE _claim_attempt: a paused component must not consume its
+        # own cooldown window, or the first firing after the pause lifts would
+        # escalate as a "second firing" without a first attempt ever happening.
+        outcome = {"skipped": pause_skip}
     else:
         first, prior = _claim_attempt(alarm, now)
         if not first:

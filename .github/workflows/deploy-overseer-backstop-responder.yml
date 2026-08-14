@@ -10,6 +10,13 @@ name: Deploy overseer-backstop-responder
 # the zip at deploy — a registry edit therefore deploys through THIS workflow's
 # code path (the path filter includes the registry).
 #
+# The automation pause manifest (infrastructure/automation_pause.json) is
+# bundled the same way and for the same reason (alpha-engine-config-I7330), so
+# it is in the path filter too. Without that line a pause edit would merge
+# green and change nothing in the deployed package: the responder would keep
+# deciding from a stale copy, with no check anywhere going red. Any file added
+# to the zip by deploy.sh must be added here in the SAME change.
+#
 # Designed per alpha-engine-config-I4480 (G9 of the 2026-07-27 conformance audit).
 # The backstop-responder subscribes directly to the alarm-backstop SNS topic and
 # performs bounded non-agentic recovery per cooldown window.
@@ -23,6 +30,7 @@ on:
     paths:
       - 'infrastructure/lambdas/overseer-backstop-responder/**'
       - 'infrastructure/overseer/playbooks.yaml'
+      - 'infrastructure/automation_pause.json'
       - '.github/workflows/deploy-overseer-backstop-responder.yml'
   workflow_dispatch:
 

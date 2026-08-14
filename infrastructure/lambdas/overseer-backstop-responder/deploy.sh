@@ -97,6 +97,23 @@ else
   echo "Continuing; deploy.sh --smoke will catch this."
 fi
 
+# Bundle the automation pause manifest (alpha-engine-config-I7330). It is the
+# fleet's record of which triggers an operator has deliberately disabled, and
+# the responder consults it before acting so a recovery cannot restart paused
+# automation. Bundled rather than fetched for the same reason playbooks.yaml is:
+# this Lambda must not acquire a runtime dependency on the plane it rescues.
+# A MISSING manifest is not fatal — index.py treats an unreadable manifest as
+# UNKNOWN, acts, and says so in the page. Failing the deploy here would make a
+# file-copy problem take out the backstop itself.
+PAUSE_SRC="${REPO_ROOT}/infrastructure/automation_pause.json"
+if [[ -f "${PAUSE_SRC}" ]]; then
+  cp "${PAUSE_SRC}" "${PKG}/automation_pause.json"
+  echo "Bundled automation_pause.json from ${PAUSE_SRC}"
+else
+  echo "WARNING: automation_pause.json not found at ${PAUSE_SRC} — the pause"
+  echo "         check will report UNKNOWN and actions will proceed unguarded."
+fi
+
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
