@@ -284,6 +284,57 @@ def test_an_unreadable_manifest_reports_unknown_rather_than_not_paused(
     assert index._pause_verdict(index.ALARM_ACTIONS[PROBE_ERRORS]) is None
 
 
+def test_every_bundled_file_is_in_the_deploy_workflow_path_filter():
+    """A file in the zip but not in the path filter merges green and deploys nothing.
+
+    `deploy.sh` copies three files into the package. The workflow only runs when
+    a path in its filter changes, so a bundled file missing from that list means
+    edits to it never reach the deployed Lambda — the responder keeps deciding
+    from a stale copy and no check goes red. `automation_pause.json` was exactly
+    that gap when it was first bundled. This asserts the general property rather
+    than the one instance, so the next bundled file cannot repeat it.
+    """
+    import re
+
+    lambda_dir = Path(__file__).resolve().parent
+    repo_root = lambda_dir.parents[2]
+    deploy = (lambda_dir / "deploy.sh").read_text(encoding="utf-8")
+    workflow = (
+        repo_root / ".github/workflows/deploy-overseer-backstop-responder.yml"
+    ).read_text(encoding="utf-8")
+
+    # Resolve the handful of path variables deploy.sh uses as `cp` sources.
+    variables = {"SCRIPT_DIR": str(lambda_dir), "REPO_ROOT": str(repo_root)}
+    for name in ("REGISTRY_SRC", "PAUSE_SRC"):
+        m = re.search(rf'^{name}="([^"]+)"', deploy, re.M)
+        assert m, f"{name} is no longer assigned in deploy.sh — update this test"
+        variables[name] = m.group(1)
+
+    def _expand(raw: str) -> str:
+        for _ in range(3):  # variables reference each other one level deep
+            raw = re.sub(r"\$\{(\w+)\}",
+                         lambda mo: variables.get(mo.group(1), mo.group(0)), raw)
+        return raw
+
+    sources = [_expand(m) for m in
+               re.findall(r'^\s*cp "([^"]+)" "\$\{PKG\}/', deploy, re.M)]
+    assert len(sources) >= 3, f"expected 3+ bundled files, parsed {sources}"
+
+    filters = re.findall(r"^\s+- '([^']+)'$", workflow, re.M)
+    for source in sources:
+        assert "${" not in source, f"unresolved variable in {source!r}"
+        rel = Path(source).resolve().relative_to(repo_root).as_posix()
+        covered = any(
+            rel == f or (f.endswith("/**") and rel.startswith(f[:-2]))
+            for f in filters
+        )
+        assert covered, (
+            f"{rel} is bundled into the zip by deploy.sh but matches no path "
+            f"filter in deploy-overseer-backstop-responder.yml. Editing it "
+            f"would merge green and deploy nothing. Filters: {filters}"
+        )
+
+
 # ── The dispatch-flag block reports state whose value agrees with its label ──
 
 

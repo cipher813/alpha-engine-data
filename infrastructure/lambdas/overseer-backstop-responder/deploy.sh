@@ -105,7 +105,7 @@ fi
 # A MISSING manifest is not fatal — index.py treats an unreadable manifest as
 # UNKNOWN, acts, and says so in the page. Failing the deploy here would make a
 # file-copy problem take out the backstop itself.
-PAUSE_SRC="${SCRIPT_DIR}/../../automation_pause.json"
+PAUSE_SRC="${REPO_ROOT}/infrastructure/automation_pause.json"
 if [[ -f "${PAUSE_SRC}" ]]; then
   cp "${PAUSE_SRC}" "${PKG}/automation_pause.json"
   echo "Bundled automation_pause.json from ${PAUSE_SRC}"
