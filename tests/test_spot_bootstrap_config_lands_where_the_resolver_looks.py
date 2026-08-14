@@ -18,13 +18,25 @@ is exactly the coupling nothing else checks.
 The candidate list here is DERIVED from
 ``nousergon_lib.config.resolve_experiment_config`` rather than hardcoded: if the
 resolver's search order changes, this test fails instead of the pipeline.
+
+## Post-cutover (alpha-engine-config-I6922, 2026-08-14)
+
+``bootstrap_spot()`` no longer writes an ``aws s3 cp`` literal into
+``_spot_common.sh`` — it passes a ``--config-copy source:dest:chown`` argument
+to ``krepis.spot_bootstrap render`` and dispatches the rendered script. This
+test now extracts that argument and renders the actual script through
+``krepis.spot_bootstrap.render_bootstrap`` before asserting the ``aws s3 cp``
+destination against the resolver, so it is exercising exactly what the spot
+box receives, not a hand-parsed proxy for it.
 """
 
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 
+from krepis.spot_bootstrap import ConfigCopy, SpotBootstrapSpec, render_bootstrap
 from nousergon_lib.config import resolve_experiment_config
 
 # Where the bootstrap clones nousergon-data on the spot box, and the working
@@ -32,12 +44,39 @@ from nousergon_lib.config import resolve_experiment_config
 _REMOTE_CHECKOUT = Path("/home/ec2-user/data")
 
 _SPOT_COMMON = Path(__file__).resolve().parents[1] / "infrastructure" / "_spot_common.sh"
-_SRC = _SPOT_COMMON.read_text(encoding="utf-8")
 
-# `aws s3 cp "${S3_STAGING}/config.yaml" "<dest>"` inside the bootstrap heredoc.
+# `aws s3 cp "${S3_STAGING}/config.yaml" "<dest>"` inside the RENDERED script.
 _STAGE_CP = re.compile(
     r'aws\s+s3\s+cp\s+"\$\{S3_STAGING\}/config\.yaml"\s+"?(?P<dest>[^"\s]+)"?'
 )
+
+
+def _rendered_bootstrap() -> str:
+    """Render the actual script bootstrap_spot() sends, from its real argv."""
+    text = _SPOT_COMMON.read_text(encoding="utf-8")
+    block_m = re.search(r"\nbootstrap_spot\(\)\s*\{(.*?)\n\}", text, re.S)
+    assert block_m, f"bootstrap_spot() not found in {_SPOT_COMMON.name}"
+    call_m = re.search(
+        r'"\$LIB_PYTHON"\s+-m\s+krepis\.spot_bootstrap\s+render\s*\\(.*?)\)"',
+        block_m.group(1),
+        re.S,
+    )
+    assert call_m, "bootstrap_spot() no longer dispatches krepis.spot_bootstrap render"
+    args = shlex.split(call_m.group(1).replace("\\\n", " "))
+
+    def flag(name: str) -> str:
+        return args[args.index(name) + 1]
+
+    source, dest, chown = flag("--config-copy").split(":")
+    spec = SpotBootstrapSpec(
+        repo_url=flag("--repo-url"),
+        checkout=flag("--checkout"),
+        region=flag("--region"),
+        branch="main",
+        config_copies=(ConfigCopy(source_name=source, dest=dest, chown=chown),),
+        exports={"S3_STAGING": "s3://placeholder/staging"},
+    )
+    return render_bootstrap(spec)
 
 
 def _resolver_candidates() -> list[str]:
@@ -59,11 +98,12 @@ def _resolver_candidates() -> list[str]:
 
 
 def test_bootstrap_stages_config_to_a_resolver_candidate():
-    dests = [m.group("dest") for m in _STAGE_CP.finditer(_SRC)]
+    src = _rendered_bootstrap()
+    dests = [m.group("dest") for m in _STAGE_CP.finditer(src)]
     assert dests, (
-        f"{_SPOT_COMMON.name} no longer stages config.yaml in its bootstrap — if that "
-        "is deliberate (prebaked image), delete this test with the reason; otherwise "
-        "the stages will fail on a fresh box."
+        f"{_SPOT_COMMON.name}'s rendered bootstrap no longer stages config.yaml — if "
+        "that is deliberate (prebaked image), delete this test with the reason; "
+        "otherwise the stages will fail on a fresh box."
     )
 
     candidates = _resolver_candidates()
@@ -78,12 +118,13 @@ def test_bootstrap_stages_config_to_a_resolver_candidate():
 
 def test_staged_config_is_readable_by_the_stage_user():
     """The bootstrap runs as root; every stage workload runs as ec2-user."""
-    dests = [m.group("dest") for m in _STAGE_CP.finditer(_SRC)]
+    src = _rendered_bootstrap()
+    dests = [m.group("dest") for m in _STAGE_CP.finditer(src)]
     for dest in dests:
         owner_root = str(Path(dest).parent.parent)
         assert re.search(
-            rf"chown -R ec2-user:ec2-user {re.escape(owner_root)}\b", _SRC
-        ) or re.search(rf"chown -R ec2-user:ec2-user {re.escape(str(Path(dest).parent))}\b", _SRC), (
+            rf"chown -R ec2-user:ec2-user {re.escape(owner_root)}\b", src
+        ) or re.search(rf"chown -R ec2-user:ec2-user {re.escape(str(Path(dest).parent))}\b", src), (
             f"config staged to {dest} by the root bootstrap is never chowned to "
             "ec2-user, which is the uid every stage's SSM heredoc runs under"
         )
