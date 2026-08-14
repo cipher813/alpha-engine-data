@@ -141,28 +141,36 @@ def test_the_descriptor_names_the_component_id_every_surface_uses(cadence):
 
 # ── The template must stay deployable ────────────────────────────────────────
 
-# CloudFormation's inline --template-body ceiling. infrastructure/
-# deploy-infrastructure.sh passes `--template-body file://` for BOTH
-# validate-template and create/update-stack, and that workflow runs on EVERY
-# push to main with no path filter — so a template that crosses this ceiling
-# does not fail the PR that did it, it fails every subsequent merge's infra
-# deploy, for changes whose authors have no idea why.
+# CloudFormation's S3-sourced --template-url ceiling (alpha-engine-config-I7250).
+# deploy-infrastructure.sh used to pass `--template-body file://` for BOTH
+# validate-template and create/update-stack, capped at the 51200-byte inline
+# ceiling. Measured 2026-08-13 while adding the preflight-sweep resources:
+# main was already at 48015 of 51200 bytes, under 7% headroom, with nothing
+# anywhere reporting that — and that workflow runs on EVERY push to main with
+# no path filter, so crossing the ceiling doesn't fail the PR that did it, it
+# fails every subsequent merge's infra deploy for authors who never touched
+# infrastructure/.
 #
-# Measured 2026-08-13 while adding the preflight-sweep resources: main was
-# already at 48015 of 51200 bytes, under 7% headroom, with nothing anywhere
-# reporting that. The structural fix is to upload the template to S3 and use
-# --template-url (1MB ceiling) — filed separately; this test is the guard that
-# turns a silent deploy break into a merge-time failure in the meantime.
-CFN_INLINE_BODY_LIMIT = 51200
+# I7250 moved the deploy to `aws s3 cp` + `--template-url`, which raises the
+# real ceiling to 460800 bytes (CloudFormation's S3-template limit). This
+# guard is retargeted at that higher ceiling, MINUS a margin — asserting
+# against the raw 460800-byte hard limit would recreate the exact defect one
+# order of magnitude later: a template that silently grows to within a few
+# hundred bytes of a wall nothing warns about until it's crossed. The margin
+# below (60800 bytes, ~13%) is deliberately generous relative to the 459-byte
+# headroom that triggered this issue.
+CFN_TEMPLATE_URL_HARD_LIMIT = 460800
+CFN_TEMPLATE_URL_MARGIN = 60800
+CFN_TEMPLATE_URL_GUARD_CEILING = CFN_TEMPLATE_URL_HARD_LIMIT - CFN_TEMPLATE_URL_MARGIN
 
 
 def test_the_orchestration_template_still_fits_the_inline_deploy_limit():
     size = len(CFN_PATH.read_bytes())
-    assert size <= CFN_INLINE_BODY_LIMIT, (
-        f"{CFN_PATH.name} is {size} bytes, over CloudFormation's "
-        f"{CFN_INLINE_BODY_LIMIT}-byte inline --template-body ceiling. "
-        "deploy-infrastructure.sh passes the template inline on EVERY push to "
-        "main, so this breaks the infra deploy for every subsequent merge, not "
-        "just this change. Either trim, or switch deploy-infrastructure.sh to "
-        "an S3 --template-url upload (1MB ceiling)."
+    assert size <= CFN_TEMPLATE_URL_GUARD_CEILING, (
+        f"{CFN_PATH.name} is {size} bytes, within {CFN_TEMPLATE_URL_MARGIN} "
+        f"bytes of CloudFormation's {CFN_TEMPLATE_URL_HARD_LIMIT}-byte "
+        "--template-url ceiling (deploy-infrastructure.sh uploads the "
+        "template to S3 and deploys via --template-url — I7250). Trim the "
+        "template, or raise CFN_TEMPLATE_URL_MARGIN here with a written "
+        "rationale — never delete this guard."
     )

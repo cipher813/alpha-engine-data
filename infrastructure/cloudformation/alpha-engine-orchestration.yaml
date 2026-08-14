@@ -1036,20 +1036,36 @@ Resources:
 # Outputs
 # ============================================================================
 
-  # Preflight sweep — daily all-stage --preflight-only check (config-I7249).
-  # WHY these three resources are shaped as they are (schedule here rather than
-  # in deploy.sh; deliberately NO AWS::Lambda::Permission; the deadman as the
-  # operator-gate detector; Period/EvaluationPeriods derived from the declared
-  # cadence) is documented in infrastructure/preflight_sweep_stages.py,
+  # --------------------------------------------------------------------------
+  # Preflight sweep — daily all-stage --preflight-only check (config-I7249)
+  # --------------------------------------------------------------------------
+  # WHY these three resources are shaped as they are — schedule declared HERE
+  # rather than baked into deploy.sh; deliberately NO AWS::Lambda::Permission
+  # (the dispatcher Lambda's resource-based policy is granted out-of-band by
+  # deploy.sh --bootstrap, mirroring the other scheduled dispatchers in this
+  # template); the deadman alarm as the operator-facing "did this even run"
+  # detector, distinct from the dispatcher-errors alarm below which only
+  # catches the Lambda itself erroring; Period/EvaluationPeriods on the
+  # deadman derived from the declared daily cadence rather than picked ad
+  # hoc — is documented in infrastructure/preflight_sweep_stages.py,
   # infrastructure/preflight_sweep_cadence.json and the dispatcher README.
   # tests/test_preflight_sweep_cadence.py fails if any of it drifts from the
-  # manifest. Comments are terse here ONLY because this template is within
-  # ~3KB of CloudFormation's 51200-byte inline --template-body ceiling.
+  # manifest (the single declared source per sf-pipeline-policy §2.6).
+  #
+  # These comments were trimmed to fit the old 51200-byte inline
+  # --template-body ceiling and are restored here now that
+  # deploy-infrastructure.sh uploads via --template-url instead
+  # (alpha-engine-config-I7250 — the ceiling is 460800 bytes now).
   PreflightSweepDailyTrigger:
     Type: AWS::Events::Rule
     Properties:
       Name: alpha-engine-preflight-sweep-daily
-      Description: Daily all-stage --preflight-only sweep of the weekly SF (config-I7249). Cadence declared in infrastructure/preflight_sweep_cadence.json.
+      Description: >-
+        Daily all-stage --preflight-only sweep of the weekly SF (config-I7249).
+        Cadence declared in infrastructure/preflight_sweep_cadence.json — this
+        rule's ScheduleExpression is asserted against that manifest by
+        tests/test_preflight_sweep_cadence.py, so the two cannot drift apart
+        silently.
       ScheduleExpression: 'cron(0 8 ? * * *)'
       State: ENABLED
       Targets:
@@ -1061,7 +1077,15 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: alpha-engine-preflight-sweep-no-run
-      AlarmDescription: Daily all-stage preflight sweep did not report at all (config-I7249). Subject is emitted on every terminal path incl. could-not-measure, so this fires only on total silence. Also stays red until deploy.sh --bootstrap creates the dispatcher Lambda.
+      AlarmDescription: >-
+        Daily all-stage preflight sweep did not report AT ALL (config-I7249).
+        PreflightSweepRunCompleted is emitted on every terminal path,
+        including could-not-measure, so this fires ONLY on total silence —
+        distinct from a sweep that ran and reported a bad result, which is a
+        separate, non-deadman alarm. Also stays red (TreatMissingData:
+        breaching) until deploy.sh --bootstrap creates the dispatcher Lambda,
+        which is the intended fail-closed posture for a component that has
+        not yet been onboarded rather than a false green.
       Namespace: AlphaEngine
       MetricName: PreflightSweepRunCompleted
       Dimensions:
@@ -1083,7 +1107,14 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: alpha-engine-preflight-sweep-dispatcher-errors
-      AlarmDescription: preflight-sweep dispatcher Lambda errored — launcher box or SSM command never happened (config-I7249)
+      AlarmDescription: >-
+        preflight-sweep dispatcher Lambda errored — the launcher box or the
+        SSM command it issues never happened (config-I7249). Complements
+        PreflightSweepDeadman above: this fires FAST on a Lambda-level
+        exception (Period 3600s vs the deadman's 86400s), while the deadman
+        is the backstop that still catches a silent failure this alarm's
+        Lambda-Errors metric cannot see (e.g. the Lambda invokes cleanly but
+        the downstream SSM command never runs).
       Namespace: AWS/Lambda
       MetricName: Errors
       Dimensions:
