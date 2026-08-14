@@ -648,6 +648,51 @@ watch_plane_liveness:
       response_window_min: 15
       lookback_hours: 24
       ssm_retention_days: 30
+    # alpha-engine-config-I4482: watch-plane backstop CloudWatch alarms must
+    # exist and be wired to the independent backstop topic (rather than the
+    # primary alpha-engine-alerts topic) — a blackout of the primary alert
+    # channel must not also silence the alarm that watches the watchers.
+    # The `alarm_action_pattern` expects the backstop topic name.
+    #
+    # Every pattern below was VERIFIED against live CloudWatch on 2026-08-14
+    # (the PR's original TODO, now discharged): each matches at least one live
+    # alarm, and every matched alarm's AlarmActions is
+    # arn:aws:sns:us-east-1:711398986525:alpha-engine-alarm-backstop. So this
+    # check reports CLEAN on the day it ships rather than opening with five
+    # false "NO alarms match pattern" findings — a detector whose first run is
+    # noise is one the reader learns to skip.
+    #
+    #   overseer-dispatcher            -> 2 alarms (errors, throttles)
+    #   alert-drain-dispatcher         -> 2 alarms (errors, throttles)
+    #   overseer-intake                -> 3 alarms (dlq-depth, age, severe-content)
+    #   overseer-intake-dlq-depth      -> 1
+    #   overseer-intake-age            -> 1
+    - type: alarm_coverage
+      alarms:
+        # Per-Lambda watch-plane Errors + Throttles (setup_watch_plane_alarms.sh)
+        - name_pattern: alpha-engine-watch-plane-overseer-dispatcher
+          alarm_action_pattern: alpha-engine-alarm-backstop
+          max_insufficient_data_hours: 168
+        - name_pattern: alpha-engine-watch-plane-alert-drain-dispatcher
+          alarm_action_pattern: alpha-engine-alarm-backstop
+          max_insufficient_data_hours: 168
+        - name_pattern: alpha-engine-watch-plane-overseer-intake
+          alarm_action_pattern: alpha-engine-alarm-backstop
+          max_insufficient_data_hours: 168
+        # Intake DLQ depth + age-of-oldest-message
+        - name_pattern: alpha-engine-watch-plane-overseer-intake-dlq-depth
+          alarm_action_pattern: alpha-engine-alarm-backstop
+          max_insufficient_data_hours: 168
+        - name_pattern: alpha-engine-watch-plane-overseer-intake-age
+          alarm_action_pattern: alpha-engine-alarm-backstop
+          max_insufficient_data_hours: 168
+        # DLQ severe-content: exists live and wired to the backstop topic, but
+        # was undeclared here. Added 2026-08-14 — an alarm nothing declares is
+        # outside the coverage denominator, which is the gap this check exists
+        # to close.
+        - name_pattern: alpha-engine-watch-plane-overseer-intake-dlq-severe-content
+          alarm_action_pattern: alpha-engine-alarm-backstop
+          max_insufficient_data_hours: 168
 
 # ── Alert-class registry (config-I3211; Brian directive 2026-07-22) ──────────
 # One row per DISTINCT notification class the fleet emits. This answers, in
