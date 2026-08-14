@@ -16,32 +16,63 @@ An assertion that a tool exists is a PRECONDITION on the image. A bootstrap's
 job is to establish preconditions, not to require them — so every `command -v`
 guard here must be preceded, in the same script, by something that provides the
 binary.
+
+## Post-cutover (alpha-engine-config-I6922, 2026-08-14)
+
+``bootstrap_spot()`` no longer writes ``dnf install`` / ``command -v`` lines
+into ``_spot_common.sh`` directly — it dispatches ``krepis.spot_bootstrap
+render`` and sends the RENDERED script over SSM. This test now renders that
+script, from the actual argv ``bootstrap_spot()`` passes, and asserts the
+install-before-assert invariant against the render instead of the local file
+text.
 """
 
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 
 import pytest
 
+from krepis.spot_bootstrap import ConfigCopy, SpotBootstrapSpec, render_bootstrap
 from nousergon_lib.shell_guards import BINARY_PROVIDERS, unprovided_binary_violations
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _COMMON = _REPO_ROOT / "infrastructure" / "_spot_common.sh"
 
 
-def _bootstrap_block() -> str:
+def _rendered_bootstrap() -> str:
     text = _COMMON.read_text()
-    m = re.search(r"bootstrap_spot\(\)\s*\{(.*?)\n\}", text, re.S)
-    assert m, "bootstrap_spot() not found in _spot_common.sh"
-    return m.group(1)
+    block_m = re.search(r"bootstrap_spot\(\)\s*\{(.*?)\n\}", text, re.S)
+    assert block_m, "bootstrap_spot() not found in _spot_common.sh"
+    call_m = re.search(
+        r'"\$LIB_PYTHON"\s+-m\s+krepis\.spot_bootstrap\s+render\s*\\(.*?)\)"',
+        block_m.group(1),
+        re.S,
+    )
+    assert call_m, "bootstrap_spot() no longer dispatches krepis.spot_bootstrap render"
+    args = shlex.split(call_m.group(1).replace("\\\n", " "))
+
+    def flag(name: str) -> str:
+        return args[args.index(name) + 1]
+
+    source, dest, chown = flag("--config-copy").split(":")
+    spec = SpotBootstrapSpec(
+        repo_url=flag("--repo-url"),
+        checkout=flag("--checkout"),
+        region=flag("--region"),
+        branch="main",
+        config_copies=(ConfigCopy(source_name=source, dest=dest, chown=chown),),
+        exports={"S3_STAGING": "s3://placeholder/staging"},
+    )
+    return render_bootstrap(spec)
 
 
 def test_every_asserted_binary_is_installed_first():
-    violations = unprovided_binary_violations(_bootstrap_block())
+    violations = unprovided_binary_violations(_rendered_bootstrap())
     assert not violations, (
-        "_spot_common.sh: " + "; ".join(violations) +
+        "_spot_common.sh's rendered bootstrap: " + "; ".join(violations) +
         " This is the 2026-08-11 MorningEnrich failure "
         "(`ERROR: python3.12 not found`), inherited by DataPhase1 and "
         "RAGIngestion too."
@@ -50,7 +81,7 @@ def test_every_asserted_binary_is_installed_first():
 
 def test_bootstrap_installs_python312_explicitly():
     """Anchored: the interpreter the whole stage depends on."""
-    assert re.search(r"dnf install[^\n]*python3\.12", _bootstrap_block()), (
+    assert re.search(r"dnf install[^\n]*python3\.12", _rendered_bootstrap()), (
         "the bootstrap must install python3.12 explicitly"
     )
 
@@ -58,7 +89,7 @@ def test_bootstrap_installs_python312_explicitly():
 @pytest.mark.parametrize("tool", ["git", "gcc"])
 def test_bootstrap_installs_the_tools_the_later_steps_use(tool):
     """git for the clone, gcc for source-built wheels in requirements.txt."""
-    block = _bootstrap_block()
+    block = _rendered_bootstrap()
     assert any(p in block for p in BINARY_PROVIDERS) and tool in block, (
         f"{tool} is used by the bootstrap or the deps step but is not installed"
     )

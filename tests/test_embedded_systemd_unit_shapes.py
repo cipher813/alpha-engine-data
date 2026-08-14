@@ -25,15 +25,28 @@ service type that waits for it to finish.
 Scope note: a genuinely one-shot job (a timer-driven backup, a drift check)
 is correctly ``Type=oneshot`` and is not flagged — the test keys on the
 ExecStart script's own body containing an unbounded loop, not on the type.
+
+## Post-cutover (alpha-engine-config-I6922, 2026-08-14)
+
+``_spot_common.sh``'s ``bootstrap_spot()`` no longer embeds the
+``ec2-spot-watchdog`` unit as heredoc text — it dispatches
+``krepis.spot_bootstrap render`` and sends the rendered script over SSM. The
+generic ``*.sh`` sweep below still runs unmodified (it finds nothing embedded
+in this file now, and that is correct — the unit lives in krepis). The two
+anchored assertions on the specific unit that hung the pipeline are rendered
+from the same argv ``bootstrap_spot()`` actually passes, so they still catch a
+future regression, just against the rendered script.
 """
 
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 
 import pytest
 
+from krepis.spot_bootstrap import ConfigCopy, SpotBootstrapSpec, render_bootstrap
 from nousergon_lib.shell_guards import (
     embedded_units,
     endless_execstart_violations,
@@ -56,14 +69,42 @@ def test_endless_execstart_is_never_a_blocking_service_type(script: Path):
     )
 
 
+def _rendered_bootstrap() -> str:
+    """Render the actual script bootstrap_spot() sends, from its real argv."""
+    text = (_INFRA / "_spot_common.sh").read_text()
+    block_m = re.search(r"bootstrap_spot\(\)\s*\{(.*?)\n\}", text, re.S)
+    assert block_m, "bootstrap_spot() not found in _spot_common.sh"
+    call_m = re.search(
+        r'"\$LIB_PYTHON"\s+-m\s+krepis\.spot_bootstrap\s+render\s*\\(.*?)\)"',
+        block_m.group(1),
+        re.S,
+    )
+    assert call_m, "bootstrap_spot() no longer dispatches krepis.spot_bootstrap render"
+    args = shlex.split(call_m.group(1).replace("\\\n", " "))
+
+    def flag(name: str) -> str:
+        return args[args.index(name) + 1]
+
+    source, dest, chown = flag("--config-copy").split(":")
+    spec = SpotBootstrapSpec(
+        repo_url=flag("--repo-url"),
+        checkout=flag("--checkout"),
+        region=flag("--region"),
+        branch="main",
+        config_copies=(ConfigCopy(source_name=source, dest=dest, chown=chown),),
+        exports={"S3_STAGING": "s3://placeholder/staging"},
+    )
+    return render_bootstrap(spec)
+
+
 def test_the_spot_watchdog_unit_is_a_simple_service():
     """Anchored assertion on the specific unit that hung the pipeline."""
-    text = (_INFRA / "_spot_common.sh").read_text()
+    text = _rendered_bootstrap()
     units = [
         u for u in embedded_units(text)
         if "ec2-spot-watchdog" in u.body or "EC2 Spot Watchdog" in u.body
     ]
-    assert units, "ec2-spot-watchdog unit not found in _spot_common.sh"
+    assert units, "ec2-spot-watchdog unit not found in _spot_common.sh's rendered bootstrap"
     for unit in units:
         assert unit.service_type == "simple", unit.body
         assert "RemainAfterExit" not in unit.body, (
@@ -76,7 +117,7 @@ def test_the_watchdog_enable_call_is_time_bounded():
     """A future regression must fail loudly in seconds, not silently at the
     SSM budget. The 2026-08-10 hang produced NO stderr past the symlink line,
     which is why it read as a slow bootstrap rather than a blocked systemctl."""
-    text = (_INFRA / "_spot_common.sh").read_text()
+    text = _rendered_bootstrap()
     assert re.search(r"timeout\s+\d+\s+systemctl\s+enable\s+--now\s+ec2-spot-watchdog", text), (
         "the watchdog enable call must be wrapped in `timeout N systemctl "
         "enable --now ec2-spot-watchdog` with an explicit error message"

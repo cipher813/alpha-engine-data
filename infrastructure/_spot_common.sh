@@ -270,106 +270,30 @@ stage_config() {
 
 bootstrap_spot() {
   echo "==> Bootstrapping spot (watchdog, python, clone, config)..."
-  local _spot_env_export
-  _spot_env_export="export S3_STAGING=${_S3_STAGING} BRANCH=${BRANCH}"$'\n'
-  run_ssm "bootstrap" "${_spot_env_export}$(cat <<'BOOTSTRAP'
-set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
-
-# systemd watchdog (config#2693). Type=simple, NOT oneshot: ExecStart is an
-# endless supervision loop, and `systemctl start` on a Type=oneshot unit BLOCKS
-# until ExecStart exits (TimeoutStartSec defaults to infinity for oneshot). The
-# original unit declared Type=oneshot + RemainAfterExit=yes, so every bootstrap
-# hung here until SSM SIGKILLed the command at its budget — rc=137 at exactly
-# PT5M0.1S, stderr ending on the `systemctl enable` symlink line with nothing
-# after it. Latent from #1122 until #1269 repointed the weekly SF onto these
-# per-stage scripts on 2026-08-09; the first weekly run on the new path
-# (2026-08-10) failed at MorningEnrich twice, and DataPhase1 + RAGIngestion
-# would have failed identically. The retired spot_data_weekly.sh monolith never
-# hit it: it arms its watchdog with a transient `systemd-run --on-active` timer,
-# not a unit file.
-if ! systemctl is-enabled ec2-spot-watchdog 2>/dev/null; then
-  cat > /tmp/ec2-spot-watchdog.service <<'UNIT'
-[Unit]
-Description=EC2 Spot Watchdog
-After=amazon-ssm-agent.service
-Requires=amazon-ssm-agent.service
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/ec2-spot-watchdog.sh
-Restart=always
-RestartSec=30
-[Install]
-WantedBy=multi-user.target
-UNIT
-  cat > /usr/local/bin/ec2-spot-watchdog.sh <<'WDSH'
-#!/usr/bin/env bash
-set -euo pipefail
-while true; do
-  if ! systemctl is-active amazon-ssm-agent >/dev/null 2>&1; then
-    sleep 60
-    if ! systemctl is-active amazon-ssm-agent >/dev/null 2>&1; then
-      shutdown -h now
-    fi
-  fi
-  sleep 60
-done
-WDSH
-  chmod +x /usr/local/bin/ec2-spot-watchdog.sh
-  cp /tmp/ec2-spot-watchdog.service /etc/systemd/system/
-  # `timeout` so a future unit-shape regression fails in seconds WITH a message,
-  # instead of consuming the whole SSM budget and dying under SIGKILL with no
-  # output — that silence is what made the 2026-08-10 hang read as "bootstrap
-  # is slow" rather than "systemctl is blocked forever".
-  timeout 60 systemctl enable --now ec2-spot-watchdog || {
-    echo "ERROR: enabling ec2-spot-watchdog did not return within 60s — the unit is misdeclared (an endless ExecStart under Type=oneshot blocks systemctl start forever)" >&2
-    exit 1
-  }
-fi
-
-# Install the interpreter — the AL2023 spot AMI does not ship python3.12.
-# The retired spot_data_weekly.sh monolith installed it here; the per-stage
-# split (#1122) replaced the install with a bare assertion, encoding an AMI
-# contract nothing provides. Latent until #1269 repointed the weekly SF onto
-# these scripts (2026-08-09); the first run over the new path died on
-# "ERROR: python3.12 not found" (watch-rerun-2026-08-10-3, 2026-08-11).
-# gcc + devel are needed by source-built wheels in requirements.txt; git for
-# the clone below. Measured on the monolith's own successful bootstraps
-# (2026-08-07 and 08-08): this whole step ran in 48-49s, well inside the 300s
-# budget, so the budget stays as it is.
-dnf install -y -q python3.12 python3.12-pip python3.12-devel git gcc 2>/dev/null || \
-    dnf install -y -q python3 python3-pip python3-devel git gcc
-
-# Post-condition, not a precondition: the install above is what makes this
-# true, and a silent fallback to a system python3 is exactly the drift the
-# per-stage scripts must not inherit (requirements.txt is resolved against
-# 3.12).
-command -v python3.12 >/dev/null || { echo "ERROR: python3.12 not found after dnf install" >&2; exit 1; }
-echo "Using: $(python3.12 --version)"
-
-if [ ! -d /home/ec2-user/data/.git ]; then
-  rm -rf /home/ec2-user/data
-  git clone --depth 1 --branch "${BRANCH:-main}" https://github.com/nousergon/nousergon-data.git /home/ec2-user/data
-fi
-
-# Destination must be a path weekly_collector.load_config actually searches.
-# It delegates to nousergon_lib.config.resolve_experiment_config("data",
-# "config.yaml", repo_root=<checkout>, repo_local_fallback=Path("config.yaml")),
-# so with the clone at /home/ec2-user/data the candidates are
-# /home/ec2-user/alpha-engine-config/{experiments/reference/,}data/config.yaml
-# plus the CWD-relative config.yaml — /home/ec2-user/data/config/config.yaml is
-# in none of them. The retired spot_data_weekly.sh monolith staged to the
-# alpha-engine-config path below; the per-stage split (#1122) changed the
-# destination and #1269 made that live, so MorningEnrich died on
-# FileNotFoundError (config#6846). No per-stage workload reads the old path —
-# it is dropped rather than written twice. tests/test_spot_bootstrap_config_
-# lands_where_the_resolver_looks.py derives the candidate list from the
-# resolver, so a resolver change fails CI instead of production.
-mkdir -p /home/ec2-user/alpha-engine-config/data
-aws s3 cp "${S3_STAGING}/config.yaml" "/home/ec2-user/alpha-engine-config/data/config.yaml" --region "${AWS_REGION:-us-east-1}" --quiet
-chown -R ec2-user:ec2-user /home/ec2-user/alpha-engine-config
-BOOTSTRAP
-)" 300
+  # Rendered by krepis.spot_bootstrap (alpha-engine-config-I6922) rather than
+  # built as an inline heredoc. That module is the fleet's single canonical
+  # source for the watchdog unit, the interpreter install and the clone/config
+  # shape this heredoc used to hand-carry (nousergon-data#1294, #1296;
+  # crucible-predictor#461, #462, #463 were the same defects reaching the
+  # sibling copy hours to days later). Region and branch are passed as
+  # LAUNCHER-SIDE LITERALS rather than left for the remote shell to expand —
+  # the predictor's REPO_URL/BRANCH class of bug (crucible-predictor#463: a
+  # value interpolated into the heredoc but never actually exported, so the
+  # remote expansion silently resolved to an empty string) cannot happen when
+  # the value is baked into the rendered script instead of read from the
+  # remote environment. `--region us-east-1` mirrors this heredoc's prior
+  # hardcode exactly (it never read the outer $AWS_REGION); tests/
+  # test_spot_bootstrap_invariants.py and its siblings assert the rendered
+  # output stays byte-for-byte equivalent on the parts that must not drift.
+  local _script
+  _script="$("$LIB_PYTHON" -m krepis.spot_bootstrap render \
+    --repo-url https://github.com/nousergon/nousergon-data.git \
+    --checkout /home/ec2-user/data \
+    --branch "${BRANCH:-main}" \
+    --region us-east-1 \
+    --export "S3_STAGING=${_S3_STAGING}" \
+    --config-copy config.yaml:/home/ec2-user/alpha-engine-config/data/config.yaml:/home/ec2-user/alpha-engine-config)"
+  run_ssm "bootstrap" "$_script" 300
   echo "  Bootstrap complete."
 }
 
