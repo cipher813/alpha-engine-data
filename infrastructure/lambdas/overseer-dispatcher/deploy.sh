@@ -185,8 +185,11 @@ run aws lambda put-function-event-invoke-config \
 # step. Gracefully fails when the caller lacks iam:PutRolePolicy (CI auto-
 # deploy role); the drift check backstops any missed apply.
 TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
-apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}" \
-  || echo "WARN: IAM auto-apply failed (expected in CI — role lacks iam:PutRolePolicy)"
+# No `||` here on purpose (alpha-engine-config-I7338): the ONE tolerated
+# failure — this caller lacks iam:PutRolePolicy — is classified inside
+# _shared/apply_iam_policy.sh. Every other cause, including this helper not
+# being sourced at all, aborts the deploy under `set -e`.
+apply_iam_policy_on_deploy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
 
 # ----- 6. Publish alert_classes projection to S3 (alpha-engine-config#5200) -----
 # The alert-drain box clones only alpha-engine-config, so the registry at

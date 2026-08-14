@@ -1,3 +1,5 @@
+# shellcheck shell=bash
+#
 # apply_iam_policy.sh — shared idempotent IAM role/policy apply, sourced by
 # every lambda's deploy.sh (alpha-engine-config#2825).
 #
@@ -50,4 +52,97 @@ apply_iam_policy() {
     --role-name "${role_name}" \
     --policy-name "${policy_name}" \
     --policy-document "file://${policy_file}"
+}
+
+# apply_iam_policy_on_deploy — the "#4472 auto-apply on merge" call site.
+#
+# Same arguments as apply_iam_policy. Tolerates EXACTLY ONE failure: the
+# caller is an identity without iam:PutRolePolicy / iam:CreateRole. That is
+# the CI auto-deploy role by design (see the single-writer note above), and
+# check-drift.py is its backstop. EVERY OTHER failure is a broken applier and
+# exits non-zero, which aborts the deploy under the callers' `set -euo
+# pipefail`.
+#
+# WHY this exists (alpha-engine-config-I7338). The four #4472 call sites each
+# wrote their own tolerance inline:
+#
+#   apply_iam_policy ... || echo "WARN: IAM auto-apply failed (expected in CI
+#                                 — role lacks iam:PutRolePolicy)"
+#
+# That `||` swallowed every cause and asserted one. On 2026-08-14, running as
+# `ne-admin` — an identity that DOES hold iam:PutRolePolicy —
+# alert-drain-liveness-probe/deploy.sh printed:
+#
+#   deploy.sh: line 188: apply_iam_policy: command not found
+#   WARN: IAM auto-apply failed (expected in CI — role lacks iam:PutRolePolicy)
+#
+# It had never sourced this file. The WARN named a cause that could not have
+# been true, read as benign, and the auto-apply feature had therefore never
+# executed on that lambda since #4472 shipped — which is the content-drift
+# half of alpha-engine-config-I6299.
+#
+# Two properties close that class, and both depend on the tolerance living
+# HERE rather than at the call site:
+#
+#   1. A `command not found` (rc 127) reaches the classifier as an unmatched
+#      stderr string and is reported LOUDLY, not as a permission note.
+#   2. If a deploy.sh forgets to source this file at all, the call site has no
+#      `||` of its own, so `apply_iam_policy_on_deploy: command not found`
+#      aborts the deploy under `set -e` instead of printing a reassurance.
+#
+# tests/test_deploy_shell_functions_are_defined.py is the derived guard for
+# the sourcing itself, so a 35th deploy.sh cannot repeat this.
+apply_iam_policy_on_deploy() {
+  local role_name="${1:?apply_iam_policy_on_deploy: role name required}"
+  local policy_name="${2:?apply_iam_policy_on_deploy: policy name required}"
+  local policy_file="${3:?apply_iam_policy_on_deploy: policy file required}"
+  local trust_policy="${4:?apply_iam_policy_on_deploy: trust policy required}"
+
+  # stderr is captured to a file rather than streamed through a process
+  # substitution: `tee` in a `>(...)` is not reaped by the `||`, so the
+  # classifier can race the flush and read an EMPTY stderr for a genuine
+  # AccessDenied. Captured stderr is replayed verbatim on both paths below,
+  # so nothing is hidden — only deferred to the end of the command.
+  local err_file rc=0 stderr_text
+  err_file="$(mktemp)"
+
+  apply_iam_policy "${role_name}" "${policy_name}" "${policy_file}" "${trust_policy}" \
+    2>"${err_file}" || rc=$?
+
+  stderr_text="$(cat "${err_file}" 2>/dev/null || true)"
+  rm -f "${err_file}"
+
+  if [ "${rc}" -eq 0 ]; then
+    if [ -n "${stderr_text}" ]; then
+      printf '%s\n' "${stderr_text}" >&2
+    fi
+    return 0
+  fi
+
+  # The ONLY tolerated cause. Matched against what the AWS CLI actually
+  # emits for a denied IAM write: an explicit `AccessDenied`/
+  # `AccessDeniedException` error code, the `is not authorized to perform`
+  # sentence, or an SCP/boundary explicit deny.
+  if printf '%s' "${stderr_text}" | grep -qiE \
+      'AccessDenied|is not authorized to perform|explicit deny|ExpiredToken|InvalidClientTokenId|UnrecognizedClientException'; then
+    echo "WARN: IAM auto-apply skipped — this caller lacks iam:PutRolePolicy/iam:CreateRole." >&2
+    echo "WARN: role=${role_name} policy=${policy_name}. This is expected for the CI" >&2
+    echo "WARN: auto-deploy OIDC role (single-writer rule). check-drift.py is the backstop;" >&2
+    echo "WARN: an operator must run this deploy.sh --apply-iam to land the change." >&2
+    return 0
+  fi
+
+  # Anything else is a BROKEN APPLIER, not a permission boundary. Loud, and
+  # non-zero so `set -e` aborts the deploy rather than shipping code whose
+  # IAM policy silently did not move.
+  echo "ERROR: IAM auto-apply FAILED for role=${role_name} policy=${policy_name} (exit ${rc})." >&2
+  echo "ERROR: This is NOT the known CI permission boundary — the stderr below carries no" >&2
+  echo "ERROR: AccessDenied. The apply mechanism itself is broken; live IAM is now unknown" >&2
+  echo "ERROR: relative to ${policy_file}." >&2
+  if [ -n "${stderr_text}" ]; then
+    printf 'ERROR: --- captured stderr ---\n%s\nERROR: --- end stderr ---\n' "${stderr_text}" >&2
+  else
+    echo "ERROR: (the failing command produced no stderr — exit ${rc} alone)" >&2
+  fi
+  return "${rc}"
 }
