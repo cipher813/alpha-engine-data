@@ -639,3 +639,53 @@ def test_deferred_invocation_schedule_failure_returns_error(monkeypatch):
     assert out["launched"] is False
     assert out["reason"] == "defer_schedule_failed"
     assert "no invoked_function_arn" in out.get("error", "").lower()
+
+
+def test_bootstrap_is_the_shared_renderers_output(monkeypatch):
+    """alpha-engine-config-I7372 — asserted by containment, never restated.
+
+    Restating the renderer's text here would be a second copy of the invariant,
+    drifting exactly as the shell heredocs it replaced did.
+    """
+    from krepis.spot_bootstrap import render_bootstrap
+
+    index = _load(monkeypatch)
+    cmd = index._bootstrap_command({"merged_sha": "a" * 40, "head_migration_number": 7})
+    assert render_bootstrap(index._bootstrap_spec()) in cmd
+    assert "PYTHON_BIN" not in cmd
+    # The SSM-liveness watchdog this lane never had — the hand-written
+    # bootstrap armed a hard-timeout timer only, which does not answer "the SSM
+    # agent died and nothing can reach this box again".
+    assert "ec2-spot-watchdog" in cmd
+
+
+def test_the_public_repo_is_cloned_without_a_credential(monkeypatch):
+    """MIGRATION_REPO is PUBLIC (measured 2026-08-14, gh repo view).
+
+    It was cloned through ``https://x-access-token:${PAT}@…``, which put the
+    fleet token in the box's ``git clone`` argv (readable in ``ps``) and in
+    ``.git/config`` on disk for the life of the box, for access it did not
+    need. The PAT still reaches the box — read THERE from SSM, never known to
+    this Lambda — for ``GH_TOKEN`` alone, which the P1-on-crash filing needs.
+    """
+    index = _load(monkeypatch)
+    cmd = index._bootstrap_command({"merged_sha": "a" * 40, "head_migration_number": 7})
+    clone_lines = [ln for ln in cmd.splitlines() if "git clone" in ln]
+    assert clone_lines, cmd
+    assert not any("x-access-token" in ln for ln in clone_lines), clone_lines
+    assert 'GH_TOKEN="$PAT"' in cmd
+
+
+def test_the_merged_sha_is_still_pinned_after_the_clone(monkeypatch):
+    """The renderer clones a branch tip; this lane must migrate what MERGED.
+
+    main may have moved on by the time the box boots, so the checkout is
+    pinned in the tail. The pre-cutover clone was a branch clone too — the
+    pin has always been what provides this guarantee, and it must not be lost
+    when the clone moves into the spec.
+    """
+    index = _load(monkeypatch)
+    sha = "b" * 40
+    cmd = index._bootstrap_command({"merged_sha": sha, "head_migration_number": 7})
+    assert f"git fetch --quiet --depth 1 origin {sha}" in cmd
+    assert f"git checkout --quiet {sha}" in cmd

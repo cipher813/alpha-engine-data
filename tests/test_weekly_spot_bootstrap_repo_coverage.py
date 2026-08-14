@@ -27,6 +27,7 @@ sixth repo fails here rather than at 02:00 on a Saturday.
 from __future__ import annotations
 
 import json
+import importlib.util
 import re
 from pathlib import Path
 
@@ -64,11 +65,36 @@ def _repos_the_sf_uses() -> set[str]:
     return found
 
 
+def _bootstrap_script() -> str:
+    """The command this dispatcher actually sends.
+
+    Since alpha-engine-config-I7372 most of it is rendered by
+    ``krepis.spot_bootstrap`` rather than written in this file, so reading the
+    SOURCE for clone lines finds only the tail's private-repo clone — which is
+    how this test read three of the five repos as missing on the cutover PR.
+    Import the handler and render, exactly as the Lambda does: the renderer is
+    a pure function of its spec, so this needs no AWS and no stubbing.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_weekly_freshness_index_for_test", _DISPATCHER
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module._bootstrap_command("test-run-token")
+
+
 def _repos_the_bootstrap_clones() -> set[str]:
-    """Every checkout path the dispatcher's bootstrap script git-clones."""
-    src = _DISPATCHER.read_text(encoding="utf-8")
-    # Each clone ends with the destination path on its own continuation line.
-    return set(re.findall(r"/home/ec2-user/(alpha-engine-[a-z-]+) \|\| fail", src))
+    """Every checkout path the bootstrap git-clones, rendered parts included."""
+    # Line continuations first: a clone whose destination sits on its own
+    # continuation line (the private-config one does) is invisible to a
+    # line-anchored match.
+    script = _bootstrap_script().replace("\\\n", " ")
+    return {
+        m.group(1)
+        for m in re.finditer(
+            r"git clone[^\n]*?/home/ec2-user/(alpha-engine-[a-z-]+)(?:\s|$)", script
+        )
+    }
 
 
 def test_sf_references_at_least_one_repo():
@@ -97,8 +123,9 @@ def test_every_cloned_repo_is_chowned_to_ec2_user():
     The bootstrap runs as root; every stage runs as ec2-user and does a
     ``git pull``, which needs write access to the checkout.
     """
-    src = _DISPATCHER.read_text(encoding="utf-8")
-    chown_block = re.search(r"chown -R ec2-user:ec2-user(.*?)\|\| fail", src, re.S)
+    chown_block = re.search(
+        r"chown -R ec2-user:ec2-user(.*?)\|\| fail", _bootstrap_script(), re.S
+    )
     assert chown_block, "bootstrap has no chown block"
     chowned = set(_CHECKOUT_RE.findall(chown_block.group(1)))
     missing = _repos_the_bootstrap_clones() - chowned

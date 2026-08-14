@@ -56,6 +56,7 @@ import uuid
 
 import boto3
 from krepis import alerts
+from krepis.spot_bootstrap import SpotBootstrapSpec, render_bootstrap
 from nousergon_lib import ec2_spot
 from nousergon_lib.ec2_spot import SpotCapacityExhausted, SpotQuotaExceededError
 
@@ -168,44 +169,70 @@ def _resolve_workload(event: dict) -> tuple[str, str]:
     return w, _WORKLOADS[w]
 
 
+def _bootstrap_spec() -> SpotBootstrapSpec:
+    """The part of this box's provisioning krepis renders.
+
+    ``nousergon-data`` is public and was already cloned from a plain URL, so
+    it moves here unchanged. ``alpha-engine-config`` is private and stays in
+    the tail, where the PAT is read on the BOX from SSM — the renderer bakes
+    URLs in as launcher-side literals, so expressing that clone here would
+    mean this Lambda reading the secret and embedding it in an SSM document.
+    """
+    return SpotBootstrapSpec(
+        repo_url=f"https://github.com/{DATA_REPO}.git",
+        checkout="/home/ec2-user/alpha-engine-data",
+        branch=DATA_BRANCH,
+        region=REGION,
+        # Same value and meaning as the hand-written timer this replaces; the
+        # renderer additionally ABORTS when it cannot be armed, where the old
+        # copy ended in `|| true`. A dispatcher-side failure after
+        # send-command can never leave this box orphaned.
+        max_runtime_seconds=MAX_RUNTIME_SECONDS,
+        exports={
+            "XDG_CACHE_HOME": "/home/ec2-user/.cache",
+            "FLOW_DOCTOR_ENABLED": "1",
+            "ALPHA_ENGINE_DEPLOYED": "1",
+            "ALPHA_ENGINE_EXPERIMENT_ID": "reference",
+        },
+    )
+
+
 def _bootstrap_command(workload: str, collector_cmd: str, run_token: str) -> str:
     """The async SSM RunShellScript body: install runtime, clone alpha-engine-data
     + alpha-engine-config (private config.yaml), build the venv, run the collector,
     self-terminate.
 
-    Runs as root on the box. Mirrors spot_data_weekly.sh's bootstrap: a spot-side
-    hard-timeout watchdog (so a dispatcher-side failure can never orphan the box),
-    python3.12 + git, shallow clones, a requirements.txt venv with the numpy<2
-    pin the fleet's pyarrow is compiled against, then the collector. The box
-    self-terminates on completion (InstanceInitiatedShutdownBehavior=terminate).
+    Runs as root on the box. Composed (alpha-engine-config-I7372) as a PRELUDE
+    this Lambda owns (tee'd log, ``fail()``, EXIT trap), then
+    ``krepis.spot_bootstrap.render_bootstrap()`` (watchdog unit, hard-timeout
+    timer, interpreter, public clone), then a TAIL (private config clone, venv,
+    the collector run). It used to render all of it inline and carried its own
+    copy of the silent interpreter fallback
+    (``command -v python3.12 ... || PYTHON_BIN=python3``) plus a hand-written
+    timer and no SSM-liveness watchdog — invisible to the fleet's Bash-only
+    fork scanner because this is a ``.py`` file.
+
+    The EXIT trap is load-bearing: the rendered block runs under ``set -e``, so
+    an abort inside it never reaches a ``|| fail`` and would otherwise skip the
+    log upload and the shutdown. The box self-terminates on completion
+    (InstanceInitiatedShutdownBehavior=terminate).
     """
     log = f"/var/log/data-spot-{workload}.log"
     s3_log = (
         f"s3://alpha-engine-research/_ssm_logs/data-spot/{workload}/"
         f"$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%S)-{run_token}.log"
     )
-    return f"""set -uo pipefail
-export HOME=/home/ec2-user
-export XDG_CACHE_HOME=/home/ec2-user/.cache
-export AWS_REGION={REGION}
-export AWS_DEFAULT_REGION={REGION}
-export FLOW_DOCTOR_ENABLED=1
-export ALPHA_ENGINE_DEPLOYED=1
-export ALPHA_ENGINE_EXPERIMENT_ID=reference
-fail() {{ echo "[data-spot-prelude] FATAL: $1"; aws s3 cp {log} "{s3_log}" --region {REGION} --quiet || true; shutdown -h now; exit 1; }}
-# Spot-side hard-timeout watchdog: shuts the box down after MAX_RUNTIME_SECONDS
-# regardless of dispatcher state (mirrors spot_data_weekly.sh's watchdog). A
-# dispatcher-side failure after send-command can never leave this box orphaned.
-systemd-run --on-active={MAX_RUNTIME_SECONDS} --unit=alpha-engine-data-watchdog \\
-  --description='alpha-engine data-spot hard-timeout' /sbin/shutdown -h now || true
-dnf install -y -q python3.12 python3.12-pip python3.12-devel git gcc >/dev/null 2>&1 \\
-  || dnf install -y -q python3 python3-pip python3-devel git gcc >/dev/null 2>&1 \\
-  || fail "runtime install failed"
-command -v python3.12 >/dev/null && PYTHON_BIN=python3.12 || PYTHON_BIN=python3
+    prelude = f"""set -uo pipefail
+mkdir -p "$(dirname {log})"
+fail() {{ trap - EXIT; echo "[data-spot-prelude] FATAL: $1"; aws s3 cp {log} "{s3_log}" --region {REGION} --quiet || true; shutdown -h now; exit 1; }}
+trap 'rc=$?; [ "$rc" -eq 0 ] || fail "bootstrap aborted (rc=$rc)"' EXIT
+"""
+    tail = f"""set +e
+set -uo pipefail
 git config --global --add safe.directory '*' || true
-rm -rf /home/ec2-user/alpha-engine-data
-git clone --depth 1 --branch {DATA_BRANCH} \\
-  https://github.com/{DATA_REPO}.git /home/ec2-user/alpha-engine-data || fail "clone failed"
+# alpha-engine-config is PRIVATE. The PAT is read HERE, on the box, from SSM
+# via the instance profile — never known to this Lambda, never in the SSM
+# document.
 PAT=$(aws ssm get-parameter --name {GH_PAT_SSM} --with-decryption \\
   --query Parameter.Value --output text --region {REGION}) || fail "PAT read failed"
 [ -n "$PAT" ] || fail "PAT empty"
@@ -214,21 +241,23 @@ git clone --depth 1 --branch {CONFIG_BRANCH} \\
   "https://x-access-token:${{PAT}}@github.com/{CONFIG_REPO}.git" \\
   /home/ec2-user/alpha-engine-config || fail "config clone failed"
 cd /home/ec2-user/alpha-engine-data
-"$PYTHON_BIN" -m venv .venv || fail "venv create failed"
+# python3.12 literally, matching the renderer, which has already installed and
+# ASSERTED it: requirements.txt is resolved against 3.12 and the AMI's python3
+# resolves different wheels.
+python3.12 -m venv .venv || fail "venv create failed"
 source .venv/bin/activate
 pip install --upgrade pip -q || fail "pip upgrade failed"
 pip install -q -r requirements.txt || fail "deps install failed"
 # numpy<2 pin to match other spot workloads (pyarrow compiled against 1.x).
 pip install -q 'numpy<2' || fail "numpy pin failed"
-mkdir -p "$(dirname {log})"
-set +e
 {collector_cmd} 2>&1 | tee -a {log}
 rc=${{PIPESTATUS[0]}}
-set -e
+trap - EXIT
 aws s3 cp {log} "{s3_log}" --region {REGION} --quiet || true
 [ "$rc" -eq 0 ] || fail "workload {workload} exited $rc"
 echo "[data-spot] workload {workload} complete"
 """
+    return prelude + "\n" + render_bootstrap(_bootstrap_spec()) + "\n" + tail
 
 
 def _launch_instance(force_on_demand: bool = False, extra_tags: dict | None = None) -> tuple[str, str]:
