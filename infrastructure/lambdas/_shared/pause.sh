@@ -66,3 +66,54 @@ else:
     print("DISABLED" if sys.argv[2] in names else "ENABLED")
 PY
 }
+
+# alarm_actions_flag <alarm-name> -> the put-metric-alarm flag controlling paging.
+#
+# The alarm-side twin of pause_state, and it exists for the identical reason:
+# `aws cloudwatch put-metric-alarm` is an UPSERT of the whole alarm with no
+# "leave the actions alone" option, and it RESETS ActionsEnabled to true. So
+# every setup_*_alarms.sh that reconciles its own alarms silently re-armed the
+# ones the pause had deliberately silenced, on every run.
+#
+# Measured 2026-08-14 (alpha-engine-config-I7023): the class re-armed eleven
+# paused-component alarms twice in one afternoon — once from
+# setup_watch_plane_alarms.sh via its deploy workflow, and once from a different
+# provisioner entirely, which is what showed this was never a one-script defect.
+# Six scripts in this repo call put-metric-alarm.
+#
+# FAIL-LOUD, diverging from pause_state's documented fail-open. That asymmetry
+# was argued on the grounds that one direction has a detector and the other does
+# not. For alarms BOTH directions now have one — `alarm-unexpectedly-enabled`
+# and `armed-but-silenced` in automation_pause.py --check — so refusing to guess
+# costs nothing, and the thing being avoided is paging a human at 3am about a
+# component that is off on purpose. A provisioner that cannot read the manifest
+# should stop, not arm everything.
+alarm_actions_flag() {
+  local name="${1:?alarm_actions_flag: alarm name required}"
+
+  if [ ! -r "${_PAUSE_MANIFEST}" ]; then
+    echo "alarm_actions_flag: cannot read ${_PAUSE_MANIFEST}" >&2
+    return 1
+  fi
+
+  python3 - "${_PAUSE_MANIFEST}" "${name}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    manifest = json.load(fh)
+
+paused = manifest["paused"]
+paused_triggers = set(paused["events_rules"]) | set(paused["scheduler_schedules"])
+paused_triggers |= {k for k in manifest.get("pending", {}) if not k.startswith("_")}
+
+entry = manifest.get("paused_alarms", {}).get(sys.argv[2])
+# Justification is computed here exactly as automation_pause.alarm_justified()
+# computes it — every watched trigger paused, and an entry watching nothing is
+# never justified. Duplicated in two languages, pinned by
+# tests/test_automation_pause.py::test_shared_helper_matches_alarm_justified.
+watches = (entry or {}).get("watches") or []
+silenced = bool(watches) and all(w in paused_triggers for w in watches)
+print("--no-actions-enabled" if silenced else "--actions-enabled")
+PY
+}

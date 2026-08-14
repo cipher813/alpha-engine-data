@@ -182,6 +182,66 @@ def test_ci_repairs_the_alarm_state_before_it_verifies_it():
     )
 
 
+def test_shared_helper_matches_alarm_justified(manifest, module):
+    """`_shared/pause.sh::alarm_actions_flag` reimplements `alarm_justified` in bash+python.
+
+    Six provisioning scripts call `put-metric-alarm`, which is an upsert that
+    RESETS ActionsEnabled — so each must consult the pause at write time, and
+    they do it through that shared helper rather than through this module (they
+    are bash, and sourcing one helper beats importing python in six places).
+    Two implementations of one predicate drift silently: the helper would keep
+    arming an alarm this module considers silenced, and `--check` would keep
+    re-muting it, forever, with neither surface calling it a conflict.
+
+    Compares the two over EVERY declared alarm plus a known-armed one.
+    """
+    import subprocess
+
+    helper = REPO_ROOT / "infrastructure/lambdas/_shared/pause.sh"
+    assert helper.is_file(), "the shared helper moved; update this test"
+
+    names = [e["name"] for e in module.alarm_entries(manifest)]
+    names.append("alpha-engine-pipeline-deadman-preopen-trading")  # never paused
+    script = (f'set -euo pipefail\nsource "{helper}"\n'
+              + "".join(f'alarm_actions_flag "{n}"\n' for n in names))
+    out = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                         check=True).stdout.split()
+
+    assert len(out) == len(names), f"helper emitted {len(out)} flags for {len(names)} alarms"
+    for name, flag in zip(names, out):
+        expected = "--no-actions-enabled" if any(
+            e["name"] == name and module.alarm_justified(e, manifest)
+            for e in module.alarm_entries(manifest)
+        ) else "--actions-enabled"
+        assert flag == expected, (
+            f"{name}: helper says {flag}, alarm_justified() says {expected} — "
+            f"the two implementations of one predicate have drifted"
+        )
+
+
+def test_every_alarm_provisioner_consults_the_pause(module):
+    """One provisioner fixed is zero provisioners fixed.
+
+    `setup_watch_plane_alarms.sh` was made pause-aware first, and within the
+    hour a DIFFERENT provisioner re-armed the same eleven alarms — which is what
+    showed this was never a one-script defect. Asserted by discovery, so a
+    seventh script added later is covered without editing this test.
+    """
+    offenders = []
+    for path in sorted(REPO_ROOT.glob("infrastructure/**/*.sh")):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        calls = [ln for ln in text.splitlines()
+                 if "aws cloudwatch put-metric-alarm" in ln
+                 and not ln.lstrip().startswith("#")]
+        if calls and 'alarm_actions_flag "' not in text:
+            offenders.append(path.relative_to(REPO_ROOT).as_posix())
+    assert not offenders, (
+        f"{offenders} call put-metric-alarm without alarm_actions_flag — "
+        f"put-metric-alarm RESETS ActionsEnabled, so each of these re-arms "
+        f"every paused-component alarm it touches, on every run"
+    )
+
+
 def test_drift_checker_consults_the_manifest_not_a_hardcoded_list():
     src = DRIFT_CHECKER.read_text(encoding="utf-8")
     assert "automation_pause.paused_names()" in src, (

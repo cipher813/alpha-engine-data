@@ -27,6 +27,13 @@
 
 set -euo pipefail
 
+# Alarm upserts RESET ActionsEnabled, so without this the next run of this
+# script re-arms any alarm the automation pause has silenced. Shared with the
+# eight other provisioners in this repo (alpha-engine-config-I7023).
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lambdas/_shared/pause.sh"
+
+
 DRY_RUN=false
 [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=true
 
@@ -79,7 +86,8 @@ for fn in "${TARGET_FUNCTIONS[@]}"; do
     --comparison-operator "GreaterThanOrEqualToThreshold" \
     --treat-missing-data "notBreaching" \
     --alarm-actions "$SNS_TOPIC_ARN" \
-    --ok-actions "$SNS_TOPIC_ARN" >/dev/null
+    --ok-actions "$SNS_TOPIC_ARN" \
+    "$(alarm_actions_flag "$alarm_name")" >/dev/null
 done
 
 echo "Done — ${#TARGET_FUNCTIONS[@]} alarms upserted."

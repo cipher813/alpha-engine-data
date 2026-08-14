@@ -21,6 +21,12 @@
 
 set -euo pipefail
 
+# Alarm upserts RESET ActionsEnabled, so without this the next deploy re-arms any alarm the automation pause has silenced
+# (alpha-engine-config-I7023).
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
+
+
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 FUNCTION_NAME="alpha-engine-thinktank-spot-dispatcher"
@@ -149,7 +155,8 @@ if [ "$CUTOVER" -eq 1 ]; then
         --statistic Sum --period 86400 --evaluation-periods 1 \
         --threshold 3 --comparison-operator GreaterThanOrEqualToThreshold \
         --treat-missing-data notBreaching \
-        --alarm-actions "$SNS_TOPIC_ARN" --region "$REGION"
+        --alarm-actions "$SNS_TOPIC_ARN" --region "$REGION" \
+        "$(alarm_actions_flag "$DISPATCH_ALARM")"
 
     echo "==> deleting the now-blind $OLD_FUNCTION alarms"
     aws cloudwatch delete-alarms --alarm-names \
