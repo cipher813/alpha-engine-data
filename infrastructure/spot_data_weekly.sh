@@ -183,16 +183,35 @@ SECURITY_GROUP="sg-03cd3c4bd91e610b0"
 # update via `aws ec2 describe-subnets --filters Name=vpc-id,Values=vpc-566f002e`.
 SUBNETS="${SUBNETS:-subnet-a61ec0fb,subnet-1e58307a,subnet-789d3857,subnet-c670118d,subnet-7cff7c43,subnet-e07166ec}"
 IAM_PROFILE="alpha-engine-executor-profile"
-# Lib CLI path: every spot launcher on the dispatcher box resolves its
-# interpreter through the ops-owned guard /opt/nousergon/bin/lib-python
-# (nous-ergon-ops: alpha-engine-dashboard/live/infrastructure/bin/lib-python).
-# That guard execs the box's DECLARED krepis venv and aborts with EX_CONFIG
-# (78), naming the version it found, when the venv is absent or below the
-# launcher floor. It never falls back to a co-tenant checkout — the silent
-# fallback is exactly the defect alpha-engine-config-I6931/I7343 removes.
+# Lib CLI path. The ops-owned guard /opt/nousergon/bin/lib-python
+# (nous-ergon-ops: alpha-engine-dashboard/live/infrastructure/bin/lib-python)
+# execs the box's DECLARED krepis venv and aborts with EX_CONFIG (78), naming
+# the version it found, rather than silently falling back to a co-tenant
+# checkout — the defect alpha-engine-config-I6931/I7343 removes.
+#
+# It is NOT the default here, because THIS SCRIPT DOES NOT RUN ON THAT BOX
+# (alpha-engine-config-I7386). The guard is installed by
+# nous-ergon-ops/alpha-engine-dashboard/live/infrastructure/bin/install-box-config.sh,
+# whose whole tree provisions the DASHBOARD BOX. This file is sourced by
+# spot_morning_enrich.sh / spot_data_phase1.sh / spot_rag_ingestion.sh, which
+# the weekly SF delivers as ssm:sendCommand payloads to $.ec2_instance_id —
+# the ephemeral weekly-freshness spot. That spot is bootstrapped by
+# infrastructure/lambdas/weekly-freshness-spot-dispatcher/index.py
+# (_bootstrap_command): it clones four repos and builds
+# /home/ec2-user/alpha-engine-dashboard/.venv, and never creates
+# /opt/nousergon. Measured on execution
+# friday-shell-2026-08-14-validate-i7382, MorningEnrich:
+# "_spot_common.sh: line 128: /opt/nousergon/bin/lib-python: No such file or
+# directory", exit 127.
+#
+# So the default names the interpreter that host actually has. The
+# ${LIB_PYTHON:-...} override is preserved, so a caller ON a box that does
+# have the guard still names it explicitly and gets the declared floor.
 # Do NOT add a guard block here: the contract lives ONCE, in the repo that
-# owns this box's provisioning (nine copies across five repos is I6922).
-LIB_PYTHON="${LIB_PYTHON:-/opt/nousergon/bin/lib-python}"
+# owns the box's provisioning (nine copies across five repos is I6922). The
+# SOTA close — install the guard on the spot too, then restore this default —
+# is alpha-engine-config-I7383.
+LIB_PYTHON="${LIB_PYTHON:-/home/ec2-user/alpha-engine-dashboard/.venv/bin/python}"
 
 # Stage-coverage window (alpha-engine-config-I7214): the instant this launcher
 # started. An artifact whose LastModified predates it is a leftover from a
