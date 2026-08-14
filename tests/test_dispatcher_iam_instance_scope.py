@@ -28,18 +28,34 @@ document statement (unconditioned) and an instance statement (conditioned)
 first; see `nousergon-data-PR1365` and this test's own module for the worked
 shape.
 
-KNOWN_GAPS_I7265: this same scan, run once across the whole repo while
-building this guard, found the identical unconditioned pattern live in seven
-MORE roles not in I7254's scope (`alert-drain-dispatcher`,
+KNOWN_GAPS_I7265 (CLOSED): this same scan, run once across the whole repo
+while building this guard, found the identical unconditioned pattern live in
+seven more roles not in I7254's scope (`alert-drain-dispatcher`,
 `arctic-migration-dispatcher`, `canary-replay-dispatcher`,
 `ci-watch-dispatcher`, `scheduled-groom-dispatcher`,
-`thinktank-spot-dispatcher`, `substrate-health-gate`). Fixing those needs its
-own per-role live-dispatch rehearsal (same reason I7254 was filed separately
-from PR1365) and is tracked as `alpha-engine-config-I7265`, not silently
-widened into this PR. Each is `xfail(strict=True)` here rather than skipped:
-the marker fails loudly the moment I7265 fixes one without clearing its
-entry, and any OTHER unconditioned grant anywhere in the repo — including a
-brand-new dispatcher — still fails this test immediately.
+`thinktank-spot-dispatcher`, `substrate-health-gate`). Those, plus
+`substrate-health-gate`'s originally-unscoped `ssm:GetCommandInvocation`
+resource, were fixed by `alpha-engine-config-I7265`
+(`nousergon-data` `fix/i7265-dispatcher-iam-scope`): each dispatcher's
+`ssm:SendCommand` grant split into an unconditioned document statement plus
+an instance statement conditioned on that dispatcher's own launch `Name` tag
+(traced through `nousergon_lib.spot_dispatch.launch_with_fallback`, which
+tags atomically via `RunInstances` `TagSpecifications` before
+`send_async_command` ever issues `ssm:SendCommand`); `ec2:CreateTags` split
+the same way for the three roles that still bundled it
+(`arctic-migration-dispatcher`, `scheduled-groom-dispatcher`,
+`thinktank-spot-dispatcher`). `substrate-health-gate` is the one exception to
+"condition on the dispatcher's own tag": it never launches a box, it probes
+whichever `$.ec2_instance_id` the Saturday weekly SF hands it immediately
+before `MorningEnrich` (`infrastructure/step_function.json`
+`SubstrateHealthGate` state) — always the box
+`weekly-freshness-spot-dispatcher` just launched — so its already-correct
+`SsmDiskProbeWeeklyFreshnessSpot` statement (conditioned on
+`alpha-engine-weekly-freshness-spot`) was kept and the redundant unconditioned
+`SsmDiskProbe` statement's `ssm:SendCommand`/instance grant was dropped
+rather than re-conditioned. `KNOWN_GAPS_I7265` is left as an empty set
+(not deleted) so a future regression in this exact class has a place to
+register.
 """
 
 from __future__ import annotations
@@ -57,27 +73,26 @@ INSTANCE_SCOPED_ACTIONS = {"ec2:CreateTags", "ec2:TerminateInstances", "ssm:Send
 # Pre-existing violations of this exact class, measured 2026-08-13 while
 # building this guard as part of alpha-engine-config-I7254. Out of scope for
 # that issue (different roles; each needs its own rehearsal) and tracked
-# separately as alpha-engine-config-I7265.
-KNOWN_GAPS_I7265: set[tuple[str, str]] = {
-    ("alert-drain-dispatcher", "ssm:SendCommand"),
-    ("arctic-migration-dispatcher", "ec2:CreateTags"),
-    ("arctic-migration-dispatcher", "ssm:SendCommand"),
-    ("canary-replay-dispatcher", "ssm:SendCommand"),
-    ("ci-watch-dispatcher", "ssm:SendCommand"),
-    ("scheduled-groom-dispatcher", "ec2:CreateTags"),
-    ("scheduled-groom-dispatcher", "ssm:SendCommand"),
-    ("thinktank-spot-dispatcher", "ec2:CreateTags"),
-    ("thinktank-spot-dispatcher", "ssm:SendCommand"),
-    ("substrate-health-gate", "ssm:SendCommand"),
-}
+# separately as alpha-engine-config-I7265. alpha-engine-config-I7265 fixed
+# all ten (nousergon-data fix/i7265-dispatcher-iam-scope) — the set is now
+# empty rather than deleted so a future regression has a place to land.
+KNOWN_GAPS_I7265: set[tuple[str, str]] = set()
 
 # Dispatchers already known to split the document grant from the instance
-# grant correctly (I7254 + PR1365) — pinned against the split regressing.
+# grant correctly (I7254 + PR1365, then I7265) — pinned against the split
+# regressing.
 DOCUMENT_SPLIT_DISPATCHERS = (
     "weekly-freshness-spot-dispatcher",
     "data-spot-dispatcher",
     "sf-watch-spot-dispatcher",
     "preflight-sweep-dispatcher",
+    "alert-drain-dispatcher",
+    "arctic-migration-dispatcher",
+    "canary-replay-dispatcher",
+    "ci-watch-dispatcher",
+    "scheduled-groom-dispatcher",
+    "thinktank-spot-dispatcher",
+    "substrate-health-gate",
 )
 
 

@@ -93,12 +93,26 @@
       }
     },
     {
-      "Sid": "SsmRunAlertDrainBootstrap",
+      "Sid": "SsmRunAlertDrainBootstrapDocument",
       "Effect": "Allow",
-      "Action": [
-        "ssm:SendCommand",
-        "ssm:DescribeInstanceInformation"
-      ],
+      "Action": "ssm:SendCommand",
+      "Resource": "arn:aws:ssm:us-east-1::document/AWS-RunShellScript"
+    },
+    {
+      "Sid": "SsmRunAlertDrainBootstrapToOwnBoxOnly",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": "arn:aws:ec2:us-east-1:711398986525:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "ssm:resourceTag/Name": "alpha-engine-alert-drain-spot"
+        }
+      }
+    },
+    {
+      "Sid": "SsmDescribeInstanceInformation",
+      "Effect": "Allow",
+      "Action": "ssm:DescribeInstanceInformation",
       "Resource": "*"
     },
     {
