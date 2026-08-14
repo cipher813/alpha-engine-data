@@ -22,6 +22,7 @@ import io
 import json
 import os
 import sys
+import time
 import types
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -3416,3 +3417,29 @@ def test_owning_item_resolution_never_widens_a_grace_window(monkeypatch, fixed_n
                                canonical_key=result.canonical_key,
                                sla_violated_by_minutes=0),
         fixed_now, owning=_owning()) is False
+
+
+def test_lookup_is_bounded_by_wall_clock_not_only_query_count(monkeypatch):
+    """MEASURED 2026-08-14: the deployed function's timeout is 120s. A
+    Lambda timeout is a HARD FAIL that halts the sweep, so the join must be
+    bounded by wall clock too — and blowing the budget degrades the
+    remaining rows (recorded, still paging) rather than killing the pass."""
+    import index
+    assert (
+        index.OWNING_ITEM_LOOKUP_MAX_QUERIES * index._OWNING_ITEM_TIMEOUT_SEC
+        > index.OWNING_ITEM_LOOKUP_MAX_SECONDS
+    ), "the count cap alone would not bound this phase — that is why the clock cap exists"
+    assert index.OWNING_ITEM_LOOKUP_MAX_SECONDS < 120
+
+    monkeypatch.setattr(index, "_cached_github_pat", lambda state: "pat")
+    monkeypatch.setattr(index, "_github_search_open_issues",
+                        lambda term, pat: [])
+    state = index._new_lookup_state()
+    state["started_at"] = time.monotonic() - index.OWNING_ITEM_LOOKUP_MAX_SECONDS - 1
+    res = index._resolve_owning_item(
+        "director_retro", "director/x/retro.json", _KNOWN_IDS,
+        datetime(2026, 8, 14, tzinfo=timezone.utc), state,
+    )
+    assert res["degraded"] is True
+    assert res["degraded_reason"] == "lookup_time_budget_exhausted"
+    assert state["queries"] == 0

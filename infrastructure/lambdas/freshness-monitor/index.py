@@ -1600,7 +1600,16 @@ OWNING_ITEM_LOOKUP_ENABLED = (
     os.environ.get("FRESHNESS_OWNING_ITEM_LOOKUP", "true").lower() == "true"
 )
 _OWNING_ITEM_TIMEOUT_SEC = int(
-    os.environ.get("OWNING_ITEM_LOOKUP_TIMEOUT_SEC", "10")
+    os.environ.get("OWNING_ITEM_LOOKUP_TIMEOUT_SEC", "5")
+)
+# MEASURED 2026-08-14: the deployed function's timeout is 120s. A per-query
+# timeout alone does not bound this phase — the query CAP times the per-query
+# timeout is the real worst case, and 24 x 5s would eat the whole function.
+# A Lambda timeout is a HARD FAIL that halts the sweep, so the join is bounded
+# by wall clock as well as by count, and blowing the budget degrades the
+# REMAINING rows (recorded, still paging) instead of killing the pass.
+OWNING_ITEM_LOOKUP_MAX_SECONDS = float(
+    os.environ.get("OWNING_ITEM_LOOKUP_MAX_SECONDS", "25")
 )
 # GitHub's search API allows 30 authenticated requests/minute. A sweep with
 # many simultaneous misses must not spend the whole budget and then fail the
@@ -1626,7 +1635,10 @@ _OWNING_ITEM_MEMBERS_IN_BODY = 5
 def _new_lookup_state() -> dict[str, Any]:
     """Per-pass owning-item lookup state: one SSM PAT read, one query
     budget, one per-artifact result cache."""
-    return {"pat": None, "pat_error": None, "queries": 0, "cache": {}}
+    return {
+        "pat": None, "pat_error": None, "queries": 0, "cache": {},
+        "started_at": time.monotonic(),
+    }
 
 
 def _unresolved(reason: str) -> dict[str, Any]:
@@ -1805,6 +1817,12 @@ def _resolve_owning_item(
     for term in _search_terms(artifact_id, canonical_key):
         if state["queries"] >= OWNING_ITEM_LOOKUP_MAX_QUERIES:
             errors.append("lookup_budget_exhausted")
+            break
+        if (
+            time.monotonic() - state.get("started_at", 0.0)
+            >= OWNING_ITEM_LOOKUP_MAX_SECONDS
+        ):
+            errors.append("lookup_time_budget_exhausted")
             break
         state["queries"] += 1
         try:
