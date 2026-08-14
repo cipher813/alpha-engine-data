@@ -299,10 +299,14 @@ def _choice_target(definition: dict, choice_name: str, data) -> str:
         # Branch A's producer.
         ("WeeklyRunDayGateChoice", {"weekly_run_day_gate": {"Payload": {}}},
          "WeeklyRunDayGateMalformed"),
+        # fail-open, VISIBLY (config#2278) — and since I7302, through the
+        # normalizer that records WHICH cause degraded the gate. This arm is
+        # the "probe ran, returned no verdict" cause, so it lands on
+        # *GateDegradedFromProbe (which then reaches *GateDegraded unchanged).
         ("LibPinDriftGate", {"libpin_drift_result": {"Payload": {}}},
-         "LibPinGateDegraded"),  # fail-open, VISIBLY (config#2278)
+         "LibPinGateDegradedFromProbe"),
         ("PipelineContractGate", {"pipeline_contract_result": {"Payload": {}}},
-         "PipelineContractGateDegraded"),  # fail-open, VISIBLY (config#2278)
+         "PipelineContractGateDegradedFromProbe"),
         ("EvalJudgePollChoice", {"eval_judge_submit": {"Payload": {}}},
          "EvalRollingMean"),  # eval is observability — fail-soft
         ("EvalJudgePollDecision", {"eval_judge_poll": {"Payload": {}}},

@@ -208,12 +208,23 @@ STAGES: tuple[Stage, ...] = (
         # these Pass+Publish pairs — no skip flag is emitted either way
         # (emit_skip=False), but the summary must say "degraded", not
         # "completed", when one was hit.
+        # alpha-engine-config-I7302 added the *GateDegradedFromProbe /
+        # *GateDegradedFromError entry pair per gate: the cause-recording
+        # normalizers the Choice absence arm and the Task Catch now route
+        # through on their way to the unchanged *GateDegraded Pass. They are
+        # part of the same degraded route, so they belong in the same witness
+        # set — a run that stopped ON one of them is a degraded gate, not a
+        # completed one.
         degraded_witness=frozenset({
+            "LibPinGateDegradedFromProbe", "LibPinGateDegradedFromError",
             "LibPinGateDegraded", "SetLibPinGateDegradedSummary", "PublishLibPinGateDegraded",
+            "PipelineContractGateDegradedFromProbe", "PipelineContractGateDegradedFromError",
             "PipelineContractGateDegraded", "SetPipelineContractGateDegradedSummary",
             "PublishPipelineContractGateDegraded",
+            "EvaluatorGateDegradedFromProbe", "EvaluatorGateDegradedFromError",
             "EvaluatorGateDegraded", "SetEvaluatorGateDegradedSummary",
             "PublishEvaluatorGateDegraded",
+            "EvaluatorDirectorGateDegradedFromProbe", "EvaluatorDirectorGateDegradedFromError",
             "EvaluatorDirectorGateDegraded", "SetEvaluatorDirectorGateDegradedSummary",
             "PublishEvaluatorDirectorGateDegraded",
             # alpha-engine-config#6722: AcquireMutex's mutex-acquire

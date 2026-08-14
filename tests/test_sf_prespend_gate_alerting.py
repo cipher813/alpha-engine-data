@@ -44,12 +44,14 @@ def states() -> dict:
 
 
 GATES = [
-    # (check state, result field, degraded pass, publish state, proceed-to)
+    # (check state, result field, degraded pass, publish state, proceed-to,
+    #  cause path)
     ("LibPinDriftCheck", "$.libpin_drift_result.Payload.has_drift",
-     "LibPinGateDegraded", "PublishLibPinGateDegraded", "PipelineContractCheck"),
+     "LibPinGateDegraded", "PublishLibPinGateDegraded", "PipelineContractCheck",
+     "$.libpin_gate_degraded_cause"),
     ("PipelineContractCheck", "$.pipeline_contract_result.Payload.has_violation",
      "PipelineContractGateDegraded", "PublishPipelineContractGateDegraded",
-     "EvaluatorDeployDriftCheck"),
+     "EvaluatorDeployDriftCheck", "$.pipeline_contract_gate_degraded_cause"),
     # config#2348: third pre-spend sibling gate — evaluator's 2 Lambdas,
     # checked in sequence (grading, then director). Each has its own
     # Check/Gate/Degraded/Publish quartet; both mirror the shape above.
@@ -58,16 +60,20 @@ GATES = [
     # gate" fix config#2278 applied to LibPinGateDegraded.
     ("EvaluatorDeployDriftCheck", "$.evaluator_deploy_drift_result.Payload.has_drift",
      "EvaluatorGateDegraded", "PublishEvaluatorGateDegraded",
-     "EvaluatorDirectorDeployDriftCheck"),
+     "EvaluatorDirectorDeployDriftCheck", "$.evaluator_gate_degraded_cause"),
     ("EvaluatorDirectorDeployDriftCheck", "$.evaluator_director_deploy_drift_result.Payload.has_drift",
      "EvaluatorDirectorGateDegraded", "PublishEvaluatorDirectorGateDegraded",
-     "WeeklyPreflight"),
+     "WeeklyPreflight", "$.evaluator_director_gate_degraded_cause"),
 ]
 
+_PARAMS = ("check", "_field", "degraded", "publish", "proceed", "cause_path")
+_IDS = [g[0] for g in GATES]
 
-@pytest.mark.parametrize(("check", "_field", "degraded", "publish", "proceed"),
-                         GATES, ids=[g[0] for g in GATES])
-def test_gate_has_transient_retry_tier(states, check, _field, degraded, publish, proceed):
+
+@pytest.mark.parametrize(_PARAMS, GATES, ids=_IDS)
+def test_gate_has_transient_retry_tier(
+    states, check, _field, degraded, publish, proceed, cause_path
+):
     retries = states[check]["Retry"]
     by_errors = {tuple(sorted(r["ErrorEquals"])): r for r in retries}
     transient = by_errors[("States.TaskFailed", "States.Timeout")]
@@ -77,14 +83,17 @@ def test_gate_has_transient_retry_tier(states, check, _field, degraded, publish,
     assert lambda_tier["MaxAttempts"] == 2
 
 
-@pytest.mark.parametrize(("check", "_field", "degraded", "publish", "proceed"),
-                         GATES, ids=[g[0] for g in GATES])
+@pytest.mark.parametrize(_PARAMS, GATES, ids=_IDS)
 def test_gate_catch_routes_through_degraded_alert_chain(
-    states, check, _field, degraded, publish, proceed
+    states, check, _field, degraded, publish, proceed, cause_path
 ):
     (catch,) = states[check]["Catch"]
     assert catch["ErrorEquals"] == ["States.ALL"]
-    assert catch["Next"] == degraded
+    # alpha-engine-config-I7302: the Catch enters the chain one state earlier,
+    # at the normalizer that records WHICH cause degraded the gate, and that
+    # normalizer hands off to the unchanged degraded Pass.
+    assert catch["Next"] == f"{degraded}FromError"
+    assert states[f"{degraded}FromError"]["Next"] == degraded
 
     degraded_state = states[degraded]
     assert degraded_state["Type"] == "Pass"
@@ -95,11 +104,18 @@ def test_gate_catch_routes_through_degraded_alert_chain(
     publish_state = states[publish]
     assert publish_state["Resource"] == "arn:aws:states:::sns:publish"
     assert publish_state["Parameters"]["TopicArn.$"] == "$.sns_topic_arn"
-    # config#1819: constants only — a parameterized Subject/Message here
-    # would reintroduce the SNS-contract States.Runtime class.
+    # config#1819: the Subject stays a constant. alpha-engine-config-I7302
+    # deliberately parameterized the MESSAGE — the constant asserted "gate
+    # Lambda failed after retries, or returned a malformed payload", a cause
+    # set that excludes the arm which actually fires in production (measured
+    # on watch-rerun-2026-08-13-5: the Lambda returned HTTP 200 in 142 ms).
+    # config#1819's States.Runtime hazard is closed structurally instead: the
+    # only paths dereferenced are two scalars written by the normalizer Pass
+    # immediately upstream on BOTH inbound arms — see
+    # test_degraded_message_names_the_cause_from_a_guaranteed_present_path.
     assert "Subject" in publish_state["Parameters"]
     assert "Subject.$" not in publish_state["Parameters"]
-    assert "Message.$" not in publish_state["Parameters"]
+    assert "Message" not in publish_state["Parameters"]
     assert "DEGRADED" in publish_state["Parameters"]["Subject"]
     assert len(publish_state["Parameters"]["Subject"]) <= 100
     # Fail-open: alert then PROCEED — and a publish failure proceeds too.
@@ -140,7 +156,8 @@ def test_malformed_gate_payload_routes_to_degraded_chain(states, gate, field, de
         if r.get("Not", {}).get("Variable") == field
         and r["Not"].get("IsPresent") is True
     )
-    assert absence_rule["Next"] == degraded
+    assert absence_rule["Next"] == f"{degraded}FromProbe"
+    assert states[f"{degraded}FromProbe"]["Next"] == degraded
 
 
 def test_gate_degraded_threads_into_completion_email(states):
@@ -194,3 +211,130 @@ def test_only_degraded_passes_set_gate_degraded(states):
         "PipelineContractGateDegraded",
         "SetMutexAcquireDegradedFlag",
     ]
+
+
+# --------------------------------------------------------------------------
+# alpha-engine-config-I7302 — the degraded alert must name the cause the
+# execution history shows, not a cause set chosen at authoring time.
+#
+# Measured 2026-08-13, ne-weekly-freshness-pipeline/watch-rerun-2026-08-13-5:
+# PipelineContractCheck reached TaskSucceeded (HTTP 200, 142 ms, zero
+# retries) and returned {"violations": [], "boundary_count": null, "reason":
+# "fetch_failed"}. The gate degraded via the Choice absence arm — and the
+# constant SNS Message asserted "gate Lambda failed after retries, or
+# returned a malformed payload". Both halves were false, and the one field
+# that WAS true (reason) never reached the reader.
+# --------------------------------------------------------------------------
+
+_LAMBDA_FAILURE_CLAIM = "gate Lambda failed after retries"
+
+
+@pytest.mark.parametrize(_PARAMS, GATES, ids=_IDS)
+def test_degraded_message_names_the_cause_from_a_guaranteed_present_path(
+    states, check, _field, degraded, publish, proceed, cause_path
+):
+    """The Message interpolates the normalizer's two scalars and nothing else.
+
+    This is what keeps config#1819's States.Runtime hazard closed while the
+    Message is parameterized: every JsonPath the notifier dereferences is
+    written by the Pass immediately upstream, on BOTH inbound arms.
+    """
+    message = states[publish]["Parameters"]["Message.$"]
+    assert message.startswith("States.Format(")
+
+    args = message[message.rindex("'") + 1:].rstrip(")")
+    referenced = [a.strip() for a in args.split(",") if a.strip()]
+    assert referenced == [f"{cause_path}.cause", f"{cause_path}.detail"], (
+        f"{publish} dereferences {referenced} — only the normalizer's own "
+        f"scalars under {cause_path} are guaranteed present on both the "
+        "Catch arm and the Choice absence arm"
+    )
+
+    template = message[message.index("'") + 1:message.rindex("'")]
+    assert template.count("{}") == len(referenced)
+
+
+@pytest.mark.parametrize(_PARAMS, GATES, ids=_IDS)
+def test_degraded_message_template_is_intrinsic_safe(
+    states, check, _field, degraded, publish, proceed, cause_path
+):
+    """A States.Format argument is a SINGLE-QUOTED ASL literal.
+
+    An apostrophe in the prose, or a stray curly brace (a `{run_date}`-style
+    placeholder copied from a sibling alert), terminates or mis-parses the
+    intrinsic and the whole definition fails to deploy — a red CI is the
+    good outcome; the bad one is a notifier that raises States.Runtime on
+    the exact path it exists to report.
+    """
+    message = states[publish]["Parameters"]["Message.$"]
+    template = message[message.index("'") + 1:message.rindex("'")]
+    assert "'" not in template, f"{publish}: apostrophe in a States.Format literal"
+    assert template.count("{") == template.count("}") == template.count("{}")
+
+
+@pytest.mark.parametrize(_PARAMS, GATES, ids=_IDS)
+def test_degraded_message_does_not_assert_an_unverified_cause(
+    states, check, _field, degraded, publish, proceed, cause_path
+):
+    """The regression this issue exists for.
+
+    The alert may DEFINE what the cause codes mean; it may not ASSERT that a
+    particular one happened. Only the interpolated `cause` scalar, written by
+    whichever normalizer actually ran, may do that.
+    """
+    message = states[publish]["Parameters"]["Message.$"]
+    template = message[message.index("'") + 1:message.rindex("'")]
+    claim_line = next(
+        (ln for ln in template.splitlines()
+         if _LAMBDA_FAILURE_CLAIM in ln and "Cause codes:" not in ln),
+        None,
+    )
+    assert claim_line is None, (
+        f"{publish} asserts {_LAMBDA_FAILURE_CLAIM!r} outside the cause-code "
+        f"legend: {claim_line!r}. The gate degrades far more often via the "
+        "Choice absence arm, where the Lambda succeeded."
+    )
+
+
+@pytest.mark.parametrize(_PARAMS, GATES, ids=_IDS)
+def test_both_degraded_causes_converge_on_one_result_path(
+    states, check, _field, degraded, publish, proceed, cause_path
+):
+    from_probe = states[f"{degraded}FromProbe"]
+    from_error = states[f"{degraded}FromError"]
+
+    for name, st in ((f"{degraded}FromProbe", from_probe),
+                     (f"{degraded}FromError", from_error)):
+        assert st["Type"] == "Pass"
+        assert st["ResultPath"] == cause_path, name
+        assert st["Next"] == degraded, name
+        assert set(st["Parameters"]) == {"cause", "detail.$"}, name
+        assert st["Parameters"]["detail.$"].startswith("States.JsonToString("), name
+
+    assert from_probe["Parameters"]["cause"] == "probe_returned_no_verdict"
+    assert from_error["Parameters"]["cause"] == "lambda_failed_after_retries"
+
+    # Each normalizer may only read the path its OWN inbound arm guarantees.
+    result_path = states[check]["ResultPath"]
+    (catch,) = states[check]["Catch"]
+    assert from_probe["Parameters"]["detail.$"] == (
+        f"States.JsonToString({result_path}.Payload)"
+    )
+    assert from_error["Parameters"]["detail.$"] == (
+        f"States.JsonToString({catch['ResultPath']})"
+    )
+
+
+@pytest.mark.parametrize(_PARAMS, GATES, ids=_IDS)
+def test_normalizers_do_not_touch_the_gate_degraded_marker(
+    states, check, _field, degraded, publish, proceed, cause_path
+):
+    """The completion-email marker stays SF-controlled and single-writer.
+
+    `test_only_degraded_passes_set_gate_degraded` pins the writer list; these
+    eight new states must not join it, or the family-boolean accumulation
+    `CheckGateDegradedNotify` depends on changes shape.
+    """
+    for name in (f"{degraded}FromProbe", f"{degraded}FromError"):
+        assert states[name]["ResultPath"] != "$.gate_degraded"
+        assert states[name]["ResultPath"] != "$.degraded_summary"
