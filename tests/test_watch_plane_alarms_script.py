@@ -181,6 +181,40 @@ class TestAlarmSemantics:
             "outside this block"
         )
 
+    def test_no_label_can_make_errors_or_throttles_breaching(self, script_text):
+        """`_effective_treat_missing` returns the default for EVERY label.
+
+        Previously it returned "breaching" for any label in
+        `_LAMBDA_CADENCE_SECONDS`, which made the absence of an error page and
+        erased the only distinction that matters when a probe goes quiet: "ran
+        and failed" versus "did not run". The Invocations-floor alarm (I5567)
+        owns "did not run" and keeps breaching; these two must not duplicate it.
+        Asserted on the function body, because a per-label branch reintroduced
+        there is invisible to the loop-body scan above (alpha-engine-config-I7023).
+        """
+        start = script_text.find("_effective_treat_missing() {")
+        assert start != -1, "the seam this property lives on was renamed"
+        body = script_text[start:script_text.find("\n}", start)]
+        code = [ln.strip() for ln in body.splitlines()
+                if ln.strip() and not ln.strip().startswith("#")]
+        assert not any("breaching" in ln and "notBreaching" not in ln
+                       for ln in code), (
+            f"a label-conditional breaching value is back in "
+            f"_effective_treat_missing: {code}"
+        )
+        assert 'echo "$DEFAULT_ALARM_TREAT_MISSING"' in body
+
+    def test_the_invocations_floor_alarm_still_owns_absence(self, script_text):
+        """The counterpart to the test above: absence detection must not be lost.
+
+        Narrowing Errors/Throttles to notBreaching is only correct because this
+        alarm keeps breaching. If both were relaxed, a probe that stopped running
+        would report green on every alarm it has.
+        """
+        block = script_text[script_text.find("Invocations-floor alarms..."):]
+        assert '--metric-name "Invocations"' in block
+        assert '--treat-missing-data "breaching"' in block
+
     def test_default_period_five_minutes_single_eval(self, script_text):
         # The default alarm shape is Period=300 (5 min), EvaluationPeriods=1
         # for event-driven Lambdas. Slow-cadence probes (config#4477) can

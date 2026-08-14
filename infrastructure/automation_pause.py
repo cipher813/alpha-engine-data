@@ -52,6 +52,22 @@ configuration survive for later reconstruction. Re-enabling an alarm is NOT
 the trigger-reenable asymmetry below — it only resumes paging, it starts no
 scheduled work, so it is safe for ``enforce()`` to do unattended.
 
+``paused_alarms`` is graded for CORRECTNESS by the above: every entry in it must
+still be justified and must match live state. It is graded for COMPLETENESS by
+``armed_alarms`` (alpha-engine-config-I7023). Every live alarm with
+``TreatMissingData=breaching`` can latch ALARM from silence alone, so each one
+must be classified into exactly one of the two blocks — silenced because a
+trigger is paused, or armed because it watches something genuinely running. An
+alarm in NEITHER block is an ``alarm-undeclared`` finding, so a new one cannot be
+born unclassified; an ``armed_alarms`` entry whose live actions are disabled is
+``armed-but-silenced``, so a detector cannot be muted by hand with no
+declaration saying why. This exists because the original ``paused_alarms`` list
+was built from the alarms OBSERVED in ALARM on one morning: four members of the
+class read OK at that moment — one of them because another component was
+re-invoking their paused probe — and were therefore never listed, and kept
+paging. A register built from symptoms is an incident log; ``armed_alarms`` is
+what makes this one an audit.
+
 Usage:
   ./infrastructure/automation_pause.py --check     # verify; exit 1 on any finding
   ./infrastructure/automation_pause.py --enforce   # re-disable anything that came back,
@@ -162,6 +178,19 @@ def alarm_entries(manifest: dict | None = None) -> list[dict]:
     return out
 
 
+def armed_alarm_names(manifest: dict | None = None) -> set[str]:
+    """Alarms deliberately left ARMED — the completeness counterpart to ``paused_alarms``.
+
+    No ``watches`` field and nothing to reconcile: armed is the default state,
+    and ``enforce()`` never silences an alarm that ``paused_alarms`` does not
+    justify. The block exists so every breaching alarm is classified rather than
+    merely every silenced one. ``_``-prefixed keys are prose, same convention as
+    every other block here.
+    """
+    m = manifest if manifest is not None else load_manifest()
+    return {k for k in m.get("armed_alarms", {}) if not k.startswith("_")}
+
+
 def alarm_justified(entry: dict, manifest: dict | None = None) -> bool:
     """Is silencing ``entry`` still justified by the manifest, right now?
 
@@ -244,6 +273,38 @@ def _alarm_actions_enabled(name: str) -> bool | None:
     if out in ("None", ""):
         return None
     return out == "True"
+
+
+def _live_breaching_alarms() -> dict[str, bool]:
+    """``{alarm name: ActionsEnabled}`` for every live alarm that latches on silence.
+
+    ``TreatMissingData=breaching`` is the whole population that can go ALARM with
+    nothing wrong, so it is the population the two manifest blocks must between
+    them cover. Paginated explicitly: DescribeAlarms caps at 100 per page and a
+    truncated first page would silently shrink the very set being graded for
+    completeness.
+    """
+    alarms: dict[str, bool] = {}
+    token: str | None = None
+    while True:
+        args = [
+            "cloudwatch", "describe-alarms", "--max-items", "100",
+            "--query",
+            "{a: MetricAlarms[?TreatMissingData=='breaching'].{n: AlarmName, e: ActionsEnabled}, "
+            "t: NextToken}",
+            "--output", "json",
+        ]
+        if token:
+            args += ["--starting-token", token]
+        rc, out, err = _aws(args)
+        if rc != 0:
+            raise RuntimeError(f"aws cloudwatch describe-alarms: {err}")
+        page = json.loads(out or "{}")
+        for row in page.get("a") or []:
+            alarms[row["n"]] = bool(row["e"])
+        token = page.get("t")
+        if not token:
+            return alarms
 
 
 def _set_alarm_actions(name: str, enabled: bool) -> None:
@@ -369,6 +430,61 @@ def alarm_findings() -> list[dict]:
                     f"entry."
                 ),
             })
+
+    out.extend(alarm_coverage_findings())
+    return out
+
+
+def alarm_coverage_findings() -> list[dict]:
+    """Is every silence-latching alarm CLASSIFIED — not merely every listed one?
+
+    ``alarm_findings()`` above grades the entries that exist. This grades the
+    ones that do not: any live alarm with ``TreatMissingData=breaching`` in
+    neither ``paused_alarms`` nor ``armed_alarms``, and any ``armed_alarms``
+    entry that has been silenced or has vanished. Without this, the manifest can
+    only ever be as complete as whatever was firing on the day someone wrote it.
+    """
+    out: list[dict] = []
+    declared_paused = {e["name"] for e in alarm_entries()}
+    declared_armed = armed_alarm_names()
+    live = _live_breaching_alarms()
+
+    for name in sorted(set(live) - declared_paused - declared_armed):
+        out.append({
+            "trigger": name, "surface": "cloudwatch", "kind": "alarm-undeclared",
+            "detail": (
+                "treat_missing_data=breaching, so it can latch ALARM on silence "
+                "alone, but it appears in neither paused_alarms nor "
+                "armed_alarms. Classify it: add it to paused_alarms with the "
+                "trigger(s) it watches if it is quiet because they are paused, "
+                "or to armed_alarms with a one-line reason if it watches "
+                "something genuinely running. An unclassified alarm of this "
+                "class is exactly what paged on 2026-08-14."
+            ),
+        })
+
+    for name in sorted(declared_armed):
+        if name not in live:
+            out.append({
+                "trigger": name, "surface": "cloudwatch", "kind": "armed-missing-in-aws",
+                "detail": (
+                    "declared in armed_alarms but no live alarm of that name has "
+                    "treat_missing_data=breaching — it was deleted, renamed, or its "
+                    "missing-data treatment was changed, and whatever it detected is "
+                    "now undetected. Remove or correct the entry."
+                ),
+            })
+        elif not live[name]:
+            out.append({
+                "trigger": name, "surface": "cloudwatch", "kind": "armed-but-silenced",
+                "detail": (
+                    "declared as deliberately ARMED, but ActionsEnabled=false — a "
+                    "detector was muted by hand with no declaration saying why, and a "
+                    "muted alarm is indistinguishable from a healthy one on every "
+                    "surface. Either re-arm it, or move it to paused_alarms naming the "
+                    "trigger(s) whose pause justifies the silence."
+                ),
+            })
     return out
 
 
@@ -442,16 +558,20 @@ def main() -> int:
         print(json.dumps({"checked": len(entries),
                           "kept_checked": len(kept_names()),
                           "alarms_checked": len(alarm_entries()),
+                          "armed_alarms_checked": len(armed_alarm_names()),
                           "findings": findings}, indent=2))
     else:
         kept = kept_names()
         alarms = alarm_entries()
+        armed = armed_alarm_names()
         print(f"automation pause — {len(entries)} paused / {len(kept)} kept trigger(s), "
-              f"{len(alarms)} declared alarm(s) checked")
+              f"{len(alarms)} silenced / {len(armed)} armed alarm(s) checked")
         if not findings:
             print("  ✓ every paused trigger exists live and is DISABLED")
             print("  ✓ every kept trigger exists live and is ENABLED")
             print("  ✓ every declared alarm's ActionsEnabled matches its current justification")
+            print("  ✓ every breaching alarm live in CloudWatch is declared in one block "
+                  "or the other")
         for f in findings:
             print(f"  ✗ [{f['kind']}] {f['surface']}:{f['trigger']}")
             print(f"      {f['detail']}")
