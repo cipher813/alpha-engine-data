@@ -204,7 +204,8 @@ if $BOOTSTRAP; then
     --statistic Sum --period 3600 --evaluation-periods 1 \
     --threshold 0 --comparison-operator GreaterThanThreshold \
     --treat-missing-data notBreaching \
-    --alarm-actions "${SNS_TOPIC_ARN}" --region "${REGION}" || echo "    (alarm may already exist — continuing)"
+    --alarm-actions "${SNS_TOPIC_ARN}" --region "${REGION}" || echo "    (alarm may already exist — continuing)" \
+    "$(alarm_actions_flag "${WFS_ALARM}")"
 fi
 
 # ----- 2. Update function code (always) -------------------------------------

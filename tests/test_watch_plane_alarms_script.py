@@ -202,17 +202,18 @@ class TestAlarmSemantics:
             f"use(s) — a call site can reset ActionsEnabled on a paused alarm"
         )
 
-    def test_the_silenced_set_comes_from_the_pause_module_not_a_second_list(
+    def test_the_silenced_set_comes_from_the_shared_helper_not_a_second_list(
             self, script_text):
-        """One predicate, three consumers.
+        """One predicate, nine provisioners.
 
         If this script hardcoded its own list of paused alarms it would drift
         from `--check` and `--enforce --alarms-only` the moment a pause lifted,
-        and the drift would show up as an alarm that is silent while the
-        manifest says it should be armed — the hardest direction to notice.
+        and the drift would show as an alarm that is silent while the manifest
+        says it should be armed — the hardest direction to notice. The helper is
+        shared because nine scripts in this repo call put-metric-alarm.
         """
-        assert "import automation_pause as ap" in script_text
-        assert "ap.alarm_justified(e)" in script_text
+        assert "_shared/pause.sh" in script_text
+        assert 'alarm_actions_flag "' in script_text
 
     def test_no_label_can_make_errors_or_throttles_breaching(self, script_text):
         """`_effective_treat_missing` returns the default for EVERY label.

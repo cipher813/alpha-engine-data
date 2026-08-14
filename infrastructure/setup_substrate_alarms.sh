@@ -38,6 +38,13 @@
 
 set -euo pipefail
 
+# Alarm upserts RESET ActionsEnabled, so without this the next run of this
+# script re-arms any alarm the automation pause has silenced. Shared with the
+# eight other provisioners in this repo (alpha-engine-config-I7023).
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lambdas/_shared/pause.sh"
+
+
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region "$REGION")
 SNS_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:alpha-engine-alerts"
@@ -98,7 +105,8 @@ for row_id in $ROW_IDS; do
     --metric-name "$PER_ROW_METRIC" \
     --dimensions "Name=RowID,Value=$row_id" \
     --alarm-actions "$SNS_TOPIC_ARN" \
-    --ok-actions "$SNS_TOPIC_ARN" > /dev/null
+    --ok-actions "$SNS_TOPIC_ARN" > /dev/null \
+    "$(alarm_actions_flag "$alarm_name")"
 done
 
 # --- Aggregate failure alarm ------------------------------------------------
@@ -120,7 +128,8 @@ aws cloudwatch put-metric-alarm \
   --namespace "$NAMESPACE" \
   --metric-name "$AGGREGATE_METRIC" \
   --alarm-actions "$SNS_TOPIC_ARN" \
-  --ok-actions "$SNS_TOPIC_ARN" > /dev/null
+  --ok-actions "$SNS_TOPIC_ARN" > /dev/null \
+  "$(alarm_actions_flag "$aggregate_name")"
 
 echo ""
 echo "All substrate alarms configured."

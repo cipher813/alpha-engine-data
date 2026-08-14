@@ -24,6 +24,13 @@
 
 set -euo pipefail
 
+# Alarm upserts RESET ActionsEnabled, so without this the next run of this
+# script re-arms any alarm the automation pause has silenced. Shared with the
+# eight other provisioners in this repo (alpha-engine-config-I7023).
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lambdas/_shared/pause.sh"
+
+
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region "$REGION")
 SNS_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:alpha-engine-alerts"
@@ -63,7 +70,8 @@ aws cloudwatch put-metric-alarm \
   --metric-name "Duration" \
   --dimensions "Name=FunctionName,Value=${FUNCTION_NAME}" \
   --alarm-actions "$SNS_TOPIC_ARN" \
-  --ok-actions "$SNS_TOPIC_ARN"
+  --ok-actions "$SNS_TOPIC_ARN" \
+  "$(alarm_actions_flag "$ALARM_NAME")"
 
 echo ""
 echo "Alarm $ALARM_NAME configured."
