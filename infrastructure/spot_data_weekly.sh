@@ -83,8 +83,9 @@
 #     DescribeInstances / SendCommand / GetCommandInvocation /
 #     ssm:SendCommand on the spot's SSM document
 #   - alpha-engine-data checked out at the script's parent dir
-#   - alpha-engine-lib installed in ae-dashboard's .venv (LIB_PYTHON
-#     points at it) — provides both `ec2_spot` and `ssm_dispatcher` CLIs
+#   - /opt/nousergon/bin/lib-python present on the launching host — the
+#     ops-owned guard over the box's declared krepis venv, which provides
+#     both the `ec2_spot` and `ssm_dispatcher` CLIs (LIB_PYTHON names it)
 #
 # Secrets resolve from SSM at Python startup via
 # nousergon_lib.secrets.get_secret(); the spot's IAM profile
@@ -182,12 +183,16 @@ SECURITY_GROUP="sg-03cd3c4bd91e610b0"
 # update via `aws ec2 describe-subnets --filters Name=vpc-id,Values=vpc-566f002e`.
 SUBNETS="${SUBNETS:-subnet-a61ec0fb,subnet-1e58307a,subnet-789d3857,subnet-c670118d,subnet-7cff7c43,subnet-e07166ec}"
 IAM_PROFILE="alpha-engine-executor-profile"
-# Lib CLI path: ae-dashboard is the SSM target instance ($MicroInstanceId)
-# for all 8 Saturday-SF spot states; the dispatcher's .venv has
-# alpha-engine-lib installed (see deploy-on-merge.sh in the dashboard
-# repo). Bare `python3` resolves to system python which does NOT carry
-# the lib — use the full venv path.
-LIB_PYTHON="${LIB_PYTHON:-/home/ec2-user/alpha-engine-dashboard/.venv/bin/python}"
+# Lib CLI path: every spot launcher on the dispatcher box resolves its
+# interpreter through the ops-owned guard /opt/nousergon/bin/lib-python
+# (nous-ergon-ops: alpha-engine-dashboard/live/infrastructure/bin/lib-python).
+# That guard execs the box's DECLARED krepis venv and aborts with EX_CONFIG
+# (78), naming the version it found, when the venv is absent or below the
+# launcher floor. It never falls back to a co-tenant checkout — the silent
+# fallback is exactly the defect alpha-engine-config-I6931/I7343 removes.
+# Do NOT add a guard block here: the contract lives ONCE, in the repo that
+# owns this box's provisioning (nine copies across five repos is I6922).
+LIB_PYTHON="${LIB_PYTHON:-/opt/nousergon/bin/lib-python}"
 
 # Stage-coverage window (alpha-engine-config-I7214): the instant this launcher
 # started. An artifact whose LastModified predates it is a leftover from a
