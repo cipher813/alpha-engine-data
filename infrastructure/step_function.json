@@ -348,7 +348,7 @@
     },
     "LibPinGateDegraded": {
       "Type": "Pass",
-      "Comment": "config#2278: the lib-pin gate could not CHECK (Lambda failure after both retry tiers, or a payload without has_drift). Still fail-open \u2014 availability over gating for a weekly pipeline \u2014 but VISIBLE and rarer: gate_degraded=true threads into the completion email via CheckGateDegradedNotify, and PublishLibPinGateDegraded alerts NOW (mirroring WeeklyRunDayGateFailed's fail-open+alert shape). Proceeds into PipelineContractCheck so a lib-pin-gate infra flake no longer silently skips the SIBLING gate too.",
+      "Comment": "config#2278: the lib-pin gate could not CHECK (Lambda failure after both retry tiers, or a payload without has_drift). Still fail-open \u2014 availability over gating for a weekly pipeline \u2014 but VISIBLE and rarer: gate_degraded=true threads into the completion email via CheckGateDegradedNotify, and PublishLibPinGateDegraded alerts NOW (mirroring WeeklyRunDayGateFailed's fail-open+alert shape). Proceeds into PipelineContractCheck so a lib-pin-gate infra flake no longer silently skips the SIBLING gate too. | alpha-engine-config-I7301 (2026-08-13): this state's population NARROWED and its alert text stopped guessing. The probe now HALTS (has_drift=true, offenders named) when a co-install-pair member's pin was read successfully but is permanently uncomparable \u2014 sha_pinned / unrecognised_pin \u2014 because that is a measured defect, not a failed measurement. Only genuine could-not-measure reaches here now: a Lambda failure, an unreachable GitHub, or a permanent problem on a FLOOR-ONLY repo. The old Message asserted 'gate Lambda failed after retries, or returned a malformed payload' as the cause on EVERY arrival; from 2026-07-31 to 2026-08-13 the real cause was a well-formed payload from a healthy Lambda declining to verdict on a SHA-pinned predictor, and the text sent readers to investigate Lambda health instead. An alert may name only what it measured \u2014 the cause now lives on the execution record and the Message points at the field.",
       "Result": true,
       "ResultPath": "$.gate_degraded",
       "Next": "SetLibPinGateDegradedSummary"
@@ -360,7 +360,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekly Pipeline \u2014 Lib-Pin Gate DEGRADED (Proceeding Unchecked)",
-        "Message": "LibPinDriftCheck could not verify cross-repo pin parity (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN: this run's spot spend is NOT protected against the co-install break this gate exists to catch. The completion email will carry the gates-degraded marker. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
+        "Message": "LibPinDriftCheck could not verify cross-repo lib-pin parity on this run. Proceeding FAIL-OPEN: this run's spot spend is NOT protected against the co-install break this gate exists to catch. THIS ALERT IS NOT A REPORTED DEFECT and it does not mean the gate Lambda is broken. A confirmed parity break, and an unverifiable pin on either half of the co-install pair, both HALT the run through HandleFailure with the offenders named (alpha-engine-config-I7301) \u2014 neither arrives here. What reaches this alert is a genuine could-not-measure, and the cause is on the execution record, never guessed by this text: $.libpin_drift_result.Payload.reason names it (fetch_failed = GitHub was unreachable, the one transient cause; sha_pinned / unrecognised_pin = a FLOOR-ONLY repo's pin is not comparable to the floor), with $.libpin_drift_result.Payload.unresolved carrying the per-repo detail. If the gate Lambda itself failed after both retry tiers, $.libpin_drift_error holds the exception and the payload path is absent. The completion email will carry the gates-degraded marker. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.libpin_gate_degraded_notify",
       "Catch": [
@@ -384,12 +384,12 @@
     },
     "PublishPipelineContractGateDegraded": {
       "Type": "Task",
-      "Comment": "config#2278: fail-open + alert. Subject/Message are hardcoded constants (config#1819 discipline). Best-effort Catch mirrors PublishLibPinGateDegraded.",
+      "Comment": "config#2278: fail-open + alert. Subject/Message are hardcoded constants (config#1819 discipline). Best-effort Catch mirrors PublishLibPinGateDegraded. | alpha-engine-config-I7301: Message no longer asserts 'gate Lambda failed after retries, or returned a malformed payload' as the cause. That parenthetical was a guess baked into a config#1819 constant and fired on every arrival; on the lib-pin sibling it was false on both halves for 13 days and sent readers to investigate a healthy Lambda. A constant cannot name this run's cause, so it must not pretend to \u2014 it states the class and points at the execution-record field. Pinned by tests/test_sf_degraded_alert_names_only_what_it_measured.py.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekly Pipeline \u2014 Contract Gate DEGRADED (Proceeding Unchecked)",
-        "Message": "PipelineContractCheck could not verify PIPELINE_CONTRACT.yaml self-consistency (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN: this run's spot spend is NOT protected against the contract break this gate exists to catch. The completion email will carry the gates-degraded marker. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
+        "Message": "PipelineContractCheck could not verify PIPELINE_CONTRACT.yaml self-consistency on this run. Proceeding FAIL-OPEN: this run's spot spend is NOT protected against the contract break this gate exists to catch. THIS ALERT IS NOT A REPORTED DEFECT and it does not mean the gate Lambda is broken \u2014 a confirmed contract violation HALTS the run through HandleFailure with the violations named, and never arrives here. What reaches this alert is a genuine could-not-measure, and the cause is on the execution record rather than guessed by this text: $.pipeline_contract_result.Payload.reason names it, and $.pipeline_contract_error holds the exception if the gate Lambda itself failed after both retry tiers (in which case the payload path is absent). The completion email will carry the gates-degraded marker. alpha-engine-config-I7301. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.pipeline_contract_gate_degraded_notify",
       "Catch": [
@@ -6707,12 +6707,12 @@
     },
     "PublishEvaluatorGateDegraded": {
       "Type": "Task",
-      "Comment": "Fail-open + alert. Subject/Message are hardcoded constants (config#1819 discipline). Best-effort Catch. Proceeds to EvaluatorDirectorDeployDriftCheck (NOT straight to CheckMutexRole) \u2014 mirrors PublishLibPinGateDegraded's config#2278 fix: the degraded chain must not silently skip the sibling gate too.",
+      "Comment": "Fail-open + alert. Subject/Message are hardcoded constants (config#1819 discipline). Best-effort Catch. Proceeds to EvaluatorDirectorDeployDriftCheck (NOT straight to CheckMutexRole) \u2014 mirrors PublishLibPinGateDegraded's config#2278 fix: the degraded chain must not silently skip the sibling gate too. | alpha-engine-config-I7301: Message no longer asserts 'gate Lambda failed after retries, or returned a malformed payload' as the cause. That parenthetical was a guess baked into a config#1819 constant and fired on every arrival; on the lib-pin sibling it was false on both halves for 13 days and sent readers to investigate a healthy Lambda. A constant cannot name this run's cause, so it must not pretend to \u2014 it states the class and points at the execution-record field. Pinned by tests/test_sf_degraded_alert_names_only_what_it_measured.py.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekly Pipeline \u2014 Evaluator Deploy-Drift Gate DEGRADED (Proceeding Unchecked)",
-        "Message": "The evaluator Lambda-SHA drift probe could not verify alpha-engine-evaluator and/or alpha-engine-evaluator-director against origin/main (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN: this run is NOT protected against a stale :live alias this gate exists to catch. The completion email will carry the gates-degraded marker. config#2348."
+        "Message": "The evaluator Lambda-SHA drift probe could not verify alpha-engine-evaluator and/or alpha-engine-evaluator-director against origin/main on this run. Proceeding FAIL-OPEN: this run is NOT protected against a stale :live alias this gate exists to catch. THIS ALERT IS NOT A REPORTED DEFECT and it does not mean the gate Lambda is broken \u2014 confirmed SHA drift HALTS the run through HandleFailure with the offenders named, and never arrives here. What reaches this alert is a genuine could-not-measure, and the cause is on the execution record rather than guessed by this text: $.evaluator_deploy_drift_result.Payload.reason names it, and $.evaluator_deploy_drift_result_error holds the exception if the gate Lambda itself failed after both retry tiers (in which case the payload path is absent). The completion email will carry the gates-degraded marker. config#2348, alpha-engine-config-I7301."
       },
       "ResultPath": "$.evaluator_gate_degraded_notify",
       "Catch": [
@@ -6821,12 +6821,12 @@
     },
     "PublishEvaluatorDirectorGateDegraded": {
       "Type": "Task",
-      "Comment": "Fail-open + alert, mirrors PublishEvaluatorGateDegraded. Proceeds to WeeklyPreflight (NOT straight to CheckMutexRole) -- mirrors PublishPipelineContractGateDegraded's config#2278 fix: the degraded chain must not silently skip the sibling gate too.",
+      "Comment": "Fail-open + alert, mirrors PublishEvaluatorGateDegraded. Proceeds to WeeklyPreflight (NOT straight to CheckMutexRole) -- mirrors PublishPipelineContractGateDegraded's config#2278 fix: the degraded chain must not silently skip the sibling gate too. | alpha-engine-config-I7301: Message no longer asserts 'gate Lambda failed after retries, or returned a malformed payload' as the cause. That parenthetical was a guess baked into a config#1819 constant and fired on every arrival; on the lib-pin sibling it was false on both halves for 13 days and sent readers to investigate a healthy Lambda. A constant cannot name this run's cause, so it must not pretend to \u2014 it states the class and points at the execution-record field. Pinned by tests/test_sf_degraded_alert_names_only_what_it_measured.py.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Weekly Pipeline \u2014 Evaluator-Director Deploy-Drift Gate DEGRADED (Proceeding Unchecked)",
-        "Message": "The evaluator-director Lambda-SHA drift probe could not verify alpha-engine-evaluator-director against origin/main (gate Lambda failed after retries, or returned a malformed payload). Proceeding FAIL-OPEN. The completion email will carry the gates-degraded marker. config#2348."
+        "Message": "The evaluator-director Lambda-SHA drift probe could not verify alpha-engine-evaluator-director against origin/main on this run. Proceeding FAIL-OPEN. THIS ALERT IS NOT A REPORTED DEFECT and it does not mean the gate Lambda is broken \u2014 confirmed SHA drift HALTS the run through HandleFailure with the offenders named, and never arrives here. What reaches this alert is a genuine could-not-measure, and the cause is on the execution record rather than guessed by this text: $.evaluator_director_deploy_drift_result.Payload.reason names it, and $.evaluator_director_deploy_drift_result_error holds the exception if the gate Lambda itself failed after both retry tiers (in which case the payload path is absent). The completion email will carry the gates-degraded marker. config#2348, alpha-engine-config-I7301."
       },
       "ResultPath": "$.evaluator_director_gate_degraded_notify",
       "Catch": [
