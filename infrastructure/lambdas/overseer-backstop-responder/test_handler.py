@@ -124,6 +124,11 @@ def wired(monkeypatch):
     monkeypatch.setattr(index, "_telegram",
                         lambda text: (state["pages"].append(text), True)[1])
     monkeypatch.setattr(index, "RECOVERY_ENABLED", True)
+    # Nothing paused, stated explicitly. In the source tree the bundled manifest
+    # does not sit next to index.py (deploy.sh copies it in), so without this the
+    # every-action test would pass because the manifest was UNREADABLE rather
+    # than because nothing was paused — a green that proves the wrong thing.
+    monkeypatch.setattr(index, "_paused_trigger_names", lambda: set())
     return state
 
 
@@ -177,8 +182,141 @@ def test_every_allowlist_entry_is_a_known_action():
     for alarm, spec in index.ALARM_ACTIONS.items():
         assert spec["action"] in ("redispatch", "invoke_probe"), alarm
         assert spec.get("rationale"), f"{alarm} must carry a rationale"
+        assert spec.get("component"), f"{alarm} must name its target component"
+        assert spec.get("triggers"), f"{alarm} must name its component's triggers"
         if spec["action"] == "redispatch":
             assert spec.get("playbook") and isinstance(spec.get("payload"), dict)
+
+
+# ── Property 5: never restart automation the operator paused (I7330) ────────
+
+
+REPO_MANIFEST = (
+    Path(__file__).resolve().parents[2] / "automation_pause.json"
+)
+
+
+def _manifest_names() -> set[str]:
+    m = json.loads(REPO_MANIFEST.read_text(encoding="utf-8"))
+    names = set()
+    for surface in ("events_rules", "scheduler_schedules"):
+        names |= set(m["paused"][surface])
+    names |= {k for k in m.get("pending", {}) if not k.startswith("_")}
+    return names
+
+
+def test_declared_triggers_all_exist_in_the_repo_manifest():
+    """A typo in `triggers` would silently disable the gate, not fail it.
+
+    `_pause_verdict` asks whether every declared name is IN the paused set. A
+    misspelled name can never be in it, so the component reads as live forever
+    and the guard is gone with nothing red. This test is the only thing that
+    notices — it compares against the real repo manifest, not a fixture.
+    """
+    known = _manifest_names()
+    assert known, "the repo manifest parsed to zero paused triggers"
+    for alarm, spec in index.ALARM_ACTIONS.items():
+        for trigger in spec["triggers"]:
+            assert trigger in known, (
+                f"{alarm}: declared trigger {trigger!r} appears nowhere in "
+                f"automation_pause.json. Either it was renamed there, or it is "
+                f"a typo — both make the pause gate a permanent no-op."
+            )
+
+
+def test_action_is_skipped_when_every_trigger_of_its_component_is_paused(
+        wired, monkeypatch):
+    for alarm, spec in index.ALARM_ACTIONS.items():
+        wired["lambda"].invocations.clear()
+        monkeypatch.setattr(index, "_paused_trigger_names",
+                            lambda s=spec: set(s["triggers"]))
+        out = index.handler(_sns(alarm), None)
+        assert wired["lambda"].invocations == [], (
+            f"{alarm}: acted on a component whose every trigger is paused"
+        )
+        assert "paused in automation_pause.json" in out["outcome"]["skipped"]
+        assert wired["pages"], "reporting stays unconditional"
+
+
+def test_a_partially_paused_component_is_still_recovered(wired, monkeypatch):
+    """One live trigger means the component still runs on its own cadence, so
+    its alarm is a real failure and the bounded recovery is still correct."""
+    spec = index.ALARM_ACTIONS[INTAKE_AGE]
+    monkeypatch.setattr(index, "_paused_trigger_names",
+                        lambda: set(spec["triggers"][1:]))
+    index.handler(_sns(INTAKE_AGE), None)
+    assert len(wired["lambda"].invocations) == 1
+
+
+def test_a_paused_component_does_not_consume_its_cooldown_window(wired, monkeypatch):
+    """The skip must happen BEFORE the attempt is claimed.
+
+    Otherwise the first firing after the pause lifts would escalate as a
+    "second firing" while no attempt was ever made — the escalation path would
+    fire having never tried anything.
+    """
+    spec = index.ALARM_ACTIONS[PROBE_ERRORS]
+    monkeypatch.setattr(index, "_paused_trigger_names",
+                        lambda: set(spec["triggers"]))
+    index.handler(_sns(PROBE_ERRORS), None)
+    assert wired["s3"].puts == [], "a paused component must not claim a window"
+
+    monkeypatch.setattr(index, "_paused_trigger_names", lambda: set())
+    out = index.handler(_sns(PROBE_ERRORS), None)
+    assert len(wired["lambda"].invocations) == 1
+    assert not out["outcome"].get("escalated"), (
+        "the first real attempt must not be treated as a retry"
+    )
+
+
+def test_an_unreadable_manifest_reports_unknown_rather_than_not_paused(
+        monkeypatch, capsys):
+    """UNKNOWN is not "nothing is paused", but it must not stop the backstop.
+
+    A backstop that silently declines to act because it could not read a file is
+    the failure mode this Lambda exists to survive, so `_pause_verdict` returns
+    no skip and the read failure is printed. Deliberately does NOT use the
+    `wired` fixture, which stubs the function under test.
+    """
+    monkeypatch.setattr(index, "PAUSE_MANIFEST", Path("/nonexistent/pause.json"))
+    assert index._paused_trigger_names() is None
+    assert "pause manifest unreadable" in capsys.readouterr().out
+    assert index._pause_verdict(index.ALARM_ACTIONS[PROBE_ERRORS]) is None
+
+
+# ── The dispatch-flag block reports state whose value agrees with its label ──
+
+
+def test_dispatch_flags_never_render_a_bare_boolean(wired):
+    """`router: true` under a heading reading "kill switches" says the opposite
+    of what it means — every variable in DISPATCH_FLAGS is an *_ENABLED flag.
+    Read as "the router is stopped", it cost a P1 filed against the wrong
+    component on 2026-08-14 (alpha-engine-config-I7330).
+    """
+    out = index.handler(_sns(INTAKE_AGE), None)
+    page = wired["pages"][-1]
+    assert "kill switches:" not in page
+    assert "dispatch flags:" in page
+    for label, value in out["evidence"]["dispatch"].items():
+        assert value.split(" ")[0] in ("ENABLED", "STOPPED", "UNREADABLE:"), (
+            f"{label}: {value!r} must lead with the semantic state"
+        )
+        assert f"    {label}: true" not in page
+        assert f"    {label}: false" not in page
+
+
+def test_dispatch_flag_polarity_matches_the_variable_value(wired, monkeypatch):
+    cases = [({"OVERSEER_DISPATCH_ENABLED": "true"}, "ENABLED"),
+             ({"OVERSEER_DISPATCH_ENABLED": "false"}, "STOPPED"),
+             ({}, "ENABLED")]  # unset defaults to enabled
+    for variables, expected in cases:
+        monkeypatch.setattr(
+            wired["lambda"], "get_function_configuration",
+            lambda FunctionName, v=variables: {"Environment": {"Variables": v}},
+        )
+        assert index._dispatch_state()["router"].startswith(expected), (
+            f"{variables} should render as {expected}"
+        )
 
 
 # ── Property 2: one attempt per window, then escalate ───────────────────────
@@ -299,8 +437,13 @@ def test_no_agent_bus_or_queue_dependency_in_the_source():
         f"responder — it must have no agent or bus dependency "
         f"(overseer-policy §4 inv. 3)"
     )
-    assert imported <= {"__future__", "json", "os", "urllib", "datetime", "boto3"}, (
-        f"unexpected import(s) {sorted(imported - {'__future__', 'json', 'os', 'urllib', 'datetime', 'boto3'})} "
+    # One list, referenced twice — the assertion and its message drifted apart
+    # once already, and a message naming a stale set sends the reader looking
+    # for an import that is not the one that failed.
+    allowed = {"__future__", "json", "os", "urllib", "datetime", "pathlib",
+               "boto3"}
+    assert imported <= allowed, (
+        f"unexpected import(s) {sorted(imported - allowed)} "
         f"— the backstop's dependency set is boto3 + stdlib, by design"
     )
 
