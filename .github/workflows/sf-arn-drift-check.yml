@@ -76,20 +76,6 @@ jobs:
           role-to-assume: arn:aws:iam::711398986525:role/github-actions-iam-drift-check
           aws-region: us-east-1
 
-      # Brian ruling 2026-08-07: all scheduled automation paused except the
-      # weekly/preopen/postclose SFs and the 24/7 box. This asserts the pause
-      # still holds — the opposite direction from every other check here, and
-      # the only surface that would notice a redeploy quietly switching a
-      # paused trigger back on. Runs unconditionally on every trigger this
-      # workflow has: the invariant is about live AWS, and tests/
-      # test_automation_pause.py::test_ci_runs_the_pause_check pins that it
-      # carries no `if:` — the 2026-08-10 fix was to the workflow's TRIGGER
-      # set, never to this step's reachability.
-      # Read-only; needs nothing beyond the events:DescribeRule +
-      # scheduler:GetSchedule this role already holds.
-      - name: Scheduled-automation pause still holds (live)
-        run: python3 infrastructure/automation_pause.py --check
-
       # alpha-engine-config-I7174. A paused component's absence-alarm
       # (treat_missing_data: breaching) cannot tell "gated off by declaration"
       # from "upstream died" — nine watch-plane/liveness alarms fired
@@ -103,15 +89,33 @@ jobs:
       # disables or enables a trigger — enable-alarm-actions only resumes
       # paging, so it carries none of the risk that keeps automation_pause.py
       # from ever re-enabling a paused TRIGGER unattended.
-      # Needs cloudwatch:DescribeAlarms + EnableAlarmActions +
-      # DisableAlarmActions on this role — granted in a companion
-      # crucible-executor change (alpha-engine-config-I7188). AccessDenied
-      # here means that grant has not landed yet; `continue-on-error` is soft
-      # only until then — same form-3 pattern as the exercise-cadence step
-      # below. Remove continue-on-error in the PR that lands I7188.
+      #
+      # ORDER IS LOAD-BEARING (alpha-engine-config-I7023): repair, THEN verify.
+      # This step used to run AFTER `--check`, and `--check` has no
+      # continue-on-error — so on exactly the runs where drift existed, the
+      # check failed the job and this remediation was SKIPPED. The self-healing
+      # loop could only ever run when there was nothing to heal. Measured
+      # 2026-08-14 (run 31819251392): eleven `alarm-unexpectedly-enabled`
+      # findings, remediation never reached. Repair-then-verify also makes the
+      # verify meaningful: a `--check` failure now means remediation ran and did
+      # not hold, which is the escalation-worthy condition.
       - name: Paused-component alarm actions reconciled with the manifest (live)
         continue-on-error: true
         run: python3 infrastructure/automation_pause.py --enforce --alarms-only
+
+      # Brian ruling 2026-08-07: all scheduled automation paused except the
+      # weekly/preopen/postclose SFs and the 24/7 box. This asserts the pause
+      # still holds — the opposite direction from every other check here, and
+      # the only surface that would notice a redeploy quietly switching a
+      # paused trigger back on. Runs unconditionally on every trigger this
+      # workflow has: the invariant is about live AWS, and tests/
+      # test_automation_pause.py::test_ci_runs_the_pause_check pins that it
+      # carries no `if:` — the 2026-08-10 fix was to the workflow's TRIGGER
+      # set, never to this step's reachability.
+      # Read-only; needs nothing beyond the events:DescribeRule +
+      # scheduler:GetSchedule this role already holds.
+      - name: Scheduled-automation pause still holds (live)
+        run: python3 infrastructure/automation_pause.py --check
 
       # alpha-engine-config-I7056. The step above asks "is the pause intact".
       # This one asks the question nothing asked before it: for each of the
