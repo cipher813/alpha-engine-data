@@ -75,7 +75,11 @@ export HOME=/home/ec2-user
 export XDG_CACHE_HOME=/tmp
 export AWS_REGION=us-east-1
 export AWS_DEFAULT_REGION=us-east-1
-command -v python3.12 >/dev/null && PYTHON_BIN=python3.12 || PYTHON_BIN=python3
+if ! command -v python3.12 >/dev/null 2>&1; then
+    echo "ERROR: python3.12 not found on this spot — bootstrap_spot() installs and asserts it. Refusing to fall back to the AMI python3: requirements.txt is resolved against 3.12 and the wheels differ (alpha-engine-config-I7372)." >&2
+    exit 1
+fi
+PYTHON_BIN=python3.12
 export PYTHON_BIN
 ENV_EOF
 

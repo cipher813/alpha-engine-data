@@ -285,12 +285,25 @@ bootstrap_spot() {
   # hardcode exactly (it never read the outer $AWS_REGION); tests/
   # test_spot_bootstrap_invariants.py and its siblings assert the rendered
   # output stays byte-for-byte equivalent on the parts that must not drift.
+  #
+  # `--max-runtime-seconds` is a GAINED guarantee, not a restored one
+  # (alpha-engine-config-I7372): neither this function nor the heredoc it
+  # replaced ever armed a hard-timeout timer — the pre-cutover copy installed
+  # the `ec2-spot-watchdog` unit only, and MAX_RUNTIME_SECONDS was purely the
+  # SSM command budget plus the `--per-attempt-seconds` input to
+  # relaunch-decision. The unit answers "the SSM agent died"; the timer
+  # answers "the workload itself hung", and only the retired
+  # spot_data_weekly.sh monolith carried the second one. krepis-PR152 was
+  # unmerged when #1388 was written, so the argument did not exist then.
+  # spot_launch() hard-exits when MAX_RUNTIME_SECONDS is empty and always runs
+  # before this function, so the value here is guaranteed non-empty.
   local _script
   _script="$("$LIB_PYTHON" -m krepis.spot_bootstrap render \
     --repo-url https://github.com/nousergon/nousergon-data.git \
     --checkout /home/ec2-user/data \
     --branch "${BRANCH:-main}" \
     --region us-east-1 \
+    --max-runtime-seconds "$MAX_RUNTIME_SECONDS" \
     --export "S3_STAGING=${_S3_STAGING}" \
     --config-copy config.yaml:/home/ec2-user/alpha-engine-config/data/config.yaml:/home/ec2-user/alpha-engine-config)"
   run_ssm "bootstrap" "$_script" 300
@@ -300,51 +313,26 @@ bootstrap_spot() {
 # ── Dependency installation ──────────────────────────────────────────────────
 
 install_deps() {
-  # config-I6949 / config-I6963, ported from crucible-predictor per
-  # alpha-engine-config-I6922: this step used to pipe pip through `tail -1`,
-  # so a run that exited 0 having silently skipped an extra was
-  # indistinguishable from a clean one — and pip reports a dropped extra as a
-  # WARNING on a SUCCESSFUL exit, which is precisely the line `tail -1` could
-  # not keep. The fleet copy is krepis.spot_bootstrap.render_install_deps;
-  # keep the three in step (tests/test_spot_bootstrap_invariants.py).
+  # Rendered by krepis.spot_bootstrap.render_install_deps (alpha-engine-config-
+  # I7372) rather than carried as a heredoc. #1388 collapsed the BOOTSTRAP onto
+  # the shared renderer and left this heredoc standing, and this is the step
+  # where the interpreter actually matters: it carried
+  #
+  #     command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+  #
+  # so a box that failed to install 3.12 resolved requirements.txt against the
+  # AMI's python3 — different wheels, silently. The renderer's copy has no
+  # fallback at all (render_bootstrap has already asserted the interpreter),
+  # and is otherwise the same script this heredoc had converged on: keep the
+  # pip log, fail on a dropped extra, report `pip check` non-fatally.
+  # config-I6949 / config-I6963 are the failures those three lines encode.
   echo "==> Installing python deps..."
-  run_ssm "deps" "$(cat <<'DEPS'
-set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
-cd /home/ec2-user/data
-command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
-_pip_log=/tmp/pip-install-deps.log
-if ! $PY -m pip install --no-warn-script-location -r requirements.txt > "$_pip_log" 2>&1; then
-  echo "ERROR: pip install -r requirements.txt failed" >&2
-  tail -80 "$_pip_log" >&2
-  exit 1
-fi
-grep -E "^Successfully installed" "$_pip_log" || true
-# A dropped extra is a BROKEN ENVIRONMENT, not a note. pip reports it as a
-# WARNING on a SUCCESSFUL exit, so nothing downstream fails until an import
-# does — in another process, minutes later, with the install log long gone.
-# That is exactly how config#6963 reached production in the predictor: the
-# training smoke died on `ModuleNotFoundError: No module named 'flow_doctor'`
-# out of krepis.logging.setup_logging, from an install pip had called a
-# success. This repo's requirements.txt requests four extras on one line
-# (nousergon-lib[arcticdb,flow-doctor,rag,contracts]), and AL2023 ships pip
-# 23.2.1, which predates PEP 685 extras normalisation (measured boundary:
-# 23.2.1 drops, 23.3.2 honours) — so this bootstrap sits on the broken side
-# by default and cannot rely on the resolver to be strict. Fail here, where
-# the log is still in hand and the cause is one line.
-if grep -E "^WARNING: .*does not provide the extra" "$_pip_log" >&2; then
-  echo "ERROR: pip dropped a requested extra (above) — the environment is incomplete." >&2
-  echo "       Extras must be HYPHENATED; pip <23.3 does not normalise '_' to '-'." >&2
-  exit 1
-fi
-# Non-fatal on purpose: an inconsistent environment is reported, not raised.
-# (a) The failure mode left unraised is a pre-existing AMI-baked conflict
-# unrelated to this checkout, which would otherwise fail every stage on every
-# run. (b) It is recorded on stdout of this SSM step, captured with the rest
-# of the deps output.
-$PY -m pip check || echo "WARNING: pip check reports an inconsistent environment (above)"
-DEPS
-)" 600
+  local _script
+  _script="$("$LIB_PYTHON" -m krepis.spot_bootstrap render-deps \
+    --repo-url https://github.com/nousergon/nousergon-data.git \
+    --checkout /home/ec2-user/data \
+    --region us-east-1)"
+  run_ssm "deps" "$_script" 600
   echo "  Deps installed."
 }
 

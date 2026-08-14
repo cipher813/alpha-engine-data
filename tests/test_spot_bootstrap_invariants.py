@@ -97,6 +97,10 @@ def render_args(bootstrap_block: str) -> list[str]:
     return shlex.split(joined)
 
 
+#: Stands in for the runtime ``$MAX_RUNTIME_SECONDS`` the launcher passes.
+_PLACEHOLDER_RUNTIME_SECONDS = 5400
+
+
 def _flag_value(args: list[str], flag: str) -> str:
     assert flag in args, f"{flag} missing from the krepis.spot_bootstrap render call"
     return args[args.index(flag) + 1]
@@ -108,10 +112,11 @@ def rendered(render_args: list[str]) -> str:
     ``bootstrap_spot()`` would — same repo, checkout, config-copy shape.
 
     ``--branch`` is ``${BRANCH:-main}`` in the shell (a runtime shell
-    expansion, asserted separately below) and ``--export`` embeds the runtime
-    ``$_S3_STAGING`` value — neither is a literal this test can read without a
-    shell, so both are substituted with a placeholder here. Neither affects
-    the watchdog or interpreter blocks this test asserts against.
+    expansion, asserted separately below), ``--export`` embeds the runtime
+    ``$_S3_STAGING`` value and ``--max-runtime-seconds`` the runtime
+    ``$MAX_RUNTIME_SECONDS`` — none is a literal this test can read without a
+    shell, so each is substituted with a placeholder here. None affects the
+    watchdog or interpreter blocks this test asserts against.
     """
     config_copy_raw = _flag_value(render_args, "--config-copy")
     parts = config_copy_raw.split(":")
@@ -123,6 +128,11 @@ def rendered(render_args: list[str]) -> str:
         branch="main",
         config_copies=(ConfigCopy(source_name=parts[0], dest=parts[1], chown=parts[2]),),
         exports={"S3_STAGING": "s3://placeholder/staging"},
+        max_runtime_seconds=(
+            _PLACEHOLDER_RUNTIME_SECONDS
+            if "--max-runtime-seconds" in render_args
+            else None
+        ),
     )
     return render_bootstrap(spec)
 
@@ -201,6 +211,43 @@ def test_region_is_the_pre_cutover_literal(render_args: list[str]):
     $AWS_REGION happens to resolve to at call time.
     """
     assert _flag_value(render_args, "--region") == "us-east-1"
+
+
+def test_the_hard_runtime_cap_is_armed(render_args: list[str], bootstrap_block: str):
+    """A GAINED guarantee, and the one most easily un-shipped in silence.
+
+    Neither this function nor the heredoc it replaced ever armed a hard-timeout
+    timer: the pre-cutover copy installed the ``ec2-spot-watchdog`` unit only,
+    and ``MAX_RUNTIME_SECONDS`` was the SSM command budget plus an input to
+    ``relaunch-decision``. Only the retired ``spot_data_weekly.sh`` monolith
+    carried the timer — the inverse fork. The unit answers "the SSM agent died
+    and nothing can ever reach this box again"; the timer answers "the workload
+    itself hung". They are separate guarantees, always rendered together, and a
+    launcher carrying one is uncovered against the other's failure mode.
+
+    Asserted on the ARGUMENT, because the shell value is a runtime expansion:
+    dropping the flag is a one-character edit that changes no rendered output
+    this test could otherwise see (alpha-engine-config-I7372).
+    """
+    assert re.search(
+        r'--max-runtime-seconds\s+"\$MAX_RUNTIME_SECONDS"', bootstrap_block
+    ), (
+        'bootstrap_spot() must pass --max-runtime-seconds "$MAX_RUNTIME_SECONDS" — '
+        "spot_launch() has already hard-exited if it is empty, so the value is "
+        "guaranteed non-empty here"
+    )
+
+
+def test_the_hard_timeout_timer_refuses_to_start_an_uncapped_workload(rendered: str):
+    """Arming it is FATAL if it fails — an uncapped hung spot bills until
+    somebody notices, and "the cap could not be armed" is exactly the condition
+    under which the run must not start."""
+    m = re.search(r"systemd-run --on-active=(\d+)[^\n]*\n(.*?)\n\}", rendered, re.S)
+    assert m, "no systemd-run hard-timeout timer in the rendered bootstrap"
+    assert int(m.group(1)) == _PLACEHOLDER_RUNTIME_SECONDS
+    assert "exit 1" in m.group(2), (
+        "a hard-timeout timer that could not be armed must abort the bootstrap"
+    )
 
 
 # ── The watchdog unit (asserted against the RENDERED output) ────────────────
