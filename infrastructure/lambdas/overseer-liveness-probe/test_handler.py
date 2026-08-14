@@ -1259,7 +1259,10 @@ def test_handler_old_format_state_treated_as_first_run():
     # dicts, so the stub must too — a raw string here would test a shape
     # production cannot produce.
     with patch("index._run_checks",
-               return_value=([index._finding("test", "rule 'r' does NOT EXIST")], {}, 1, 0)), \
+               return_value=([index._finding("test", "rule 'r' does NOT EXIST")], {}, 1, 0,
+                             # 5th value: the I4482 reconciliation block.
+                             {"playbooks_declared": 0, "schedule_checks_declared": 0,
+                              "alarm_coverage_declared": 0})), \
          patch("index._s3_client", return_value=s3), \
          patch("index.notify_via_flow_doctor", notify):
         result = index.handler({}, None)
@@ -1592,7 +1595,11 @@ def test_page_inlines_detail_when_the_report_write_fails():
     s3.get_object.side_effect = FakeClientError("NoSuchKey")
     s3.put_object.side_effect = [FakeClientError("AccessDenied"), None]
     notify = MagicMock(return_value=True)
-    with patch("index._run_checks", return_value=([finding], {}, 25, 0)), \
+    with patch("index._run_checks", return_value=(
+            [finding], {}, 25, 0,
+            # 5th value: the I4482 reconciliation block.
+            {"playbooks_declared": 0, "schedule_checks_declared": 0,
+             "alarm_coverage_declared": 0})), \
          patch("index._s3_client", return_value=s3), \
          patch("index.notify_via_flow_doctor", notify):
         index.handler({}, None)
