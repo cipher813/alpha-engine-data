@@ -44,6 +44,14 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# alpha-engine-config-I7338: this source was MISSING while the script called
+# apply_iam_policy at the #4472 auto-apply site below, so that call failed
+# with `command not found` on every run — privileged or not — and the old
+# `|| echo "WARN: ... expected in CI"` reported it as a permission boundary.
+# shellcheck source=infrastructure/lambdas/_shared/apply_iam_policy.sh
+source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
+
 FUNCTION_NAME="alpha-engine-alert-drain-liveness-probe"
 ROLE_NAME="alpha-engine-alert-drain-liveness-probe-role"
 POLICY_NAME="alpha-engine-alert-drain-liveness-probe-policy"
@@ -185,8 +193,11 @@ echo "✓ Code deployed."
 # step. Gracefully fails when the caller lacks iam:PutRolePolicy (CI auto-
 # deploy role); the drift check backstops any missed apply.
 TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
-apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}" \
-  || echo "WARN: IAM auto-apply failed (expected in CI — role lacks iam:PutRolePolicy)"
+# No `||` here on purpose (alpha-engine-config-I7338): the ONE tolerated
+# failure — this caller lacks iam:PutRolePolicy — is classified inside
+# _shared/apply_iam_policy.sh. Every other cause, including this helper not
+# being sourced at all, aborts the deploy under `set -e`.
+apply_iam_policy_on_deploy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
 
 echo "Updating Lambda environment (flow-doctor SSM hydration)..."
 run aws lambda update-function-configuration \
