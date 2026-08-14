@@ -32,6 +32,8 @@ from infrastructure.preflight_sweep_stages import (
     load_manifest,
     manifest_disagreement,
     map_binding_disagreement,
+    upstream_dependencies,
+    upstream_dependency_disagreement,
 )
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -304,3 +306,67 @@ def test_a_stage_whose_command_cannot_be_rendered_is_unsweepable(definition, bin
     stages = derive_stages(mutated, bindings, CONTEXT, checkout_root="/nonexistent")
     assert stages[0].classification is UNSWEEPABLE
     assert "could not be rendered" in stages[0].reason
+
+
+# ── Declared same-day upstream dependencies (alpha-engine-config#7323) ───────
+# The classification of a stage whose preflight fails only because its upstream
+# has not run today is DECLARED here and nowhere else. If it were inferred from
+# the launcher's stderr, rewording an error message would silently turn a real
+# failure into a "could not measure".
+
+
+def test_the_declared_upstream_dependencies_and_the_definition_agree_today(
+    stages, manifest
+):
+    assert upstream_dependency_disagreement(stages, manifest) == []
+
+
+def test_the_backtest_chain_is_declared_with_its_prefix_and_its_producer(manifest):
+    declared = upstream_dependencies(manifest)
+    assert set(declared) == {"PredictorBacktest", "PortfolioOptimizerBacktest"}
+    assert declared["PredictorBacktest"]["produced_by"] == "Backtester"
+    assert declared["PortfolioOptimizerBacktest"]["produced_by"] == "PredictorBacktest"
+    for entry in declared.values():
+        assert entry["prefix"] == "backtest/{run_date}/"
+        # The non-inferable gotcha, declared rather than buried in code: the
+        # prefix EXISTS on a day nothing produced it, because the sweep's own
+        # phase markers are written under it.
+        assert ".phases/" in entry["ignore_subprefixes"]
+
+
+def test_a_declaration_for_a_stage_the_definition_lost_is_a_finding(stages):
+    stale = {"upstream_artifact_dependencies": [
+        {"stage": "StageThatWasRenamed", "produced_by": "Backtester",
+         "prefix": "backtest/{run_date}/", "reason": "r"}
+    ]}
+    findings = upstream_dependency_disagreement(stages, stale)
+    assert findings and "does not contain" in findings[0]
+
+
+def test_a_declaration_naming_a_producer_that_does_not_exist_is_a_finding(stages):
+    bad = {"upstream_artifact_dependencies": [
+        {"stage": "PredictorBacktest", "produced_by": "NoSuchStage",
+         "prefix": "backtest/{run_date}/", "reason": "r"}
+    ]}
+    findings = upstream_dependency_disagreement(stages, bad)
+    assert findings and "not a stage in the definition" in findings[0]
+
+
+def test_a_declaration_for_a_stage_with_no_dry_path_at_all_is_a_finding(stages):
+    no_dry = next(s for s in stages if s.classification is NO_DRY_PATH)
+    bad = {"upstream_artifact_dependencies": [
+        {"stage": no_dry.name, "produced_by": "Backtester",
+         "prefix": "backtest/{run_date}/", "reason": "r"}
+    ]}
+    findings = upstream_dependency_disagreement(stages, bad)
+    assert findings and "can never apply" in findings[0]
+
+
+def test_a_malformed_declaration_is_dropped_and_reported_never_half_applied(stages):
+    """A declaration the sweep cannot act on must not arm a reclassification."""
+    bad = {"upstream_artifact_dependencies": [
+        {"stage": "PredictorBacktest", "produced_by": "Backtester", "reason": "r"}
+    ]}
+    assert upstream_dependencies(bad) == {}
+    findings = upstream_dependency_disagreement(stages, bad)
+    assert findings and "missing prefix" in findings[0]

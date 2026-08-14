@@ -28,6 +28,7 @@ from infrastructure.preflight_sweep_console import (
     stage_check_id,
     stage_envelope,
 )
+from infrastructure.preflight_sweep import update_streaks
 from infrastructure.preflight_sweep_stages import Stage
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -37,13 +38,22 @@ CADENCE_PATH = REPO / "infrastructure" / "preflight_sweep_cadence.json"
 
 
 class FakeAws:
-    def __init__(self):
+    def __init__(self, listing: dict[str, list[dict]] | None = None):
         self.objects: dict[str, dict] = {}
         self.metrics: list[tuple[str, float]] = []
         self.notifications: list[tuple[str, str]] = []
+        self.listing = listing or {}
+        self.list_calls: list[str] = []
 
     def put_json(self, key, payload):
         self.objects[key] = payload
+
+    def get_json(self, key):
+        return self.objects.get(key)
+
+    def list_objects(self, prefix, max_keys=1000):
+        self.list_calls.append(prefix)
+        return self.listing.get(prefix, [])
 
     def put_text(self, key, body):
         self.objects[key] = body
@@ -238,7 +248,408 @@ def test_the_live_definition_derives_a_non_empty_stage_set(tmp_path):
     """Guards against the sweep silently grading an empty pipeline."""
     report = ps.sweep(SF_PATH, MANIFEST_PATH, "/nonexistent", "t")
     assert report.stages_declared > 0
+    # No BLOCKING finding: the acknowledged no-dry-path stages are findings by
+    # design now (they must be named), and they must not fail the run.
+    assert [f for f in report.coverage_findings if ps._is_blocking(f)] == []
+
+
+# ── I7323: an unmet same-day upstream is UNSWEEPABLE, never FAILED ───────────
+
+DECL = {
+    "stage": "PredictorBacktest",
+    "produced_by": "Backtester",
+    "prefix": "backtest/{run_date}/",
+    "ignore_subprefixes": [".phases/"],
+    "reason": "declared",
+}
+BINDINGS = {"run_date": "2026-08-14"}
+
+
+def _failed(stage="PredictorBacktest"):
+    return ps.StageResult(stage=stage, verdict=ps.FAILED, returncode=1,
+                          reason="preflight exited rc=1")
+
+
+def test_a_failure_on_an_absent_declared_upstream_is_unsweepable_not_failed():
+    result = ps.classify_upstream(_failed(), DECL, BINDINGS, lambda _p: [])
+    assert result.verdict == ps.UNSWEEPABLE_VERDICT
+    assert result.unsweepable_kind == ps.UNSWEEPABLE_UPSTREAM_PENDING
+    # The reason must name BOTH the unmet prefix and its producing stage —
+    # otherwise the operator gets a verdict with nothing to act on.
+    assert "backtest/2026-08-14/" in result.reason
+    assert "Backtester" in result.reason
+
+
+def test_the_prefix_gotcha_a_prefix_holding_only_sweep_markers_is_not_content():
+    """NON-INFERABLE: backtest/<date>/ EXISTS on a day nothing produced it,
+    because the sweep's own .phases/ markers live under it. A probe testing
+    prefix EXISTENCE would read as satisfied and measure nothing at all."""
+    listing = [
+        {"Key": "backtest/2026-08-14/.phases/preflight.json", "Size": 235},
+        {"Key": "backtest/2026-08-14/.phases/runtime_smoke.json", "Size": 239},
+    ]
+    present, detail = ps.upstream_content(
+        "backtest/2026-08-14/", [".phases/"], lambda _p: listing
+    )
+    assert present is False
+    assert detail["content_keys"] == 0 and detail["ignored_keys"] == 2
+
+    result = ps.classify_upstream(_failed(), DECL, BINDINGS, lambda _p: listing)
+    assert result.verdict == ps.UNSWEEPABLE_VERDICT
+
+
+def test_a_zero_byte_key_is_not_upstream_content():
+    present, _ = ps.upstream_content(
+        "backtest/2026-08-14/",
+        [".phases/"],
+        lambda _p: [{"Key": "backtest/2026-08-14/_SUCCESS", "Size": 0}],
+    )
+    assert present is False
+
+
+def test_a_real_failure_stays_failed_when_its_declared_upstream_is_populated():
+    """The regression this whole mechanism must not introduce: a declaration
+    that swallows genuine defects. The declaration only ARMS the check; the
+    prefix is still probed on the day."""
+    listing = [
+        {"Key": "backtest/2026-08-14/.phases/preflight.json", "Size": 235},
+        {"Key": "backtest/2026-08-14/results/portfolio.parquet", "Size": 91234},
+    ]
+    result = ps.classify_upstream(_failed(), DECL, BINDINGS, lambda _p: listing)
+    assert result.verdict == ps.FAILED
+    assert "REAL failure" in result.reason
+
+
+def test_a_reworded_launcher_error_cannot_reclassify_anything():
+    """The classification is DECLARED per stage, never inferred from stderr.
+    A stage with no declaration keeps its failure however its error reads."""
+    result = _failed(stage="DataPhase1")
+    result.last_stderr_line = (
+        "ERROR: s3://alpha-engine-research/backtest/2026-08-14/ is empty or unreachable."
+    )
+    # sweep() only consults upstream_dependencies(manifest); DataPhase1 is not
+    # in it, so classify_upstream is never reached for that stage.
+    manifest = json.loads(MANIFEST_PATH.read_text())
+    from infrastructure.preflight_sweep_stages import upstream_dependencies
+
+    assert "DataPhase1" not in upstream_dependencies(manifest)
+    assert result.verdict == ps.FAILED
+
+
+def test_an_unprobeable_upstream_is_unmeasured_not_a_guess_in_either_direction():
+    def boom(_prefix):
+        raise RuntimeError("AccessDenied")
+
+    result = ps.classify_upstream(_failed(), DECL, BINDINGS, boom)
+    assert result.verdict == ps.UNMEASURED
+    assert result.verdict not in (ps.FAILED, ps.UNSWEEPABLE_VERDICT)
+    assert "AccessDenied" in result.reason
+
+
+def test_an_upstream_pending_stage_does_not_count_toward_failures_or_page():
+    report = ps.SweepReport(
+        component_id=ps.COMPONENT_ID, run_id="t", started_at="now",
+        outcome=ps.OUTCOME_DEGRADED, measured=True, stages_declared=2,
+        stages_failed=0, stages_unsweepable=1,
+        stages_unsweepable_upstream_pending=1, stages_unsweepable_coverage_defect=0,
+        results=[
+            {"stage": "Backtester", "verdict": ps.PASSED},
+            {"stage": "PredictorBacktest", "verdict": ps.UNSWEEPABLE_VERDICT,
+             "unsweepable_kind": ps.UNSWEEPABLE_UPSTREAM_PENDING,
+             "reason": "NOT MEASURABLE TODAY — backtest/2026-08-14/"},
+        ],
+    )
+    aws = FakeAws()
+    ps.emit(report, aws, "arn:sns")
+    assert ("PreflightSweepStagesFailed", 0) in aws.metrics
+    assert ("PreflightSweepStagesUnsweepableUpstreamPending", 1) in aws.metrics
+    assert ("PreflightSweepStagesUnsweepableCoverageDefect", 0) in aws.metrics
+    subject, _ = ps.render_notification(report)
+    assert "failed" not in subject.split("—")[0].lower() or "no failures" in subject
+    # And it never advances the clean-run pointer: nothing failed, but the
+    # sweep did not cover everything it declares.
+    assert f"{ps.REPORT_PREFIX}/last_clean.json" not in aws.objects
+
+
+def test_a_coverage_defect_unsweepable_still_fails_the_run(tmp_path):
+    """The loud kind must stay loud: /nonexistent has no launchers at all."""
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, "/nonexistent", "t")
+    assert report.stages_unsweepable_coverage_defect > 0
+    assert report.outcome == ps.OUTCOME_FAILED
+
+
+# ── I7323 (3): unsweepable forever is its own finding, not coverage ──────────
+
+
+def _unsweepable(stage="PredictorBacktest"):
+    return ps.StageResult(
+        stage=stage, verdict=ps.UNSWEEPABLE_VERDICT,
+        unsweepable_kind=ps.UNSWEEPABLE_UPSTREAM_PENDING, reason="upstream absent",
+    )
+
+
+def test_a_streak_below_the_threshold_is_not_yet_a_finding():
+    state, findings = update_streaks(None, [_unsweepable()], "r1", "now", 8)
+    assert state["streaks"]["PredictorBacktest"]["consecutive_runs"] == 1
+    assert findings == []
+
+
+def test_unsweepable_on_every_run_past_the_threshold_becomes_its_own_finding():
+    prior = {"streaks": {"PredictorBacktest": {"consecutive_runs": 7, "since": "d0"}}}
+    _state, findings = update_streaks(prior, [_unsweepable()], "r8", "now", 8)
+    assert len(findings) == 1
+    assert findings[0]["stage"] == "PredictorBacktest"
+    assert findings[0]["consecutive_runs"] == 8
+    assert "measured NOTHING" in findings[0]["finding"]
+
+
+def test_a_stage_that_became_measurable_has_its_streak_dropped():
+    prior = {"streaks": {"PredictorBacktest": {"consecutive_runs": 7, "since": "d0"}}}
+    passed = ps.StageResult(stage="PredictorBacktest", verdict=ps.PASSED)
+    state, findings = update_streaks(prior, [passed], "r8", "now", 8)
+    assert "PredictorBacktest" not in state["streaks"]
+    assert findings == []
+
+
+def test_the_persistent_finding_is_emitted_separately_from_coverage_findings():
+    """It must not read as coverage: a stage nothing has measured for a week is
+    the opposite of a covered stage."""
+    report = ps.SweepReport(
+        component_id=ps.COMPONENT_ID, run_id="t", started_at="now",
+        outcome=ps.OUTCOME_FAILED, measured=True, stages_declared=1,
+        persistent_unsweepable_findings=[
+            {"stage": "PredictorBacktest", "consecutive_runs": 9, "threshold_runs": 8,
+             "since": "d0", "finding": "PredictorBacktest measured NOTHING for 9 runs"}
+        ],
+        results=[{"stage": "PredictorBacktest", "verdict": ps.UNSWEEPABLE_VERDICT,
+                  "unsweepable_kind": ps.UNSWEEPABLE_UPSTREAM_PENDING}],
+    )
     assert report.coverage_findings == []
+    _subject, message = ps.render_notification(report)
+    assert "PERSISTENTLY UNSWEEPABLE" in message
+    aws = FakeAws()
+    ps.emit(report, aws, "arn:sns")
+    assert ("PreflightSweepPersistentUnsweepable", 1) in aws.metrics
+
+
+def test_the_streak_threshold_is_declared_in_days_and_derived_against_cadence():
+    manifest = json.loads(MANIFEST_PATH.read_text())
+    cadence = load_cadence(CADENCE_PATH)
+    assert manifest["unsweepable_streak_threshold_days"] > 7, (
+        "a threshold of 7 or less fires on the ordinary weekday state of the "
+        "backtest chain and would page every week"
+    )
+    assert ps.streak_threshold_runs(manifest, cadence) == (
+        manifest["unsweepable_streak_threshold_days"]
+    ), "daily cadence means one run per day"
+
+
+def test_an_unreadable_streak_history_is_named_never_treated_as_no_history(tmp_path):
+    """Silently resetting to zero would make the finding unable to fire — the
+    exact bug class of a detector that cannot report."""
+
+    class Broken(FakeAws):
+        def get_json(self, key):
+            raise RuntimeError("AccessDenied")
+
+    aws = Broken()
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, "/nonexistent", "t", aws=aws)
+    assert "unavailable" in report.unsweepable_streak_state
+    assert "AccessDenied" in report.unsweepable_streak_state
+    assert f"{ps.REPORT_PREFIX}/{ps.STREAK_STATE_KEY_SUFFIX}" not in aws.objects
+
+
+# ── I7324: every declared stage carries a verdict, named on every surface ────
+
+
+def test_every_declared_stage_carries_a_verdict_row():
+    """THE missing assertion that is I7324's root cause: 19 declared, 16 rows,
+    and which 3 were missing was unrecoverable from the report."""
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, "/nonexistent", "t")
+    assert len(report.results) == report.stages_declared
+    assert {r["stage"] for r in report.results} == {
+        s["stage"] for s in report.declared_stages
+    }
+
+
+def test_the_declared_stage_list_is_serialised_so_declared_minus_swept_is_auditable():
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, "/nonexistent", "t")
+    assert len(report.declared_stages) == report.stages_declared
+    assert all({"stage", "classification"} <= set(s) for s in report.declared_stages)
+
+
+def test_a_no_dry_path_stage_gets_its_own_verdict_row_with_repo_and_launcher():
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, "/nonexistent", "t")
+    rows = [r for r in report.results if r["verdict"] == ps.NO_DRY_PATH_VERDICT]
+    assert len(rows) == report.stages_no_dry_path > 0
+    for row in rows:
+        assert row["reason"], "a row with no reason is a count with extra steps"
+        assert row["acknowledged_reason"], (
+            "the manifest's written acknowledgement must reach the report — an "
+            "operator must not have to open the repo to learn why"
+        )
+        assert set(row) >= {"stage", "repo", "launcher", "reason"}
+
+
+def test_coverage_findings_are_non_empty_whenever_a_stage_has_no_dry_path():
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, "/nonexistent", "t")
+    assert report.stages_no_dry_path > 0
+    named = {f.get("stage") for f in report.coverage_findings
+             if f.get("kind") == ps.FINDING_NO_DRY_PATH}
+    assert named == {
+        r["stage"] for r in report.results if r["verdict"] == ps.NO_DRY_PATH_VERDICT
+    }
+
+
+def test_an_acknowledged_no_dry_path_gap_is_named_but_does_not_fail_the_run():
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, "/nonexistent", "t")
+    gaps = [f for f in report.coverage_findings
+            if f["kind"] == ps.FINDING_NO_DRY_PATH]
+    assert gaps and all(f["blocking"] is False for f in gaps)
+
+
+def test_the_notification_names_every_non_passed_category_not_only_failures():
+    report = ps.SweepReport(
+        component_id=ps.COMPONENT_ID, run_id="t", started_at="now",
+        outcome=ps.OUTCOME_DEGRADED, measured=True,
+        stages_declared=4, stages_passed=1, stages_no_dry_path=1,
+        stages_unsweepable=1, stages_unsweepable_upstream_pending=1,
+        stages_unmeasured=1,
+        coverage_findings=[
+            {"kind": ps.FINDING_NO_DRY_PATH, "stage": "SaturdayHealthCheck",
+             "blocking": False, "finding": "SaturdayHealthCheck has NO dry path"},
+        ],
+        results=[
+            {"stage": "DataPhase1", "verdict": ps.PASSED},
+            {"stage": "SaturdayHealthCheck", "verdict": ps.NO_DRY_PATH_VERDICT,
+             "reason": "threads no $.preflight_args",
+             "acknowledged_reason": "consumer, not a precondition"},
+            {"stage": "PredictorBacktest", "verdict": ps.UNSWEEPABLE_VERDICT,
+             "unsweepable_kind": ps.UNSWEEPABLE_UPSTREAM_PENDING,
+             "reason": "NOT MEASURABLE TODAY"},
+            {"stage": "EvaluatorOptimize", "verdict": ps.UNMEASURED,
+             "reason": "worker died"},
+        ],
+    )
+    subject, message = ps.render_notification(report)
+    # Every non-passed stage is named in the BODY.
+    for stage in ("SaturdayHealthCheck", "PredictorBacktest", "EvaluatorOptimize"):
+        assert stage in message, stage
+    assert "NO DRY PATH" in message
+    assert "consumer, not a precondition" in message
+    # And the subject's denominator is not silently over a hidden category.
+    assert "no dry path" in subject or "no-dry-path" in subject
+    assert "4" in subject
+
+
+def test_a_missing_verdict_is_filled_in_as_not_attempted_and_fails_the_run():
+    """The invariant is self-healing AND loud: a hole in the sweep's own
+    coverage outranks anything the sweep found."""
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, "/nonexistent", "t")
+    assert len(report.results) == report.stages_declared
+    # Nothing should be missing today; the guard is that if it ever is, the
+    # run fails rather than under-reporting.
+    if report.stages_not_attempted:
+        assert report.outcome == ps.OUTCOME_FAILED
+
+
+# ── End to end, over the LIVE definition ─────────────────────────────────────
+
+
+def _fake_checkout(root: pathlib.Path) -> pathlib.Path:
+    """A checkout where every declared launcher exists and implements the flag,
+    so the live definition's stages classify SWEEPABLE and actually run."""
+    from infrastructure.preflight_sweep_stages import (
+        derive_shell_run_bindings,
+        derive_stages,
+        apply_map_bindings,
+        load_manifest,
+    )
+
+    definition = json.loads(SF_PATH.read_text())
+    manifest = load_manifest(MANIFEST_PATH)
+    bindings = apply_map_bindings(derive_shell_run_bindings(definition), manifest)
+    bindings.setdefault("run_date", "2026-08-14")
+    for stage in derive_stages(definition, bindings, {"Execution": {"Name": "t", "Id": "t"}}, "/x"):
+        if not (stage.box_dir and stage.launcher):
+            continue
+        path = root / stage.box_dir / stage.launcher
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/bash\n# --preflight-only\n")
+    return root
+
+
+def test_the_weekday_case_end_to_end_zero_failures_and_no_page(tmp_path):
+    """THE case that made the sweep's first run email '2 failed': the weekly SF
+    has not run today, so the backtest chain's upstream prefix holds only the
+    sweep's own phase markers."""
+    root = _fake_checkout(tmp_path)
+
+    def runner(argv, **_kwargs):
+        script = argv[-1]
+        rc = 1 if ("spot_predictor_backtest.sh" in script
+                   or "spot_portfolio_optimizer_backtest.sh" in script) else 0
+        return subprocess.CompletedProcess(
+            args=argv, returncode=rc, stdout="",
+            stderr=("ERROR: s3://alpha-engine-research/backtest/2026-08-14/ is empty "
+                    "or unreachable.\n" if rc else ""),
+        )
+
+    run_date = dt.date.today().isoformat()
+    aws = FakeAws(listing={f"backtest/{run_date}/": [
+        {"Key": f"backtest/{run_date}/.phases/preflight.json", "Size": 235},
+        {"Key": f"backtest/{run_date}/.phases/runtime_smoke.json", "Size": 239},
+    ]})
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", aws=aws, runner=runner)
+
+    assert report.stages_failed == 0
+    assert report.stages_unsweepable_upstream_pending == 2
+    assert report.stages_unsweepable_coverage_defect == 0
+    pending = {r["stage"] for r in report.results
+               if r.get("unsweepable_kind") == ps.UNSWEEPABLE_UPSTREAM_PENDING}
+    assert pending == {"PredictorBacktest", "PortfolioOptimizerBacktest"}
+    assert len(report.results) == report.stages_declared == 19
+    # It does not page and it does not claim a clean run.
+    assert report.outcome == ps.OUTCOME_DEGRADED
+    ps.emit(report, aws, "arn:sns")
+    assert ("PreflightSweepStagesFailed", 0) in aws.metrics
+    assert f"{ps.REPORT_PREFIX}/last_clean.json" not in aws.objects
+
+
+def test_a_genuinely_broken_backtest_stage_still_fails_when_upstream_is_present(tmp_path):
+    """The other half of the closes-when: the declaration must not become a
+    blanket excuse on the day the pipeline HAS run."""
+    root = _fake_checkout(tmp_path)
+
+    def runner(argv, **_kwargs):
+        rc = 1 if "spot_predictor_backtest.sh" in argv[-1] else 0
+        return subprocess.CompletedProcess(args=argv, returncode=rc, stdout="", stderr="")
+
+    run_date = dt.date.today().isoformat()
+    aws = FakeAws(listing={f"backtest/{run_date}/": [
+        {"Key": f"backtest/{run_date}/.phases/preflight.json", "Size": 235},
+        {"Key": f"backtest/{run_date}/results/backtest.parquet", "Size": 8123},
+    ]})
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", aws=aws, runner=runner)
+    failed = {r["stage"] for r in report.results if r["verdict"] == ps.FAILED}
+    assert "PredictorBacktest" in failed
+    assert report.outcome == ps.OUTCOME_FAILED
+
+
+def test_the_report_written_to_s3_carries_a_verdict_for_every_declared_stage(tmp_path):
+    root = _fake_checkout(tmp_path)
+    aws = FakeAws()
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", aws=aws,
+                      runner=_completed(0))
+    ps.emit(report, aws, "arn:sns")
+    written = aws.objects[f"{ps.REPORT_PREFIX}/latest.json"]
+    assert len(written["results"]) == written["stages_declared"]
+    assert written["declared_stages"]
+    # And a console row exists for the stages that have no dry path, so they
+    # are visible rather than absent from the surface entirely.
+    for stage in ("SaturdayHealthCheck", "WeeklySubstrateHealthCheck",
+                  "ResearchPredictorParallel.ResolveZooSpecs"):
+        assert f"ops/checks/{stage_check_id(stage)}/latest.json" in aws.objects
 
 
 # ── Console surface ──────────────────────────────────────────────────────────
@@ -285,6 +696,75 @@ def test_an_unsweepable_stage_is_an_error_because_it_is_unmonitored(cadence):
         {"stage": "DataPhase1", "verdict": "unsweepable"}, "r", "t", cadence
     )
     assert body["status"] == ENVELOPE_ERROR
+
+
+def test_an_upstream_pending_stage_renders_attention_not_error_and_not_green(cadence):
+    body = stage_envelope(
+        {"stage": "PredictorBacktest", "verdict": "unsweepable",
+         "unsweepable_kind": ps.UNSWEEPABLE_UPSTREAM_PENDING}, "r", "t", cadence
+    )
+    assert body["status"] == ENVELOPE_ATTENTION
+    assert body["status"] != ENVELOPE_OK
+
+
+def test_an_unrecognised_unsweepable_kind_keeps_the_loud_default(cadence):
+    body = stage_envelope(
+        {"stage": "X", "verdict": "unsweepable", "unsweepable_kind": "brand_new"},
+        "r", "t", cadence,
+    )
+    assert body["status"] == ENVELOPE_ERROR
+
+
+def test_a_no_dry_path_stage_renders_attention_never_green(cadence):
+    """It is not healthy — the sweep asserts nothing whatever about it. A row
+    reading `ok` would claim precondition-health nobody measured."""
+    body = stage_envelope(
+        {"stage": "SaturdayHealthCheck", "verdict": "no_dry_path",
+         "reason": "threads no $.preflight_args"}, "r", "t", cadence
+    )
+    assert body["status"] == ENVELOPE_ATTENTION
+    assert body["status"] != ENVELOPE_OK
+    assert "no declared envelope mapping" not in body["verdict"]
+
+
+def test_the_rollup_names_the_no_dry_path_stages_rather_than_counting_them(cadence):
+    report = {
+        "run_id": "r", "measured": True, "outcome": "degraded",
+        "stages_declared": 3, "stages_no_dry_path": 1, "stages_passed": 2,
+        "results": [
+            {"stage": "A", "verdict": ps.PASSED},
+            {"stage": "B", "verdict": ps.PASSED},
+            {"stage": "SaturdayHealthCheck", "verdict": "no_dry_path"},
+        ],
+    }
+    rollup = rollup_envelope(report, cadence, "t")
+    assert rollup["no_dry_path_stages"] == ["SaturdayHealthCheck"]
+    # The no-dry-path row must not cancel out the stage it represents.
+    assert rollup["stages_expected"] == 2 and rollup["stages_reported"] == 2
+    assert rollup["status"] == ENVELOPE_ATTENTION
+
+
+def test_an_acknowledged_coverage_gap_does_not_turn_the_rollup_red(cadence):
+    rollup = rollup_envelope(
+        {"run_id": "r", "measured": True, "stages_declared": 1, "stages_passed": 1,
+         "stages_no_dry_path": 0,
+         "coverage_findings": [{"kind": "no_dry_path", "blocking": False,
+                                "finding": "acknowledged"}],
+         "results": [{"stage": "A", "verdict": ps.PASSED}]},
+        cadence, "t",
+    )
+    assert rollup["status"] == ENVELOPE_OK
+    assert rollup["coverage_findings_blocking"] == 0
+
+
+def test_a_legacy_string_coverage_finding_is_still_treated_as_blocking(cadence):
+    rollup = rollup_envelope(
+        {"run_id": "r", "measured": True, "stages_declared": 1, "stages_passed": 1,
+         "coverage_findings": ["a stage lost its dry path"],
+         "results": [{"stage": "A", "verdict": ps.PASSED}]},
+        cadence, "t",
+    )
+    assert rollup["status"] == ENVELOPE_ERROR
 
 
 def test_a_verdict_with_no_declared_mapping_is_not_silently_green(cadence):

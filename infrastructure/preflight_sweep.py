@@ -29,10 +29,23 @@ as a pass:
                     NOT a pass and NOT a defect. The verdict vocabulary mirrors
                     ``validators/stage_output_sweep.py`` (I7167) deliberately
                     rather than inventing a parallel one.
-* ``unsweepable`` — the stage declares a dry path the sweep cannot exercise
-                    (launcher missing, flag unimplemented, command unrenderable).
-                    A coverage defect in its own right; fails the run.
-* ``not_attempted`` — the run ended before reaching this stage.
+* ``unsweepable`` — the stage could not be exercised. TWO kinds, kept apart
+                    because one is a defect and the other is Tuesday:
+                    ``coverage_defect`` (launcher missing, flag unimplemented,
+                    command unrenderable) fails the run and pages;
+                    ``upstream_pending`` (the stage reads a same-day artifact a
+                    preceding stage produces, and that stage has not run for
+                    real today) does neither. The second is DECLARED per stage
+                    in ``preflight_sweep_manifest.json`` and still probed on the
+                    day — a reworded launcher error cannot reclassify a real
+                    failure, and a declaration alone cannot hide one.
+* ``no_dry_path`` — the stage threads no ``$.preflight_args`` and is never
+                    exercised at all. A verdict ROW, not just a counter: a count
+                    published without its members is unactionable.
+* ``not_attempted`` — the run produced no verdict for a declared stage. The
+                    invariant ``len(results) == stages_declared`` holds on every
+                    report, and a stage that would have broken it is filled in
+                    here AND raised as a blocking coverage finding.
 
 A run that could not measure anything terminates ``failed`` with
 ``measured: false`` and a reason. It never writes the clean-run pointer.
@@ -71,15 +84,45 @@ from infrastructure.preflight_sweep_stages import (  # noqa: E402
     load_manifest,
     manifest_disagreement,
     map_binding_disagreement,
+    upstream_dependencies,
+    upstream_dependency_disagreement,
 )
-from infrastructure.preflight_sweep_console import envelopes, load_cadence  # noqa: E402
+from infrastructure.preflight_sweep_console import (  # noqa: E402
+    envelopes,
+    finding_text as _finding_text,
+    is_blocking_finding as _is_blocking,
+    load_cadence,
+)
 
 # ── Verdict vocabulary (closed; mirrors validators/stage_output_sweep.py) ────
 PASSED = "passed"
 FAILED = "failed"
 UNMEASURED = "unmeasured"
 UNSWEEPABLE_VERDICT = "unsweepable"
+NO_DRY_PATH_VERDICT = "no_dry_path"
 NOT_ATTEMPTED = "not_attempted"
+
+# ── Why a stage is unsweepable (closed; add by PR) ───────────────────────────
+# The distinction is load-bearing, not cosmetic. One of these is a defect in
+# the sweep's own coverage and MUST page; the other is the ordinary state of a
+# stage whose upstream has not run today and MUST NOT. Collapsing them is how
+# the first sweep run emailed "2 failed" on a structurally unmeasurable pair.
+UNSWEEPABLE_COVERAGE_DEFECT = "coverage_defect"
+UNSWEEPABLE_UPSTREAM_PENDING = "upstream_pending"
+
+# ── Coverage-finding kinds (closed; add by PR) ───────────────────────────────
+# Every finding carries its own `blocking` flag rather than deriving severity
+# from which list it landed in: an acknowledged no-dry-path stage is a real
+# coverage gap that must be NAMED on every surface, and is not a reason to fail
+# the run — an integer that only says how many is a count published without its
+# members (alpha-engine-config#7324).
+FINDING_MANIFEST_DISAGREEMENT = "manifest_disagreement"
+FINDING_MAP_BINDING_DISAGREEMENT = "map_binding_disagreement"
+FINDING_UPSTREAM_DECLARATION = "upstream_declaration"
+FINDING_NO_DRY_PATH = "no_dry_path"
+FINDING_MISSING_VERDICT = "missing_verdict"
+
+STREAK_STATE_KEY_SUFFIX = "unsweepable_streaks.json"
 
 # Run-level outcome, from observability-policy §3.1's closed vocabulary.
 OUTCOME_OK = "ok"
@@ -117,6 +160,15 @@ class StageResult:
     reason: str | None = None
     last_stderr_line: str | None = None
     log_key: str | None = None
+    # Set only when verdict == UNSWEEPABLE_VERDICT. Which of the two kinds it
+    # is decides whether the run fails and whether the console row is an error.
+    unsweepable_kind: str | None = None
+    # The declared upstream dependency that produced an `upstream_pending`
+    # verdict, echoed onto the row so the operator reads the unmet prefix and
+    # its producing stage without opening the manifest.
+    upstream: dict[str, Any] | None = None
+    # For a `no_dry_path` row: the written acknowledgement from the manifest.
+    acknowledged_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -139,8 +191,23 @@ class SweepReport:
     stages_failed: int = 0
     stages_unmeasured: int = 0
     stages_unsweepable: int = 0
+    # The two kinds of unsweepable, published separately and both at zero:
+    # a coverage defect fails the run, an unmet same-day upstream does not.
+    stages_unsweepable_coverage_defect: int = 0
+    stages_unsweepable_upstream_pending: int = 0
     stages_no_dry_path: int = 0
-    coverage_findings: list[str] = field(default_factory=list)
+    stages_not_attempted: int = 0
+    coverage_findings: list[dict[str, Any]] = field(default_factory=list)
+    # A stage unsweepable on EVERY run for the declared streak threshold is its
+    # own finding: the sweep covers nothing there. Kept OUT of coverage_findings
+    # deliberately so it can never be read as coverage (I7323 deliverable 3).
+    persistent_unsweepable_findings: list[dict[str, Any]] = field(default_factory=list)
+    unsweepable_streak_state: str = "unavailable"
+    unsweepable_streak_threshold_runs: int | None = None
+    # Every stage the definition declares, with its classification — so
+    # `declared - swept` is auditable from the report alone rather than being a
+    # scalar nobody can expand (I7324 deliverable 2).
+    declared_stages: list[dict[str, Any]] = field(default_factory=list)
     results: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -175,6 +242,35 @@ class AwsSurface:
             Body=json.dumps(payload, indent=2, sort_keys=True).encode(),
             ContentType="application/json",
         )
+
+    def get_json(self, key: str) -> dict | None:
+        """Read a JSON object, or ``None`` if it does not exist yet.
+
+        Only a genuine absence returns ``None``. Any other error propagates —
+        an unreadable streak file must not be silently treated as "no history",
+        which would reset every streak to zero on each run and make the
+        persistent-unsweepable finding structurally unable to fire.
+        """
+        if self._s3 is None:
+            self._s3 = self._client("s3")
+        try:
+            body = self._s3.get_object(Bucket=self.bucket, Key=key)["Body"].read()
+        except self._s3.exceptions.NoSuchKey:
+            return None
+        return json.loads(body)
+
+    def list_objects(self, prefix: str, max_keys: int = 1000) -> list[dict[str, Any]]:
+        """``[{"Key": ..., "Size": ...}]`` under ``prefix``. Never swallows."""
+        if self._s3 is None:
+            self._s3 = self._client("s3")
+        out: list[dict[str, Any]] = []
+        paginator = self._s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            for obj in page.get("Contents", []) or []:
+                out.append({"Key": obj["Key"], "Size": obj.get("Size", 0)})
+                if len(out) >= max_keys:
+                    return out
+        return out
 
     def put_text(self, key: str, body: str) -> None:
         if self._s3 is None:
@@ -300,6 +396,194 @@ def _stage_log(stage: Stage, result: StageResult, script: str) -> str:
     )
 
 
+# ── Declared same-day upstream dependencies ──────────────────────────────────
+
+
+def _finding(kind: str, detail: str, *, blocking: bool, stage: str | None = None) -> dict:
+    """One coverage finding, carrying its own severity.
+
+    A finding that has to be looked up in a severity table somewhere else is a
+    finding whose severity drifts from its text.
+    """
+    return {"kind": kind, "stage": stage, "blocking": blocking, "finding": detail}
+
+
+def upstream_content(
+    prefix: str, ignore_subprefixes: list[str], lister
+) -> tuple[bool, dict[str, Any]]:
+    """Is the declared upstream prefix populated with real content?
+
+    CONTENT, never existence. ``backtest/<date>/`` EXISTS on a day nothing
+    produced it, because the sweep's own phase markers are written under it —
+    a probe that tested existence would report every stage's upstream as
+    satisfied and would therefore change nothing while appearing to work. Keys
+    under a declared ignore sub-prefix, and zero-byte keys, are not content.
+    """
+    objects = lister(prefix)
+    counted: list[str] = []
+    ignored: list[str] = []
+    for obj in objects:
+        key = obj.get("Key", "")
+        rel = key[len(prefix):] if key.startswith(prefix) else key
+        if any(rel.startswith(p) for p in ignore_subprefixes):
+            ignored.append(key)
+            continue
+        if int(obj.get("Size", 0) or 0) == 0:
+            ignored.append(key)
+            continue
+        counted.append(key)
+    detail = {
+        "prefix": prefix,
+        "content_keys": len(counted),
+        "ignored_keys": len(ignored),
+        "ignore_subprefixes": list(ignore_subprefixes),
+        "sample": sorted(counted)[:3] or sorted(ignored)[:3],
+    }
+    return bool(counted), detail
+
+
+def classify_upstream(
+    result: StageResult, declaration: dict[str, Any], bindings: dict[str, Any], lister
+) -> StageResult:
+    """Reclassify a FAILED stage whose declared same-day upstream is absent.
+
+    Applies only to a stage that RAN and FAILED and carries a declaration in
+    ``preflight_sweep_manifest.json``. Three outcomes, all explicit:
+
+    * upstream prefix has content  -> stays ``failed``, and says the upstream
+      was present, which is what keeps a real defect from hiding behind the
+      declaration;
+    * upstream prefix is empty     -> ``unsweepable`` / ``upstream_pending``,
+      naming the producing stage and the prefix. Not a failure, does not page;
+    * the probe itself could not run -> ``unmeasured``. The sweep cannot tell a
+      real failure from an unmet upstream, and saying either would be a guess.
+    """
+    template = declaration["prefix"]
+    try:
+        prefix = template.format(**bindings)
+    except (KeyError, IndexError, ValueError) as exc:
+        result.verdict = UNMEASURED
+        result.reason = (
+            f"preflight exited rc={result.returncode}, and the declared upstream prefix "
+            f"template {template!r} could not be rendered from the sweep's bindings "
+            f"({type(exc).__name__}: {exc}) — a real failure cannot be told from an "
+            "unmet upstream"
+        )
+        return result
+
+    if lister is None:
+        result.verdict = UNMEASURED
+        result.reason = (
+            f"preflight exited rc={result.returncode}, and the declared upstream "
+            f"{prefix!r} (produced by {declaration['produced_by']}) could not be probed: "
+            "the sweep has no S3 surface in this run. A real failure cannot be told "
+            "from an unmet upstream, so neither is claimed."
+        )
+        return result
+
+    try:
+        present, detail = upstream_content(
+            prefix, list(declaration.get("ignore_subprefixes") or []), lister
+        )
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        result.verdict = UNMEASURED
+        result.reason = (
+            f"preflight exited rc={result.returncode}, and probing the declared upstream "
+            f"{prefix!r} raised {type(exc).__name__}: {exc} — a real failure cannot be "
+            "told from an unmet upstream"
+        )
+        return result
+
+    result.upstream = {**detail, "produced_by": declaration["produced_by"], "present": present}
+    if present:
+        result.reason = (
+            f"{result.reason or f'preflight exited rc={result.returncode}'} — and its "
+            f"declared upstream {prefix} IS populated ({detail['content_keys']} objects "
+            f"from {declaration['produced_by']}), so this is a REAL failure, not an "
+            "unmet upstream"
+        )
+        return result
+
+    result.verdict = UNSWEEPABLE_VERDICT
+    result.unsweepable_kind = UNSWEEPABLE_UPSTREAM_PENDING
+    result.reason = (
+        f"NOT MEASURABLE TODAY — this stage reads s3://{DEFAULT_BUCKET}/{prefix}, produced "
+        f"by the {declaration['produced_by']} stage, and that prefix holds no content "
+        f"({detail['ignored_keys']} key(s) ignored as "
+        f"{', '.join(detail['ignore_subprefixes']) or 'n/a'} markers or zero-byte). A "
+        f"--preflight-only run of {declaration['produced_by']} does not produce it, so the "
+        "preconditions of this stage are UNKNOWN rather than broken. Declared in "
+        "preflight_sweep_manifest.json:upstream_artifact_dependencies."
+    )
+    return result
+
+
+# ── Persistent-unsweepable streaks ───────────────────────────────────────────
+
+
+def streak_threshold_runs(manifest: dict, cadence: dict) -> int:
+    """Consecutive RUNS that make an unsweepable stage a finding of its own.
+
+    Declared in days in the manifest and converted here against the declared
+    cadence, so changing the sweep cadence cannot silently change what "N
+    consecutive days" means.
+    """
+    days = int(manifest.get("unsweepable_streak_threshold_days", 8))
+    per_day = 1440.0 / float(cadence["cadence_minutes"])
+    return max(1, round(days * per_day))
+
+
+def update_streaks(
+    prior: dict[str, Any] | None,
+    results: list[StageResult],
+    run_id: str,
+    now_iso: str,
+    threshold_runs: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Advance the per-stage unsweepable streak and emit the findings it earns.
+
+    A stage that produced any verdict other than ``unsweepable`` this run has
+    its streak dropped: it became measurable, which is the condition the
+    threshold exists to detect the absence of.
+    """
+    prior_streaks = (prior or {}).get("streaks", {}) or {}
+    streaks: dict[str, Any] = {}
+    findings: list[dict[str, Any]] = []
+    for result in results:
+        if result.verdict != UNSWEEPABLE_VERDICT:
+            continue
+        previous = prior_streaks.get(result.stage) or {}
+        runs = int(previous.get("consecutive_runs", 0)) + 1
+        entry = {
+            "consecutive_runs": runs,
+            "since": previous.get("since") or now_iso,
+            "kind": result.unsweepable_kind,
+            "last_run_id": run_id,
+            "last_reason": result.reason,
+        }
+        streaks[result.stage] = entry
+        if runs >= threshold_runs:
+            findings.append(
+                {
+                    "stage": result.stage,
+                    "kind": result.unsweepable_kind,
+                    "consecutive_runs": runs,
+                    "threshold_runs": threshold_runs,
+                    "since": entry["since"],
+                    "finding": (
+                        f"{result.stage} has been unsweepable on every one of the last "
+                        f"{runs} runs (threshold {threshold_runs}, since {entry['since']}) "
+                        "— the sweep has measured NOTHING about this stage's preconditions "
+                        "for that whole period. This is not coverage."
+                    ),
+                }
+            )
+    return (
+        {"schema_version": 1, "updated_at": now_iso, "run_id": run_id, "streaks": streaks},
+        findings,
+    )
+
+
 # ── Report rendering ─────────────────────────────────────────────────────────
 
 
@@ -307,18 +591,37 @@ def render_notification(report: SweepReport) -> tuple[str, str]:
     """ONE notification for the whole run (observability-policy §7.2a: one per
     group failure, never one per member). Carries the full member list by name
     so the operator never has to open a console to learn which stages broke."""
+    not_covered = (
+        report.stages_unsweepable
+        + report.stages_unmeasured
+        + report.stages_no_dry_path
+        + report.stages_not_attempted
+    )
     if not report.measured:
         subject = f"[preflight-sweep] COULD NOT MEASURE — {report.run_id}"
     elif report.outcome == OUTCOME_OK:
         subject = (
             f"[preflight-sweep] all {report.stages_passed} stages clean — {report.run_id}"
         )
+    elif report.stages_failed == 0 and report.stages_unsweepable_coverage_defect == 0:
+        # Nothing broke, but the run did not cover everything. Naming the
+        # denominator's missing part IS the subject — a subject reading
+        # "0 failed" over a run that measured 14 of 19 stages is the count
+        # published without its members.
+        subject = (
+            f"[preflight-sweep] no failures — {not_covered} of {report.stages_declared} "
+            f"stages not covered ({report.stages_unsweepable_upstream_pending} awaiting "
+            f"upstream / {report.stages_no_dry_path} no dry path / "
+            f"{report.stages_unmeasured} unmeasured) — {report.run_id}"
+        )
     else:
         subject = (
             f"[preflight-sweep] {report.stages_failed} failed / "
-            f"{report.stages_unsweepable} unsweepable / "
-            f"{report.stages_unmeasured} unmeasured of {report.stages_declared} "
-            f"— {report.run_id}"
+            f"{report.stages_unsweepable_coverage_defect} unsweepable / "
+            f"{report.stages_unmeasured} unmeasured / "
+            f"{report.stages_no_dry_path} no-dry-path / "
+            f"{report.stages_unsweepable_upstream_pending} awaiting-upstream "
+            f"of {report.stages_declared} — {report.run_id}"
         )
 
     lines = [
@@ -332,18 +635,50 @@ def render_notification(report: SweepReport) -> tuple[str, str]:
         "",
         f"declared {report.stages_declared} | swept {report.stages_swept} | "
         f"passed {report.stages_passed} | failed {report.stages_failed} | "
-        f"unmeasured {report.stages_unmeasured} | unsweepable {report.stages_unsweepable} | "
-        f"no-dry-path {report.stages_no_dry_path}",
+        f"unmeasured {report.stages_unmeasured} | "
+        f"unsweepable {report.stages_unsweepable} "
+        f"(coverage-defect {report.stages_unsweepable_coverage_defect}, "
+        f"awaiting-upstream {report.stages_unsweepable_upstream_pending}) | "
+        f"no-dry-path {report.stages_no_dry_path} | "
+        f"not-attempted {report.stages_not_attempted}",
         "",
     ]
-    if report.coverage_findings:
+    blocking = [f for f in report.coverage_findings if _is_blocking(f)]
+    acknowledged = [f for f in report.coverage_findings if not _is_blocking(f)]
+    if blocking:
         lines.append("COVERAGE FINDINGS (the sweep's own denominator is wrong):")
-        lines += [f"  - {f}" for f in report.coverage_findings]
+        lines += [f"  - {_finding_text(f)}" for f in blocking]
         lines.append("")
+    if acknowledged:
+        lines.append(
+            "COVERAGE GAPS (acknowledged in preflight_sweep_manifest.json — the sweep "
+            "does not cover these, which is not the same as their being healthy):"
+        )
+        lines += [f"  - {_finding_text(f)}" for f in acknowledged]
+        lines.append("")
+    if report.persistent_unsweepable_findings:
+        lines.append(
+            "PERSISTENTLY UNSWEEPABLE (measured nothing for a full threshold period "
+            "— this is NOT coverage):"
+        )
+        lines += [
+            f"  - {f['finding']}" for f in report.persistent_unsweepable_findings
+        ]
+        lines.append("")
+    if report.unsweepable_streak_state != "measured":
+        lines.append(
+            f"streak state: {report.unsweepable_streak_state} — the persistent-unsweepable "
+            "finding could not be evaluated this run."
+        )
+        lines.append("")
+    # EVERY non-passed category is named here, not only the failures. A
+    # category with a non-zero count and no members on the human-facing surface
+    # is a number nobody can act on (alpha-engine-config#7324).
     for verdict, header in (
         (FAILED, "FAILED"),
         (UNSWEEPABLE_VERDICT, "UNSWEEPABLE"),
         (UNMEASURED, "UNMEASURED (not a pass, not a defect)"),
+        (NO_DRY_PATH_VERDICT, "NO DRY PATH (declared, never exercised by the sweep)"),
         (NOT_ATTEMPTED, "NOT ATTEMPTED"),
     ):
         members = [r for r in report.results if r["verdict"] == verdict]
@@ -351,8 +686,14 @@ def render_notification(report: SweepReport) -> tuple[str, str]:
             lines.append(f"{header}:")
             for r in members:
                 detail = r.get("reason") or ""
+                kind = r.get("unsweepable_kind")
+                label = f"  - {r['stage']}"
+                if kind:
+                    label += f" [{kind}]"
                 err = r.get("last_stderr_line")
-                lines.append(f"  - {r['stage']}: {detail}")
+                lines.append(f"{label}: {detail}")
+                if r.get("acknowledged_reason"):
+                    lines.append(f"      acknowledged: {r['acknowledged_reason']}")
                 if err:
                     lines.append(f"      last stderr: {err}")
             lines.append("")
@@ -413,11 +754,23 @@ def sweep(
         # Map-scoped variable.
         base_bindings.setdefault("run_date", started.date().isoformat())
         required_map = derive_required_map_bindings(definition, base_bindings)
-        report.coverage_findings += map_binding_disagreement(required_map, manifest)
+        report.coverage_findings += [
+            _finding(FINDING_MAP_BINDING_DISAGREEMENT, f, blocking=True)
+            for f in map_binding_disagreement(required_map, manifest)
+        ]
         bindings = apply_map_bindings(base_bindings, manifest)
         context = {"Execution": {"Name": run_id, "Id": f"preflight-sweep:{run_id}"}}
         stages = derive_stages(definition, bindings, context, checkout_root)
-        report.coverage_findings += manifest_disagreement(stages, manifest)
+        report.coverage_findings += [
+            _finding(FINDING_MANIFEST_DISAGREEMENT, f, blocking=True)
+            for f in manifest_disagreement(stages, manifest)
+        ]
+        report.coverage_findings += [
+            _finding(FINDING_UPSTREAM_DECLARATION, f, blocking=True)
+            for f in upstream_dependency_disagreement(stages, manifest)
+        ]
+        upstream_decls = upstream_dependencies(manifest)
+        cadence = load_cadence()
     except Exception as exc:  # noqa: BLE001 — reported, never swallowed
         report.finished_at = dt.datetime.now(dt.timezone.utc).isoformat()
         report.outcome = OUTCOME_FAILED
@@ -431,6 +784,24 @@ def sweep(
 
     report.stages_declared = len(stages)
     report.stages_no_dry_path = sum(1 for s in stages if s.classification == NO_DRY_PATH)
+    # The declared stage list, serialised — so `declared - swept` is auditable
+    # from the report alone. A scalar nobody can expand is a count published
+    # without its members (alpha-engine-config#7324).
+    report.declared_stages = [
+        {
+            "stage": s.name,
+            "classification": s.classification,
+            "repo": s.repo,
+            "launcher": s.launcher,
+            "box_dir": s.box_dir,
+        }
+        for s in stages
+    ]
+    acknowledgements = {
+        entry["stage"]: entry
+        for entry in (manifest.get("no_dry_path_stages") or [])
+        if isinstance(entry, dict) and entry.get("stage")
+    }
 
     results: list[StageResult] = []
     for stage in stages:
@@ -439,9 +810,50 @@ def sweep(
                 StageResult(
                     stage=stage.name,
                     verdict=UNSWEEPABLE_VERDICT,
+                    unsweepable_kind=UNSWEEPABLE_COVERAGE_DEFECT,
                     repo=stage.repo,
                     launcher=stage.launcher,
                     reason=stage.reason,
+                )
+            )
+        elif stage.classification == NO_DRY_PATH:
+            # A verdict ROW, not just an increment. Before this, the three
+            # no-dry-path stages existed in the report only as the scalar
+            # `stages_no_dry_path: 3` — absent from results[], absent from the
+            # notification, and un-nameable after the fact.
+            ack = acknowledgements.get(stage.name)
+            results.append(
+                StageResult(
+                    stage=stage.name,
+                    verdict=NO_DRY_PATH_VERDICT,
+                    repo=stage.repo,
+                    launcher=stage.launcher,
+                    reason=stage.reason,
+                    acknowledged_reason=(ack or {}).get("reason"),
+                )
+            )
+            report.coverage_findings.append(
+                _finding(
+                    FINDING_NO_DRY_PATH,
+                    (
+                        f"{stage.name} has NO dry path and is never exercised by the sweep "
+                        f"(launcher={stage.launcher or 'n/a'}, repo={stage.repo or 'n/a'}). "
+                        + (
+                            f"Acknowledged {ack.get('acknowledged')}: {ack['reason']}"
+                            if ack
+                            else (
+                                "NOT acknowledged in preflight_sweep_manifest.json — the "
+                                "blocking manifest_disagreement finding above is the one "
+                                "that fails this run; this entry only names the gap."
+                            )
+                        )
+                    ),
+                    # Never blocking: an acknowledged gap is a reviewed decision,
+                    # and an UNacknowledged one already has its own blocking
+                    # manifest_disagreement finding. Emitting a second blocking
+                    # copy would make one fact fail the run twice.
+                    blocking=False,
+                    stage=stage.name,
                 )
             )
 
@@ -487,25 +899,142 @@ def sweep(
                             file=sys.stderr,
                         )
 
+    # ── Declared same-day upstream reclassification ──────────────────────────
+    # A stage whose preflight failed SOLELY because an upstream artifact of the
+    # same execution does not exist yet was not measured — it did not find a
+    # defect. The stages this may apply to are DECLARED in the manifest, so a
+    # reworded launcher error can never reclassify a real failure; the prefix
+    # is still probed on the day, so the declaration alone can never hide one.
+    lister = (lambda prefix: aws.list_objects(prefix)) if aws is not None else None
+    for result in results:
+        if result.verdict != FAILED:
+            continue
+        declaration = upstream_decls.get(result.stage)
+        if declaration is None:
+            continue
+        classify_upstream(result, declaration, bindings, lister)
+
     order = {s.name: i for i, s in enumerate(stages)}
+    # ── The invariant: every declared stage carries a verdict ────────────────
+    # `len(results) == stages_declared`. Its absence is the root cause of
+    # alpha-engine-config#7324: 19 declared, 16 rows, and the 3 missing stages
+    # unrecoverable from the report. A stage with no verdict is filled in as
+    # not_attempted AND raised as a blocking coverage finding — the sweep's own
+    # denominator is wrong, which outranks anything it found.
+    have = {r.stage for r in results}
+    for stage in stages:
+        if stage.name in have:
+            continue
+        results.append(
+            StageResult(
+                stage=stage.name,
+                verdict=NOT_ATTEMPTED,
+                repo=stage.repo,
+                launcher=stage.launcher,
+                reason=(
+                    "the sweep produced NO verdict for this declared stage — a hole in "
+                    "the sweep's own coverage, not a fact about the stage"
+                ),
+            )
+        )
+        report.coverage_findings.append(
+            _finding(
+                FINDING_MISSING_VERDICT,
+                (
+                    f"declared stage {stage.name!r} (classification "
+                    f"{stage.classification!r}) produced no verdict — len(results) did "
+                    "not equal stages_declared"
+                ),
+                blocking=True,
+                stage=stage.name,
+            )
+        )
     results.sort(key=lambda r: order.get(r.stage, 10**6))
-    report.results = [r.to_dict() for r in results]
+
     report.stages_swept = sum(1 for r in results if r.verdict in (PASSED, FAILED))
     report.stages_passed = sum(1 for r in results if r.verdict == PASSED)
     report.stages_failed = sum(1 for r in results if r.verdict == FAILED)
     report.stages_unmeasured = sum(1 for r in results if r.verdict == UNMEASURED)
     report.stages_unsweepable = sum(1 for r in results if r.verdict == UNSWEEPABLE_VERDICT)
+    report.stages_unsweepable_coverage_defect = sum(
+        1
+        for r in results
+        if r.verdict == UNSWEEPABLE_VERDICT
+        and r.unsweepable_kind != UNSWEEPABLE_UPSTREAM_PENDING
+    )
+    report.stages_unsweepable_upstream_pending = sum(
+        1
+        for r in results
+        if r.verdict == UNSWEEPABLE_VERDICT
+        and r.unsweepable_kind == UNSWEEPABLE_UPSTREAM_PENDING
+    )
+    report.stages_not_attempted = sum(1 for r in results if r.verdict == NOT_ATTEMPTED)
+
+    # ── Persistent-unsweepable streaks ───────────────────────────────────────
+    report.unsweepable_streak_threshold_runs = streak_threshold_runs(manifest, cadence)
+    if aws is None:
+        report.unsweepable_streak_state = (
+            "unavailable — the sweep had no S3 surface, so no streak history was read "
+            "or written"
+        )
+    else:
+        streak_key = f"{REPORT_PREFIX}/{STREAK_STATE_KEY_SUFFIX}"
+        try:
+            prior = aws.get_json(streak_key)
+        except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+            # Treating an unreadable history as "no history" would reset every
+            # streak to 1 on each run and make the finding structurally unable
+            # to fire. It is named instead, and nothing is written over it.
+            report.unsweepable_streak_state = (
+                f"unavailable — could not read {streak_key} "
+                f"({type(exc).__name__}: {exc}); streaks were NOT reset and the "
+                "persistent-unsweepable finding could not be evaluated"
+            )
+        else:
+            state, findings = update_streaks(
+                prior,
+                results,
+                run_id,
+                dt.datetime.now(dt.timezone.utc).isoformat(),
+                report.unsweepable_streak_threshold_runs,
+            )
+            report.persistent_unsweepable_findings = findings
+            try:
+                aws.put_json(streak_key, state)
+                report.unsweepable_streak_state = "measured"
+            except Exception as exc:  # noqa: BLE001
+                report.unsweepable_streak_state = (
+                    f"degraded — streaks were evaluated but could not be persisted to "
+                    f"{streak_key} ({type(exc).__name__}: {exc}); the next run will "
+                    "under-count"
+                )
+
+    report.results = [r.to_dict() for r in results]
     report.finished_at = dt.datetime.now(dt.timezone.utc).isoformat()
 
+    blocking_findings = [f for f in report.coverage_findings if _is_blocking(f)]
+    # A run is CLEAN only if every stage the sweep is accountable for passed.
+    # An acknowledged no-dry-path stage and a stage awaiting its upstream are
+    # not failures — and they are not passes either, so they keep the run out
+    # of OK and out of last_clean.json. Rendering "measured 14 of 19" as green
+    # is exactly the failure this component exists to avoid.
     clean = (
         report.stages_failed == 0
         and report.stages_unsweepable == 0
         and report.stages_unmeasured == 0
-        and not report.coverage_findings
+        and report.stages_not_attempted == 0
+        and report.stages_no_dry_path == 0
+        and not blocking_findings
     )
     if clean and report.stages_passed > 0:
         report.outcome = OUTCOME_OK
-    elif report.stages_failed or report.stages_unsweepable or report.coverage_findings:
+    elif (
+        report.stages_failed
+        or report.stages_unsweepable_coverage_defect
+        or report.stages_not_attempted
+        or blocking_findings
+        or report.persistent_unsweepable_findings
+    ):
         report.outcome = OUTCOME_FAILED
     else:
         # Nothing failed, but something could not be measured. Degraded, and
@@ -552,7 +1081,28 @@ def emit(report: SweepReport, aws: AwsSurface, sns_topic: str) -> None:
             ("PreflightSweepStagesFailed", report.stages_failed),
             ("PreflightSweepStagesUnmeasured", report.stages_unmeasured),
             ("PreflightSweepStagesUnsweepable", report.stages_unsweepable),
+            # Published separately and both at zero. Only the coverage-defect
+            # series may drive an alarm: a stage awaiting its same-day upstream
+            # is the ordinary weekday state and must not page (I7323).
+            (
+                "PreflightSweepStagesUnsweepableCoverageDefect",
+                report.stages_unsweepable_coverage_defect,
+            ),
+            (
+                "PreflightSweepStagesUnsweepableUpstreamPending",
+                report.stages_unsweepable_upstream_pending,
+            ),
+            ("PreflightSweepStagesNoDryPath", report.stages_no_dry_path),
+            ("PreflightSweepStagesNotAttempted", report.stages_not_attempted),
             ("PreflightSweepCoverageFindings", len(report.coverage_findings)),
+            (
+                "PreflightSweepCoverageFindingsBlocking",
+                len([f for f in report.coverage_findings if _is_blocking(f)]),
+            ),
+            (
+                "PreflightSweepPersistentUnsweepable",
+                len(report.persistent_unsweepable_findings),
+            ),
         ]
     )
     subject, message = render_notification(report)
@@ -598,6 +1148,7 @@ def main(argv: list[str] | None = None) -> int:
             args.checkout_root,
         )
         findings += manifest_disagreement(stages, manifest)
+        findings += upstream_dependency_disagreement(stages, manifest)
         print(
             json.dumps(
                 {

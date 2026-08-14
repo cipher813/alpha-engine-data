@@ -93,13 +93,60 @@ _VERDICT_TO_STATUS = {
     "failed": ENVELOPE_ERROR,
     # A coverage defect: the stage declares a dry path the sweep cannot
     # exercise. Loud, because an unsweepable stage is an unmonitored stage.
+    # NOTE: an `unsweepable` row carrying unsweepable_kind="upstream_pending"
+    # is downgraded to ATTENTION below — see _UNSWEEPABLE_KIND_TO_STATUS.
     "unsweepable": ENVELOPE_ERROR,
     # Could not measure. NOT a pass and NOT a defect — "attention" is the
     # envelope's honest middle, and principles.md §2.7 forbids rendering it
     # green.
     "unmeasured": ENVELOPE_ATTENTION,
     "not_attempted": ENVELOPE_ATTENTION,
+    # A stage the definition declares with no dry path at all, acknowledged in
+    # preflight_sweep_manifest.json with a written reason. It is NOT green: the
+    # sweep asserts nothing whatever about it, and a row reading `ok` would
+    # claim precondition-health nobody measured. It is not an error either —
+    # the gap is declared and reviewed. ATTENTION is the honest rendering, and
+    # it is why the row exists at all rather than the stage being absent from
+    # the console (alpha-engine-config#7324).
+    "no_dry_path": ENVELOPE_ATTENTION,
 }
+
+# An `unsweepable` stage has two very different causes, and the console must
+# not render them identically. A coverage defect (missing launcher, missing
+# --preflight-only branch, unrenderable command) means a stage that SHOULD be
+# monitored is not: error. An unmet same-day upstream means the stage cannot be
+# exercised until its producer has run for real — the ordinary state on ~6 days
+# of any week: attention, never error, never green (alpha-engine-config#7323).
+_UNSWEEPABLE_KIND_TO_STATUS = {
+    "coverage_defect": ENVELOPE_ERROR,
+    "upstream_pending": ENVELOPE_ATTENTION,
+}
+
+
+def is_blocking_finding(finding: Any) -> bool:
+    """Does this coverage finding mean the sweep's own denominator is WRONG?
+
+    Findings carry their own severity because two different things live in the
+    same list: a denominator defect (a stage silently lost its dry path — the
+    sweep is measuring the wrong pipeline) and an acknowledged coverage gap (a
+    stage that has no dry path, written down with a reason). Both must be NAMED
+    on every surface; only the first may fail the run.
+
+    A bare string is treated as blocking. That is the legacy shape written by
+    ``preflight_sweep.sh``'s could-not-measure payload and by any report
+    predating the structured form, and defaulting an unknown shape to blocking
+    keeps the fail-loud direction.
+    """
+    if isinstance(finding, dict):
+        return bool(finding.get("blocking", True))
+    return True
+
+
+def finding_text(finding: Any) -> str:
+    """The human-readable body of a coverage finding, either shape."""
+    if isinstance(finding, dict):
+        return str(finding.get("finding", finding))
+    return str(finding)
 
 
 class CadenceError(RuntimeError):
@@ -157,6 +204,12 @@ def stage_envelope(
         status = ENVELOPE_ATTENTION
         verdict = f"{verdict or 'missing'} (no declared envelope mapping)"
 
+    kind = result.get("unsweepable_kind")
+    if verdict == "unsweepable" and kind is not None:
+        # An unrecognised kind keeps the ERROR default: a new kind must be
+        # added by PR here, not absorbed into the quieter status.
+        status = _UNSWEEPABLE_KIND_TO_STATUS.get(kind, ENVELOPE_ERROR)
+
     return {
         "check_id": stage_check_id(result["stage"]),
         "status": status,
@@ -165,6 +218,9 @@ def stage_envelope(
         "component_id": stage_check_id(result["stage"]),
         "stage": result["stage"],
         "verdict": verdict,
+        "unsweepable_kind": kind,
+        "upstream": result.get("upstream"),
+        "acknowledged_reason": result.get("acknowledged_reason"),
         "repo": result.get("repo"),
         "launcher": result.get("launcher"),
         "returncode": result.get("returncode"),
@@ -200,19 +256,38 @@ def rollup_envelope(
     # acknowledged set and the definition disagree in either direction — so it
     # cannot be used to quietly shrink what is being counted.
     expected = max(declared - no_dry_path, 0)
-    reported = len(report.get("results", []))
+    results = report.get("results", []) or []
+    # Stages the sweep is accountable for AND produced a verdict for. A
+    # `no_dry_path` row is a verdict, but it is not coverage — counting it here
+    # would let the acknowledged gaps cancel out the stages they represent and
+    # drive `stages_unobserved` to zero while nothing was exercised.
+    reported = len([r for r in results if r.get("verdict") != "no_dry_path"])
     unobserved = max(expected - reported, 0)
+    findings = report.get("coverage_findings", []) or []
+    blocking = [f for f in findings if is_blocking_finding(f)]
+    persistent = report.get("persistent_unsweepable_findings", []) or []
+    coverage_defects = int(report.get("stages_unsweepable_coverage_defect", 0) or 0)
+    upstream_pending = int(report.get("stages_unsweepable_upstream_pending", 0) or 0)
+    if not report.get("stages_unsweepable_coverage_defect") and not upstream_pending:
+        # A report predating the kind split (or the shell's could-not-measure
+        # payload) carries only the total. Attribute it to the loud kind rather
+        # than assume the quiet one.
+        coverage_defects = int(report.get("stages_unsweepable", 0) or 0)
 
     if not report.get("measured", False):
         status = ENVELOPE_ERROR
     elif (
         report.get("stages_failed")
-        or report.get("stages_unsweepable")
-        or report.get("coverage_findings")
+        or coverage_defects
+        or blocking
+        or persistent
         or unobserved
     ):
         status = ENVELOPE_ERROR
-    elif report.get("stages_unmeasured"):
+    elif report.get("stages_unmeasured") or upstream_pending or no_dry_path:
+        # Nothing is broken, but the sweep did not cover everything it declares.
+        # Rendering that green is the failure mode this component exists to
+        # avoid: "no data" is never green (principles.md §2.7).
         status = ENVELOPE_ATTENTION
     else:
         status = ENVELOPE_OK
@@ -236,14 +311,34 @@ def rollup_envelope(
         "stages_failed": report.get("stages_failed", 0),
         "stages_unmeasured": report.get("stages_unmeasured", 0),
         "stages_unsweepable": report.get("stages_unsweepable", 0),
-        "stages_no_dry_path": report.get("stages_no_dry_path", 0),
-        "coverage_findings": report.get("coverage_findings", []),
+        "stages_unsweepable_coverage_defect": coverage_defects,
+        "stages_unsweepable_upstream_pending": upstream_pending,
+        "stages_no_dry_path": no_dry_path,
+        "stages_not_attempted": report.get("stages_not_attempted", 0),
+        # Named, not counted: which stages have no dry path, and which have
+        # been unsweepable long enough to be a finding in their own right.
+        "no_dry_path_stages": [
+            r.get("stage") for r in results if r.get("verdict") == "no_dry_path"
+        ],
+        "upstream_pending_stages": [
+            r.get("stage")
+            for r in results
+            if r.get("verdict") == "unsweepable"
+            and r.get("unsweepable_kind") == "upstream_pending"
+        ],
+        "coverage_findings": findings,
+        "coverage_findings_blocking": len(blocking),
+        "persistent_unsweepable_findings": persistent,
+        "unsweepable_streak_state": report.get("unsweepable_streak_state", "unavailable"),
+        "declared_stages": report.get("declared_stages", []),
         "definition_sha": report.get("definition_sha"),
         "summary": (
             f"All-stage preflight sweep: {report.get('stages_passed', 0)} passed, "
             f"{report.get('stages_failed', 0)} failed, "
             f"{report.get('stages_unmeasured', 0)} unmeasured, "
-            f"{report.get('stages_unsweepable', 0)} unsweepable, "
+            f"{coverage_defects} unsweepable (coverage defect), "
+            f"{upstream_pending} awaiting upstream, "
+            f"{no_dry_path} with no dry path, "
             f"{unobserved} unobserved of {expected} expected "
             f"({declared} declared, {no_dry_path} acknowledged as having no dry path). "
             + _PRECONDITION_SCOPE
