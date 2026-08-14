@@ -208,14 +208,30 @@ _effective_evals() {
 
 _effective_treat_missing() {
   local label="$1"
-  # For slow-cadence probes: a completely silent period means the probe never
-  # ran — which IS a failure (the "not running" failure mode). For event-driven
-  # Lambdas, missing data is the healthy steady state.
-  if [ -n "${_LAMBDA_CADENCE_SECONDS[$label]:-}" ]; then
-    echo "breaching"
-  else
-    echo "$DEFAULT_ALARM_TREAT_MISSING"
-  fi
+  # ALWAYS notBreaching in the Errors/Throttles loop, slow-cadence probes
+  # included. This is deliberately not a per-label decision any more; the
+  # function is kept as the seam where someone would be tempted to re-add
+  # `breaching`, so the argument against it lives where the change would be made.
+  #
+  # WHY (alpha-engine-config-I7023). These two alarms are `Sum(Errors) >= 1` and
+  # `Sum(Throttles) >= 1`. Treating an empty window as breaching makes the
+  # ABSENCE OF AN ERROR page, and it destroys the only distinction that matters
+  # when a probe goes quiet: "ran and failed" versus "did not run". Both alarms
+  # then report the same fact, neither reports it cleanly, and a deliberately
+  # paused probe latches ALARM on all three of its alarms at once — four pages
+  # per cycle on 2026-08-14, from a plane that was off on purpose.
+  #
+  # The "did not run" failure mode is NOT lost: that is exactly what the
+  # per-liveness-probe Invocations-floor alarm in section 3 detects, and it
+  # keeps `breaching`, because for THAT alarm absence is the condition being
+  # measured rather than the absence of the condition. That alarm postdates this
+  # override (I5567 after I4477) — it took the job over and the override was
+  # never narrowed.
+  #
+  # The Period/EvaluationPeriods override is untouched and still needed: a
+  # slow-cadence probe failing every invocation must not self-clear in the
+  # datapoint-sparse windows between runs (the original I4477 finding).
+  echo "$DEFAULT_ALARM_TREAT_MISSING"
 }
 
 echo ""

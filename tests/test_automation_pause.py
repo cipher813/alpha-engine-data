@@ -570,7 +570,13 @@ def test_reconcile_monthly_is_paused_not_pending(manifest, module):
 # check() is bidirectional (unexpectedly-enabled AND stale-disabled); and
 # enforce() can act in BOTH directions for alarms specifically, unlike triggers.
 
-ALARM_NAMES = {
+# The nine declared when the block was created (alpha-engine-config-I7174).
+# Asserted as a SUBSET below, never as equality. The original test demanded
+# equality, which meant the manifest could not gain an entry without a test
+# edit — and the four alarms it was missing were precisely the ones still paging
+# on 2026-08-14. A frozen expected-set turns "the register grew" into a failure
+# and "the register is incomplete" into a pass, which is backwards.
+ORIGINAL_ALARM_NAMES = {
     "alpha-engine-watch-plane-alert-drain-liveness-probe-invocations-floor",
     "alpha-engine-watch-plane-canary-replay-liveness-probe-invocations-floor",
     "alpha-engine-watch-plane-ci-watch-liveness-probe-invocations-floor",
@@ -583,11 +589,30 @@ ALARM_NAMES = {
 }
 
 
-def test_all_nine_pause_caused_alarms_are_declared(manifest, module):
+def test_the_original_pause_caused_alarms_are_still_declared(manifest, module):
     names = {e["name"] for e in module.alarm_entries(manifest)}
-    assert names == ALARM_NAMES, (
-        f"missing: {ALARM_NAMES - names}; unexpected: {names - ALARM_NAMES}"
+    assert ORIGINAL_ALARM_NAMES <= names, (
+        f"an alarm silenced under I7174 lost its declaration: "
+        f"{ORIGINAL_ALARM_NAMES - names}"
     )
+
+
+def test_the_four_alarms_that_paged_on_2026_08_14_are_declared(manifest, module):
+    """The instance this issue was opened for (alpha-engine-config-I7023).
+
+    These four have exactly the same shape as the nine above — breaching alarms
+    on probes whose every trigger is paused — and were left out because the
+    original list was built from what was firing that morning rather than from
+    the class.
+    """
+    names = {e["name"] for e in module.alarm_entries(manifest)}
+    for name in (
+        "alpha-engine-watch-plane-overseer-liveness-probe-errors",
+        "alpha-engine-watch-plane-overseer-liveness-probe-throttles",
+        "alpha-engine-watch-plane-overseer-liveness-probe-invocations-floor",
+        "alpha-engine-watch-plane-sf-watch-liveness-probe-invocations-floor",
+    ):
+        assert name in names, f"{name} is undeclared and will page again"
 
 
 def test_the_three_deliberately_armed_alarms_are_not_declared(manifest, module):
@@ -660,17 +685,42 @@ def test_alarm_justified_requires_ALL_watched_triggers_paused(module):
     assert module.alarm_justified(entry, partial) is False
 
 
-def test_check_flags_a_justified_alarm_left_armed(module, monkeypatch):
+@pytest.fixture(autouse=True)
+def classified_world(module, monkeypatch, request):
+    """A live CloudWatch in which every breaching alarm is already classified.
+
+    `check()` scans live alarms for coverage, so without this a test would shell
+    out to `aws cloudwatch describe-alarms` and grade against whatever the real
+    account happens to hold — passing on a developer laptop with credentials and
+    failing in CI, which has none by design. Returns the dict so a test can
+    mutate it to induce a coverage finding.
+
+    AUTOUSE deliberately. I7174 added a live alarm read to `check()` and patched
+    the three tests that noticed, one at a time; I7023 added another and the
+    same three broke again the same way. The fixture makes the whole module
+    unable to reach AWS, so the next live read added to `check()` cannot
+    reintroduce this — the failure mode is a test file that silently depends on
+    ambient credentials, not any one call.
+    """
+    live = {e["name"]: False for e in module.alarm_entries()}
+    live.update({name: True for name in module.armed_alarm_names()})
+    if request.node.get_closest_marker("real_alarm_scan") is None:
+        monkeypatch.setattr(module, "_live_breaching_alarms", lambda: live)
+    return live
+
+
+def test_check_flags_a_justified_alarm_left_armed(module, monkeypatch, classified_world):
     """The bug this issue fixes, induced: paused trigger, ActionsEnabled=true."""
     monkeypatch.setattr(module, "_live_state", lambda surface, name: "DISABLED")
     monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: True)
     findings = module.check()
     kinds = {(f["trigger"], f["kind"]) for f in findings}
-    for name in ALARM_NAMES:
+    for name in ORIGINAL_ALARM_NAMES:
         assert (name, "alarm-unexpectedly-enabled") in kinds, findings
 
 
-def test_check_flags_a_stale_disabled_alarm_after_its_pause_lifts(module, monkeypatch):
+def test_check_flags_a_stale_disabled_alarm_after_its_pause_lifts(
+        module, monkeypatch, classified_world):
     """The failure this issue exists to prevent: pause lifted, alarm never re-armed."""
     lifted = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
     del lifted["paused"]["scheduler_schedules"]["alpha-engine-sf-watch-liveness-0645-daily"]
@@ -686,11 +736,87 @@ def test_check_flags_a_stale_disabled_alarm_after_its_pause_lifts(module, monkey
             "alarm-stale-disabled") in kinds, findings
 
 
-def test_check_is_silent_on_alarms_whose_state_matches_justification(module, monkeypatch):
+def test_check_is_silent_on_alarms_whose_state_matches_justification(
+        module, monkeypatch, classified_world):
     monkeypatch.setattr(module, "_live_state", lambda surface, name: "DISABLED")
     monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: False)
     findings = module.check()
     assert not [f for f in findings if f["surface"] == "cloudwatch"], findings
+
+
+# ── Completeness: every breaching alarm is classified (config-I7023) ────────
+
+
+def test_every_armed_alarm_entry_carries_a_reason(manifest, module):
+    for name in module.armed_alarm_names(manifest):
+        reason = manifest["armed_alarms"][name].get("reason", "")
+        assert reason.strip(), f"{name} is declared armed with no reason"
+
+
+def test_no_alarm_is_declared_both_paused_and_armed(manifest, module):
+    """The two blocks are a partition, not two lists that may overlap.
+
+    An alarm in both is a contradiction the reconciler would resolve silently in
+    favour of whichever block it reads first.
+    """
+    paused = {e["name"] for e in module.alarm_entries(manifest)}
+    both = paused & module.armed_alarm_names(manifest)
+    assert not both, f"declared as both silenced and armed: {sorted(both)}"
+
+
+def test_an_undeclared_breaching_alarm_is_a_finding(module, monkeypatch,
+                                                    classified_world):
+    """The defect this check exists for: a new absence-alarm nobody classified."""
+    monkeypatch.setattr(module, "_live_state", lambda surface, name: "DISABLED")
+    monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: False)
+    classified_world["alpha-engine-brand-new-probe-dead"] = True
+    kinds = {(f["trigger"], f["kind"]) for f in module.check()}
+    assert ("alpha-engine-brand-new-probe-dead", "alarm-undeclared") in kinds
+
+
+def test_a_hand_muted_armed_alarm_is_a_finding(module, monkeypatch, classified_world):
+    """A detector muted with no declaration is indistinguishable from a healthy one."""
+    monkeypatch.setattr(module, "_live_state", lambda surface, name: "DISABLED")
+    monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: False)
+    victim = sorted(module.armed_alarm_names())[0]
+    classified_world[victim] = False
+    kinds = {(f["trigger"], f["kind"]) for f in module.check()}
+    assert (victim, "armed-but-silenced") in kinds
+
+
+def test_an_armed_alarm_that_vanished_is_a_finding(module, monkeypatch,
+                                                   classified_world):
+    monkeypatch.setattr(module, "_live_state", lambda surface, name: "DISABLED")
+    monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: False)
+    victim = sorted(module.armed_alarm_names())[0]
+    del classified_world[victim]
+    kinds = {(f["trigger"], f["kind"]) for f in module.check()}
+    assert (victim, "armed-missing-in-aws") in kinds
+
+
+@pytest.mark.real_alarm_scan
+def test_describe_alarms_pagination_is_followed(module, monkeypatch):
+    """A truncated first page would silently shrink the population being graded.
+
+    Opts out of the autouse stub — this is the one test whose subject IS
+    `_live_breaching_alarms`. It fakes `_aws` instead, so it still never reaches
+    the network.
+    """
+    pages = [
+        ('{"a": [{"n": "a1", "e": true}], "t": "tok"}', None),
+        ('{"a": [{"n": "a2", "e": false}], "t": null}', "tok"),
+    ]
+    seen: list[str | None] = []
+
+    def fake_aws(args):
+        token = args[args.index("--starting-token") + 1] if "--starting-token" in args else None
+        seen.append(token)
+        body = next(b for b, t in pages if t == token)
+        return 0, body, ""
+
+    monkeypatch.setattr(module, "_aws", fake_aws)
+    assert module._live_breaching_alarms() == {"a1": True, "a2": False}
+    assert seen == [None, "tok"], "the second page was never requested"
 
 
 def test_enforce_can_both_disable_and_enable_alarm_actions(module, monkeypatch):

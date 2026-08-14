@@ -146,6 +146,79 @@
         "alpha-engine-alert-drain-1600utc",
         "alpha-engine-alert-drain-2200utc"
       ]
+    },
+    "alpha-engine-watch-plane-overseer-liveness-probe-errors": {
+      "reason": "overseer liveness-probe Errors. Period=28800 with treat_missing_data=breaching, so an 8h window with no invocation latches ALARM - and the probe's only two triggers are paused. Added 2026-08-14 (alpha-engine-config-I7023): this alarm and its two siblings were the four still paging Brian after the I7174 reconciler silenced the rest, because the I7174 entry list was built from the alarms observed in ALARM on 2026-08-13 and these read OK at that moment - the backstop responder was re-invoking the probe on every firing (alpha-engine-config-I7330), manufacturing the datapoint that cleared them.",
+      "watches": [
+        "alpha-engine-overseer-liveness-0650-daily",
+        "alpha-engine-overseer-liveness-1450-daily"
+      ]
+    },
+    "alpha-engine-watch-plane-overseer-liveness-probe-throttles": {
+      "reason": "overseer liveness-probe Throttles; same shape, same window and same paused triggers as the Errors sibling above. Added 2026-08-14 (alpha-engine-config-I7023).",
+      "watches": [
+        "alpha-engine-overseer-liveness-0650-daily",
+        "alpha-engine-overseer-liveness-1450-daily"
+      ]
+    },
+    "alpha-engine-watch-plane-overseer-liveness-probe-invocations-floor": {
+      "reason": "invocations-floor on the overseer liveness probe. This is the alarm whose ENTIRE job is detecting a probe that stopped running, so while the probe is deliberately stopped it can only report the pause back to us. Added 2026-08-14 (alpha-engine-config-I7023).",
+      "watches": [
+        "alpha-engine-overseer-liveness-0650-daily",
+        "alpha-engine-overseer-liveness-1450-daily"
+      ]
+    },
+    "alpha-engine-watch-plane-sf-watch-liveness-probe-invocations-floor": {
+      "reason": "invocations-floor on the sf-watch liveness probe. Its -errors and -throttles siblings were declared under I7174 and this one was not, so it stayed armed on the same paused triggers - the family-completeness check added with this entry is what makes that shape impossible to repeat. Silenced under Brian's 2026-08-12 ruling (alpha-engine-config-I6984); re-exam 2026-09-09, same predicate as the sf-watch entries it watches.",
+      "watches": [
+        "alpha-engine-sf-watch-liveness-0645-daily",
+        "alpha-engine-sf-watch-liveness-1445-daily"
+      ]
+    }
+  },
+  "armed_alarms": {
+    "_why": "alpha-engine-config-I7023. The counterpart to `paused_alarms`, and the reason that block can be graded for COMPLETENESS rather than only for correctness. Every live CloudWatch alarm with treat_missing_data=breaching can latch ALARM purely from silence, so every one of them must be classified: either it is silent because a trigger is paused (`paused_alarms`) or it is watching something that is genuinely running and must stay armed (here). `--check` reports any breaching alarm in neither block as `alarm-undeclared`, so a new one cannot be born unclassified, and reports an entry here whose actions are live-disabled as `armed-but-silenced`, so a detector cannot be muted by hand without a declaration saying why. I7174 built `paused_alarms` from the alarms OBSERVED in ALARM on 2026-08-13; four of the class read OK at that moment and were therefore never listed, which is what kept paging Brian on 2026-08-14. A register built from symptoms is an incident log, not an audit - this block is what makes it an audit. Entries need only a reason; there is nothing to reconcile, because armed is the default state and `--enforce` never disables an alarm that is not justified by `paused_alarms`.",
+    "alpha-engine-backtester-no-heartbeat": {
+      "reason": "weekly heartbeat floor for the backtester; the component is running and this is its only silence detector."
+    },
+    "alpha-engine-evaluator-no-heartbeat": {
+      "reason": "weekly heartbeat floor for the evaluator; running."
+    },
+    "alpha-engine-predictor-training-no-heartbeat": {
+      "reason": "weekly heartbeat floor for predictor training; running."
+    },
+    "alpha-engine-rag-ingestion-no-heartbeat": {
+      "reason": "weekly heartbeat floor for RAG ingestion; running."
+    },
+    "alpha-engine-research-runner-no-invocations": {
+      "reason": "weekly Invocations floor on alpha-engine-research-runner; running."
+    },
+    "alpha-engine-pipeline-deadman-preopen-trading": {
+      "reason": "ExecutionsSucceeded deadman on ne-preopen-trading-pipeline - one of the three pipelines the 2026-08-07 ruling explicitly KEPT. Silencing this would silence a kept pipeline."
+    },
+    "alpha-engine-pipeline-deadman-postclose-trading": {
+      "reason": "ExecutionsSucceeded deadman on ne-postclose-trading-pipeline - kept by the same ruling."
+    },
+    "alpha-engine-preflight-sweep-no-run": {
+      "reason": "daily run-completed floor for the preflight sweep; running."
+    },
+    "alpha-engine-dashboard-box-disk-critical": {
+      "reason": "disk on the 24/7 dashboard box (i-09b539c844515d549), explicitly kept by the 2026-08-07 ruling. Missing data means the box stopped reporting, which is itself the finding."
+    },
+    "alpha-engine-console-exposure-probe-dead": {
+      "reason": "15-min heartbeat for the console exposure probe; running."
+    },
+    "alpha-engine-console-exposure-probe-violation": {
+      "reason": "console exposure violations; the probe feeding it is running."
+    },
+    "alpha-engine-router-exposure-probe-dead": {
+      "reason": "15-min heartbeat for the router exposure probe; running."
+    },
+    "alpha-engine-router-exposure-probe-violation": {
+      "reason": "router exposure violations; the probe feeding it is running."
+    },
+    "router-degraded-mode-drill-stale": {
+      "reason": "daily freshness of the router degraded-mode drill heartbeat; running."
     }
   }
 }

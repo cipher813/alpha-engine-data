@@ -8,6 +8,9 @@ requires-python = ">=3.11"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "real_alarm_scan: opt out of the autouse CloudWatch stub in tests/test_automation_pause.py — for the one test whose subject IS the live-alarm scan",
+]
 
 [tool.coverage.run]
 source = ["."]
