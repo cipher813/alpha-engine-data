@@ -163,6 +163,25 @@ def test_ci_runs_the_pause_check(module):
     assert "if:" not in tail, "the pause check is conditionally skipped"
 
 
+def test_ci_repairs_the_alarm_state_before_it_verifies_it():
+    """Repair and verify are one unit, in that order (alpha-engine-config-I7023).
+
+    `--check` carries no `continue-on-error` (pinned above, deliberately). So
+    when `--enforce --alarms-only` ran AFTER it, the enforce step was skipped on
+    exactly the runs where drift existed — the self-healing loop could only run
+    when there was nothing to heal. Measured 2026-08-14 on run 31819251392:
+    eleven `alarm-unexpectedly-enabled` findings, remediation never reached, and
+    the alarms stayed armed until a human ran the same command by hand.
+    """
+    wf = WORKFLOW.read_text(encoding="utf-8")
+    enforce = wf.index("automation_pause.py --enforce --alarms-only")
+    check = wf.index("automation_pause.py --check")
+    assert enforce < check, (
+        "the alarm-action repair step runs after the check that can fail the "
+        "job, so it is skipped precisely when it is needed"
+    )
+
+
 def test_drift_checker_consults_the_manifest_not_a_hardcoded_list():
     src = DRIFT_CHECKER.read_text(encoding="utf-8")
     assert "automation_pause.paused_names()" in src, (

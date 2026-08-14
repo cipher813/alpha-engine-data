@@ -181,6 +181,39 @@ class TestAlarmSemantics:
             "outside this block"
         )
 
+    def test_every_put_metric_alarm_carries_the_pause_aware_actions_flag(
+            self, script_text):
+        """`put-metric-alarm` is an upsert and RESETS ActionsEnabled to true.
+
+        So a call site without `_actions_flag` silently re-arms whatever the
+        automation pause had silenced. Measured 2026-08-14: merging
+        alpha-engine-config-I7023 fired this script's deploy workflow and
+        re-armed all eleven paused-component alarms at once. Asserted over every
+        invocation rather than the ones that existed that day — a new alarm
+        added here without the flag is the same defect again.
+        """
+        calls = script_text.count("put-metric-alarm \\")
+        # `_actions_flag "` counts invocations only — the definition line reads
+        # `_actions_flag() {`, with no space before the argument.
+        flags = script_text.count('_actions_flag "')
+        assert calls > 0, "the call sites this property is about were renamed"
+        assert flags == calls, (
+            f"{calls} put-metric-alarm call(s) but {flags} _actions_flag "
+            f"use(s) — a call site can reset ActionsEnabled on a paused alarm"
+        )
+
+    def test_the_silenced_set_comes_from_the_pause_module_not_a_second_list(
+            self, script_text):
+        """One predicate, three consumers.
+
+        If this script hardcoded its own list of paused alarms it would drift
+        from `--check` and `--enforce --alarms-only` the moment a pause lifted,
+        and the drift would show up as an alarm that is silent while the
+        manifest says it should be armed — the hardest direction to notice.
+        """
+        assert "import automation_pause as ap" in script_text
+        assert "ap.alarm_justified(e)" in script_text
+
     def test_no_label_can_make_errors_or_throttles_breaching(self, script_text):
         """`_effective_treat_missing` returns the default for EVERY label.
 
