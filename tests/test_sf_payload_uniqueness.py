@@ -136,12 +136,20 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # Evaluator Report Card v2 (Layer B) — alpha-engine-evaluator:live. Builds
     # evaluator/{date}/report_card.json; non-fatal (own Catch → notify gate).
     # dry_run.$=$.research_dry → no-write on the Friday preflight (ROADMAP L4504).
-    "ReportCard": frozenset({"date.$", "dry_run.$", "snapshot"}),
+    # alpha-engine-config-I7282: `gate_state` — the run's correctness-gate
+    # verdicts (sf-pipeline-policy.md 2.3a rule 3). A nested object rather than
+    # flat keys because it is a VERSIONED CROSS-REPO CONTRACT with
+    # crucible-evaluator (grading/pipeline_gates.py); its internal shape is
+    # pinned by infrastructure/contracts/sf_gate_state.v1.schema.json and by
+    # tests/test_sf_gate_state_wiring.py, not by this namespace registry.
+    "ReportCard": frozenset({"date.$", "dry_run.$", "snapshot", "gate_state"}),
     # Director (Layer C, Part II) — alpha-engine-evaluator-director:live. Final
     # advisory task; reads the fresh report card, writes director/{date}/
     # action_plan.json; flag-gated (DIRECTOR_ENABLED) + non-fatal (own Catch).
     # dry_run.$=$.research_dry → no-Opus / no-write probe on the preflight (L4504).
-    "Director": frozenset({"date.$", "dry_run.$"}),
+    # alpha-engine-config-I7282: same `gate_state` block as ReportCard, byte-
+    # identical (one contract, one consumer implementation).
+    "Director": frozenset({"date.$", "dry_run.$", "gate_state"}),
     # config#2248: launches the launcher spot that replaces the always-on
     # dashboard box as the $.ec2_instance_id source. It reads the rest of its
     # config from Lambda env vars.
