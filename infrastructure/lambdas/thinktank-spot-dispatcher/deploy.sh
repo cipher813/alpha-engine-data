@@ -11,6 +11,7 @@
 #
 #   (no flags)    update the Lambda's code only
 #   --bootstrap   create the IAM role + Lambda (idempotent)
+#   --apply-iam   re-apply iam-policy.json only, no code/bootstrap side effects (config#2825)
 #   --smoke       fire ONE real run on a REAL spot box (the §47 validation gate)
 #   --cutover     repoint alpha-research-thinktank-daily at this dispatcher
 #
@@ -38,15 +39,36 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$(mktemp -d)"
 trap 'rm -rf "$BUILD_DIR"' EXIT
 
-BOOTSTRAP=0; SMOKE=0; CUTOVER=0
+BOOTSTRAP=0; SMOKE=0; CUTOVER=0; APPLY_IAM=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --bootstrap) BOOTSTRAP=1; shift ;;
         --smoke) SMOKE=1; shift ;;
         --cutover) CUTOVER=1; shift ;;
+        --apply-iam) APPLY_IAM=1; shift ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+
+# ----- Apply IAM only (config#2825, no bootstrap/code side effects) --------
+if [ "$APPLY_IAM" -eq 1 ]; then
+    echo "==> applying IAM (role=$ROLE_NAME, policy=$POLICY_NAME)"
+    aws iam get-role --role-name "$ROLE_NAME" --region "$REGION" >/dev/null 2>&1 || {
+        echo "  Creating IAM role: $ROLE_NAME"
+        aws iam create-role --role-name "$ROLE_NAME" \
+            --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}' \
+            --region "$REGION" >/dev/null
+        echo "  waiting for IAM propagation..."
+        sleep 10
+    }
+    aws iam put-role-policy --role-name "$ROLE_NAME" \
+        --policy-name "$POLICY_NAME" \
+        --policy-document "file://$SCRIPT_DIR/iam-policy.json" \
+        --region "$REGION"
+    echo "  ✓ IAM applied."
+    echo "==> done"
+    exit 0
+fi
 
 echo "==> building package"
 cp "$SCRIPT_DIR/index.py" "$BUILD_DIR/"
