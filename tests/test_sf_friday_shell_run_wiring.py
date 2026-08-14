@@ -549,6 +549,17 @@ def orig_spot_cmds() -> dict:
       to a checkout, not of the Parallel state that happened to expose it.
       See `tests/test_sf_git_pull_serialized.py`.
 
+    - **Regenerated 2026-08-14** (alpha-engine-config-I7364): every
+      `krepis.ssm_log_capture` wrapper's interpreter moved from the
+      crucible-dashboard co-tenant venv
+      (`/home/ec2-user/alpha-engine-dashboard/.venv/bin/python`) to the
+      ops-owned guard (`/opt/nousergon/bin/lib-python`) — the same guard
+      `I7343` pointed the launcher scripts' own `LIB_PYTHON` default at, one
+      frame up the stack. A deliberate, reviewed absent-path change confined
+      to the interpreter token; every other argument is unchanged. 14 of the
+      15 keys here changed (all except `DriftDetection`, a stale key with no
+      corresponding live SF state).
+
     Regenerate ONLY on a deliberate, reviewed change to a spot state's
     absent-path (`preflight_args=""`) command, by re-extracting the
     resolved spot commands from the new `origin/main` SF.
@@ -910,6 +921,10 @@ class TestByteIdenticalAbsentPath:
         The lib CLI internalizes tee + S3-ship; --preflight-only still
         sits immediately after the launcher's mode token so the
         orthogonal-modifier shape is preserved.
+
+        2026-08-14 (alpha-engine-config-I7364): the interpreter token moved
+        from the crucible-dashboard co-tenant venv to the ops-owned guard
+        `/opt/nousergon/bin/lib-python`; everything after it is unchanged.
         """
         token, log = _SPOT_STATES[name]
         slug = Path(log).stem
@@ -918,7 +933,7 @@ class TestByteIdenticalAbsentPath:
         )
         final = cmds[-1]
         expected = (
-            "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python "
+            "/opt/nousergon/bin/lib-python "
             "-m krepis.ssm_log_capture run "
             f"--correlation-id {_CONTEXT_OBJECT['Execution.Name']} "
             f"--slug {slug} --log {log} -- "
