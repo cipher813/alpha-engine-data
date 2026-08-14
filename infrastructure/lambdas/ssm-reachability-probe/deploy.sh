@@ -100,7 +100,8 @@ apply_alarms() {
     --statistic Maximum --period 300 --evaluation-periods 2 --datapoints-to-alarm 2 \
     --threshold 0 --comparison-operator GreaterThanThreshold \
     --treat-missing-data breaching \
-    --alarm-actions "${sns}" --region "${REGION}"
+    --alarm-actions "${sns}" --region "${REGION}" \
+    "$(alarm_actions_flag "${FUNCTION_NAME}-unreachable")"
 
   # ── Alarm 2: the probe itself ─────────────────────────────────────────────
   # A detector that stops running must not read as a healthy fleet. 15 minutes
@@ -114,7 +115,8 @@ apply_alarms() {
     --statistic Sum --period 300 --evaluation-periods 3 --datapoints-to-alarm 3 \
     --threshold 1 --comparison-operator LessThanThreshold \
     --treat-missing-data breaching \
-    --alarm-actions "${sns}" --region "${REGION}"
+    --alarm-actions "${sns}" --region "${REGION}" \
+    "$(alarm_actions_flag "${FUNCTION_NAME}-dead")"
 }
 
 # ----- Apply IAM only -------------------------------------------------------

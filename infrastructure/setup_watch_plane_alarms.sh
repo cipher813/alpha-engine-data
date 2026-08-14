@@ -63,43 +63,15 @@ ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region 
 
 # --- 0. The pause overrides this script's default arming --------------------
 #
-# `put-metric-alarm` is an UPSERT of the whole alarm, and it resets
-# ActionsEnabled to true. So every run of this script re-armed every alarm the
-# automation pause had deliberately silenced — measured 2026-08-14: the merge of
-# alpha-engine-config-I7023 fired this script's deploy workflow and re-armed all
-# eleven, and Brian would have been paged again within the hour. The pause was
-# not weak; the provisioner was overwriting it, silently, and nothing said so.
-#
-# Fixed here rather than by re-muting afterwards, because a fix downstream of
-# the overwrite leaves a window in which the alarms are live, and because this
-# script is the thing that knows it is about to reset the field.
-#
-# Justification is computed from the manifest alone — no AWS calls, no second
-# list. An alarm is silenced here for exactly as long as
-# `automation_pause.alarm_justified()` says it is, which is the same predicate
-# `--check` and `--enforce --alarms-only` grade against, so the three can never
-# disagree about which alarms are paused.
-#
-# Fails loud: if the manifest or module cannot be read we do NOT fall back to
-# arming everything, because that is precisely the silent overwrite this exists
-# to stop.
+# `put-metric-alarm` is an UPSERT that RESETS ActionsEnabled to true, so this
+# script re-armed every alarm the automation pause had deliberately silenced,
+# on every run. See _shared/pause.sh::alarm_actions_flag for the full argument
+# and the measurement — it is the alarm-side twin of pause_state, and it is
+# shared because SIX scripts in this repo call put-metric-alarm and fixing one
+# of them fixed nothing.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SILENCED_ALARMS=" $(python3 -c "
-import sys
-sys.path.insert(0, '${SCRIPT_DIR}')
-import automation_pause as ap
-print(' '.join(e['name'] for e in ap.alarm_entries() if ap.alarm_justified(e)))
-") "
-echo "  Paused-component alarms (provisioned with actions DISABLED):"
-echo "${SILENCED_ALARMS}" | tr ' ' '\n' | grep -v '^$' | sed 's/^/    /' || echo "    (none)"
-
-# Emits the put-metric-alarm flag controlling whether this alarm may page.
-_actions_flag() {
-  case "${SILENCED_ALARMS}" in
-    *" $1 "*) echo "--no-actions-enabled" ;;
-    *) echo "--actions-enabled" ;;
-  esac
-}
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "${SCRIPT_DIR}/lambdas/_shared/pause.sh"
 
 # Deliberately NOT alpha-engine-alerts — see header comment. Provisioned by
 # setup_pipeline_deadman_alarms.sh (sole owner); consumed here.
@@ -305,7 +277,7 @@ for label in "${!WATCH_PLANE_FUNCTIONS[@]}"; do
       --treat-missing-data "$treat" \
       --alarm-actions "$BACKSTOP_TOPIC_ARN" \
       --ok-actions "$BACKSTOP_TOPIC_ARN" \
-      "$(_actions_flag "$alarm_name")" >/dev/null
+      "$(alarm_actions_flag "$alarm_name")" >/dev/null
   done
 done
 
@@ -371,7 +343,7 @@ for label in "${!WATCH_PLANE_FUNCTIONS[@]}"; do
         --treat-missing-data "breaching" \
         --alarm-actions "$BACKSTOP_TOPIC_ARN" \
         --ok-actions "$BACKSTOP_TOPIC_ARN" \
-        "$(_actions_flag "$alarm_name")" >/dev/null
+        "$(alarm_actions_flag "$alarm_name")" >/dev/null
       ;;
   esac
 done
@@ -399,7 +371,7 @@ run aws cloudwatch put-metric-alarm \
   --treat-missing-data "notBreaching" \
   --alarm-actions "$BACKSTOP_TOPIC_ARN" \
   --ok-actions "$BACKSTOP_TOPIC_ARN" \
-  "$(_actions_flag "alpha-engine-watch-plane-overseer-intake-dlq-depth")"
+  "$(alarm_actions_flag "alpha-engine-watch-plane-overseer-intake-dlq-depth")"
 
 # --- 5. Overseer intake queue age-of-oldest-message (alpha-engine-config-I2910)
 # The DLQ-depth alarm above only fires once EventBridge has delivered an
@@ -451,7 +423,7 @@ run aws cloudwatch put-metric-alarm \
   --treat-missing-data "notBreaching" \
   --alarm-actions "$BACKSTOP_TOPIC_ARN" \
   --ok-actions "$BACKSTOP_TOPIC_ARN" \
-  "$(_actions_flag "alpha-engine-watch-plane-overseer-intake-age")"
+  "$(alarm_actions_flag "alpha-engine-watch-plane-overseer-intake-age")"
 
 # --- 6. Backstop Telegram forwarder (alpha-engine-config-I2899) ---------------
 # The backstop alarm topic must have a real-time channel beyond email. The

@@ -162,7 +162,8 @@ if $APPLY_ALARMS; then
     --threshold 1 \
     --comparison-operator "GreaterThanOrEqualToThreshold" \
     --treat-missing-data "notBreaching" \
-    --alarm-actions "arn:aws:sns:us-east-1:711398986525:alpha-engine-watchdog-alerts" >/dev/null
+    --alarm-actions "arn:aws:sns:us-east-1:711398986525:alpha-engine-watchdog-alerts" \
+    "$(alarm_actions_flag "${FUNCTION_NAME}-errors")" >/dev/null
   echo "  ✓ Alarm ${FUNCTION_NAME}-errors upserted."
 fi
 
