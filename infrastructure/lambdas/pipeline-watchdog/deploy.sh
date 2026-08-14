@@ -140,31 +140,17 @@ if $APPLY_IAM; then
   echo "  ✓ IAM applied."
 fi
 
-# ----- Apply alarms only (config#6709) -------------------------------------
-# The module docstring long claimed "CW alarm on Lambda errors pages the
-# operator"; measured 2026-08-09 there were ZERO alarms on this function, so a
-# fail-loud handler crash (e.g. the Sunday DescribeExecution AccessDenied,
-# config#6709) was silently un-paged. This upserts the alarm the docstring
-# assumes. TreatMissingData=notBreaching: no invocations -> the deadman/pause
-# posture owns that axis, not this alarm.
+# ----- Apply alarms only -----------------------------------------------------
+# RETIRED as an alarm-creation path (alpha-engine-config-I7359, executing the
+# I7359 ownership ruling). ${FUNCTION_NAME}-errors is codified in the PRIVATE
+# nous-ergon-ops repo:
+#   infrastructure/cloudwatch/alarms/alpha-engine-pipeline-watchdog-errors.json
+# Edit it there; do not add put-metric-alarm back here —
+# nousergon-data/tests/test_no_imperative_alarm_authorship.py fails the build
+# if it reappears. To apply immediately from nous-ergon-ops:
+#   infrastructure/cloudwatch/apply.py --name alpha-engine-pipeline-watchdog-errors
 if $APPLY_ALARMS; then
-  echo "Upserting ${FUNCTION_NAME}-errors alarm..."
-  aws cloudwatch put-metric-alarm \
-    --region "${REGION}" \
-    --alarm-name "${FUNCTION_NAME}-errors" \
-    --alarm-description "pipeline-watchdog Lambda raised (fail-loud handler): the fleet's same-day pipeline-liveness detector is itself failing - see /aws/lambda/${FUNCTION_NAME} logs (config#6709)" \
-    --namespace "AWS/Lambda" \
-    --metric-name "Errors" \
-    --dimensions "Name=FunctionName,Value=${FUNCTION_NAME}" \
-    --statistic "Sum" \
-    --period 86400 \
-    --evaluation-periods 1 \
-    --threshold 1 \
-    --comparison-operator "GreaterThanOrEqualToThreshold" \
-    --treat-missing-data "notBreaching" \
-    --alarm-actions "arn:aws:sns:us-east-1:711398986525:alpha-engine-watchdog-alerts" \
-    "$(alarm_actions_flag "${FUNCTION_NAME}-errors")" >/dev/null
-  echo "  ✓ Alarm ${FUNCTION_NAME}-errors upserted."
+  echo "  (no-op: alarms for ${FUNCTION_NAME} are applied from nous-ergon-ops, alpha-engine-config-I7359)"
 fi
 
 if $BOOTSTRAP; then
