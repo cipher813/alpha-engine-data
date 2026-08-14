@@ -218,8 +218,30 @@ if $SMOKE; then
   echo ""
   echo "Smoke-testing via direct invoke (synthetic Friday-EOD SUCCEEDED event)..."
   RESP=$(mktemp)
-  # 2026-05-22 (Friday) 20:25 UTC = 13:25 PT — normal Friday EOD success window
-  PAYLOAD=$(cat <<'EOF'
+  # The event timestamps are DERIVED, not hardcoded (alpha-engine-config-I7378).
+  # This block previously embedded stopDate=1779828300000 under a comment
+  # claiming "2026-05-22 (Friday) 20:25 UTC". That epoch is actually
+  # 2026-05-26T20:45Z — a TUESDAY — so the handler answered
+  # {"fired": false, "reason": "not_friday"} on every --smoke since the value
+  # was written, printed it, and exited 0. A smoke test that cannot reach the
+  # code path it exists to exercise reports success for a dead trigger, which
+  # is precisely the shape that let I7376's stale deploy sit undetected.
+  #
+  # Deriving the most recent Friday at 20:25 UTC (13:25 PT — the normal Friday
+  # EOD success window) keeps the payload correct forever instead of correct
+  # until someone re-reads the epoch.
+  SMOKE_STOP_MS=$(python3 -c "
+import datetime
+now = datetime.datetime.now(datetime.timezone.utc)
+d = now.date()
+d -= datetime.timedelta(days=(d.weekday() - 4) % 7)
+stop = datetime.datetime.combine(d, datetime.time(20, 25), datetime.timezone.utc)
+if stop > now:
+    stop -= datetime.timedelta(days=7)
+print(int(stop.timestamp() * 1000))
+")
+  SMOKE_START_MS=$((SMOKE_STOP_MS - 600000))
+  PAYLOAD=$(cat <<EOF
 {
   "source": "aws.states",
   "detail-type": "Step Functions Execution Status Change",
@@ -228,14 +250,15 @@ if $SMOKE; then
     "stateMachineArn": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline",
     "executionArn": "arn:aws:states:us-east-1:711398986525:execution:ne-postclose-trading-pipeline:smoke-test",
     "name": "smoke-test",
-    "startDate": 1779827700000,
-    "stopDate": 1779828300000
+    "startDate": ${SMOKE_START_MS},
+    "stopDate": ${SMOKE_STOP_MS}
   }
 }
 EOF
 )
-  echo "WARNING: --smoke will START a real saturday-pipeline shell run if the embedded date is a Friday."
-  echo "         Confirm before proceeding or omit --smoke and rely on unit tests + first live event."
+  echo "WARNING: --smoke WILL START a real saturday-pipeline shell run — the payload"
+  echo "         now derives a genuine Friday, so the fire path is actually reached."
+  echo "         Omit --smoke and rely on unit tests + the first live event if that is not wanted."
   aws lambda invoke \
     --function-name "${FUNCTION_NAME}" \
     --cli-binary-format raw-in-base64-out \
@@ -244,5 +267,18 @@ EOF
     "${RESP}" >/dev/null
   cat "${RESP}"
   echo ""
+  # Assert the outcome. Printing the response and exiting 0 regardless is what
+  # made the broken payload survive: the operator saw output and read it as a
+  # pass.
+  if ! grep -q '"fired": *true' "${RESP}"; then
+    echo "SMOKE FAILED: the handler did not fire on a synthetic Friday EOD success." >&2
+    echo "  If reason=not_friday, the most recent Friday was an exchange holiday and" >&2
+    echo "  last_closed_trading_day() walked back to Thursday — re-run next week or" >&2
+    echo "  pass a known-good trading Friday by hand. Any other reason is a real" >&2
+    echo "  regression in index.py's handler." >&2
+    rm -f "${RESP}"
+    exit 1
+  fi
+  echo "✓ Smoke passed: handler fired and started a shell run."
   rm -f "${RESP}"
 fi
