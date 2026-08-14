@@ -219,6 +219,9 @@
     },
     "router-degraded-mode-drill-stale": {
       "reason": "daily freshness of the router degraded-mode drill heartbeat; running."
+    },
+    "alpha-engine-director-plan-latency": {
+      "reason": "Director plan-LLM latency amber line on the weekly SF (alpha-engine-config-I7311), created 2026-08-14. Stays ARMED: the weekly SF is one of the three pipelines the 2026-08-07 ruling explicitly KEPT, so the Director runs and this alarm is measuring something live. Its treat_missing_data=breaching is deliberate per its own description - the Director emits on every plan attempt including timeouts, so no datapoint means it did not run or its emitter is dead. Found by the alarm-undeclared check the same day that check shipped (I7023): the alarm was created between that PR's snapshot and its merge, which is exactly the gap the check exists to close."
     }
   }
 }
