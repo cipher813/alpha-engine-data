@@ -65,6 +65,37 @@ _fdt_stub.notify_via_flow_doctor = lambda *a, **k: True  # type: ignore[attr-def
 sys.modules["flow_doctor_telegram"] = _fdt_stub
 
 
+# ── Hermetic guard #2: no live SSM read (I7326 / §7.4a) ─────────────────────
+# The owning-item resolver reads the GitHub PAT from SSM on every confirmed
+# miss, so a test exercising the probe pass would otherwise reach real SSM on
+# any machine with ambient AWS credentials — and, with a real PAT in hand,
+# real GitHub search. Same failure shape as the 2026-07-11 flow-doctor
+# incident, so it gets the same by-construction treatment rather than relying
+# on every future test author remembering to stub.
+#
+# Patching `boto3.client` on the boto3 MODULE (not on `index`) is what makes
+# this survive the `importlib.reload(index)` many tests perform: reload
+# re-binds `index.boto3` to this same module object. Tests that deliberately
+# replace `index.boto3` with a Mock are unaffected. The AssertionError lands
+# inside the resolver's own trap, so the guard also exercises the degraded
+# path — a page still fires, carrying `owning_item=unknown`.
+import boto3 as _boto3  # noqa: E402
+
+_real_boto3_client = _boto3.client
+
+
+def _no_live_ssm(service, *args, **kwargs):
+    if service == "ssm":
+        raise AssertionError(
+            "hermetic guard: a unit test attempted a live SSM read "
+            "(owning-item PAT / escalation PAT). Stub it in the test."
+        )
+    return _real_boto3_client(service, *args, **kwargs)
+
+
+_boto3.client = _no_live_ssm
+
+
 # ── Hermetic guard regression coverage (config#2208) ────────────────────────
 
 
@@ -1934,7 +1965,7 @@ def test_probe_pass_miss_counter_increments_and_resets(fake_s3, monkeypatch,
     spec, missing_result = _warning_spec_and_missing_result(index)
     monkeypatch.setattr(index, "_check_one",
                         lambda s3c, sp, now: (missing_result, None))
-    _pairs, _a, _d, _e, counts = index._run_probe_pass(
+    _pairs, _a, _d, _e, counts, _tel = index._run_probe_pass(
         fake_s3, [spec], {}, fixed_now, {"champion_feed": 2})
     assert counts == {"champion_feed": 3}
 
@@ -1942,7 +1973,7 @@ def test_probe_pass_miss_counter_increments_and_resets(fake_s3, monkeypatch,
         state="fresh", reason="ok", canonical_key=spec.s3_key_template)
     monkeypatch.setattr(index, "_check_one",
                         lambda s3c, sp, now: (fresh_result, None))
-    _pairs, _a, _d, _e, counts = index._run_probe_pass(
+    _pairs, _a, _d, _e, counts, _tel = index._run_probe_pass(
         fake_s3, [spec], {}, fixed_now, {"champion_feed": 7})
     assert counts == {"champion_feed": 0}
 
@@ -2050,7 +2081,7 @@ def test_escalate_files_issue_when_anchor_miss_crosses_threshold(monkeypatch, fi
     spec, result = _event_driven_pair(index, "config_scoring_weights", "config_apply_audit")
     anchor_spec, anchor_result = _anchor_pair(index)
     pairs = [(spec, result), (anchor_spec, anchor_result)]
-    miss_counts = {"config_apply_audit": index.ISSUE_ESCALATION_RUNS}
+    miss_counts = {"config_apply_audit": index.WARNING_ESCALATION_RUNS}
     file_mock = mock.Mock(return_value={"filed": True, "url": "https://github.com/x/y/issues/1"})
     monkeypatch.setattr(index, "_file_escalation_issue", file_mock)
     out = index._escalate_stale_key_deliverables(
@@ -2059,7 +2090,8 @@ def test_escalate_files_issue_when_anchor_miss_crosses_threshold(monkeypatch, fi
     assert out == {"config_scoring_weights": "https://github.com/x/y/issues/1"}
     file_mock.assert_called_once_with(
         "config_scoring_weights", "alpha-engine-backtester",
-        index.ISSUE_ESCALATION_RUNS, "config_apply_audit")
+        index.WARNING_ESCALATION_RUNS, "config_apply_audit",
+        index.WARNING_ESCALATION_RUNS, None)
 
 
 def test_escalate_does_not_file_below_threshold(monkeypatch, fixed_now):
@@ -2070,7 +2102,7 @@ def test_escalate_does_not_file_below_threshold(monkeypatch, fixed_now):
     spec, result = _event_driven_pair(index, "config_scoring_weights", "config_apply_audit")
     anchor_spec, anchor_result = _anchor_pair(index)
     pairs = [(spec, result), (anchor_spec, anchor_result)]
-    miss_counts = {"config_apply_audit": index.ISSUE_ESCALATION_RUNS - 1}
+    miss_counts = {"config_apply_audit": index.WARNING_ESCALATION_RUNS - 1}
     file_mock = mock.Mock()
     monkeypatch.setattr(index, "_file_escalation_issue", file_mock)
     out = index._escalate_stale_key_deliverables(
@@ -2090,7 +2122,7 @@ def test_escalate_dedupes_already_filed(monkeypatch, fixed_now):
     spec, result = _event_driven_pair(index, "config_scoring_weights", "config_apply_audit")
     anchor_spec, anchor_result = _anchor_pair(index)
     pairs = [(spec, result), (anchor_spec, anchor_result)]
-    miss_counts = {"config_apply_audit": index.ISSUE_ESCALATION_RUNS + 5}
+    miss_counts = {"config_apply_audit": index.WARNING_ESCALATION_RUNS + 5}
     file_mock = mock.Mock()
     monkeypatch.setattr(index, "_file_escalation_issue", file_mock)
     prev = {"config_scoring_weights": "https://github.com/x/y/issues/1"}
@@ -2128,7 +2160,7 @@ def test_escalate_observe_mode_never_files(monkeypatch, fixed_now):
     spec, result = _event_driven_pair(index, "config_scoring_weights", "config_apply_audit")
     anchor_spec, anchor_result = _anchor_pair(index)
     pairs = [(spec, result), (anchor_spec, anchor_result)]
-    miss_counts = {"config_apply_audit": index.ISSUE_ESCALATION_RUNS + 5}
+    miss_counts = {"config_apply_audit": index.WARNING_ESCALATION_RUNS + 5}
     file_mock = mock.Mock()
     monkeypatch.setattr(index, "_file_escalation_issue", file_mock)
     out = index._escalate_stale_key_deliverables(
@@ -2147,7 +2179,7 @@ def test_escalate_uses_own_miss_count_for_non_event_driven(monkeypatch, fixed_no
     importlib.reload(index)
     anchor_spec, anchor_result = _anchor_pair(index, artifact_id="some_direct_artifact")
     pairs = [(anchor_spec, anchor_result)]
-    miss_counts = {"some_direct_artifact": index.ISSUE_ESCALATION_RUNS}
+    miss_counts = {"some_direct_artifact": index.WARNING_ESCALATION_RUNS}
     file_mock = mock.Mock(return_value={"filed": True, "url": "https://x/1"})
     monkeypatch.setattr(index, "_file_escalation_issue", file_mock)
     out = index._escalate_stale_key_deliverables(
@@ -2155,7 +2187,8 @@ def test_escalate_uses_own_miss_count_for_non_event_driven(monkeypatch, fixed_no
     )
     file_mock.assert_called_once_with(
         "some_direct_artifact", "alpha-engine-backtester",
-        index.ISSUE_ESCALATION_RUNS, "some_direct_artifact")
+        index.WARNING_ESCALATION_RUNS, "some_direct_artifact",
+        index.WARNING_ESCALATION_RUNS, None)
     assert out == {"some_direct_artifact": "https://x/1"}
 
 
@@ -2196,7 +2229,8 @@ def test_file_escalation_issue_posts_expected_shape(monkeypatch):
     monkeypatch.setattr(index.urllib.request, "urlopen", _fake_urlopen)
 
     result = index._file_escalation_issue(
-        "config_scoring_weights", "alpha-engine-backtester", 20, "config_apply_audit")
+        "config_scoring_weights", "alpha-engine-backtester", 20,
+        "config_apply_audit", 3)
 
     assert result == {
         "filed": True,
@@ -2219,7 +2253,8 @@ def test_file_escalation_issue_failure_is_non_fatal(monkeypatch):
     monkeypatch.setattr(index, "boto3", mock.Mock(
         client=mock.Mock(side_effect=RuntimeError("ssm down"))))
     result = index._file_escalation_issue(
-        "config_scoring_weights", "alpha-engine-backtester", 20, "config_apply_audit")
+        "config_scoring_weights", "alpha-engine-backtester", 20,
+        "config_apply_audit", 3)
     assert result["filed"] is False
     assert "ssm down" in result["error"]
 
@@ -2843,3 +2878,541 @@ def test_a_failed_write_does_not_take_down_the_sweep():
         _FakeEvents([]), _FakeScheduler(),
     )
     assert payload["disabled_count"] == 0
+
+
+# ── §7.4a: a page names the item that owns it (I7326) ───────────────────────
+#
+# The measured instance these pin: 2026-08-14 08:00 UTC, `[CRITICAL]
+# freshness-monitor: artifact_id=director_retro ... escalated_from=warning
+# after_consecutive_miss_runs=13` — while alpha-engine-config-I6562 had
+# root-caused the exact condition nine days earlier and three further open
+# P1s (#6155, #6345, #6747) described it. The page named none of them.
+
+
+def _owning(number=6562, priority="P1", age_days=9.0, sla_days=3,
+            members=(), degraded=False, reason=None, title="migrate "
+            "director-retro-judge off direct OpenRouter"):
+    return {
+        "resolved": True,
+        "degraded": degraded,
+        "degraded_reason": reason,
+        "owning_item": {
+            "number": number,
+            "url": f"https://github.com/nousergon/alpha-engine-config/issues/{number}",
+            "title": title,
+            "priority": priority,
+            "sla_days": sla_days,
+            "age_days": age_days,
+            "created_at": "2026-08-05T00:00:00Z",
+            "n_artifacts_named": 1,
+        },
+        "members": list(members),
+        "n_candidates": 1 + len(members),
+    }
+
+
+def _critical_spec_and_missing_result(index, artifact_id="director_retro"):
+    from nousergon_lib.artifact_freshness import CheckResult
+    spec = index.ArtifactSpec(
+        artifact_id=artifact_id,
+        s3_bucket="alpha-engine-research",
+        s3_key_template="director/{date}/retro.json",
+        cadence="weekday_sf",
+        sla_minutes_after_cron=60,
+        severity="critical",
+        owner_repo="alpha-engine-test",
+        created_at=date(2025, 1, 1),
+    )
+    result = CheckResult(
+        state="stale",
+        reason="past sla",
+        canonical_key="director/2026-08-13/retro.json",
+        sla_violated_by_minutes=31649,
+    )
+    return spec, result
+
+
+def test_page_names_the_already_open_owning_item(monkeypatch, fixed_now):
+    """Clause (a): the identifier, priority and age of the open item are in
+    the delivered body. This is the exact fact the 2026-08-14 page omitted."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+    spec, result = _critical_spec_and_missing_result(index)
+
+    assert index._maybe_alert(spec, result, fixed_now,
+                              owning=_owning()) is True
+    body = publish_mock.call_args.args[0]
+    assert "owning_item=#6562" in body
+    assert "owning_item_priority=P1" in body
+    assert "owning_item_age_days=9.0" in body
+    assert "issues/6562" in body
+
+
+def test_page_lists_the_other_items_describing_the_same_condition(
+        monkeypatch, fixed_now):
+    """Clause (a) + the many-items-one-cause rule: one page, naming the
+    owner, listing the rest as members."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+    spec, result = _critical_spec_and_missing_result(index)
+    members = [{"number": n} for n in (6155, 6345, 6747)]
+
+    assert index._maybe_alert(spec, result, fixed_now,
+                              owning=_owning(members=members)) is True
+    body = publish_mock.call_args.args[0]
+    assert "owning_item=#6562" in body
+    assert "owning_item_members=#6155,#6345,#6747" in body
+    assert "owning_item_members_total=3" in body
+    # Exactly ONE page for the group.
+    assert publish_mock.call_count == 1
+
+
+def test_degraded_owning_item_search_still_pages_and_says_so(
+        monkeypatch, fixed_now):
+    """Fail SOFT, never silent: an unreachable tracker must not decide
+    whether the operator is paged, and 'unknown' must not read as 'none'."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+    spec, result = _critical_spec_and_missing_result(index)
+
+    assert index._maybe_alert(
+        spec, result, fixed_now,
+        owning=index._unresolved("api.github.com: URLError: timed out"),
+    ) is True
+    body = publish_mock.call_args.args[0]
+    assert "owning_item=unknown" in body
+    assert "owning_item_lookup=degraded" in body
+    assert "timed out" in body
+    assert "owning_item=none" not in body
+
+
+def test_no_open_item_says_none_not_unknown(monkeypatch, fixed_now):
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+    spec, result = _critical_spec_and_missing_result(index)
+    empty = {"resolved": True, "degraded": False, "degraded_reason": None,
+             "owning_item": None, "members": [], "n_candidates": 0}
+
+    assert index._maybe_alert(spec, result, fixed_now, owning=empty) is True
+    body = publish_mock.call_args.args[0]
+    assert "owning_item=none owning_item_lookup=ok" in body
+
+
+# ── §7.4a clause (b): escalation tracks the item's age, not the miss count ──
+
+
+def test_owning_item_age_drives_escalation_not_the_miss_count(
+        monkeypatch, fixed_now):
+    """A P1 open nine days escalates BECAUSE it is a P1 open nine days —
+    at consecutive_miss_runs=0, which the miss-count ladder would never
+    have escalated."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+    spec, result = _warning_spec_and_missing_result(index)
+
+    assert index._maybe_alert(
+        spec, result, fixed_now, consecutive_miss_runs=0,
+        owning=_owning(age_days=9.0, sla_days=3),
+    ) is True
+    assert publish_mock.call_args.kwargs["severity"] == "critical"
+    body = publish_mock.call_args.args[0]
+    assert "escalation_basis=owning_item_age" in body
+    assert "after_consecutive_miss_runs=0" in body
+
+
+def test_young_owning_item_does_not_escalate_but_is_still_recorded(
+        monkeypatch, fixed_now):
+    """The converse of the clause: a P1 filed today is being executed, so
+    the miss count is not the reason to wake anyone. This is a DELIVERY
+    decision only — the row still carries its true state and its full
+    owning-item block into check_results.json (asserted below)."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    monkeypatch.setattr(index, "publish", publish_mock)
+    spec, result = _warning_spec_and_missing_result(index)
+    owning = _owning(age_days=0.5, sla_days=3)
+
+    assert index._maybe_alert(
+        spec, result, fixed_now, consecutive_miss_runs=13, owning=owning,
+    ) is False
+    publish_mock.assert_not_called()
+
+    row = index._serialize_check_results(
+        [(spec, result)], fixed_now,
+        miss_counts={spec.artifact_id: 13},
+        owning_by_id={spec.artifact_id: owning},
+    )["results"][0]
+    assert row["state"] == "missing"
+    assert row["consecutive_miss_runs"] == 13
+    assert row["owning_item_number"] == 6562
+    assert row["owning_item_age_days"] == 0.5
+
+
+def test_miss_count_ladder_still_governs_an_undiagnosed_condition(
+        monkeypatch, fixed_now):
+    """No owning item ⇒ the condition is undiagnosed and the detector's own
+    clock is the only one available."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+    spec, result = _warning_spec_and_missing_result(index)
+    empty = {"resolved": True, "degraded": False, "degraded_reason": None,
+             "owning_item": None, "members": [], "n_candidates": 0}
+
+    assert index._maybe_alert(
+        spec, result, fixed_now,
+        consecutive_miss_runs=index.WARNING_ESCALATION_RUNS, owning=empty,
+    ) is True
+    assert publish_mock.call_args.kwargs["severity"] == "critical"
+    assert "escalation_basis=miss_count" in publish_mock.call_args.args[0]
+
+
+def test_creating_the_owning_item_is_the_escalation_not_a_rung_above_it():
+    """The threshold at which the item is CREATED is the threshold at which
+    the row first pages critical — not a separate, higher one. `director_
+    retro` sat at miss 13 against the old ISSUE_ESCALATION_RUNS=14, so no
+    auto-filed item existed when the CRITICAL fired."""
+    import index
+    warning_spec, _ = _warning_spec_and_missing_result(index)
+    critical_spec, _ = _critical_spec_and_missing_result(index)
+    assert index._escalation_threshold(warning_spec) == index.WARNING_ESCALATION_RUNS
+    assert index._escalation_threshold(critical_spec) == 1
+    assert not hasattr(index, "ISSUE_ESCALATION_RUNS")
+
+
+def test_no_second_item_is_filed_when_one_already_owns_the_condition(
+        monkeypatch, fixed_now):
+    """The join is bidirectional now: an item a HUMAN filed suppresses the
+    monitor's own filing, which the self-referential `issue_filed_url`
+    marker could never do."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    anchor_spec, anchor_result = _anchor_pair(index)
+    file_mock = mock.Mock()
+    monkeypatch.setattr(index, "_file_escalation_issue", file_mock)
+
+    out = index._escalate_stale_key_deliverables(
+        [(anchor_spec, anchor_result)],
+        {"config_apply_audit": index.WARNING_ESCALATION_RUNS + 10},
+        {"config_apply_audit": True}, {}, fixed_now,
+        owning_by_id={"config_apply_audit": _owning()},
+    )
+    file_mock.assert_not_called()
+    assert out == {"config_apply_audit": None}
+
+
+def test_degraded_search_still_files_and_records_the_degradation(
+        monkeypatch, fixed_now):
+    """Failing toward a possible duplicate is cheaper than failing toward
+    an untracked condition — but the duplicate must be reconcilable."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    anchor_spec, anchor_result = _anchor_pair(index)
+    file_mock = mock.Mock(return_value={"filed": True, "url": "https://x/1"})
+    monkeypatch.setattr(index, "_file_escalation_issue", file_mock)
+
+    index._escalate_stale_key_deliverables(
+        [(anchor_spec, anchor_result)],
+        {"config_apply_audit": index.WARNING_ESCALATION_RUNS},
+        {"config_apply_audit": True}, {}, fixed_now,
+        owning_by_id={"config_apply_audit": index._unresolved("api down")},
+    )
+    file_mock.assert_called_once_with(
+        "config_apply_audit", "alpha-engine-backtester",
+        index.WARNING_ESCALATION_RUNS, "config_apply_audit",
+        index.WARNING_ESCALATION_RUNS, "api down")
+
+
+# ── §7.4a: cause-level grouping across the tracker ─────────────────────────
+
+
+_MEASURED_ITEMS = [
+    {"number": 6155, "html_url": "https://x/6155", "created_at": "2026-08-02T00:00:00Z",
+     "title": "4 director artifacts stale since Jul 17/21",
+     "body": "director_retro director_retro_trend director_action_plan director_carryover",
+     "labels": [{"name": "P1"}, {"name": "triage:session"}]},
+    {"number": 6345, "html_url": "https://x/6345", "created_at": "2026-08-03T00:00:00Z",
+     "title": "advisory pipeline artifacts stale",
+     "body": "director_retro and director_action_plan are stale",
+     "labels": [{"name": "P1"}]},
+    {"number": 6562, "html_url": "https://x/6562", "created_at": "2026-08-05T00:00:00Z",
+     "title": "migrate director-retro-judge off direct OpenRouter",
+     "body": "the retro judge sends a registry group handle to OpenRouter; director_retro",
+     "labels": [{"name": "P1"}, {"name": "complexity:mid"}]},
+    {"number": 6747, "html_url": "https://x/6747", "created_at": "2026-08-10T00:00:00Z",
+     "title": "Director stage has not written fresh output since 07-17/07-20",
+     "body": "director_retro director_action_plan director_carryover",
+     "labels": [{"name": "P1"}]},
+]
+
+_KNOWN_IDS = {"director_retro", "director_retro_trend", "director_action_plan",
+              "director_carryover"}
+
+
+def test_grouping_names_the_cause_owner_and_lists_the_rest(monkeypatch):
+    """Four open P1s, one condition ⇒ one owner (the narrowest claim, then
+    the oldest) and three members. #6562 is the root cause; the three
+    broader items are members, not owners."""
+    import index
+    now = datetime(2026, 8, 14, 8, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(index, "_cached_github_pat", lambda state: "pat")
+    monkeypatch.setattr(index, "_github_search_open_issues",
+                        lambda term, pat: _MEASURED_ITEMS)
+
+    res = index._resolve_owning_item(
+        "director_retro", "director/2026-08-13/retro.json", _KNOWN_IDS,
+        now, index._new_lookup_state(),
+    )
+    assert res["resolved"] is True
+    assert res["degraded"] is False
+    assert res["owning_item"]["number"] == 6562
+    assert res["owning_item"]["priority"] == "P1"
+    assert res["owning_item"]["age_days"] == 9.33
+    assert [m["number"] for m in res["members"]] == [6345, 6747, 6155]
+    assert res["n_candidates"] == 4
+
+
+def test_search_terms_cover_the_human_prose_variant():
+    """#6562's title says `director-retro-judge`. An exact `director_retro`
+    match misses it, and missing it is the whole measured defect."""
+    import index
+    terms = index._search_terms("director_retro", "director/2026-08-13/retro.json")
+    assert "director_retro" in terms
+    assert "director-retro" in terms
+    assert "director retro" in terms
+    assert "director" in terms
+    # A date-shaped first path segment is not a stable identifier.
+    assert "2026-08-13" not in index._search_terms(
+        "x_y", "2026-08-13/retro.json")
+
+
+def test_pat_read_failure_degrades_the_lookup_and_never_raises(monkeypatch):
+    """The hermetic guard makes the SSM read raise; the resolver must
+    absorb it into a DEGRADED resolution so the page still fires."""
+    import index
+    state = index._new_lookup_state()
+    res = index._resolve_owning_item(
+        "director_retro", "director/x/retro.json", _KNOWN_IDS,
+        datetime(2026, 8, 14, tzinfo=timezone.utc), state,
+    )
+    assert res["owning_item"] is None
+    assert res["degraded"] is True
+    assert "pat_read_failed" in res["degraded_reason"]
+
+
+def test_search_error_on_every_term_degrades_not_raises(monkeypatch):
+    import index
+    monkeypatch.setattr(index, "_cached_github_pat", lambda state: "pat")
+
+    def _boom(term, pat):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(index, "_github_search_open_issues", _boom)
+    res = index._resolve_owning_item(
+        "director_retro", "director/x/retro.json", _KNOWN_IDS,
+        datetime(2026, 8, 14, tzinfo=timezone.utc), index._new_lookup_state(),
+    )
+    assert res["degraded"] is True
+    assert res["owning_item"] is None
+    assert "TimeoutError" in res["degraded_reason"]
+
+
+def test_partial_search_failure_resolves_but_flags_incompleteness(monkeypatch):
+    import index
+    calls = {"n": 0}
+
+    def _flaky(term, pat):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return [_MEASURED_ITEMS[2]]
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(index, "_cached_github_pat", lambda state: "pat")
+    monkeypatch.setattr(index, "_github_search_open_issues", _flaky)
+    res = index._resolve_owning_item(
+        "director_retro", "director/x/retro.json", _KNOWN_IDS,
+        datetime(2026, 8, 14, tzinfo=timezone.utc), index._new_lookup_state(),
+    )
+    assert res["owning_item"]["number"] == 6562
+    assert res["degraded"] is True
+
+
+def test_query_budget_exhaustion_is_a_recorded_reason(monkeypatch):
+    import index
+    monkeypatch.setattr(index, "_cached_github_pat", lambda state: "pat")
+    monkeypatch.setattr(index, "_github_search_open_issues",
+                        lambda term, pat: [])
+    state = index._new_lookup_state()
+    state["queries"] = index.OWNING_ITEM_LOOKUP_MAX_QUERIES
+    res = index._resolve_owning_item(
+        "director_retro", "director/x/retro.json", _KNOWN_IDS,
+        datetime(2026, 8, 14, tzinfo=timezone.utc), state,
+    )
+    assert res["degraded"] is True
+    assert res["degraded_reason"] == "lookup_budget_exhausted"
+
+
+def test_self_filed_marker_is_unioned_in_when_the_search_found_nothing():
+    import index
+    empty = {"resolved": True, "degraded": False, "degraded_reason": None,
+             "owning_item": None, "members": [], "n_candidates": 0}
+    merged = index._merge_self_filed(
+        empty, "https://github.com/nousergon/alpha-engine-config/issues/4242")
+    assert merged["owning_item"]["number"] == 4242
+    assert merged["owning_item"]["source"] == "self_filed_marker"
+    # A human-filed item outranks a stale self-filed marker.
+    kept = index._merge_self_filed(_owning(), "https://x/issues/4242")
+    assert kept["owning_item"]["number"] == 6562
+
+
+# ── §7.4a clause (c): the number ───────────────────────────────────────────
+
+
+def test_execution_loop_number_emits_zero_on_the_healthy_path(fixed_now):
+    """A metric that only appears when something is wrong is
+    indistinguishable from a dead emitter. Zero pages ⇒ still a row, with
+    the denominator published alongside the ratio."""
+    import index
+    spec, _ = _critical_spec_and_missing_result(index)
+    payload = index._summarize_execution_loop([(spec, _)], [], fixed_now)
+    all_row = payload["classes"]["freshness-monitor.all"]
+    assert all_row == {
+        "pages": 0,
+        "pages_with_open_owning_item": 0,
+        "fraction_with_open_owning_item": 0.0,
+        "median_owning_item_age_days_at_page": 0.0,
+        "pages_with_degraded_lookup": 0,
+    }
+    assert "freshness-monitor.weekday_sf" in payload["classes"]
+
+
+def test_execution_loop_number_counts_pages_against_open_items(fixed_now):
+    import index
+    spec, _ = _critical_spec_and_missing_result(index)
+    records = [
+        {"artifact_id": "a", "alert_class": "freshness-monitor.weekday_sf",
+         "owning_item_number": 6562, "owning_item_age_days": 9.0,
+         "lookup_degraded": False},
+        {"artifact_id": "b", "alert_class": "freshness-monitor.weekday_sf",
+         "owning_item_number": 6155, "owning_item_age_days": 3.0,
+         "lookup_degraded": False},
+        {"artifact_id": "c", "alert_class": "freshness-monitor.weekday_sf",
+         "owning_item_number": None, "owning_item_age_days": None,
+         "lookup_degraded": True},
+    ]
+    payload = index._summarize_execution_loop([(spec, _)], records, fixed_now)
+    row = payload["classes"]["freshness-monitor.weekday_sf"]
+    assert row["pages"] == 3
+    assert row["pages_with_open_owning_item"] == 2
+    assert row["fraction_with_open_owning_item"] == round(2 / 3, 4)
+    assert row["median_owning_item_age_days_at_page"] == 6.0
+    assert row["pages_with_degraded_lookup"] == 1
+    assert payload["classes"]["freshness-monitor.all"] == row
+
+
+def test_execution_loop_metrics_are_emitted_every_run(fixed_now):
+    import index
+    spec, _ = _critical_spec_and_missing_result(index)
+    payload = index._summarize_execution_loop([(spec, _)], [], fixed_now)
+    cw = mock.Mock()
+    index._emit_execution_loop_metrics(cw, payload)
+    names = {
+        d["MetricName"]
+        for call in cw.put_metric_data.call_args_list
+        for d in call.kwargs["MetricData"]
+    }
+    assert names == {
+        "AlertPages", "AlertPagesWithOpenOwningItem",
+        "AlertPagesWithOpenOwningItemFraction",
+        "OwningItemAgeDaysAtPageMedian", "OwningItemLookupDegraded",
+    }
+    dims = {
+        d["Dimensions"][0]["Value"]
+        for call in cw.put_metric_data.call_args_list
+        for d in call.kwargs["MetricData"]
+    }
+    assert "freshness-monitor.all" in dims
+
+
+def test_check_results_carries_the_execution_loop_block(fixed_now):
+    import index
+    spec, result = _critical_spec_and_missing_result(index)
+    payload = index._serialize_check_results(
+        [(spec, result)], fixed_now,
+        execution_loop=index._summarize_execution_loop(
+            [(spec, result)], [], fixed_now),
+    )
+    assert payload["execution_loop"]["classes"]["freshness-monitor.all"]["pages"] == 0
+
+
+# ── §7.4a: the forbidden remedy ────────────────────────────────────────────
+
+
+def test_cooldown_constants_are_not_a_noise_remedy():
+    """§7.4a clause (c): a class that is correctly right too often is a
+    backlog-drain defect, and quieting the channel deletes the only
+    evidence the execution loop is not closing. Raising any of these to
+    reduce page volume must fail a check rather than merely be
+    discouraged — so they are pinned here. Changing one requires changing
+    this test, which requires stating why it is not the forbidden move."""
+    import index
+    assert index.WARNING_ESCALATION_RUNS == 3
+    assert index.RECOVERY_COOLDOWN_MINUTES == 120
+    assert index.DRAIN_DISPATCH_COOLDOWN_MINUTES == 120
+    assert index.PRODUCER_SUPPRESSION_MAX_DAYS == 14
+
+
+def test_owning_item_resolution_never_widens_a_grace_window(monkeypatch, fixed_now):
+    """The join must not become suppression: a row inside its SLA grace is
+    still not paged, and a row past it is still paged, regardless of what
+    the tracker says."""
+    import importlib
+    import index
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    importlib.reload(index)
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+    spec, result = _critical_spec_and_missing_result(index)
+    assert index._maybe_alert(spec, result, fixed_now, owning=_owning()) is True
+    assert index._maybe_alert(
+        spec, result.__class__(state="stale", reason="in grace",
+                               canonical_key=result.canonical_key,
+                               sla_violated_by_minutes=0),
+        fixed_now, owning=_owning()) is False

@@ -35,7 +35,24 @@ invocation:
      is coerced to critical at probe time, and a warning row
      confirmed-missing for ``WARNING_ESCALATION_RUNS`` consecutive sweeps
      escalates to the critical page path.
-  6. **OBSERVE-mode gate**: when env
+  6. **Owning-item join (observability-policy §7.4a / I7326)**: before
+     emitting, resolve the ``artifact_id`` against the OPEN issues of
+     ``ISSUES_REPO`` — the union of the self-filed ``issue_filed_url``
+     marker and a tracker search that also sees items a HUMAN filed. The
+     page names the item that owns the cause, its age and its priority,
+     and lists overlapping items as members. Where an item is open,
+     warning→critical escalation is driven by that item's AGE against its
+     priority SLA rather than the miss count; where none is open, crossing
+     the miss ladder CREATES the item as the escalation's first action.
+     Per alert class, ``_freshness_monitor/execution_loop.json`` and the
+     ``AlertPagesWithOpenOwningItemFraction`` /
+     ``OwningItemAgeDaysAtPageMedian`` CW metrics record whether a class is
+     paging about a component or about a backlog that is not being drained
+     — emitted EVERY run, zeros included. None of this suppresses anything:
+     no cooldown or grace window is widened by it, and a row whose page is
+     not delivered still carries its true state and its full owning-item
+     block into ``check_results.json``.
+  7. **OBSERVE-mode gate**: when env
      ``FRESHNESS_MONITOR_ENABLED`` is anything other than
      ``"true"`` (case-insensitive), alerts are suppressed but the
      check results and heartbeat are still emitted. Phase 6 cutover
@@ -55,6 +72,7 @@ import json
 import logging
 import os
 import time
+import urllib.parse
 import urllib.request
 from collections import defaultdict
 from dataclasses import replace as dc_replace
@@ -97,6 +115,12 @@ HEARTBEAT_KEY = "_freshness_monitor/heartbeat.json"
 CHECK_RESULTS_KEY = "_freshness_monitor/check_results.json"
 HISTORY_KEY = "_freshness_monitor/history.json"
 CYCLE_VERDICT_KEY = "_freshness_monitor/cycle_verdict.json"
+# I7326 / observability-policy §7.4a clause (c) — the durable surface for
+# "is this class of page evidence about the component, or about a backlog
+# that is not being drained?". Written EVERY run, including the healthy run
+# where every number is zero: a metric that only appears when something is
+# wrong is indistinguishable from a dead emitter.
+EXECUTION_LOOP_KEY = "_freshness_monitor/execution_loop.json"
 
 # config#1297 — the general sweep moved from a 15-min cron to daily (Brian's
 # 2026-06-27 directive: the 15-min sweep was unnecessary noise once the
@@ -230,17 +254,35 @@ WARNING_ESCALATION_RUNS = int(os.environ.get("WARNING_ESCALATION_RUNS", "3"))
 # issue directly, mirroring overseer-dispatcher's `_file_p1`). A row opts in
 # via the registry's `escalate_to_issue: true` flag (parsed as a parallel
 # map, same pattern as `critical_while_champion_arm` — not a schema field on
-# the frozen lib `ArtifactSpec`). WARNING_ESCALATION_RUNS (above) already
-# promotes a persistent warning to the critical SNS/Telegram page after 3
-# daily sweeps (~3 days) — this is a SEPARATE, much longer threshold for
-# "nobody has acted on the page either": ~2 weeks of consecutive confirmed
-# misses before a P1 lands on the Decision Queue. For an `event_driven` row
-# (whose own freshness check ALWAYS short-circuits to fresh — see
-# `check_freshness`'s event-driven short-circuit — so its own
-# `consecutive_miss_runs` is always 0), the threshold is evaluated against
-# its `liveness_via` ANCHOR's miss-streak instead; see
-# `_escalate_stale_key_deliverables`.
-ISSUE_ESCALATION_RUNS = int(os.environ.get("ISSUE_ESCALATION_RUNS", "14"))
+# the frozen lib `ArtifactSpec`). For an `event_driven` row (whose own
+# freshness check ALWAYS short-circuits to fresh — see `check_freshness`'s
+# event-driven short-circuit — so its own `consecutive_miss_runs` is always
+# 0), the threshold is evaluated against its `liveness_via` ANCHOR's
+# miss-streak instead; see `_escalate_stale_key_deliverables`.
+#
+# I7326 / observability-policy §7.4a clause (b). This used to be a SEPARATE,
+# much longer rung (`ISSUE_ESCALATION_RUNS = 14`) ABOVE the critical-page
+# threshold — "nobody acted on the page either, so now file". That ordering
+# IS the defect the clause names: severity is raised first and the owning
+# item created second, so the operator is paged repeatedly about a condition
+# that is not yet tracked anywhere. On 2026-08-14 `director_retro` sat at
+# miss 13 — one short of 14 — so no auto-filed item existed when the CRITICAL
+# fired. Creating the owning item is now the FIRST action of the escalation:
+# the threshold collapses onto the point the row reaches the critical page
+# path (`_escalation_threshold`), and above that point the ladder is the
+# owning item's age, not the miss count (`_maybe_alert`).
+
+
+def _escalation_threshold(spec: ArtifactSpec) -> int:
+    """Consecutive confirmed-miss sweeps at which the owning item is
+    created — i.e. the sweep on which this row first reaches the critical
+    page path. A `warning` row reaches it via the WARNING_ESCALATION_RUNS
+    promotion; a `critical` row pages on its first confirmed miss."""
+    if spec.severity == "warning" and WARNING_ESCALATION_RUNS > 0:
+        return WARNING_ESCALATION_RUNS
+    return 1
+
+
 ISSUES_REPO = os.environ.get("ISSUES_REPO", "nousergon/alpha-engine-config")
 # Same SSM param overseer-dispatcher already reads (IAM-reuse convention) —
 # no new secret, just a new grant on the existing parameter.
@@ -863,6 +905,8 @@ def _serialize_check_results(
     coerced_ids: set[str] | None = None,
     issue_filed_by_id: dict[str, str | None] | None = None,
     suppression_by_id: dict[str, dict[str, Any]] | None = None,
+    owning_by_id: dict[str, dict[str, Any]] | None = None,
+    execution_loop: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the ``check_results.json`` payload — one row per spec for
     the dashboard surface (Phase 5). ``miss_counts``/``coerced_ids``
@@ -884,11 +928,30 @@ def _serialize_check_results(
     coerced_ids = coerced_ids or set()
     issue_filed_by_id = issue_filed_by_id or {}
     suppression_by_id = suppression_by_id or {}
+    owning_by_id = owning_by_id or {}
     rows = []
     for spec, result in pairs:
         suppression = suppression_by_id.get(spec.artifact_id)
+        # §7.4a: the RECORD carries the full owning-item block for every
+        # row that had one resolved — including rows whose page was
+        # console-only or suppressed. Suppression is a delivery decision,
+        # never a recording one.
+        owning = owning_by_id.get(spec.artifact_id) or {}
+        owning_item = owning.get("owning_item") or {}
         rows.append(
             {
+                "owning_item_number": owning_item.get("number"),
+                "owning_item_url": owning_item.get("url"),
+                "owning_item_title": owning_item.get("title"),
+                "owning_item_priority": owning_item.get("priority"),
+                "owning_item_age_days": owning_item.get("age_days"),
+                "owning_item_sla_days": owning_item.get("sla_days"),
+                "owning_item_members": [
+                    m["number"] for m in owning.get("members") or []
+                ],
+                "owning_item_lookup_attempted": bool(owning),
+                "owning_item_lookup_degraded": bool(owning.get("degraded")),
+                "owning_item_lookup_degraded_reason": owning.get("degraded_reason"),
                 "producer_trigger": (
                     suppression["trigger"] if suppression else None
                 ),
@@ -922,6 +985,10 @@ def _serialize_check_results(
         "run_at": now.isoformat(),
         "alerts_enabled": ALERTS_ENABLED,
         "n_entries": len(rows),
+        # §7.4a clause (c) — rendered alongside the rows so the console
+        # never has to fetch a second artifact to answer "is this class
+        # paging about a component or about an undrained backlog?".
+        "execution_loop": execution_loop,
         "results": rows,
     }
 
@@ -1034,6 +1101,114 @@ def _emit_cycle_metrics(cw_client: Any, verdict_payload: dict[str, Any]) -> None
     if metric_data:
         # Cadence set is ≤4 → one call, well under CW's 1000-metric cap.
         cw_client.put_metric_data(Namespace=CW_NAMESPACE, MetricData=metric_data)
+
+
+# ── The execution-loop number (observability-policy §7.4a clause c) ─────────
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    n = len(ordered)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    if n % 2:
+        return round(ordered[mid], 2)
+    return round((ordered[mid - 1] + ordered[mid]) / 2.0, 2)
+
+
+def _alert_class(spec: ArtifactSpec) -> str:
+    """The alert class this page belongs to. Cadence-scoped: a stable,
+    low-cardinality set a CW alarm can bind to, and the axis on which
+    "detection works, execution does not" actually differs."""
+    return f"{_FLOW_NAME}.{spec.cadence}"
+
+
+def _summarize_execution_loop(
+    pairs: list[tuple[ArtifactSpec, CheckResult]],
+    page_records: list[dict[str, Any]],
+    now: datetime,
+) -> dict[str, Any]:
+    """Per alert class: the fraction of pages fired against an ALREADY-OPEN
+    owning item, and the median age of that item at page time.
+
+    A high fraction is a backlog-drain defect, not a monitoring defect —
+    monitoring worked. §7.4a forbids the reachable remedy (raising the
+    class's cooldown to quiet it), because that deletes the only evidence
+    that the execution loop is not closing.
+
+    Every class present in this pass's registry walk gets a row, whether or
+    not it paged, plus an aggregate ``freshness-monitor.all``. A class that
+    fired nothing renders ``pages: 0`` — the denominator is published with
+    the ratio so 0.0 can never be read as "healthy" when it means "nothing
+    measured". ``lookup_degraded`` counts pages whose owning-item search
+    could not run: those pages are NOT in the denominator of a claim they
+    could not support.
+    """
+    classes: dict[str, dict[str, Any]] = {}
+    for spec, _result in pairs:
+        classes.setdefault(_alert_class(spec), {"pages": 0, "owned": 0,
+                                                "degraded": 0, "ages": []})
+    classes.setdefault(f"{_FLOW_NAME}.all", {"pages": 0, "owned": 0,
+                                             "degraded": 0, "ages": []})
+    for rec in page_records:
+        for key in (rec["alert_class"], f"{_FLOW_NAME}.all"):
+            bucket = classes.setdefault(
+                key, {"pages": 0, "owned": 0, "degraded": 0, "ages": []}
+            )
+            bucket["pages"] += 1
+            if rec.get("lookup_degraded"):
+                bucket["degraded"] += 1
+            if rec.get("owning_item_number") is not None:
+                bucket["owned"] += 1
+                bucket["ages"].append(float(rec.get("owning_item_age_days") or 0.0))
+    return {
+        "run_at": now.isoformat(),
+        "policy_clause": "OB-7.4a-recurring-pages-are-measured-against-the-execution-loop",
+        "classes": {
+            name: {
+                "pages": b["pages"],
+                "pages_with_open_owning_item": b["owned"],
+                "fraction_with_open_owning_item": (
+                    round(b["owned"] / b["pages"], 4) if b["pages"] else 0.0
+                ),
+                "median_owning_item_age_days_at_page": _median(b["ages"]),
+                "pages_with_degraded_lookup": b["degraded"],
+            }
+            for name, b in sorted(classes.items())
+        },
+    }
+
+
+def _emit_execution_loop_metrics(
+    cw_client: Any, payload: dict[str, Any]
+) -> None:
+    """Emit the §7.4a numbers to CW, dimensioned by ``AlertClass``. Emitted
+    on EVERY run, zero included — the absence of these datapoints means the
+    emitter is dead, never that the loop is healthy."""
+    metric_data = []
+    for name, stats in payload["classes"].items():
+        dims = [{"Name": "AlertClass", "Value": name}]
+        metric_data.extend([
+            {"MetricName": "AlertPages", "Dimensions": dims,
+             "Value": float(stats["pages"]), "Unit": "Count"},
+            {"MetricName": "AlertPagesWithOpenOwningItem", "Dimensions": dims,
+             "Value": float(stats["pages_with_open_owning_item"]), "Unit": "Count"},
+            {"MetricName": "AlertPagesWithOpenOwningItemFraction",
+             "Dimensions": dims,
+             "Value": float(stats["fraction_with_open_owning_item"]), "Unit": "None"},
+            {"MetricName": "OwningItemAgeDaysAtPageMedian", "Dimensions": dims,
+             "Value": float(stats["median_owning_item_age_days_at_page"]),
+             "Unit": "None"},
+            {"MetricName": "OwningItemLookupDegraded", "Dimensions": dims,
+             "Value": float(stats["pages_with_degraded_lookup"]), "Unit": "Count"},
+        ])
+    # CW caps a single PutMetricData at 1000 datapoints; classes are
+    # cadence-scoped (≤6) × 5 metrics, so one call always suffices.
+    for i in range(0, len(metric_data), 900):
+        cw_client.put_metric_data(
+            Namespace=CW_NAMESPACE, MetricData=metric_data[i:i + 900]
+        )
 
 
 def _emit_cycle_verdict_error(stage: str) -> None:
@@ -1384,9 +1559,359 @@ def _maybe_dispatch_drain(
 _ALERTING_STATES = frozenset({"missing", "stale", "probe_failed"})
 
 
+# ── Owning-item resolution (observability-policy §7.4a) ─────────────────────
+#
+# alpha-engine-config-I7326 / nous-ergon-ops-PR661. On 2026-08-14 08:00 UTC
+# this monitor paged CRITICAL for `director_retro` after 13 consecutive
+# misses. At that moment alpha-engine-config-I6562 — which had root-caused
+# the exact condition nine days earlier — was open, ungated and unexecuted,
+# and three further open P1s (#6155, #6345, #6747) described the same
+# condition. The page named none of them, and its `after_consecutive_miss_
+# runs=13` would have read identically had no fix ever been filed.
+#
+# Three obligations, one per registered §7.4a clause:
+#
+#   (a) OB-7.4a-a-page-names-its-owning-tracked-item — before emitting, the
+#       artifact_id is resolved against the OPEN issues of ISSUES_REPO and
+#       the owning item's number, title, age and priority go in the body.
+#       The monitor already tracked `issue_filed_url` (config#2055), but
+#       that join is self-referential: it only ever knew about issues THIS
+#       Lambda filed, which is precisely why #6562 — filed by a human — was
+#       invisible. The resolution below is the union of the two.
+#   (b) OB-7.4a-escalation-tracks-the-owning-items-age-not-the-miss-count —
+#       see `_maybe_alert`: where an owning item is open, the warning→
+#       critical promotion is a function of that item's age against its
+#       priority SLA. Where none is open, the miss-count ladder stands AND
+#       crossing it CREATES the owning item (see `_escalation_threshold`) —
+#       creation IS the escalation, not a second rung above it.
+#   (c) OB-7.4a-recurring-pages-are-measured-against-the-execution-loop —
+#       see `_summarize_execution_loop`.
+#
+# NOT SUPPRESSION. Nothing here removes a record. A row whose page is not
+# delivered still carries its true state, its full owning-item block and its
+# console row into check_results.json, exactly as config-I6570's producer
+# suppression does. No cooldown or grace window is widened by this path;
+# `test_cooldown_constants_are_not_a_noise_remedy` pins that.
+
+# Read-only GitHub search over ISSUES_REPO. Reuses the SSM PAT and the
+# egress path `_file_escalation_issue` already uses — no new grant, no new
+# secret, so a code-only deploy is sufficient.
+OWNING_ITEM_LOOKUP_ENABLED = (
+    os.environ.get("FRESHNESS_OWNING_ITEM_LOOKUP", "true").lower() == "true"
+)
+_OWNING_ITEM_TIMEOUT_SEC = int(
+    os.environ.get("OWNING_ITEM_LOOKUP_TIMEOUT_SEC", "10")
+)
+# GitHub's search API allows 30 authenticated requests/minute. A sweep with
+# many simultaneous misses must not spend the whole budget and then fail the
+# rest opaquely: past this cap the remaining rows resolve DEGRADED with an
+# explicit reason, which is a recorded fact rather than a silent absence.
+OWNING_ITEM_LOOKUP_MAX_QUERIES = int(
+    os.environ.get("OWNING_ITEM_LOOKUP_MAX_QUERIES", "24")
+)
+# Age at which an open item of each priority stops being "in progress" and
+# starts being the actionable fact. A P1 open nine days escalates because it
+# is a P1 open nine days.
+PRIORITY_SLA_DAYS = {"P0": 1, "P1": 3, "P2": 14, "P3": 30}
+DEFAULT_PRIORITY_SLA_DAYS = int(
+    os.environ.get("OWNING_ITEM_DEFAULT_SLA_DAYS", "7")
+)
+_PRIORITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+# Cap on how many sibling items a single page names, so one page can never
+# become a wall. The full candidate set is still written to
+# check_results.json — this trims the DELIVERED view, never the record.
+_OWNING_ITEM_MEMBERS_IN_BODY = 5
+
+
+def _new_lookup_state() -> dict[str, Any]:
+    """Per-pass owning-item lookup state: one SSM PAT read, one query
+    budget, one per-artifact result cache."""
+    return {"pat": None, "pat_error": None, "queries": 0, "cache": {}}
+
+
+def _unresolved(reason: str) -> dict[str, Any]:
+    """A resolution that could not be made. `degraded=True` is what the
+    page prints as `owning_item=unknown owning_item_lookup=degraded` and
+    what the execution-loop metric counts — an unreachable tracker must
+    still page, and must never look like 'no owning item exists'."""
+    return {
+        "resolved": False,
+        "degraded": True,
+        "degraded_reason": reason,
+        "owning_item": None,
+        "members": [],
+        "n_candidates": 0,
+    }
+
+
+def _read_github_pat() -> str:
+    """SSM-sourced GitHub PAT — the same parameter and client construction
+    `_file_escalation_issue` has always used (IAM-reuse convention)."""
+    return boto3.client(
+        "ssm", region_name=os.environ.get("AWS_REGION", "us-east-1")
+    ).get_parameter(Name=GH_PAT_SSM, WithDecryption=True)["Parameter"]["Value"]
+
+
+def _cached_github_pat(state: dict[str, Any]) -> str | None:
+    """One SSM read per pass. A failure is sticky for the pass and carries
+    its reason into every subsequent `_unresolved`."""
+    if state.get("pat"):
+        return state["pat"]
+    if state.get("pat_error"):
+        return None
+    try:
+        state["pat"] = _read_github_pat()
+        return state["pat"]
+    except Exception as exc:  # noqa: BLE001 — degrades to "owning item unknown"; recording surfaces: this WARNING, the row's owning_item_lookup_degraded_reason, the OwningItemLookupDegraded CW metric
+        state["pat_error"] = f"pat_read_failed: {type(exc).__name__}: {exc}"
+        logger.warning(
+            "owning-item lookup (§7.4a) cannot authenticate — pages will "
+            "carry owning_item=unknown for this pass: %s", state["pat_error"],
+        )
+        return None
+
+
+def _github_search_open_issues(term: str, pat: str) -> list[dict]:
+    """One quoted-phrase search over ISSUES_REPO's OPEN issues. Raises on
+    failure — the caller owns the degrade."""
+    query = f'repo:{ISSUES_REPO} is:issue is:open "{term}"'
+    url = (
+        "https://api.github.com/search/issues?per_page=20&sort=created"
+        "&order=asc&q=" + urllib.parse.quote(query, safe="")
+    )
+    req = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {pat}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "freshness-monitor",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=_OWNING_ITEM_TIMEOUT_SEC) as resp:
+        payload = json.loads(resp.read())
+    items = payload.get("items") or []
+    return [i for i in items if isinstance(i, dict) and i.get("number")]
+
+
+def _search_terms(artifact_id: str, canonical_key: str) -> list[str]:
+    """Search terms derived from the alert's own §7.2 signature.
+
+    The artifact_id verbatim is the exact key both the registry row and a
+    machine-filed item use. The hyphen/space variants exist because a HUMAN
+    writes the condition in prose — #6562's title says `director-retro-judge`,
+    which an exact `director_retro` match misses entirely, and missing it is
+    the whole measured defect. The canonical key's own directory prefix
+    catches items that name the S3 path instead of the artifact.
+    """
+    terms = [artifact_id]
+    for variant in (artifact_id.replace("_", "-"), artifact_id.replace("_", " ")):
+        if variant not in terms:
+            terms.append(variant)
+    prefix = (canonical_key or "").split("/", 1)[0]
+    # A date-shaped or empty first segment is not a stable identifier.
+    if prefix and not prefix[:1].isdigit() and prefix not in terms:
+        terms.append(prefix)
+    return terms
+
+
+def _priority_of(issue: dict) -> str | None:
+    for label in issue.get("labels") or []:
+        name = label.get("name") if isinstance(label, dict) else str(label)
+        if name in PRIORITY_SLA_DAYS:
+            return name
+    return None
+
+
+def _age_days(created_at: str | None, now: datetime) -> float:
+    if not created_at:
+        return 0.0
+    try:
+        created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return round(max((now - created).total_seconds(), 0.0) / 86400.0, 2)
+
+
+def _summarize_issue(
+    issue: dict, now: datetime, known_artifact_ids: set[str],
+) -> dict[str, Any]:
+    priority = _priority_of(issue)
+    haystack = f"{issue.get('title') or ''}\n{issue.get('body') or ''}"
+    return {
+        "number": int(issue["number"]),
+        "url": issue.get("html_url"),
+        "title": (issue.get("title") or "")[:160],
+        "priority": priority,
+        "sla_days": PRIORITY_SLA_DAYS.get(priority, DEFAULT_PRIORITY_SLA_DAYS),
+        "age_days": _age_days(issue.get("created_at"), now),
+        "created_at": issue.get("created_at"),
+        # Specificity: how many OTHER registry artifacts this item also
+        # claims. An item naming four stale artifacts is over-broad relative
+        # to one naming exactly this artifact's cause.
+        "n_artifacts_named": sum(
+            1 for aid in known_artifact_ids if aid and aid in haystack
+        ),
+    }
+
+
+def _rank_key(item: dict[str, Any]) -> tuple:
+    """Deterministic cause-ownership order (§7.4a's many-items-one-cause
+    rule): highest priority first, then the NARROWEST claim, then the
+    oldest — the item that has gone unexecuted longest owns the cause, and
+    a broader item that merely contains this artifact is a member, never
+    the owner."""
+    return (
+        _PRIORITY_RANK.get(item["priority"], 9),
+        item["n_artifacts_named"] if item["n_artifacts_named"] else 99,
+        item["created_at"] or "",
+        item["number"],
+    )
+
+
+def _resolve_owning_item(
+    artifact_id: str,
+    canonical_key: str,
+    known_artifact_ids: set[str],
+    now: datetime,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve the OPEN tracked item that owns this artifact's condition.
+
+    Union of two sources, which is the point: the self-filed
+    `issue_filed_url` this monitor already carried, plus a search over
+    ISSUES_REPO that also sees items a HUMAN filed. Returns a resolution
+    dict — never None, never raises. A search that cannot run degrades to
+    `owning_item=None, degraded=True` WITH a reason: the page still fires,
+    and the degradation is itself a recorded, alarmable fact.
+    """
+    if not OWNING_ITEM_LOOKUP_ENABLED:
+        return _unresolved("lookup_disabled")
+    cached = state["cache"].get(artifact_id)
+    if cached is not None:
+        return cached
+
+    pat = _cached_github_pat(state)
+    if pat is None:
+        resolution = _unresolved(state.get("pat_error") or "pat_unavailable")
+        state["cache"][artifact_id] = resolution
+        return resolution
+
+    by_number: dict[int, dict] = {}
+    errors: list[str] = []
+    ran_any = False
+    for term in _search_terms(artifact_id, canonical_key):
+        if state["queries"] >= OWNING_ITEM_LOOKUP_MAX_QUERIES:
+            errors.append("lookup_budget_exhausted")
+            break
+        state["queries"] += 1
+        try:
+            for issue in _github_search_open_issues(term, pat):
+                by_number.setdefault(int(issue["number"]), issue)
+            ran_any = True
+        except Exception as exc:  # noqa: BLE001 — a single failed query degrades that term only; recording surfaces: `errors` → degraded_reason on the page and in check_results.json, plus the OwningItemLookupDegraded CW metric
+            errors.append(f"{term}: {type(exc).__name__}: {exc}")
+
+    if not ran_any:
+        resolution = _unresolved("; ".join(errors) or "no_query_ran")
+        state["cache"][artifact_id] = resolution
+        return resolution
+
+    ranked = sorted(
+        (_summarize_issue(i, now, known_artifact_ids) for i in by_number.values()),
+        key=_rank_key,
+    )
+    resolution = {
+        "resolved": True,
+        # A PARTIAL search still resolved something, but the operator is
+        # told the candidate set may be incomplete.
+        "degraded": bool(errors),
+        "degraded_reason": "; ".join(errors) or None,
+        "owning_item": ranked[0] if ranked else None,
+        "members": ranked[1:],
+        "n_candidates": len(ranked),
+    }
+    state["cache"][artifact_id] = resolution
+    return resolution
+
+
+def _merge_self_filed(
+    resolution: dict[str, Any], self_filed_url: str | None,
+) -> dict[str, Any]:
+    """Union the self-filed marker into the resolution. The search is the
+    richer source (it carries priority and age), so a self-filed URL only
+    matters when the search found nothing or could not run — otherwise the
+    monitor would report a stale marker as the owner while a human's item
+    outranks it."""
+    if not self_filed_url or resolution.get("owning_item"):
+        return resolution
+    try:
+        number = int(str(self_filed_url).rstrip("/").rsplit("/", 1)[-1])
+    except (ValueError, IndexError):
+        return resolution
+    merged = dict(resolution)
+    merged["owning_item"] = {
+        "number": number,
+        "url": self_filed_url,
+        "title": "(self-filed extended-staleness escalation)",
+        "priority": "P1",
+        "sla_days": PRIORITY_SLA_DAYS["P1"],
+        # Unknown from the marker alone; 0.0 keeps the age-driven ladder
+        # from escalating on a fact we do not have. The miss-count ladder
+        # is not disabled by a self-filed item (see `_maybe_alert`).
+        "age_days": 0.0,
+        "created_at": None,
+        "n_artifacts_named": 1,
+        "source": "self_filed_marker",
+    }
+    merged["n_candidates"] = merged.get("n_candidates", 0) + 1
+    return merged
+
+
+def _owning_item_body_fragment(owning: dict[str, Any] | None) -> str:
+    """The §7.4a clause-(a) half of the notification body. Exactly one of
+    three shapes, and never silence — an absent lookup and an absent item
+    are different facts and must not read the same."""
+    if owning is None:
+        return "owning_item=unknown owning_item_lookup=not_attempted"
+    item = owning.get("owning_item")
+    if item is None:
+        if owning.get("degraded"):
+            return (
+                "owning_item=unknown owning_item_lookup=degraded "
+                f"owning_item_lookup_reason={owning.get('degraded_reason')!r}"
+            )
+        return "owning_item=none owning_item_lookup=ok"
+    frag = (
+        f"owning_item=#{item['number']} "
+        f"owning_item_priority={item.get('priority') or 'unlabelled'} "
+        f"owning_item_age_days={item['age_days']} "
+        f"owning_item_sla_days={item['sla_days']} "
+        f"owning_item_url={item.get('url')} "
+        f"owning_item_title={item.get('title')!r}"
+    )
+    members = owning.get("members") or []
+    if members:
+        shown = members[:_OWNING_ITEM_MEMBERS_IN_BODY]
+        frag += (
+            " owning_item_members="
+            + ",".join(f"#{m['number']}" for m in shown)
+            + f" owning_item_members_total={len(members)}"
+        )
+    if owning.get("degraded"):
+        frag += (
+            " owning_item_lookup=degraded "
+            f"owning_item_lookup_reason={owning.get('degraded_reason')!r}"
+        )
+    return frag
+
+
 def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
                  consecutive_miss_runs: int = 0,
-                 producer_suppression: dict[str, Any] | None = None) -> bool:
+                 producer_suppression: dict[str, Any] | None = None,
+                 owning: dict[str, Any] | None = None) -> bool:
     """Route an alert for a non-fresh probe result. Returns True if
     publish was attempted (OBSERVE-mode short-circuit returns False).
 
@@ -1448,17 +1973,32 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
     # console-only is the designed noise floor; a PERSISTENT warning is an
     # incident nobody is looking at (the I3053 champion-feed staleness sat
     # on dashboard page 26 for days).
-    escalated = (
-        severity == "warning"
-        and WARNING_ESCALATION_RUNS > 0
-        and consecutive_miss_runs >= WARNING_ESCALATION_RUNS
-    )
+    #
+    # §7.4a (I7326) supersedes the BASIS of that promotion whenever an
+    # owning item is open: a miss count measures how long the artifact has
+    # been absent, which stops being the actionable question the moment the
+    # cause is known and filed. What is actionable then is that a diagnosed
+    # defect has gone unexecuted for N days against its priority's SLA. The
+    # miss-count ladder remains in force for an UNDIAGNOSED condition (no
+    # owning item), where it is still the only clock available.
+    owning_item = (owning or {}).get("owning_item")
+    escalation_basis = "miss_count"
+    if severity == "warning" and owning_item and owning_item.get("created_at"):
+        escalation_basis = "owning_item_age"
+        escalated = owning_item["age_days"] >= owning_item["sla_days"]
+    else:
+        escalated = (
+            severity == "warning"
+            and WARNING_ESCALATION_RUNS > 0
+            and consecutive_miss_runs >= WARNING_ESCALATION_RUNS
+        )
     if escalated:
         severity = "critical"
         logger.info(
-            "warning-escalation (config-I3086): %s confirmed-missing for %d "
-            "consecutive sweeps — paging via critical path",
-            spec.artifact_id, consecutive_miss_runs,
+            "warning-escalation: %s paging via critical path (basis=%s, "
+            "consecutive_miss_runs=%d, owning_item=%s)",
+            spec.artifact_id, escalation_basis, consecutive_miss_runs,
+            (owning_item or {}).get("number"),
         )
 
     # Registry convention: severity=warning means dashboard/console-only —
@@ -1485,9 +2025,10 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
     )
     if escalated:
         body += (
-            f" escalated_from=warning after_consecutive_miss_runs="
-            f"{consecutive_miss_runs}"
+            f" escalated_from=warning escalation_basis={escalation_basis}"
+            f" after_consecutive_miss_runs={consecutive_miss_runs}"
         )
+    body += " " + _owning_item_body_fragment(owning)
     dedup_key = resolve_dedup_key(spec, now)
 
     # config-I6796: `publish()` is the only channel here whose dedup actually
@@ -1529,6 +2070,9 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
             "artifact_id": spec.artifact_id,
             "state": result.state,
             "owner_repo": spec.owner_repo,
+            "owning_item": (owning_item or {}).get("number"),
+            "owning_item_age_days": (owning_item or {}).get("age_days"),
+            "escalation_basis": escalation_basis,
         },
     )
     return True
@@ -1552,14 +2096,20 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
 
 def _file_escalation_issue(
     artifact_id: str, owner_repo: str, miss_runs: int, anchor_id: str,
+    threshold: int, owning_degraded_reason: str | None = None,
 ) -> dict:
     """File the extended-staleness P1 on ISSUES_REPO. Best-effort — the
     WARNING log + the returned dict (persisted into check_results.json's
-    ``issue_filed_url`` for dedup) are the other recording surfaces."""
+    ``issue_filed_url`` for dedup) are the other recording surfaces.
+
+    ``owning_degraded_reason`` is set when the §7.4a owning-item search
+    could not run, so this filing may duplicate an item that already
+    exists. It is filed anyway — the codebase-wide convention is to fail
+    toward action, never toward silence — and the reason is written into
+    the body so the duplicate is reconcilable rather than mysterious.
+    """
     try:
-        pat = boto3.client("ssm", region_name=os.environ.get("AWS_REGION", "us-east-1")).get_parameter(
-            Name=GH_PAT_SSM, WithDecryption=True
-        )["Parameter"]["Value"]
+        pat = _read_github_pat()
         body = "\n".join([
             f"`{artifact_id}` (owner: `{owner_repo}`) has been confirmed-missing/"
             f"stale for {miss_runs} consecutive daily freshness sweeps via its "
@@ -1588,8 +2138,19 @@ def _file_escalation_issue(
             "",
             f"- **Anchor (liveness proxy):** `{anchor_id}`",
             f"- **Consecutive confirmed-miss daily sweeps:** {miss_runs} "
-            f"(threshold: {ISSUE_ESCALATION_RUNS})",
-            "- **Filed via:** alpha-engine-freshness-monitor (config#2055 Gap 2)",
+            f"(threshold: {threshold})",
+            "- **Filed via:** alpha-engine-freshness-monitor (config#2055 Gap 2, "
+            "observability-policy §7.4a / I7326 — creating this item IS the "
+            "escalation's first action)",
+            *(
+                [
+                    "- **Owning-item search DEGRADED at filing time** "
+                    f"(`{owning_degraded_reason}`) — this item may duplicate "
+                    "an existing open item for the same condition. Reconcile "
+                    "at the cause per §7.4a; do not silence either."
+                ]
+                if owning_degraded_reason else []
+            ),
             "",
             "Closes-when: the underlying staleness is resolved (producer fixed "
             "and a fresh write confirmed) or explicitly acknowledged as "
@@ -1632,9 +2193,20 @@ def _escalate_stale_key_deliverables(
     escalate_to_issue_by_id: dict[str, bool],
     prev_issue_filed: dict[str, str],
     now: datetime,
+    owning_by_id: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, str | None]:
     """For every ``escalate_to_issue``-flagged spec, file a Decision-Queue
-    P1 once its confirmed-miss streak crosses :data:`ISSUE_ESCALATION_RUNS`.
+    P1 once its confirmed-miss streak reaches :func:`_escalation_threshold`
+    — the sweep on which the row first reaches the critical page path.
+    Creating the owning item is the escalation's FIRST action (§7.4a).
+
+    ``owning_by_id`` carries this pass's §7.4a resolutions. An artifact
+    with an already-open owning item — including one a HUMAN filed, which
+    the self-referential ``prev_issue_filed`` marker could never see — does
+    NOT get a second item; the page names the existing one instead. Where
+    the search DEGRADED, the item is filed anyway with the degradation
+    recorded in its body: failing toward a possible duplicate is the
+    cheaper error than failing toward an untracked condition.
 
     An ``event_driven`` row's OWN ``check_freshness`` result always
     short-circuits to ``fresh`` (see the event-driven short-circuit in
@@ -1653,6 +2225,7 @@ def _escalate_stale_key_deliverables(
     """
     if not escalate_to_issue_by_id:
         return {}
+    owning_by_id = owning_by_id or {}
     results_by_id = {spec.artifact_id: (spec, result) for spec, result in pairs}
     issue_filed_by_id: dict[str, str | None] = {}
     for artifact_id in escalate_to_issue_by_id:
@@ -1664,6 +2237,8 @@ def _escalate_stale_key_deliverables(
             spec.liveness_via if spec.cadence == "event_driven" else spec.artifact_id
         )
         anchor_miss = miss_counts.get(anchor_id, 0)
+        anchor_spec = (results_by_id.get(anchor_id) or (spec, None))[0]
+        threshold = _escalation_threshold(anchor_spec)
 
         if anchor_miss == 0:
             # Recovered (or never missing) — clear any sticky marker so a
@@ -1678,6 +2253,21 @@ def _escalate_stale_key_deliverables(
             issue_filed_by_id[artifact_id] = already_filed
             continue
 
+        # §7.4a: an item that already OWNS this condition — whoever filed
+        # it — is the escalation. Filing a second one is the overlapping-
+        # items defect the clause exists to stop.
+        owning = owning_by_id.get(artifact_id) or owning_by_id.get(anchor_id) or {}
+        owning_item = owning.get("owning_item")
+        if owning_item:
+            logger.info(
+                "§7.4a: not filing for %s — open owning item #%s (%s, %.1fd) "
+                "already owns this condition; the page names it instead",
+                artifact_id, owning_item["number"],
+                owning_item.get("priority"), owning_item.get("age_days", 0.0),
+            )
+            issue_filed_by_id[artifact_id] = None
+            continue
+
         if not ALERTS_ENABLED:
             logger.info(
                 "OBSERVE-mode: would escalate %s to Decision Queue P1 "
@@ -1686,11 +2276,14 @@ def _escalate_stale_key_deliverables(
             issue_filed_by_id[artifact_id] = None
             continue
 
-        if anchor_miss < ISSUE_ESCALATION_RUNS:
+        if anchor_miss < threshold:
             issue_filed_by_id[artifact_id] = None
             continue
 
-        filed = _file_escalation_issue(artifact_id, spec.owner_repo, anchor_miss, anchor_id)
+        filed = _file_escalation_issue(
+            artifact_id, spec.owner_repo, anchor_miss, anchor_id, threshold,
+            owning.get("degraded_reason") if owning.get("degraded") else None,
+        )
         issue_filed_by_id[artifact_id] = filed.get("url") if filed.get("filed") else None
 
     return issue_filed_by_id
@@ -2021,7 +2614,8 @@ def _handle_intraday(s3_client: Any, now: datetime, started_at: float) -> dict:
         s3_client, intraday_triggers, now
     )
 
-    pairs, alerted, dispatched, per_spec_exceptions, _miss_counts = _run_probe_pass(
+    (pairs, alerted, dispatched, per_spec_exceptions, _miss_counts,
+     _telemetry) = _run_probe_pass(
         s3_client, intraday_specs, recovery_by_id, now,
         remediation_by_id=remediation_by_id,
         suppression_by_id=suppression_by_id,
@@ -2056,9 +2650,15 @@ def _run_probe_pass(
     prev_miss_counts: dict[str, int] | None = None,
     remediation_by_id: dict[str, str] | None = None,
     suppression_by_id: dict[str, dict[str, Any]] | None = None,
-) -> tuple[list[tuple[ArtifactSpec, CheckResult]], int, int, int, dict[str, int]]:
+    prev_issue_filed: dict[str, str] | None = None,
+) -> tuple[
+    list[tuple[ArtifactSpec, CheckResult]], int, int, int, dict[str, int],
+    dict[str, Any],
+]:
     """Walk ``specs``, probe each, dispatch confirmed-miss recoveries, and
-    alert. Returns ``(pairs, alerted, dispatched, per_spec_exceptions)``.
+    alert. Returns ``(pairs, alerted, dispatched, per_spec_exceptions,
+    miss_counts, telemetry)`` where ``telemetry`` carries the §7.4a
+    per-artifact owning-item resolutions and one record per page fired.
 
     config-I3282: after the walk, one aggregated event-time drain dispatch
     fires for the pass's critical pages (see :func:`_maybe_dispatch_drain`
@@ -2085,6 +2685,13 @@ def _run_probe_pass(
     remediation_by_id = remediation_by_id or {}
     miss_counts: dict[str, int] = {}
     drain_candidates: list[str] = []
+    # §7.4a (I7326) — one SSM PAT read and one query budget for the whole
+    # pass; resolutions are per-artifact and cached inside the state.
+    prev_issue_filed = prev_issue_filed or {}
+    lookup_state = _new_lookup_state()
+    known_artifact_ids = {s.artifact_id for s in specs}
+    owning_by_id: dict[str, dict[str, Any]] = {}
+    page_records: list[dict[str, Any]] = []
     # Per-pass cache of lazily-created SF/Lambda clients (shared across the
     # walk so a pass dispatching several recoveries reuses one client each).
     aws_clients: dict[str, Any] = {}
@@ -2129,13 +2736,56 @@ def _run_probe_pass(
             and isinstance(recovery, dict)
             and recovery.get("mode", "dispatch_and_page") == "dispatch"
         )
+        # §7.4a clause (a): resolve the OPEN tracked item that owns this
+        # condition BEFORE emitting, so the page can name it. Only for
+        # confirmed misses — a fresh row has no condition to own. Trapped:
+        # the tracker is not allowed to decide whether the operator is
+        # paged, so an unreachable GitHub API degrades to
+        # `owning_item=unknown` and the page still fires. Recording
+        # surfaces: the WARNING below, `owning_item_lookup_degraded_reason`
+        # on the check_results row, and the OwningItemLookupDegraded metric.
+        owning: dict[str, Any] | None = None
+        if _is_confirmed_miss(result):
+            try:
+                owning = _resolve_owning_item(
+                    spec.artifact_id, result.canonical_key,
+                    known_artifact_ids, now, lookup_state,
+                )
+            except Exception as owning_exc:  # noqa: BLE001 — the join must never sink a page
+                logger.warning(
+                    "owning-item resolution for %s raised (non-fatal): %s",
+                    spec.artifact_id, owning_exc, exc_info=True,
+                )
+                owning = _unresolved(
+                    f"resolver_raised: {type(owning_exc).__name__}: {owning_exc}"
+                )
+            owning = _merge_self_filed(
+                owning, prev_issue_filed.get(spec.artifact_id)
+            )
+            owning_by_id[spec.artifact_id] = owning
+
         paged = False
         if not suppress_page and _maybe_alert(
                 spec, result, now, consecutive_miss_runs=miss_runs,
                 producer_suppression=(suppression_by_id or {}).get(
-                    spec.artifact_id)):
+                    spec.artifact_id),
+                owning=owning):
             alerted += 1
             paged = True
+
+        if paged:
+            owning_item = (owning or {}).get("owning_item")
+            page_records.append({
+                "artifact_id": spec.artifact_id,
+                "alert_class": _alert_class(spec),
+                "owning_item_number": (
+                    owning_item["number"] if owning_item else None
+                ),
+                "owning_item_age_days": (
+                    owning_item["age_days"] if owning_item else None
+                ),
+                "lookup_degraded": bool((owning or {}).get("degraded")),
+            })
 
         # config-I3282 — collect this pass's dispatch-eligible critical
         # pages. `_maybe_alert` returns True ONLY on an actual critical
@@ -2162,7 +2812,10 @@ def _run_probe_pass(
             sorted(drain_candidates), drain_exc, exc_info=True,
         )
 
-    return pairs, alerted, dispatched, per_spec_exceptions, miss_counts
+    return (
+        pairs, alerted, dispatched, per_spec_exceptions, miss_counts,
+        {"owning_by_id": owning_by_id, "page_records": page_records},
+    )
 
 
 # ── Main handler ────────────────────────────────────────────────────────────
@@ -2241,19 +2894,43 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         s3, now, set(producer_trigger_by_id.values())
     )
 
-    pairs, alerted, dispatched, per_spec_exceptions, miss_counts = _run_probe_pass(
+    # Read BEFORE the pass: the §7.4a owning-item resolution unions the
+    # self-filed marker with the tracker search, and the pass is where the
+    # pages are composed.
+    prev_issue_filed = _load_prev_issue_filed(s3)
+
+    (pairs, alerted, dispatched, per_spec_exceptions, miss_counts,
+     pass_telemetry) = _run_probe_pass(
         s3, specs, recovery_by_id, now, prev_miss_counts,
         remediation_by_id=remediation_by_id,
         suppression_by_id=suppression_by_id,
+        prev_issue_filed=prev_issue_filed,
     )
+    owning_by_id = pass_telemetry["owning_by_id"]
 
-    # config#2055 Gap 2: extended-staleness -> Decision Queue P1. Runs after
-    # the full pass so flagged `event_driven` rows can look up their
-    # `liveness_via` ANCHOR's miss-streak from this same sweep (their own
+    # config#2055 Gap 2 + §7.4a: extended-staleness -> Decision Queue P1,
+    # skipped where an item already owns the condition. Runs after the full
+    # pass so flagged `event_driven` rows can look up their `liveness_via`
+    # ANCHOR's miss-streak from this same sweep (their own
     # `consecutive_miss_runs` is always 0 — event_driven never self-pages).
-    prev_issue_filed = _load_prev_issue_filed(s3)
     issue_filed_by_id = _escalate_stale_key_deliverables(
         pairs, miss_counts, escalate_to_issue_by_id, prev_issue_filed, now,
+        owning_by_id=owning_by_id,
+    )
+
+    # §7.4a clause (c) — the number, computed every run including the run
+    # where it is all zeros.
+    execution_loop = _summarize_execution_loop(
+        pairs, pass_telemetry["page_records"], now,
+    )
+    _all = execution_loop["classes"][f"{_FLOW_NAME}.all"]
+    logger.info(
+        "§7.4a execution-loop: pages=%d with_open_owning_item=%d "
+        "fraction=%.4f median_owning_item_age_days=%.2f degraded_lookups=%d",
+        _all["pages"], _all["pages_with_open_owning_item"],
+        _all["fraction_with_open_owning_item"],
+        _all["median_owning_item_age_days_at_page"],
+        _all["pages_with_degraded_lookup"],
     )
 
     # Emit dashboard surface + self-heartbeat.
@@ -2261,11 +2938,34 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         pairs, now, miss_counts=miss_counts, coerced_ids=coerced_ids,
         issue_filed_by_id=issue_filed_by_id,
         suppression_by_id=suppression_by_id,
+        owning_by_id=owning_by_id,
+        execution_loop=execution_loop,
     )
     heartbeat = _serialize_heartbeat(pairs, now, started_at)
 
     _put_json(s3, REGISTRY_BUCKET, CHECK_RESULTS_KEY, check_results)
     _put_json(s3, REGISTRY_BUCKET, HEARTBEAT_KEY, heartbeat)
+
+    # §7.4a clause (c) durable surface + CW metrics. Split into independent
+    # traps for the same reason the cycle-verdict pair is (config#1236): a
+    # CW-grant regression must not suppress the S3 artifact, and a swallowed
+    # failure here is alarmable via ArtifactFreshnessCycleVerdictError rather
+    # than only visible as a stale execution_loop.json.
+    try:
+        _put_json(s3, REGISTRY_BUCKET, EXECUTION_LOOP_KEY, execution_loop)
+    except Exception as exc:  # noqa: BLE001 — secondary observability; recording surfaces: this ERROR, the CW Stage=execution_loop_s3_write datapoint, and the staleness of execution_loop.json itself
+        logger.error(
+            "execution-loop S3 write failed (non-fatal): %s", exc, exc_info=True
+        )
+        _emit_cycle_verdict_error("execution_loop_s3_write")
+    try:
+        _emit_execution_loop_metrics(boto3.client("cloudwatch"), execution_loop)
+    except Exception as exc:  # noqa: BLE001 — secondary observability; recording surfaces: this ERROR, the CW Stage=execution_loop_cw_emit datapoint, and execution_loop.json (already written above)
+        logger.error(
+            "execution-loop CW metric emit failed (non-fatal): %s", exc,
+            exc_info=True,
+        )
+        _emit_cycle_verdict_error("execution_loop_cw_emit")
 
     # ── Per-cycle completion rollup (L249 consumer) ─────────────────────
     # Secondary observability hung off the primary probe pass. The artifact
@@ -2333,4 +3033,5 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         "per_spec_exceptions": per_spec_exceptions,
         "duration_seconds": heartbeat["duration_seconds"],
         "cycle_verdicts": cycle_verdicts,
+        "execution_loop": execution_loop["classes"],
     }
