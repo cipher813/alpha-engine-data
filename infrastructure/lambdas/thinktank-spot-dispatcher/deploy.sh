@@ -145,18 +145,16 @@ if [ "$CUTOVER" -eq 1 ]; then
     OLD_FUNCTION="alpha-engine-research-thinktank"
     DISPATCH_ALARM="alpha-engine-thinktank-spot-dispatch-failed"
 
-    echo "==> arming $DISPATCH_ALARM on the dispatcher"
-    aws cloudwatch put-metric-alarm \
-        --alarm-name "$DISPATCH_ALARM" \
-        --alarm-description "The daily Think Tank DISPATCH failed: >= 3 Lambda Errors in a day = the initial EventBridge invoke plus both async retries all raised, so no spot box was launched and the day has no Think Tank run. NOTE this alarm covers the LAUNCH only. A box that boots and then fails its run is NOT visible here -- that is covered end-to-end by the ARTIFACT_REGISTRY row thinktank_challenger_selection (continuous, 1440min interval, 720min SLA), which pages when the artifact itself goes stale. Both are required: this one catches 'never launched', the freshness row catches 'launched and produced nothing'." \
-        --namespace "AWS/Lambda" \
-        --metric-name Errors \
-        --dimensions "Name=FunctionName,Value=${FUNCTION_NAME}" \
-        --statistic Sum --period 86400 --evaluation-periods 1 \
-        --threshold 3 --comparison-operator GreaterThanOrEqualToThreshold \
-        --treat-missing-data notBreaching \
-        --alarm-actions "$SNS_TOPIC_ARN" --region "$REGION" \
-        "$(alarm_actions_flag "$DISPATCH_ALARM")"
+    # RETIRED as an alarm-creation path (alpha-engine-config-I7359, executing
+    # the I7359 ownership ruling). $DISPATCH_ALARM is codified in the PRIVATE
+    # nous-ergon-ops repo:
+    #   infrastructure/cloudwatch/alarms/alpha-engine-thinktank-spot-dispatch-failed.json
+    # Edit it there; do not add put-metric-alarm back here —
+    # nousergon-data/tests/test_no_imperative_alarm_authorship.py fails the
+    # build if it reappears. This one-time CUTOVER path already ran; the
+    # alarm this block used to arm on first cutover already exists live and
+    # is now codified, so nothing here needs to (re-)create it.
+    echo "==> $DISPATCH_ALARM is applied from nous-ergon-ops, not here (alpha-engine-config-I7359)"
 
     echo "==> deleting the now-blind $OLD_FUNCTION alarms"
     aws cloudwatch delete-alarms --alarm-names \
