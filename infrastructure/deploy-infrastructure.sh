@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # infrastructure/deploy-infrastructure.sh — Deploy Alpha Engine orchestration infrastructure.
 #
-# Uploads Step Function definitions to S3, then deploys/updates the CloudFormation
-# stack. Also updates the state machines directly (CloudFormation can't update
-# Step Function definitions from S3 on stack update — it only reads on create).
+# Uploads the CFN template AND the Step Function definitions to S3, then
+# deploys/updates the CloudFormation stack via --template-url (not inline
+# --template-body — see alpha-engine-config-I7250). Also updates the state
+# machines directly (CloudFormation can't update Step Function definitions
+# from S3 on stack update — it only reads on create).
 #
 # Usage:
 #   bash infrastructure/deploy-infrastructure.sh              # deploy/update
@@ -20,8 +22,15 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUCKET="alpha-engine-research"
 STACK_NAME="alpha-engine-orchestration"
 TEMPLATE="$SCRIPT_DIR/cloudformation/alpha-engine-orchestration.yaml"
+# alpha-engine-config-I7250: the template is uploaded to S3 and deployed via
+# --template-url rather than passed inline. Inline --template-body is capped
+# at CloudFormation's 51200-byte ceiling; an S3-sourced template raises that
+# to 460800 bytes. Same bucket/prefix InfraDeployS3 already grants
+# (arn:aws:s3:::alpha-engine-research/infrastructure/*) — no new IAM needed.
+TEMPLATE_S3_KEY="infrastructure/alpha-engine-orchestration.yaml"
 REGION="us-east-1"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+TEMPLATE_URL="https://${BUCKET}.s3.${REGION}.amazonaws.com/${TEMPLATE_S3_KEY}"
 
 # Git SHA stamp — baked into the SF Comment field and the CF stack tags so
 # the deploy-drift preflight can detect when main has moved past the deployed
@@ -45,9 +54,17 @@ echo "  Account:  $ACCOUNT_ID"
 echo "  Dry run:  $DRY_RUN"
 echo ""
 
-# ── 1. Validate CloudFormation template ──────────────────────────────────────
+# ── 1. Upload the CFN template to S3, then validate via --template-url ───────
+# Uploaded BEFORE validation (not just before create/update-stack) so
+# validate-template exercises the exact artifact create-stack/update-stack
+# will read below — an S3-sourced template that fails to upload fails here,
+# not three steps later against a stale copy.
+echo "==> Uploading CloudFormation template to S3..."
+aws s3 cp "$TEMPLATE" "s3://$BUCKET/$TEMPLATE_S3_KEY" --quiet
+echo "  Uploaded to s3://$BUCKET/$TEMPLATE_S3_KEY"
+
 echo "==> Validating CloudFormation template..."
-aws cloudformation validate-template --template-body "file://$TEMPLATE" --query "Description" --output text
+aws cloudformation validate-template --template-url "$TEMPLATE_URL" --query "Description" --output text
 echo "  Template valid."
 
 if $DRY_RUN; then
@@ -426,7 +443,7 @@ if [ "$STACK_STATUS" = "DOES_NOT_EXIST" ]; then
     echo "  Creating new stack..."
     aws cloudformation create-stack \
         --stack-name "$STACK_NAME" \
-        --template-body "file://$TEMPLATE" \
+        --template-url "$TEMPLATE_URL" \
         --capabilities CAPABILITY_NAMED_IAM \
         --tags "Key=git-sha,Value=$GIT_SHA" \
         --query "StackId" --output text
@@ -439,7 +456,7 @@ else
     set +e
     aws cloudformation update-stack \
         --stack-name "$STACK_NAME" \
-        --template-body "file://$TEMPLATE" \
+        --template-url "$TEMPLATE_URL" \
         --capabilities CAPABILITY_NAMED_IAM \
         --tags "Key=git-sha,Value=$GIT_SHA" \
         --query "StackId" --output text > "$UPDATE_OUT" 2>&1
