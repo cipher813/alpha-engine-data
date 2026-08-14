@@ -685,18 +685,27 @@ def test_alarm_justified_requires_ALL_watched_triggers_paused(module):
     assert module.alarm_justified(entry, partial) is False
 
 
-@pytest.fixture
-def classified_world(module, monkeypatch):
+@pytest.fixture(autouse=True)
+def classified_world(module, monkeypatch, request):
     """A live CloudWatch in which every breaching alarm is already classified.
 
-    `check()` now scans live alarms for coverage, so without this the tests
-    below would shell out to `aws cloudwatch describe-alarms` and grade against
-    whatever the real account happens to hold. Returns the dict so a test can
+    `check()` scans live alarms for coverage, so without this a test would shell
+    out to `aws cloudwatch describe-alarms` and grade against whatever the real
+    account happens to hold — passing on a developer laptop with credentials and
+    failing in CI, which has none by design. Returns the dict so a test can
     mutate it to induce a coverage finding.
+
+    AUTOUSE deliberately. I7174 added a live alarm read to `check()` and patched
+    the three tests that noticed, one at a time; I7023 added another and the
+    same three broke again the same way. The fixture makes the whole module
+    unable to reach AWS, so the next live read added to `check()` cannot
+    reintroduce this — the failure mode is a test file that silently depends on
+    ambient credentials, not any one call.
     """
     live = {e["name"]: False for e in module.alarm_entries()}
     live.update({name: True for name in module.armed_alarm_names()})
-    monkeypatch.setattr(module, "_live_breaching_alarms", lambda: live)
+    if request.node.get_closest_marker("real_alarm_scan") is None:
+        monkeypatch.setattr(module, "_live_breaching_alarms", lambda: live)
     return live
 
 
@@ -785,8 +794,14 @@ def test_an_armed_alarm_that_vanished_is_a_finding(module, monkeypatch,
     assert (victim, "armed-missing-in-aws") in kinds
 
 
+@pytest.mark.real_alarm_scan
 def test_describe_alarms_pagination_is_followed(module, monkeypatch):
-    """A truncated first page would silently shrink the population being graded."""
+    """A truncated first page would silently shrink the population being graded.
+
+    Opts out of the autouse stub — this is the one test whose subject IS
+    `_live_breaching_alarms`. It fakes `_aws` instead, so it still never reaches
+    the network.
+    """
     pages = [
         ('{"a": [{"n": "a1", "e": true}], "t": "tok"}', None),
         ('{"a": [{"n": "a2", "e": false}], "t": null}', "tok"),
