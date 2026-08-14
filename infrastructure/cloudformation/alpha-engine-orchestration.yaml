@@ -269,10 +269,41 @@ Resources:
           # input carrying ec2_instance_id (the same escape hatch
           # scripts/weekly_sf_rerun.py's rerun passthrough uses) — this cron
           # Input is not that path.
+          #
+          # skip_parity (2026-08-13, Brian ruling — alpha-engine-config-I7309
+          # tracks re-enabling in phase 3): the CADENCE run does not execute
+          # pit_parity. CheckSkipParity routes straight to CheckSkipEvaluator,
+          # which bypasses ParityParallel (lookahead + walkforward + replay)
+          # AND PitParityCompare in one hop — compare is only reachable via
+          # the Parallel's exit path, so this single flag disables the whole
+          # branch and no second flag is needed.
+          #
+          # Legitimate because pit_parity gates nothing: analysis/pit_parity.py
+          # states its own contract as "observational — it never gates the
+          # Saturday SF and never writes optimizer configs". It emits a
+          # contamination report a human reads. The weekly pipeline was being
+          # blocked by a stage with no downstream consumer — 2 real verdicts in
+          # 13 attempts (alpha-engine-config#6036).
+          #
+          # NOT a permanent removal and NOT a silent skip. Two blockers must
+          # clear before I7309 can close: the walk-forward pass cannot finish
+          # inside any sane budget (2700s timeout on 2026-08-13 runs -2/-4/-5;
+          # the lookahead pass runs ONE simulation in 922s while walkforward
+          # runs param_sweep.sweep -> _run_combos, one simulation PER COMBO —
+          # asymptotically different work under a single shared ceiling), and
+          # the walk-forward pass places ZERO orders (`shares round to 0
+          # (weight=0.000, dollar=$0)` on all 20 signals -> pit_status
+          # no_orders, while current_status is ok on the same date grid).
+          #
+          # Scope is the CADENCE trigger only. An operator StartExecution input
+          # without the flag still runs the full parity branch, which is the
+          # loop for working I7309 (and the smoke-pit-parity slice reproduces
+          # the no_orders half in 70s).
           Input: !Sub |
             {
               "sns_topic_arn": "${AlertsTopic}",
-              "pipeline_role": "weekly"
+              "pipeline_role": "weekly",
+              "skip_parity": true
             }
 
   # Friday-PM "shell run" cron rule (alpha-engine-friday-shell-run) RETIRED
