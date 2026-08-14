@@ -68,7 +68,13 @@ def test_check_fails_open_via_catch(states):
     # config#2278: still fail-open (the pipeline, not HandleFailure) — but
     # through the visible degraded chain (flag + SNS alert); full topology
     # in test_sf_prespend_gate_alerting.
-    assert catch["Next"] == "PipelineContractGateDegraded"
+    # alpha-engine-config-I7302: the Catch now enters the chain at the
+    # cause normalizer, which records lambda_failed_after_retries and
+    # hands off to PipelineContractGateDegraded unchanged. Pre-fix, this arm and the
+    # Choice absence arm were indistinguishable downstream, so the SNS
+    # alert asserted the Lambda-failure cause on BOTH.
+    assert catch["Next"] == "PipelineContractGateDegradedFromError"
+    assert states["PipelineContractGateDegradedFromError"]["Next"] == "PipelineContractGateDegraded"
 
 
 def test_gate_halts_only_on_confirmed_violation(states):

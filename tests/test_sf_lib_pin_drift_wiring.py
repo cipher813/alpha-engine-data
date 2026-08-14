@@ -83,7 +83,13 @@ def test_check_fails_open_via_catch(states):
     # through the visible degraded chain (flag + SNS alert), re-entering the
     # SIBLING contract gate instead of skipping it (the old direct
     # CheckMutexRole jump); full topology in test_sf_prespend_gate_alerting.
-    assert catch["Next"] == "LibPinGateDegraded"
+    # alpha-engine-config-I7302: the Catch now enters the chain at the
+    # cause normalizer, which records lambda_failed_after_retries and
+    # hands off to LibPinGateDegraded unchanged. Pre-fix, this arm and the
+    # Choice absence arm were indistinguishable downstream, so the SNS
+    # alert asserted the Lambda-failure cause on BOTH.
+    assert catch["Next"] == "LibPinGateDegradedFromError"
+    assert states["LibPinGateDegradedFromError"]["Next"] == "LibPinGateDegraded"
 
 
 def test_gate_halts_only_on_confirmed_drift(states):
