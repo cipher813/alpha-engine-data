@@ -186,26 +186,17 @@ if $BOOTSTRAP; then
     --source-arn "${RULE_ARN}" \
     --region "${REGION}" 2>/dev/null || true
 
-  # ── CloudWatch alarm on weekly-freshness-spot reaps (config#5695) ──────────
-  # A deadline-tagged box should never be reaped — the watchdog-deadline tag
-  # ensures the reaper only terminates after the on-box watchdog's deadline
-  # + grace, so any reap of a deadline-tagged box means the watchdog failed.
-  # At minimum, alarm on the weekly-freshness-spot dimension; extend to other
-  # deadline-tagged workloads as they adopt the tag.
-  SNS_TOPIC_ARN="${SNS_TOPIC_ARN:-arn:aws:sns:${REGION}:${ACCOUNT_ID}:alpha-engine-alerts}"
-  WFS_ALARM="alpha-engine-weekly-freshness-spot-reaped"
-  echo "  Creating CloudWatch alarm: ${WFS_ALARM}"
-  run aws cloudwatch put-metric-alarm \
-    --alarm-name "${WFS_ALARM}" \
-    --alarm-description "The weekly-freshness-spot launcher box was terminated by the orphan reaper — the watchdog-deadline tag should make this impossible unless the on-box watchdog failed or the tag was missing/malformed. Triggers on any non-zero spot_orphans_terminated data point for this dimension (the reaper emits a sum=1 on each reap)." \
-    --namespace "AlphaEngine/Infra" \
-    --metric-name "spot_orphans_terminated" \
-    --dimensions "Name=name,Value=alpha-engine-weekly-freshness-spot" \
-    --statistic Sum --period 3600 --evaluation-periods 1 \
-    --threshold 0 --comparison-operator GreaterThanThreshold \
-    --treat-missing-data notBreaching \
-    --alarm-actions "${SNS_TOPIC_ARN}" --region "${REGION}" || echo "    (alarm may already exist — continuing)" \
-    "$(alarm_actions_flag "${WFS_ALARM}")"
+  # ── CloudWatch alarm on weekly-freshness-spot reaps ─────────────────────────
+  # RETIRED as an alarm-creation path (alpha-engine-config-I7359, executing the
+  # I7359 ownership ruling). alpha-engine-weekly-freshness-spot-reaped is now
+  # codified in the PRIVATE nous-ergon-ops repo:
+  #   infrastructure/cloudwatch/alarms/alpha-engine-weekly-freshness-spot-reaped.json
+  # (newly written in that same PR — it had no file before this). Edit it
+  # there; do not add put-metric-alarm back here —
+  # nousergon-data/tests/test_no_imperative_alarm_authorship.py fails the build
+  # if it reappears. To apply immediately from nous-ergon-ops:
+  #   infrastructure/cloudwatch/apply.py --name alpha-engine-weekly-freshness-spot-reaped
+  echo "  (no-op: alpha-engine-weekly-freshness-spot-reaped is applied from nous-ergon-ops, alpha-engine-config-I7359)"
 fi
 
 # ----- 2. Update function code (always) -------------------------------------

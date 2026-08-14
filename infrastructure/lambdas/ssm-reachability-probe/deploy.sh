@@ -83,40 +83,17 @@ package() {
 # --bootstrap. That is the detector which stays red until the command runs;
 # folding alarm creation into --bootstrap would make it circular — the detector
 # for "bootstrap has not run" would not exist until bootstrap ran.
+# RETIRED as an alarm-creation path (alpha-engine-config-I7359, executing the
+# I7359 ownership ruling). Both alarms this used to create
+# (${FUNCTION_NAME}-unreachable, ${FUNCTION_NAME}-dead) are codified in the
+# PRIVATE nous-ergon-ops repo:
+#   infrastructure/cloudwatch/alarms/alpha-engine-ssm-reachability-probe-{unreachable,dead}.json
+# Edit those files there; do not add put-metric-alarm back here —
+# nousergon-data/tests/test_no_imperative_alarm_authorship.py fails the build
+# if it reappears. To apply immediately from nous-ergon-ops:
+#   infrastructure/cloudwatch/apply.py --prefix alpha-engine-ssm-reachability-probe-
 apply_alarms() {
-  local sns="${SNS_TOPIC_ARN:-arn:aws:sns:${REGION}:${ACCOUNT_ID}:alpha-engine-alerts}"
-
-  # ── Alarm 1: the fleet ────────────────────────────────────────────────────
-  # Two consecutive 5-minute periods, so one scan racing a legitimate boot does
-  # not page. treat-missing-data=breaching: no data means the probe is not
-  # running, and an unobserved transport is precisely what this exists to stop
-  # being rendered as green.
-  echo "  Applying CloudWatch alarm: ${FUNCTION_NAME}-unreachable"
-  run aws cloudwatch put-metric-alarm \
-    --alarm-name "${FUNCTION_NAME}-unreachable" \
-    --alarm-description "One or more running alpha-engine instances are not Online in SSM. SSM is the single transport by which every unattended workload receives its work — the groom, sweep, sf-watch, ci-watch, alert-drain, think-tank, data-spot and the weekly SF all dispatch over it. On 2026-08-03 this condition held VPC-wide for 2h31m and emitted nothing (alpha-engine-config-I6198). Check the VPC endpoint for com.amazonaws.us-east-1.ssm and its security group first." \
-    --namespace "AlphaEngine/Infra" \
-    --metric-name "ssm_unreachable_instances" \
-    --statistic Maximum --period 300 --evaluation-periods 2 --datapoints-to-alarm 2 \
-    --threshold 0 --comparison-operator GreaterThanThreshold \
-    --treat-missing-data breaching \
-    --alarm-actions "${sns}" --region "${REGION}" \
-    "$(alarm_actions_flag "${FUNCTION_NAME}-unreachable")"
-
-  # ── Alarm 2: the probe itself ─────────────────────────────────────────────
-  # A detector that stops running must not read as a healthy fleet. 15 minutes
-  # of missing heartbeat at a 5-minute cadence is three consecutive misses.
-  echo "  Applying CloudWatch alarm: ${FUNCTION_NAME}-dead"
-  run aws cloudwatch put-metric-alarm \
-    --alarm-name "${FUNCTION_NAME}-dead" \
-    --alarm-description "The SSM reachability probe has not reported in 15 minutes. Its silence is indistinguishable from a healthy fleet on the unreachable metric, which is why this alarm exists. Until alpha-engine-config-I6198's operator bootstrap has run, this alarm is EXPECTED to be red — it is the detector for that step (pull-request-policy §4.2 form 3). Clear it with: AWS_PROFILE=ne-admin bash infrastructure/lambdas/ssm-reachability-probe/deploy.sh --bootstrap" \
-    --namespace "AlphaEngine/Infra" \
-    --metric-name "ssm_probe_heartbeat" \
-    --statistic Sum --period 300 --evaluation-periods 3 --datapoints-to-alarm 3 \
-    --threshold 1 --comparison-operator LessThanThreshold \
-    --treat-missing-data breaching \
-    --alarm-actions "${sns}" --region "${REGION}" \
-    "$(alarm_actions_flag "${FUNCTION_NAME}-dead")"
+  echo "  (no-op: alarms for ${FUNCTION_NAME} are applied from nous-ergon-ops, alpha-engine-config-I7359)"
 }
 
 # ----- Apply IAM only -------------------------------------------------------
