@@ -143,13 +143,13 @@ next_saturday_utc() {
 
 shell_input() {
   cat <<EOF
-{"sns_topic_arn": "${SNS_TOPIC_ARN}", "shell_run": true, "pipeline_role": "shell-run"}
+{"sns_topic_arn": "${SNS_TOPIC_ARN}", "shell_run": true, "pipeline_role": "shell-run", "skip_parity": true}
 EOF
 }
 
 full_input() {
   cat <<EOF
-{"sns_topic_arn": "${SNS_TOPIC_ARN}", "pipeline_role": "weekly"}
+{"sns_topic_arn": "${SNS_TOPIC_ARN}", "pipeline_role": "weekly", "skip_parity": true}
 EOF
 }
 
