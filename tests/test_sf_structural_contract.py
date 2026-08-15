@@ -1405,3 +1405,36 @@ def test_no_stale_degraded_flag_exemptions(sf_file: str):
         f"present in the definition: {stale} — remove the stale entry "
         f"(alpha-engine-config#6715)"
     )
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I7418 — a degraded run's notification may not claim SUCCESS
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("sf_file", _DEGRADED_FLAG_SF_FILES)
+def test_no_degraded_notifier_subject_claims_success(sf_file: str):
+    """Since config-I6891 a degraded run terminates in a **Fail** state, so an
+    SNS subject leading with SUCCESS states the opposite of the execution's own
+    status.
+
+    Asserted as a class rather than per-notifier: the weekly definition carried
+    SIX of these subjects (gates / health / gates+health / report card /
+    parity / multiple), all reading `SUCCESS (<something> DEGRADED)`, and four
+    separate wiring tests asserted `"SUCCESS" in subject` — the guards pinned
+    the false claim. Fixing the six without this test leaves the seventh
+    notifier free to reintroduce it.
+    """
+    flat = _flat_index(_load(sf_file))
+    offenders = []
+    for name, state in flat.items():
+        params = state.get("Parameters") or {}
+        subject = params.get("Subject")
+        if not isinstance(subject, str):
+            continue
+        if "DEGRADED" in subject.upper() and "SUCCESS" in subject.upper():
+            offenders.append(f"{name}: {subject}")
+    assert not offenders, (
+        f"{sf_file}: notifier subject(s) claim SUCCESS for a degraded run, "
+        f"which terminates FAILED since config-I6891: {offenders}"
+    )

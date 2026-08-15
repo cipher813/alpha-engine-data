@@ -21,7 +21,7 @@ Shape pinned here (mirrors WeeklyRunDayGateFailed's fail-open+alert model):
      config#2275 IsPresent absence route) lands on the SAME degraded chain;
   4. ``gate_degraded`` threads into the completion email:
      CheckShellRunNotify → CheckGateDegradedNotify →
-     NotifyCompleteGatesDegraded (constants-only "SUCCESS (pre-spend gates
+     NotifyCompleteGatesDegraded (constants-only "DEGRADED: pre-spend gates
      DEGRADED)" Subject) | NotifyComplete.
 """
 from __future__ import annotations
@@ -183,7 +183,11 @@ def test_gate_degraded_threads_into_completion_email(states):
     notify = states["NotifyCompleteGatesDegraded"]
     assert notify["Resource"] == "arn:aws:states:::sns:publish"
     assert "DEGRADED" in notify["Parameters"]["Subject"]
-    assert "SUCCESS" in notify["Parameters"]["Subject"]
+    # alpha-engine-config-I7418: was `assert "SUCCESS" in ...`. Since
+    # config-I6891 a degraded run terminates in the DegradedRun **Fail**
+    # state, so a subject leading with SUCCESS contradicts the execution's
+    # own status — the guard was pinning the false claim.
+    assert "SUCCESS" not in notify["Parameters"]["Subject"]
     assert len(notify["Parameters"]["Subject"]) <= 100
     assert "Subject.$" not in notify["Parameters"]
     # config#2857: converges into the SF-envelope completion marker before
