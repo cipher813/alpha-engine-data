@@ -6228,8 +6228,8 @@
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (pre-spend gates DEGRADED)",
-        "Message": "All steps completed successfully \u2014 BUT one or both pre-spend gates (LibPinDriftCheck / PipelineContractCheck) could not check and failed OPEN; a gate-degraded alert fired earlier in this run. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
+        "Subject": "Alpha Engine Saturday Pipeline \u2014 DEGRADED: pre-spend gates (run terminates FAILED)",
+        "Message": "Every WORK stage completed, and the run still terminates FAILED (config-I6891, sf-pipeline-policy.md \u00a72.3 Option A) because one or both pre-spend gates (LibPinDriftCheck / PipelineContractCheck) could not check and failed OPEN; a gate-degraded alert fired earlier in this run. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6250,8 +6250,8 @@
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (health checks DEGRADED)",
-        "Message": "All steps completed successfully \u2014 BUT a post-pipeline health check (SaturdayHealthCheck freshness and/or WeeklySubstrateHealthCheck substrate/constituents-drift) could not run to Success; the run's freshness validation is NOT confirmed. Which check degraded is on the execution record: $.health_check_error / $.health_check_poll (freshness) vs $.substrate_check_error / $.substrate_check_poll (substrate). View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
+        "Subject": "Alpha Engine Saturday Pipeline \u2014 DEGRADED: health checks (run terminates FAILED)",
+        "Message": "Every WORK stage completed, and the run still terminates FAILED (config-I6891, sf-pipeline-policy.md \u00a72.3 Option A) because a post-pipeline health check (SaturdayHealthCheck freshness and/or WeeklySubstrateHealthCheck substrate/constituents-drift) could not run to Success; the run's freshness validation is NOT confirmed. Which check degraded is on the execution record: $.health_check_error / $.health_check_poll (freshness) vs $.substrate_check_error / $.substrate_check_poll (substrate). View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6272,8 +6272,8 @@
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (gates + health checks DEGRADED)",
-        "Message": "All steps completed successfully \u2014 BUT (1) one or both pre-spend gates (LibPinDriftCheck / PipelineContractCheck) could not check and failed OPEN (a gate-degraded alert fired earlier in this run), AND (2) a post-pipeline health check (SaturdayHealthCheck freshness and/or WeeklySubstrateHealthCheck substrate/constituents-drift) could not run to Success. Specifics are on the execution record: $.health_check_error / $.health_check_poll / $.substrate_check_error / $.substrate_check_poll. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
+        "Subject": "Alpha Engine Saturday Pipeline \u2014 DEGRADED: gates + health checks (run terminates FAILED)",
+        "Message": "Every WORK stage completed, and the run still terminates FAILED (config-I6891, sf-pipeline-policy.md \u00a72.3 Option A) because (1) one or both pre-spend gates (LibPinDriftCheck / PipelineContractCheck) could not check and failed OPEN (a gate-degraded alert fired earlier in this run), AND (2) a post-pipeline health check (SaturdayHealthCheck freshness and/or WeeklySubstrateHealthCheck substrate/constituents-drift) could not run to Success. Specifics are on the execution record: $.health_check_error / $.health_check_poll / $.substrate_check_error / $.substrate_check_poll. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6294,8 +6294,8 @@
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (report card DEGRADED)",
-        "Message": "All steps completed successfully \u2014 BUT ReportCard (the Evaluator Report Card v2 Lambda, advisory grading) failed and did not run; a report-card-degraded alert fired earlier in this run. See $.report_card_error on the execution record for detail. The weekly run's real trading artifacts are unaffected; only the advisory grading layer (report_card.json, and downstream Director) did not run. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
+        "Subject": "Alpha Engine Saturday Pipeline \u2014 DEGRADED: report card (run terminates FAILED)",
+        "Message": "Every WORK stage completed, and the run still terminates FAILED (config-I6891, sf-pipeline-policy.md \u00a72.3 Option A) because ReportCard (the Evaluator Report Card v2 Lambda, advisory grading) failed and did not run; a report-card-degraded alert fired earlier in this run. See $.report_card_error on the execution record for detail. The weekly run's real trading artifacts are unaffected; only the advisory grading layer (report_card.json, and downstream Director) did not run. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6316,8 +6316,8 @@
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (run DEGRADED)",
-        "Message": "All steps completed successfully \u2014 BUT one or more of the following degraded on this run: the pre-spend gates (LibPinDriftCheck/PipelineContractCheck/AcquireMutex), the tail health checks (SaturdayHealthCheck/WeeklySubstrateHealthCheck), the report card advisory grading (ReportCard Lambda), the Parity verdict (pit_parity/replay \u2014 absence of a verdict must NOT be read as a clean pass), and/or an internal ResearchPredictorParallel fail-open (Scanner/RegimeSubstrate/ChallengerShadow/ThinkTank/the eval-judge chain/cost aggregation/the model-zoo rotation). Exact combination is on the execution record: $.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded / $.research_predictor_degraded, with detail at $.report_card_error and (if set) $.health_check_error / $.substrate_check_error / $.parity_error / $.branch_outcomes. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
+        "Subject": "Alpha Engine Saturday Pipeline \u2014 DEGRADED: multiple (run terminates FAILED)",
+        "Message": "Every WORK stage completed, and the run still terminates FAILED (config-I6891, sf-pipeline-policy.md \u00a72.3 Option A) because one or more of the following degraded on this run: the pre-spend gates (LibPinDriftCheck/PipelineContractCheck/AcquireMutex), the tail health checks (SaturdayHealthCheck/WeeklySubstrateHealthCheck), the report card advisory grading (ReportCard Lambda), the Parity verdict (pit_parity/replay \u2014 absence of a verdict must NOT be read as a clean pass), and/or an internal ResearchPredictorParallel fail-open (Scanner/RegimeSubstrate/ChallengerShadow/ThinkTank/the eval-judge chain/cost aggregation/the model-zoo rotation). Exact combination is on the execution record: $.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded / $.research_predictor_degraded, with detail at $.report_card_error and (if set) $.health_check_error / $.substrate_check_error / $.parity_error / $.branch_outcomes. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -6338,8 +6338,8 @@
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Saturday Pipeline \u2014 SUCCESS (parity DEGRADED)",
-        "Message": "All steps completed successfully \u2014 BUT the Parity stage (pit_parity look-ahead/walk-forward contamination check + backtester\u2194executor replay) did not complete; a parity-degraded alert fired earlier in this run. This run produced NO parity verdict \u2014 absence of a verdict must NOT be read as a clean pass. See $.parity_poll / $.parity_error on the execution record for detail. The weekly run's real trading artifacts are unaffected; only the parity verdict is missing. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
+        "Subject": "Alpha Engine Saturday Pipeline \u2014 DEGRADED: parity verdict (run terminates FAILED)",
+        "Message": "Every WORK stage completed, and the run still terminates FAILED (config-I6891, sf-pipeline-policy.md \u00a72.3 Option A) because the Parity stage (pit_parity look-ahead/walk-forward contamination check + backtester\u2194executor replay) did not complete; a parity-degraded alert fired earlier in this run. This run produced NO parity verdict \u2014 absence of a verdict must NOT be read as a clean pass. See $.parity_poll / $.parity_error on the execution record for detail. The weekly run's real trading artifacts are unaffected; only the parity verdict is missing. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [

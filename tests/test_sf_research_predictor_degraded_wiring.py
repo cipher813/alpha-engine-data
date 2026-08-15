@@ -392,7 +392,16 @@ def test_multiple_degraded_names_research_predictor(states):
     subject = st["Parameters"]["Subject"]
     message = st["Parameters"]["Message"]
     assert "research_predictor_degraded" in message
-    assert "SUCCESS" in subject and "DEGRADED" in subject
+    # alpha-engine-config-I7418: this used to assert "SUCCESS" in subject.
+    # Since config-I6891 a degraded run routes through CheckDegradedOutcome ->
+    # WriteCompletionMarkerDegraded -> DegradedRun, a **Fail** state — so a
+    # notifier whose subject leads with SUCCESS states the opposite of the
+    # run's own terminal, and the guard was pinning the false claim.
+    assert "DEGRADED" in subject
+    assert "SUCCESS" not in subject, (
+        "a degraded run terminates FAILED (config-I6891); a subject leading "
+        "with SUCCESS contradicts the execution's own status"
+    )
     assert 0 < len(subject) <= 100
 
 
