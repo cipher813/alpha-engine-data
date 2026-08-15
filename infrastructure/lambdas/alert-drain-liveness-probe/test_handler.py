@@ -159,7 +159,13 @@ def test_first_mid_run_death_relaunches_once_with_record_before_invoke():
     assert kwargs["FunctionName"] == index.ALERT_DRAIN_DISPATCHER_FUNCTION
     assert kwargs["InvocationType"] == "Event"
     payload = json.loads(kwargs["Payload"])
-    assert payload == {"is_drill": "false", "trigger": "reclaim-relaunch"}
+    assert payload == {
+        "is_drill": "false",
+        "trigger": "reclaim-relaunch",
+        # config-I7400: the relaunch MUST inherit the lineage, or the fresh
+        # run_id the dispatcher mints resets the bound it is supposed to spend.
+        "lineage_id": RUN_ID,
+    }
     index.notify_via_flow_doctor.assert_called_once()
     assert index.notify_via_flow_doctor.call_args.kwargs["silent"] is True
 
@@ -223,3 +229,116 @@ def test_completed_drill_box_is_clean_no_relaunch_no_page():
 def test_keys_derived_from_run_id():
     assert index._completion_key(RUN_ID) == COMPLETION_KEY
     assert index._relaunch_key(RUN_ID) == RELAUNCH_KEY
+
+
+# ── config-I7400 ────────────────────────────────────────────────────────────
+# Two defects that together turned one deterministic failure into 17 spot
+# boxes in 70 minutes on 2026-08-15, every page reading "attempt 1/1".
+
+LINEAGE_ID = "drain-2026-07-22T1100Z"
+LINEAGE_RELAUNCH_KEY = f"overseer/_control/relaunch/alert-drain-{LINEAGE_ID}.json"
+
+_STATE_CHANGE = "EC2 Instance State-change Notification"
+
+
+def _terminated_event(instance_id="i-dead"):
+    """The event a SELF-SHUTDOWN produces — indistinguishable, at the event
+    level, from the one a reclaim produces after the warning."""
+    return _reclaim_event(detail_type=_STATE_CHANGE, instance_id=instance_id,
+                          state="terminated")
+
+
+class TestOnlyAReclaimMayRelaunch:
+    def test_bare_termination_without_a_warning_escalates_and_does_not_relaunch(self):
+        result, _, s3, lam = _run(_terminated_event())
+        assert result["relaunched"] is False
+        assert result["reason"] == "workload_failure_not_reclaim"
+        assert result["escalated"] is True
+        lam.invoke.assert_not_called(), "a deterministic failure was retried unchanged"
+        s3.put_object.assert_not_called()
+
+    def test_that_escalation_is_loud(self):
+        _run(_terminated_event())
+        kwargs = index.notify_via_flow_doctor.call_args.kwargs
+        assert kwargs["silent"] is False
+        assert kwargs["severity"] == "error"
+        assert "NOT reclaimed" in index.notify_via_flow_doctor.call_args.args[0]
+
+    def test_a_spot_interruption_warning_still_relaunches(self):
+        """The fix must not disarm the case the probe exists for."""
+        result, _, _, lam = _run(_reclaim_event())
+        assert result["relaunched"] is True
+        lam.invoke.assert_called_once()
+
+    def test_a_completed_box_is_still_clean_on_a_bare_termination(self):
+        """The normal end of every healthy drain: it finishes, writes its
+        marker, and shuts itself down. That must not page."""
+        result, _, _, lam = _run(_terminated_event(), s3=_make_s3(marker_exists=True))
+        assert result["completed"] is True
+        assert "reason" not in result
+        lam.invoke.assert_not_called()
+        index.notify_via_flow_doctor.assert_not_called()
+
+    def test_the_workload_failure_page_dedups_per_lineage(self):
+        """A stuck lane pages once per chain, not once per box."""
+        _run(_terminated_event())
+        key = index.notify_via_flow_doctor.call_args.kwargs["dedup_key"]
+        assert key.endswith(f":workload_failure:{RUN_ID}")
+
+
+class TestTheBoundKeysOnLineage:
+    def test_ledger_key_uses_the_lineage_tag_when_present(self):
+        tags = {**WATCH_TAGS, "alert-drain-lineage-id": LINEAGE_ID}
+        result, _, s3, _ = _run(_reclaim_event(), ec2=_make_ec2(tags=tags))
+        assert result["lineage_id"] == LINEAGE_ID
+        assert s3.put_object.call_args.kwargs["Key"] == LINEAGE_RELAUNCH_KEY
+
+    def test_ledger_key_falls_back_to_run_id_for_a_pre_lineage_box(self):
+        """A box launched before this shipped carries no lineage tag. Its own
+        run_id IS the lineage root, so nothing is stranded."""
+        result, _, s3, _ = _run(_reclaim_event())
+        assert result["lineage_id"] == RUN_ID
+        assert s3.put_object.call_args.kwargs["Key"] == RELAUNCH_KEY
+
+    def test_the_relaunched_box_spends_the_bound_instead_of_resetting_it(self):
+        """THE REGRESSION. Box A (run_id=RUN_ID) is reclaimed and relaunched.
+        Box B inherits the lineage but gets a NEW run_id. Box B is then also
+        reclaimed. Before this fix B's ledger key was derived from B's own
+        run_id, which had no record, so B relaunched too -- and so on without
+        end. Keyed on lineage, B's death finds A's record and escalates."""
+        b_tags = {
+            "Name": "alpha-engine-alert-drain-spot",
+            "alert-drain-run-id": "drain-2026-07-22T1204Z",   # freshly minted
+            "alert-drain-lineage-id": LINEAGE_ID,             # inherited
+        }
+        s3 = _make_s3()
+        docs = {LINEAGE_RELAUNCH_KEY: {"dead_instance_id": "i-box-a"}}
+
+        def get_object(Bucket, Key):  # noqa: N803 — boto3 kwarg names
+            if Key not in docs:
+                raise FakeClientError("NoSuchKey")
+            body = MagicMock()
+            body.read.return_value = json.dumps(docs[Key]).encode()
+            return {"Body": body}
+
+        s3.get_object.side_effect = get_object
+
+        result, _, s3, lam = _run(
+            _reclaim_event(instance_id="i-box-b"), ec2=_make_ec2(tags=b_tags), s3=s3,
+        )
+        assert result["reason"] == "second_death"
+        assert result["escalated"] is True
+        lam.invoke.assert_not_called()
+
+    def test_second_death_page_dedups_per_lineage(self):
+        s3 = _make_s3(relaunch={"dead_instance_id": "i-first"})
+        _run(_reclaim_event(instance_id="i-second"), s3=s3)
+        key = index.notify_via_flow_doctor.call_args.kwargs["dedup_key"]
+        assert key.endswith(f":second_death:{RUN_ID}")
+
+    def test_the_ledger_records_both_identities(self):
+        _, _, s3, _ = _run(_reclaim_event(instance_id="i-dead"))
+        ledger = json.loads(s3.put_object.call_args.kwargs["Body"])
+        assert ledger["dead_instance_id"] == "i-dead"
+        assert ledger["dead_run_id"] == RUN_ID
+        assert ledger["lineage_id"] == RUN_ID

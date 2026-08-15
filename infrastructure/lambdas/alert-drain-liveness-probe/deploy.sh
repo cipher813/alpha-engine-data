@@ -199,6 +199,43 @@ TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal"
 # being sourced at all, aborts the deploy under `set -e`.
 apply_iam_policy_on_deploy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
 
+# ----- 4b. Reconcile the reclaim rules from the repo (always, idempotent) ---
+# config-I7400. The rules' definition and ENABLED/DISABLED bit used to be
+# written ONLY under --bootstrap, so a code-only deploy could never correct
+# either. On 2026-08-15 `alpha-engine-alert-drain-instance-terminated` was
+# hand-disabled to contain a relaunch loop, and nothing in a merge would ever
+# have put it back -- re-arming was an operator step, which
+# pull-request-policy.md 4.2 does not permit as a post-merge action.
+#
+# Re-asserting here makes this repo the SOLE writer of each reclaim rule's
+# pattern and armed state -- the repo-is-the-only-writer property
+# (sf-pipeline-policy.md 2.4), which a bootstrap-gated setting does not have.
+# A hand-disable becomes drift the next merge corrects, visibly, in the deploy
+# log, instead of surviving unrecorded until it is forgotten.
+#
+# `put-rule` rather than `enable-rule`/`disable-rule`: the deploy identity
+# (github-actions-lambda-deploy) holds `events:PutRule` but NOT
+# `events:EnableRule`, and widening a CI identity's authority to avoid one
+# extra argument is the wrong trade. put-rule does not touch targets, which
+# stay bootstrap-owned above.
+#
+# Ordered AFTER the code update on purpose: a rule must never be armed onto a
+# stale handler.
+for i in "${!RECLAIM_RULE_NAMES[@]}"; do
+  rule="${RECLAIM_RULE_NAMES[$i]}"
+  echo "  Reclaim rule ${rule}: asserting state from automation_pause.json"
+  # pause_state is inlined into the put-rule statement, not hoisted into a
+  # variable: tests/test_automation_pause.py scans each EventBridge write
+  # STATEMENT for it, and a hoisted value reads to that guard exactly like a
+  # hardcoded literal would.
+  run aws events put-rule \
+    --name "${rule}" --state "$(pause_state "${rule}")" \
+    --event-pattern "${RECLAIM_RULE_PATTERNS[$i]}" \
+    --description "${RECLAIM_RULE_DESCRIPTIONS[$i]}" \
+    --region "${REGION}" \
+    --query 'RuleArn' --output text
+done
+
 echo "Updating Lambda environment (flow-doctor SSM hydration)..."
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
