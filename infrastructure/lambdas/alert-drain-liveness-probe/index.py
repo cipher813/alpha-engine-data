@@ -32,17 +32,32 @@ box's own Name tag). For an `alpha-engine-alert-drain-spot` box:
      (`overseer/_control/completed/alert-drain-{run_id}.json`, the same key
      scripts/alert_drain_run.sh writes). Present = clean finish.
   4. Absent = died mid-run. Read the relaunch ledger
-     (`overseer/_control/relaunch/alert-drain-{run_id}.json`): a record
+     (`overseer/_control/relaunch/alert-drain-{LINEAGE_id}.json`): a record
      naming THIS dead instance is a duplicate notification (both EC2 event
      types fire for one death); a record naming a DIFFERENT instance is a
-     second death for the same run_id — the exactly-one relaunch bound is
+     second death in the same lineage — the exactly-one relaunch bound is
      spent, escalate LOUD instead of relaunching again.
-  5. First death: record the relaunch decision FIRST (exactly-one bound),
-     THEN invoke alpha-engine-alert-drain-dispatcher DIRECTLY (bypassing the
-     Overseer router and the twice-daily schedule entirely, mirroring
-     sf-watch-reclaim-sweep-handler's direct invoke of the spot dispatcher) with a
-     fresh `{"is_drill": "false", "trigger": "reclaim-relaunch"}` — the drain
-     needs no fields from the dead run, only to run again.
+  5. Classify (config-I7400). ONLY an `EC2 Spot Instance Interruption
+     Warning` is evidence the SUBSTRATE was taken. A bare `terminated`
+     state-change is not: the drain box shuts ITSELF down on any non-zero
+     exit, so a deterministic workload failure emits the same event a reclaim
+     does. A non-reclaim death escalates LOUD and is never relaunched.
+  6. First reclaim death: record the relaunch decision FIRST (exactly-one
+     bound), THEN invoke alpha-engine-alert-drain-dispatcher DIRECTLY
+     (bypassing the Overseer router and the twice-daily schedule entirely,
+     mirroring sf-watch-reclaim-sweep-handler's direct invoke of the spot
+     dispatcher) with `{"is_drill": "false", "trigger": "reclaim-relaunch",
+     "lineage_id": …}` — the drain needs no fields from the dead run, only to
+     run again, but it MUST inherit the lineage.
+
+THE BOUND KEYS ON LINEAGE, NOT RUN_ID (config-I7400, measured 2026-08-15).
+The dispatcher mints a fresh `run_id` on every launch, so a ledger keyed on
+run_id is re-minted by the very act it exists to bound: every relaunched box
+is its own run_id's FIRST death, forever. On 2026-08-15 that produced 17
+t3.medium boxes in 70 minutes, each page reading "attempt 1/1", against a
+deterministic failure (a missing IAM grant, then an unresolvable router
+class) that no number of relaunches could clear. The lineage id is minted
+once by the chain's first run and carried through every relaunch.
 
 Fail-loud (CLAUDE.md no-silent-fails): DescribeTags and the ledger/marker
 reads RAISE on any error OTHER than genuine absence. The Telegram send and
@@ -82,6 +97,14 @@ WATCH_BUCKET = os.environ.get("WATCH_BUCKET", "alpha-engine-research")
 
 ALERT_DRAIN_SPOT_TAG_NAME = "alpha-engine-alert-drain-spot"
 ALERT_DRAIN_RUN_ID_TAG_KEY = "alert-drain-run-id"
+# config-I7400: the relaunch bound's key. A relaunched drain gets a NEW
+# run_id from the dispatcher, so a ledger keyed on run_id can never bind — it
+# is re-minted by the very act it is supposed to bound. The lineage id is
+# minted ONCE, by the first run of a chain, and carried forward by every
+# relaunch, so "this chain has already used its one relaunch" is answerable.
+# A box tagged before this shipped has no lineage tag and falls back to its
+# run_id, which is exactly the lineage root a first run would have written.
+ALERT_DRAIN_LINEAGE_TAG_KEY = "alert-drain-lineage-id"
 COMPLETION_MARKER_PREFIX = "overseer/_control/completed/"
 RELAUNCH_LEDGER_PREFIX = "overseer/_control/relaunch/"
 
@@ -128,8 +151,10 @@ def _completion_key(run_id: str) -> str:
     return f"{COMPLETION_MARKER_PREFIX}alert-drain-{run_id}.json"
 
 
-def _relaunch_key(run_id: str) -> str:
-    return f"{RELAUNCH_LEDGER_PREFIX}alert-drain-{run_id}.json"
+def _relaunch_key(lineage_id: str) -> str:
+    """Keyed on the LINEAGE, not the run (config-I7400). See
+    ALERT_DRAIN_LINEAGE_TAG_KEY."""
+    return f"{RELAUNCH_LEDGER_PREFIX}alert-drain-{lineage_id}.json"
 
 
 def _completion_marker_exists(s3, run_id: str) -> bool:
@@ -161,15 +186,17 @@ def _read_json(s3, key: str) -> dict | None:
         return None
 
 
-def _record_relaunch(s3, run_id: str, dead_instance_id: str) -> None:
+def _record_relaunch(s3, lineage_id: str, dead_instance_id: str, run_id: str) -> None:
     """PRIMARY deliverable of the relaunch path — RAISES on failure, runs
     BEFORE the dispatcher invoke (the exactly-one bound must never depend on
     the invoke succeeding)."""
     s3.put_object(
         Bucket=WATCH_BUCKET,
-        Key=_relaunch_key(run_id),
+        Key=_relaunch_key(lineage_id),
         Body=json.dumps({
             "dead_instance_id": dead_instance_id,
+            "dead_run_id": run_id,
+            "lineage_id": lineage_id,
             "relaunched_at": datetime.now(timezone.utc).isoformat(),
         }).encode("utf-8"),
         ContentType="application/json",
@@ -242,7 +269,11 @@ def _handle_reclaim_event(event: dict) -> dict:
         return {**base, "watch_box": True, "handled": False,
                 "reason": "missing_discriminator_tag", "escalated": alerted}
 
-    key_ctx = {"instance_id": instance_id, "run_id": run_id}
+    # config-I7400: the lineage this box belongs to. Pre-lineage boxes fall
+    # back to their own run_id, which is the lineage root a first run writes.
+    lineage_id = tags.get(ALERT_DRAIN_LINEAGE_TAG_KEY) or run_id
+    key_ctx = {"instance_id": instance_id, "run_id": run_id, "lineage_id": lineage_id}
+    base = {**base, "lineage_id": lineage_id}
     s3 = _s3_client()
 
     # Drill isolation (config#2223 pattern): a drill's run_id ALWAYS carries
@@ -265,7 +296,7 @@ def _handle_reclaim_event(event: dict) -> dict:
         return {**base, "watch_box": True, "completed": True}
 
     # No completion marker: the box died mid-run.
-    relaunch_record = _read_json(s3, _relaunch_key(run_id))
+    relaunch_record = _read_json(s3, _relaunch_key(lineage_id))
     if relaunch_record is not None:
         if relaunch_record.get("dead_instance_id") == instance_id:
             logger.info("reclaim check: death of %s already handled — duplicate notification",
@@ -273,21 +304,60 @@ def _handle_reclaim_event(event: dict) -> dict:
             return {**base, "watch_box": True, "completed": False, "duplicate_notification": True}
         alerted = _escalate(
             "\U0001f6a8 *Alert-Drain reclaim checker — SECOND watch-box death*\n"
-            f"run_id={run_id}: relaunched box `{instance_id}` ALSO died "
-            "without a completion marker (prior relaunch: "
-            f"`{relaunch_record.get('dead_instance_id', '?')}`). The bounded "
-            "relaunch budget is spent — human needed (config#3173).",
-            dedup_key=f"{_FLOW_NAME}:second_death:{run_id}",
+            f"lineage={lineage_id} (run_id={run_id}): relaunched box "
+            f"`{instance_id}` ALSO died without a completion marker (prior "
+            f"relaunch: `{relaunch_record.get('dead_instance_id', '?')}`). The "
+            "bounded relaunch budget is spent — human needed (config#3173).",
+            dedup_key=f"{_FLOW_NAME}:second_death:{lineage_id}",
             context_info=key_ctx,
         )
         return {**base, "watch_box": True, "completed": False, "relaunched": False,
                 "reason": "second_death", "escalated": alerted}
 
+    # config-I7400: ONLY a spot-interruption warning is evidence that the
+    # SUBSTRATE was taken. A bare `terminated` state-change is not: the drain
+    # box shuts ITSELF down on any non-zero exit, so a deterministic workload
+    # failure produces exactly the same event a reclaim does. On 2026-08-15
+    # that made 17 boxes in 70 minutes -- each self-shutdown read as a
+    # reclaim, relaunched onto the same broken workload, which is precisely
+    # what sf-pipeline-policy.md 3 obligation 2 forbids ("never auto-retry an
+    # unchanged kill; a relaunch is legitimate ONLY when the substrate
+    # changed").
+    #
+    # The discriminator is the EVENT TYPE, which the fleet already routes on
+    # two separate rules, rather than a DescribeInstances read of
+    # StateReason.Code -- that would need an IAM grant this Lambda does not
+    # have, and a Lambda IAM change is not applied by the merge button
+    # (pull-request-policy.md 4.2). If a genuine reclaim's warning event is
+    # ever missed, this path escalates loud instead of relaunching, which is
+    # the safe direction to be wrong in.
+    if detail_type != RECLAIM_INTERRUPTION_DETAIL_TYPE:
+        alerted = _escalate(
+            "\U0001f6a8 *Alert-Drain — box died WITHOUT finishing, and it was "
+            "NOT reclaimed*\n"
+            f"Box `{instance_id}` (run_id={run_id}, lineage={lineage_id}) "
+            "terminated with no completion marker and no spot-interruption "
+            "warning — it shut itself down, i.e. the drain exited non-zero. "
+            "NOT relaunching: the workload is unchanged and would fail "
+            "identically. Read the run log at "
+            f"`overseer/run_logs/alert-drain/…/{run_id}.log` (config-I7400).",
+            dedup_key=f"{_FLOW_NAME}:workload_failure:{lineage_id}",
+            context_info=key_ctx,
+        )
+        return {**base, "watch_box": True, "completed": False, "relaunched": False,
+                "reason": "workload_failure_not_reclaim", "escalated": alerted}
+
     # First mid-run death: record FIRST (exactly-one bound), then invoke —
     # no dispatch-record reconstruction needed (unlike ci-watch): a fresh
     # drain run carries no per-run fields, only "run again".
-    _record_relaunch(s3, run_id, instance_id)
-    payload = {"is_drill": "false", "trigger": "reclaim-relaunch"}
+    _record_relaunch(s3, lineage_id, instance_id, run_id)
+    payload = {
+        "is_drill": "false",
+        "trigger": "reclaim-relaunch",
+        # Carry the lineage forward so the relaunched box's own death lands on
+        # the SAME ledger key and spends the budget instead of resetting it.
+        "lineage_id": lineage_id,
+    }
     try:
         _lambda_client().invoke(
             FunctionName=ALERT_DRAIN_DISPATCHER_FUNCTION,
@@ -312,7 +382,7 @@ def _handle_reclaim_event(event: dict) -> dict:
             f"Watch box `{instance_id}` (run_id={run_id}) was reclaimed "
             "mid-drain — a fresh drain was relaunched (attempt 1/1; a second "
             "death escalates loud, config#3173).",
-            dedup_key=f"{_FLOW_NAME}:relaunch:{run_id}:{instance_id}",
+            dedup_key=f"{_FLOW_NAME}:relaunch:{lineage_id}:{instance_id}",
             context_info=key_ctx,
         )
         return {**base, "watch_box": True, "completed": False, "relaunched": True,
@@ -324,7 +394,7 @@ def _handle_reclaim_event(event: dict) -> dict:
         "decision was recorded but invoking "
         f"`{ALERT_DRAIN_DISPATCHER_FUNCTION}` failed — no fresh box was "
         "actually launched. Relaunch manually (config#3173).",
-        dedup_key=f"{_FLOW_NAME}:invoke_failed:{run_id}",
+        dedup_key=f"{_FLOW_NAME}:invoke_failed:{lineage_id}",
         context_info=key_ctx,
     )
     return {**base, "watch_box": True, "completed": False, "relaunched": False,

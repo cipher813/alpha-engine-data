@@ -87,6 +87,12 @@ VOLUME_SIZE_GB = int(os.environ.get("ALERT_DRAIN_VOLUME_SIZE_GB", "40"))
 
 DRAIN_TAG_NAME = "alpha-engine-alert-drain-spot"
 DRAIN_RUN_ID_TAG_KEY = "alert-drain-run-id"
+# config-I7400: the relaunch-chain identity. Minted once, by a chain's FIRST
+# run (where it equals that run's run_id), and carried forward by every
+# relaunch. The liveness probe's exactly-one relaunch bound keys on THIS, not
+# on run_id -- which this dispatcher re-mints on every launch, so a run_id
+# ledger is reset by the very act it is supposed to bound.
+DRAIN_LINEAGE_TAG_KEY = "alert-drain-lineage-id"
 # Fleet-wide drill marker — SAME tag key as sf/ci watch (config#2223): one
 # discriminator every consumer can filter on.
 DRAIN_DRILL_TAG_KEY = "sf-watch-drill"
@@ -103,6 +109,10 @@ CW_LOG_GROUP = os.environ.get("ALERT_DRAIN_CW_LOG_GROUP", "/alpha-engine/alert-d
 
 _BOOL_RE = re.compile(r"^(true|false)$")
 _TRIGGER_RE = re.compile(r"^[a-z0-9_-]{0,64}$")
+# A lineage id is a run_id by construction (the chain root's own), so it
+# carries the same shape: `drain-`/`drill-` prefix + an ISO minute stamp.
+# Anchored allow-list because it becomes an EC2 tag value.
+_LINEAGE_RE = re.compile(r"^((drain|drill)-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{4}Z)?$")
 # config-I3293 — optional registry-declared model, injected by the overseer
 # router from playbooks.yaml. Empty = absent = run-script inline default.
 # alpha-engine-config-I4478/I4516: provider-agnostic, mirroring
@@ -119,10 +129,16 @@ class _InvalidEvent(ValueError):
     """A required event field is missing or fails its allowlist."""
 
 
-def _resolve_event_fields(event: dict) -> tuple[str, str, str, str]:
+def _resolve_event_fields(event: dict) -> tuple[str, str, str, str, str]:
     """Validate + synthesize the run identity. A drill's run id ALWAYS carries
     the ``drill-`` prefix (drill-vs-real isolation on the completion-marker
-    and ledger keys, config#2223 pattern) and a real run's never does."""
+    and ledger keys, config#2223 pattern) and a real run's never does.
+
+    Also resolves the LINEAGE id (config-I7400): an inbound ``lineage_id``
+    means this launch is a relaunch and must inherit the chain's identity; its
+    absence means this launch STARTS a chain, so the lineage is its own fresh
+    run_id. Defaulting to the run_id rather than to empty is what makes the
+    probe's ledger key total -- there is no launch with no lineage."""
     is_drill = str(event.get("is_drill") or "false").strip()
     if not _BOOL_RE.match(is_drill):
         raise _InvalidEvent(f"malformed 'is_drill' in event: {is_drill!r}")
@@ -132,10 +148,13 @@ def _resolve_event_fields(event: dict) -> tuple[str, str, str, str]:
     model = str(event.get("model") or "").strip()
     if not _MODEL_RE.match(model):
         raise _InvalidEvent(f"malformed 'model' in event: {model!r}")
+    lineage_id = str(event.get("lineage_id") or "").strip()
+    if not _LINEAGE_RE.match(lineage_id):
+        raise _InvalidEvent(f"malformed 'lineage_id' in event: {lineage_id!r}")
     now = datetime.now(timezone.utc)
     prefix = "drill-" if is_drill == "true" else "drain-"
     run_id = f"{prefix}{now:%Y-%m-%dT%H%MZ}"
-    return run_id, is_drill, trigger, model
+    return run_id, is_drill, trigger, model, lineage_id or run_id
 
 
 def _bootstrap_command(run_id: str, is_drill: str, model: str = "") -> str:
@@ -197,10 +216,11 @@ def _running_drain_instance_ids() -> list[str]:
     return spot_dispatch.running_instance_ids(DRAIN_TAG_NAME, {}, region=REGION)
 
 
-def _launch_instance(run_id: str, is_drill: str) -> tuple[str, str]:
+def _launch_instance(run_id: str, is_drill: str, lineage_id: str = "") -> tuple[str, str]:
     """Launch the drain box; spot first, on-demand fallback. Discriminator
     tags ride the RunInstances call atomically via extra_tags (config#2292)."""
-    extra_tags = {DRAIN_RUN_ID_TAG_KEY: run_id}
+    extra_tags = {DRAIN_RUN_ID_TAG_KEY: run_id,
+                  DRAIN_LINEAGE_TAG_KEY: lineage_id or run_id}
     if is_drill == "true":
         extra_tags[DRAIN_DRILL_TAG_KEY] = "true"
     return spot_dispatch.launch_with_fallback(
@@ -248,7 +268,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     ``{"launched": false, "reason": ...}``, never raises."""
     event = event or {}
     try:
-        run_id, is_drill, trigger, model = _resolve_event_fields(event)
+        run_id, is_drill, trigger, model, lineage_id = _resolve_event_fields(event)
     except _InvalidEvent as exc:
         logger.error("invalid alert-drain event: %s", exc)
         return {"launched": False, "reason": "invalid_event", "error": str(exc)}
@@ -283,13 +303,14 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 "existing_instance_ids": existing}
 
     try:
-        instance_id, market = _launch_instance(run_id, is_drill)
+        instance_id, market = _launch_instance(run_id, is_drill, lineage_id)
     except SpotLaunchError as exc:
         logger.error("alert-drain spot launch failed: %s: %s", type(exc).__name__, exc)
         return {"launched": False, "reason": "launch_failed", "error": str(exc)}
 
-    logger.info("launched alert-drain box %s (%s) run_id=%s%s", instance_id, market,
-                run_id, " dedupe_degraded=true" if dedupe_degraded else "")
+    logger.info("launched alert-drain box %s (%s) run_id=%s lineage=%s%s",
+                instance_id, market, run_id, lineage_id,
+                " dedupe_degraded=true" if dedupe_degraded else "")
 
     try:
         _wait_ssm_online(instance_id)
@@ -309,6 +330,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         "market": market,
         "command_id": command_id,
         "run_id": run_id,
+        "lineage_id": lineage_id,
         "trigger": trigger,
         "is_drill": is_drill == "true",
         "dedupe_degraded": dedupe_degraded,

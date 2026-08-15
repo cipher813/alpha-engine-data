@@ -167,3 +167,56 @@ def test_malformed_model_rejected():
     out = index.handler({"trigger": "x", "model": 'claude-$(rm -rf /)'}, None)
     assert out == {"launched": False, "reason": "invalid_event",
                    "error": out["error"]}
+
+
+class TestLineageIdentity:
+    """config-I7400 — the relaunch chain's identity.
+
+    The dispatcher mints a fresh ``run_id`` on every launch, so the liveness
+    probe's exactly-one relaunch bound could never bind while it keyed on
+    run_id: each relaunched box was its own run_id's FIRST death. On
+    2026-08-15 that produced 17 t3.medium boxes in 70 minutes against a
+    deterministic failure, every page reading "attempt 1/1". The lineage id is
+    the key that survives a relaunch.
+    """
+
+    def test_a_fresh_run_is_its_own_lineage_root(self, index_mod):
+        index, sd = index_mod
+        out = index.handler({"trigger": "scheduled-1000utc"}, None)
+        assert out["lineage_id"] == out["run_id"]
+        tags = sd.launch_with_fallback.call_args.kwargs["extra_tags"]
+        assert tags[index.DRAIN_LINEAGE_TAG_KEY] == out["run_id"]
+
+    def test_a_relaunch_inherits_the_lineage_and_gets_a_new_run_id(self, index_mod):
+        index, sd = index_mod
+        root = "drain-2026-07-22T1100Z"
+        out = index.handler(
+            {"trigger": "reclaim-relaunch", "lineage_id": root}, None,
+        )
+        assert out["lineage_id"] == root
+        assert out["run_id"] != root, "the run identity must still be fresh"
+        tags = sd.launch_with_fallback.call_args.kwargs["extra_tags"]
+        assert tags[index.DRAIN_LINEAGE_TAG_KEY] == root
+        assert tags[index.DRAIN_RUN_ID_TAG_KEY] == out["run_id"]
+
+    def test_a_drill_lineage_is_accepted(self, index_mod):
+        index, sd = index_mod
+        out = index.handler(
+            {"is_drill": "true", "lineage_id": "drill-2026-07-22T1100Z"}, None,
+        )
+        assert out["lineage_id"] == "drill-2026-07-22T1100Z"
+
+    @pytest.mark.parametrize("bad", [
+        "'; rm -rf /",
+        "drain-2026-07-22T1100Z extra",
+        "not-a-run-id",
+        "drain-2026-7-22T1100Z",
+        "x" * 80,
+    ])
+    def test_a_malformed_lineage_is_rejected_not_sanitised(self, index_mod, bad):
+        """It becomes an EC2 tag value, so the allow-list is the guard."""
+        index, sd = index_mod
+        out = index.handler({"lineage_id": bad}, None)
+        assert out["launched"] is False
+        assert out["reason"] == "invalid_event"
+        sd.launch_with_fallback.assert_not_called()
