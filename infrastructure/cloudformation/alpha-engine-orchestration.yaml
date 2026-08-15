@@ -295,10 +295,25 @@ Resources:
           # (weight=0.000, dollar=$0)` on all 20 signals -> pit_status
           # no_orders, while current_status is ok on the same date grid).
           #
-          # Scope is the CADENCE trigger only. An operator StartExecution input
-          # without the flag still runs the full parity branch, which is the
-          # loop for working I7309 (and the smoke-pit-parity slice reproduces
-          # the no_orders half in 70s).
+          # Scope WAS the cadence trigger only. Widened 2026-08-14 (Brian
+          # ruling, "disable it in the meantime"): the Friday shell-run trigger
+          # Lambda (infrastructure/lambdas/eod-success-friday-shell-trigger/
+          # index.py::_build_shell_run_input) and both inputs in
+          # infrastructure/run_weekly_offcycle.sh now carry the flag too, so no
+          # AUTOMATIC launch path runs parity until I7309 clears.
+          #
+          # The divergence was itself a defect: the Friday run exists to
+          # rehearse Saturday, and a rehearsal taking a different input
+          # rehearses something production never runs. Measured on execution
+          # friday-shell-2026-08-14-validate-i7386 — it cleared every stage
+          # Saturday actually executes, then died with States.DataLimitExceeded
+          # inside ParityParallel, a state the cadence run skips entirely.
+          #
+          # The working loop for I7309 is unchanged, and is now the ONLY way
+          # parity runs: an operator StartExecution carrying
+          # {"skip_parity": false} overrides these defaults (InitializeInput's
+          # JsonMerge puts user input ABOVE them), and the smoke-pit-parity
+          # slice still reproduces the no_orders half in 70s.
           Input: !Sub |
             {
               "sns_topic_arn": "${AlertsTopic}",

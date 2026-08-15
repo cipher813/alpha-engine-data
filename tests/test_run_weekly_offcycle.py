@@ -21,6 +21,7 @@ weekly cadence silently dead).
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -113,14 +114,100 @@ def test_full_input_matches_live_cron_target() -> None:
     assert _dry_run_input("full")["pipeline_role"] == "weekly"
 
 
+def _lambda_shell_input() -> dict:
+    """The dict literal `_build_shell_run_input` returns, parsed from source.
+
+    Derived with `ast` rather than substring-matched. The previous version of
+    the lockstep test below hand-checked two NAMED keys, so a field added to
+    one side and not the other was invisible to it — which is exactly how
+    `skip_parity` came to be on the Saturday cadence input and absent from
+    this one for a day (alpha-engine-config-I7309). Comparing the whole key
+    set is the only form of this assertion that actually holds.
+    """
+    tree = ast.parse(_LAMBDA.read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_build_shell_run_input":
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Dict):
+                    out = {}
+                    for k, v in zip(sub.keys, sub.values):
+                        assert isinstance(k, ast.Constant), (
+                            "_build_shell_run_input has a non-literal key; this "
+                            "derivation needs updating"
+                        )
+                        out[k.value] = (
+                            v.value if isinstance(v, ast.Constant) else "<non-literal>"
+                        )
+                    return out
+    raise AssertionError(
+        "_build_shell_run_input not found (or returns no dict literal) in "
+        f"{_LAMBDA.name} — re-derive this helper before trusting the lockstep test"
+    )
+
+
 def test_shell_input_matches_lambda() -> None:
-    """The ``shell`` builder must reproduce the friday-shell Lambda input."""
-    lam = _LAMBDA.read_text()
-    assert '"shell_run": True' in lam or '"shell_run": true' in lam.lower()
-    assert '"pipeline_role"' in lam and "shell-run" in lam
+    """The ``shell`` builder must reproduce the friday-shell Lambda input —
+    KEY FOR KEY, not just on the two keys someone remembered to list.
+
+    ``sns_topic_arn`` is compared by presence only: the Lambda reads it from
+    the process environment and the runner from its own literal, so the two
+    VALUES legitimately differ in source form while naming the same topic.
+    """
+    lam_input = _lambda_shell_input()
     obj = _dry_run_input("shell")
+
+    assert set(obj) == set(lam_input), (
+        "the off-cycle `shell` input and the friday-shell Lambda input have "
+        f"diverged: runner-only={sorted(set(obj) - set(lam_input))}, "
+        f"lambda-only={sorted(set(lam_input) - set(obj))}. The whole point of "
+        "the shell verb is that an off-cycle rehearsal is identical to the "
+        "automatic one; a key on one side only means the two rehearse "
+        "different pipelines."
+    )
+    for key in sorted(set(obj) - {"sns_topic_arn"}):
+        assert obj[key] == lam_input[key], (
+            f"{key}: runner={obj[key]!r} but Lambda={lam_input[key]!r}"
+        )
+
+    # The two values every caller of this contract depends on.
     assert obj["shell_run"] is True
     assert obj["pipeline_role"] == "shell-run"
+
+
+#: Brian ruling 2026-08-14 ("disable it in the meantime"): no AUTOMATIC launch
+#: path may run pit_parity until alpha-engine-config-I7309 clears. An operator
+#: StartExecution passing {"skip_parity": false} still overrides it — that
+#: override is the working loop for I7309 and is deliberately NOT closed here.
+_NO_AUTOMATIC_PARITY_RULING = "alpha-engine-config-I7309"
+
+
+def test_no_automatic_launch_path_runs_parity() -> None:
+    """Checked across ALL THREE automatic inputs at once, not one at a time.
+
+    Parity was disabled on the Saturday cadence trigger on 2026-08-13 and left
+    enabled on the Friday rehearsal, so the rehearsal ran a stage production
+    skips — and died in it (execution friday-shell-2026-08-14-validate-i7386,
+    States.DataLimitExceeded inside ParityParallel) after clearing every stage
+    Saturday actually runs. A per-path assertion would have passed in that
+    state; this one does not.
+    """
+    lam_input = _lambda_shell_input()
+    assert lam_input.get("skip_parity") is True, (
+        "the friday-shell trigger Lambda no longer sets skip_parity — the "
+        "rehearsal would run a stage the cadence run skips "
+        f"({_NO_AUTOMATIC_PARITY_RULING})"
+    )
+    for verb in ("shell", "full"):
+        obj = _dry_run_input(verb)
+        assert obj.get("skip_parity") is True, (
+            f"run_weekly_offcycle.sh `{verb}` input no longer sets skip_parity "
+            f"({_NO_AUTOMATIC_PARITY_RULING})"
+        )
+    cfn = _CFN.read_text()
+    assert '"skip_parity": true' in cfn, (
+        "the Saturday cadence trigger's CFN Input no longer sets skip_parity "
+        f"({_NO_AUTOMATIC_PARITY_RULING})"
+    )
 
 
 def test_full_targets_correct_state_machine(runner_text: str) -> None:

@@ -105,6 +105,26 @@ def _build_shell_run_input() -> str:
             # event-driven path is a faithful replacement, not a surface
             # regression. shell_run=true stays the load-bearing input.
             "pipeline_role": "shell-run",
+            # skip_parity (2026-08-14, Brian ruling — alpha-engine-config-I7309
+            # tracks re-enabling in phase 3). The Saturday CADENCE trigger has
+            # carried this since 2026-08-13 (infrastructure/cloudformation/
+            # alpha-engine-orchestration.yaml). This rehearsal did NOT, and that
+            # divergence was itself the defect: a rehearsal whose input differs
+            # from production's rehearses something production never runs.
+            #
+            # Measured on execution friday-shell-2026-08-14-validate-i7386: the
+            # run cleared every stage Saturday actually executes — MorningEnrich,
+            # DataPhase1, Scanner, PredictorTraining, RegimeSubstrate,
+            # SignalsEnvelope — then died with States.DataLimitExceeded inside
+            # ParityParallel, a state the Saturday run skips entirely. So the
+            # rehearsal reported a failure production could not have, and cost a
+            # diagnosis cycle establishing that.
+            #
+            # The escape hatch the CFN comment describes is unchanged: an
+            # operator StartExecution carrying {"skip_parity": false} still runs
+            # the full parity branch (InitializeInput's JsonMerge puts user input
+            # ABOVE the defaults), which remains the working loop for I7309.
+            "skip_parity": True,
         }
     )
 
