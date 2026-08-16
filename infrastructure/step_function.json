@@ -406,11 +406,12 @@
     },
     "WeeklyPreflight": {
       "Type": "Task",
-      "Comment": "I4494: pre-spend gate \u2014 runs sf_preflight.py checks against live AWS state before the pipeline spends on any spot or mutex acquisition. Checks: IAM reachability, tool contracts, definition input coherence, Lambda memory headroom. Fail-hard on assertion failure (preflight is cheaper than a Saturday spot run that would die for the same reason). Routes failures through ExtractWeeklyPreflightError \u2192 NormalizeFailureContext (the same chokepoint all pre-spend gate failures use), NOT directly to HandleFailure. Reads-only: no writes, no cost, no side effects. <60s target.",
+      "Comment": "I4494: pre-spend gate \u2014 runs sf_preflight.py checks against live AWS state before the pipeline spends on any spot or mutex acquisition. Checks: IAM reachability, tool contracts, definition input coherence, Lambda memory headroom. Fail-hard on assertion failure (preflight is cheaper than a Saturday spot run that would die for the same reason). Routes failures through ExtractWeeklyPreflightError \u2192 NormalizeFailureContext (the same chokepoint all pre-spend gate failures use), NOT directly to HandleFailure. Reads-only: no writes, no cost, no side effects. <60s target. | alpha-engine-config-I7443: passes Payload.$=\"$\". This was the ONLY lambda:invoke task in this definition with no Payload at all, so the handler received {} on every real execution and its documented bucket/sf_name event overrides were unreachable from the SF. The gate now sees the execution input it is gating, which is what lets check_skip_flag_artifact_coherence verify each skip_* CLAIM against a live artifact for THIS run_date before AcquireMutex and before any spot spend (the 2026-08-15 cycle burned two ~18-minute dispatches on a skip_predictor_training claim the in-SF guard correctly rejected far later). Deliberately the whole input rather than this definition's usual narrow projection: the skip_* set is ~25 dynamic keys, so an enumerated projection would silently stop covering any stage added later -- coverage must be a function of sf_preflight's registry, not of a list duplicated here. No secrets transit: the input holds run_date, role, skip flags, an SNS topic ARN and an instance id.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "TimeoutSeconds": 60,
       "Parameters": {
-        "FunctionName": "alpha-engine-weekly-preflight:live"
+        "FunctionName": "alpha-engine-weekly-preflight:live",
+        "Payload.$": "$"
       },
       "Retry": [
         {

@@ -34,6 +34,8 @@ What this catches (mapped to today's incidents):
     Tool-contract flag/version mismatch   — check_tool_contracts (Leg 2)
     Unresolvable JSONPath in SF def       — check_definition_input_coherence (Leg 3)
     Lambda alias memory headroom breach   — check_lambda_memory_headroom (Leg 4)
+    Recovery input claiming a skip whose
+      artifact does not exist for run_date — check_skip_flag_artifact_coherence
 
 What this CANNOT catch:
     - Polygon coverage flipping AFTER preflight succeeds (transient
@@ -116,6 +118,15 @@ class PreflightContext:
     bucket: str
     today: str  # YYYY-MM-DD
     prior_trading_day: str  # YYYY-MM-DD
+    # The execution input's own run_date and skip_* flags, when the caller
+    # has them (alpha-engine-config-I7443). The WeeklyPreflight Lambda is
+    # invoked with the whole SF state as its payload, so it does; the CLI
+    # normally does not. Absent => check_skip_flag_artifact_coherence reports
+    # "ok (nothing claimed)" rather than failing — a caller that cannot see
+    # the input has not observed a violation, it has observed nothing, and
+    # the in-SF guards remain the authority either way.
+    run_date: "str | None" = None
+    skip_flags: dict = field(default_factory=dict)
     fresh_constituents: "set[str] | None" = None  # populated by check_constituents_fetch
     arctic_universe_symbols: "set[str] | None" = None  # populated by check_arctic_connectivity
     polygon_returned_tickers: "set[str] | None" = None  # populated by check_polygon_grouped_coverage
@@ -1322,6 +1333,194 @@ _CLOUDWATCH_METRIC_DAYS = 30  # lookback window
 _CLOUDWATCH_PERIOD = 86400  # 1-day period (granular enough for a weekly pipeline)
 
 
+# ── Skip-flag artifact coherence (check_skip_flag_artifact_coherence) ────────
+#
+# alpha-engine-config-I7443. A recovery rerun's input is a CLAIM: every
+# ``skip_X: true`` asserts "stage X already produced its artifact for this
+# run_date, so do not spend on it again". When the claim is false the run
+# does not merely waste a dispatch — it would silently build on a stale
+# artifact, which is why the SF carries in-pipeline guards for it at all.
+#
+# The measured cost of asserting this LATE (2026-08-15 cycle): two recovery
+# executions, `watch-rerun-2026-08-16-1` and `-2`, each carried
+# `skip_predictor_training: true` alongside `run_date: 2026-08-16` while the
+# weights manifest was last written 2026-08-15. Both died on
+# `PredictorSkipWeightsStale` — the guard worked — but only after
+# WeeklyFreshnessSpotBootstrap had dispatched a spot and ~18 minutes had
+# elapsed, twice. sf-pipeline-policy §2.2 is explicit that this is the wrong
+# layer: "Everything cheaply knowable before spend must be known before
+# spend." A HeadObject is cheaply knowable.
+#
+# This check does NOT replace the in-SF guards; they remain the authority and
+# the last line (a preflight pass is not a promise about a later instant).
+# It moves the same predicate to the pre-spend gate so an incoherent input —
+# from the rerun helper, from sf-watch, or hand-authored — fails in seconds
+# rather than after a spot launch. `tests/test_sf_preflight.py` pins this
+# predicate against the SF definition's own Choice so the two cannot drift.
+
+
+@dataclass(frozen=True)
+class SkipArtifactPredicate:
+    """What must be true for one ``skip_*`` claim to be honest."""
+
+    flag: str          # the execution-input key, e.g. "skip_predictor_training"
+    stage: str         # human name for the message
+    key: str           # S3 key, may contain "{run_date}"
+    kind: str          # "last_modified_gte_run_date" | "key_exists"
+    sf_guard: str      # the in-SF state that owns the authoritative check
+    note: str = ""
+
+
+# Registry. Deliberately small and evidence-backed: an entry is added only
+# when the SF itself carries the matching guard, so the predicate here is a
+# copy of a rule that already exists rather than a new rule invented at the
+# preflight layer. Adding a stage without its `sf_guard` counterpart would
+# make this gate the sole author of a correctness rule, which is exactly the
+# drift the pinning test exists to prevent.
+SKIP_ARTIFACT_PREDICATES: "tuple[SkipArtifactPredicate, ...]" = (
+    SkipArtifactPredicate(
+        flag="skip_predictor_training",
+        stage="PredictorTraining",
+        key="predictor/weights/meta/manifest.json",
+        kind="last_modified_gte_run_date",
+        sf_guard="CheckPredictorSkipWeightsFresh",
+        note=(
+            "manifest LastModified date >= run_date proves a non-dry training "
+            "run completed FOR THIS run_date; an earlier date means the skip "
+            "would silently reuse the previous cycle's weights"
+        ),
+    ),
+)
+
+
+def check_skip_flag_artifact_coherence(ctx: PreflightContext) -> CheckResult:
+    """Every ``skip_X: true`` in the execution input must be backed by X's
+    artifact existing for ``run_date`` — asserted BEFORE any spot spend."""
+    import time
+    t0 = time.time()
+    name = "skip_flag_artifact_coherence"
+
+    if not ctx.run_date or not ctx.skip_flags:
+        # Not a violation — this caller simply was not handed the execution
+        # input. Reported as ok with an explicit reason so the gate's own
+        # coverage is legible rather than looking like a silent pass.
+        return CheckResult(
+            name=name,
+            status="ok",
+            message=(
+                "no execution input available to this caller "
+                f"(run_date={ctx.run_date!r}, {len(ctx.skip_flags)} skip flags) "
+                "— nothing claimed, nothing to verify"
+            ),
+            details={"claims_checked": 0},
+            elapsed_seconds=time.time() - t0,
+        )
+
+    claimed = [p for p in SKIP_ARTIFACT_PREDICATES if ctx.skip_flags.get(p.flag) is True]
+    if not claimed:
+        return CheckResult(
+            name=name,
+            status="ok",
+            message=(
+                f"run_date={ctx.run_date}: no registered skip_* flag is claimed "
+                f"({len(SKIP_ARTIFACT_PREDICATES)} registered)"
+            ),
+            details={"claims_checked": 0, "run_date": ctx.run_date},
+            elapsed_seconds=time.time() - t0,
+        )
+
+    import boto3 as _boto3
+    s3 = _boto3.client("s3")
+    violations: list[str] = []
+    verified: list[str] = []
+
+    for pred in claimed:
+        key = pred.key.replace("{run_date}", ctx.run_date)
+        try:
+            head = s3.head_object(Bucket=ctx.bucket, Key=key)
+        except Exception as exc:
+            code = ""
+            resp = getattr(exc, "response", None)
+            if isinstance(resp, dict):
+                code = (resp.get("Error") or {}).get("Code", "")
+            if code in ("404", "NoSuchKey", "NotFound"):
+                violations.append(
+                    f"{pred.flag}=true but s3://{ctx.bucket}/{key} does not exist "
+                    f"— {pred.stage} never produced its artifact"
+                )
+            else:
+                # Any other S3 error is UNKNOWN, never a pass (§2.3a). Fail
+                # loud: an unreadable artifact cannot witness a skip claim.
+                violations.append(
+                    f"{pred.flag}=true but s3://{ctx.bucket}/{key} is unreadable "
+                    f"({type(exc).__name__}: {exc}) — cannot verify the claim"
+                )
+            continue
+
+        if pred.kind == "key_exists":
+            verified.append(f"{pred.flag} (artifact present)")
+            continue
+
+        # last_modified_gte_run_date — mirrors CheckPredictorSkipWeightsFresh:
+        # the ISO date part, shape-guarded, compared lexicographically.
+        last_modified = head.get("LastModified")
+        lm_date = (
+            last_modified.strftime("%Y-%m-%d")
+            if hasattr(last_modified, "strftime")
+            else str(last_modified)[:10]
+        )
+        # The SF's own StringMatches '20*-*-*' shape guard, replicated: a
+        # non-ISO serialization must become a LOUD failure, never a silent
+        # lexicographic wrong-pass.
+        if not (len(lm_date) == 10 and lm_date.startswith("20")
+                and lm_date[4] == "-" and lm_date[7] == "-"):
+            violations.append(
+                f"{pred.flag}=true but s3://{ctx.bucket}/{key} LastModified "
+                f"parsed as {lm_date!r}, which is not YYYY-MM-DD — cannot "
+                f"compare against run_date {ctx.run_date}"
+            )
+            continue
+        if lm_date < ctx.run_date:
+            violations.append(
+                f"{pred.flag}=true but s3://{ctx.bucket}/{key} LastModified date "
+                f"{lm_date} < run_date {ctx.run_date} — no completed {pred.stage} "
+                f"for this run_date. Either re-run WITHOUT {pred.flag}, or pass "
+                f"the ORIGINAL run_date if this is a cross-UTC-midnight recovery "
+                f"rerun (see {pred.sf_guard})"
+            )
+            continue
+        verified.append(f"{pred.flag} (artifact dated {lm_date} >= {ctx.run_date})")
+
+    if violations:
+        return CheckResult(
+            name=name,
+            status="fail",
+            message=(
+                f"{len(violations)} incoherent skip claim(s) for run_date "
+                f"{ctx.run_date} — halting before spot spend: {violations[0]}"
+            ),
+            details={
+                "run_date": ctx.run_date,
+                "violations": violations,
+                "verified": verified,
+                "claims_checked": len(claimed),
+            },
+            elapsed_seconds=time.time() - t0,
+        )
+
+    return CheckResult(
+        name=name,
+        status="ok",
+        message=(
+            f"run_date={ctx.run_date}: {len(verified)} skip claim(s) backed by "
+            f"a live artifact ({'; '.join(verified)})"
+        ),
+        details={"run_date": ctx.run_date, "verified": verified,
+                 "claims_checked": len(claimed)},
+        elapsed_seconds=time.time() - t0,
+    )
+
+
 def check_lambda_memory_headroom(ctx: PreflightContext) -> CheckResult:
     """Each SF-invoked Lambda's alias-resolved memory exceeds its observed
     30d ``maxMemoryUsed`` high-water mark by a stated margin.
@@ -1912,6 +2111,8 @@ CHECKS = [
     check_tool_contracts,
     check_definition_input_coherence,
     check_lambda_memory_headroom,
+    # alpha-engine-config-I7443:
+    check_skip_flag_artifact_coherence,
 ]
 
 
@@ -1965,6 +2166,7 @@ CHECK_CAPABILITIES: "dict[str, frozenset[str]]" = {
     "check_tool_contracts": frozenset({CAP_AWS, CAP_CHECKOUT}),
     "check_definition_input_coherence": frozenset({CAP_AWS}),
     "check_lambda_memory_headroom": frozenset({CAP_AWS}),
+    "check_skip_flag_artifact_coherence": frozenset({CAP_AWS}),
 }
 
 
@@ -1988,6 +2190,8 @@ def _previous_trading_day_str() -> str:
 def run_preflight(
     bucket: str = DEFAULT_BUCKET,
     capabilities: "frozenset[str] | set[str] | None" = None,
+    run_date: "str | None" = None,
+    skip_flags: "dict | None" = None,
 ) -> tuple[int, list[CheckResult]]:
     """Execute the checks this environment can run. Returns (n_failures, results).
 
@@ -1997,13 +2201,21 @@ def run_preflight(
     ``LAMBDA_CAPABILITIES``, the laptop and spot box have FULL_CAPABILITIES
     (the default, so the CLI and every existing caller are unchanged).
 
+    ``run_date`` / ``skip_flags`` carry the SF execution input when the caller
+    has it (alpha-engine-config-I7443). Both default to absent so every
+    existing caller — the CLI, the spot box — is unchanged and
+    ``check_skip_flag_artifact_coherence`` reports "nothing claimed".
+
     Each check runs in its own try/except — a single check raising must
     not abort the others (we want the full picture, not first-fail-bail).
     """
     caps = frozenset(capabilities) if capabilities is not None else FULL_CAPABILITIES
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     prior = _previous_trading_day_str()
-    ctx = PreflightContext(bucket=bucket, today=today, prior_trading_day=prior)
+    ctx = PreflightContext(
+        bucket=bucket, today=today, prior_trading_day=prior,
+        run_date=run_date, skip_flags=dict(skip_flags or {}),
+    )
 
     results: list[CheckResult] = []
     for check_fn in CHECKS:
