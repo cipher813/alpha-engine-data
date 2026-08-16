@@ -181,3 +181,30 @@ def test_main_requires_run_date():
 
     with pytest.raises(SystemExit):
         main(["--no-alert"])
+
+
+def test_abbreviated_long_option_is_rejected_not_rebound():
+    """`--alert` must NOT be silently accepted as a prefix of `--alert-severity`.
+
+    config-I7415: the weekly SF's substrate health check invoked the sweep with
+    `--alert`, intending to turn alerting on (it is already the default).
+    argparse's default `allow_abbrev=True` rebound it to `--alert-severity`,
+    which then aborted for a missing value — so the sweep exited non-zero
+    without ever sweeping, and the caller read that as a phase-marker finding.
+    """
+    from validators.phase_marker_sweep import main
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--run-date", "2026-07-18", "--alert"])
+    # argparse exits 2 for an unrecognised argument — NOT the sweep's own
+    # rc=1 "phase errors detected", which is what the rebinding produced.
+    assert excinfo.value.code == 2
+
+
+def test_declared_long_options_still_parse_in_full():
+    from validators.phase_marker_sweep import main
+
+    fake = _FakeS3({"backtest/2026-07-18/.phases/simulate.json": _marker("simulate", "ok")})
+    with patch("validators.phase_marker_sweep.boto3", MagicMock(client=lambda *a, **k: fake)):
+        rc = main(["--run-date", "2026-07-18", "--no-alert", "--alert-severity", "warn"])
+    assert rc == 0
