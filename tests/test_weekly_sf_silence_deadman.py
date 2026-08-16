@@ -342,16 +342,55 @@ class TestMeasuredFortyFiveDayShape:
 
 
 class TestNormalizeRole:
+    """Amended 2026-08-16 (alpha-engine-config-I7440).
+
+    This class previously asserted that ``watch-rerun`` normalizes to
+    ``None`` — it pinned the defect rather than forbidding it. That
+    collapsing is precisely what disarmed ``pipeline-watchdog``'s weekly
+    failed-cycle check: its ``WEEKLY_CADENCE_ROLES`` filter names
+    ``watch-rerun`` and ``recovery``, and this function guaranteed no record
+    could ever carry either, so a weekly cycle recovered by the §2.5
+    mechanical rerun could never clear the detector watching it. The test
+    passed for exactly as long as the bug existed and would have turned CI
+    red on the fix.
+
+    Roles are now passed through for the whole KNOWN_ROLES vocabulary, and
+    the closed-vocabulary property — an UNRECOGNIZED role still normalizes to
+    None, so a new launch path cannot silently start counting as a declared
+    cycle — is what this class asserts instead.
+    """
+
     @pytest.mark.parametrize("raw,expected", [
         ("exercise", "exercise"),
         ("weekly", "weekly"),
+        ("watch-rerun", "watch-rerun"),
+        ("recovery", "recovery"),
+        ("shell-run", "shell-run"),
+        # Not a weekly-SF launch role (it is the postclose SF's operator
+        # replay role) — still discarded.
         ("operator-replay", None),
-        ("watch-rerun", None),
+        ("something-new", None),
         (None, None),
         ("", None),
     ])
-    def test_only_the_two_declared_roles_pass_through(self, mod, raw, expected):
+    def test_known_roles_pass_through_and_unknown_ones_are_discarded(self, mod, raw, expected):
         assert mod.normalize_role(raw) == expected
+
+    def test_slot_matching_is_unchanged_by_the_widening(self, mod):
+        """Behaviour-preservation guard for THIS module. Slot roles are only
+        weekly/exercise, so records that used to be None and matched no slot
+        are now named and must still match no slot — the widening may not
+        let a rerun start satisfying a cron slot."""
+        day = date(2026, 8, 15)
+        start = datetime(2026, 8, 15, 9, 0, tzinfo=timezone.utc)
+        rerun = mod.ExecutionRecord(
+            name="watch-rerun-2026-08-15-1", role="watch-rerun",
+            status="SUCCEEDED", start=start,
+            stop=start + timedelta(seconds=1800), run_date=day,
+        )
+        slot = mod.ExpectedSlot(day=day, role="weekly", gated_off=False, note="")
+        result = mod.evaluate_slot(slot, [rerun])
+        assert result.classification == "CRITICAL"
 
 
 # ---------------------------------------------------------------------------

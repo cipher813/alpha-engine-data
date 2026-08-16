@@ -50,6 +50,13 @@ sys.modules["flow_doctor_telegram"] = _fd_mod
 sys.path.insert(0, str(Path(__file__).parent))
 import index  # noqa: E402
 
+# Importable only AFTER `index`, whose own import block puts the in-repo
+# scripts/ dir on sys.path for the non-deployed layout. Tested directly
+# because its role vocabulary and the watchdog's role FILTER have to agree,
+# and nothing asserted that until they silently disagreed in production
+# (alpha-engine-config-I7440).
+import weekly_sf_silence_deadman as _deadman  # noqa: E402
+
 
 SAT_ARN = index.SATURDAY_SF_ARN
 WKD_ARN = index.WEEKDAY_SF_ARN
@@ -1689,3 +1696,265 @@ def test_handler_includes_weekly_silence_check_in_summary():
     assert silence["degraded_reason"] is None
     assert silence["critical"] == 4  # Mon-Thu, no executions in the mock
     assert silence["critical_slots"][-1] == "2026-08-06:exercise"
+
+
+# ── Weekly failed-CYCLE check (alpha-engine-config-I7440) ────────────────
+#
+# The live false page these cover, in full: cycle day 2026-08-15's Saturday
+# cron run FAILED at PredictorBacktest, six `watch-rerun` executions
+# recovered it, and the last one SUCCEEDED at 2026-08-16T03:29Z writing a
+# `status: SUCCEEDED` marker with `cycle_key: 2026-08-15`. The watchdog
+# paged anyway, reporting "1 execution(s) started, none SUCCEEDED".
+#
+# FOUR independent defects produced that, and each one alone is sufficient —
+# so each gets its own test. Fixing three of four would still page.
+#   1. role set     — `watch-rerun`/`recovery` discarded, so the §2.5
+#                     recovery path was invisible to the detector.
+#   2. normalizer   — `normalize_role` collapsed both to None upstream, which
+#                     is WHY `WEEKLY_CADENCE_ROLES` could never match.
+#   3. cycle key    — matched on UTC start date, so a Sunday rerun of
+#                     Saturday's cycle never counted toward it.
+#   4. marker clear — only a DEGRADED marker cleared; a SUCCEEDED one paged.
+
+
+_CYCLE = date(2026, 8, 15)
+
+
+def _make_weekly_cycle_client(rows):
+    """Weekly-SF stand-in for the failed-cycle check's live fetch.
+
+    ``rows`` — dicts with ``start`` (aware UTC datetime), ``role``,
+    ``status``, optional ``run_date`` and ``duration`` (seconds; default
+    well above GATE_NOOP_MAX_SECONDS so rows are real runs unless a test
+    says otherwise). Role and run_date are readable ONLY via
+    ``describe_execution``, exactly as in production.
+    """
+    execs, inputs = [], {}
+    for i, row in enumerate(rows):
+        arn = f"{_WEEKLY_EXEC_ARN_PREFIX}c{i}"
+        start = row["start"]
+        execs.append({
+            "name": f"c{i}",
+            "executionArn": arn,
+            "status": row["status"],
+            "startDate": start,
+            "stopDate": start + timedelta(seconds=row.get("duration", 1800)),
+        })
+        payload = {}
+        if row.get("role"):
+            payload["pipeline_role"] = row["role"]
+        if row.get("run_date"):
+            payload["run_date"] = row["run_date"]
+        inputs[arn] = json.dumps(payload)
+
+    client = MagicMock()
+    client.list_executions.side_effect = lambda **kw: {
+        "executions": execs if kw.get("stateMachineArn") == SAT_ARN else []
+    }
+    client.describe_execution.side_effect = lambda executionArn: {
+        "input": inputs.get(executionArn, "{}")
+    }
+    return client
+
+
+def _cron_failure():
+    """The 2026-08-15 Saturday cron run: real weekly role, FAILED."""
+    return {
+        "start": datetime(2026, 8, 15, 9, 0, tzinfo=timezone.utc),
+        "role": "weekly", "status": "FAILED", "run_date": "2026-08-15",
+    }
+
+
+def _rerun_success():
+    """The run that actually closed cycle 2026-08-15 — started the NEXT UTC
+    day, under the watch-rerun role, carrying the ORIGINAL run_date."""
+    return {
+        "start": datetime(2026, 8, 16, 3, 21, tzinfo=timezone.utc),
+        "role": "watch-rerun", "status": "SUCCEEDED", "run_date": "2026-08-15",
+    }
+
+
+def test_weekly_cycle_recovered_by_a_watch_rerun_does_not_page():
+    """THE regression. The cycle failed on the cron and succeeded on a rerun
+    the next UTC day — the exact live shape of 2026-08-15/16. Before the
+    fix this paged with 'none SUCCEEDED'."""
+    client = _make_weekly_cycle_client([_cron_failure(), _rerun_success()])
+    s3 = MagicMock()
+    result = index._check_failed_day(
+        sf_label="Weekly SF", sf_arn=SAT_ARN,
+        pipeline_name="ne-weekly-freshness-pipeline",
+        target_date=_CYCLE, cadence="weekly", client=client, s3_client=s3,
+    )
+    assert result.alert_emitted is False
+    assert result.succeeded_on_day == 1
+    assert result.executions_on_day == 2
+    # A cleared day must never spend an S3 read on the marker.
+    s3.get_object.assert_not_called()
+    _alerts_mod.publish.assert_not_called()
+
+
+def test_weekly_cycle_counts_the_recovery_role_too():
+    """sf-watch's substrate-reclaim relaunch uses role='recovery'. It is in
+    WEEKLY_CADENCE_ROLES and must count exactly like watch-rerun — a cycle
+    rescued from a spot reclaim is a cycle that succeeded."""
+    recovery = dict(_rerun_success(), role="recovery")
+    client = _make_weekly_cycle_client([_cron_failure(), recovery])
+    result = index._check_failed_day(
+        sf_label="Weekly SF", sf_arn=SAT_ARN,
+        pipeline_name="ne-weekly-freshness-pipeline",
+        target_date=_CYCLE, cadence="weekly", client=client, s3_client=MagicMock(),
+    )
+    assert result.alert_emitted is False
+    assert result.succeeded_on_day == 1
+
+
+def test_weekly_cycle_keys_on_run_date_not_on_utc_start_date():
+    """Defect 3 in isolation: same role, same status, but the rerun starts on
+    2026-08-16 UTC. Keying on the start date drops it; keying on run_date —
+    the mutex's and the marker's own cycle key — keeps it."""
+    client = _make_weekly_cycle_client([_rerun_success()])
+    counts = index._weekly_real_statuses_for_day(client, _CYCLE)
+    assert counts == {"SUCCEEDED": 1}
+    # ...and it belongs to 08-15's cycle, NOT to 08-16's.
+    assert index._weekly_real_statuses_for_day(client, date(2026, 8, 16)) == {}
+
+
+def test_weekly_cycle_without_run_date_falls_back_to_utc_start_date():
+    """Records predating run_date being carried must keep the old behaviour
+    rather than silently vanishing from every cycle."""
+    legacy = {
+        "start": datetime(2026, 8, 15, 9, 0, tzinfo=timezone.utc),
+        "role": "weekly", "status": "FAILED",
+    }
+    client = _make_weekly_cycle_client([legacy])
+    assert index._weekly_real_statuses_for_day(client, _CYCLE) == {"FAILED": 1}
+
+
+def test_weekly_cycle_still_excludes_exercise_and_gate_noop_runs():
+    """The widened role set must not start counting the two things this
+    check has always been required to ignore: the daily chained exercise
+    run, and WeeklyRunDayGateChoice's ~2s designed skip."""
+    exercise = {
+        "start": datetime(2026, 8, 15, 20, 30, tzinfo=timezone.utc),
+        "role": "exercise", "status": "SUCCEEDED", "run_date": "2026-08-15",
+    }
+    gate_noop = {
+        "start": datetime(2026, 8, 15, 9, 0, tzinfo=timezone.utc),
+        "role": "weekly", "status": "SUCCEEDED", "run_date": "2026-08-15",
+        "duration": 2,
+    }
+    client = _make_weekly_cycle_client([exercise, gate_noop])
+    assert index._weekly_real_statuses_for_day(client, _CYCLE) == {}
+
+
+def test_weekly_cycle_with_only_failures_still_pages():
+    """The check must still do its job: a cycle whose cron AND whose reruns
+    all failed, with no marker, is exactly what it exists to catch."""
+    failed_rerun = dict(_rerun_success(), status="FAILED")
+    client = _make_weekly_cycle_client([_cron_failure(), failed_rerun])
+    s3 = _make_s3_marker_client(error=_FakeNoSuchKey())
+    result = index._check_failed_day(
+        sf_label="Weekly SF", sf_arn=SAT_ARN,
+        pipeline_name="ne-weekly-freshness-pipeline",
+        target_date=_CYCLE, cadence="weekly", client=client, s3_client=s3,
+    )
+    assert result.alert_emitted is True
+    assert result.executions_on_day == 2
+    assert result.succeeded_on_day == 0
+    assert _alerts_mod.publish.call_args.kwargs["severity"] == "error"
+    assert "cycle day" in _alerts_mod.publish.call_args.kwargs["message"]
+
+
+def test_succeeded_marker_clears_instead_of_paging():
+    """Defect 4 in isolation. Only DEGRADED used to clear, so a marker
+    reading SUCCEEDED — the single most authoritative statement that the
+    cycle worked — fell through to the error page."""
+    client = _make_weekly_cycle_client([_cron_failure()])
+    s3 = _make_s3_marker_client(marker={"status": "SUCCEEDED"})
+    result = index._check_failed_day(
+        sf_label="Weekly SF", sf_arn=SAT_ARN,
+        pipeline_name="ne-weekly-freshness-pipeline",
+        target_date=_CYCLE, cadence="weekly", client=client, s3_client=s3,
+    )
+    assert result.alert_emitted is False
+    assert result.marker_status == "SUCCEEDED"
+    _alerts_mod.publish.assert_not_called()
+
+
+def test_normalize_role_preserves_the_recovery_vocabulary():
+    """Defect 2 at its own layer — the reason WEEKLY_CADENCE_ROLES could
+    never match. A filter naming roles the fetch layer cannot emit is a
+    filter that is always empty, and nothing said so."""
+    for role in ("weekly", "exercise", "watch-rerun", "recovery", "shell-run"):
+        assert _deadman.normalize_role(role) == role
+    assert _deadman.normalize_role("something-new") is None
+    assert _deadman.normalize_role(None) is None
+
+
+def test_every_weekly_cadence_role_survives_the_fetch_normalizer():
+    """The two layers must agree BY CONSTRUCTION, not by coincidence: every
+    role the watchdog filters on has to be one the fetch layer can produce.
+    This is the assertion whose absence let the two drift apart."""
+    for role in index.WEEKLY_CADENCE_ROLES:
+        assert _deadman.normalize_role(role) == role, (
+            f"WEEKLY_CADENCE_ROLES names {role!r} but normalize_role discards "
+            f"it — the filter can never match and the check is disarmed"
+        )
+
+
+# ── IAM contract: the role can read every marker the code reads ──────────
+#
+# sf-pipeline-policy §2.2: "Identity & permission — every IAM action each
+# stage will call ... asserted by contract test against the codified role."
+#
+# This is the assertion whose absence produced the 2026-08-16 page. The
+# weekly pipeline was added to _FAILED_DAY_PIPELINES (I7036) and its marker
+# prefix was never added to CompletionMarkerRead, so every weekly marker
+# consult returned AccessDenied → UNREADABLE → "UNKNOWN ≠ pass" → error page.
+# Nothing failed at merge, and nothing failed on deploy: the grant is only
+# exercised on the branch reached when a cycle has zero counted successes,
+# so it sat latent until the first day it mattered and then fired as a
+# false alarm about the pipeline rather than about itself.
+
+
+_IAM_POLICY_PATH = Path(__file__).parent / "iam-policy.json"
+
+
+def _statement(sid):
+    doc = _json.loads(_IAM_POLICY_PATH.read_text())
+    for stmt in doc["Statement"]:
+        if stmt.get("Sid") == sid:
+            return stmt
+    raise AssertionError(f"iam-policy.json has no statement with Sid={sid!r}")
+
+
+def test_completion_marker_read_covers_every_pipeline_the_code_reads():
+    """Adding a pipeline to _FAILED_DAY_PIPELINES without extending the role
+    must fail HERE, at merge — not silently in production on the first day
+    the marker branch is reached."""
+    granted = _statement("CompletionMarkerRead")["Resource"]
+    for _label, _arn, pipeline_name, _cadence in index._FAILED_DAY_PIPELINES:
+        expected = (
+            f"arn:aws:s3:::{index.MARKER_BUCKET}/_sf_completion/{pipeline_name}/*"
+        )
+        assert expected in granted, (
+            f"{pipeline_name} is in _FAILED_DAY_PIPELINES, so "
+            f"_completion_marker_status will GetObject its marker, but "
+            f"iam-policy.json's CompletionMarkerRead does not grant "
+            f"{expected}. The check would page 'UNREADABLE' on AccessDenied "
+            f"— a false alarm about the pipeline, caused by the watchdog."
+        )
+
+
+def test_list_bucket_prefix_condition_covers_the_same_pipelines():
+    """The s3:ListBucket prefix condition gates the same reads; a prefix
+    granted in one statement and omitted from the other is the same latent
+    denial one layer down."""
+    prefixes = _statement("DedupMarkerListBucket")["Condition"]["StringLike"]["s3:prefix"]
+    for _label, _arn, pipeline_name, _cadence in index._FAILED_DAY_PIPELINES:
+        expected = f"_sf_completion/{pipeline_name}/*"
+        assert expected in prefixes, (
+            f"DedupMarkerListBucket's prefix condition omits {expected} while "
+            f"CompletionMarkerRead grants the object read — the two must list "
+            f"the same pipelines."
+        )

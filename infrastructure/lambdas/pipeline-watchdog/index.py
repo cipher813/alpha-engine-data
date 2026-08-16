@@ -1254,28 +1254,55 @@ def _last_due_weekly_day(now_utc: datetime) -> Optional[date]:
 
 
 def _weekly_real_statuses_for_day(client: object, target_date: date) -> "dict[str, int]":
-    """Status counts of REAL (``pipeline_role="weekly"``, non-gate-noop)
-    executions on ``target_date`` (alpha-engine-config-I7036).
+    """Status counts of REAL, non-gate-noop executions of the weekly CYCLE
+    ``target_date`` (alpha-engine-config-I7036, corrected by -I7440).
 
-    Reuses ``weekly_sf_silence_deadman.fetch_execution_records`` (role read
-    from each execution's own input, never inferred from name — no launch
-    path passes an explicit SF ``Name``) and ``_is_gate_noop`` (excludes a
-    SUCCEEDED execution that finished in under
-    ``GATE_NOOP_MAX_SECONDS`` — ``WeeklyRunDayGateChoice``'s designed ~2s
-    skip on a THU/FRI cron firing that isn't the real cycle day). An
-    ``exercise``-role execution never matches ``role != "weekly"``; a
-    ``shell-run`` (Friday-PM preflight) execution's role normalizes to
-    ``None`` and is excluded the same way. window_days=10 comfortably
-    covers ``target_date`` even on the longest holiday-shortened weeks
-    while capping the ``describe_execution`` fan-out this makes.
+    Reuses ``weekly_sf_silence_deadman.fetch_execution_records`` (role and
+    run_date read from each execution's own input, never inferred from name —
+    no launch path passes an explicit SF ``Name``) and ``_is_gate_noop``
+    (excludes a SUCCEEDED execution that finished in under
+    ``GATE_NOOP_MAX_SECONDS`` — ``WeeklyRunDayGateChoice``'s designed ~2s skip
+    on a THU/FRI cron firing that isn't the real cycle day). window_days=12
+    covers ``target_date`` even on the longest holiday-shortened weeks, plus
+    the multi-day recovery tail below, while capping the
+    ``describe_execution`` fan-out this makes.
+
+    **Two corrections, either of which alone false-paged cycle 2026-08-15**
+    (alpha-engine-config-I7440 — the cycle recovered to a SUCCEEDED terminal
+    and this check paged anyway):
+
+    1. **Role set.** This counted only ``role == "weekly"`` — the Saturday
+       cron — so every execution from the §2.5 mechanical recovery path
+       (``watch-rerun``) and every sf-watch substrate relaunch (``recovery``)
+       was discarded. A cycle whose cron run failed and whose rerun succeeded
+       could therefore NEVER clear this check: the policy-mandated recovery
+       mechanism was invisible to the detector watching the thing it
+       recovers. It now uses ``WEEKLY_CADENCE_ROLES``, the same constant the
+       liveness check above already passes as its ``role_filter`` — which is
+       what the block comment above always claimed ("can never disagree") and
+       what was measurably false on 2026-08-16, when the two checks in this
+       one invocation saw 1 execution and 24 executions for the same SF on
+       the same day and reached opposite verdicts.
+    2. **Cycle key.** This matched on the execution's UTC START date. A
+       recovery rerun of Saturday's cycle legitimately starts Sunday — the
+       run that closed cycle 2026-08-15 started 2026-08-16T03:21Z — so
+       matching on start excludes exactly the executions recovery produces.
+       It now matches the execution's own ``run_date`` input, which is the
+       key the run-slot mutex and the completion marker's ``cycle_key``
+       already use. Records with no parseable run_date fall back to the UTC
+       start date, preserving the old behaviour for anything that predates
+       run_date being carried.
     """
     since_anchor = target_date + timedelta(days=2)
-    records = fetch_execution_records(client, window_days=10, today=since_anchor)
+    records = fetch_execution_records(client, window_days=12, today=since_anchor)
     counts: "dict[str, int]" = {}
     for record in records:
-        if record.role != "weekly":
+        if record.role not in WEEKLY_CADENCE_ROLES:
             continue
-        if record.start.astimezone(timezone.utc).date() != target_date:
+        cycle = getattr(record, "run_date", None)
+        if cycle is None:
+            cycle = record.start.astimezone(timezone.utc).date()
+        if cycle != target_date:
             continue
         if _is_gate_noop(record):
             continue
@@ -1386,6 +1413,35 @@ def _check_failed_day(
         logger.info(
             "failed-day clear (degraded-by-design): sf=%s day=%s marker=DEGRADED",
             sf_label, target_date,
+        )
+        return FailedDayCheckResult(
+            sf_label=sf_label,
+            checked=True,
+            target_trading_day=target_date.isoformat(),
+            executions_on_day=total,
+            succeeded_on_day=0,
+            marker_status=marker_status,
+        )
+
+    if marker_status == "SUCCEEDED":
+        # The day's own pipeline wrote a SUCCEEDED marker, which only its
+        # WriteCompletionMarker state on a SUCCEEDED terminal does — that is
+        # a real verdict, and §2.3a's rule is that a MISSING verdict is
+        # UNKNOWN, not that a present one may be overruled by this check's
+        # own execution walk. Clear, do not page.
+        #
+        # But the walk and the marker have now DISAGREED, and exactly one of
+        # them is wrong. Say so at warning severity rather than clearing
+        # quietly: a counting bug in the walk (which is what
+        # alpha-engine-config-I7440 was) is otherwise completely invisible
+        # from the moment the marker starts covering for it.
+        logger.warning(
+            "failed-day clear (marker SUCCEEDED) but the execution walk found "
+            "0 SUCCEEDED of %d on sf=%s day=%s — the walk and the completion "
+            "marker disagree; one of them is wrong. Not paging (the marker is "
+            "the authoritative verdict), but the walk's role/cycle-key "
+            "filtering needs checking (alpha-engine-config-I7440).",
+            total, sf_label, target_date,
         )
         return FailedDayCheckResult(
             sf_label=sf_label,
