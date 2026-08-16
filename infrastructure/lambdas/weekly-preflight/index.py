@@ -72,9 +72,23 @@ def handler(event: dict, context) -> dict:
             "traceback": traceback.format_exc(),
         }
 
+    # alpha-engine-config-I7443: the SF Task passes no explicit Payload, so
+    # `event` IS the whole state input — run_date and every skip_* flag are
+    # already here. Forwarding them lets check_skip_flag_artifact_coherence
+    # assert that each skip CLAIM is backed by a real artifact for this
+    # run_date, before AcquireMutex and before any spot dispatch. Absent
+    # (a bare {} test invoke) => that check reports "nothing claimed", never
+    # a failure: this gate must not start halting the pipeline over a payload
+    # shape it previously ignored.
+    run_date = event.get("run_date")
+    skip_flags = {k: v for k, v in event.items() if k.startswith("skip_")}
+
     try:
         n_fail, results = sfp.run_preflight(
-            bucket=bucket, capabilities=sfp.LAMBDA_CAPABILITIES
+            bucket=bucket,
+            capabilities=sfp.LAMBDA_CAPABILITIES,
+            run_date=run_date,
+            skip_flags=skip_flags,
         )
     except Exception as exc:
         return {
