@@ -210,14 +210,19 @@ GH_PAT_SSM = os.environ.get(
     "WEEKLY_SPOT_GH_PAT_SSM", "/alpha-engine/saturday_sf_watch/github_pat"
 )
 
-# Bootstrap (clone x4 + venv build) execution timeout — the SSM command's own
-# ceiling, independent of the SF's poll loop. Generous: 4 shallow clones +
-# one full nousergon_lib/krepis/pandas/numpy/pyarrow venv build realistically
+# Bootstrap (clone x5 + TWO venv builds) execution timeout — the SSM command's
+# own ceiling, independent of the SF's poll loop. Generous: 5 shallow clones +
+# a full nousergon_lib/krepis/pandas/numpy/pyarrow venv build realistically
 # takes low-single-digit minutes, but a cold pip index / dnf mirror can be
-# slow; bounding at 20 min leaves large headroom without risking a false
+# slow; bounding at 30 min leaves large headroom without risking a false
 # guillotine on a slow-but-healthy build.
+#
+# Raised 1200 -> 1800 with the alpha-engine-data venv (config-I7427): that
+# build pulls arcticdb, a large native wheel, on top of the dashboard venv's
+# closure. Two builds under a ceiling sized for one is how a correct bootstrap
+# starts failing on a slow mirror day and reads as an infrastructure fault.
 BOOTSTRAP_TIMEOUT_SECONDS = int(
-    os.environ.get("WEEKLY_SPOT_BOOTSTRAP_TIMEOUT_SECONDS", "1200")
+    os.environ.get("WEEKLY_SPOT_BOOTSTRAP_TIMEOUT_SECONDS", "1800")
 )
 SSM_ONLINE_BUDGET_SEC = int(os.environ.get("WEEKLY_SPOT_SSM_ONLINE_BUDGET_SEC", "300"))
 CW_LOG_GROUP = os.environ.get("WEEKLY_SPOT_CW_LOG_GROUP", "/alpha-engine/weekly-freshness-spot")
@@ -378,6 +383,44 @@ fi
 # numpy<2 pin to match every other spot workload (pyarrow compiled against 1.x).
 pip install -q 'numpy<2' || fail "numpy pin failed"
 chown -R ec2-user:ec2-user /home/ec2-user/alpha-engine-dashboard/.venv || fail "venv chown failed"
+deactivate
+# A SECOND venv, for alpha-engine-data's own code (alpha-engine-config-I7427).
+#
+# WeeklySubstrateHealthCheck runs three of its four checks out of
+# /home/ec2-user/alpha-engine-data (validators.constituents_drift_check,
+# validators.phase_marker_sweep, validators.stage_output_sweep) and, until
+# this venv existed, ran them under the DASHBOARD interpreter above. The
+# constituents drift check therefore never once reached its comparison:
+#
+#   WARNING [collectors.constituents] Constituents fetch failed
+#     (`Import openpyxl` failed...); trying local cache...
+#   ERROR   [__main__] Drift check failed at stage=arctic_list:
+#     No module named 'arcticdb'
+#
+# (measured 2026-08-15, execution watch-rerun-2026-08-15-2).
+#
+# The two dependency sets CANNOT be merged into one venv: the dashboard venv
+# is pinned `numpy<2` on the line above because every spot workload's pyarrow
+# is compiled against 1.x, and alpha-engine-data declares `numpy>=2.4.6`.
+# Installing data's requirements into the dashboard venv would silently break
+# the pin that fourteen other stages depend on. Two venvs is the only shape
+# that is correct for both.
+echo "[weekly-freshness-spot-bootstrap] building alpha-engine-data venv..."
+cd /home/ec2-user/alpha-engine-data
+# python3.12 literally, for the same reason as the dashboard venv above: an
+# interpreter-selection fallback resolves a different wheel set and says
+# nothing when it does. The renderer has already installed 3.12 by this point,
+# and test_handler.py asserts no such fallback survives in this rendered
+# command at all.
+python3.12 -m venv .venv || fail "data venv create failed"
+.venv/bin/pip install --upgrade pip -q || fail "data pip upgrade failed"
+[ -f requirements.txt ] || fail "alpha-engine-data requirements.txt missing"
+.venv/bin/pip install -q -r requirements.txt || fail "data requirements install failed"
+# krepis is not in alpha-engine-data's requirements.txt but stage_output_sweep
+# and the ssm_log_capture wrapper resolve krepis modules; install it explicitly
+# rather than letting an import failure read as a domain finding.
+.venv/bin/pip install -q 'krepis>=0.59.8' || fail "data krepis install failed"
+chown -R ec2-user:ec2-user /home/ec2-user/alpha-engine-data/.venv || fail "data venv chown failed"
 trap - EXIT
 aws s3 cp {log} "{s3_log}" --region {REGION} --quiet || true
 echo "[weekly-freshness-spot-bootstrap] complete — launcher box ready"
