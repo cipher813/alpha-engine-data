@@ -47,11 +47,66 @@ apply_iam_policy() {
     echo "  IAM role exists: ${role_name}"
   fi
 
+  # Report whether this apply actually CHANGES anything
+  # (alpha-engine-config-I7444).
+  #
+  # put-role-policy is idempotent, so re-applying an unchanged document
+  # succeeds exactly like a real change and the caller's "IAM applied" line
+  # prints either way. The command is therefore indistinguishable from a
+  # no-op by reading its output — which is precisely how, on 2026-08-16, an
+  # operator ran this from a checkout on `main` while the changed
+  # iam-policy.json lived on an unmerged PR branch, saw the success line,
+  # and reasonably believed the grant had landed. It had not: the file that
+  # was applied was main's, identical to what was already live. The
+  # iam-policy-change-guard stayed red and the cause was invisible.
+  #
+  # Comparing live against the file first costs one read and converts an
+  # unfalsifiable "applied" into a statement with content. Best-effort by
+  # design: if the read or the comparison cannot be done, say so and apply
+  # anyway — a diagnostic must never be able to block the apply itself.
+  local live_doc="" verdict="unknown"
+  if live_doc="$(aws iam get-role-policy \
+        --role-name "${role_name}" \
+        --policy-name "${policy_name}" \
+        --query 'PolicyDocument' --output json 2>/dev/null)"; then
+    if command -v python3 >/dev/null 2>&1; then
+      verdict="$(python3 -c '
+import json, sys
+try:
+    live = json.loads(sys.argv[1])
+    disk = json.load(open(sys.argv[2]))
+except Exception:
+    print("unknown"); raise SystemExit(0)
+# Key-order- and whitespace-insensitive: only the semantic document matters.
+print("same" if json.dumps(live, sort_keys=True) == json.dumps(disk, sort_keys=True)
+      else "different")
+' "${live_doc}" "${policy_file}" 2>/dev/null || echo unknown)"
+    fi
+  else
+    # No inline policy of that name yet — a first apply is by definition a change.
+    verdict="absent"
+  fi
+
   echo "  Applying inline policy: ${policy_name}"
+  case "${verdict}" in
+    same)
+      echo "  NOTE: live policy already matches ${policy_file} — this apply is a NO-OP." >&2
+      echo "  NOTE: If you expected a change, you are almost certainly running from the" >&2
+      echo "  NOTE: wrong checkout: this reads iam-policy.json from the working tree, so" >&2
+      echo "  NOTE: a policy edit that lives on an unmerged branch requires running from" >&2
+      echo "  NOTE: THAT BRANCH (alpha-engine-config-I7444)." >&2
+      ;;
+    different) echo "  live policy DIFFERS from ${policy_file} — applying the change." ;;
+    absent)    echo "  no inline policy ${policy_name} on the role yet — first apply." ;;
+    *)         echo "  (could not compare live policy against ${policy_file}; applying anyway)" >&2 ;;
+  esac
+
   run aws iam put-role-policy \
     --role-name "${role_name}" \
     --policy-name "${policy_name}" \
     --policy-document "file://${policy_file}"
+
+  APPLY_IAM_POLICY_VERDICT="${verdict}"
 }
 
 # apply_iam_policy_on_deploy — the "#4472 auto-apply on merge" call site.
