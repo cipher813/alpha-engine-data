@@ -115,7 +115,8 @@ if $APPLY_IAM; then
     --role-name "${ROLE_NAME}" \
     --policy-name "${POLICY_NAME}" \
     --policy-document "file://${SCRIPT_DIR}/iam-policy.json"
-  echo "  ✓ IAM applied."
+  echo "  ✓ IAM applied. Nothing else was touched — no code, no env, no alarms."
+  exit 0
 fi
 
 # Ensure the live Lambda env has the new structured-prefix var. Idempotent —

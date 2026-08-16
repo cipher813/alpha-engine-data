@@ -137,7 +137,8 @@ if $APPLY_IAM; then
   echo "Applying IAM (role=${ROLE_NAME}, policy=${POLICY_NAME})..."
   TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
   apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
-  echo "  ✓ IAM applied."
+  echo "  ✓ IAM applied. Nothing else was touched — no code, no env, no alarms."
+  exit 0
 fi
 
 # ----- Apply alarms only -----------------------------------------------------
