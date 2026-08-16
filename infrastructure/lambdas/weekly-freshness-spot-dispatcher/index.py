@@ -407,7 +407,12 @@ deactivate
 # that is correct for both.
 echo "[weekly-freshness-spot-bootstrap] building alpha-engine-data venv..."
 cd /home/ec2-user/alpha-engine-data
-"$PYTHON_BIN" -m venv .venv || fail "data venv create failed"
+# python3.12 literally, for the same reason as the dashboard venv above: an
+# interpreter-selection fallback resolves a different wheel set and says
+# nothing when it does. The renderer has already installed 3.12 by this point,
+# and test_handler.py asserts no such fallback survives in this rendered
+# command at all.
+python3.12 -m venv .venv || fail "data venv create failed"
 .venv/bin/pip install --upgrade pip -q || fail "data pip upgrade failed"
 [ -f requirements.txt ] || fail "alpha-engine-data requirements.txt missing"
 .venv/bin/pip install -q -r requirements.txt || fail "data requirements install failed"

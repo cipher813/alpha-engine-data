@@ -36,7 +36,12 @@ def _src() -> str:
 
 def test_bootstrap_creates_the_data_venv():
     src = _src()
-    assert '"$PYTHON_BIN" -m venv .venv' in src
+    assert "python3.12 -m venv .venv" in src
+    assert '"$PYTHON_BIN" -m venv' not in src, (
+        "the bootstrap deliberately names python3.12 literally — the "
+        "`command -v python3.12 ... || PYTHON_BIN=python3` fallback resolves "
+        "a different wheel set and says nothing when it does"
+    )
     assert "cd /home/ec2-user/alpha-engine-data" in src, (
         "the bootstrap never enters the alpha-engine-data checkout to build "
         "its venv (config-I7427)"
