@@ -319,10 +319,62 @@ class ExecutionRecord:
     status: str
     start: datetime  # tz-aware UTC
     stop: datetime | None
+    # The execution's own ``run_date`` input — the CYCLE it belongs to, which
+    # is NOT derivable from ``start``: a recovery rerun of Saturday's cycle
+    # legitimately starts on Sunday (or later) and still carries
+    # run_date=<Saturday>. This is the same key the run-slot mutex and the
+    # completion marker's ``cycle_key`` use, so a consumer asking "did cycle
+    # D succeed?" must match on this and never on a wall-clock date in any
+    # zone (alpha-engine-config-I7440). ``None`` when the input carried no
+    # usable run_date; consumers fall back to ``start`` and say so.
+    run_date: date | None = None
+
+
+# The weekly SF's pipeline_role vocabulary, as emitted by its launch paths:
+#   weekly      — the alpha-engine-saturday EventBridge cron (the real cycle)
+#   exercise    — the daily postclose-chained dry exercise run
+#   watch-rerun — scripts/weekly_sf_rerun.py, the §2.5 mechanical recovery
+#   recovery    — sf-watch's substrate-reclaim relaunch
+#   shell-run   — the Friday-PM off-cycle preflight shell
+# Closed on purpose: an unrecognized role normalizes to None so a new launch
+# path cannot silently start counting as a cycle nobody declared.
+KNOWN_ROLES = ("exercise", "weekly", "watch-rerun", "recovery", "shell-run")
+
+
+def _parse_run_date(raw: object) -> date | None:
+    """``run_date`` input → ``date``; ``None`` on anything unparseable.
+
+    Never raises: an execution whose input carries a malformed run_date is a
+    record with ``run_date=None``, which consumers treat as "cycle unknown"
+    and fall back on — it must not take down the whole fetch for the other
+    executions in the window.
+    """
+    if not isinstance(raw, str):
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return None
 
 
 def normalize_role(raw: object) -> str | None:
-    return raw if raw in ("exercise", "weekly") else None
+    """Pass a recognized ``pipeline_role`` through unchanged; unknown → None.
+
+    Until 2026-08-16 this collapsed EVERYTHING except ``exercise``/``weekly``
+    to ``None``, which made ``watch-rerun`` and ``recovery`` indistinguishable
+    from an unrecognized launch path. That is why
+    ``pipeline-watchdog``'s ``WEEKLY_CADENCE_ROLES`` filter — which names both
+    — could never match a record produced by ``fetch_execution_records``, and
+    why its weekly failed-day check counted 1 execution on cycle day
+    2026-08-15 while its own liveness check, reading roles by a second
+    unrelated path, counted 24 and returned CLEAR (alpha-engine-config-I7440).
+
+    Widening is behaviour-preserving for this module's own slot matching:
+    ``evaluate_slot`` compares ``e.role == slot.role`` and slot roles are only
+    ``weekly``/``exercise``, so records that were ``None`` and matched nothing
+    are now named and still match nothing.
+    """
+    return raw if raw in KNOWN_ROLES else None
 
 
 @dataclass(frozen=True)
@@ -424,10 +476,12 @@ def fetch_execution_records(
         if start < since:
             continue
         role = None
+        run_date = None
         try:
             desc = sf_client.describe_execution(executionArn=ex["executionArn"])
             inp = json.loads(desc.get("input") or "{}")
             role = normalize_role(inp.get("pipeline_role"))
+            run_date = _parse_run_date(inp.get("run_date"))
         except Exception as exc:  # noqa: BLE001 — best-effort per-execution; unrecognized role is a safe fallback, not a hidden failure (surfaced below)
             print(f"WARN: could not read input of {ex['executionArn']}: {exc}", file=sys.stderr)
         records.append(ExecutionRecord(
@@ -436,6 +490,7 @@ def fetch_execution_records(
             status=ex["status"],
             start=start,
             stop=ex.get("stopDate"),
+            run_date=run_date,
         ))
     return records
 

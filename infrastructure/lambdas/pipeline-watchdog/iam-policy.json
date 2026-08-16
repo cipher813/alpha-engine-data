@@ -73,7 +73,8 @@
       ],
       "Resource": [
         "arn:aws:s3:::alpha-engine-research/_sf_completion/ne-preopen-trading-pipeline/*",
-        "arn:aws:s3:::alpha-engine-research/_sf_completion/ne-postclose-trading-pipeline/*"
+        "arn:aws:s3:::alpha-engine-research/_sf_completion/ne-postclose-trading-pipeline/*",
+        "arn:aws:s3:::alpha-engine-research/_sf_completion/ne-weekly-freshness-pipeline/*"
       ]
     },
     {
@@ -98,7 +99,8 @@
             "_alerts/_dedup",
             "_alerts/_dedup/*",
             "_sf_completion/ne-preopen-trading-pipeline/*",
-            "_sf_completion/ne-postclose-trading-pipeline/*"
+            "_sf_completion/ne-postclose-trading-pipeline/*",
+            "_sf_completion/ne-weekly-freshness-pipeline/*"
           ]
         }
       }
