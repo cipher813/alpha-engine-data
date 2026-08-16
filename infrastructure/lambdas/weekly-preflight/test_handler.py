@@ -41,9 +41,15 @@ def _install_stub(results, n_fail=None, raises=None):
     stub.LAMBDA_CAPABILITIES = frozenset({"aws"})
     stub.FULL_CAPABILITIES = frozenset({"aws", "arctic", "repo_modules", "checkout", "polygon"})
 
-    def run_preflight(bucket=None, capabilities=None):
+    def run_preflight(bucket=None, capabilities=None, run_date=None, skip_flags=None):
         recorded["bucket"] = bucket
         recorded["capabilities"] = capabilities
+        # alpha-engine-config-I7443: the handler forwards the SF execution
+        # input so check_skip_flag_artifact_coherence can verify each skip
+        # claim before spot spend. Recorded so the forwarding is asserted,
+        # not assumed.
+        recorded["run_date"] = run_date
+        recorded["skip_flags"] = skip_flags
         if raises is not None:
             raise raises
         fails = n_fail if n_fail is not None else sum(1 for r in results if r.status == "fail")
@@ -123,6 +129,67 @@ class WeeklyPreflightHandlerTests(unittest.TestCase):
         recorded = _install_stub([_Result("sf_iam_reachability", "ok")])
         self._handler()({"bucket": "some-other-bucket"}, None)
         self.assertEqual(recorded["bucket"], "some-other-bucket")
+
+
+class WeeklyPreflightExecutionInputForwardingTests(unittest.TestCase):
+    """alpha-engine-config-I7443.
+
+    The SF Task invokes this Lambda with no explicit Payload, so the whole
+    state input arrives as ``event`` — run_date and every skip_* flag are
+    already present and were simply discarded. Forwarding them is what lets
+    the pre-spend gate reject an incoherent recovery input (a skip claim
+    with no artifact for that run_date) in seconds, instead of the in-SF
+    guard catching it after a spot dispatch and ~18 minutes.
+    """
+
+    def tearDown(self):
+        sys.modules.pop("sf_preflight", None)
+        sys.modules.pop("index", None)
+
+    def _handler(self):
+        sys.modules.pop("index", None)
+        import index
+        return index.handler
+
+    def test_run_date_and_skip_flags_reach_run_preflight(self):
+        recorded = _install_stub([_Result("sf_iam_reachability", "ok")])
+        event = {
+            "run_date": "2026-08-16",
+            "skip_predictor_training": True,
+            "skip_scanner": True,
+            "skip_aggregate_costs": False,
+            "pipeline_role": "watch-rerun",
+            "sns_topic_arn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        }
+        self._handler()(event, None)
+        self.assertEqual(recorded["run_date"], "2026-08-16")
+        self.assertEqual(
+            recorded["skip_flags"],
+            {
+                "skip_predictor_training": True,
+                "skip_scanner": True,
+                "skip_aggregate_costs": False,
+            },
+        )
+
+    def test_non_skip_keys_are_not_forwarded_as_skip_flags(self):
+        """Only skip_* keys — pipeline_role and sns_topic_arn are not claims."""
+        recorded = _install_stub([_Result("sf_iam_reachability", "ok")])
+        self._handler()(
+            {"run_date": "2026-08-16", "pipeline_role": "watch-rerun"}, None
+        )
+        self.assertEqual(recorded["skip_flags"], {})
+
+    def test_bare_event_forwards_nothing_and_still_passes(self):
+        """A bare {} test invoke must keep working. An absent payload is
+        'nothing claimed', never a violation — this gate must not begin
+        halting the pipeline over a shape it previously ignored."""
+        recorded = _install_stub([_Result("sf_iam_reachability", "ok")])
+        out = self._handler()({}, None)
+        self.assertIsNone(recorded["run_date"])
+        self.assertEqual(recorded["skip_flags"], {})
+        self.assertEqual(out["status"], "OK")
+        self.assertFalse(out["has_violation"])
 
 
 if __name__ == "__main__":

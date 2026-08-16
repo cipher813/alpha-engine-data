@@ -1090,3 +1090,225 @@ def test_definition_input_coherence_ignores_mid_flow_refs():
     assert result.status == "ok", result.details
     assert result.details["undecidable_refs"] >= 3
     assert result.details["checked"] >= 1  # $.pipeline_role still verified
+
+
+# ── check_skip_flag_artifact_coherence (alpha-engine-config-I7443) ────────────
+#
+# The live shape these reproduce: on 2026-08-15's cycle, two recovery
+# executions carried `skip_predictor_training: true` with `run_date:
+# 2026-08-16` while the weights manifest was last written 2026-08-15. Both
+# died on the in-SF `PredictorSkipWeightsStale` guard — correct, but only
+# after a spot dispatch and ~18 minutes, twice. This check asserts the same
+# predicate at the pre-spend gate (sf-pipeline-policy §2.2).
+
+
+from datetime import datetime as _dt, timezone as _tz  # noqa: E402
+
+
+class _NotFound(Exception):
+    def __init__(self):
+        super().__init__("Not Found")
+        self.response = {"Error": {"Code": "404"}}
+
+
+def _skip_ctx(run_date="2026-08-16", **flags) -> sfp.PreflightContext:
+    return sfp.PreflightContext(
+        bucket="alpha-engine-research",
+        today="2026-08-16",
+        prior_trading_day="2026-08-14",
+        run_date=run_date,
+        skip_flags=dict(flags),
+    )
+
+
+def _s3_with_last_modified(day: str) -> MagicMock:
+    s3 = MagicMock()
+    s3.head_object.return_value = {
+        "LastModified": _dt.fromisoformat(f"{day}T12:00:00+00:00").astimezone(_tz.utc)
+    }
+    return s3
+
+
+def test_skip_coherence_fails_when_artifact_predates_run_date():
+    """THE regression: manifest dated 2026-08-15, run_date 2026-08-16."""
+    ctx = _skip_ctx(run_date="2026-08-16", skip_predictor_training=True)
+    with patch("boto3.client", return_value=_s3_with_last_modified("2026-08-15")):
+        res = sfp.check_skip_flag_artifact_coherence(ctx)
+    assert res.status == "fail"
+    assert "2026-08-15 < run_date 2026-08-16" in res.details["violations"][0]
+    assert "CheckPredictorSkipWeightsFresh" in res.details["violations"][0]
+
+
+def test_skip_coherence_passes_when_artifact_is_current():
+    ctx = _skip_ctx(run_date="2026-08-15", skip_predictor_training=True)
+    with patch("boto3.client", return_value=_s3_with_last_modified("2026-08-15")):
+        res = sfp.check_skip_flag_artifact_coherence(ctx)
+    assert res.status == "ok"
+    assert res.details["claims_checked"] == 1
+
+
+def test_skip_coherence_fails_when_the_artifact_does_not_exist():
+    ctx = _skip_ctx(skip_predictor_training=True)
+    s3 = MagicMock()
+    s3.head_object.side_effect = _NotFound()
+    with patch("boto3.client", return_value=s3):
+        res = sfp.check_skip_flag_artifact_coherence(ctx)
+    assert res.status == "fail"
+    assert "does not exist" in res.details["violations"][0]
+
+
+def test_skip_coherence_unreadable_artifact_is_unknown_not_pass():
+    """§2.3a: a verdict that cannot be read is UNKNOWN, never a pass. An S3
+    error other than 404 must fail loudly rather than waving the claim
+    through — the same rule that made the watchdog's UNREADABLE page."""
+    ctx = _skip_ctx(skip_predictor_training=True)
+    s3 = MagicMock()
+    s3.head_object.side_effect = RuntimeError("s3 5xx")
+    with patch("boto3.client", return_value=s3):
+        res = sfp.check_skip_flag_artifact_coherence(ctx)
+    assert res.status == "fail"
+    assert "unreadable" in res.details["violations"][0]
+
+
+def test_skip_coherence_rejects_a_non_iso_last_modified_instead_of_wrong_passing():
+    """The SF's StringMatches '20*-*-*' shape guard, replicated. A non-ISO
+    serialization compared lexicographically could SILENTLY wrong-pass; it
+    must become the loud path instead."""
+    ctx = _skip_ctx(skip_predictor_training=True)
+    s3 = MagicMock()
+    s3.head_object.return_value = {"LastModified": "Sat, 15 Aug 2026 12:00:00 GMT"}
+    with patch("boto3.client", return_value=s3):
+        res = sfp.check_skip_flag_artifact_coherence(ctx)
+    assert res.status == "fail"
+    assert "not YYYY-MM-DD" in res.details["violations"][0]
+
+
+def test_skip_coherence_is_silent_when_the_flag_is_not_claimed():
+    """An unclaimed skip must cost zero S3 calls — this runs on every
+    weekly execution, including the clean Saturday one."""
+    ctx = _skip_ctx(skip_scanner=True)  # registered flags not among them
+    s3 = MagicMock()
+    with patch("boto3.client", return_value=s3):
+        res = sfp.check_skip_flag_artifact_coherence(ctx)
+    assert res.status == "ok"
+    assert res.details["claims_checked"] == 0
+    s3.head_object.assert_not_called()
+
+
+def test_skip_coherence_without_execution_input_is_ok_not_fail():
+    """The CLI and the spot box call run_preflight without the SF input.
+    That is 'nothing observed', not 'violation' — this gate must not start
+    halting the pipeline for callers that never passed a payload."""
+    ctx = _ctx()  # no run_date, no skip_flags
+    res = sfp.check_skip_flag_artifact_coherence(ctx)
+    assert res.status == "ok"
+    assert res.details["claims_checked"] == 0
+
+
+def test_skip_predicate_matches_the_sf_definitions_own_guard():
+    """Anti-drift pin. This check duplicates a predicate the SF already
+    owns; duplication is only safe while the two agree, so assert against
+    the definition itself rather than against a copy of it.
+
+    Every registry entry must name a real state in step_function.json, and
+    the predictor entry's S3 object path must be the one that state heads.
+    """
+    import json
+    from pathlib import Path
+
+    defn = json.loads(
+        (Path(__file__).resolve().parents[1] / "infrastructure" / "step_function.json").read_text()
+    )
+
+    def walk(states):
+        for n, s in states.items():
+            yield n, s
+            if s.get("Type") == "Parallel":
+                for b in s.get("Branches", []):
+                    yield from walk(b.get("States", {}))
+            if s.get("Type") == "Map":
+                it = s.get("Iterator") or s.get("ItemProcessor") or {}
+                yield from walk(it.get("States", {}))
+
+    states = dict(walk(defn["States"]))
+
+    assert sfp.SKIP_ARTIFACT_PREDICATES, "registry must not be empty"
+    for pred in sfp.SKIP_ARTIFACT_PREDICATES:
+        assert pred.sf_guard in states, (
+            f"{pred.flag} names sf_guard={pred.sf_guard!r}, which is not a state "
+            f"in step_function.json — this check would be the SOLE author of a "
+            f"correctness rule instead of an early copy of the SF's own"
+        )
+
+    # The predictor entry specifically: the object path must match the
+    # HeadObject the SF performs, or the preflight asserts against a
+    # different artifact than the guard it claims to mirror.
+    validate = states["ValidatePredictorSkipWeightsFresh"]
+    sf_target = validate["Parameters"]["Key"]
+    pred = next(p for p in sfp.SKIP_ARTIFACT_PREDICATES
+                if p.flag == "skip_predictor_training")
+    assert pred.key == sf_target, (
+        f"preflight checks {pred.key!r} but ValidatePredictorSkipWeightsFresh "
+        f"heads {sf_target!r} — the two have drifted"
+    )
+
+    # ...and the comparison must still be >= run_date, not something else.
+    choice = states["CheckPredictorSkipWeightsFresh"]["Choices"][0]["And"]
+    assert any(
+        c.get("StringGreaterThanEqualsPath") == "$.run_date" for c in choice
+    ), (
+        "CheckPredictorSkipWeightsFresh no longer compares >= $.run_date; "
+        "check_skip_flag_artifact_coherence's last_modified_gte_run_date "
+        "predicate is now wrong"
+    )
+
+
+def test_weekly_preflight_receives_the_execution_input():
+    """alpha-engine-config-I7443 — structural pin on the definition.
+
+    WeeklyPreflight was the ONLY ``lambda:invoke`` task in this definition
+    with no ``Payload`` at all. Under the optimized Lambda integration an
+    omitted Payload means the function is invoked with no event, so the
+    handler received ``{}`` on every real execution: its documented
+    ``bucket`` / ``sf_name`` overrides were dead code in production, and
+    ``check_skip_flag_artifact_coherence`` would have had nothing to check.
+
+    A gate that cannot see the input it is gating is not a gate. This pins
+    that it can — and that every other lambda:invoke still passes one, so
+    the omission cannot silently reappear on a new state.
+    """
+    import json
+    from pathlib import Path
+
+    defn = json.loads(
+        (Path(__file__).resolve().parents[1] / "infrastructure" / "step_function.json").read_text()
+    )
+
+    def walk(states):
+        for n, s in states.items():
+            yield n, s
+            if s.get("Type") == "Parallel":
+                for b in s.get("Branches", []):
+                    yield from walk(b.get("States", {}))
+            if s.get("Type") == "Map":
+                it = s.get("Iterator") or s.get("ItemProcessor") or {}
+                yield from walk(it.get("States", {}))
+
+    states = dict(walk(defn["States"]))
+
+    params = states["WeeklyPreflight"]["Parameters"]
+    assert params.get("Payload.$") == "$", (
+        "WeeklyPreflight must receive the whole execution input; without it "
+        "check_skip_flag_artifact_coherence sees no run_date and no skip_* "
+        "flags and silently reports 'nothing claimed' on every run"
+    )
+
+    missing = [
+        name for name, s in states.items()
+        if s.get("Resource", "").endswith("lambda:invoke")
+        and not any(k.startswith("Payload") for k in s.get("Parameters", {}))
+    ]
+    assert not missing, (
+        f"lambda:invoke states with no Payload receive an empty event: {missing}. "
+        f"Every handler's event contract is dead code until one is passed."
+    )
