@@ -88,6 +88,27 @@ def _stage(name="DataPhase1"):
 # ── Per-stage verdicts ───────────────────────────────────────────────────────
 
 
+
+def _sweep_run_date() -> str:
+    """The run_date the sweep itself derives — UTC, never local.
+
+    `preflight_sweep.sweep` binds `run_date` from
+    `dt.datetime.now(dt.timezone.utc).date()`, mirroring the SF's own
+    `InitializeInput`. A fixture built from `dt.date.today()` (LOCAL) agrees
+    with it only outside the hours where the two dates differ — 17:00-24:00
+    Pacific, every day. Measured 2026-08-15 23:5x PT: the sweep probed
+    `backtest/2026-08-16/` while the fixture declared `backtest/2026-08-15/`,
+    and `test_a_genuinely_broken_backtest_stage_still_fails_when_upstream_is_present`
+    failed on an ambient clock rather than on anything about the code.
+
+    The upstream-PENDING test is the worse half: a mismatched date produces
+    an empty upstream probe, which is exactly the state it asserts — so it
+    passed for the wrong reason in that window and would have kept passing
+    if the probe had stopped working entirely.
+    """
+    return dt.datetime.now(dt.timezone.utc).date().isoformat()
+
+
 def test_a_clean_preflight_is_a_pass(tmp_path):
     result = ps.run_stage(_stage(), str(tmp_path), 60, runner=_completed(0))
     assert result.verdict == ps.PASSED
@@ -595,7 +616,7 @@ def test_the_weekday_case_end_to_end_zero_failures_and_no_page(tmp_path):
                     "or unreachable.\n" if rc else ""),
         )
 
-    run_date = dt.date.today().isoformat()
+    run_date = _sweep_run_date()
     aws = FakeAws(listing={f"backtest/{run_date}/": [
         {"Key": f"backtest/{run_date}/.phases/preflight.json", "Size": 235},
         {"Key": f"backtest/{run_date}/.phases/runtime_smoke.json", "Size": 239},
@@ -625,7 +646,7 @@ def test_a_genuinely_broken_backtest_stage_still_fails_when_upstream_is_present(
         rc = 1 if "spot_predictor_backtest.sh" in argv[-1] else 0
         return subprocess.CompletedProcess(args=argv, returncode=rc, stdout="", stderr="")
 
-    run_date = dt.date.today().isoformat()
+    run_date = _sweep_run_date()
     aws = FakeAws(listing={f"backtest/{run_date}/": [
         {"Key": f"backtest/{run_date}/.phases/preflight.json", "Size": 235},
         {"Key": f"backtest/{run_date}/results/backtest.parquet", "Size": 8123},
@@ -853,3 +874,29 @@ def test_console_rows_are_published_even_when_the_run_failed(cadence):
     ps.emit(report, aws, "arn:sns")
     assert f"ops/checks/{stage_check_id('A')}/latest.json" in aws.objects
     assert "ops/checks/ae-preflight-sweep/latest.json" in aws.objects
+
+
+def test_the_sweep_derives_run_date_from_utc_not_local_time():
+    """Pins what `_sweep_run_date` above mirrors.
+
+    The sweep binds `run_date` from the execution's UTC start time, matching
+    the SF's `InitializeInput`. Two tests build S3 fixtures from that date; if
+    the sweep ever switched to local time they would silently start probing a
+    prefix the fixture does not declare, and the upstream-pending assertions
+    would pass vacuously rather than fail. Caught live 2026-08-15 in the
+    17:00-24:00 PT window (alpha-engine-config-I7431).
+    """
+    import inspect
+
+    src = inspect.getsource(ps.sweep)
+    assert "started.date().isoformat()" in src, (
+        "sweep no longer binds run_date from `started` — re-derive "
+        "_sweep_run_date() from whatever it uses now"
+    )
+    assert "dt.datetime.now(dt.timezone.utc)" in inspect.getsource(ps), (
+        "the sweep's `started` is no longer UTC; _sweep_run_date() is wrong"
+    )
+    assert "dt.date.today()" not in src, (
+        "sweep uses LOCAL today() for run_date — the fixtures, the SF's "
+        "InitializeInput and the sweep must all agree on one clock"
+    )
