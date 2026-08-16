@@ -188,8 +188,16 @@ def sweep(
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    # allow_abbrev=False (config-I7415): argparse's default accepts any
+    # unambiguous prefix of a long option. A caller passing `--alert` —
+    # believing it was turning alerting ON, which is already the default —
+    # was silently rebound to `--alert-severity`, which then failed for a
+    # missing value and took the whole sweep's exit code with it. The sweep
+    # is invoked from a shell script on a box, so the only signal that the
+    # flag did not mean what it read as is the run that already failed.
     parser = argparse.ArgumentParser(
         description="Weekly-SF post-run phase-marker sweep (config#2322)",
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--run-date", required=True,
