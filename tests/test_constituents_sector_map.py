@@ -276,8 +276,9 @@ def test_collect_warns_but_proceeds_within_sector_gap_tolerance(tmp_path) -> Non
 
 def test_fetch_raises_when_sector_column_missing(tmp_path, monkeypatch) -> None:
     """If Wikipedia table column header changes, _fetch_constituents must
-    fall through to the cache (or empty result) rather than silently
-    selecting a junk table."""
+    fall through to the cache rather than silently selecting a junk table —
+    and with no cache present, RAISE (alpha-engine-config-I7435) rather than
+    return an empty result."""
     # Isolate the cache to a tmp path so prior tests' cache pollution
     # doesn't disguise the missing-column signature.
     monkeypatch.setattr(
@@ -293,13 +294,14 @@ def test_fetch_raises_when_sector_column_missing(tmp_path, monkeypatch) -> None:
         return _FakeResp(text=bad_wiki_html)
 
     with patch("collectors.constituents.requests.get", side_effect=fake_get):
-        tickers, sector_map, _, _, _, _ = constituents._fetch_constituents()
+        with pytest.raises(constituents.ConstituentsUnavailable) as excinfo:
+            constituents._fetch_constituents()
 
-    # No Wikipedia tables matched the schema → the whole fetch falls
-    # through to the cache (empty here) → empty result, which collect()
-    # then short-circuits with status=error before any S3 write.
-    assert tickers == []
-    assert sector_map == {}
+    # No Wikipedia tables matched the schema → the whole fetch falls through
+    # to the cache, which is absent here → ConstituentsUnavailable rather than
+    # an empty result (alpha-engine-config-I7435). A column-header change at
+    # the source is exactly the case that must not render as "0 constituents".
+    assert "no local constituents cache" in str(excinfo.value)
 
 
 def test_cache_persists_sector_map_and_etf(tmp_path, monkeypatch) -> None:
@@ -380,10 +382,16 @@ def test_cache_fallback_handles_legacy_ticker_only_schema(tmp_path, monkeypatch)
     assert sector_etf_map == {}
 
 
-def test_cache_fallback_missing_cache_returns_empty(tmp_path, monkeypatch) -> None:
-    """No source AND no cache → empty lists/dicts, not a crash. The
-    eventual `collect()` short-circuit ('No tickers fetched') handles
-    this state."""
+def test_cache_fallback_missing_cache_raises(tmp_path, monkeypatch) -> None:
+    """No source AND no cache → RAISE (alpha-engine-config-I7435).
+
+    Corrected from `..._returns_empty`, which asserted the defect: it pinned
+    the empty-tuple return and would have turned CI red on the fix. The old
+    rationale was that `collect()`'s "No tickers fetched" short-circuit
+    handles the state — but `collect()` is not the only consumer.
+    `validators/constituents_drift_check.py` calls `_fetch_constituents()`
+    directly, and on 2026-08-15 it logged "0 tickers" at INFO as a RESULT.
+    """
     cache_path = tmp_path / "constituents_cache.csv"  # does not exist
     monkeypatch.setattr(constituents, "_CACHE_PATH", cache_path)
 
@@ -391,10 +399,10 @@ def test_cache_fallback_missing_cache_returns_empty(tmp_path, monkeypatch) -> No
         raise RuntimeError("simulated outage")
 
     with patch("collectors.constituents.requests.get", side_effect=fake_get):
-        tickers, sector_map, sector_etf_map, _, _, _ = constituents._fetch_constituents()
+        with pytest.raises(constituents.ConstituentsUnavailable) as excinfo:
+            constituents._fetch_constituents()
 
-    assert tickers == []
-    assert sector_map == {} and sector_etf_map == {}
+    assert "simulated outage" in str(excinfo.value)
 
 
 def test_ssga_membership_filters_non_equity_rows() -> None:
@@ -641,3 +649,56 @@ def test_sector_map_writes_to_canonical_paths_only() -> None:
     # Bodies must be byte-equal — readers can pick any path safely.
     bodies = [c["Body"] for c in sector_map_writes]
     assert len(set(bodies)) == 1, "sector_map.json bodies diverge across paths"
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I7435 — a total outage is an exception, not an empty list
+# ---------------------------------------------------------------------------
+
+
+def test_double_failure_raises_instead_of_returning_an_empty_universe(tmp_path):
+    """Both sources gone must RAISE, never return ``([], {}, {}, {}, 0, 0)``.
+
+    Observed on `ne-weekly-freshness-pipeline` execution
+    `watch-rerun-2026-08-15-2`: the live fetch failed on a missing `openpyxl`,
+    the cache was absent, and the function returned normally with an empty
+    universe — which the caller then logged at INFO as a RESULT
+    ("Wikipedia constituents: 0 tickers"). A drift check comparing 0 tickers
+    against anything cannot fail for the right reason: it either passes
+    vacuously or reports drift whose real cause is a missing dependency.
+    """
+    missing_cache = tmp_path / "constituents_cache.csv"
+    assert not missing_cache.exists()
+
+    with patch.object(
+        constituents, "_fetch_ssga_membership",
+        side_effect=ImportError("Import openpyxl failed."),
+    ), patch.object(constituents, "_CACHE_PATH", missing_cache):
+        with pytest.raises(constituents.ConstituentsUnavailable) as excinfo:
+            constituents._fetch_constituents()
+
+    message = str(excinfo.value)
+    # BOTH causes must survive: naming only the cache miss buries the trigger,
+    # and "no cache found" reads nothing like "openpyxl is not installed".
+    assert "openpyxl" in message, message
+    assert "cache" in message.lower(), message
+    assert isinstance(excinfo.value.__cause__, ImportError)
+
+
+def test_cache_miss_alone_raises_the_typed_error(tmp_path):
+    """`_load_from_cache` is the layer that must not invent an empty result."""
+    missing_cache = tmp_path / "constituents_cache.csv"
+    with patch.object(constituents, "_CACHE_PATH", missing_cache):
+        with pytest.raises(constituents.ConstituentsUnavailable):
+            constituents._load_from_cache()
+
+
+def test_the_typed_error_is_narrow_enough_to_opt_out_of(tmp_path):
+    """A caller wanting a soft failure catches THIS, not `Exception`.
+
+    Deliverable 2 of I7435: the fail-loud default stays the default, and
+    opting out is explicit and narrow. A bare `RuntimeError` would have made
+    the opt-out swallow a schema change or a permissions error too.
+    """
+    assert issubclass(constituents.ConstituentsUnavailable, RuntimeError)
+    assert constituents.ConstituentsUnavailable is not RuntimeError
