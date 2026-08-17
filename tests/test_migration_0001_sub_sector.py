@@ -65,14 +65,37 @@ def _series_like(df: pd.DataFrame, seed: int) -> pd.Series:
 # ── (1) COLUMNS_AFTER framing ────────────────────────────────────────────────
 
 
-def test_columns_after_matches_live_features_list():
-    """COLUMNS_AFTER must equal OHLCV + source + the live FEATURES list —
-    the exact invariant tests/test_schema_migration_chokepoint.py enforces.
-    A drift here means this migration's frozen declaration is already stale."""
-    expected = ("Open", "High", "Low", "Close", "Volume", "VWAP", "source") + tuple(
-        FEATURES
+def test_columns_after_is_the_live_list_minus_later_migrations():
+    """0001's COLUMNS_AFTER is FROZEN — it declares the schema as of 0001.
+
+    This originally asserted equality with the live FEATURES list, which held
+    only while 0001 was the LATEST migration. That is the chokepoint test's
+    invariant (it checks the live schema against the newest migration), not
+    this module's: asserting it here would fail on every future schema change
+    for no reason connected to migration 0001.
+
+    The durable invariant is that 0001's frozen declaration is still a
+    faithful PREFIX-STATE of the live schema — every column it declared is
+    still live and still in canonical order, and the only differences are
+    columns added by LATER migrations.
+    """
+    from migrations import load_migrations
+
+    live = ("Open", "High", "Low", "Close", "Volume", "VWAP", "source") + tuple(FEATURES)
+
+    added_later: set[str] = set()
+    for mig in load_migrations():
+        if mig.number > 1:
+            added_later |= set(mig.columns_after) - set(migration_0001.COLUMNS_AFTER)
+
+    assert set(migration_0001.COLUMNS_AFTER) <= set(live), (
+        "0001 declared a column that no longer exists live — the frozen "
+        "declaration has gone stale, or a column was removed without a migration"
     )
-    assert migration_0001.COLUMNS_AFTER == expected
+    assert tuple(c for c in live if c not in added_later) == migration_0001.COLUMNS_AFTER, (
+        "the live schema minus later migrations' additions must reproduce "
+        "0001's frozen declaration exactly, in order"
+    )
 
 
 def test_new_columns_immediately_follow_sector_vs_spy_20d():
