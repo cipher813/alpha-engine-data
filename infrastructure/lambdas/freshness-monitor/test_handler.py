@@ -3481,7 +3481,7 @@ def _gha_inventory(now, workflows, *, complete=True, age_hours=1.0):
     return {index.GHA_WORKFLOW_STATE_KEY: json.dumps({
         "generated_at": stamped.isoformat(),
         "complete": complete,
-        "workflows": workflows,
+        "workflows": {k: {"state": v} for k, v in workflows.items()},
     }).encode()}
 
 
@@ -3688,3 +3688,24 @@ def test_partially_malformed_trigger_list_is_dropped_whole(fake_s3, caplog):
         fake_s3, "b", "k"
     )
     assert producer == {}
+
+
+def test_gha_pause_age_comes_from_githubs_own_switch_off_date(fixed_now):
+    """The inventory carries GitHub's `updated_at`. Using this Lambda's
+    first-observation instead would date every pause from whenever the monitor
+    happened to look, and the latch sweep reading the same inventory would
+    then disagree with it about how old the pause is."""
+    import index
+    trig = "gha:nousergon/alpha-engine-config/merge-drain.yml"
+    name = "nousergon/alpha-engine-config/merge-drain.yml"
+    objects = {index.GHA_WORKFLOW_STATE_KEY: json.dumps({
+        "generated_at": (fixed_now - timedelta(hours=1)).isoformat(),
+        "complete": True,
+        "workflows": {name: {
+            "state": "disabled_manually", "disabled_since": "2026-05-01",
+        }},
+    }).encode()}
+    out = index.apply_producer_suppression(
+        _keyed_s3(objects), {"pr_resting_state_trend": trig}, fixed_now)
+    assert out["pr_resting_state_trend"]["disabled_since"] == "2026-05-01"
+    assert out["pr_resting_state_trend"]["days_disabled"] == 29

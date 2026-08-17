@@ -689,9 +689,15 @@ def _load_json_with_age_ceiling(
     return payload
 
 
-def _load_gha_workflow_states(s3_client: Any, now: datetime) -> dict[str, str]:
-    """``{"owner/repo/workflow.yml": "<state>"}`` from the latch sweep's
-    inventory, or ``{}`` when it is absent, malformed or stale."""
+def _load_gha_workflow_states(s3_client: Any, now: datetime) -> dict[str, dict]:
+    """``{"owner/repo/workflow.yml": {"state", "disabled_since"}}`` from the
+    latch sweep's inventory, or ``{}`` when it is absent, malformed or stale.
+
+    ``disabled_since`` is GitHub's own ``updated_at`` for the workflow, i.e.
+    the moment it was actually switched off — better than this Lambda's
+    first-observed stamp, which can only ever say "since the monitor noticed".
+    Two surfaces disagreeing about how old a pause is, is the thing the
+    disabled-since bookkeeping exists to prevent."""
     payload = _load_json_with_age_ceiling(
         s3_client, GHA_WORKFLOW_STATE_KEY, now,
         GHA_INVENTORY_MAX_AGE_HOURS, "gha workflow-state inventory",
@@ -709,9 +715,19 @@ def _load_gha_workflow_states(s3_client: Any, now: datetime) -> dict[str, str]:
     workflows = payload.get("workflows")
     if not isinstance(workflows, dict):
         return {}
-    return {
-        str(k): str(v) for k, v in workflows.items() if isinstance(v, str)
-    }
+    out: dict[str, dict] = {}
+    for name, row in workflows.items():
+        # Accept the bare-string shape too, so a writer rolled back to the
+        # simpler payload degrades to "no disabled_since", never to a crash.
+        if isinstance(row, str):
+            out[str(name)] = {"state": row, "disabled_since": None}
+        elif isinstance(row, dict) and isinstance(row.get("state"), str):
+            since = row.get("disabled_since")
+            out[str(name)] = {
+                "state": row["state"],
+                "disabled_since": str(since)[:10] if since else None,
+            }
+    return out
 
 
 def _load_pause_ownership(s3_client: Any, now: datetime) -> dict[str, dict]:
@@ -762,7 +778,7 @@ def resolve_disabled_producers(
         surface, name = parsed
         try:
             if surface == "gha":
-                state = (gha_states or {}).get(name)
+                state = ((gha_states or {}).get(name) or {}).get("state")
                 if state == "disabled_manually":
                     disabled[trigger] = (
                         f"GitHub Actions workflow {name} is disabled_manually"
@@ -865,9 +881,9 @@ def apply_producer_suppression(
     all_triggers = {
         t for v in producer_trigger_by_id.values() for t in _declared_triggers(v)
     }
+    gha_states = _load_gha_workflow_states(s3_client, now)
     disabled = resolve_disabled_producers(
-        all_triggers, events_client, scheduler_client,
-        gha_states=_load_gha_workflow_states(s3_client, now),
+        all_triggers, events_client, scheduler_client, gha_states=gha_states,
     )
     ownership = _load_pause_ownership(s3_client, now) if disabled else {}
     since = _load_producer_disabled_since(s3_client)
@@ -875,7 +891,17 @@ def apply_producer_suppression(
     # Drop triggers that came back — a re-enabled producer restarts the clock.
     next_since = {k: v for k, v in since.items() if k in disabled}
     for trigger in disabled:
-        next_since.setdefault(trigger, today)
+        # A gha trigger carries GitHub's own switch-off date; prefer it over
+        # both the stored first-observation and today.
+        parsed = parse_producer_trigger(trigger)
+        authoritative = (
+            (gha_states.get(parsed[1]) or {}).get("disabled_since")
+            if parsed and parsed[0] == "gha" else None
+        )
+        if authoritative:
+            next_since[trigger] = authoritative
+        else:
+            next_since.setdefault(trigger, today)
     if next_since != since:
         _save_producer_disabled_since(s3_client, next_since)
 
