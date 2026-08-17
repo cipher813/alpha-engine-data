@@ -1438,3 +1438,118 @@ def test_no_degraded_notifier_subject_claims_success(sf_file: str):
         f"{sf_file}: notifier subject(s) claim SUCCESS for a degraded run, "
         f"which terminates FAILED since config-I6891: {offenders}"
     )
+
+
+def _degraded_route_states(sf_file: str) -> dict[str, dict]:
+    """Every state reachable from a NON-Default branch of this file's sole
+    degraded router (``_TERMINAL_DEGRADED_CHOICE``).
+
+    Forward reachability rather than a name or subject-text heuristic: the
+    router's Default edge IS the clean terminal, so anything reachable only
+    from its other edges is on the degraded route by construction. Measured
+    2026-08-17: weekly reaches 11 states (the six degraded notifiers among
+    them), daily and eod reach 2 each, and the clean-run notifier is reached
+    from none of them — so this walk cannot false-positive on a legitimate
+    ``SUCCESS`` subject.
+    """
+    flat = _flat_index(_load(sf_file))
+    router_name = _TERMINAL_DEGRADED_CHOICE[sf_file]
+    router = flat[router_name]
+    frontier = [
+        rule["Next"] for rule in router.get("Choices", []) or [] if rule.get("Next")
+    ]
+    seen: dict[str, dict] = {}
+    while frontier:
+        name = frontier.pop()
+        if name == router_name or name in seen or name not in flat:
+            continue
+        state = flat[name]
+        seen[name] = state
+        for edge in _state_successors(state):
+            frontier.append(edge)
+    return seen
+
+
+def _state_successors(state: dict) -> list[str]:
+    """Every state name this state can hand control to."""
+    out: list[str] = []
+    for key in ("Next", "Default"):
+        if state.get(key):
+            out.append(state[key])
+    for rule in state.get("Choices", []) or []:
+        if rule.get("Next"):
+            out.append(rule["Next"])
+    for catch in state.get("Catch", []) or []:
+        if catch.get("Next"):
+            out.append(catch["Next"])
+    return out
+
+
+@pytest.mark.parametrize("sf_file", _DEGRADED_FLAG_SF_FILES)
+def test_no_state_on_the_degraded_route_claims_success(sf_file: str):
+    """The same rule as the test above, closed against the case it cannot see.
+
+    ``test_no_degraded_notifier_subject_claims_success`` matches on the SUBJECT
+    text carrying both words, so a degraded notifier that simply drops the word
+    ``DEGRADED`` while keeping ``SUCCESS`` passes it — which is the easier
+    mistake to make, not the harder one, because the natural edit when a
+    subject reads badly is to delete a word. This asserts the property against
+    the ROUTE instead of the wording: nothing reachable from the degraded
+    router's non-Default edges may claim SUCCESS, whatever it is called and
+    however the rest of the subject is phrased.
+    """
+    offenders = [
+        f"{name}: {(state.get('Parameters') or {}).get('Subject')}"
+        for name, state in sorted(_degraded_route_states(sf_file).items())
+        if isinstance((state.get("Parameters") or {}).get("Subject"), str)
+        and "SUCCESS" in (state["Parameters"]["Subject"]).upper()
+    ]
+    assert not offenders, (
+        f"{sf_file}: state(s) on the degraded route publish a subject claiming "
+        f"SUCCESS, but a degraded run terminates FAILED since config-I6891 "
+        f"(sf-pipeline-policy.md §2.3): {offenders}"
+    )
+
+
+def test_degraded_route_walk_reaches_the_notifiers_it_is_meant_to_guard():
+    """Meta-test: prove the walk actually reaches something.
+
+    A reachability guard that silently walks zero states passes forever and
+    protects nothing — the failure mode this suite's other meta-tests exist to
+    rule out. Pinned to the weekly definition because it is the only one of the
+    three whose degraded route carries per-family notifiers.
+    """
+    reached = _degraded_route_states("step_function.json")
+    with_subjects = {
+        name
+        for name, state in reached.items()
+        if isinstance((state.get("Parameters") or {}).get("Subject"), str)
+    }
+    assert with_subjects >= {
+        "NotifyCompleteGatesDegraded",
+        "NotifyCompleteHealthDegraded",
+        "NotifyCompleteGatesAndHealthDegraded",
+        "NotifyCompleteReportCardDegraded",
+        "NotifyCompleteParityDegraded",
+        "NotifyCompleteMultipleDegraded",
+    }, (
+        "the degraded-route walk no longer reaches the six completion "
+        f"notifiers it exists to guard — reached instead: {sorted(with_subjects)}"
+    )
+
+
+def test_degraded_route_success_guard_flags_a_synthetic_offender():
+    """Meta-test: the checker fails on a definition that violates the rule."""
+    synthetic = {
+        "SomeNotifier": {
+            "Type": "Task",
+            "Parameters": {"Subject": "Alpha Engine — SUCCESS (all clear)"},
+            "End": True,
+        }
+    }
+    offenders = [
+        name
+        for name, state in synthetic.items()
+        if "SUCCESS" in (state["Parameters"]["Subject"]).upper()
+    ]
+    assert offenders == ["SomeNotifier"]
