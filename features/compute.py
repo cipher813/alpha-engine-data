@@ -119,7 +119,39 @@ def make_source_series(values: list[str] | pd.Series, index: pd.Index | None = N
 # passes every null-coverage check. 340 keeps a ~28-row buffer, matching the
 # ~10% margin the original 252->280 buffer used. Do not lower this without
 # re-deriving the deepest stacked window across feature_engineer.py.
-_FEATURE_WARMUP_ROWS = 340
+#
+# alpha-engine-config-I7539 (2026-08-17): RAISED 340 -> 585. 340 covered the
+# deepest per-ticker STACKED window, and the factor-momentum SECOND PASS needs
+# strictly more than that — it is a cross-sectional time series built ON TOP of
+# the per-ticker output, so its warmup composes with theirs rather than sitting
+# inside it:
+#
+#   dist_from_52w_high, the deepest DEFAULT_FACTOR_LOADINGS member,
+#   is NaN for its first 252 rows (FEATURE_CFG["weeks_52_days"], and
+#   compute_features deliberately does NOT dropna since 2026-04-21), so
+#   compute_daily_factor_returns' min_names=20 gate drops every one of those
+#   dates for that factor.                                              252
+#   compute_factor_momentum_series then needs
+#   rolling(window - skip = 231, min_periods=231).sum().shift(21)
+#   dates of FACTOR RETURNS, all of which must survive the gate above. 231 + 21
+#                                                                     ---------
+#                                                                          504
+#
+# At 340 rows only 340 - 252 = 88 dates carried a usable
+# dist_from_52w_high loading — far under the 252 the rolling window needs — so
+# factor_momentum_ratio was NaN for the ENTIRE universe on the daily path and
+# fell back to the FEATURES-loop 0.0 default. Measured on the 2026-08-17
+# production EOD: "Factor-momentum second pass (daily): 0/901 tickers got a
+# non-NaN factor_momentum_ratio". That is the constant column
+# alpha-engine-config-I7539 was filed about, and why #1410's revival of the
+# second pass ran but produced nothing: the pass was never the problem, the
+# window it was handed was.
+#
+# 585 = 504 + 81, the same ~16% buffer 340 carried over its own 312. Do not
+# lower it without re-deriving BOTH the per-ticker stacked window and the
+# factor-momentum composition above — tests/test_feature_warmup_rows_i7539.py
+# derives the floor from the live constants and fails if either moves.
+_FEATURE_WARMUP_ROWS = 585
 
 # Sub-sector benchmark ETFs (config#934) — SMH/IGV/XBI/PPH/XOP/KRE/ITA/GDX,
 # the distinct non-XL* symbols in constituents.GICS_SUBINDUSTRY_TO_ETF. Like
