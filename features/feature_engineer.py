@@ -247,6 +247,11 @@ FEATURES = [
     # at ±3σ then standardized (Barra USE4 / AQR convention).
     "momentum_20d_zscore",
     "return_60d_zscore",
+    # Barra MOMENTUM long-horizon (RSTR) — 12-1 skip-month. Completes the
+    # MOMENTUM family, which until now emitted only its two short-horizon
+    # members. See cross_sectional.FACTOR_LOADING_SOURCES for the measured
+    # reason this is not redundant with them.
+    "mom_12_1_pct_zscore",
     "beta_60d_zscore",
     "idio_vol_60d_zscore",
     "realized_vol_63d_zscore",

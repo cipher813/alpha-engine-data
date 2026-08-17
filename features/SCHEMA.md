@@ -242,6 +242,7 @@ non-degenerate cross-section again.
 |---|---|---|---|
 | `momentum_20d_zscore` | z-score (`_zscore` suffix) | Cross-sectional z of `momentum_20d`, ±3σ winsorized | executor (Barra MOMENTUM short-horizon, C.3) |
 | `return_60d_zscore` | z-score | Cross-sectional z of `return_60d`, ±3σ winsorized | executor (Barra MOMENTUM medium-horizon, C.3) |
+| `mom_12_1_pct_zscore` | z-score | Cross-sectional z of `mom_12_1_pct`, ±3σ winsorized | scanner (mom_12_1_sleeve challenger arm) |
 | `beta_60d_zscore` | z-score | Cross-sectional z of `beta_60d`, ±3σ winsorized | executor (Barra BETA loading — market sensitivity, C.3) |
 | `idio_vol_60d_zscore` | z-score | Cross-sectional z of `idio_vol_60d`, ±3σ winsorized | executor (Barra RESVOL — idiosyncratic risk, C.3) |
 | `realized_vol_63d_zscore` | z-score | Cross-sectional z of `realized_vol_63d`, ±3σ winsorized | executor (Barra VOLATILITY — total realized risk, C.3) |
