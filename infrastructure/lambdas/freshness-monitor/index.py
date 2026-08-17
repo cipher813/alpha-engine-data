@@ -414,14 +414,29 @@ def load_registry_with_recovery(
         # to a registry that fails to load. The PR-time validator in
         # alpha-engine-config is the chokepoint that catches the typo.
         producer_trigger = merged.get("producer_trigger")
-        if parse_producer_trigger(producer_trigger) is not None:
-            producer_trigger_by_id[spec.artifact_id] = producer_trigger
-        elif producer_trigger is not None:
-            logger.warning(
-                "registry row %s carries a malformed producer_trigger %r — "
-                "expected '<events|scheduler>:<name>'; row keeps alerting",
-                spec.artifact_id, producer_trigger,
+        if producer_trigger is not None:
+            # config-I7509: a row may name SEVERAL producers. The groom store
+            # is written by whichever of four schedules fires; suppressing on
+            # one of them being off would silence a row three live producers
+            # are still expected to write. A list suppresses only when EVERY
+            # named trigger is off — see apply_producer_suppression.
+            declared = (
+                list(producer_trigger)
+                if isinstance(producer_trigger, list)
+                else [producer_trigger]
             )
+            parsed = [t for t in declared if parse_producer_trigger(t) is not None]
+            if parsed and len(parsed) == len(declared):
+                producer_trigger_by_id[spec.artifact_id] = tuple(parsed)
+            else:
+                logger.warning(
+                    "registry row %s carries a malformed producer_trigger %r — "
+                    "expected '<events|scheduler|gha>:<name>'; row keeps "
+                    "alerting. A partially-valid list is dropped whole: "
+                    "suppressing on the subset that parsed would silence the "
+                    "row on fewer producers than it declares",
+                    spec.artifact_id, producer_trigger,
+                )
     return (specs, recovery_by_id, critical_arms_by_id,
             escalate_to_issue_by_id, remediation_by_id, producer_trigger_by_id)
 
@@ -542,17 +557,74 @@ PRODUCER_DISABLED_SINCE_KEY = "_freshness_monitor/producer_disabled_since.json"
 # has no credential for and should not. The join is a separate sweep's job.
 DISABLED_PRODUCER_INVENTORY_KEY = "_freshness_monitor/disabled_producers.json"
 
-_PRODUCER_SURFACES = ("events", "scheduler")
+# alpha-engine-config-I7509. AWS is not the only place a producer is switched
+# off. Brian's 2026-08-12 groomer/Overseer deactivation (config-I6984) disabled
+# TEN GitHub Actions workflows alongside three EventBridge rules; the AWS half
+# suppressed correctly and the GitHub half paged for five days, because
+# `gha` was not an expressible producer surface. `groom_flow_metrics` and
+# `pr_resting_state_trend` escalated warning→critical off miss_count and reached
+# Telegram as CRITICAL — the exact "trains the operator to ignore the monitor"
+# outcome the block above exists to prevent, arriving through the one surface it
+# could not see.
+#
+# This Lambda holds no GitHub credential and must not acquire one — its blast
+# radius is already the fleet's alerting (same argument as
+# `disabled_producer_latch_sweep.py`, which is why the backlog join lives in a
+# sweep and not here). So the live GitHub state arrives as DATA: the latch sweep
+# already runs daily with a `ne-groomer` App token AND `saturday-sf-watch-role`,
+# and writes every enrolled repo's workflow states to this key.
+#
+# The three properties above are preserved through the indirection:
+#   1. FAILS TOWARD PAGING — an absent, unreadable, malformed or STALE
+#      inventory resolves no trigger, so every gha-backed row keeps alerting.
+#      The staleness ceiling matters most: the inventory's own producer is a
+#      GitHub Actions workflow, so a freeze that disables the writer must not
+#      silently freeze the last-known-good states into a permanent blindfold.
+#   2. NEVER SILENT — identical annotation path; the row still lands in
+#      check_results.json with its true state and `alert_suppressed: true`.
+#   3. EXPIRES — same PRODUCER_SUPPRESSION_MAX_DAYS clock, and see
+#      PAUSE_OWNERSHIP_KEY below for the one narrow way a pause outlives it.
+#
+# ONLY `disabled_manually` suppresses. GitHub also sets `disabled_inactivity`
+# on scheduled workflows in repos it considers dormant — that is GitHub
+# switching a producer off, not us, and it is precisely the failure
+# `alpha-engine-config-I7370` exists for ("a workflow disabled by GitHub reads
+# as HEALTHY"). Suppressing on it would convert that open finding into a
+# permanent blind spot.
+GHA_WORKFLOW_STATE_KEY = "_freshness_monitor/gha_workflow_states.json"
+GHA_INVENTORY_MAX_AGE_HOURS = int(
+    os.environ.get("GHA_INVENTORY_MAX_AGE_HOURS", "36")
+)
+# alpha-engine-config-I7509. The 14-day expiry is right for a pause NOBODY
+# owns — that is the latch case, and going loud is the correct end state. It is
+# wrong for a pause that IS owned: I6984 is an open P1 carrying the exact
+# restore commands, a `gate:decision` label, and a backstop re-exam two months
+# out. Paging every 30 minutes for eight weeks about a decision already written
+# down and queued is noise with a tracking number.
+#
+# So ownership EXTENDS suppression, and only ownership does. The file is
+# written by the same latch sweep, which has the backlog credential this Lambda
+# deliberately lacks; it maps trigger → the OPEN item owning the pause. No
+# owner, unreadable file, stale file, or a closed item ⇒ the 14-day clock
+# applies unchanged. A pause whose owning issue is closed is a latch again, and
+# goes loud again, which is the I6828 incident's whole lesson.
+PAUSE_OWNERSHIP_KEY = "_freshness_monitor/pause_ownership.json"
+PAUSE_OWNERSHIP_MAX_AGE_HOURS = int(
+    os.environ.get("PAUSE_OWNERSHIP_MAX_AGE_HOURS", "72")
+)
+
+_PRODUCER_SURFACES = ("events", "scheduler", "gha")
 
 
 def parse_producer_trigger(value: Any) -> tuple[str, str] | None:
     """Parse a registry ``producer_trigger`` scalar into ``(surface, name)``.
 
     Grammar is ``"<surface>:<name>"`` where surface is ``events`` (an
-    EventBridge rule) or ``scheduler`` (an EventBridge Scheduler schedule) —
+    EventBridge rule), ``scheduler`` (an EventBridge Scheduler schedule) —
     different APIs, not aliases, exactly as ``automation_pause.py`` splits
-    them. Anything else returns ``None`` and the row keeps today's behaviour;
-    a malformed field must never suppress.
+    them — or ``gha`` (a GitHub Actions workflow, config-I7509), whose name is
+    ``<owner>/<repo>/<workflow-file>``. Anything else returns ``None`` and the
+    row keeps today's behaviour; a malformed field must never suppress.
     """
     if not isinstance(value, str) or ":" not in value:
         return None
@@ -560,13 +632,114 @@ def parse_producer_trigger(value: Any) -> tuple[str, str] | None:
     surface, name = surface.strip(), name.strip()
     if surface not in _PRODUCER_SURFACES or not name:
         return None
+    if surface == "gha":
+        # owner/repo/workflow-file — three non-empty segments. A two-segment
+        # value is ambiguous between "repo default workflow" and a typo, and
+        # guessing would suppress against a workflow nobody named.
+        parts = name.split("/")
+        if len(parts) != 3 or not all(p.strip() for p in parts):
+            return None
     return surface, name
+
+
+def _load_json_with_age_ceiling(
+    s3_client: Any, key: str, now: datetime, max_age_hours: int, label: str,
+) -> dict[str, Any] | None:
+    """Read a JSON object that is only trusted while recent (config-I7509).
+
+    Returns ``None`` — meaning "resolve nothing from this file" — when the
+    object is absent, unreadable, malformed, missing ``generated_at``, or older
+    than ``max_age_hours``. Every one of those is the fail-toward-paging
+    direction: this file can only ever REMOVE a page, so refusing to read it
+    leaves the pass exactly as loud as it would be without the feature.
+    """
+    try:
+        obj = s3_client.get_object(Bucket=REGISTRY_BUCKET, Key=key)
+        payload = json.loads(obj["Body"].read())
+    except Exception as exc:  # noqa: BLE001 — absent/denied ⇒ page as before
+        logger.info(
+            "%s unreadable at %s (%s) — every row it would have covered keeps "
+            "alerting", label, key, type(exc).__name__,
+        )
+        return None
+    if not isinstance(payload, dict):
+        logger.warning("%s at %s is not an object — ignored", label, key)
+        return None
+    generated_at = payload.get("generated_at")
+    try:
+        stamped = datetime.fromisoformat(str(generated_at))
+    except (TypeError, ValueError):
+        logger.warning(
+            "%s at %s has no parseable generated_at (%r) — ignored; a file that "
+            "cannot prove its age cannot be trusted to silence a page",
+            label, key, generated_at,
+        )
+        return None
+    if stamped.tzinfo is None:
+        stamped = stamped.replace(tzinfo=timezone.utc)
+    age_hours = (now - stamped).total_seconds() / 3600.0
+    if age_hours > max_age_hours:
+        logger.warning(
+            "%s at %s is %.1fh old (ceiling %dh) — ignored. Its own producer "
+            "may be off; a frozen snapshot must not become a permanent "
+            "blindfold, so the rows it covers page again",
+            label, key, age_hours, max_age_hours,
+        )
+        return None
+    return payload
+
+
+def _load_gha_workflow_states(s3_client: Any, now: datetime) -> dict[str, str]:
+    """``{"owner/repo/workflow.yml": "<state>"}`` from the latch sweep's
+    inventory, or ``{}`` when it is absent, malformed or stale."""
+    payload = _load_json_with_age_ceiling(
+        s3_client, GHA_WORKFLOW_STATE_KEY, now,
+        GHA_INVENTORY_MAX_AGE_HOURS, "gha workflow-state inventory",
+    )
+    if payload is None:
+        return {}
+    if payload.get("complete") is False:
+        # A partial enumeration cannot distinguish "absent because enabled"
+        # from "absent because the listing broke half way".
+        logger.warning(
+            "gha workflow-state inventory reports complete=false — ignored; "
+            "a partial listing cannot prove a workflow is enabled",
+        )
+        return {}
+    workflows = payload.get("workflows")
+    if not isinstance(workflows, dict):
+        return {}
+    return {
+        str(k): str(v) for k, v in workflows.items() if isinstance(v, str)
+    }
+
+
+def _load_pause_ownership(s3_client: Any, now: datetime) -> dict[str, dict]:
+    """``{trigger: {"item", "url", "state"}}`` for pauses an OPEN backlog item
+    owns, or ``{}`` when the file is absent, malformed or stale."""
+    payload = _load_json_with_age_ceiling(
+        s3_client, PAUSE_OWNERSHIP_KEY, now,
+        PAUSE_OWNERSHIP_MAX_AGE_HOURS, "pause-ownership map",
+    )
+    if payload is None:
+        return {}
+    owners = payload.get("owners")
+    if not isinstance(owners, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for trigger, owner in owners.items():
+        # Only an OPEN item extends a suppression. A closed one means the
+        # pause outlived its ruling and is a latch again (I6828).
+        if isinstance(owner, dict) and owner.get("state") == "open" and owner.get("item"):
+            out[str(trigger)] = owner
+    return out
 
 
 def resolve_disabled_producers(
     triggers: set[str],
     events_client: Any = None,
     scheduler_client: Any = None,
+    gha_states: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Return ``{trigger: reason}`` for triggers LIVE-confirmed disabled.
 
@@ -574,6 +747,10 @@ def resolve_disabled_producers(
     fail-toward-paging direction: an unresolvable trigger must not suppress
     its artifact's page. Each lookup is trapped individually so one denied or
     renamed trigger cannot blind the rest of the pass.
+
+    ``gha_states`` carries the GitHub half (config-I7509), already read from
+    the inventory by the caller; an empty or omitted map resolves no ``gha:``
+    trigger, so those rows keep alerting.
     """
     disabled: dict[str, str] = {}
     if not triggers:
@@ -584,7 +761,21 @@ def resolve_disabled_producers(
             continue
         surface, name = parsed
         try:
-            if surface == "events":
+            if surface == "gha":
+                state = (gha_states or {}).get(name)
+                if state == "disabled_manually":
+                    disabled[trigger] = (
+                        f"GitHub Actions workflow {name} is disabled_manually"
+                    )
+                elif state == "disabled_inactivity":
+                    # Deliberately NOT suppressed — see the GHA_WORKFLOW_STATE_KEY
+                    # comment. This is GitHub switching a producer off, which is
+                    # a fault to page on, not a ruling to respect (I7370).
+                    logger.warning(
+                        "%s is disabled_inactivity — NOT suppressing; GitHub "
+                        "turned this off, not us (config-I7370)", name,
+                    )
+            elif surface == "events":
                 client = events_client or boto3.client("events")
                 state = client.describe_rule(Name=name).get("State", "")
                 if state == "DISABLED":
@@ -638,9 +829,18 @@ def _save_producer_disabled_since(s3_client: Any, mapping: dict[str, str]) -> No
         )
 
 
+def _declared_triggers(value: Any) -> tuple[str, ...]:
+    """Normalise a row's ``producer_trigger`` map value to a tuple. The loader
+    already stores tuples; a bare string is accepted so every existing caller
+    and test keeps working unchanged."""
+    if isinstance(value, str):
+        return (value,)
+    return tuple(value)
+
+
 def apply_producer_suppression(
     s3_client: Any,
-    producer_trigger_by_id: dict[str, str],
+    producer_trigger_by_id: dict[str, str | tuple[str, ...]],
     now: datetime,
     events_client: Any = None,
     scheduler_client: Any = None,
@@ -651,13 +851,25 @@ def apply_producer_suppression(
     "days_disabled", "suppressed"}}`` for every artifact whose producer is
     live-confirmed DISABLED. ``suppressed`` is False once the pause has run
     past :data:`PRODUCER_SUPPRESSION_MAX_DAYS` — the row is still annotated
-    (so the console can explain the page) but it pages again.
+    (so the console can explain the page) but it pages again — UNLESS an open
+    backlog item owns the pause (config-I7509), in which case ``pause_owner``
+    carries that item and the suppression holds.
+
+    A row may declare SEVERAL triggers (config-I7509). It is suppressed only
+    when EVERY one of them is off, and its clock runs from the MOST RECENT
+    switch-off — a row with one live producer left is still a row whose
+    artifact somebody expects to be written.
     """
     if not producer_trigger_by_id:
         return {}
+    all_triggers = {
+        t for v in producer_trigger_by_id.values() for t in _declared_triggers(v)
+    }
     disabled = resolve_disabled_producers(
-        set(producer_trigger_by_id.values()), events_client, scheduler_client
+        all_triggers, events_client, scheduler_client,
+        gha_states=_load_gha_workflow_states(s3_client, now),
     )
+    ownership = _load_pause_ownership(s3_client, now) if disabled else {}
     since = _load_producer_disabled_since(s3_client)
     today = now.date().isoformat()
     # Drop triggers that came back — a re-enabled producer restarts the clock.
@@ -668,21 +880,41 @@ def apply_producer_suppression(
         _save_producer_disabled_since(s3_client, next_since)
 
     out: dict[str, dict[str, Any]] = {}
-    for artifact_id, trigger in producer_trigger_by_id.items():
-        reason = disabled.get(trigger)
-        if reason is None:
+    for artifact_id, declared in producer_trigger_by_id.items():
+        triggers = _declared_triggers(declared)
+        # EVERY declared producer must be off. One live producer left means
+        # the artifact is still expected, and the miss is a real one.
+        if not all(t in disabled for t in triggers):
             continue
-        first_seen = next_since.get(trigger, today)
+        reason = "; ".join(disabled[t] for t in triggers)
+        trigger = ", ".join(triggers)
+        first_seens = [next_since.get(t, today) for t in triggers]
+        # The pause is only as old as its most recent switch-off — that is the
+        # date from which "has anybody looked at this?" is a fair question.
+        first_seen = max(first_seens)
         try:
             days = (now.date() - date.fromisoformat(first_seen)).days
         except ValueError:
             days = 0
-        suppressed = days < PRODUCER_SUPPRESSION_MAX_DAYS
-        if not suppressed:
+        # Any owned trigger owns the whole row's pause: the row is quiet
+        # because of a decision, and the decision has a tracking number.
+        owner = next((ownership[t] for t in triggers if t in ownership), None)
+        within_clock = days < PRODUCER_SUPPRESSION_MAX_DAYS
+        suppressed = within_clock or owner is not None
+        if not within_clock and owner is not None:
+            logger.info(
+                "producer-suppression HELD past the %d-day clock for %s: %s "
+                "has been disabled %d days and %s owns the pause — the "
+                "decision is already written down and queued, so this stays "
+                "console-only (config-I7509)",
+                PRODUCER_SUPPRESSION_MAX_DAYS, artifact_id, trigger, days,
+                owner.get("item"),
+            )
+        elif not suppressed:
             logger.warning(
                 "producer-suppression LAPSED for %s: %s has been disabled %d "
-                "days (limit %d) — paging again, a pause this long is a "
-                "decision, not a state",
+                "days (limit %d) with no open item owning the pause — paging "
+                "again, a pause this long that nobody owns is a latch",
                 artifact_id, trigger, days, PRODUCER_SUPPRESSION_MAX_DAYS,
             )
         out[artifact_id] = {
@@ -691,6 +923,8 @@ def apply_producer_suppression(
             "disabled_since": first_seen,
             "days_disabled": days,
             "suppressed": suppressed,
+            "pause_owner": owner.get("item") if owner else None,
+            "pause_owner_url": owner.get("url") if owner else None,
         }
     return out
 
@@ -961,6 +1195,16 @@ def _serialize_check_results(
                 ),
                 "alert_suppressed": bool(
                     suppression and suppression["suppressed"]
+                ),
+                # config-I7509: the console must be able to say WHOSE decision
+                # is holding this row quiet past the 14-day clock. A suppressed
+                # row with no named owner is the latch case and reads
+                # differently to an operator.
+                "pause_owner": (
+                    suppression.get("pause_owner") if suppression else None
+                ),
+                "pause_owner_url": (
+                    suppression.get("pause_owner_url") if suppression else None
                 ),
                 "artifact_id": spec.artifact_id,
                 "owner_repo": spec.owner_repo,
@@ -2909,7 +3153,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     # artifact row names. Written before the probe pass so a pass that raises
     # still leaves the inventory current.
     write_disabled_producer_inventory(
-        s3, now, set(producer_trigger_by_id.values())
+        s3, now,
+        {t for v in producer_trigger_by_id.values() for t in _declared_triggers(v)},
     )
 
     # Read BEFORE the pass: the §7.4a owning-item resolution unions the
