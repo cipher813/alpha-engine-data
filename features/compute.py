@@ -40,10 +40,12 @@ from dataclasses import dataclass
 
 import corporate_actions as ca
 from features.cross_sectional import apply_factor_zscores
+from features.factor_momentum import DEFAULT_FACTOR_LOADINGS, compute_factor_momentum_feature
 from features.feature_engineer import FEATURES, FEATURE_CFG, MIN_ROWS_FOR_FEATURES, compute_features
 from features.metron_supplemental import compute_metron_supplemental_features, write_metron_supplemental_snapshot
+from features.postflight import assert_no_zero_variance_features
 from features.private_pack import apply_private_features
-from features.registry import upload_registry
+from features.registry import GROUPS, upload_registry
 from features.writer import write_feature_snapshot
 
 log = logging.getLogger(__name__)
@@ -103,11 +105,18 @@ def make_source_series(values: list[str] | pd.Series, index: pd.Index | None = N
     cat = pd.Categorical(cleaned, categories=SOURCE_CATEGORIES)
     return pd.Series(cat, index=index)
 
-# Rows to keep per ticker before feature computation. The longest rolling
-# window is 252 rows (52w high/low); 280 provides a small buffer. Trimming
-# before the compute loop cuts base memory ~44% vs the full 2y slim cache
-# and lets each ticker's DataFrame be freed incrementally via pop().
-_FEATURE_WARMUP_ROWS = 280
+# Rows to keep per ticker before feature computation. The longest STACKED
+# rolling window is residual_momentum_ratio (alpha-engine-config-I7539): it
+# needs beta_60d's 60-row warmup BEFORE the 231-row cumulative-residual
+# window can start, then a 21-row shift on top — 60 + 231 + 21 = 312 rows
+# minimum for the latest (most recent) row to be non-NaN. Below that, the
+# per-ticker value is NaN for every ticker, and the compute.py store-row
+# fallback (`row[f] = float(val) if pd.notna(val) else 0.0`) silently turns
+# a universe-wide NaN into a universe-wide 0.0 — a zero-variance column that
+# passes every null-coverage check. 340 keeps a ~28-row buffer, matching the
+# ~10% margin the original 252->280 buffer used. Do not lower this without
+# re-deriving the deepest stacked window across feature_engineer.py.
+_FEATURE_WARMUP_ROWS = 340
 
 # Sub-sector benchmark ETFs (config#934) — SMH/IGV/XBI/PPH/XOP/KRE/ITA/GDX,
 # the distinct non-XL* symbols in constituents.GICS_SUBINDUSTRY_TO_ETF. Like
@@ -922,9 +931,10 @@ def compute_and_write(
     )
 
     # Trim price DataFrames to the last _FEATURE_WARMUP_ROWS rows before the
-    # compute loop. The longest rolling window is 252 rows; keeping 280 is
-    # sufficient. Trimming here reduces peak RSS on t3.micro by ~40%+ vs
-    # holding the full 2y slim cache in memory during feature computation.
+    # compute loop — see the constant's definition above for the derived
+    # minimum (alpha-engine-config-I7539). Trimming here reduces peak RSS on
+    # t3.micro by ~40%+ vs holding the full 2y slim cache in memory during
+    # feature computation.
     for _t in list(price_data.keys()):
         df = price_data[_t]
         if len(df) > _FEATURE_WARMUP_ROWS:
@@ -956,6 +966,18 @@ def compute_and_write(
     uso_series = macro.get("USO")
     vix3m_series = macro.get("VIX3M")
     hyoas_series = macro.get("HYOAS")
+
+    # alpha-engine-config-I7539: factor_momentum_ratio (W2.3, Gupta-Kelly) is a
+    # cross-sectional-time-series column — it needs the WHOLE universe panel's
+    # (date, close, loading) history at once (compute_factor_momentum_feature),
+    # not a single ticker's latest row. builders/backfill.py runs this as a
+    # second pass over ArcticDB, but nothing ran the equivalent second pass on
+    # this S3 daily snapshot path, so the FEATURES-loop fallback below
+    # (`row[f] = ... else 0.0`) silently wrote a universe-wide constant 0.0
+    # every day. Collect the slim (date, close, *loading) frame per ticker
+    # here — while featured_df is already in hand — so the second pass below
+    # can rebuild the long panel without re-computing or re-loading anything.
+    fm_frames: dict[str, pd.DataFrame] = {}
 
     for ticker in universe_tickers:
         try:
@@ -991,6 +1013,13 @@ def compute_and_write(
                 n_skip += 1
                 continue
 
+            _fm_loading_cols = [c for c in DEFAULT_FACTOR_LOADINGS if c in featured_df.columns]
+            if _fm_loading_cols:
+                _fm_slim = featured_df[["Close", *_fm_loading_cols]].rename(columns={"Close": "close"})
+                _fm_slim = _fm_slim.reset_index(names="date")
+                _fm_slim.insert(0, "ticker", ticker)
+                fm_frames[ticker] = _fm_slim
+
             latest = featured_df.iloc[-1]
             row = {"ticker": ticker}
             for f in FEATURES:
@@ -1025,6 +1054,54 @@ def compute_and_write(
     # ── 3. Write to S3 ───────────────────────────────────────────────────────
     features_df = pd.DataFrame(store_rows)
 
+    # alpha-engine-config-I7539: factor_momentum_ratio second pass. Rebuild the
+    # long panel from the slim per-ticker frames collected in the compute loop
+    # above and run the SAME cross-sectional-time-series construction backfill
+    # uses (features.factor_momentum.materialize_factor_momentum), just against
+    # the in-memory panel instead of a re-read of ArcticDB — this snapshot
+    # already holds the whole universe's (date, close, loading) history for the
+    # trimmed warmup window, which is all compute_factor_momentum_feature needs.
+    # A failure here is caught and logged (log.exception, full traceback) so
+    # it doesn't take down the per-ticker compute / zscore / private-pack
+    # producers that already succeeded — but it deliberately does NOT
+    # swallow the outcome: leaving factor_momentum_ratio at the FEATURES-loop
+    # default (0.0) is caught downstream by the postflight zero-variance
+    # guard below, which raises before anything is written. So the net
+    # effect of a failure here is still a loud, pipeline-halting failure —
+    # just with the stack trace preserved and the OTHER columns' failure
+    # isolated from this one's.
+    if fm_frames:
+        try:
+            _fm_panel = pd.concat(fm_frames.values(), ignore_index=True)
+            _fm_signal = compute_factor_momentum_feature(_fm_panel)
+            _fm_panel = _fm_panel.assign(factor_momentum_ratio=_fm_signal)
+            _fm_latest = (
+                _fm_panel.sort_values("date")
+                .groupby("ticker", sort=False)["factor_momentum_ratio"]
+                .last()
+            )
+            _fm_map = _fm_latest.dropna()
+            n_fm = int(features_df["ticker"].map(_fm_map).notna().sum())
+            features_df["factor_momentum_ratio"] = (
+                features_df["ticker"].map(_fm_map).fillna(0.0).astype(float)
+            )
+            log.info(
+                "Factor-momentum second pass (daily): %d/%d tickers got a non-NaN "
+                "factor_momentum_ratio (window/skip warmup — rest fall back to 0.0)",
+                n_fm, len(features_df),
+            )
+        except Exception:
+            log.exception(
+                "Factor-momentum second pass failed — factor_momentum_ratio "
+                "stays at the FEATURES-loop default (0.0) for this snapshot"
+            )
+    else:
+        log.warning(
+            "Factor-momentum second pass skipped: no per-ticker loading frames "
+            "collected — factor_momentum_ratio will be the FEATURES-loop "
+            "default (0.0) for every ticker"
+        )
+
     # C.1 (optimizer-sota-upgrades-260526.md §C.1): append cross-sectional
     # factor-loading z-scores AFTER per-ticker compute, BEFORE write. These
     # are the columns of the factor-loading matrix B that workstream C.3
@@ -1038,6 +1115,16 @@ def compute_and_write(
     # (features_df unchanged) unless NOUSERGON_PRIVATE_FEATURE_PACK is set;
     # every public/CI run takes this no-op path. See features/private_pack.py.
     features_df = apply_private_features(features_df)
+
+    # alpha-engine-config-I7539: postflight zero-variance guard, run AFTER
+    # every producer above (per-ticker compute, factor-momentum second pass,
+    # cross-sectional zscores, private pack) has had its chance to fill a
+    # column and BEFORE the snapshot is written. Macro-group columns are
+    # excluded — they broadcast one value to the whole universe on a date BY
+    # CONSTRUCTION (e.g. the VIX level), so zero cross-sectional variance
+    # there is the expected shape, not a defect.
+    _non_macro_features = [f for f in FEATURES if f not in GROUPS.get("macro", ())]
+    assert_no_zero_variance_features(features_df, _non_macro_features)
 
     if dry_run:
         log.info(

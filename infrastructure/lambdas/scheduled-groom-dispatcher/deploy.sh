@@ -674,6 +674,8 @@ fi  # end CODE_DEPLOY (steps 3, 3b and the env update)
 
 # ----- 4. Smoke (synthetic schedule event, via the SF — the real live path) --
 
+# shellcheck source=infrastructure/lambdas/_shared/smoke.sh
+source "${SCRIPT_DIR}/../_shared/smoke.sh"
 if $SMOKE; then
   echo ""
   echo "Smoke-testing via SF start-execution (synthetic schedule event, run_mode=full)..."
@@ -689,5 +691,10 @@ if $SMOKE; then
   echo "{\"executionArn\": \"${EXEC_ARN}\"}" > "${RESP}"
   cat "${RESP}"
   echo ""
+  # This SF's first state invokes the groom Lambda directly (config#1472); a
+  # handler crash surfaces as the execution going FAILED almost immediately.
+  # Bounded poll, NOT a wait for the multi-hour groom itself.
+  echo "Polling briefly for a crash on the dispatch (not the full groom run)..."
+  assert_sf_lambda_task_not_failed "${EXEC_ARN}" "${REGION}"
   rm -f "${RESP}"
 fi

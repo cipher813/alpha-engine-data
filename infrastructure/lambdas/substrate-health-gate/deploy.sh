@@ -168,17 +168,20 @@ echo "✓ Code deployed."
 #          instance — not read-only like ssm-liveness-poller's smoke, since
 #          this Lambda's whole job is to issue one) -------------------------
 
+# shellcheck source=infrastructure/lambdas/_shared/smoke.sh
+source "${SCRIPT_DIR}/../_shared/smoke.sh"
 if $SMOKE; then
   echo ""
   echo "Smoke: live invoke against i-018eb3307a21329bf (issues a real df probe command)"
   RESP=$(mktemp)
-  aws lambda invoke \
+  INVOKE_STDOUT=$(aws lambda invoke \
     --function-name "${FUNCTION_NAME}" \
     --cli-binary-format raw-in-base64-out \
     --payload '{"instance_id":"i-018eb3307a21329bf"}' \
     --region "${REGION}" \
-    "${RESP}" >/dev/null
+    "${RESP}")
   cat "${RESP}"
   echo ""
+  assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
   rm -f "${RESP}"
 fi

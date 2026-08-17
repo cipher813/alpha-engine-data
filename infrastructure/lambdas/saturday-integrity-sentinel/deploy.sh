@@ -141,10 +141,13 @@ run aws lambda update-function-configuration \
 if ! $DRY_RUN; then aws lambda wait function-updated --function-name "${FUNCTION_NAME}" --region "${REGION}"; fi
 
 # ----- 4. Smoke -------------------------------------------------------------
+# shellcheck source=infrastructure/lambdas/_shared/smoke.sh
+source "${SCRIPT_DIR}/../_shared/smoke.sh"
 if $SMOKE; then
   echo ""
   echo "Smoke-testing via direct invoke (reads the live verdict, sends Telegram)..."
   RESP=$(mktemp)
-  aws lambda invoke --function-name "${FUNCTION_NAME}" --cli-binary-format raw-in-base64-out --payload '{}' --region "${REGION}" "${RESP}" >/dev/null
-  cat "${RESP}"; echo ""; rm -f "${RESP}"
+  INVOKE_STDOUT=$(aws lambda invoke --function-name "${FUNCTION_NAME}" --cli-binary-format raw-in-base64-out --payload '{}' --region "${REGION}" "${RESP}")
+  cat "${RESP}"; echo ""
+  assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"; rm -f "${RESP}"
 fi

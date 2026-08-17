@@ -250,20 +250,23 @@ echo "✓ Env converged."
 
 # ----- 4. Smoke (synthetic event, direct invoke) -----------------------------
 
+# shellcheck source=infrastructure/lambdas/_shared/smoke.sh
+source "${SCRIPT_DIR}/../_shared/smoke.sh"
 if $SMOKE; then
   echo ""
   echo "Smoke-testing via direct invoke (synthetic merged_sha/head_migration_number)..."
   echo "⚠ this fires a REAL spot box + REAL scripts/run_arctic_migrations.py run."
   RESP=$(mktemp)
   trap "rm -f '${RESP}'" EXIT
-  aws lambda invoke \
+  INVOKE_STDOUT=$(aws lambda invoke \
     --function-name "${FUNCTION_NAME}" \
     --payload '{"merged_sha":"0000000000000000000000000000000000000000","head_migration_number":0}' \
     --cli-binary-format raw-in-base64-out \
     --region "${REGION}" \
-    "${RESP}" >/dev/null
+    "${RESP}")
   cat "${RESP}"
   echo ""
+  assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
 fi
 
 echo ""
