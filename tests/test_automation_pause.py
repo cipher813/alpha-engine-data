@@ -445,9 +445,32 @@ def test_pending_entries_are_paused_at_write_time_but_not_required_live(manifest
     alpha-engine-config-I6620. nousergon-data#1207 declares three schedules its
     deploy would create ENABLED mid-pause. They cannot go in `paused` — the
     check requires those to exist live — but they must still be born DISABLED.
+
+    **An empty `pending` block is the SUCCESS state, not a regression**
+    (corrected 2026-08-17, alpha-engine-config-I7547). This test used to assert
+    the block was non-empty, which made it pass for exactly as long as there was
+    an un-graduated trigger and turn red the moment the block did its job — the
+    previous message even prescribed the graduation it then failed. All four
+    entries were created live DISABLED on 2026-08-14 and moved up to `paused` on
+    2026-08-17, so the population is now zero. The MECHANISM is therefore
+    exercised on a synthetic manifest below, where it is always testable; the
+    live block is graded on the invariants that hold at any population, and the
+    bash leg SKIPS rather than passing vacuously when there is nothing pending
+    (a green assertion written over an empty list proves nothing).
     """
+    synthetic = {
+        "ruling": {"by": "Brian", "date": "2026-08-07", "statement": "x"},
+        "not_paused": {},
+        "pending": {"_why": "prose", "a-trigger-not-yet-created": "lands after the ruling"},
+        "paused": {"events_rules": {"a-live-paused-rule": "off"}, "scheduler_schedules": {}},
+    }
+    assert module.pending_names(synthetic) == {"a-trigger-not-yet-created"}
+    # paused_names answers "is DISABLED deliberate?" and must include pending.
+    assert "a-trigger-not-yet-created" in module.paused_names(synthetic)
+    # paused_entries answers "does it exist live and is it off?" and must not.
+    assert {n for _, n, _ in module.paused_entries(synthetic)} == {"a-live-paused-rule"}
+
     pending = {k for k in manifest.get("pending", {}) if not k.startswith("_")}
-    assert pending, "the pending block is empty; if #1207's schedules now exist live, move them to paused"
 
     # --check must NOT require them to exist live. That obligation is carried
     # by paused_entries(), NOT by paused_names() — the latter deliberately
@@ -466,6 +489,14 @@ def test_pending_entries_are_paused_at_write_time_but_not_required_live(manifest
         )
         return out.stdout.strip()
 
+    if not pending:
+        pytest.skip(
+            "the pending block is empty — every entry graduated to `paused` once it "
+            "existed live, which is the block working. Skipped rather than passed: a "
+            "loop over an empty list is a green assertion that proves nothing, and the "
+            "born-DISABLED property has no live subject to assert it against right now. "
+            "The Python-side mechanism is covered synthetically above."
+        )
     for name in sorted(pending):
         assert _state(name) == "DISABLED", f"{name} would be created ENABLED"
 
@@ -489,21 +520,41 @@ def test_paused_names_includes_pending_but_check_does_not(manifest, module):
 
       paused_names()   -> "is DISABLED deliberate?"  MUST include pending
       paused_entries() -> "does it exist live and is it off?"  MUST NOT
-    """
-    pending = module.pending_names(manifest)
-    assert pending, "pending is empty; this test guards a block that must exist"
 
-    names = module.paused_names(manifest)
+    Graded on a SYNTHETIC manifest (corrected 2026-08-17,
+    alpha-engine-config-I7547). It previously required the live `pending` block
+    to be non-empty, which tied a test of two functions' semantics to a
+    transient population and turned red when the block was correctly emptied.
+    The distinction these two functions draw is a property of the code and is
+    testable whether or not anything is pending today — and it is worth MORE
+    when nothing is, because that is when a regression in it would go unnoticed.
+    """
+    synthetic = {
+        "ruling": {"by": "Brian", "date": "2026-08-07", "statement": "x"},
+        "not_paused": {},
+        "pending": {"_why": "prose", "not-yet-live": "lands after the ruling"},
+        "paused": {"events_rules": {"live-and-off": "off"}, "scheduler_schedules": {}},
+    }
+    pending = module.pending_names(synthetic)
+    assert pending == {"not-yet-live"}
+
+    names = module.paused_names(synthetic)
     assert pending <= names, (
         "paused_names() excludes pending, so every drift checker will report a "
         "correctly-pending trigger as drift and fail the deploy that created it"
     )
 
-    entry_names = {name for _, name, _ in module.paused_entries(manifest)}
+    entry_names = {name for _, name, _ in module.paused_entries(synthetic)}
     assert not (pending & entry_names), (
         "paused_entries() includes a pending name — automation_pause.py --check "
         "would demand it exist live, which is exactly why pending is separate"
     )
+
+    # And the same invariant over the LIVE manifest, which holds at any
+    # population including zero: the two blocks never name the same trigger.
+    live_pending = module.pending_names(manifest)
+    live_entries = {name for _, name, _ in module.paused_entries(manifest)}
+    assert not (live_pending & live_entries)
 
 
 def test_pending_notes_are_not_returned_as_names(module, manifest):

@@ -43,6 +43,29 @@ name: Pause Reconcile
 # contains no mutating verb. Editing a lifecycle declaration because a manifest
 # entry moved would INFER a decision from a file diff, which
 # observability-policy.md §8.3 forbids.
+#
+# TWO JOBS, AND THAT IS THE POINT (alpha-engine-config-I7547). A detect-only job
+# exits non-zero on every real finding, and GitHub renders "the detector broke"
+# and "the detector works and found five things" as the same word: `failure`.
+# Four consecutive such runs were four CORRECT detections and were read as one
+# broken job, which is why a champion/challenger arm stayed silently missing for
+# five days. The exit code is not the problem and is deliberately unchanged —
+# the rendering was. So:
+#
+#   * `reconcile` fails ONLY when the reconciler could not run (exit 2: AWS
+#     denied, the published registry empty, a register unreadable). That is a
+#     broken job, and it is the only thing that turns this job red.
+#   * `verdict` fails when there are findings, and its job NAME is the
+#     reconciler's own headline — "DRIFT — 5 finding(s) across 72 live
+#     trigger(s): running-while-declared-off, …". The run page states the count
+#     and the kinds in the job list, with no log opened.
+#
+# The run still fails on drift, because the exit code is the signal. What
+# changed is that a reader can now tell WHICH red it is at a glance, on three
+# surfaces that do not require a log: the failing job's name, the `::error::`
+# annotation the tool prints, and the rendered step summary. The console row is
+# the fourth and is the one the fleet reads — `attention` for drift, and now
+# `error` rather than SILENCE for a breakage.
 
 on:
   push:
@@ -62,8 +85,13 @@ permissions:
 
 jobs:
   reconcile:
+    name: compare the three registers
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      verdict: ${{ steps.check.outputs.verdict }}
+      findings: ${{ steps.check.outputs.findings }}
+      headline: ${{ steps.check.outputs.headline }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
@@ -92,12 +120,55 @@ jobs:
       # --publish is best-effort by construction (fleet_check_result.emit never
       # raises): a check must not go red because its telemetry did. The verdict
       # is the exit code, and it is unaffected either way.
+      #
+      # ONE invocation writes all four surfaces — the console row, the rendered
+      # run summary, the `::error::`/`::notice::` annotation and the job
+      # outputs. The previous version ran the whole check a SECOND time to fill
+      # the step summary, which doubled a ~100-call enumeration of the account
+      # and let the summary disagree with the verdict printed above it whenever
+      # live state moved between the two runs. It does: a runtime-minted
+      # one-shot Scheduler schedule appeared in one and not the other on
+      # 2026-08-17, which is what surfaced this.
+      #
+      # Exit 2 (could not run) fails this job; exit 1 (found drift) does not,
+      # and fails the `verdict` job below instead — see the header.
       - name: Pause manifest vs observability registry vs live AWS
-        run: python3 infrastructure/pause_reconcile.py --check --publish
+        id: check
+        run: |
+          code=0
+          python3 infrastructure/pause_reconcile.py --check --publish --markdown "$GITHUB_STEP_SUMMARY" --github-output "$GITHUB_OUTPUT" || code=$?
+          echo "reconciler exit code: $code"
+          if [ "$code" -ge 2 ]; then
+            echo "The reconciler could NOT run. This is a broken detector, not a clean fleet."
+            exit 1
+          fi
+          exit 0
 
-      # The record on every run, green ones included, so the verdict is readable
-      # without re-deriving it. `always()` because it is most worth reading on
-      # the run where the step above failed.
-      - name: Publish the reconcile record to the run summary
-        if: always()
-        run: python3 infrastructure/pause_reconcile.py --check --json | tee -a "$GITHUB_STEP_SUMMARY"
+  # The job whose NAME is the verdict. `needs` is one of the contexts
+  # `jobs.<id>.name` accepts, which is what puts the finding count on the run
+  # page without a log open. Skipped when `reconcile` failed, so a breakage
+  # never masquerades as drift.
+  verdict:
+    name: ${{ needs.reconcile.outputs.headline }}
+    needs: reconcile
+    if: always() && needs.reconcile.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Via env, never interpolated into the script body: these values are this
+      # repo's own tool output rather than user input, and the habit of
+      # inlining `${{ }}` into `run:` is the one that eventually meets input
+      # that is not.
+      - name: Fail on drift, pass when every trigger is declared
+        env:
+          VERDICT: ${{ needs.reconcile.outputs.verdict }}
+          FINDINGS: ${{ needs.reconcile.outputs.findings }}
+          HEADLINE: ${{ needs.reconcile.outputs.headline }}
+        run: |
+          echo "$HEADLINE"
+          if [ "$VERDICT" != "clear" ]; then
+            echo "::error title=pause reconcile: $FINDINGS finding(s)::$HEADLINE"
+            echo "Detect-only by design — nothing here is auto-remediated. Declare the"
+            echo "component's real state; never re-enable or disable a trigger to clear this."
+            exit 1
+          fi
