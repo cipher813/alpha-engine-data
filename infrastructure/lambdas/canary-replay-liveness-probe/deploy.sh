@@ -206,18 +206,21 @@ echo "✓ Code deployed."
 
 # ----- 4. Smoke (direct invoke, read-only) -----------------------------------
 
+# shellcheck source=infrastructure/lambdas/_shared/smoke.sh
+source "${SCRIPT_DIR}/../_shared/smoke.sh"
 if $SMOKE; then
   echo ""
   echo "Smoke-testing via direct invoke..."
   echo "(read-only — pages ONLY if genuinely in-window with a bad/missing marker)"
   RESP=$(mktemp)
   trap "rm -f '${RESP}'" EXIT
-  aws lambda invoke \
+  INVOKE_STDOUT=$(aws lambda invoke \
     --function-name "${FUNCTION_NAME}" \
     --payload '{}' \
     --cli-binary-format raw-in-base64-out \
     --region "${REGION}" \
-    "${RESP}" >/dev/null
+    "${RESP}")
   cat "${RESP}"
   echo ""
+  assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
 fi

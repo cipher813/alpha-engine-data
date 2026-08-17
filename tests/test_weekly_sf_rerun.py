@@ -879,3 +879,158 @@ class TestHistoricalWorkStateNames:
                 f"in step_function.json — remove the alias or the rename is "
                 f"not complete"
             )
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I7443: a rerun must carry the cycle's run_date, never
+# mint one across a UTC-midnight boundary, and a skip_predictor_training
+# whose weights are stale for that run_date must be rejected BEFORE a
+# dispatch is spent (sf-pipeline-policy §2.5).
+# ---------------------------------------------------------------------------
+
+def _history(*, explicit_run_date=None, init_run_date=None, extra_input=None):
+    """Build a minimal synthetic execution-history events list."""
+    inp = {"pipeline_role": "watch-rerun"}
+    if extra_input:
+        inp.update(extra_input)
+    if explicit_run_date is not None:
+        inp["run_date"] = explicit_run_date
+    events = [{
+        "type": "ExecutionStarted",
+        "executionStartedEventDetails": {"input": json.dumps(inp)},
+    }]
+    if init_run_date is not None:
+        out = dict(inp)
+        out["run_date"] = init_run_date
+        events.append({
+            "type": "PassStateExited",
+            "stateExitedEventDetails": {
+                "name": "InitializeInput",
+                "output": json.dumps(out),
+            },
+        })
+    return events
+
+
+class TestRunDateCarriedAcrossUTCMidnight:
+    """derive_run_date must carry the ORIGINAL cycle's run_date, never mint
+    one from wall-clock/start-time, whenever the source execution's own
+    input or InitializeInput output actually resolves one — regardless of
+    what UTC calendar date the rerun happens to be launched on.
+
+    Regression for alpha-engine-config-I7443: watch-rerun-2026-08-16-1/-2
+    carried run_date=2026-08-16 though the recovered cycle was 2026-08-15;
+    a start_time that has already crossed UTC midnight relative to the
+    source's own explicit/InitializeInput run_date must NOT leak in.
+    """
+
+    def test_explicit_input_run_date_wins_over_a_later_start_time(self, mod):
+        events = _history(explicit_run_date="2026-08-15")
+        # start_time is AFTER UTC midnight relative to the cycle's own date —
+        # exactly the shape of the real 2026-08-15/16 incident.
+        late_start = datetime(2026, 8, 16, 1, 51, 10, tzinfo=timezone.utc)
+        run_date, provenance = mod.derive_run_date(events, late_start)
+        assert run_date == "2026-08-15"
+        assert "explicit" in provenance
+        assert "2026-08-16" not in provenance
+
+    def test_initialize_input_run_date_wins_over_a_later_start_time(self, mod):
+        events = _history(init_run_date="2026-08-15")
+        late_start = datetime(2026, 8, 16, 1, 51, 10, tzinfo=timezone.utc)
+        run_date, provenance = mod.derive_run_date(events, late_start)
+        assert run_date == "2026-08-15"
+        assert "InitializeInput" in provenance
+
+    def test_only_a_genuine_pre_workload_failure_falls_back_to_start_time(self, mod):
+        """No explicit run_date, no InitializeInput output at all (the
+        source never reached it) — the ONLY case where start_time is used,
+        and it must be labeled FALLBACK so --start refuses it by default."""
+        events = _history()
+        start = datetime(2026, 8, 16, 1, 51, 10, tzinfo=timezone.utc)
+        run_date, provenance = mod.derive_run_date(events, start)
+        assert run_date == "2026-08-16"
+        assert provenance.startswith("FALLBACK")
+
+    def test_start_refuses_a_fallback_run_date_without_explicit_acceptance(self, mod):
+        """--start must not launch on a FALLBACK-provenance run_date unless
+        the operator passes --accept-fallback-run-date (alpha-engine-
+        config-I7443: the printed FALLBACK note went unnoticed on
+        2026-08-16 and the operator's rerun launched anyway)."""
+        plan = mod.RerunPlan(
+            run_date="2026-08-16",
+            run_date_provenance="FALLBACK: UTC date of the failed execution's start time",
+            original_input={},
+        )
+        with pytest.raises(SystemExit) as exc:
+            mod.refuse_fallback_run_date_without_acceptance(plan, accept=False)
+        assert "FALLBACK" in str(exc.value)
+        assert "--accept-fallback-run-date" in str(exc.value)
+        # explicit acceptance lets it through
+        mod.refuse_fallback_run_date_without_acceptance(plan, accept=True)
+
+    def test_non_fallback_provenance_never_refused(self, mod):
+        plan = mod.RerunPlan(
+            run_date="2026-08-15",
+            run_date_provenance="explicit run_date in the failed execution's input",
+            original_input={},
+        )
+        mod.refuse_fallback_run_date_without_acceptance(plan, accept=False)  # does not raise
+
+    def test_accept_fallback_flag_is_wired_into_the_cli(self, mod, capsys):
+        with pytest.raises(SystemExit) as exc:
+            mod.main(["--help"])
+        assert exc.value.code == 0
+        assert "--accept-fallback-run-date" in capsys.readouterr().out
+
+
+class TestPredictorSkipFreshness:
+    """check_predictor_skip_freshness mirrors the SF's own
+    ValidatePredictorSkipWeightsFresh / CheckPredictorSkipWeightsFresh
+    predicate (infrastructure/step_function.json): HeadObject the live
+    weights manifest and require LastModified's DATE >= run_date. Checked
+    here BEFORE any dispatch — alpha-engine-config-I7443."""
+
+    class _FakeS3:
+        def __init__(self, *, last_modified=None, error=None):
+            self._last_modified = last_modified
+            self._error = error
+
+        def head_object(self, **kwargs):
+            if self._error is not None:
+                raise self._error
+            return {"LastModified": self._last_modified}
+
+    def test_noop_when_skip_predictor_training_not_set(self, mod):
+        s3 = self._FakeS3(error=RuntimeError("must not be called"))
+        mod.check_predictor_skip_freshness(s3, "2026-08-16", {})
+        mod.check_predictor_skip_freshness(
+            s3, "2026-08-16", {"skip_predictor_training": False}
+        )
+
+    def test_fresh_manifest_passes(self, mod):
+        s3 = self._FakeS3(
+            last_modified=datetime(2026, 8, 16, 3, 0, 0, tzinfo=timezone.utc)
+        )
+        mod.check_predictor_skip_freshness(
+            s3, "2026-08-16", {"skip_predictor_training": True}
+        )  # does not raise
+
+    def test_manifest_older_than_run_date_is_rejected(self, mod):
+        """The real 2026-08-15/16 incident shape: manifest last written
+        2026-08-15, skip claimed for run_date 2026-08-16."""
+        s3 = self._FakeS3(
+            last_modified=datetime(2026, 8, 15, 20, 0, 0, tzinfo=timezone.utc)
+        )
+        with pytest.raises(mod.SkipCoherenceError) as exc:
+            mod.check_predictor_skip_freshness(
+                s3, "2026-08-16", {"skip_predictor_training": True}
+            )
+        assert "2026-08-15" in str(exc.value)
+        assert "2026-08-16" in str(exc.value)
+
+    def test_s3_error_is_rejected_not_silently_trusted(self, mod):
+        s3 = self._FakeS3(error=RuntimeError("boom"))
+        with pytest.raises(mod.SkipCoherenceError):
+            mod.check_predictor_skip_freshness(
+                s3, "2026-08-16", {"skip_predictor_training": True}
+            )
