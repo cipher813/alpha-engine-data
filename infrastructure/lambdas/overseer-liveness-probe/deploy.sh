@@ -293,12 +293,15 @@ fi
 
 # ----- 4. Smoke (synthetic invoke; read-only — only pings on a REAL problem) -
 
+# shellcheck source=infrastructure/lambdas/_shared/smoke.sh
+source "${SCRIPT_DIR}/../_shared/smoke.sh"
 if $SMOKE; then
   echo ""
   echo "Smoke-testing via direct invoke (read-only wiring check)..."
   RESP=$(mktemp)
-  aws lambda invoke --function-name "${FUNCTION_NAME}" --cli-binary-format raw-in-base64-out \
-    --payload '{}' --region "${REGION}" "${RESP}" >/dev/null
+  INVOKE_STDOUT=$(aws lambda invoke --function-name "${FUNCTION_NAME}" --cli-binary-format raw-in-base64-out \
+    --payload '{}' --region "${REGION}" "${RESP}")
   cat "${RESP}"; echo ""
+  assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
   rm -f "${RESP}"
 fi

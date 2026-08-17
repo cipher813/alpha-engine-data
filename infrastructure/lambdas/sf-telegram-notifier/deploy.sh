@@ -292,6 +292,8 @@ fi
 
 # ----- 4. Smoke (synthetic SUCCEEDED event) ---------------------------------
 
+# shellcheck source=infrastructure/lambdas/_shared/smoke.sh
+source "${SCRIPT_DIR}/../_shared/smoke.sh"
 if $SMOKE; then
   echo ""
   echo "Smoke-testing via direct invoke (synthetic SUCCEEDED event)..."
@@ -311,13 +313,14 @@ if $SMOKE; then
 }
 EOF
 )
-  aws lambda invoke \
+  INVOKE_STDOUT=$(aws lambda invoke \
     --function-name "${FUNCTION_NAME}" \
     --cli-binary-format raw-in-base64-out \
     --payload "${PAYLOAD}" \
     --region "${REGION}" \
-    "${RESP}" >/dev/null
+    "${RESP}")
   cat "${RESP}"
   echo ""
+  assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
   rm -f "${RESP}"
 fi

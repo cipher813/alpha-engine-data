@@ -207,4 +207,42 @@ if [[ "${SMOKE_ARG}" == "--smoke" ]]; then
     > /dev/null
   echo "  → Published. Entry should land in s3://alpha-engine-research/changelog/entries/ within ~3s."
   echo "  → Check with: aws s3 ls s3://alpha-engine-research/changelog/entries/$(date -u +%Y-%m-%d)/ --recursive | tail"
+
+  # Crash check (alpha-engine-config-I7535). The publish above is async via
+  # SNS delivery — there is no invoke response to inspect. Follow it with a
+  # DIRECT invoke carrying a synthetic SNS Records envelope (same technique
+  # backstop-telegram-notifier and overseer-backstop-responder already use
+  # for their SNS-subscribed Lambdas) purely to get a synchronous response
+  # assert_no_function_error can check. This writes one additional
+  # (harmless) changelog entry.
+  # shellcheck source=infrastructure/lambdas/_shared/smoke.sh
+  source "${SCRIPT_DIR}/../_shared/smoke.sh"
+  echo "Direct-invoking for a crash check (writes one additional smoke entry)..."
+  RESP=$(mktemp)
+  trap "rm -f '${RESP}'" EXIT
+  CRASH_CHECK_PAYLOAD=$(cat <<EOF
+{
+  "Records": [
+    {
+      "Sns": {
+        "MessageId": "smoke-crash-check-${TS}",
+        "TopicArn": "arn:aws:sns:${REGION}:711398986525:alpha-engine-alerts",
+        "Subject": "deploy.sh --smoke crash check",
+        "Message": "[SMOKE] deploy.sh crash-check invoke ${TS}: verifying changelog-incident-mirror handler does not raise",
+        "Timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+      }
+    }
+  ]
+}
+EOF
+)
+  INVOKE_STDOUT=$(aws lambda invoke \
+    --function-name "${FUNCTION_NAME}" \
+    --cli-binary-format raw-in-base64-out \
+    --payload "${CRASH_CHECK_PAYLOAD}" \
+    --region "${REGION}" \
+    "${RESP}")
+  cat "${RESP}"
+  echo ""
+  assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
 fi

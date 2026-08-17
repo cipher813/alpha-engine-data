@@ -177,17 +177,20 @@ echo "✓ Code deployed."
 # ----- 4. Smoke (read-only — a nonexistent command id exercises the
 #          registration-window path and both SSM read calls) ----------------
 
+# shellcheck source=infrastructure/lambdas/_shared/smoke.sh
+source "${SCRIPT_DIR}/../_shared/smoke.sh"
 if $SMOKE; then
   echo ""
   echo "Smoke: read-only invoke (nonexistent command id → IN_PROGRESS/Registering)"
   RESP=$(mktemp)
-  aws lambda invoke \
+  INVOKE_STDOUT=$(aws lambda invoke \
     --function-name "${FUNCTION_NAME}" \
     --cli-binary-format raw-in-base64-out \
     --payload '{"instance_id":"i-018eb3307a21329bf","command_id":"00000000-0000-0000-0000-000000000000","attempts":0,"ping_misses":0,"max_attempts":3,"max_ping_misses":3,"step":"smoke"}' \
     --region "${REGION}" \
-    "${RESP}" >/dev/null
+    "${RESP}")
   cat "${RESP}"
   echo ""
+  assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
   rm -f "${RESP}"
 fi

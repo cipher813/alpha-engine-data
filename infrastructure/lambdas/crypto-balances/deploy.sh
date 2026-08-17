@@ -199,13 +199,16 @@ echo "✓ Code deployed."
 
 # ----- 4. Smoke (real invoke — writes crypto/holdings.json if addresses exist) ---
 
+# shellcheck source=infrastructure/lambdas/_shared/smoke.sh
+source "${SCRIPT_DIR}/../_shared/smoke.sh"
 if $SMOKE; then
   echo ""
   echo "Smoke-testing via direct invoke (⚠ a real run — writes crypto/holdings.json)..."
   RESP=$(mktemp)
-  aws lambda invoke --function-name "${FUNCTION_NAME}" \
+  INVOKE_STDOUT=$(aws lambda invoke --function-name "${FUNCTION_NAME}" \
     --cli-binary-format raw-in-base64-out --payload '{}' \
-    --region "${REGION}" "${RESP}" >/dev/null
+    --region "${REGION}" "${RESP}")
   cat "${RESP}"; echo ""
+  assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
   rm -f "${RESP}"
 fi
