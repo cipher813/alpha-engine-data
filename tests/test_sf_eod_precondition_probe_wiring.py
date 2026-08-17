@@ -443,8 +443,14 @@ class TestHealOutcomeNotifications:
     standalone dashboard-box systemd timer, so these now route to
     StopTradingInstance directly."""
 
+    # alpha-engine-config-I7586: HealConvergedNotify's expected substring moved
+    # from "CONVERGED" to "replay dispatched". Not a test bent to fit the code —
+    # the state fires on a fire-and-forget DISPATCH and cannot know whether the
+    # replay converged, and under the deploy-refresh defect it never had. The
+    # property this parametrization actually protects (three heal-outcome
+    # notifications, three distinct subjects) is unchanged and still asserted.
     @pytest.mark.parametrize("state_name,subject_substr", [
-        ("HealConvergedNotify", "CONVERGED"),
+        ("HealConvergedNotify", "replay dispatched"),
         ("HealReplayDispatchFailed", "REPLAY DISPATCH FAILED"),
         ("HealNonConvergent", "DID NOT CONVERGE"),
     ])

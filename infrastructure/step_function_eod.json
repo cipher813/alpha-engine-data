@@ -1923,7 +1923,7 @@
     },
     "HealDispatchReplay": {
       "Type": "Task",
-      "Comment": "config-I2702 deliverable #3(c): auto-start the reconcile-only replay execution, reusing I2700's PROVEN input shape EXACTLY (pipeline_role=operator-replay + skip_post_market_data=true + skip_capture_snapshot=true \u2014 the shape that ran successfully as 'operator-replay-eodreconcile-2026-07-15' and its 2026-07-13 precedent). Deliberately a SEPARATE execution rather than looping this one back through CaptureSnapshot: CaptureSnapshot already ran ONCE earlier in THIS execution (it sits upstream of the precondition probe in the pipeline order), so re-entering the data-spot phase in-place would re-trigger a second live-IB snapshot capture \u2014 exactly what I2700's skip_capture_snapshot flag exists to avoid. skip_refresh_executor_deploy=true because RefreshExecutorDeploy already ran at the top of THIS execution and re-froze .frozen_executor_sha \u2014 the box is already known-fresh. Fire-and-forget (non-.sync): this execution's own terminal state does not wait for the replay's outcome \u2014 the replay's own SUCCEEDED/FAILED status is independently observable (execution name eod-heal-replay-{run_date}-*) and IS the 'convergence notification' this issue's closes-when criteria describes.",
+      "Comment": "config-I2702 deliverable #3(c): auto-start the reconcile-only replay execution, reusing I2700's PROVEN input shape (pipeline_role=operator-replay + skip_post_market_data=true + skip_capture_snapshot=true). Deliberately a SEPARATE execution rather than looping this one back through CaptureSnapshot: CaptureSnapshot already ran ONCE earlier in THIS execution (it sits upstream of the precondition probe in the pipeline order), so re-entering the data-spot phase in-place would re-trigger a second live-IB snapshot capture \u2014 exactly what I2700's skip_capture_snapshot flag exists to avoid. Fire-and-forget (non-.sync): this execution's own terminal state does not wait for the replay's outcome \u2014 the replay's own SUCCEEDED/FAILED status is independently observable (execution name eod-heal-replay-{run_date}-*). \u2014 alpha-engine-config-I7586: skip_refresh_executor_deploy was REMOVED from this Input. It was justified as 'RefreshExecutorDeploy already ran at the top of THIS execution and re-froze .frozen_executor_sha \u2014 the box is already known-fresh'. That premise holds for the PARENT and not for the CHILD, because this state's own successors are HealConvergedNotify \u2192 StopTradingInstance: the parent stops the trading box out from under the fire-and-forget replay it just started, the replay's own StartTradingInstance boots it again, and a rebooted box is not on the SHA the parent froze. Reproduced by hand 2026-08-17 with this exact input shape \u2014 the replay reached EODReconcile and died in executor/preflight.py::check_deploy_drift ('checkout is on dfbab49b7b06 but this run pinned EXPECTED_EXECUTOR_SHA=1ea15df6ce83'), terminal EODPipelineFailure. Re-running the identical input WITHOUT the flag succeeded first try. The drift guard is correct; the replay was handing it a box nobody synced. THE OTHER TWO FLAGS ARE CORRECT and must not be swept along with it: skip_capture_snapshot (the parent genuinely already captured, and a second live-IB capture is the thing it exists to avoid) and skip_post_market_data (the heal loop just ran it). Only the deploy-refresh flag has a premise a box restart invalidates. The replay's own RefreshExecutorDeploy is cheap relative to a failed reconcile, and it is the only thing that makes the child's freshness gate meaningful.",
       "Resource": "arn:aws:states:::states:startExecution",
       "Parameters": {
         "StateMachineArn.$": "$$.StateMachine.Id",
@@ -1935,8 +1935,7 @@
           "triggered_by": "eod-self-heal",
           "pipeline_role": "operator-replay",
           "skip_post_market_data": true,
-          "skip_capture_snapshot": true,
-          "skip_refresh_executor_deploy": true
+          "skip_capture_snapshot": true
         }
       },
       "TimeoutSeconds": 30,
@@ -1977,12 +1976,12 @@
     },
     "HealConvergedNotify": {
       "Type": "Task",
-      "Comment": "config-I2702 closes-when 'convergence notification': informational (non-paging) \u2014 the self-heal succeeded without any operator action; the replay execution named here does the actual EODReconcile.",
+      "Comment": "config-I2702 closes-when 'convergence notification': informational (non-paging) \u2014 the self-heal re-dispatched the missing workload(s) and the replay execution named here does the actual EODReconcile. alpha-engine-config-I7586: this used to assert 'No operator action required' on the strength of a DISPATCH. Under the deploy-refresh defect that claim was false in every case this state could be reached, and it is a claim this state structurally cannot make \u2014 the dispatch is fire-and-forget, so the convergence signal belongs to the replay's own terminal, independently observable by execution name.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
-        "Subject": "Alpha Engine EOD Self-Heal \u2014 CONVERGED (replay dispatched, no operator action needed)",
-        "Message.$": "States.Format('EOD self-heal for {} converged after {} attempt(s): the missing data-spot workload(s) were re-dispatched, SPY close is now verified present in ArcticDB, and a reconcile-only replay execution has been started automatically ({}). No operator action required.', $.run_date, States.MathAdd($.heal_loop.attempts, 1), States.JsonToString($.heal_replay_dispatch))"
+        "Subject": "Alpha Engine EOD Self-Heal \u2014 replay dispatched (convergence pending)",
+        "Message.$": "States.Format('EOD self-heal for {} re-dispatched the missing data-spot workload(s) after {} attempt(s); SPY close is now verified present in ArcticDB and a reconcile-only replay execution has been started ({}). The replay\\'s OWN terminal is the convergence signal \u2014 this message reports a dispatch, not an outcome.', $.run_date, States.MathAdd($.heal_loop.attempts, 1), States.JsonToString($.heal_replay_dispatch))"
       },
       "ResultPath": "$.heal_converged_notify",
       "TimeoutSeconds": 60,
