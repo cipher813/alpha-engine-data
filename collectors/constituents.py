@@ -63,6 +63,18 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+
+class ConstituentsUnavailable(RuntimeError):
+    """Neither the live constituent feed nor the local cache could be read.
+
+    A distinct type, not a bare ``RuntimeError``, so a caller that genuinely
+    wants to soft-fail can catch exactly this and nothing else — the fleet's
+    fail-loud default stays the default, and opting out is explicit and
+    narrow rather than an ``except Exception`` that also swallows a schema
+    change or a permissions error (alpha-engine-config-I7435).
+    """
+
+
 # GICS sector name → sector ETF symbol
 GICS_TO_ETF: dict[str, str] = {
     "Information Technology": "XLK",
@@ -544,7 +556,18 @@ def _fetch_constituents() -> tuple[
 
     except Exception as e:
         logger.warning("Constituents fetch failed (%s); trying local cache...", e)
-        return _load_from_cache()
+        try:
+            return _load_from_cache()
+        except ConstituentsUnavailable as cache_exc:
+            # BOTH sources are gone. Chaining is the whole point: raising the
+            # cache miss alone would name the symptom and bury the trigger,
+            # and on 2026-08-15 the trigger was a missing `openpyxl` — an
+            # environment defect that reads nothing like "no cache found"
+            # (alpha-engine-config-I7435).
+            raise ConstituentsUnavailable(
+                f"constituents unavailable: live fetch failed ({e!r}) AND the "
+                f"local cache fallback failed ({cache_exc})"
+            ) from e
 
 
 def _load_from_cache() -> tuple[
@@ -560,8 +583,16 @@ def _load_from_cache() -> tuple[
     additive and not yet consumed downstream).
     """
     if not _CACHE_PATH.exists():
-        logger.error("No cache found — cannot build universe")
-        return [], {}, {}, {}, 0, 0
+        # An empty universe is never a legitimate return value here. Returning
+        # one made a total outage indistinguishable from a real result: on
+        # 2026-08-15 the caller logged "Wikipedia constituents: 0 tickers" at
+        # INFO, and a drift check comparing 0 against anything either passes
+        # vacuously or reports drift whose real cause is a missing dependency
+        # (alpha-engine-config-I7435).
+        raise ConstituentsUnavailable(
+            f"no local constituents cache at {_CACHE_PATH} — cannot build "
+            "universe, and an empty universe is not a result"
+        )
     df = pd.read_csv(_CACHE_PATH)
     tickers = df["ticker"].astype(str).tolist()
     sector_map: dict[str, str] = {}
