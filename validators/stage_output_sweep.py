@@ -240,7 +240,9 @@ def read_execution_context(
         try:
             import boto3  # noqa: PLC0415
 
-            sfn_client = boto3.client("stepfunctions")
+            from krepis.aws_region import resolve_region  # noqa: PLC0415
+
+            sfn_client = boto3.client("stepfunctions", region_name=resolve_region())
         except Exception as exc:  # noqa: BLE001
             context.notes.append(f"stepfunctions client unavailable: {exc}")
             return context
