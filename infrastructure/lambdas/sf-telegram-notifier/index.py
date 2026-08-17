@@ -76,6 +76,14 @@ _STATUS_EMOJI: dict[str, str] = {
 # must also not read as a generic failure). Distinct emoji, distinct label.
 _DEGRADED_EMOJI = "\U0001f7e0"  # 🟠
 
+# Every severity this notifier can emit is exempt from the fleet-shared daily
+# alert budget. Justified by the producer being BOUNDED, not by the traffic
+# being important: this Lambda mirrors the lifecycle of a fixed set of state
+# machines, so its event count per day is bounded by SF transitions and it
+# cannot storm. Repeats of one signature are still suppressed by signature
+# dedup + `dedup_cooldown_minutes: 1`. See the ruling note in `handler`.
+_RATE_LIMIT_EXEMPT_SEVERITIES: tuple[str, ...] = ("critical", "error", "warning", "info")
+
 _CAUSE_MAX_CHARS = 280
 _TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"})
 
@@ -86,6 +94,7 @@ def build_flow_doctor_config_for_tests() -> dict:
         _FLOW_NAME,
         PIPELINE_OBSERVER_TELEGRAM_TOPICS,
         db_basename=_DB_BASENAME,
+        rate_limit_exempt_severities=_RATE_LIMIT_EXEMPT_SEVERITIES,
     )
 
 
@@ -339,6 +348,26 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001
         flow_name=_FLOW_NAME,
         topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
         db_basename=_DB_BASENAME,
+        # Brian's ruling, 2026-08-17: "eod outcome should land in the same
+        # place as 'Post-close Trading SF — RUNNING'". Those two messages take
+        # DIFFERENT delivery paths, which is why they had different
+        # reliability. RUNNING goes out via the `silent_topic` branch's
+        # `send_raw`, which never touches flow-doctor's alert pipeline and so
+        # always arrives. The terminal goes through `notify_event`, where the
+        # fleet-shared daily budget can drop it — measured on the postclose SF:
+        # 2026-08-03, -04 and -07 all reached SUCCEEDED and all three reports
+        # were recorded `reason=rate_limited`, delivered nowhere, while that
+        # morning's RUNNING ping landed normally. Three of the last eight
+        # trading days had a green EOD that was indistinguishable, on the
+        # thread the operator actually reads, from a pipeline that never ran.
+        #
+        # Two changes make the ruling structurally true rather than probable:
+        # the exemption below takes this bounded lifecycle mirror out of the
+        # shared budget so the ordinary path fires, and `guaranteed_topic` is
+        # the belt — any FUTURE suppression that is not dedup still lands the
+        # message in PIPELINE, the same thread RUNNING goes to.
+        rate_limit_exempt_severities=_RATE_LIMIT_EXEMPT_SEVERITIES,
+        guaranteed_topic=FleetTelegramTopic.PIPELINE,
         context={
             "state_machine": sm_name,
             "execution": detail.get("name"),

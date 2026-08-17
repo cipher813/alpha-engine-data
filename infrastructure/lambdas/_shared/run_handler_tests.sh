@@ -47,15 +47,52 @@
 #   HANDLER_TEST_PYTHONPATH  extra colon-path appended after the scratch deps dir
 #                            (e.g. the lambdas dir so `import flow_doctor_telegram`
 #                            resolves for tests that don't self-path)
-#   HANDLER_TEST_TARGETS     extra pytest target paths run alongside test_handler.py
-#                            (e.g. sf-telegram-notifier's test_execution_digest.py)
-# Returns pytest's exit code (0 if the lambda has no test_handler.py). Cleans up
-# its own scratch dir; safe under `set -euo pipefail`.
+#   HANDLER_TEST_TARGETS     extra pytest target paths run alongside test_handler.py.
+#                            DEFAULTS to every sibling test_*.py in SCRIPT_DIR.
+#                            Set it explicitly to narrow; set it to " " to run
+#                            test_handler.py alone.
+# Returns non-zero if ANY target failed (0 if the lambda has no test_handler.py).
+# Cleans up its own scratch dir; safe under `set -euo pipefail`.
+#
+# Two invariants this function owns, both earned (alpha-engine-config-I7573):
+#
+#  1. AUTO-DISCOVERY. HANDLER_TEST_TARGETS was set in exactly one place —
+#     sf-telegram-notifier/deploy.sh — and nowhere in ci.yml, whose glob step
+#     passes only the directory. So that lambda's test_execution_digest.py and
+#     test_eod_artifact_verification.py ran at DEPLOY time (post-merge) and
+#     never pre-merge, and its test_flow_doctor_fleet_wiring.py ran in neither.
+#     A test file that no gate runs is not coverage. Defaulting to the sibling
+#     glob makes pre-merge and post-merge see the same set, which is the whole
+#     reason this helper exists.
+#
+#  2. ONE PROCESS PER FILE. They used to share a single pytest invocation, so a
+#     module-scope `sys.modules[...] = <stub>` in one file leaked into every
+#     file collected after it. Live instance: sf-telegram-notifier's
+#     test_handler.py installs a stub of `nousergon_lib.flow_doctor_fleet` that
+#     omits `fleet_telegram_notifier_dicts`, and
+#     test_flow_doctor_fleet_wiring.py — which exists precisely to check the
+#     config against the REAL fleet spec — then fails on import. It passes
+#     alone and fails in a full run, i.e. the result depended on collection
+#     order. Separate processes make each file's answer its own.
 run_handler_tests() {
   local script_dir="$1"; shift
   local test_file="${script_dir}/test_handler.py"
   if [[ ! -f "${test_file}" ]]; then
     return 0
+  fi
+
+  local targets
+  if [[ -n "${HANDLER_TEST_TARGETS+x}" ]]; then
+    # shellcheck disable=SC2206 — intentional word-split on the caller's list.
+    targets=(${HANDLER_TEST_TARGETS})
+  else
+    targets=()
+    local sibling
+    for sibling in "${script_dir}"/test_*.py; do
+      if [[ -f "${sibling}" && "${sibling}" != "${test_file}" ]]; then
+        targets+=("${sibling}")
+      fi
+    done
   fi
 
   local deps_dir
@@ -69,13 +106,20 @@ run_handler_tests() {
   fi
 
   local pypath="${deps_dir}${HANDLER_TEST_PYTHONPATH:+:${HANDLER_TEST_PYTHONPATH}}"
-  echo "Running handler unit tests (${test_file##*/}${HANDLER_TEST_TARGETS:+ + ${HANDLER_TEST_TARGETS}})..." >&2
 
-  local rc=0
-  # ${HANDLER_TEST_TARGETS} intentionally unquoted — space-separated extra targets.
-  PYTHONPATH="${pypath}" \
-  AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}" \
-    python3 -m pytest "${test_file}" ${HANDLER_TEST_TARGETS:-} -q || rc=$?
+  local rc=0 one file_rc
+  # ${targets[@]+...} guard: bash 3.2 (the macOS system bash every deploy.sh
+  # runs under) errors on "${arr[@]}" for an EMPTY array under `set -u`.
+  for one in "${test_file}" ${targets[@]+"${targets[@]}"}; do
+    echo "Running ${one##*/}..." >&2
+    file_rc=0
+    PYTHONPATH="${pypath}" \
+    AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}" \
+      python3 -m pytest "${one}" -q || file_rc=$?
+    if [[ "${file_rc}" -ne 0 ]]; then
+      rc="${file_rc}"
+    fi
+  done
 
   rm -rf "${deps_dir}"
   return "${rc}"
