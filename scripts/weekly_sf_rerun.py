@@ -95,7 +95,7 @@ import json
 import re
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # sys.path insertion (not a package import) so this resolves identically
@@ -970,6 +970,101 @@ def next_rerun_name(sf, sm_arn: str, run_date: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Skip-coherence pre-flight (alpha-engine-config-I7443, sf-pipeline-policy
+# §2.5: "a skip-set that leaves a downstream JSONPath unresolvable must be
+# rejected by the helper, not discovered as a States.Runtime error thirty
+# seconds into the rerun.")
+# ---------------------------------------------------------------------------
+
+PREDICTOR_MANIFEST_BUCKET = "alpha-engine-research"
+PREDICTOR_MANIFEST_KEY = "predictor/weights/meta/manifest.json"
+
+
+class SkipCoherenceError(Exception):
+    """A derived (or carried-forward) skip_* flag is incoherent with the
+    plan's run_date: the artifact it claims already exists does not, FOR
+    THIS run_date. Raised before any dispatch is spent finding out.
+
+    2026-08-15 recovery of weekly cycle 2026-08-15 burned two full
+    ne-weekly-freshness-pipeline executions (watch-rerun-2026-08-16-1,
+    -2; ~50 minutes) on skip_predictor_training=true paired with a
+    run_date the predictor never trained for — the SF's own
+    ValidatePredictorSkipWeightsFresh / CheckPredictorSkipWeightsFresh gate
+    (infrastructure/step_function.json) caught it correctly, but four hours
+    and two dispatches into the recovery arc instead of at --dry-run. This
+    mirrors that exact predicate here, ahead of --start.
+    """
+
+
+def refuse_fallback_run_date_without_acceptance(plan: "RerunPlan", accept: bool) -> None:
+    """Refuse (SystemExit) a --start whose run_date was MINTED from the
+    source execution's own UTC start time rather than carried from an
+    explicit input or InitializeInput output, unless the operator passed
+    ``--accept-fallback-run-date``. alpha-engine-config-I7443: the printed
+    FALLBACK provenance note went unnoticed/unacted-on for exactly this
+    reason on 2026-08-16, and the resulting rerun burned two dispatches on
+    PredictorSkipWeightsStale."""
+    if not plan.run_date_provenance.startswith("FALLBACK") or accept:
+        return
+    raise SystemExit(
+        f"FATAL: run_date {plan.run_date!r} was MINTED from the source "
+        f"execution's own UTC start time ([{plan.run_date_provenance}]), "
+        "not carried from an explicit input or InitializeInput output — "
+        "refusing to --start on it. If this really is a pre-workload "
+        "failure (the source never reached InitializeInput) and "
+        f"{plan.run_date!r} is correct, re-run with "
+        "--accept-fallback-run-date. Otherwise pass --execution-arn to "
+        "point at the right source, or pass the cycle's ORIGINAL "
+        "run_date by hand-crafting the input (alpha-engine-config-I7443)."
+    )
+
+
+def check_predictor_skip_freshness(s3, run_date: str, skip_flags: dict) -> None:
+    """Mirror ValidatePredictorSkipWeightsFresh: if skip_predictor_training
+    is set, HeadObject the live weights manifest and require its
+    LastModified DATE >= run_date (lexicographic YYYY-MM-DD compare, same as
+    the SF's CheckPredictorSkipWeightsFresh Choice state). Raises
+    SkipCoherenceError rather than emitting an input the SF will only reject
+    after a dispatch is already spent.
+
+    Any S3 error (missing manifest, AccessDenied, throttling exhausted) is
+    treated the same as the SF's own Catch on ValidatePredictorSkipWeightsFresh
+    — fail loud rather than silently trust an unverifiable freshness claim.
+    """
+    if not skip_flags.get("skip_predictor_training"):
+        return
+    try:
+        head = s3.head_object(Bucket=PREDICTOR_MANIFEST_BUCKET, Key=PREDICTOR_MANIFEST_KEY)
+    except Exception as exc:  # noqa: BLE001 — cannot PROVE freshness on any S3 error; fail loud, mirrors the SF's own Catch
+        raise SkipCoherenceError(
+            f"skip_predictor_training=true but HeadObject on "
+            f"s3://{PREDICTOR_MANIFEST_BUCKET}/{PREDICTOR_MANIFEST_KEY} "
+            f"failed ({exc!r}) — cannot verify weights freshness for "
+            f"run_date {run_date}. Refusing to emit a plan the SF's own "
+            "ValidatePredictorSkipWeightsFresh would also reject. Re-run "
+            "WITHOUT skip_predictor_training, or investigate the manifest."
+        ) from exc
+    last_modified = head["LastModified"]
+    if hasattr(last_modified, "astimezone"):
+        manifest_date = last_modified.astimezone(timezone.utc).date().isoformat()
+    else:
+        manifest_date = str(last_modified).split("T", 1)[0]
+    if manifest_date < run_date:
+        raise SkipCoherenceError(
+            f"skip_predictor_training=true but "
+            f"s3://{PREDICTOR_MANIFEST_BUCKET}/{PREDICTOR_MANIFEST_KEY} "
+            f"LastModified date {manifest_date} < run_date {run_date} — no "
+            "completed predictor training for this run_date; refusing to "
+            "launch onto stale weights (same predicate as the SF's own "
+            "ValidatePredictorSkipWeightsFresh / PredictorSkipWeightsStale — "
+            "checked here BEFORE a dispatch, not after one; "
+            "alpha-engine-config-I7443). Either re-run WITHOUT "
+            "skip_predictor_training, or pass the ORIGINAL run_date "
+            "explicitly if this is a cross-UTC-midnight recovery rerun."
+        )
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -997,7 +1092,13 @@ def _print_plan(plan: RerunPlan, source_arn: str, source_status: str, name: str,
         print(f"WARN : {w}", file=sys.stderr)
     print("\nStartExecution input:")
     print(json.dumps(_emitted, indent=2, sort_keys=True))
-    print("\nequivalent CLI:")
+    print(
+        "\nequivalent CLI (name and input.run_date are DERIVED TOGETHER — "
+        "alpha-engine-config-I7443: watch-rerun-{run_date}-N must never "
+        "carry a different run_date. Do not hand-edit the JSON below "
+        "without also renaming; re-run this script with --execution-arn "
+        "instead):"
+    )
     print(
         f"aws stepfunctions start-execution --state-machine-arn {sm_arn} "
         f"--name {name} --input '{json.dumps(_emitted, sort_keys=True)}'"
@@ -1011,6 +1112,17 @@ def main(argv: list | None = None) -> int:
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="derive + print only (default)")
     mode.add_argument("--start", action="store_true", help="run pre-start guards, steal stale mutex item if safe, StartExecution")
+    ap.add_argument(
+        "--accept-fallback-run-date", action="store_true",
+        help=(
+            "required to --start when run_date could not be resolved from "
+            "an explicit input or InitializeInput output and fell back to "
+            "the source execution's own UTC start date (provenance "
+            "'FALLBACK: ...'). Without it, --start refuses rather than "
+            "silently minting a run_date that may not match the cycle "
+            "being recovered (alpha-engine-config-I7443)."
+        ),
+    )
     ap.add_argument("--region", default="us-east-1")
     args = ap.parse_args(argv)
 
@@ -1018,6 +1130,7 @@ def main(argv: list | None = None) -> int:
 
     sf = boto3.client("stepfunctions", region_name=args.region)
     ddb = boto3.client("dynamodb", region_name=args.region)
+    s3 = boto3.client("s3", region_name=args.region)
 
     if args.execution_arn:
         desc = sf.describe_execution(executionArn=args.execution_arn)
@@ -1041,6 +1154,16 @@ def main(argv: list | None = None) -> int:
     name = next_rerun_name(sf, args.state_machine_arn, plan.run_date)
     sm_name = args.state_machine_arn.rsplit(":", 1)[-1]
     source_role = execution_input(events).get("pipeline_role")
+
+    # Skip-coherence pre-flight (alpha-engine-config-I7443): reject an
+    # incoherent skip-set BEFORE any mutex work or dispatch, not after one —
+    # sf-pipeline-policy §2.5. Checked ahead of the mutex inspection below so
+    # a doomed plan never touches DynamoDB or prints a false "OK" mutex line.
+    try:
+        check_predictor_skip_freshness(s3, plan.run_date, plan.skip_flags)
+    except SkipCoherenceError as exc:
+        _print_plan(plan, source_arn, source_status, name, args.state_machine_arn)
+        raise SystemExit(f"\nFATAL (skip-coherence, alpha-engine-config-I7443): {exc}")
 
     # Mutex inspection (read-only here; delete only under --start).
     decision = None
@@ -1097,6 +1220,14 @@ def main(argv: list | None = None) -> int:
     if not args.start:
         print("\n(dry-run — nothing mutated; re-run with --start to execute)")
         return 0
+
+    # A FALLBACK-provenance run_date was MINTED from the source execution's
+    # own start time, not carried from an explicit input or InitializeInput
+    # output — never let --start launch on one silently (alpha-engine-
+    # config-I7443: the printed provenance line went unnoticed/unacted-on
+    # for exactly this reason on 2026-08-16). --dry-run always shows it
+    # above; --start additionally refuses unless explicitly acknowledged.
+    refuse_fallback_run_date_without_acceptance(plan, args.accept_fallback_run_date)
 
     # --- pre-start guards ---------------------------------------------------
     running = list_all_executions(sf, args.state_machine_arn, status_filter="RUNNING")
