@@ -243,7 +243,12 @@ def _phase_collect(
             result = run_fn() or {}
             if result.get("status") == "error":
                 raise _CollectorError(name, result.get("error"))
-            if verify_artifact_exists and artifact_key and result.get("status") == "ok":
+            # `degraded` is verified exactly like `ok` (alpha-engine-config-I7572):
+            # its whole meaning is "the artifact WAS produced, and something in it
+            # is known-defective". Verifying only `ok` would let the one status
+            # that continues the pipeline skip the verify-by-artifact contract —
+            # i.e. the new non-fatal path would be the only unverified one.
+            if verify_artifact_exists and artifact_key and result.get("status") in ("ok", "degraded"):
                 if bucket is None:
                     raise _CollectorError(
                         name, "verify_artifact_exists=True but bucket was not supplied to _phase_collect"
@@ -251,11 +256,18 @@ def _phase_collect(
                 if not _s3_object_exists(bucket, artifact_key):
                     raise _CollectorError(
                         name,
-                        f"collector reported status=ok but its contracted artifact "
+                        f"collector reported status={result.get('status')} but its contracted artifact "
                         f"s3://{bucket}/{artifact_key} does not exist (verify-by-artifact, "
                         f"config-I2702 deliverable #2 — rc=0 must mean the artifact exists, "
                         f"never just 'the process did not crash')",
                     )
+            # `degraded` is deliberately NOT recorded as a completed artifact.
+            # record_artifact is what arms same-date auto-skip, and a rerun that
+            # skips a degraded phase returns `{"status": "ok", "auto_skipped":
+            # True}` — the degradation would vanish on the second run, which is a
+            # false green on exactly the day someone is rerunning to look at it.
+            # The cost is that a same-date rerun recomputes the snapshot; that is
+            # the right trade against losing the verdict.
             if artifact_key and result.get("status") in ("ok", "ok_dry_run"):
                 ctx.record_artifact(artifact_key)
             return result
@@ -2911,9 +2923,18 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
     logger.info("COMPUTING: feature store snapshot")
     logger.info("=" * 60)
     from features.compute import compute_and_write
+    # zero_variance_fatal=False is EOD-path-only (alpha-engine-config-I7572).
+    # Every other caller of compute_and_write keeps the default True, so a
+    # backfill or weekly recompute still refuses to write a snapshot carrying a
+    # dead column — nothing downstream is waiting on those, so refusing is the
+    # right answer there. Here the snapshot IS written and the run is reported
+    # `degraded`; see the status-aggregation note below for why.
     results["collectors"]["features"] = _phase_collect(
         reg, "features",
-        lambda: compute_and_write(date_str=run_date, bucket=bucket, dry_run=dry_run),
+        lambda: compute_and_write(
+            date_str=run_date, bucket=bucket, dry_run=dry_run,
+            zero_variance_fatal=False,
+        ),
         artifact_key=f"features/{run_date}/schema_version.json",
     )
 
@@ -2956,16 +2977,43 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
 
     results["completed_at"] = datetime.now(timezone.utc).isoformat()
 
-    # Status
+    # Status. ``degraded`` (alpha-engine-config-I7572) is a THIRD outcome, not a
+    # softer failure: the phase produced its artifact and every consumer of that
+    # artifact can proceed, but something in it is known-defective. The only
+    # producer of it today is the feature store's zero-variance postflight.
+    #
+    # It is non-fatal HERE, on the EOD daily path, for one reason: this process's
+    # exit code is what the EOD Step Function reads to decide whether to run
+    # LaunchPostMarketArcticAppendSpot. Exiting 1 on a features-only defect
+    # therefore withholds the day's SPY close from ArcticDB, which strands the
+    # freshness sentinel on the prior trading day, skips EODReconcile, and sends
+    # the self-heal loop round twice on a deterministic failure before it pages.
+    # That is what happened on 2026-08-17. An analytics column defect must not be
+    # able to take the price-append and reconcile path down with it.
+    #
+    # It is NOT silent: the offending columns are logged at ERROR by
+    # compute_and_write, the phase status is `degraded` in the per-collector map
+    # printed below, the run's own status is `degraded`, and the health marker
+    # records it. `ok` is still reserved for a genuinely clean run.
     statuses = [r.get("status", "unknown") for r in results["collectors"].values()]
     if all(s in ("ok", "ok_dry_run") for s in statuses):
         results["status"] = "ok"
+    elif all(s in ("ok", "ok_dry_run", "degraded") for s in statuses):
+        results["status"] = "degraded"
+        results["degraded_collectors"] = sorted(
+            k for k, v in results["collectors"].items()
+            if v.get("status") == "degraded"
+        )
     else:
         results["status"] = "failed"
 
-    # Health marker
-    if not dry_run and results["status"] == "ok":
-        _write_health_marker(bucket, 0, run_date, "ok")
+    # Health marker. Written on degraded too, carrying the degraded status —
+    # previously only an `ok` run wrote one, so a degraded day left the marker
+    # absent, which reads on every freshness surface as "this never ran"
+    # (principles.md §2.7: no data is never rendered as green, and it must not
+    # be rendered as a different failure either).
+    if not dry_run and results["status"] in ("ok", "degraded"):
+        _write_health_marker(bucket, 0, run_date, results["status"])
 
     duration = ""
     try:
@@ -3507,7 +3555,23 @@ def main() -> None:
     # when invoked after 1:30pm PT on a trading day (polygon free-tier 403's
     # today's grouped-daily). Treated as success so spot_data_weekly.sh's
     # ``if ! ... exit 1`` check does not trip.
-    if results["status"] not in ("ok", "skipped"):
+    # `degraded` joins ok/skipped as a non-halting outcome (alpha-engine-config-
+    # I7572). It is emitted ONLY by the EOD daily path, ONLY for the feature
+    # store's zero-variance postflight, and it is loud at every layer: ERROR log
+    # naming the offending columns, `degraded` in the per-collector status map,
+    # `degraded` on the run, and a health marker recording it. The hard-fail
+    # posture for every genuine data failure is unchanged — see the comment
+    # above, which still governs `failed`.
+    if results["status"] == "degraded":
+        logger.error(
+            "Collection finished DEGRADED — the artifact was produced and the "
+            "pipeline continues, but %s reported a known defect. Exiting 0 so "
+            "the EOD SF still runs the ArcticDB append and EODReconcile; the "
+            "defect is tracked, not swallowed. Per-collector statuses: %s",
+            ", ".join(results.get("degraded_collectors", [])) or "a collector",
+            {k: v.get("status", "?") for k, v in results.get("collectors", {}).items()},
+        )
+    if results["status"] not in ("ok", "skipped", "degraded"):
         logger.error(
             "Weekly collection finished with non-ok status=%s — exiting 1 "
             "to halt the pipeline. Per-collector statuses: %s",
