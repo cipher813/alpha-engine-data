@@ -405,13 +405,52 @@ fi
 INSTANCE_ID=""
 S3_STAGING=""
 
+# ── Staging teardown (config-I7442, superseding config-I7396) ───────────────
+# This monolith is STILL the SF's live DataPhase2 path (spot_data_weekly.sh
+# --phase2-only), so the same defect that hit PredictorBacktest on
+# 2026-08-15 lives here too: run_ssm() further below points SSM's
+# --output-key-prefix at "${S3_STAGING_PREFIX}/ssm-output", the only place
+# a stage's full stdout/stderr survives past SSM's 24 KB GetCommandInvocation
+# cap, and the two call sites this replaced ran an unguarded
+# `aws s3 rm "$S3_STAGING" --recursive` in cleanup() on every exit path,
+# success or failure alike. Routed through `krepis.spot_evidence teardown`
+# — the one chokepoint every launcher in the fleet now calls (see
+# _spot_common.sh's twin of this function) — rather than reimplemented here:
+# it copies the staging prefix to `_spot_evidence/<slug>/<date>/<run-id>/`
+# first and deletes staging only if that copy succeeded, and sweeps stale
+# tmp/spot_<slug>/ and _spot_evidence/<slug>/ prefixes on every teardown.
+teardown_staging() {
+    local _exit_code="$1"
+    if [ -z "${S3_STAGING:-}" ]; then
+        return 0
+    fi
+    if "$LIB_PYTHON" -m krepis.spot_evidence teardown \
+            --staging "$S3_STAGING" \
+            --slug "data-weekly" \
+            --exit-code "$_exit_code"; then
+        return 0
+    fi
+    # Chokepoint unreachable (krepis pin predates spot_evidence, or a broken
+    # interpreter) — RETAIN, never fall back to `aws s3 rm`. An unswept
+    # prefix costs storage bounded by the next teardown's sweep; re-deleting
+    # here repeats I7442. This is what makes the merge order safe on a box
+    # whose krepis pin has not yet been bumped. Always `return 0`: this must
+    # never change the trap's own exit status.
+    echo "  spot_evidence: chokepoint unavailable via $LIB_PYTHON — S3 staging RETAINED at $S3_STAGING/ (not deleted)" >&2
+    echo "    Full stage stdout/stderr: $S3_STAGING/ssm-output/" >&2
+    return 0
+}
+
 cleanup() {
+    local _exit_code="${1:-0}"
     if [ "$KEEP_INSTANCE" = "1" ]; then
         # launch-only success: the spot is handed to the weekday SF (id
         # artifact written); the SF's TerminateDailyDataSpot state + the
-        # on-box systemd watchdog own its lifecycle from here.
-        [ -n "$S3_STAGING" ] && aws s3 rm "$S3_STAGING" --recursive --quiet 2>/dev/null || true
-        echo "  launch-only: instance $INSTANCE_ID left running (SF-owned); staging cleaned."
+        # on-box systemd watchdog own its lifecycle from here. No workload
+        # has run on THIS box yet, so teardown must not read a workload
+        # exit status that was never evaluated (config-I7442).
+        teardown_staging 0
+        echo "  launch-only: instance $INSTANCE_ID left running (SF-owned); staging teardown reported above."
         return 0
     fi
     if [ -n "$INSTANCE_ID" ]; then
@@ -419,8 +458,8 @@ cleanup() {
         echo "==> Terminating spot instance $INSTANCE_ID..."
         aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true
     fi
-    [ -n "$S3_STAGING" ] && aws s3 rm "$S3_STAGING" --recursive --quiet 2>/dev/null || true
-    [ -n "$INSTANCE_ID" ] && echo "  Instance terminated; S3 staging cleaned."
+    teardown_staging "$_exit_code"
+    [ -n "$INSTANCE_ID" ] && echo "  Instance terminated."
     return 0
 }
 
@@ -484,7 +523,7 @@ on_exit() {
     if [ "$rc" -ne 0 ]; then
         reason="$(_spot_failure_reason "$rc")" || reason=""
     fi
-    cleanup
+    cleanup "$rc"
     if [ "$rc" -ne 0 ] && [ -n "$reason" ] && [ "$SPOT_ATTEMPT" -lt "$MAX_SPOT_ATTEMPTS" ]; then
         # Record the absorbed interruption on a named CloudWatch surface
         # (fail-loud posture: the retry is observable, never silent).
