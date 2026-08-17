@@ -243,6 +243,8 @@ fi
 
 # ----- 3. Smoke (dry-run scan) ----------------------------------------------
 
+# shellcheck source=infrastructure/lambdas/_shared/smoke.sh
+source "${SCRIPT_DIR}/../_shared/smoke.sh"
 if $SMOKE; then
   echo ""
   echo "Smoke-testing via direct invoke (DRY_RUN override)..."
@@ -256,13 +258,14 @@ if $SMOKE; then
     --query 'LastUpdateStatus' --output text > /dev/null
   aws lambda wait function-updated --function-name "${FUNCTION_NAME}" --region "${REGION}"
 
-  aws lambda invoke \
+  INVOKE_STDOUT=$(aws lambda invoke \
     --function-name "${FUNCTION_NAME}" \
     --payload '{}' \
     --region "${REGION}" \
-    "${RESP}" >/dev/null
+    "${RESP}")
   cat "${RESP}"
   echo ""
+  assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
 
   # Restore production env (DRY_RUN=false)
   aws lambda update-function-configuration \

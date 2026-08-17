@@ -349,6 +349,8 @@ fi
 
 # ----- 4. Smoke test --------------------------------------------------------
 
+# shellcheck source=infrastructure/lambdas/_shared/smoke.sh
+source "${SCRIPT_DIR}/../_shared/smoke.sh"
 if $SMOKE; then
   echo ""
   echo "Smoke-testing via direct Lambda invoke (synthetic payload)..."
@@ -361,13 +363,14 @@ if $SMOKE; then
 
   RESP=$(mktemp)
   trap "rm -f '${RESP}'" EXIT
-  aws lambda invoke \
+  INVOKE_STDOUT=$(aws lambda invoke \
     --function-name "${FUNCTION_NAME}" \
     --payload "${EVENT}" \
     --cli-binary-format raw-in-base64-out \
     --region "${REGION}" \
-    "${RESP}" >/dev/null
+    "${RESP}")
   cat "${RESP}"
   echo ""
+  assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
   echo "  → Check entry at: aws s3 ls s3://alpha-engine-research/changelog/entries/$(date -u +%Y-%m-%d)/ --recursive | grep '${TS}'"
 fi

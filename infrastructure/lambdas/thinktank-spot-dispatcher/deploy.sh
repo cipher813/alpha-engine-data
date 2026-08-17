@@ -111,11 +111,16 @@ aws lambda wait function-updated --function-name "$FUNCTION_NAME" --region "$REG
 if [ "$SMOKE" -eq 1 ]; then
     echo "==> SMOKE: firing ONE real Think Tank run on a REAL spot box"
     echo "    (this spends a spot instance and a real LLM pass — ~25 min expected)"
-    aws lambda invoke --function-name "$FUNCTION_NAME" \
+    # shellcheck source=infrastructure/lambdas/_shared/smoke.sh
+    source "${SCRIPT_DIR}/../_shared/smoke.sh"
+    # Full invoke response JSON captured (not --query/--output text, which
+    # discards FunctionError) so assert_no_function_error can see a crash.
+    INVOKE_STDOUT=$(aws lambda invoke --function-name "$FUNCTION_NAME" \
         --payload '{}' --cli-binary-format raw-in-base64-out \
-        --region "$REGION" /tmp/thinktank-smoke-out.json --query 'StatusCode' --output text
+        --region "$REGION" /tmp/thinktank-smoke-out.json)
     echo "    dispatcher returned:"
     cat /tmp/thinktank-smoke-out.json; echo
+    assert_no_function_error "${INVOKE_STDOUT}" /tmp/thinktank-smoke-out.json
     echo "    Watch: aws logs tail /alpha-engine/thinktank-spot --follow"
     echo "    Gate:  thinktank/challenger_selection/, thinktank/ratings/ AND"
     echo "           thinktank/events/ written for the trading day, box self-terminated."
