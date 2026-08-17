@@ -36,7 +36,8 @@ is retained purely to TAG the dispatch (``triggered_by``) for observability,
 never to gate it.
 
 If the box is already stopped, EOD either ran (success or failure — both end
-in stopping the box, caught by the ``eod_ran_today`` guard) or the box never
+in stopping the box, and a completed EOD leaves its eod_pnl row, caught by
+the ``_eod_did_its_job`` guard) or the box never
 booted (caught by the widened dispatch above). The late-discovery case (box
 long gone, gap found days later) is NOT this Lambda's job — that is the IBKR
 Flex Query ``eod_pnl`` backfill (config#1229).
@@ -44,7 +45,7 @@ Flex Query ``eod_pnl`` backfill (config#1229).
 The EOD SF's own DynamoDB mutex (``AcquireMutex``) is the concurrency
 backstop: if a daemon-triggered EOD is mid-flight when this fires, our
 StartExecution would only hit ``MutexConflict`` and fail cleanly — but the
-``eod_ran_today`` guard means we don't even attempt it.
+``_eod_did_its_job`` guard means we don't even attempt it.
 
 CaptureSnapshot on a freshly-booted box (config-I6690 evidence, verified
 against crucible-executor + step_function_eod.json, not assumed): IB Gateway
@@ -92,6 +93,8 @@ import boto3
 
 from nousergon_lib.trading_calendar import is_trading_day, last_closed_trading_day
 
+from eod_artifact_verification import verify_eod_artifacts
+
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
@@ -125,6 +128,115 @@ SNS_TOPIC_ARN = os.environ.get(
 _STARTED_STATUSES = ("RUNNING", "SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED")
 
 
+def _eod_did_its_job(trading_day: str, s3_client: Optional[object] = None) -> bool:
+    """True iff ``trading_day``'s EOD produced its load-bearing ARTIFACT.
+
+    alpha-engine-config-I7582. This replaced ``_eod_ran_today`` as the dispatch
+    predicate. That one asked "did an execution START today", which covers *the
+    EOD never fired* and not *the EOD fired and did not do its job* — and this
+    module's whole reason for existing, in its own words above, is "the
+    load-bearing failure — NO ``eod_pnl`` ROW for the day".
+
+    Measured 2026-08-17: the EOD SF started at 20:00 UTC and ended at 21:55 UTC
+    in ``DegradedRun`` (``reason: eod_reconcile_skipped_data_gap``) with no
+    ArcticDB append, no ``EODReconcile`` and no ``eod_pnl`` row. This Lambda's
+    22:30 UTC firing was a no-op, CORRECTLY per its own predicate, on exactly
+    the day it exists for.
+
+    Keyed on the ARTIFACT, not on the terminal's colour, and deliberately so: a
+    ``DegradedRun`` whose degradation is unrelated to the row
+    (``mutex_acquire_degraded``, ``weekly_exercise_launch_failed``) has already
+    produced it, and re-dispatching would cost a second live-IB snapshot
+    capture — the exact thing ``skip_capture_snapshot`` exists to avoid.
+
+    The check itself is ``eod_artifact_verification``, the same module
+    sf-telegram-notifier uses to decide whether a terminal message may read
+    clean. Two consumers, one definition of "did the EOD do its job": a
+    backstop that stands down on a day the notifier would call incomplete is
+    the gap this closes, reopened.
+
+    ``verify_eod_artifacts`` fails TOWARD absent on any non-404 S3 fault, which
+    is the correct direction here too — an unverifiable day dispatches a
+    backstop run rather than silently skipping one.
+    """
+    if s3_client is None:  # pragma: no cover — production path
+        s3_client = boto3.client("s3", region_name=REGION)
+    status = verify_eod_artifacts(s3_client, trading_day)
+    if status is None:
+        logger.warning(
+            "EOD artifact verification returned no status for %s — treating as "
+            "NOT done so the backstop dispatches rather than silently skipping.",
+            trading_day,
+        )
+        return False
+    logger.info(
+        "EOD artifacts for %s: completion_marker=%s pnl_row=%s",
+        trading_day, status.completion_marker_present, status.pnl_row_present,
+    )
+    return status.pnl_row_present
+
+
+def _eod_running(sf_client: Optional[object] = None) -> bool:
+    """True iff an EOD execution is RUNNING right now.
+
+    A degraded run still inside its self-heal loop must not be re-dispatched
+    underneath itself. The SF's own DynamoDB ``AcquireMutex`` is the hard
+    concurrency backstop; this is the cheap check that avoids relying on it.
+    """
+    if sf_client is None:  # pragma: no cover — production path
+        sf_client = boto3.client("stepfunctions", region_name=REGION)
+    resp = sf_client.list_executions(
+        stateMachineArn=EOD_SF_ARN, statusFilter="RUNNING", maxResults=1
+    )
+    running = bool(resp.get("executions"))
+    if running:
+        logger.info("An EOD execution is currently RUNNING — no-op.")
+    return running
+
+
+def _backstop_already_fired_today(
+    now_utc: datetime, sf_client: Optional[object] = None
+) -> bool:
+    """True iff THIS Lambda already dispatched an EOD today.
+
+    One retry per day. Without this the outcome predicate would re-dispatch on
+    every firing for as long as the row stayed missing, which on a genuinely
+    broken day is an unbounded loop of trading-box boots. A second miss is a
+    page, not another attempt.
+    """
+    if sf_client is None:  # pragma: no cover — production path
+        sf_client = boto3.client("stepfunctions", region_name=REGION)
+    midnight = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    for status_filter in _STARTED_STATUSES:
+        next_token: Optional[str] = None
+        while True:
+            kwargs = {
+                "stateMachineArn": EOD_SF_ARN,
+                "statusFilter": status_filter,
+                "maxResults": 100,
+            }
+            if next_token:
+                kwargs["nextToken"] = next_token
+            resp = sf_client.list_executions(**kwargs)
+            for row in resp.get("executions") or []:
+                if not str(row.get("name") or "").startswith("eod-backstop-"):
+                    continue
+                start = row.get("startDate")
+                if not hasattr(start, "astimezone"):
+                    continue
+                start_utc = (
+                    start.astimezone(timezone.utc)
+                    if start.tzinfo
+                    else start.replace(tzinfo=timezone.utc)
+                )
+                if start_utc >= midnight:
+                    return True
+            next_token = resp.get("nextToken")
+            if not next_token:
+                break
+    return False
+
+
 def _trading_box_running(ec2_client: Optional[object] = None) -> bool:
     """True iff the trading EC2 instance is in the ``running`` state.
 
@@ -146,48 +258,13 @@ def _trading_box_running(ec2_client: Optional[object] = None) -> bool:
     return False
 
 
-def _eod_ran_today(now_utc: datetime, sf_client: Optional[object] = None) -> bool:
-    """True iff at least one EOD SF execution STARTED since 00:00 UTC today.
-
-    At the ~22:30 UTC firing time, today's expected EOD (~20:00–21:30 UTC) is
-    within the since-midnight window, while the prior trading day's EOD is not
-    — so this is trading-day-correct without a per-day marker. Raises on a
-    ListExecutions failure (fail-loud)."""
-    if sf_client is None:  # pragma: no cover — production path
-        sf_client = boto3.client("stepfunctions", region_name=REGION)
-    midnight = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-    for status_filter in _STARTED_STATUSES:
-        next_token: Optional[str] = None
-        while True:
-            kwargs = {
-                "stateMachineArn": EOD_SF_ARN,
-                "statusFilter": status_filter,
-                "maxResults": 100,
-            }
-            if next_token:
-                kwargs["nextToken"] = next_token
-            resp = sf_client.list_executions(**kwargs)
-            for row in resp.get("executions") or []:
-                start = row.get("startDate")
-                if not hasattr(start, "astimezone"):
-                    continue
-                start_utc = (
-                    start.astimezone(timezone.utc)
-                    if start.tzinfo
-                    else start.replace(tzinfo=timezone.utc)
-                )
-                if start_utc >= midnight:
-                    logger.info(
-                        "EOD execution %s already started today (%s, %s)",
-                        row.get("name"), start_utc.isoformat(), status_filter,
-                    )
-                    return True
-            next_token = resp.get("nextToken")
-            if not next_token:
-                break
-    return False
-
-
+# _eod_ran_today was REMOVED (alpha-engine-config-I7582). It answered "did an
+# EOD execution start since 00:00 UTC", which is not the question this Lambda
+# exists to ask, and on 2026-08-17 it correctly returned True for an execution
+# that produced no eod_pnl row — so the backstop stood down on exactly the day
+# it was written for. Replaced by _eod_did_its_job (the artifact) + _eod_running
+# (concurrency) + _backstop_already_fired_today (one retry per day). Deleted
+# rather than left dormant: champion-challenger-policy.md §6.
 def _start_eod(trading_day: str, triggered_by: str, sf_client: Optional[object] = None) -> str:
     """Start the EOD SF with the same input shape the daemon uses (config-I6690:
     identical regardless of whether the box was running — see the module
@@ -229,9 +306,32 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     trading_day = last_closed_trading_day(now_utc).isoformat()
 
-    if _eod_ran_today(now_utc):
-        logger.info("An EOD execution already started today — no-op.")
-        return {"action": "noop", "reason": "eod_already_ran_today", "trading_day": trading_day}
+    # alpha-engine-config-I7582: the dispatch predicate is the ARTIFACT, not the
+    # fact that something started. Order matters — cheapest and most decisive
+    # first, and each no-op reason is distinct so the console can tell a quiet
+    # healthy day from a quiet blocked one.
+    if _eod_running():
+        return {"action": "noop", "reason": "eod_currently_running", "trading_day": trading_day}
+
+    if _eod_did_its_job(trading_day):
+        logger.info("EOD produced its eod_pnl row for %s — no-op.", trading_day)
+        return {"action": "noop", "reason": "eod_row_present", "trading_day": trading_day}
+
+    if _backstop_already_fired_today(now_utc):
+        # One retry per day. A second miss is a page, not another boot — see
+        # _backstop_already_fired_today.
+        logger.error(
+            "EOD-BACKSTOP EXHAUSTED: this Lambda already dispatched an EOD today "
+            "and trading_day=%s STILL has no eod_pnl row. Not dispatching again. "
+            "The next day's reconcile will have no adjacent prior-day NAV "
+            "baseline (config#1229) — operator action required.",
+            trading_day,
+        )
+        return {
+            "action": "noop",
+            "reason": "backstop_already_fired_and_row_still_missing",
+            "trading_day": trading_day,
+        }
 
     # config-I6690: box state no longer gates dispatch — it is checked only
     # to tag the run (StartTradingInstance boots the box unconditionally and

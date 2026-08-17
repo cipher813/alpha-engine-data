@@ -97,7 +97,10 @@ HANDLER_TEST_PYTHONPATH="${LAMBDAS_DIR}" \
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
 cp "${SCRIPT_DIR}/execution_digest.py" "${PKG}/execution_digest.py"
-cp "${SCRIPT_DIR}/eod_artifact_verification.py" "${PKG}/eod_artifact_verification.py"
+# Moved up to LAMBDAS_DIR (alpha-engine-config-I7582): eod-backstop now reads the
+# same artifact definition, and two copies of "did the EOD do its job" is the
+# §2.3 one-owner-per-config-fact defect.
+cp "${LAMBDAS_DIR}/eod_artifact_verification.py" "${PKG}/eod_artifact_verification.py"
 cp "${SCRIPT_DIR}/../flow_doctor_telegram.py" "${PKG}/flow_doctor_telegram.py"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")

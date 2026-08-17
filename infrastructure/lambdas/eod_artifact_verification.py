@@ -1,4 +1,16 @@
-"""EOD artifact verification for sf-telegram-notifier (alpha-engine-config#5289).
+"""EOD artifact verification — the fleet definition of "did the EOD do its job".
+
+Originally sf-telegram-notifier-local (alpha-engine-config#5289); lifted to the
+shared lambdas dir on second adoption (alpha-engine-config-I7582, shared-code
+policy). Two consumers, one definition:
+
+  * ``sf-telegram-notifier`` — so a terminal Telegram message cannot read clean
+    when the day's load-bearing artifacts were never written.
+  * ``eod-backstop`` — so the same-day trigger of last resort asks whether the
+    EOD PRODUCED ITS ROW, not merely whether an execution started.
+
+Those two must never drift: a backstop that stands down on a day the notifier
+would call incomplete is the 2026-08-17 gap.
 
 A postclose (EOD) run's terminal SUCCEEDED/DEGRADED Telegram message must not
 read "clean" when the day's load-bearing artifacts were never written — the

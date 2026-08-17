@@ -105,7 +105,18 @@ run_handler_tests() {
     return 1
   fi
 
-  local pypath="${deps_dir}${HANDLER_TEST_PYTHONPATH:+:${HANDLER_TEST_PYTHONPATH}}"
+  # The lambdas dir is ALWAYS on the path (alpha-engine-config-I7582), not only
+  # when a caller remembers to set HANDLER_TEST_PYTHONPATH. It holds the modules
+  # siblings import by bare name — flow_doctor_telegram.py, and now
+  # eod_artifact_verification.py — and it was hand-set in exactly one deploy.sh
+  # and in NO ci.yml step, so a lambda importing a shared sibling passed locally
+  # and ModuleNotFound'd in CI. Same shape as the HANDLER_TEST_TARGETS gap this
+  # helper already absorbed: a mechanism every caller needs, owned here instead
+  # of re-declared per caller. An explicit HANDLER_TEST_PYTHONPATH still appends
+  # after it, so callers that set one keep whatever extra roots they wanted.
+  local lambdas_dir
+  lambdas_dir="$(cd "${script_dir}/.." && pwd)"
+  local pypath="${deps_dir}:${lambdas_dir}${HANDLER_TEST_PYTHONPATH:+:${HANDLER_TEST_PYTHONPATH}}"
 
   local rc=0 one file_rc
   # ${targets[@]+...} guard: bash 3.2 (the macOS system bash every deploy.sh
