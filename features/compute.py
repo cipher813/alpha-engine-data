@@ -761,9 +761,25 @@ def _alt_entry_from_payload(ticker_data: dict) -> dict:
     eps = ticker_data.get("eps_revision") or {}
     consensus = ticker_data.get("analyst_consensus") or {}
     options = ticker_data.get("options_flow") or {}
+    # Neither ``eps_revision.surprise_pct`` nor ``analyst_consensus.surprise_pct``
+    # exist in the producer's payload shape — verified live against
+    # s3://alpha-engine-research/market_data/weekly/2026-08-14/alternative/AAPL.json
+    # (alpha-engine-config-I7569): the real data is
+    # ``analyst_consensus.earnings_surprises``, a list of per-quarter
+    # {date, actual, estimated, surprise_pct} dicts ordered most-recent-first.
+    # The two direct-key lookups above always missed, so ``surprise`` was
+    # always None and every ticker silently fell to the literal 0.0 default.
     surprise = eps.get("surprise_pct")
     if surprise is None:
-        surprise = consensus.get("surprise_pct", 0.0)
+        surprises = consensus.get("earnings_surprises") or []
+        surprise = surprises[0].get("surprise_pct") if surprises else 0.0
+    # registry.py documents earnings_surprise_pct as "decimal pct (_pct
+    # suffix)" (e.g. 0.01 for 1%), but the producer's surprise_pct is a
+    # percent-point number (AAPL 2026-06-30: actual=1.91 vs
+    # estimated=1.9271 -> -0.887% -> emitted as -0.8873, not -0.008873).
+    # Convert here so the feature matches its declared unit convention.
+    if surprise is not None:
+        surprise = surprise / 100.0
     return {
         "earnings": {
             "surprise_pct": surprise,
