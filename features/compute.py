@@ -43,7 +43,10 @@ from features.cross_sectional import apply_factor_zscores
 from features.factor_momentum import DEFAULT_FACTOR_LOADINGS, compute_factor_momentum_feature
 from features.feature_engineer import FEATURES, FEATURE_CFG, MIN_ROWS_FOR_FEATURES, compute_features
 from features.metron_supplemental import compute_metron_supplemental_features, write_metron_supplemental_snapshot
-from features.postflight import assert_no_zero_variance_features
+from features.postflight import (
+    assert_no_zero_variance_features,
+    find_zero_variance_columns,
+)
 from features.private_pack import apply_private_features
 from features.registry import GROUPS, upload_registry
 from features.writer import write_feature_snapshot
@@ -948,11 +951,39 @@ def compute_and_write(
     date_str: str,
     bucket: str = DEFAULT_BUCKET,
     dry_run: bool = False,
+    zero_variance_fatal: bool = True,
 ) -> dict:
     """
     Compute all 53 features for the full universe and write to S3.
 
-    Returns summary dict with counts and timing.
+    Returns summary dict with counts and timing. When the zero-variance
+    postflight finds offending columns, the returned dict carries them under
+    ``zero_variance_columns`` regardless of which mode ran — the caller decides
+    what that means for ITS pipeline.
+
+    ``zero_variance_fatal`` (alpha-engine-config-I7572) selects between the two
+    correct answers to "a feature column is a cross-sectional constant":
+
+    * ``True`` (default — backfill, weekly, any offline recompute): raise
+      BEFORE the snapshot is written. Nothing downstream is waiting on the
+      artifact, so refusing to produce a known-defective one is right.
+
+    * ``False`` (the EOD daily path): write the snapshot, THEN report. On
+      2026-08-17 the fatal form cost far more than the defect it caught. Eight
+      columns were constants; the raise sits before ``write_feature_snapshot``,
+      so the OTHER ~200 columns of that day's snapshot were destroyed too, the
+      collector exited 1, the SF's data-spot workload failed, and
+      ``LaunchPostMarketArcticAppendSpot`` was therefore never reached — so the
+      day's SPY close never landed in ArcticDB, the freshness sentinel stayed
+      on the prior trading day, ``EODReconcile`` was skipped, and the self-heal
+      loop re-ran the same deterministic failure twice before paging
+      ``HealNonConvergent``. A defect in eight analytics columns took the
+      price-append and reconcile path down with it.
+
+      The guard is NOT weakened here and no column is exempted: it runs over
+      exactly the same columns and its verdict is reported at ERROR, carried in
+      the summary, and surfaced by the caller. What changes is only what the
+      verdict is allowed to destroy.
     """
     import boto3
 
@@ -1180,7 +1211,24 @@ def compute_and_write(
     # CONSTRUCTION (e.g. the VIX level), so zero cross-sectional variance
     # there is the expected shape, not a defect.
     _non_macro_features = [f for f in FEATURES if f not in GROUPS.get("macro", ())]
-    assert_no_zero_variance_features(features_df, _non_macro_features)
+    if zero_variance_fatal:
+        assert_no_zero_variance_features(features_df, _non_macro_features)
+        _zero_variance: dict[str, int] = {}
+    else:
+        # Same columns, same predicate — only the consequence differs. See the
+        # zero_variance_fatal note in this function's docstring.
+        _zero_variance = find_zero_variance_columns(features_df, _non_macro_features)
+        if _zero_variance:
+            log.error(
+                "ZERO-VARIANCE feature column(s) detected on the daily path: every "
+                "non-null value is identical across the whole universe, so the column "
+                "passes every null-coverage check and carries zero signal "
+                "(alpha-engine-config-I7539/I7572). The snapshot IS still written — "
+                "the other columns are good and downstream needs them — and this run "
+                "is reported DEGRADED, not failed. Offending columns "
+                "(column: non_null_count): %s",
+                _zero_variance,
+            )
 
     if dry_run:
         log.info(
@@ -1254,7 +1302,13 @@ def compute_and_write(
     t_total = time.time() - t0
 
     result = {
-        "status": "ok",
+        # DEGRADED, not ok: the snapshot was written and every other column in
+        # it is usable, but at least one column is a cross-sectional constant.
+        # A distinct status rather than "ok" so no caller can read a run whose
+        # feature store carries a dead column as a fully clean one
+        # (alpha-engine-config-I7572).
+        "status": "degraded" if _zero_variance else "ok",
+        "zero_variance_columns": _zero_variance,
         "date": date_str,
         "tickers_computed": n_ok,
         "tickers_skipped": n_skip,
