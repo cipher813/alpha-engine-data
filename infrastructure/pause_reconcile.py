@@ -55,10 +55,24 @@ Deleting a ``lifecycle: disabled`` declaration because a manifest entry vanished
 would INFER a decision from a file diff, which is the thing §8.3 forbids and the
 reason I7118 specifies detect-only.
 
+**Three exit codes, and the distinction is the point (alpha-engine-config-I7547).**
+``0`` clean, ``1`` findings, ``2`` the detector could not run. A detect-only job
+that exits 1 on every real finding renders in the GitHub Actions list exactly
+like a job whose credentials expired, and four consecutive ``failure`` runs read
+as a broken job — which is why this correct detector went unread for four days
+running while it reported a champion/challenger arm missing. So the verdict is
+published where it can be read WITHOUT opening the log: a rendered run summary,
+a headline naming the finding count that the workflow uses as its failing job's
+title, and a console row that now distinguishes ``error`` (this check broke)
+from ``attention`` (this check works and found something). The exit code is
+untouched — neutering it would remove the signal instead of making it legible.
+
 Usage:
   ./infrastructure/pause_reconcile.py --check          # exit 1 on any finding
   ./infrastructure/pause_reconcile.py --check --json
   ./infrastructure/pause_reconcile.py --check --publish # + the console row
+  ./infrastructure/pause_reconcile.py --check --markdown "$GITHUB_STEP_SUMMARY" \
+      --github-output "$GITHUB_OUTPUT"                 # + the readable verdict
 """
 
 from __future__ import annotations
@@ -234,6 +248,44 @@ def lambda_invocations(function_name: str, since=None) -> float:
     return sum(float(d.get("Sum") or 0) for d in got.get("Datapoints", []))
 
 
+def is_ephemeral_one_shot(name: str) -> bool:
+    """Does this Scheduler schedule delete itself the moment it fires?
+
+    **The class this exists for (alpha-engine-config-I7547).** Two dispatchers
+    mint one-shot EventBridge Scheduler schedules at RUNTIME to defer their own
+    re-invocation rather than drop the work — ``sf-watch-defer-*``
+    (``sf-watch-spot-dispatcher/index.py``, config#2226) and
+    ``arctic-migration-defer-*`` (``arctic-migration-dispatcher/index.py``),
+    both created with ``ActionAfterCompletion="DELETE"`` and both scoped by
+    their IAM policy to exactly that name prefix. Measured 2026-08-17:
+    ``arctic-migration-defer-0002-g1`` was created at 11:09:22-07:00 by
+    ``alpha-engine-arctic-migration-dispatcher``, was reported by this module as
+    ``undeclared-enabled`` minutes later, and no longer existed by the time it
+    was described.
+
+    Such a schedule is an **in-flight continuation of a component that already
+    has a row**, not standing scheduled work a register failed to account for,
+    and it cannot be declared: its name is generated (``defer-{migration:04d}-
+    g{generation}``, or a digest when that would overflow), so a manifest entry
+    naming a literal would be stale at the next generation and a prefix denylist
+    would be the hand-maintained list §2.2 exists to forbid. The predicate is
+    therefore read off the resource's OWN declared behaviour, which is
+    self-maintaining for any future defer family and never needs editing.
+
+    A schedule that vanished between ``list-schedules`` and here is ``True`` by
+    proof rather than by assumption — self-deletion after firing is the only way
+    that race resolves, and raising on it would make this check fail whenever a
+    dispatcher happened to be deferring while it ran.
+    """
+    try:
+        got = _aws_json(["scheduler", "get-schedule", "--name", name])
+    except RuntimeError as exc:
+        if "ResourceNotFoundException" in str(exc):
+            return True
+        raise
+    return got.get("ActionAfterCompletion") == "DELETE"
+
+
 def trigger_targets(trigger: dict) -> list[str]:
     """The ARNs a trigger invokes. Empty is a legitimate answer (a rule whose
     targets were removed), and is reported as such rather than skipped."""
@@ -331,6 +383,8 @@ def reconcile(
     sf_invoked: set[str] | None = None,
     invocations_of=None,
     alarm_actions_of=None,
+    is_ephemeral=None,
+    noted: list[dict] | None = None,
 ) -> list[dict]:
     """Every disagreement between the three registers.
 
@@ -340,6 +394,14 @@ def reconcile(
     `paused_alarms` direction (alpha-engine-config-I7174): a callable
     `alarm_name -> bool | None` (live `ActionsEnabled`, or `None` if the alarm
     does not exist), defaulting to `automation_pause._alarm_actions_enabled`.
+
+    `is_ephemeral` is `is_ephemeral_one_shot` and is called LAZILY — only for a
+    Scheduler schedule about to be reported `undeclared-enabled`, so a clean run
+    makes zero extra API calls and a run with findings makes at most one per
+    candidate. `noted` is an optional list the caller passes in to receive what
+    was excluded and why; excluding a class silently is how the next reader
+    rediscovers it from scratch, so the exclusion renders even though it never
+    reaches the exit code.
     """
     m = manifest if manifest is not None else ap.load_manifest()
     reg = rows if rows is not None else load_registry()
@@ -349,6 +411,8 @@ def reconcile(
     since = window_start(m)
     invocations_of = invocations_of or (lambda cid: lambda_invocations(cid, since=since))
     alarm_actions_of = alarm_actions_of or ap._alarm_actions_enabled
+    is_ephemeral = is_ephemeral or is_ephemeral_one_shot
+    noted = noted if noted is not None else []
 
     paused = ap.paused_names(m)          # paused + pending
     kept = ap.kept_names(m)
@@ -396,6 +460,25 @@ def reconcile(
                     ),
                 })
             elif name not in kept and row is None:
+                # A self-deleting one-shot is an in-flight continuation of an
+                # already-registered dispatcher, not standing scheduled work —
+                # see `is_ephemeral_one_shot`. Probed only here, so a clean run
+                # pays nothing for it.
+                if t["surface"] == "scheduler" and is_ephemeral(name):
+                    noted.append({
+                        "id": name, "kind": "ephemeral-one-shot",
+                        "detail": (
+                            "live State=ENABLED and named in no register, but it declares "
+                            "ActionAfterCompletion=DELETE — a one-shot minted at runtime by a "
+                            "dispatcher to defer its own re-invocation, which deletes itself "
+                            "when it fires. Its name is generated per run, so no manifest "
+                            "entry could name it and none should: the component to hold "
+                            "accountable is the dispatcher that minted it, which has its own "
+                            "registry row. Excluded from the verdict, listed here so the "
+                            "exclusion is visible rather than rediscovered."
+                        ),
+                    })
+                    continue
                 findings.append({
                     "kind": "undeclared-enabled", "trigger": name, "surface": t["surface"],
                     "detail": (
@@ -551,6 +634,103 @@ def declared_alarm_gaps(manifest: dict | None = None) -> list[dict]:
     ]
 
 
+# ── the verdict, made readable without opening the log (I7547 deliverable 3) ─
+
+def headline(findings: list[dict], checked: int, error: str | None = None) -> str:
+    """One line, ≤ a job title, that says WHICH kind of red this is.
+
+    `pause-reconcile.yml` uses this as the name of the job that carries the
+    non-zero exit, so the Actions run page states the verdict where a reader
+    lands rather than 60 lines into a log. The three forms are deliberately
+    unmistakable at a glance, because the failure this closes is a HUMAN one:
+    four consecutive `failure` runs that were four correct detections got read
+    as one broken job, and the arm they were reporting stayed missing for five
+    days (alpha-engine-config-I7547).
+    """
+    if error is not None:
+        return f"BROKE — the reconciler could not run: {error.splitlines()[0][:120]}"
+    if not findings:
+        return f"clear — {checked} live trigger(s), every one declared"
+    kinds = sorted({f["kind"] for f in findings})
+    return (f"DRIFT — {len(findings)} finding(s) across {checked} live trigger(s): "
+            + ", ".join(kinds))
+
+
+def annotation(findings: list[dict], checked: int, error: str | None = None) -> str:
+    """The same verdict as a GitHub workflow-command annotation.
+
+    Annotations render at the top of the run page and on the check itself, so
+    this is the second surface that carries the count without a log open. A
+    breakage is `::error::` with a different title from a finding, because the
+    two need different responses and GitHub renders both job outcomes as
+    `failure`.
+    """
+    if error is not None:
+        return f"::error title=pause reconcile BROKE::{error.splitlines()[0]}"
+    if not findings:
+        return f"::notice title=pause reconcile clear::{checked} live trigger(s), every one declared"
+    return (f"::error title=pause reconcile: {len(findings)} finding(s)::"
+            + " | ".join(f"[{f['kind']}] {f['surface']}:{f['trigger']}" for f in findings))
+
+
+def render_markdown(findings: list[dict], checked: int, registry_rows: int,
+                    gaps: list[dict] | None = None, noted: list[dict] | None = None,
+                    error: str | None = None) -> str:
+    """The run summary, as Markdown rather than as the raw `--json` blob.
+
+    The workflow previously appended `--json` to `$GITHUB_STEP_SUMMARY`, which
+    (a) renders as an unformatted wall a reader has to parse by eye and (b) cost
+    a SECOND full enumeration of the account, so the summary could disagree with
+    the verdict above it whenever live state moved between the two runs — which
+    is exactly how a self-deleting one-shot schedule appeared in one and not the
+    other. One run, one verdict, rendered.
+    """
+    out: list[str] = ["## Pause reconcile", "", f"**{headline(findings, checked, error)}**", ""]
+    if error is not None:
+        out += ["The three registers were NOT compared. This is a broken detector, not a",
+                "clean fleet — nothing below was graded.", "", "```", error, "```", ""]
+        return "\n".join(out)
+    out += [f"`{checked}` live trigger(s) vs `{registry_rows}` registry row(s).", ""]
+    if findings:
+        out += ["### Findings — these fail the run", "",
+                "| kind | surface | subject |", "|---|---|---|"]
+        out += [f"| `{f['kind']}` | {f['surface']} | `{f['trigger']}` |" for f in findings]
+        out += ["", "<details><summary>What each one means and how to clear it</summary>", ""]
+        out += [f"**`{f['trigger']}`** ({f['kind']}) — {f['detail']}\n" for f in findings]
+        out += ["</details>", ""]
+    else:
+        out += ["No disagreement between the pause manifest, the observability registry "
+                "and live AWS.", ""]
+    for title, rows, why in (
+        ("Declared gaps — alarms deliberately silenced by the pause", gaps or [],
+         "Expected to be non-empty for the duration of the pause. These do NOT affect "
+         "the verdict; they render so a declared gap is never invisible."),
+        ("Excluded — runtime one-shots that delete themselves", noted or [],
+         "Not declarable and not findings. Listed so the exclusion is auditable."),
+    ):
+        if not rows:
+            continue
+        out += [f"### {title}", "", f"_{why}_", ""]
+        out += [f"- `{r['id']}` — {r['detail']}" for r in rows]
+        out += [""]
+    return "\n".join(out)
+
+
+def write_github_output(path: Path, findings: list[dict], checked: int,
+                        error: str | None = None) -> None:
+    """`$GITHUB_OUTPUT` key/values the workflow turns into a job name.
+
+    Multi-line-safe by construction: every value here is a single line, and
+    `headline` truncates the only one that could carry a newline.
+    """
+    verdict = "broken" if error is not None else ("drift" if findings else "clear")
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(f"verdict={verdict}\n")
+        fh.write(f"findings={len(findings)}\n")
+        fh.write(f"checked={checked}\n")
+        fh.write(f"headline={headline(findings, checked, error)}\n")
+
+
 # ── the console row ──────────────────────────────────────────────────────────
 
 def publish(findings: list[dict], checked: int, dry_run: bool = False,
@@ -602,6 +782,37 @@ def publish(findings: list[dict], checked: int, dry_run: bool = False,
     return fcr.emit(env, dry_run=dry_run)
 
 
+def publish_error(error: str, dry_run: bool = False) -> str | None:
+    """The console row for a run that could not compare the registers.
+
+    **The gap this closes (alpha-engine-config-I7547).** The breakage path used
+    to `return 2` before reaching `publish()`, so a check that lost its AWS
+    access wrote NOTHING and the console kept rendering yesterday's row. That is
+    the §8.3 collapse this module exists to detect, committed by the detector
+    itself: "we could not look" was indistinguishable from "we looked and it was
+    the same as yesterday", and it stayed that way until the row aged out.
+
+    `STATUS_ERROR` is a different state from `STATUS_ATTENTION` for the same
+    reason the exit codes differ — `attention` means this check works and the
+    FLEET has drift; `error` means the check is blind and the fleet's state is
+    currently unknown. A blind detector reporting `attention` would understate
+    it; reporting `ok` would be a lie.
+    """
+    from nousergon_lib import fleet_check_result as fcr
+
+    env = fcr.build(
+        check_id=CHECK_ID, label=CHECK_LABEL, status=fcr.STATUS_ERROR,
+        summary=f"could not compare the three registers: {error.splitlines()[0][:400]}",
+        cadence_minutes=CADENCE_MINUTES,
+        findings=[{"id": CHECK_ID, "kind": "reconciler-broken", "detail": error}],
+        deep_link=(
+            "https://github.com/nousergon/nousergon-data/blob/main/"
+            "infrastructure/pause_reconcile.py"
+        ),
+    )
+    return fcr.emit(env, dry_run=dry_run)
+
+
 def main() -> int:
     ap_ = argparse.ArgumentParser(
         description="reconcile the pause manifest, the observability registry and live AWS")
@@ -614,15 +825,33 @@ def main() -> int:
                      help="with --publish, print the envelope instead of writing it")
     ap_.add_argument("--registry-dir", type=Path, default=None,
                      help="read the registry from a local directory instead of S3")
+    ap_.add_argument("--markdown", type=Path, default=None,
+                     help="append the rendered verdict to this file (use $GITHUB_STEP_SUMMARY)")
+    ap_.add_argument("--github-output", type=Path, default=None,
+                     help="append verdict/findings/headline to this file (use $GITHUB_OUTPUT)")
     args = ap_.parse_args()
 
+    noted: list[dict] = []
     try:
         triggers = live_triggers()
         rows = load_registry(args.registry_dir)
-        findings = reconcile(rows=rows, triggers=triggers)
+        findings = reconcile(rows=rows, triggers=triggers, noted=noted)
         gaps = declared_alarm_gaps()
     except RuntimeError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        # The verdict surfaces are written on the BREAKAGE path too, and say
+        # something different from the drift path. A detector whose failure
+        # renders identically to its findings is the whole of I7547 deliverable
+        # 3 — silence here would reproduce it one level down.
+        error = str(exc)
+        print(f"ERROR: {error}", file=sys.stderr)
+        print(annotation([], 0, error))
+        if args.publish:
+            publish_error(error, dry_run=args.dry_run)
+        if args.markdown:
+            with args.markdown.open("a", encoding="utf-8") as fh:
+                fh.write(render_markdown([], 0, 0, error=error) + "\n")
+        if args.github_output:
+            write_github_output(args.github_output, [], 0, error=error)
         return 2
 
     if args.publish:
@@ -631,9 +860,18 @@ def main() -> int:
         # is unaffected either way.
         publish(findings, checked=len(triggers), dry_run=args.dry_run, declared_gaps=gaps)
 
+    print(annotation(findings, len(triggers)))
+    if args.markdown:
+        with args.markdown.open("a", encoding="utf-8") as fh:
+            fh.write(render_markdown(findings, len(triggers), len(rows),
+                                     gaps=gaps, noted=noted) + "\n")
+    if args.github_output:
+        write_github_output(args.github_output, findings, len(triggers))
+
     if args.json:
         print(json.dumps({"checked": len(triggers), "registry_rows": len(rows),
-                          "findings": findings, "declared_alarm_gaps": gaps}, indent=2))
+                          "findings": findings, "declared_alarm_gaps": gaps,
+                          "excluded": noted}, indent=2))
     else:
         print(f"pause reconcile — {len(triggers)} live trigger(s) vs "
               f"{len(rows)} registry row(s), {len(gaps)} alarm(s) declared silenced")
@@ -648,6 +886,9 @@ def main() -> int:
         for g in gaps:
             print(f"  · [declared gap] {g['id']}")
             print(f"      {g['detail']}")
+        for n in noted:
+            print(f"  · [excluded: {n['kind']}] {n['id']}")
+            print(f"      {n['detail']}")
     return 1 if findings else 0
 
 

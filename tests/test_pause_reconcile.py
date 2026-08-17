@@ -374,3 +374,185 @@ def test_publish_renders_declared_gaps_without_forcing_attention_status(mod, mon
     mod.publish([], checked=3, declared_gaps=[gap])
     assert captured["status"] == "ok", "a declared gap alone must not flip status to attention"
     assert gap in captured["findings"], "the declared gap must still render on the console row"
+
+
+# ── alpha-engine-config-I7547: runtime one-shots, and a legible verdict ──────
+
+def test_a_self_deleting_one_shot_is_not_undeclared_scheduled_work(mod):
+    """Induced: the exact resource that produced a false finding on 2026-08-17.
+
+    `alpha-engine-arctic-migration-dispatcher` minted
+    `arctic-migration-defer-0002-g1` at 11:09:22-07:00 to defer its own
+    re-invocation; the reconciler reported it `undeclared-enabled` minutes
+    later, and by the time it was described it no longer existed. Its name is
+    generated per run, so no manifest entry could ever name it.
+    """
+    noted: list[dict] = []
+    findings = mod.reconcile(
+        manifest=_manifest(), rows={"other": _row("other")},
+        triggers=[{"surface": "scheduler", "name": "arctic-migration-defer-0002-g1",
+                   "state": "ENABLED"}],
+        targets_of=lambda t: [], sf_invoked=set(), invocations_of=lambda cid: 0,
+        alarm_actions_of=lambda n: None,
+        is_ephemeral=lambda name: True, noted=noted,
+    )
+    assert findings == []
+    assert [(n["kind"], n["id"]) for n in noted] == [
+        ("ephemeral-one-shot", "arctic-migration-defer-0002-g1")]
+
+
+def test_a_standing_schedule_is_still_a_finding(mod):
+    """The exclusion is scoped to self-deleting one-shots, not to Scheduler.
+
+    Without this, `is_ephemeral` returning True for everything would silently
+    delete a whole finding class — the failure mode an exclusion always has.
+    """
+    findings = mod.reconcile(
+        manifest=_manifest(), rows={},
+        triggers=[{"surface": "scheduler", "name": "some-daily-job", "state": "ENABLED"}],
+        targets_of=lambda t: [], sf_invoked=set(), invocations_of=lambda cid: 0,
+        alarm_actions_of=lambda n: None,
+        is_ephemeral=lambda name: False,
+    )
+    assert [(f["kind"], f["trigger"]) for f in findings] == [
+        ("undeclared-enabled", "some-daily-job")]
+
+
+def test_the_ephemeral_probe_is_not_called_on_a_clean_run(mod):
+    """It costs one `get-schedule` per candidate, and a clean run has none."""
+    calls: list[str] = []
+    mod.reconcile(
+        manifest=_manifest(kept={"kept-job": "ruled on"}), rows={},
+        triggers=[{"surface": "scheduler", "name": "kept-job", "state": "ENABLED"}],
+        targets_of=lambda t: [], sf_invoked=set(), invocations_of=lambda cid: 0,
+        alarm_actions_of=lambda n: None,
+        is_ephemeral=lambda name: calls.append(name) or True,
+    )
+    assert calls == []
+
+
+def test_a_schedule_that_vanished_mid_run_is_proof_it_was_a_one_shot(mod, monkeypatch):
+    """The race IS the evidence, so it must not raise. `list-schedules` saw it
+    and `get-schedule` did not, which only self-deletion-after-firing explains;
+    raising would turn any concurrent deferral into a broken detector."""
+    def _boom(args):
+        raise RuntimeError("aws scheduler get-schedule: An error occurred "
+                           "(ResourceNotFoundException) when calling the GetSchedule operation")
+    monkeypatch.setattr(mod, "_aws_json", _boom)
+    assert mod.is_ephemeral_one_shot("sf-watch-defer-abc-g1") is True
+
+
+def test_a_real_scheduler_failure_still_raises(mod, monkeypatch):
+    """Only ResourceNotFound is evidence. An AccessDenied read as `ephemeral`
+    would let this check grade itself green by losing its own access — the
+    posture `_aws_json` already takes."""
+    def _boom(args):
+        raise RuntimeError("aws scheduler get-schedule: AccessDeniedException")
+    monkeypatch.setattr(mod, "_aws_json", _boom)
+    with pytest.raises(RuntimeError, match="AccessDenied"):
+        mod.is_ephemeral_one_shot("sf-watch-defer-abc-g1")
+
+
+def test_the_headline_distinguishes_drift_from_a_broken_detector(mod):
+    """I7547 deliverable 3. GitHub renders both as `failure`; these do not.
+
+    The literal failure this closes: four consecutive `failure` runs were four
+    CORRECT detections and were read as one broken job, so a champion/challenger
+    arm stayed missing five days.
+    """
+    drift = mod.headline([{"kind": "undeclared-dark", "trigger": "x", "surface": "events"}], 72)
+    clear = mod.headline([], 72)
+    broke = mod.headline([], 0, error="AccessDenied listing rules")
+    assert drift.startswith("DRIFT") and "1 finding(s)" in drift and "72" in drift
+    assert clear.startswith("clear") and "72" in clear
+    assert broke.startswith("BROKE") and "AccessDenied" in broke
+    assert len({drift, clear, broke}) == 3
+
+
+def test_the_headline_is_one_line_so_it_can_be_a_job_name(mod):
+    """`pause-reconcile.yml` uses it as `jobs.verdict.name`, and a newline there
+    would truncate the verdict to nothing."""
+    long_error = "line one of the failure\n" + "x" * 5000
+    for text in (mod.headline([], 72), mod.headline([], 0, error=long_error),
+                 mod.headline([{"kind": "k", "trigger": "t", "surface": "s"}], 1)):
+        assert "\n" not in text and text
+
+
+def test_the_workflow_fails_the_run_on_findings(mod):
+    """The exit code IS the signal. I7547 says so in as many words: do not fix a
+    noisy detector by making it exit 0."""
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert 'if [ "$VERDICT" != "clear" ]; then' in text and "exit 1" in text, (
+        "the verdict job no longer fails on drift — a detect-only check that "
+        "cannot go red reports nothing at all"
+    )
+
+
+def test_the_workflow_names_the_failing_job_after_the_verdict(mod):
+    """The surface a reader lands on. `jobs.<id>.name` accepts the `needs`
+    context, which is what carries the finding count onto the run page."""
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert "name: ${{ needs.reconcile.outputs.headline }}" in text
+    assert "headline: ${{ steps.check.outputs.headline }}" in text, (
+        "the reconcile job does not export the headline, so the verdict job's "
+        "name resolves to empty and the count is invisible again"
+    )
+
+
+def test_a_breakage_publishes_an_error_row_rather_than_nothing(mod, monkeypatch):
+    """Before I7547 the exit-2 path returned before `publish()`, so a check that
+    lost its AWS access wrote NOTHING and the console kept rendering yesterday's
+    row — the §8.3 collapse this module exists to detect, committed by the
+    detector itself."""
+    captured: dict = {}
+    from nousergon_lib import fleet_check_result as fcr
+    monkeypatch.setattr(fcr, "emit", lambda e, dry_run=False: captured.update(e))
+    mod.publish_error("AccessDenied listing rules")
+    assert captured["status"] == fcr.STATUS_ERROR != fcr.STATUS_ATTENTION
+    assert "AccessDenied" in captured["summary"]
+    assert captured["check_id"] == mod.CHECK_ID
+
+
+def test_the_rendered_verdict_states_that_nothing_was_graded_on_a_breakage(mod):
+    """A broken run's summary must not read like a clean one. `0 findings` is
+    literally true and completely misleading when the comparison never ran."""
+    broken = mod.render_markdown([], 0, 0, error="AccessDenied")
+    clean = mod.render_markdown([], 72, 210)
+    assert "NOT compared" in broken and "AccessDenied" in broken
+    assert "No disagreement" in clean and "NOT compared" not in clean
+
+
+def test_the_rendered_verdict_lists_findings_and_the_excluded_separately(mod):
+    text = mod.render_markdown(
+        [{"kind": "undeclared-dark", "trigger": "ghost", "surface": "events",
+          "detail": "nobody declared it"}],
+        72, 210,
+        gaps=[{"id": "an-alarm", "kind": "declared-silenced-alarm", "detail": "silenced"}],
+        noted=[{"id": "defer-0002-g1", "kind": "ephemeral-one-shot", "detail": "one-shot"}],
+    )
+    assert "these fail the run" in text
+    assert "`ghost`" in text and "`an-alarm`" in text and "`defer-0002-g1`" in text
+    assert text.index("Findings") < text.index("Declared gaps") < text.index("Excluded")
+
+
+def test_github_output_is_written_as_single_line_key_values(mod, tmp_path):
+    out = tmp_path / "gh_output"
+    mod.write_github_output(out, [{"kind": "k", "trigger": "t", "surface": "s"}], 72)
+    lines = out.read_text(encoding="utf-8").strip().splitlines()
+    kv = dict(line.split("=", 1) for line in lines)
+    assert len(lines) == 4 and kv["verdict"] == "drift" and kv["findings"] == "1"
+    assert kv["checked"] == "72" and kv["headline"].startswith("DRIFT")
+    mod.write_github_output(out, [], 72)
+    assert "verdict=clear" in out.read_text(encoding="utf-8")
+
+
+def test_the_run_summary_is_written_by_the_same_invocation_as_the_verdict(mod):
+    """The old workflow ran the whole check a SECOND time to fill the summary,
+    which doubled a ~100-call account enumeration and let the two disagree
+    whenever live state moved between them — which is how a runtime-minted
+    one-shot appeared in one and not the other."""
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert text.count("pause_reconcile.py --check") == 1, (
+        "the reconciler runs more than once per workflow run; one run, one verdict"
+    )
+    assert "--markdown" in text and "--github-output" in text
