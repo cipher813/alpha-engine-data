@@ -24,7 +24,7 @@ import os
 import sys
 import time
 import types
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -2578,9 +2578,11 @@ def test_loader_parses_producer_trigger_and_drops_malformed(fake_s3):
     assert {s.artifact_id for s in specs} == {
         "paused_producer", "scheduler_producer", "malformed_producer", "no_producer",
     }
+    # Values are TUPLES since config-I7509 — a row may declare several
+    # producers and is suppressed only when every one of them is off.
     assert producer == {
-        "paused_producer": "events:alpha-research-thinktank-daily",
-        "scheduler_producer": "scheduler:alpha-engine-alert-drain-0400utc",
+        "paused_producer": ("events:alpha-research-thinktank-daily",),
+        "scheduler_producer": ("scheduler:alpha-engine-alert-drain-0400utc",),
     }
 
 
@@ -3443,3 +3445,267 @@ def test_lookup_is_bounded_by_wall_clock_not_only_query_count(monkeypatch):
     assert res["degraded"] is True
     assert res["degraded_reason"] == "lookup_time_budget_exhausted"
     assert state["queries"] == 0
+
+
+# ── GitHub Actions producer surface (alpha-engine-config-I7509) ─────────────
+#
+# Regression set for the 2026-08-12 miss: ten GHA workflows were disabled under
+# Brian's groomer/Overseer deactivation ruling (I6984) while the freshness
+# monitor could only see EventBridge, so `groom_flow_metrics` and
+# `pr_resting_state_trend` escalated warning→critical and paged him for days
+# about producers that were off on purpose.
+
+def _keyed_s3(objects: dict[str, bytes]):
+    """S3 fake that answers per KEY. `fake_s3` returns one body for every key,
+    which cannot express 'inventory present, ownership absent'."""
+    client = mock.Mock()
+    client._put_calls: list[tuple[str, str, bytes]] = []
+
+    def _get(*, Bucket, Key):
+        if Key not in objects:
+            raise _ClientError404()
+        return {"Body": io.BytesIO(objects[Key])}
+
+    def _put(*, Bucket, Key, Body, **kwargs):
+        client._put_calls.append((Bucket, Key, Body))
+        return {"ETag": '"deadbeef"'}
+
+    client.get_object.side_effect = _get
+    client.put_object.side_effect = _put
+    return client
+
+
+def _gha_inventory(now, workflows, *, complete=True, age_hours=1.0):
+    import index
+    stamped = now - timedelta(hours=age_hours)
+    return {index.GHA_WORKFLOW_STATE_KEY: json.dumps({
+        "generated_at": stamped.isoformat(),
+        "complete": complete,
+        "workflows": {k: {"state": v} for k, v in workflows.items()},
+    }).encode()}
+
+
+def test_parse_producer_trigger_accepts_gha_and_rejects_partial_names():
+    import index
+    assert index.parse_producer_trigger(
+        "gha:nousergon/alpha-engine-config/flow-metrics.yml"
+    ) == ("gha", "nousergon/alpha-engine-config/flow-metrics.yml")
+    # owner/repo/workflow or nothing — a two-segment value is ambiguous, and
+    # guessing would suppress against a workflow nobody named.
+    for bad in ("gha:alpha-engine-config/flow-metrics.yml", "gha:flow-metrics.yml",
+                "gha:nousergon//flow-metrics.yml", "gha:a/b/c/d", "gha:"):
+        assert index.parse_producer_trigger(bad) is None
+
+
+def test_gha_disabled_manually_suppresses_and_inactivity_does_not(fixed_now):
+    """`disabled_manually` is our ruling and suppresses. `disabled_inactivity`
+    is GitHub switching a producer off — that is the fault I7370 exists for,
+    and suppressing it would convert an open finding into a blind spot."""
+    import index
+    trig = "gha:nousergon/alpha-engine-config/flow-metrics.yml"
+    name = "nousergon/alpha-engine-config/flow-metrics.yml"
+
+    s3 = _keyed_s3(_gha_inventory(fixed_now, {name: "disabled_manually"}))
+    out = index.apply_producer_suppression(s3, {"groom_flow_metrics": trig}, fixed_now)
+    assert out["groom_flow_metrics"]["suppressed"] is True
+    assert "disabled_manually" in out["groom_flow_metrics"]["reason"]
+
+    s3 = _keyed_s3(_gha_inventory(fixed_now, {name: "disabled_inactivity"}))
+    assert index.apply_producer_suppression(
+        s3, {"groom_flow_metrics": trig}, fixed_now) == {}
+
+    s3 = _keyed_s3(_gha_inventory(fixed_now, {name: "active"}))
+    assert index.apply_producer_suppression(
+        s3, {"groom_flow_metrics": trig}, fixed_now) == {}
+
+
+@pytest.mark.parametrize("objects_kwargs, why", [
+    (dict(age_hours=48.0), "stale inventory — its own producer may be off"),
+    (dict(complete=False), "partial listing cannot prove a workflow is enabled"),
+])
+def test_gha_inventory_fails_toward_paging(fixed_now, objects_kwargs, why):
+    import index
+    trig = "gha:nousergon/alpha-engine-config/flow-metrics.yml"
+    name = "nousergon/alpha-engine-config/flow-metrics.yml"
+    s3 = _keyed_s3(_gha_inventory(
+        fixed_now, {name: "disabled_manually"}, **objects_kwargs))
+    assert index.apply_producer_suppression(s3, {"a": trig}, fixed_now) == {}, why
+
+
+def test_gha_inventory_absent_or_unstamped_fails_toward_paging(fixed_now):
+    """Absent, malformed, and undateable all resolve nothing. This file can
+    only ever REMOVE a page, so refusing to read it is always the safe side."""
+    import index
+    trig = "gha:nousergon/alpha-engine-config/flow-metrics.yml"
+    name = "nousergon/alpha-engine-config/flow-metrics.yml"
+    assert index.apply_producer_suppression(
+        _keyed_s3({}), {"a": trig}, fixed_now) == {}
+    assert index.apply_producer_suppression(
+        _keyed_s3({index.GHA_WORKFLOW_STATE_KEY: b"not json"}),
+        {"a": trig}, fixed_now) == {}
+    unstamped = {index.GHA_WORKFLOW_STATE_KEY: json.dumps(
+        {"complete": True, "workflows": {name: "disabled_manually"}}).encode()}
+    assert index.apply_producer_suppression(
+        _keyed_s3(unstamped), {"a": trig}, fixed_now) == {}
+
+
+def test_open_owning_item_holds_suppression_past_the_expiry_clock(
+    fixed_now, monkeypatch,
+):
+    """I6984 is an open P1 carrying the restore commands and a queued ruling.
+    Paging every 30 minutes for eight weeks about a decision already written
+    down is noise with a tracking number — ownership extends the clock."""
+    import index
+    monkeypatch.setattr(index, "PRODUCER_SUPPRESSION_MAX_DAYS", 14)
+    monkeypatch.setattr(
+        index, "_load_producer_disabled_since",
+        lambda _s3: {"events:r": "2026-05-01"},   # 29 days before fixed_now
+    )
+    objects = {index.PAUSE_OWNERSHIP_KEY: json.dumps({
+        "generated_at": (fixed_now - timedelta(hours=2)).isoformat(),
+        "owners": {"events:r": {
+            "item": "alpha-engine-config#6984",
+            "url": "https://github.com/nousergon/alpha-engine-config/issues/6984",
+            "state": "open",
+        }},
+    }).encode()}
+    out = index.apply_producer_suppression(
+        _keyed_s3(objects), {"a": "events:r"}, fixed_now,
+        events_client=_events("DISABLED"),
+    )
+    assert out["a"]["days_disabled"] == 29
+    assert out["a"]["suppressed"] is True
+    assert out["a"]["pause_owner"] == "alpha-engine-config#6984"
+
+
+@pytest.mark.parametrize("owner_state, age_hours, expected", [
+    ("closed", 2, False),   # closed item ⇒ the pause is a latch again (I6828)
+    ("open", 200, False),   # stale ownership map ⇒ no extension
+])
+def test_ownership_extension_is_narrow(
+    fixed_now, monkeypatch, owner_state, age_hours, expected,
+):
+    import index
+    monkeypatch.setattr(index, "PRODUCER_SUPPRESSION_MAX_DAYS", 14)
+    monkeypatch.setattr(
+        index, "_load_producer_disabled_since",
+        lambda _s3: {"events:r": "2026-05-01"},
+    )
+    objects = {index.PAUSE_OWNERSHIP_KEY: json.dumps({
+        "generated_at": (fixed_now - timedelta(hours=age_hours)).isoformat(),
+        "owners": {"events:r": {"item": "x#1", "state": owner_state}},
+    }).encode()}
+    out = index.apply_producer_suppression(
+        _keyed_s3(objects), {"a": "events:r"}, fixed_now,
+        events_client=_events("DISABLED"),
+    )
+    assert out["a"]["suppressed"] is expected
+
+
+def test_ownership_never_creates_a_suppression_on_an_enabled_producer(
+    fixed_now, monkeypatch,
+):
+    """Ownership only ever EXTENDS an existing live-confirmed pause. It must
+    never be able to silence a row whose producer is running and failing."""
+    import index
+    objects = {index.PAUSE_OWNERSHIP_KEY: json.dumps({
+        "generated_at": fixed_now.isoformat(),
+        "owners": {"events:r": {"item": "x#1", "state": "open"}},
+    }).encode()}
+    assert index.apply_producer_suppression(
+        _keyed_s3(objects), {"a": "events:r"}, fixed_now,
+        events_client=_events("ENABLED"),
+    ) == {}
+
+
+def test_multi_trigger_row_suppresses_only_when_every_producer_is_off(
+    fixed_now, monkeypatch,
+):
+    """`groom_status_store_groom` is written by whichever of four schedules
+    fires. Suppressing while three are still live would silence a row the
+    fleet genuinely expects to be written."""
+    import index
+    states = {"scheduler:a": "DISABLED", "scheduler:b": "ENABLED"}
+
+    def _fake_resolve(triggers, events_client=None, scheduler_client=None,
+                      gha_states=None):
+        return {t: f"{t} is DISABLED" for t in triggers
+                if states.get(t) == "DISABLED"}
+
+    monkeypatch.setattr(index, "resolve_disabled_producers", _fake_resolve)
+    s3 = _keyed_s3({})
+    assert index.apply_producer_suppression(
+        s3, {"groom": ("scheduler:a", "scheduler:b")}, fixed_now) == {}
+
+    states["scheduler:b"] = "DISABLED"
+    out = index.apply_producer_suppression(
+        s3, {"groom": ("scheduler:a", "scheduler:b")}, fixed_now)
+    assert out["groom"]["suppressed"] is True
+    assert out["groom"]["trigger"] == "scheduler:a, scheduler:b"
+
+
+def test_multi_trigger_clock_runs_from_the_most_recent_switch_off(
+    fixed_now, monkeypatch,
+):
+    """A row that lost its last live producer yesterday has been quiet for a
+    day, not for the month its first producer has been off."""
+    import index
+    monkeypatch.setattr(
+        index, "resolve_disabled_producers",
+        lambda triggers, *_a, **_kw: {t: "off" for t in triggers},
+    )
+    monkeypatch.setattr(
+        index, "_load_producer_disabled_since",
+        lambda _s3: {"scheduler:a": "2026-05-01", "scheduler:b": "2026-05-29"},
+    )
+    out = index.apply_producer_suppression(
+        _keyed_s3({}), {"groom": ("scheduler:a", "scheduler:b")}, fixed_now)
+    assert out["groom"]["disabled_since"] == "2026-05-29"
+    assert out["groom"]["days_disabled"] == 1
+
+
+def test_partially_malformed_trigger_list_is_dropped_whole(fake_s3, caplog):
+    """Keeping the half that parsed would suppress the row on fewer producers
+    than it declares — quieter than the registry says, which is the one
+    direction this field may never fail in."""
+    import index
+    fake_s3._registry_body = (
+        b"artifacts:\n"
+        b"  - artifact_id: half_bad\n"
+        b"    s3_bucket: alpha-engine-research\n"
+        b"    s3_key_template: k\n"
+        b"    cadence: continuous\n"
+        b"    interval_minutes: 60\n"
+        b"    sla_minutes_after_cron: 60\n"
+        b"    severity: warning\n"
+        b"    owner_repo: r\n"
+        b"    created_at: 2026-01-01\n"
+        b"    producer_trigger:\n"
+        b"      - scheduler:good\n"
+        b"      - not-a-trigger\n"
+    )
+    _s, _r, _a, _e, _rem, producer = index.load_registry_with_recovery(
+        fake_s3, "b", "k"
+    )
+    assert producer == {}
+
+
+def test_gha_pause_age_comes_from_githubs_own_switch_off_date(fixed_now):
+    """The inventory carries GitHub's `updated_at`. Using this Lambda's
+    first-observation instead would date every pause from whenever the monitor
+    happened to look, and the latch sweep reading the same inventory would
+    then disagree with it about how old the pause is."""
+    import index
+    trig = "gha:nousergon/alpha-engine-config/merge-drain.yml"
+    name = "nousergon/alpha-engine-config/merge-drain.yml"
+    objects = {index.GHA_WORKFLOW_STATE_KEY: json.dumps({
+        "generated_at": (fixed_now - timedelta(hours=1)).isoformat(),
+        "complete": True,
+        "workflows": {name: {
+            "state": "disabled_manually", "disabled_since": "2026-05-01",
+        }},
+    }).encode()}
+    out = index.apply_producer_suppression(
+        _keyed_s3(objects), {"pr_resting_state_trend": trig}, fixed_now)
+    assert out["pr_resting_state_trend"]["disabled_since"] == "2026-05-01"
+    assert out["pr_resting_state_trend"]["days_disabled"] == 29
