@@ -40,6 +40,7 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 FUNCTION_NAME="alpha-engine-eod-backstop"
 ROLE_NAME="alpha-engine-eod-backstop-role"
@@ -106,6 +107,12 @@ python3 -m pip install \
   -r "${SCRIPT_DIR}/requirements.txt"
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
+# alpha-engine-config-I7582: the backstop's dispatch predicate is "did the EOD
+# produce its artifacts", read from the SAME module sf-telegram-notifier uses to
+# decide whether a terminal message may read clean. One definition, two
+# consumers — a backstop that stands down on a day the notifier would call
+# incomplete is the 2026-08-17 gap.
+cp "${LAMBDAS_DIR}/eod_artifact_verification.py" "${PKG}/eod_artifact_verification.py"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
