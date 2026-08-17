@@ -14,7 +14,9 @@
     {
       "Sid": "DescribeTradingBox",
       "Effect": "Allow",
-      "Action": ["ec2:DescribeInstances"],
+      "Action": [
+        "ec2:DescribeInstances"
+      ],
       "Resource": "*"
     },
     {
@@ -25,6 +27,33 @@
         "states:StartExecution"
       ],
       "Resource": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
+    },
+    {
+      "Sid": "EodPnlRowRead",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research/trades/eod_pnl.csv",
+        "arn:aws:s3:::alpha-engine-research/_sf_completion/ne-postclose-trading-pipeline/*"
+      ]
+    },
+    {
+      "Sid": "EodPnlRowListBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "trades/*",
+            "_sf_completion/ne-postclose-trading-pipeline/*"
+          ]
+        }
+      }
     }
   ]
 }
