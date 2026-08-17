@@ -168,12 +168,60 @@ spot_launch() {
   echo "  S3 staging: ${_S3_STAGING}/"
 }
 
+# ── Staging teardown (config-I7442, superseding config-I7396) ───────────────
+# The staging prefix holds the ONLY full copy of a stage's stdout/stderr:
+# run_ssm() below points SSM's --output-key-prefix at
+# "${_S3_STAGING_PREFIX}/ssm-output", and GetCommandInvocation returns just
+# the first 24 KB — on any long-running stage the failing tail exists
+# nowhere else. Measured 2026-08-15 (config-I7396 → I7442): the
+# PredictorBacktest stage died after ~4h, printed an error naming that exact
+# S3 prefix as "the full remote log", and the SAME exit path then ran
+# `aws s3 rm "$S3_STAGING" --recursive` four lines later — the prefix was
+# empty by the time anyone read the message. That defect was fixed locally
+# in crucible-backtester (#675) with a retain-on-failure branch, but
+# mirroring 55 lines of bash into every sibling `_spot_common.sh`/monolith
+# is exactly what policy-shared-code forbids at second adoption. This now
+# goes through `krepis.spot_evidence teardown`, the one chokepoint every
+# launcher in the fleet calls: it copies the staging prefix to
+# `_spot_evidence/<slug>/<date>/<run-id>/` FIRST and deletes staging only if
+# that copy succeeded (a clean run deletes with nothing retained, so no
+# green run accrues storage), and sweeps stale `tmp/spot_<slug>/` and
+# `_spot_evidence/<slug>/` prefixes on every teardown.
+teardown_staging() {
+  local _exit_code="$1"
+  if [ -z "${_S3_STAGING:-}" ]; then
+    return 0
+  fi
+  if "$LIB_PYTHON" -m krepis.spot_evidence teardown \
+      --staging "$_S3_STAGING" \
+      --slug "$_SPOT_NAME" \
+      --exit-code "$_exit_code"; then
+    return 0
+  fi
+  # The chokepoint is unreachable on this box — a krepis pin older than the
+  # release carrying `spot_evidence`, or a broken interpreter. RETAIN rather
+  # than fall back to `aws s3 rm`: an unswept prefix is a cost bounded by the
+  # next teardown's sweep, whereas re-deleting here would repeat I7442. This
+  # is also what makes the merge order safe — this change is correct on a
+  # box whose krepis pin has not yet been bumped. `return 0` always: a
+  # janitor that changes the trap's own exit status would mask the
+  # workload's real failure.
+  echo "  spot_evidence: chokepoint unavailable via $LIB_PYTHON — S3 staging RETAINED at $_S3_STAGING/ (not deleted)" >&2
+  echo "    Full stage stdout/stderr: $_S3_STAGING/ssm-output/" >&2
+  return 0
+}
+
 # ── Cleanup (instance + S3 staging) ──────────────────────────────────────────
 
 cleanup() {
+  local _exit_code="${1:-0}"
   local _keep="${KEEP_INSTANCE:-0}"
   if [ "$_keep" = "1" ]; then
-    [ -n "$_S3_STAGING" ] && aws s3 rm "$_S3_STAGING" --recursive --quiet 2>/dev/null || true
+    # launch-only handoff: no workload has run on this box — the caller's
+    # own downstream stage is what will succeed or fail later. Evidence
+    # teardown here must not read a workload exit status that was never
+    # evaluated (config-I7442).
+    teardown_staging 0
     echo "  launch-only: instance $_INSTANCE_ID left running (SF-owned); staging cleaned."
     return 0
   fi
@@ -182,7 +230,7 @@ cleanup() {
     echo "==> Terminating spot instance $_INSTANCE_ID..."
     aws ec2 terminate-instances --instance-ids "$_INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true
   fi
-  [ -n "$_S3_STAGING" ] && aws s3 rm "$_S3_STAGING" --recursive --quiet 2>/dev/null || true
+  teardown_staging "$_exit_code"
   [ -n "$_INSTANCE_ID" ] && echo "  Instance terminated; S3 staging cleaned."
   return 0
 }
@@ -219,7 +267,7 @@ on_exit() {
   if [ "$rc" -ne 0 ]; then
     reason="$(_spot_failure_reason "$rc")" || reason=""
   fi
-  cleanup
+  cleanup "$rc"
   if [ "$rc" -ne 0 ] && [ -n "$reason" ] && [ "$SPOT_ATTEMPT" -lt "$MAX_SPOT_ATTEMPTS" ]; then
     aws cloudwatch put-metric-data \
       --namespace "AlphaEngine" \
@@ -274,6 +322,7 @@ run_ssm() {
     --region "$AWS_REGION" \
     --diagnostics-bucket "$S3_BUCKET" \
     --diagnostics-prefix "_spot_diagnostics/ae-data" \
+    --resource-limit "instance-types=${INSTANCE_TYPES}" \
     --script-stdin
 }
 
