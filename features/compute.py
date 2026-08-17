@@ -260,6 +260,20 @@ def _load_delta_from_daily_closes(
             # ``_apply_daily_delta`` so downstream ArcticDB writes can
             # tag each row with where its values came from.
             src_raw = row.get("source")
+            # VWAP (alpha-engine-config-I7569): daily_closes.parquet DOES
+            # carry a VWAP column (collectors/daily_closes.py schema), but
+            # this dict was never including it, so pd.concat in
+            # _apply_daily_delta unioned it in as NaN for every delta-merged
+            # (i.e. every "latest") row, every ticker, every day. That NaN
+            # fed feature_engineer.compute_features's
+            # ``(Close - VWAP) / VWAP`` as NaN, which the FEATURES-loop
+            # fallback below (`row[f] = ... else 0.0`) then silently turned
+            # into a universe-wide constant 0.0 for vwap_divergence_pct —
+            # the same fallback line I7539 already implicated once. VWAP is
+            # genuinely None on yfinance-fallback/FRED rows (no true
+            # volume-weighted price to report) — preserved as NaN, not
+            # backfilled, so those days still correctly neutral-default.
+            vwap_raw = row.get("VWAP")
             ticker_rows[ticker].append({
                 "date":   pd.Timestamp(d),
                 "Open":   float(row.get("Open", np.nan)),
@@ -267,6 +281,7 @@ def _load_delta_from_daily_closes(
                 "Low":    float(row.get("Low", np.nan)),
                 "Close":  float(row.get("Close", np.nan)),
                 "Volume": int(row.get("Volume", 0)),
+                "VWAP":   float(vwap_raw) if pd.notna(vwap_raw) else np.nan,
                 "source": str(src_raw) if pd.notna(src_raw) else "unknown",
             })
 
@@ -410,7 +425,13 @@ def _apply_daily_delta(
     n_updated = 0
 
     for ticker, slim_df in list(price_data.items()):
-        base_cols = ["Open", "High", "Low", "Close", "Volume"]
+        # VWAP included (alpha-engine-config-I7569): this whitelist used to
+        # silently drop VWAP off the cache side even when the slim frame
+        # carried it, and the delta_df whitelist below dropped it off every
+        # delta (i.e. "latest") row unconditionally — the second, decisive
+        # gate that zeroed vwap_divergence_pct universe-wide even after
+        # _load_delta_from_daily_closes started returning it.
+        base_cols = ["Open", "High", "Low", "Close", "Volume", "VWAP"]
         base = slim_df[[c for c in base_cols if c in slim_df.columns]].copy()
         # Tag pre-delta rows as yfinance-origin (price_cache parquets are
         # yfinance-sourced) so the merged frame carries provenance per
@@ -429,7 +450,10 @@ def _apply_daily_delta(
         # Build delta DataFrame with capitalized columns (matches slim cache schema)
         delta_df = pd.DataFrame(
             [
-                {k: r[k] for k in ["Open", "High", "Low", "Close", "Volume"]}
+                {
+                    **{k: r[k] for k in ["Open", "High", "Low", "Close", "Volume"]},
+                    "VWAP": r.get("VWAP", np.nan),
+                }
                 for r in delta
             ],
             index=pd.DatetimeIndex([r["date"] for r in delta]),
@@ -609,9 +633,16 @@ def _extract_macro(
         if source is not None and "Close" in source.columns:
             macro[key] = source["Close"].dropna()
 
-    # Sector ETFs
+    # Sector ETFs (XL*) + sub-sector benchmark ETFs (config#934: SMH/IGV/…,
+    # collectors/prices.py::_SUB_SECTOR_ETFS — the "XL" prefix test can't
+    # catch them, alpha-engine-config-I7569). Both are collected daily
+    # alongside the stock universe (excluded from per-ticker feature
+    # computation via _SKIP_TICKERS) but were never surfaced into `macro`,
+    # so `sub_sector_etf_series = macro.get(sub_sector_etf_sym)` resolved to
+    # None for every ticker and sub_sector_vs_benchmark_* neutral-defaulted
+    # for the whole universe.
     for stem, df in slim_data.items():
-        if stem.startswith("XL") and "Close" in df.columns:
+        if (stem.startswith("XL") or stem in _SUB_SECTOR_ETFS) and "Close" in df.columns:
             source = price_data.get(stem) if stem in price_data else df
             macro[stem] = source["Close"].dropna()
 
@@ -764,9 +795,25 @@ def _alt_entry_from_payload(ticker_data: dict) -> dict:
     eps = ticker_data.get("eps_revision") or {}
     consensus = ticker_data.get("analyst_consensus") or {}
     options = ticker_data.get("options_flow") or {}
+    # Neither ``eps_revision.surprise_pct`` nor ``analyst_consensus.surprise_pct``
+    # exist in the producer's payload shape — verified live against
+    # s3://alpha-engine-research/market_data/weekly/2026-08-14/alternative/AAPL.json
+    # (alpha-engine-config-I7569): the real data is
+    # ``analyst_consensus.earnings_surprises``, a list of per-quarter
+    # {date, actual, estimated, surprise_pct} dicts ordered most-recent-first.
+    # The two direct-key lookups above always missed, so ``surprise`` was
+    # always None and every ticker silently fell to the literal 0.0 default.
     surprise = eps.get("surprise_pct")
     if surprise is None:
-        surprise = consensus.get("surprise_pct", 0.0)
+        surprises = consensus.get("earnings_surprises") or []
+        surprise = surprises[0].get("surprise_pct") if surprises else 0.0
+    # registry.py documents earnings_surprise_pct as "decimal pct (_pct
+    # suffix)" (e.g. 0.01 for 1%), but the producer's surprise_pct is a
+    # percent-point number (AAPL 2026-06-30: actual=1.91 vs
+    # estimated=1.9271 -> -0.887% -> emitted as -0.8873, not -0.008873).
+    # Convert here so the feature matches its declared unit convention.
+    if surprise is not None:
+        surprise = surprise / 100.0
     return {
         "earnings": {
             "surprise_pct": surprise,
@@ -950,15 +997,16 @@ def compute_and_write(
         return {"status": "error", "error": "no_price_data"}
 
     sector_map = _load_sector_map(s3, bucket)
+    sub_sector_map = _load_sub_sector_etf_map(s3, bucket)
     fundamentals = _load_cached_fundamentals(s3, bucket, date_str)
     alt_data = _load_cached_alternative(s3, bucket)
 
     t_load = time.time() - t0
     log.info(
         "Data loaded in %.1fs: %d tickers, %d macro series, %d sector mappings, "
-        "%d fundamentals, %d alt data",
+        "%d sub-sector mappings, %d fundamentals, %d alt data",
         t_load, len(price_data), len(macro), len(sector_map),
-        len(fundamentals), len(alt_data),
+        len(sub_sector_map), len(fundamentals), len(alt_data),
     )
 
     # Trim price DataFrames to the last _FEATURE_WARMUP_ROWS rows before the
@@ -1015,6 +1063,13 @@ def compute_and_write(
             df = price_data.pop(ticker)  # release as we go to avoid holding all 900 DFs
             sector_etf_sym = sector_map.get(ticker)
             sector_etf_series = macro.get(sector_etf_sym) if sector_etf_sym else None
+            # Sub-sector benchmark ETF (config#934), resolved the same way as
+            # the sector ETF above — mirrors builders/daily_append.py's
+            # ArcticDB go-forward path (alpha-engine-config-I7569).
+            sub_sector_etf_sym = sub_sector_map.get(ticker)
+            sub_sector_etf_series = (
+                macro.get(sub_sector_etf_sym) if sub_sector_etf_sym else None
+            )
 
             # Get alt data for this ticker (if available)
             ticker_alt = alt_data.get(ticker, {})
@@ -1028,6 +1083,7 @@ def compute_and_write(
                 spy_series=spy_series,
                 vix_series=vix_series,
                 sector_etf_series=sector_etf_series,
+                sub_sector_etf_series=sub_sector_etf_series,
                 tnx_series=tnx_series,
                 irx_series=irx_series,
                 gld_series=gld_series,

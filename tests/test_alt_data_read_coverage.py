@@ -29,12 +29,18 @@ def _payload(ticker: str) -> dict:
     return {
         "ticker": ticker,
         "eps_revision": {
-            "surprise_pct": 1.5,
+            "surprise_pct": 1.5,  # percent-point (1.5%) — see I7569
             "days_since_earnings": 0.25,
             "revision_4w": 0.02,
             "streak": 3,
         },
-        "analyst_consensus": {"surprise_pct": 9.9},
+        # Real producer shape (alpha-engine-config-I7569): a list of
+        # per-quarter surprises, not a scalar "surprise_pct" key. Present
+        # here only to prove the fallback path is never reached while
+        # eps_revision.surprise_pct is set above.
+        "analyst_consensus": {
+            "earnings_surprises": [{"date": "2026-07-15", "actual": 1.0, "estimated": 0.9, "surprise_pct": 9.9}],
+        },
         "options_flow": {
             "put_call_ratio": 0.8,
             "iv_rank": 0.4,
@@ -131,7 +137,8 @@ def test_reads_every_ticker_past_the_old_200_cap():
     assert len(alt) == 903
     assert set(alt) == set(tickers)
     # The tail of the alphabet is what the cap silently dropped.
-    assert alt[sorted(tickers)[-1]]["earnings"]["surprise_pct"] == 1.5
+    # 1.5 percent-point -> 0.015 decimal pct (I7569 unit conversion).
+    assert alt[sorted(tickers)[-1]]["earnings"]["surprise_pct"] == pytest.approx(0.015)
 
 
 def test_paginates_beyond_one_list_page():

@@ -69,6 +69,7 @@ def _patch_loaders(monkeypatch, price_data, macro):
         lambda s3, bucket, date_str: (dict(price_data), dict(macro)),
     )
     monkeypatch.setattr(compute, "_load_sector_map", lambda s3, bucket: {})
+    monkeypatch.setattr(compute, "_load_sub_sector_etf_map", lambda s3, bucket: {})
     monkeypatch.setattr(
         compute, "_load_cached_fundamentals", lambda s3, bucket, date_str: {}
     )

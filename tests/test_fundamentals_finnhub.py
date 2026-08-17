@@ -34,7 +34,16 @@ from collectors.fundamentals import (
 
 
 def _aapl_payload(**overrides):
-    """A representative Finnhub /stock/metric response for AAPL."""
+    """A representative Finnhub /stock/metric response for AAPL.
+
+    Percent-point fields (growth/margin/return/payout/yield) are expressed
+    the way Finnhub actually returns them — e.g. ``grossMarginTTM: 42.0``
+    means 42%, not the FMP-style decimal fraction ``0.42`` this fixture
+    used before alpha-engine-config-I7569. Verified live against
+    AAPL/INTC/F. ``peTTM``/``pbAnnual``/``totalDebt/totalEquity*``/
+    ``currentRatio*`` are genuine ratios, not percentages, and are
+    unaffected.
+    """
     metric = {
         "peTTM": 28.5,
         "peExclExtraTTM": 27.9,
@@ -42,23 +51,25 @@ def _aapl_payload(**overrides):
         "pbQuarterly": 36.1,
         "totalDebt/totalEquityAnnual": 1.95,
         "totalDebt/totalEquityQuarterly": 2.01,
-        "revenueGrowthTTMYoy": 0.025,  # 2.5%
-        "revenueGrowthQuarterlyYoy": 0.018,
-        "freeCashFlowTTM": 100_000_000_000.0,  # $100B
-        "marketCapitalization": 3_000_000_000_000.0,  # $3T → 3.33% yield
-        "grossMarginTTM": 0.42,
-        "grossMarginAnnual": 0.41,
-        "roeTTM": 0.62,  # 62% — extreme but exists
-        "roeRfy": 0.61,
+        "revenueGrowthTTMYoy": 2.5,  # 2.5%
+        "revenueGrowthQuarterlyYoy": 1.8,
+        # freeCashFlowTTM/Annual do not exist in Finnhub's response
+        # (I7569) — fcf_yield is derived from pfcfShareTTM instead.
+        "pfcfShareTTM": 30.0,  # P/FCF of 30x -> fcf_yield = 1/30
+        "marketCapitalization": 3_000_000_000_000.0,  # $3T
+        "grossMarginTTM": 42.0,
+        "grossMarginAnnual": 41.0,
+        "roeTTM": 62.0,  # 62% — extreme but exists
+        "roeRfy": 61.0,
         "currentRatioAnnual": 0.93,
         "currentRatioQuarterly": 0.95,
         # Phase 3a of attractiveness-pillars-260520 — Growth + Stewardship
         # pillar substrate added to NEUTRAL + _fetch_single_ticker.
-        "revenueGrowth3Y": 0.08,           # 8% 3y CAGR
-        "epsGrowth3Y": 0.12,                # 12% 3y EPS CAGR
-        "payoutRatioTTM": 0.18,             # 18% of NI paid as dividends
-        "dividendYieldIndicatedAnnual": 0.005,  # 0.5%
-        "capitalSpendingGrowth5Y": 0.10,    # 10% CAPEX growth
+        "revenueGrowth3Y": 8.0,             # 8% 3y CAGR
+        "epsGrowth3Y": 12.0,                # 12% 3y EPS CAGR
+        "payoutRatioTTM": 18.0,             # 18% of NI paid as dividends
+        "dividendYieldIndicatedAnnual": 0.5,  # 0.5%
+        "capexCagr5Y": 10.0,                # 10% CAPEX growth
     }
     metric.update(overrides)
     return {"metric": metric, "metricType": "all", "symbol": "AAPL"}
@@ -145,23 +156,23 @@ class TestFetchSingleTicker:
         # 4.0 / 2 = 2.0
         assert data["debt_to_equity"] == pytest.approx(2.0)
 
-    def test_fcf_yield_computed_from_raw(self):
-        payload = _aapl_payload(freeCashFlowTTM=10.0, marketCapitalization=200.0)
+    def test_fcf_yield_computed_from_pfcf_share(self):
+        payload = _aapl_payload(pfcfShareTTM=20.0)
         with patch.object(fundamentals, "finnhub_get", return_value=payload):
             data = _fetch_single_ticker("AAPL")
-        # 10/200 = 0.05
+        # 1/20 = 0.05
         assert data["fcf_yield"] == pytest.approx(0.05)
 
-    def test_fcf_yield_neutral_when_market_cap_zero(self):
-        payload = _aapl_payload(freeCashFlowTTM=10.0, marketCapitalization=0.0)
+    def test_fcf_yield_neutral_when_pfcf_share_zero(self):
+        payload = _aapl_payload(pfcfShareTTM=0.0)
         with patch.object(fundamentals, "finnhub_get", return_value=payload):
             data = _fetch_single_ticker("AAPL")
         assert data["fcf_yield"] == 0.0
 
-    def test_fcf_yield_neutral_when_fcf_missing(self):
+    def test_fcf_yield_neutral_when_pfcf_share_missing(self):
         payload = _aapl_payload()
-        payload["metric"]["freeCashFlowTTM"] = None
-        payload["metric"]["freeCashFlowAnnual"] = None
+        payload["metric"]["pfcfShareTTM"] = None
+        payload["metric"]["pfcfShareAnnual"] = None
         with patch.object(fundamentals, "finnhub_get", return_value=payload):
             data = _fetch_single_ticker("AAPL")
         assert data["fcf_yield"] == 0.0
@@ -229,7 +240,7 @@ class TestPillarSubstrateFields:
         """3y CAGR is preferred; 5y is the fallback for newer listings."""
         payload = _aapl_payload()
         payload["metric"]["revenueGrowth3Y"] = None
-        payload["metric"]["revenueGrowth5Y"] = 0.05
+        payload["metric"]["revenueGrowth5Y"] = 5.0  # 5%
         with patch.object(fundamentals, "finnhub_get", return_value=payload):
             data = _fetch_single_ticker("AAPL")
         assert data["revenue_growth_3y"] == pytest.approx(0.05)
@@ -237,7 +248,7 @@ class TestPillarSubstrateFields:
     def test_eps_growth_3y_falls_back_through_annual_5y(self):
         payload = _aapl_payload()
         payload["metric"]["epsGrowth3Y"] = None
-        payload["metric"]["epsBasicExclExtraItemsAnnual5Y"] = 0.07
+        payload["metric"]["epsBasicExclExtraItemsAnnual5Y"] = 7.0  # 7%
         with patch.object(fundamentals, "finnhub_get", return_value=payload):
             data = _fetch_single_ticker("AAPL")
         assert data["eps_growth_3y"] == pytest.approx(0.07)
@@ -245,7 +256,7 @@ class TestPillarSubstrateFields:
     def test_payout_ratio_falls_back_to_annual(self):
         payload = _aapl_payload()
         payload["metric"]["payoutRatioTTM"] = None
-        payload["metric"]["payoutRatioAnnual"] = 0.25
+        payload["metric"]["payoutRatioAnnual"] = 25.0  # 25%
         with patch.object(fundamentals, "finnhub_get", return_value=payload):
             data = _fetch_single_ticker("AAPL")
         assert data["payout_ratio"] == pytest.approx(0.25)
@@ -253,15 +264,16 @@ class TestPillarSubstrateFields:
     def test_dividend_yield_falls_back_to_ttm(self):
         payload = _aapl_payload()
         payload["metric"]["dividendYieldIndicatedAnnual"] = None
-        payload["metric"]["currentDividendYieldTTM"] = 0.012
+        payload["metric"]["currentDividendYieldTTM"] = 1.2  # 1.2%
         with patch.object(fundamentals, "finnhub_get", return_value=payload):
             data = _fetch_single_ticker("AAPL")
         assert data["dividend_yield"] == pytest.approx(0.012)
 
     def test_clipping_extreme_growth_caps_at_upper_bound(self):
-        """A 500% YoY growth (e.g. post-spinoff base-effect) clips at the
-        upper bound. revenue_growth_3y cap is 1.5; eps_growth_3y cap is 2.0."""
-        payload = _aapl_payload(revenueGrowth3Y=5.0, epsGrowth3Y=10.0)
+        """A 500%/1000% YoY growth (e.g. post-spinoff base-effect) clips at
+        the upper bound. revenue_growth_3y cap is 1.5; eps_growth_3y cap is
+        2.0."""
+        payload = _aapl_payload(revenueGrowth3Y=500.0, epsGrowth3Y=1000.0)
         with patch.object(fundamentals, "finnhub_get", return_value=payload):
             data = _fetch_single_ticker("AAPL")
         assert data["revenue_growth_3y"] == 1.5
@@ -271,7 +283,7 @@ class TestPillarSubstrateFields:
         """A 50% indicated yield (data error / micro-cap special dividend)
         clips at 0.20 — the prior-realistic real-world ceiling for sustainable
         dividend yields."""
-        payload = _aapl_payload(dividendYieldIndicatedAnnual=0.50)
+        payload = _aapl_payload(dividendYieldIndicatedAnnual=50.0)
         with patch.object(fundamentals, "finnhub_get", return_value=payload):
             data = _fetch_single_ticker("AAPL")
         assert data["dividend_yield"] == 0.20
@@ -279,7 +291,7 @@ class TestPillarSubstrateFields:
     def test_payout_ratio_clipped_above_2(self):
         """payout_ratio > 2.0 (paying out 2x earnings — possible briefly in
         a loss year as legacy dividend, but unsustainable) clips at 2.0."""
-        payload = _aapl_payload(payoutRatioTTM=5.0)
+        payload = _aapl_payload(payoutRatioTTM=500.0)
         with patch.object(fundamentals, "finnhub_get", return_value=payload):
             data = _fetch_single_ticker("AAPL")
         assert data["payout_ratio"] == 2.0
@@ -301,6 +313,46 @@ class TestPillarSubstrateFields:
         with patch.object(fundamentals, "finnhub_get", return_value=[]):
             data = _fetch_single_ticker("UNKNOWN")
         assert data == NEUTRAL
+
+
+class TestPercentPointConversion:
+    """alpha-engine-config-I7569: Finnhub returns growth/margin/return/
+    payout/yield metrics as PERCENT POINTS (grossMarginTTM=48.65 means
+    48.65%), not decimal fractions. Values below are the live figures
+    measured against AAPL/INTC/F, verified RED against origin/main before
+    this fix (every field here clipped to its ceiling on real data)."""
+
+    def test_realistic_percent_point_values_convert_to_decimal(self):
+        payload = _aapl_payload(
+            revenueGrowthTTMYoy=14.24,
+            grossMarginTTM=48.65,
+            roeTTM=137.18,
+            payoutRatioTTM=12.13,
+            dividendYieldIndicatedAnnual=0.353,
+            capexCagr5Y=11.71,
+        )
+        with patch.object(fundamentals, "finnhub_get", return_value=payload):
+            data = _fetch_single_ticker("AAPL")
+        assert data["revenue_growth_yoy"] == pytest.approx(0.1424)
+        assert data["gross_margin"] == pytest.approx(0.4865)
+        # roe clips at 1.0 (137% > the 100% band) — still not the pinned
+        # 1.0-for-everyone artifact the unconverted bug produced, since a
+        # genuinely low-ROE ticker now clips at its own (different) value.
+        assert data["roe"] == 1.0
+        assert data["payout_ratio"] == pytest.approx(0.1213)
+        assert data["dividend_yield"] == pytest.approx(0.00353)
+        assert data["capex_growth_5y"] == pytest.approx(0.1171)
+
+    def test_capex_field_is_capex_cagr_5y_not_capital_spending_growth(self):
+        """capitalSpendingGrowth5Y never existed in Finnhub's response
+        (always None) — capexCagr5Y is the real field."""
+        payload = _aapl_payload()
+        payload["metric"].pop("capexCagr5Y", None)
+        payload["metric"]["capitalSpendingGrowth5Y"] = 99.0  # would-be old key
+        with patch.object(fundamentals, "finnhub_get", return_value=payload):
+            data = _fetch_single_ticker("AAPL")
+        # The old key is ignored entirely; missing capexCagr5Y -> default 0.0.
+        assert data["capex_growth_5y"] == 0.0
 
 
 # ── collect() — full collection flow ────────────────────────────────────────

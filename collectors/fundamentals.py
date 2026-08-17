@@ -297,14 +297,19 @@ def _fetch_single_ticker(ticker: str) -> dict:
     # Current ratio: annual; quarterly fallback.
     current_ratio_raw = _pick(metrics, "currentRatioAnnual", "currentRatioQuarterly")
 
-    # FCF yield: Finnhub doesn't expose this directly. Compute from raw FCF
-    # and market cap. Fall back to NEUTRAL (0.0) when either input is
-    # missing or non-positive — clipping below would silently emit
-    # potentially-meaningful values for negative-FCF firms.
-    fcf_ttm = _pick(metrics, "freeCashFlowTTM", "freeCashFlowAnnual")
+    # FCF yield: ``freeCashFlowTTM``/``freeCashFlowAnnual`` were assumed
+    # present by analogy with the old FMP integration but are absent from
+    # Finnhub's ``metric=all`` response on this plan for every ticker
+    # sampled (alpha-engine-config-I7569) — confirmed live against AAPL,
+    # INTC and F. Finnhub does expose price-to-FCF-per-share directly
+    # (``pfcfShareTTM`` / ``pfcfShareAnnual`` fallback), which is the same
+    # ratio inverted: FCF yield = 1 / (P/FCF). Fall back to NEUTRAL (0.0)
+    # when the ratio is missing or non-positive — inverting a non-positive
+    # P/FCF would silently emit a meaningless (or sign-flipped) yield.
     market_cap = _pick(metrics, "marketCapitalization")
-    if fcf_ttm and market_cap and market_cap > 0:
-        fcf_yield_raw = fcf_ttm / market_cap
+    pfcf_share = _pick(metrics, "pfcfShareTTM", "pfcfShareAnnual")
+    if pfcf_share and pfcf_share > 0:
+        fcf_yield_raw = 1.0 / pfcf_share
     else:
         fcf_yield_raw = 0.0
 
@@ -341,28 +346,42 @@ def _fetch_single_ticker(ticker: str) -> dict:
     dividend_yield_raw = _pick(
         metrics, "dividendYieldIndicatedAnnual", "currentDividendYieldTTM",
     )
-    capex_growth_5y_raw = _pick(metrics, "capitalSpendingGrowth5Y")
+    # capitalSpendingGrowth5Y does not exist in Finnhub's response (same
+    # absent-field problem as freeCashFlowTTM above); the real 5y CAPEX CAGR
+    # field is capexCagr5Y (alpha-engine-config-I7569).
+    capex_growth_5y_raw = _pick(metrics, "capexCagr5Y")
 
-    # Finnhub returns gross margin and ROE as fractions (e.g. 0.42 for 42%);
-    # FMP returned them the same way. Clipping ranges unchanged from the
-    # FMP version so downstream feature-engineering / scoring sees the
-    # same numeric ranges.
+    # Finnhub reports growth/margin/return/payout/yield metrics as PERCENT
+    # POINTS (e.g. ``grossMarginTTM: 48.65`` means 48.65%, ``roeTTM: 137.18``
+    # means 137.18%) — verified live against AAPL/INTC/F
+    # (alpha-engine-config-I7569). The comment this replaced claimed Finnhub
+    # matched FMP's decimal-fraction convention (0.42 for 42%); that was
+    # never verified and is wrong. Every percent-point field below is
+    # divided by 100 before the pre-existing clip ranges (which were always
+    # decimal-fraction bounds, e.g. dividend_yield hi=0.20 for 20%) are
+    # applied — without it, values routinely exceed the clip bounds and get
+    # silently clamped to the same boundary constant for most of the
+    # universe (measured: gross_margin was 0.0/1.0 for every sampled
+    # ticker, payout_ratio and dividend_yield pinned at their clip
+    # ceilings). ``pe_ratio``/``pb_ratio``/``debt_to_equity``/
+    # ``current_ratio`` are genuine ratios, not percentages, and are
+    # unaffected — their existing fixed-divisor normalization is unchanged.
     return {
         "pe_ratio": _clip(pe_raw / 30.0, -3.0, 3.0),
         "pb_ratio": _clip(pb_raw / 5.0, -3.0, 3.0),
         "debt_to_equity": _clip(de_raw / 2.0, -3.0, 3.0),
-        "revenue_growth_yoy": _clip(revenue_growth_raw, -1.0, 2.0),
+        "revenue_growth_yoy": _clip(revenue_growth_raw / 100.0, -1.0, 2.0),
         "fcf_yield": _clip(fcf_yield_raw, -0.5, 0.5),
-        "gross_margin": _clip(gross_margin_raw, 0.0, 1.0),
-        "roe": _clip(roe_raw, -1.0, 1.0),
+        "gross_margin": _clip(gross_margin_raw / 100.0, 0.0, 1.0),
+        "roe": _clip(roe_raw / 100.0, -1.0, 1.0),
         "current_ratio": _clip(current_ratio_raw / 3.0, 0.0, 3.0),
         # Growth pillar quant signals
-        "revenue_growth_3y": _clip(revenue_growth_3y_raw, -0.5, 1.5),
-        "eps_growth_3y": _clip(eps_growth_3y_raw, -1.0, 2.0),
+        "revenue_growth_3y": _clip(revenue_growth_3y_raw / 100.0, -0.5, 1.5),
+        "eps_growth_3y": _clip(eps_growth_3y_raw / 100.0, -1.0, 2.0),
         # Stewardship pillar quant signals
-        "payout_ratio": _clip(payout_ratio_raw, 0.0, 2.0),
-        "dividend_yield": _clip(dividend_yield_raw, 0.0, 0.20),
-        "capex_growth_5y": _clip(capex_growth_5y_raw, -1.0, 2.0),
+        "payout_ratio": _clip(payout_ratio_raw / 100.0, 0.0, 2.0),
+        "dividend_yield": _clip(dividend_yield_raw / 100.0, 0.0, 0.20),
+        "capex_growth_5y": _clip(capex_growth_5y_raw / 100.0, -1.0, 2.0),
         # SIZE pillar substrate (config#1142): raw market cap in USD,
         # deliberately UN-clipped/UN-normalized (it's a _raw column). The
         # SIZE loading's log + cross-sectional z-score downstream tames the
