@@ -29,14 +29,16 @@ def _ec2(state: str | None):
     return cli
 
 
-def _sf(exec_start: datetime | None):
+def _sf(exec_start: datetime | None, name: str = "eod-x"):
     """A Step Functions client mock. ``exec_start`` (a tz-aware datetime) seeds
-    one EOD execution under the RUNNING status; None → no executions."""
+    one EOD execution under the RUNNING status; None → no executions. ``name``
+    matters since alpha-engine-config-I7582: _backstop_already_fired_today only
+    counts executions THIS Lambda started (``eod-backstop-*``)."""
     cli = MagicMock()
 
     def _list(**kwargs):
         if kwargs.get("statusFilter") == "RUNNING" and exec_start is not None:
-            return {"executions": [{"name": "eod-x", "startDate": exec_start}]}
+            return {"executions": [{"name": name, "startDate": exec_start}]}
         return {"executions": []}
 
     cli.list_executions.side_effect = _list
@@ -60,19 +62,35 @@ class TestBoxRunning:
         assert index._trading_box_running(_ec2(None)) is False
 
 
-class TestEodRanToday:
+class TestBackstopAlreadyFiredToday:
+    """One retry per day. `_eod_ran_today` used to be the dispatch predicate and
+    is deleted (alpha-engine-config-I7582); this replaces only its
+    since-midnight window logic, narrowed to THIS Lambda's own dispatches."""
+
     NOW = datetime(2026, 6, 25, 22, 30, tzinfo=timezone.utc)
 
-    def test_execution_started_today_is_true(self):
-        started = datetime(2026, 6, 25, 20, 15, tzinfo=timezone.utc)
-        assert index._eod_ran_today(self.NOW, _sf(started)) is True
+    def test_backstop_execution_started_today_is_true(self):
+        started = datetime(2026, 6, 25, 22, 30, tzinfo=timezone.utc)
+        assert index._backstop_already_fired_today(
+            self.NOW, _sf(started, name="eod-backstop-2026-06-25-1750000000")
+        ) is True
 
-    def test_yesterdays_execution_is_not_today(self):
-        started = datetime(2026, 6, 24, 20, 15, tzinfo=timezone.utc)
-        assert index._eod_ran_today(self.NOW, _sf(started)) is False
+    def test_a_daemon_triggered_eod_is_not_a_backstop_dispatch(self):
+        """The whole point of the I7582 change: a daemon-triggered EOD that ran
+        and produced nothing must NOT suppress the backstop."""
+        started = datetime(2026, 6, 25, 20, 15, tzinfo=timezone.utc)
+        assert index._backstop_already_fired_today(
+            self.NOW, _sf(started, name="eod-2026-06-25-1750000000")
+        ) is False
+
+    def test_yesterdays_backstop_is_not_today(self):
+        started = datetime(2026, 6, 24, 22, 30, tzinfo=timezone.utc)
+        assert index._backstop_already_fired_today(
+            self.NOW, _sf(started, name="eod-backstop-2026-06-24-1749000000")
+        ) is False
 
     def test_no_executions_is_false(self):
-        assert index._eod_ran_today(self.NOW, _sf(None)) is False
+        assert index._backstop_already_fired_today(self.NOW, _sf(None)) is False
 
 
 # ── Handler decision matrix ───────────────────────────────────────────────────
@@ -81,18 +99,21 @@ class TestEodRanToday:
 class TestHandler:
     TRADING_NOW = datetime(2026, 6, 25, 22, 30, tzinfo=timezone.utc)  # Thursday
 
-    def _run(self, *, trading_day=True, box="running", eod_started=None):
+    def _run(self, *, trading_day=True, box="running", eod_started=None,
+             row_present=False, running=False, backstop_fired=False):
         with patch("index.datetime") as dt, \
              patch("index.is_trading_day", return_value=trading_day), \
              patch("index.last_closed_trading_day", return_value=self.TRADING_NOW.date()), \
              patch("index._trading_box_running", return_value=(box == "running")), \
-             patch("index._eod_ran_today", return_value=(eod_started is not None)), \
+             patch("index._eod_running", return_value=running), \
+             patch("index._eod_did_its_job", return_value=row_present), \
+             patch("index._backstop_already_fired_today", return_value=backstop_fired), \
              patch("index._start_eod", return_value="arn:exec:backstop") as start:
             dt.now.return_value = self.TRADING_NOW
             result = index.handler({}, None)
         return result, start
 
-    def test_starts_eod_when_box_up_and_no_eod_today(self):
+    def test_starts_eod_when_box_up_and_no_row(self):
         # box running + no execution + trading day -> dispatch (existing
         # behavior preserved), tagged triggered_by="backstop".
         result, start = self._run(box="running", eod_started=None)
@@ -111,16 +132,57 @@ class TestHandler:
         assert result["box_was_running"] is False
         start.assert_called_once_with(self.TRADING_NOW.date().isoformat(), "backstop-box-stopped")
 
-    def test_noop_when_box_stopped_and_execution_exists(self):
-        # box stopped + execution exists -> no dispatch, regardless of box
-        # state (the eod_ran_today guard alone decides this).
-        result, start = self._run(box="stopped", eod_started=self.TRADING_NOW)
-        assert result["action"] == "noop" and result["reason"] == "eod_already_ran_today"
+    def test_noop_when_the_row_is_present(self):
+        # The artifact decides, regardless of box state.
+        for box in ("running", "stopped"):
+            result, start = self._run(box=box, row_present=True)
+            assert result["action"] == "noop"
+            assert result["reason"] == "eod_row_present"
+            start.assert_not_called()
+
+    def test_THE_2026_08_17_CASE_an_execution_ran_and_produced_nothing(self):
+        """The defect this whole change exists for.
+
+        On 2026-08-17 the EOD SF started at 20:00 UTC and ended at 21:55 UTC in
+        DegradedRun with no ArcticDB append, no EODReconcile and no eod_pnl row.
+        The old `_eod_ran_today` predicate returned True, so this Lambda's 22:30
+        UTC firing was a no-op — correctly, per its own predicate, on exactly
+        the day it was written for. It must now DISPATCH.
+        """
+        result, start = self._run(box="stopped", row_present=False, running=False)
+        assert result["action"] == "started_eod"
+        start.assert_called_once()
+
+    def test_noop_while_an_eod_is_still_running(self):
+        """A degraded run still inside its self-heal loop must not be
+        re-dispatched underneath itself."""
+        result, start = self._run(running=True, row_present=False)
+        assert result["action"] == "noop"
+        assert result["reason"] == "eod_currently_running"
         start.assert_not_called()
 
-    def test_noop_when_box_running_and_eod_already_ran(self):
-        result, start = self._run(box="running", eod_started=self.TRADING_NOW)
-        assert result["action"] == "noop" and result["reason"] == "eod_already_ran_today"
+    def test_one_retry_per_day_then_page(self):
+        """A second miss is a page, not another trading-box boot. Without this
+        the outcome predicate would re-dispatch on every firing for as long as
+        the row stayed missing."""
+        result, start = self._run(row_present=False, backstop_fired=True)
+        assert result["action"] == "noop"
+        assert result["reason"] == "backstop_already_fired_and_row_still_missing"
+        start.assert_not_called()
+
+    def test_running_is_checked_before_the_artifact(self):
+        """Cheapest and most decisive first: a RUNNING execution may still be
+        about to write the row, so reading S3 to decide is both wasted and
+        misleading."""
+        with patch("index.datetime") as dt, \
+             patch("index.is_trading_day", return_value=True), \
+             patch("index.last_closed_trading_day", return_value=self.TRADING_NOW.date()), \
+             patch("index._eod_running", return_value=True), \
+             patch("index._eod_did_its_job") as did_its_job, \
+             patch("index._start_eod") as start:
+            dt.now.return_value = self.TRADING_NOW
+            index.handler({}, None)
+        did_its_job.assert_not_called()
         start.assert_not_called()
 
     def test_noop_when_not_a_trading_day(self):
@@ -128,15 +190,17 @@ class TestHandler:
         assert result["action"] == "noop" and result["reason"] == "not_a_trading_day"
         start.assert_not_called()
 
-    def test_eod_ran_today_checked_before_box_state(self):
-        # eod_ran_today is decisive on its own — box state must not even be
-        # consulted once an execution is already found for today (avoids an
-        # unnecessary EC2 describe_instances call on the common no-op path).
+    def test_row_present_checked_before_box_state(self):
+        # The artifact predicate is decisive on its own — box state must not
+        # even be consulted once the row is confirmed (avoids an unnecessary
+        # EC2 describe_instances call on the common no-op path).
         with patch("index.datetime") as dt, \
              patch("index.is_trading_day", return_value=True), \
              patch("index.last_closed_trading_day", return_value=self.TRADING_NOW.date()), \
              patch("index._trading_box_running") as box_running, \
-             patch("index._eod_ran_today", return_value=True), \
+             patch("index._eod_running", return_value=False), \
+             patch("index._eod_did_its_job", return_value=True), \
+             patch("index._backstop_already_fired_today", return_value=False), \
              patch("index._start_eod") as start:
             dt.now.return_value = self.TRADING_NOW
             index.handler({}, None)
@@ -189,4 +253,6 @@ class TestFailLoud:
         cli = MagicMock()
         cli.list_executions.side_effect = RuntimeError("states down")
         with pytest.raises(RuntimeError):
-            index._eod_ran_today(datetime(2026, 6, 25, 22, 30, tzinfo=timezone.utc), cli)
+            index._backstop_already_fired_today(
+                datetime(2026, 6, 25, 22, 30, tzinfo=timezone.utc), cli
+            )
