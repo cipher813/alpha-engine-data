@@ -33,7 +33,18 @@ log = logging.getLogger(__name__)
 # The test_schema_contract suite enforces 1+2+3 parity.
 #
 # Selected for v1 institutional Barra-style factor set:
-#   • momentum (short + medium horizon) — Barra's MOMENTUM family
+#   • momentum (short + medium + long horizon) — Barra's MOMENTUM family.
+#     The LONG-horizon member is 12-1 skip-month (`mom_12_1_pct`), which is
+#     Barra's canonical RSTR: trailing 12-month return excluding the most
+#     recent month. It was absent until now, so the emitted "MOMENTUM family"
+#     carried only its 20d and 60d members — both inside the window where
+#     cross-sectional momentum REVERSES rather than persists (Jegadeesh 1990),
+#     and neither the horizon the Jegadeesh-Titman premium is defined over.
+#     Measured on the 2026-08-14 snapshot over 901 names, `mom_12_1_pct` is
+#     Spearman -0.14 against `momentum_20d` and -0.03 against `return_60d`:
+#     the long-horizon factor is not a stronger version of the short-horizon
+#     ones, it points the other way, so a consumer ranking on the short pair
+#     is taking the opposite bet from one ranking on 12-1.
 #   • beta — Barra's BETA factor (market sensitivity)
 #   • residual vol — Barra's RESVOL (idiosyncratic risk)
 #   • realized vol — Barra's VOLATILITY (total risk; complements RESVOL)
@@ -46,6 +57,7 @@ log = logging.getLogger(__name__)
 FACTOR_LOADING_SOURCES: dict[str, str] = {
     "momentum_20d":         "momentum_20d_zscore",
     "return_60d":           "return_60d_zscore",
+    "mom_12_1_pct":         "mom_12_1_pct_zscore",
     "beta_60d":             "beta_60d_zscore",
     "idio_vol_60d":         "idio_vol_60d_zscore",
     "realized_vol_63d":     "realized_vol_63d_zscore",
