@@ -101,6 +101,84 @@ _FUNDAMENTALS_FIELD_SPECS: dict[str, dict] = {
 }
 
 
+# ── Cross-sectional collapse gate (alpha-engine-config-I7583) ────────────────
+#
+# The per-ticker `ok_ratio` gate below asks "did THIS TICKER return anything at
+# all". It cannot see a field that is dead for EVERY ticker: a ticker returning
+# 13 of 14 fields counts as fully populated, so a field absent from the vendor
+# response for the whole universe passes it 903 times over.
+#
+# That is not hypothetical. `capitalSpendingGrowth5Y` and `freeCashFlowTTM` do
+# not exist in Finnhub's `metric=all` response at all; `_pick`'s `default=0.0`
+# turned both into a universe-wide 0.0, and this collector reported `ok` every
+# run for as long as the Finnhub integration has been live. The same shape hit
+# a second way when the percent-point units were wrong: every value exceeded
+# its clip bound, so `gross_margin` and `roe` collapsed onto the ceiling for
+# ~90% of the universe. Both were found by hand, off a question in a chat
+# (alpha-engine-config-I7569); nothing in this file would have raised, and
+# nothing would raise for the next one.
+#
+# This gate is deliberately written over the OUTPUT rather than over the vendor
+# keys, so it catches the class regardless of cause — an absent key defaulting
+# to a constant, a units mismatch saturating a clip bound, a scaling divisor
+# that collapses a range, or a vendor silently switching a field to a fixed
+# value. Any cause that ends in "this column carries no cross-sectional
+# information" is caught by the same predicate.
+#
+# It also sits where `_FUNDAMENTALS_FIELD_SPECS` cannot: that gate runs on
+# values `_clip` has ALREADY bounded to its own bands, so it is structurally
+# incapable of firing on saturation. This one runs on the assembled universe.
+#
+# FAIL is set at 0.99 rather than 1.00 so a single stray ticker cannot mask a
+# dead field. WARN is the observe band: it does not halt, because a legitimately
+# concentrated field (a payout ratio where most of the universe pays nothing) is
+# plausible, and per alpha-engine-config-I7581 a new gate must not go straight
+# to enforcing on a range whose real distribution has not been measured over the
+# full universe. Promote the warn band to fail once a full post-I7569 run has
+# been observed — tracked on I7583.
+_FIELD_COLLAPSE_FAIL_SHARE = 0.99
+_FIELD_COLLAPSE_WARN_SHARE = 0.70
+
+# Below this many fetched tickers the gate does not apply. "Every value is the
+# same" is unremarkable across three tickers and says nothing about whether a
+# field carries cross-sectional information — the statement this gate makes is
+# only meaningful over a real universe. 50 is well under the ~900 production
+# universe and well over any fixture or smoke run, so a narrowed operator run
+# is not falsely failed and a production run is never exempted. Recorded rather
+# than silently skipped: a run below the floor logs that the gate did not
+# apply, because "the check did not fire" and "the check was not run" must not
+# look the same on the log (principles.md §2.7).
+_FIELD_COLLAPSE_MIN_TICKERS = 50
+
+# Fields exempt from the gate, each with the reason it may legitimately
+# collapse. Deliberately by NAME, never by a heuristic: a heuristic that
+# tolerates "few distinct values" would also tolerate the defect.
+_COLLAPSE_EXEMPT: frozenset[str] = frozenset()
+
+
+def _field_collapse_report(records: list[dict]) -> dict[str, tuple[float, object]]:
+    """{field: (modal_share, modal_value)} for every field, over ``records``.
+
+    Callers pass only records that actually came back from the vendor —
+    NEUTRAL rows are fetch failures and are already accounted for by
+    ``ok_ratio``; including them would let a bad fetch day manufacture a
+    collapse that is really an outage.
+    """
+    from collections import Counter
+
+    if not records:
+        return {}
+    fields = sorted({k for r in records for k in r})
+    out: dict[str, tuple[float, object]] = {}
+    for field in fields:
+        if field in _COLLAPSE_EXEMPT:
+            continue
+        counts = Counter(r.get(field) for r in records)
+        value, n = counts.most_common(1)[0]
+        out[field] = (n / len(records), value)
+    return out
+
+
 def _load_fundamentals_block_anomaly_types() -> frozenset[str]:
     """Read ``FUNDAMENTALS_BLOCK_ANOMALY_TYPES`` env var or fall back.
 
@@ -519,6 +597,69 @@ def collect(
         "quality_anomaly_counts": quality_counts_by_type,
         "quality_block_anomaly_types": sorted(block_anomaly_types),
     }
+
+    # ── Cross-sectional collapse gate (alpha-engine-config-I7583) ───────────
+    # Runs BEFORE the ok_ratio gate below and is deliberately independent of
+    # it: ok_ratio answers "did each ticker return anything", this answers
+    # "does each FIELD carry any information across the universe". A field
+    # that is dead for every ticker passes ok_ratio 903 times over — that is
+    # exactly how capitalSpendingGrowth5Y and freeCashFlowTTM went unnoticed
+    # for the life of the Finnhub integration (alpha-engine-config-I7569).
+    _real_records = [r for r in results.values() if r != NEUTRAL]
+    if len(_real_records) < _FIELD_COLLAPSE_MIN_TICKERS:
+        logger.info(
+            "Fundamentals field-collapse gate NOT APPLIED: %d fetched ticker(s) "
+            "is below the %d floor, where 'every value is identical' carries no "
+            "information about cross-sectional coverage.",
+            len(_real_records), _FIELD_COLLAPSE_MIN_TICKERS,
+        )
+        _collapse = {}
+    else:
+        _collapse = _field_collapse_report(_real_records)
+    _collapsed = {
+        f: (share, val) for f, (share, val) in _collapse.items()
+        if share >= _FIELD_COLLAPSE_FAIL_SHARE
+    }
+    _concentrated = {
+        f: (share, val) for f, (share, val) in _collapse.items()
+        if _FIELD_COLLAPSE_WARN_SHARE <= share < _FIELD_COLLAPSE_FAIL_SHARE
+    }
+    if _concentrated:
+        # Observe band — loud, not halting. See the promotion note on
+        # _FIELD_COLLAPSE_WARN_SHARE.
+        logger.error(
+            "Fundamentals field-collapse WARN over %d fetched tickers: %s. "
+            "Each of these carries one value for most of the universe. That is "
+            "plausible for a genuinely concentrated field and is the signature "
+            "of an absent source key or a units/clip mismatch — check before "
+            "the next consumer reads it.",
+            len(_real_records),
+            {f: f"{share:.1%} at {val!r}" for f, (share, val) in sorted(_concentrated.items())},
+        )
+    if _collapsed:
+        msg = (
+            f"field(s) carry a single value for effectively the whole universe "
+            f"over {len(_real_records)} fetched tickers: "
+            + ", ".join(
+                f"{f} ({share:.1%} at {val!r})"
+                for f, (share, val) in sorted(_collapsed.items())
+            )
+            + ". A source key absent from the vendor response, a units mismatch "
+            "saturating a clip bound, or a vendor field switched to a constant "
+            "all land here. Refusing to write a fundamentals snapshot whose "
+            "column(s) would read as fully covered while carrying zero "
+            "cross-sectional information (alpha-engine-config-I7583)."
+        )
+        logger.error("Fundamentals collapse gate: %s", msg)
+        return {
+            "status": "error",
+            "error": msg,
+            "tickers_ok": n_ok,
+            "tickers_error": n_err,
+            "collapsed_fields": {f: share for f, (share, _v) in _collapsed.items()},
+            "concentrated_fields": {f: share for f, (share, _v) in _concentrated.items()},
+            **_quality_fields,
+        }
 
     if ok_ratio < _MIN_OK_RATIO:
         msg = (
