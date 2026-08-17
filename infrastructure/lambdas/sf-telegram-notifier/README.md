@@ -100,7 +100,7 @@ via `.github/workflows/deploy-sf-telegram-notifier.yml` on merge to `main`
   `/alpha-engine/TELEGRAM_CHAT_ID` (no other parameters)
 - `states:DescribeExecution` + `states:GetExecutionHistory` on
   `arn:aws:states:…:execution:{alpha-engine-*,ne-*}:*`
-- `s3:HeadObject`/`s3:GetObject` on
+- `s3:GetObject` (a HeadObject call is authorized by GetObject — there is no `s3:HeadObject` action; alpha-engine-config-I7571) on
   `alpha-engine-research/_sf_completion/ne-postclose-trading-pipeline/*` +
   `alpha-engine-research/trades/eod_pnl.csv` (EOD artifact verification,
   alpha-engine-config#5289)
