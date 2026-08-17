@@ -29,6 +29,7 @@ def _cross_section_panel(n_tickers: int = 40, seed: int = 0) -> pd.DataFrame:
                 "Close": 100.0 + rng.normal(),
                 "momentum_20d": rng.normal(),
                 "return_60d": rng.normal(),
+                "mom_12_1_pct": rng.normal(0.15, 0.35),
                 "beta_60d": rng.normal(1.0, 0.2),
                 "idio_vol_60d": abs(rng.normal(0.2, 0.05)),
                 "realized_vol_63d": abs(rng.normal(0.25, 0.05)),

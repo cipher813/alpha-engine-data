@@ -93,7 +93,7 @@ class TestWinsorizeAndZscore:
 
 class TestApplyFactorZscores:
     def _baseline_panel(self):
-        """Synthetic cross-sectional panel with 50 tickers and all 9
+        """Synthetic cross-sectional panel with 50 tickers and all 10
         source columns populated. Each column has a distinct scale to
         verify standardization handles heterogeneous units."""
         rng = np.random.default_rng(7)
@@ -101,6 +101,10 @@ class TestApplyFactorZscores:
             "ticker":              [f"T{i:02d}" for i in range(50)],
             "momentum_20d":        rng.normal(0.01, 0.05, 50),
             "return_60d":          rng.normal(0.05, 0.15, 50),
+            # Barra MOMENTUM long-horizon (RSTR), 12-1 skip-month. Wider
+            # dispersion than the short-horizon members — a 12-month return
+            # accumulates more variance than a 20-day one.
+            "mom_12_1_pct":        rng.normal(0.15, 0.35, 50),
             "beta_60d":            rng.normal(1.0, 0.3, 50),
             "idio_vol_60d":        rng.uniform(0.10, 0.40, 50),
             "realized_vol_63d":    rng.uniform(0.15, 0.45, 50),
@@ -178,16 +182,46 @@ class TestApplyFactorZscores:
 
     def test_default_source_map_matches_canonical_barra_factors(self):
         """The default factor set is the canonical institutional Barra-style
-        loading matrix. SIZE (config#1142) completes the set at 9 factors.
-        Adding a 10th factor here also requires CATALOG + SCHEMA.md updates —
+        loading matrix. SIZE (config#1142) completed the risk-factor set at 9;
+        the 12-1 skip-month MOMENTUM long-horizon member (RSTR) brings it to
+        10 — Barra's MOMENTUM factor is canonically defined at 12-1, so the
+        set was previously missing the very horizon it named.
+        Adding an 11th factor here also requires CATALOG + SCHEMA.md updates —
         keep this test as the chokepoint."""
-        assert len(FACTOR_LOADING_SOURCES) == 9
+        assert len(FACTOR_LOADING_SOURCES) == 10
         expected_sources = {
-            "momentum_20d", "return_60d", "beta_60d", "idio_vol_60d",
-            "realized_vol_63d", "dist_from_52w_high", "pe_ratio", "roe",
-            "market_cap_raw",
+            "momentum_20d", "return_60d", "mom_12_1_pct", "beta_60d",
+            "idio_vol_60d", "realized_vol_63d", "dist_from_52w_high",
+            "pe_ratio", "roe", "market_cap_raw",
         }
         assert set(FACTOR_LOADING_SOURCES.keys()) == expected_sources
+
+    def test_momentum_family_spans_short_medium_and_long_horizons(self):
+        """The MOMENTUM family must carry a member at the 12-1 horizon.
+
+        Guard for the defect this column was added to fix: the emitted set
+        was named for Barra's MOMENTUM family but held only 20d and 60d
+        members. Both sit inside the short-term-reversal window; neither is
+        the horizon the Jegadeesh-Titman momentum premium is defined over.
+        A consumer ranking on the short pair alone is not taking a weak
+        momentum bet, it is taking the opposite one — measured Spearman
+        -0.14 (mom_12_1_pct vs momentum_20d) on the 2026-08-14 snapshot
+        over 901 names.
+
+        Fails on the pre-fix source map, which is the point (§7.4: a guard
+        that cannot fail is indistinguishable from no guard).
+        """
+        horizons = {
+            "short":  "momentum_20d",
+            "medium": "return_60d",
+            "long":   "mom_12_1_pct",
+        }
+        for label, source in horizons.items():
+            assert source in FACTOR_LOADING_SOURCES, (
+                f"MOMENTUM family is missing its {label}-horizon member "
+                f"{source!r} — the emitted loading matrix would claim a "
+                f"factor family it does not actually span"
+            )
 
     def test_z_score_is_orthogonal_to_input_units(self):
         """Z-score output range is in σ-units (typically [-3, 3] after
