@@ -116,7 +116,7 @@ The role's inline policy (`iam-policy.json`):
 - `ec2:DescribeInstances *` — global read for the scan
 - `ec2:TerminateInstances` scoped to instances with `tag:Name` matching `alpha-engine-*` — defence in depth so even a buggy reaper run cannot terminate anything outside the alpha-engine tag prefix
 - `cloudwatch:PutMetricData` scoped to namespace `AlphaEngine/Infra`
-- `s3:HeadObject` scoped to `s3://alpha-engine-research/ci_watch/_control/completed/*` and `s3://alpha-engine-research/sf_watch/_control/completed/*` — the watch-kind incomplete-reap marker checks (above)
+- `s3:GetObject` scoped to the `_control/completed/` prefix of all four watch kinds (`ci_watch`, `sf_watch`, `overseer`, `thinktank`) — the watch-kind incomplete-reap marker checks (above). A HeadObject call is authorized by `s3:GetObject`; there is no `s3:HeadObject` IAM action, and the `overseer`/`thinktank` prefixes were never granted at all, so all four checks 403'd and every reap of those kinds reported "WITHOUT completing" (alpha-engine-config-I7571)
 - `ssm:GetParameter` scoped to the two Telegram secrets (`/alpha-engine/TELEGRAM_BOT_TOKEN`, `/alpha-engine/TELEGRAM_CHAT_ID`) — resolved by `krepis.secrets.get_secret` inside `send_message`
 - Standard Lambda logging perms
 

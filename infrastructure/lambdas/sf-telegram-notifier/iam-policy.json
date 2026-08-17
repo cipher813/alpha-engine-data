@@ -14,7 +14,9 @@
     {
       "Sid": "TelegramSecretsSSM",
       "Effect": "Allow",
-      "Action": ["ssm:GetParameter"],
+      "Action": [
+        "ssm:GetParameter"
+      ],
       "Resource": [
         "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_BOT_TOKEN",
         "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_CHAT_ID",
@@ -26,7 +28,10 @@
     {
       "Sid": "DescribeExecutionForFailureCause",
       "Effect": "Allow",
-      "Action": ["states:DescribeExecution", "states:GetExecutionHistory"],
+      "Action": [
+        "states:DescribeExecution",
+        "states:GetExecutionHistory"
+      ],
       "Resource": [
         "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-*:*",
         "arn:aws:states:us-east-1:711398986525:execution:ne-*:*"
@@ -35,7 +40,10 @@
     {
       "Sid": "ArtifactAttestationRead",
       "Effect": "Allow",
-      "Action": ["s3:HeadObject", "s3:ListBucket"],
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
       "Resource": [
         "arn:aws:s3:::alpha-engine-research",
         "arn:aws:s3:::alpha-engine-research/predictor/metrics/*",
@@ -43,17 +51,36 @@
       ]
     },
     {
-      "Sid": "EodCompletionMarkerHead",
+      "Sid": "EodCompletionMarkerRead",
       "Effect": "Allow",
-      "Action": ["s3:HeadObject"],
+      "Action": [
+        "s3:GetObject"
+      ],
       "Resource": [
         "arn:aws:s3:::alpha-engine-research/_sf_completion/ne-postclose-trading-pipeline/*"
       ]
     },
     {
+      "Sid": "EodCompletionMarkerListBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "_sf_completion/ne-postclose-trading-pipeline/*"
+          ]
+        }
+      }
+    },
+    {
       "Sid": "EodPnlCsvGet",
       "Effect": "Allow",
-      "Action": ["s3:GetObject"],
+      "Action": [
+        "s3:GetObject"
+      ],
       "Resource": [
         "arn:aws:s3:::alpha-engine-research/trades/eod_pnl.csv"
       ]
@@ -61,11 +88,15 @@
     {
       "Sid": "EodPnlCsvListBucket",
       "Effect": "Allow",
-      "Action": ["s3:ListBucket"],
+      "Action": [
+        "s3:ListBucket"
+      ],
       "Resource": "arn:aws:s3:::alpha-engine-research",
       "Condition": {
         "StringLike": {
-          "s3:prefix": ["trades/eod_pnl.csv"]
+          "s3:prefix": [
+            "trades/eod_pnl.csv"
+          ]
         }
       }
     },
