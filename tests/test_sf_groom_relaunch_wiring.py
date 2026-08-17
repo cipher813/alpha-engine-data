@@ -84,6 +84,16 @@ def test_completion_marker_task_token_timeout_routes_to_retry(states):
 
 
 def test_sf_role_grants_head_object_on_completion_marker(iam_policy):
+    """A HeadObject call is authorized by ``s3:GetObject`` — there is no
+    ``s3:HeadObject`` IAM action (alpha-engine-config-I7571).
+
+    This assertion was INVERTED until 2026-08-17: it required the literal
+    ``s3:HeadObject`` to be present, i.e. it enforced the very defect it was
+    named after. ``put-role-policy`` accepts unknown action strings without
+    error, so the grant is inert at apply time and 403s only at call time —
+    which is exactly why a test, not the AWS API, has to be the thing that
+    catches it.
+    """
     marker_stmts = [
         s
         for s in iam_policy["Statement"]
@@ -93,8 +103,8 @@ def test_sf_role_grants_head_object_on_completion_marker(iam_policy):
     actions = marker_stmts[0]["Action"]
     if isinstance(actions, str):
         actions = [actions]
-    assert "s3:HeadObject" in actions
     assert "s3:GetObject" in actions
+    assert "s3:HeadObject" not in actions
 
 
 def test_prep_relaunch_carries_the_fields_its_successors_read(states):

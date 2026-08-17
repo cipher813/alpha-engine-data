@@ -30,16 +30,33 @@
       }
     },
     {
-      "Sid": "CheckCiWatchCompletionMarker",
+      "Sid": "CheckWatchCompletionMarkers",
       "Effect": "Allow",
-      "Action": "s3:HeadObject",
-      "Resource": "arn:aws:s3:::alpha-engine-research/ci_watch/_control/completed/*"
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research/ci_watch/_control/completed/*",
+        "arn:aws:s3:::alpha-engine-research/sf_watch/_control/completed/*",
+        "arn:aws:s3:::alpha-engine-research/overseer/_control/completed/*",
+        "arn:aws:s3:::alpha-engine-research/thinktank/_control/completed/*"
+      ]
     },
     {
-      "Sid": "CheckSfWatchCompletionMarker",
+      "Sid": "CheckWatchCompletionMarkersListBucket",
       "Effect": "Allow",
-      "Action": "s3:HeadObject",
-      "Resource": "arn:aws:s3:::alpha-engine-research/sf_watch/_control/completed/*"
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "ci_watch/_control/completed/*",
+            "sf_watch/_control/completed/*",
+            "overseer/_control/completed/*",
+            "thinktank/_control/completed/*"
+          ]
+        }
+      }
     },
     {
       "Sid": "TelegramSecretsSSM",

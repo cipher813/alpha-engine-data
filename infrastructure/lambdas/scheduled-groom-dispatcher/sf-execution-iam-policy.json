@@ -23,8 +23,7 @@
       "Sid": "CheckGroomRunCompletionMarker",
       "Effect": "Allow",
       "Action": [
-        "s3:GetObject",
-        "s3:HeadObject"
+        "s3:GetObject"
       ],
       "Resource": "arn:aws:s3:::alpha-engine-research/groom/_control/completed/*"
     },
@@ -35,7 +34,9 @@
       "Resource": "arn:aws:s3:::alpha-engine-research",
       "Condition": {
         "StringLike": {
-          "s3:prefix": ["groom/_control/completed/*"]
+          "s3:prefix": [
+            "groom/_control/completed/*"
+          ]
         }
       }
     },
