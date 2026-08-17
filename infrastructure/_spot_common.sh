@@ -222,7 +222,7 @@ cleanup() {
     # teardown here must not read a workload exit status that was never
     # evaluated (config-I7442).
     teardown_staging 0
-    echo "  launch-only: instance $_INSTANCE_ID left running (SF-owned); staging cleaned."
+    echo "  launch-only: instance $_INSTANCE_ID left running (SF-owned); staging teardown reported above."
     return 0
   fi
   if [ -n "$_INSTANCE_ID" ]; then
@@ -231,7 +231,7 @@ cleanup() {
     aws ec2 terminate-instances --instance-ids "$_INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true
   fi
   teardown_staging "$_exit_code"
-  [ -n "$_INSTANCE_ID" ] && echo "  Instance terminated; S3 staging cleaned."
+  [ -n "$_INSTANCE_ID" ] && echo "  Instance terminated."
   return 0
 }
 
