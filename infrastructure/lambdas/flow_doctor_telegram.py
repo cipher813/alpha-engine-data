@@ -38,6 +38,7 @@ def build_flow_doctor_config(
     db_basename: str,
     repo: str = "nousergon/nousergon-data",
     notifier_overrides: Optional[Dict[str, Any]] = None,
+    rate_limit_exempt_severities: Optional[Sequence[str]] = None,
 ) -> dict:
     """Build a flow-doctor config for ``topics``.
 
@@ -78,7 +79,32 @@ def build_flow_doctor_config(
         # Lambda's own iam-policy.json FlowDoctorDedupStore statement.
         "store": {"type": "dynamodb", "table_name": "flow-doctor-store", "region": "us-east-1"},
         "dedup_cooldown_minutes": 1,
-        "rate_limits": {"max_alerts_per_day": 100},
+        # `max_alerts_per_day` is counted by flow-doctor's RateLimiter as
+        # `store.count_actions_today("telegram_alert")` — against the SHARED
+        # DynamoDB store above, so the 100/day budget is a FLEET-WIDE counter,
+        # not a per-flow one. Every consumer writing to `flow-doctor-store`
+        # spends from the same pool, and terminal notifications are by
+        # construction the last events of the day, so they are the ones the
+        # budget reaches first (flow_doctor/core/rate_limiter.py's own docstring
+        # records the 2026-07-28 incident where exactly this dropped 12 of 13
+        # terminal pipeline notifications).
+        #
+        # `rate_limit_exempt_severities` is flow-doctor's mechanism for taking a
+        # class of traffic out of that blunt daily cap; it defaults to
+        # critical+error, so `info` (a SUCCEEDED terminal) and `warning` (a
+        # FAILED or DegradedRun terminal) are both droppable by default.
+        # Callers that are BOUNDED producers — a lifecycle mirror of a fixed
+        # set of state machines cannot storm, and repeats of one signature are
+        # already handled by signature dedup + `dedup_cooldown_minutes` — pass
+        # their own list. Unset is byte-identical to before.
+        "rate_limits": (
+            {"max_alerts_per_day": 100}
+            if rate_limit_exempt_severities is None
+            else {
+                "max_alerts_per_day": 100,
+                "rate_limit_exempt_severities": list(rate_limit_exempt_severities),
+            }
+        ),
     }
 
 
@@ -88,6 +114,7 @@ def get_flow_doctor(
     *,
     db_basename: str,
     notifier_overrides: Optional[Dict[str, Any]] = None,
+    rate_limit_exempt_severities: Optional[Sequence[str]] = None,
 ) -> Any | None:
     # NOTE: the cache is keyed on flow_name alone, so a caller applying
     # notifier_overrides MUST use a distinct flow_name (the groom cycle flow
@@ -109,6 +136,7 @@ def get_flow_doctor(
         cfg = build_flow_doctor_config(
             flow_name, topics, db_basename=db_basename,
             notifier_overrides=notifier_overrides,
+            rate_limit_exempt_severities=rate_limit_exempt_severities,
         )
         path = Path(f"/tmp/flow_doctor_{db_basename}.yaml")
         path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
@@ -186,7 +214,9 @@ def notify_via_flow_doctor(
     source: Optional[str] = None,
     context: Optional[Dict[str, Any]] = None,
     silent_topic: Any | None = None,
+    guaranteed_topic: Any | None = None,
     notifier_overrides: Optional[Dict[str, Any]] = None,
+    rate_limit_exempt_severities: Optional[Sequence[str]] = None,
 ) -> bool:
     """Route ``text`` through flow-doctor forum topics; fallback to ``send_message``.
     Args:
@@ -204,6 +234,16 @@ def notify_via_flow_doctor(
             krepis behavior).
         context: Arbitrary key-value metadata.
         silent_topic: Optional topic for silent notifications when ``silent`` is True.
+        guaranteed_topic: Optional topic that MUST receive ``text`` even when
+            flow-doctor suppresses the alert. On any suppression other than
+            dedup (rate_limited, severity_filtered, category_filtered,
+            delivery_failed, no_notifiers) the message is delivered raw to this
+            topic's notifier, bypassing the shared daily budget. For a
+            once-per-day lifecycle terminal, "suppressed" and "the pipeline
+            never ran" look identical to the operator, and the second is the
+            one worth interrupting them for.
+        rate_limit_exempt_severities: Severities this flow takes out of the
+            fleet-shared daily alert budget — see ``build_flow_doctor_config``.
         notifier_overrides: Per-flow delivery-posture override merged into every
             notifier dict — see ``build_flow_doctor_config``. Requires a
             flow_name unique to that posture (the config cache is keyed on it).
@@ -220,6 +260,7 @@ def notify_via_flow_doctor(
         fd = get_flow_doctor(
             flow_name, topics, db_basename=db_basename,
             notifier_overrides=notifier_overrides,
+            rate_limit_exempt_severities=rate_limit_exempt_severities,
         )
         if fd is None:
             return send_message(text, disable_notification=silent)
@@ -231,11 +272,49 @@ def notify_via_flow_doctor(
             if notifier is not None:
                 return notifier.send_raw(text, disable_notification=True) is not None
 
-        report_id = fd.notify_event(
+        fd.notify_event(
             subject,
             body=None,
             severity=severity,
             context=context or {},
             dedup_key=dedup_key,
         )
-        return report_id is not None
+        # NOT `report_id is not None`. flow-doctor returns a report id for
+        # `severity_filtered` / `category_filtered` / `rate_limited` /
+        # `delivery_failed` / `no_notifiers` too — "seen and evaluated", not
+        # "delivered" — so the old expression reported `telegram_sent: True`
+        # on every suppressed alert. `last_dispatched()` is the library's own
+        # answer to exactly this question (>=1 notifier reached).
+        dispatched = bool(fd.last_dispatched())
+        if dispatched or guaranteed_topic is None:
+            return dispatched
+
+        # Guaranteed delivery. `dedup` is deliberately NOT overridden: a repeat
+        # of the same signature inside the cooldown is a message the operator
+        # has already been shown, and re-sending it raw would defeat the one
+        # suppression that exists to protect them. Every OTHER suppression
+        # reason means the operator was shown nothing, which for a
+        # once-per-day lifecycle terminal is indistinguishable from the
+        # pipeline never having run (principles.md §2.7).
+        reason = fd.last_dispatch_reason()
+        if reason == "deduped":
+            logger.info(
+                "notify_via_flow_doctor: %s suppressed as a duplicate — not "
+                "re-sending raw (flow=%s)", dedup_key, flow_name,
+            )
+            return False
+        notifier = topic_telegram_notifier(fd, guaranteed_topic)
+        if notifier is None:
+            logger.warning(
+                "notify_via_flow_doctor: %r suppressed (reason=%s) and no "
+                "notifier is configured for guaranteed_topic=%r — the message "
+                "reached nobody (flow=%s)",
+                dedup_key, reason, guaranteed_topic, flow_name,
+            )
+            return False
+        logger.warning(
+            "notify_via_flow_doctor: %r suppressed by flow-doctor (reason=%s) "
+            "— delivering raw to guaranteed_topic=%r (flow=%s)",
+            dedup_key, reason, guaranteed_topic, flow_name,
+        )
+        return notifier.send_raw(text, disable_notification=silent) is not None
