@@ -18,11 +18,92 @@
 # below rather than omitted from the denominator.
 component_id: ae-preflight-sweep
 owning_repo: nousergon-data
-substrate: eventbridge+ec2-spot
+# `eventbridge`, not `eventbridge+ec2-spot`. `substrate` is a CLOSED set in
+# `nous-ergon-ops/scripts/observability_registry.py` (a substrate with no
+# representation there is a blind spot by construction), and the value must
+# agree with `origin` — alpha-engine-config-I7061 is 25 rows that said `lambda`
+# while their origin named an EventBridge rule, so the console asked the
+# AWS/Lambda question about a schedule and correctly found nothing. This row's
+# origin IS the daily rule; the spot box it provisions is the thing triggered,
+# not the trigger.
+substrate: eventbridge
 origin: aws:events:alpha-engine-preflight-sweep-daily
 owner: brian
 lifecycle: in-service
+
+# ── Registry claims (observability-policy.md §2.2) ──────────────────────────
+# This file is now gathered into the fleet observability registry by
+# `nous-ergon-ops/scripts/gather_repo_descriptors.py` and held to the SAME
+# schema as a row in `governance/observability.d/`
+# (alpha-engine-config-I7490). That is the point rather than a tax: §2.6 says
+# the descriptor IS the declaration for its component, so a descriptor exempt
+# from the required-field rule would be a way to publish a row that reads as
+# declared and is not. One file, one declaration, one standard.
+#
+# Every `unknown` below carries a reason, per §2.2's rule that a blank required
+# field is worse than no row. Two of them were SEARCHED FOR and not found
+# rather than left unexamined, and the reason says which — a claim recorded as
+# a guess is a wrong answer that reads as measured.
 authority_tier: observe-and-report
+
+signals:
+  # Emitted: the run report and the per-stage check envelopes both carry
+  # `ran_at`, and the dispatcher's own invocation is an EventBridge target.
+  execution: emitted
+  # Emitted: `stages_declared` / `_passed` / `_failed` / `_unmeasured` /
+  # `_unobserved` are the sweep's own coverage numbers, published even at zero.
+  data: emitted
+  # Emitted: `outcome`, plus `unsweepable_streak_state`.
+  outcome: emitted
+  cost:
+    status: unknown
+    reason: >-
+      The sweep provisions a spot box per run and no cost figure is written to
+      any artifact this row names. Not audited — stated as a work item rather
+      than claimed absent, because nothing here has looked at Cost Explorer
+      tagging for the launcher.
+  resource:
+    status: unknown
+    reason: >-
+      Not audited. The launcher box emits no memory/CPU record into
+      `_preflight_sweep/latest.json` or the check envelope, and whether the
+      spot instance publishes CloudWatch agent metrics has not been checked.
+
+log_location: >-
+  s3://alpha-engine-research/_ssm_logs/preflight-sweep/{YYYY-MM-DD}/{run_id}.log
+  (written by infrastructure/preflight_sweep.sh, which tees /var/log/
+  preflight-sweep-${RUN_ID}.log to S3), plus the
+  alpha-engine-preflight-sweep-dispatcher Lambda's CloudWatch log group for the
+  provisioning half.
+
+alert_channel: unknown
+alert_channel_reason: >-
+  Searched and not found rather than unexamined: no SES, Telegram or notifier
+  call exists in infrastructure/preflight_sweep.sh, infrastructure/
+  preflight_sweep.py or the preflight-sweep-dispatcher handler as of
+  2026-08-17. The sweep publishes verdicts and nothing routes them, so its
+  console rows are currently its ONLY reader. Recorded as unknown rather than
+  `n/a` because a daily coverage sweep with no alert path is a gap to close,
+  not a design.
+
+severity_source: unknown
+severity_source_reason: >-
+  Follows from alert_channel: with no routing there is no severity mapping to
+  declare. The status vocabulary the envelopes use is pinned by
+  alpha-engine-config-PR7488, which is a console contract, not a severity
+  taxonomy.
+
+console_surface: >-
+  console:/component/ae-preflight-sweep — the roll-up row from this descriptor,
+  plus one `ae-preflight-stage-<Stage>` check-envelope row per derived stage
+  (see the design note above on why the stage set is not enumerated here).
+
+retention: unknown
+retention_reason: >-
+  Not audited. `_preflight_sweep/latest.json` is last-write-wins with no
+  declared history, `_ssm_logs/preflight-sweep/` is date-partitioned under no
+  lifecycle rule this row has verified, and the bucket-level policy on
+  alpha-engine-research has not been read for these prefixes.
 
 # Executions: the dispatcher Lambda that provisions the launcher box and sends
 # the sweep command. Did it run, did it finish, did it miss.
