@@ -268,18 +268,21 @@ fi
 
 # ----- 4. Smoke (synthetic event, direct invoke) -----------------------------
 
+# shellcheck source=infrastructure/lambdas/_shared/smoke.sh
+source "${SCRIPT_DIR}/../_shared/smoke.sh"
 if $SMOKE; then
   echo ""
   echo "Smoke-testing via direct invoke (synthetic CI-failure event)..."
   echo "⚠ this fires a REAL spot box + REAL ci_watch_spot_bootstrap.sh run."
   RESP=$(mktemp)
   trap "rm -f '${RESP}'" EXIT
-  aws lambda invoke \
+  INVOKE_STDOUT=$(aws lambda invoke \
     --function-name "${FUNCTION_NAME}" \
     --payload '{"repo":"nousergon/alpha-engine-config","sha":"0000000000000000000000000000000000000000","run_id":"999999999","run_url":"https://github.com/nousergon/alpha-engine-config/actions/runs/999999999","workflow":"smoke-test","branch":"main"}' \
     --cli-binary-format raw-in-base64-out \
     --region "${REGION}" \
-    "${RESP}" >/dev/null
+    "${RESP}")
   cat "${RESP}"
   echo ""
+  assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
 fi

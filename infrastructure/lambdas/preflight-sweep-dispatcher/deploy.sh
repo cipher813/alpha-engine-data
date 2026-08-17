@@ -240,18 +240,21 @@ fi
 
 # ----- 4. Smoke (synthetic scheduled event, direct invoke) -------------------
 
+# shellcheck source=infrastructure/lambdas/_shared/smoke.sh
+source "${SCRIPT_DIR}/../_shared/smoke.sh"
 if $SMOKE; then
   echo ""
   echo "Smoke-testing via direct invoke (synthetic scheduled event)..."
   echo "⚠ this launches a REAL spot launcher box (via alpha-engine-weekly-freshness-spot-dispatcher) and runs a REAL all-stage preflight sweep on it — roughly one spot-hour, ~\$0.20."
   RESP=$(mktemp)
   trap "rm -f '${RESP}'" EXIT
-  aws lambda invoke \
+  INVOKE_STDOUT=$(aws lambda invoke \
     --function-name "${FUNCTION_NAME}" \
     --payload '{}' \
     --cli-binary-format raw-in-base64-out \
     --region "${REGION}" \
-    "${RESP}" >/dev/null
+    "${RESP}")
   cat "${RESP}"
   echo ""
+  assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
 fi

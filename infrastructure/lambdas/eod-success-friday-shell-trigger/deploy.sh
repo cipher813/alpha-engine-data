@@ -215,6 +215,8 @@ echo "✓ Code deployed."
 
 # ----- 4. Smoke (synthetic Friday-SUCCEEDED event) --------------------------
 
+# shellcheck source=infrastructure/lambdas/_shared/smoke.sh
+source "${SCRIPT_DIR}/../_shared/smoke.sh"
 if $SMOKE; then
   echo ""
   echo "Smoke-testing via direct invoke (synthetic Friday-EOD SUCCEEDED event)..."
@@ -260,14 +262,15 @@ EOF
   echo "WARNING: --smoke WILL START a real saturday-pipeline shell run — the payload"
   echo "         now derives a genuine Friday, so the fire path is actually reached."
   echo "         Omit --smoke and rely on unit tests + the first live event if that is not wanted."
-  aws lambda invoke \
+  INVOKE_STDOUT=$(aws lambda invoke \
     --function-name "${FUNCTION_NAME}" \
     --cli-binary-format raw-in-base64-out \
     --payload "${PAYLOAD}" \
     --region "${REGION}" \
-    "${RESP}" >/dev/null
+    "${RESP}")
   cat "${RESP}"
   echo ""
+  assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
   # Assert the outcome. Printing the response and exiting 0 regardless is what
   # made the broken payload survive: the operator saw output and read it as a
   # pass.
