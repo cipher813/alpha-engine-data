@@ -97,6 +97,12 @@
       ]
     },
     {
+      "Sid": "DisabledProducerInventoryEnumerate",
+      "Effect": "Allow",
+      "Action": ["events:ListRules", "scheduler:ListSchedules"],
+      "Resource": "*"
+    },
+    {
       "Sid": "FlowDoctorDedupStore",
       "Effect": "Allow",
       "Action": [
