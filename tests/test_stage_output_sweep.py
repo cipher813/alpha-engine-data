@@ -849,6 +849,32 @@ class TestExecutionContext:
         assert ctx.start is None and ctx.entered_stages is None
         assert len(ctx.notes) == 2
 
+    def test_no_injected_client_resolves_a_region_with_no_env_set(self, monkeypatch):
+        """Regression for alpha-engine-config-I7428: SSM AWS-RunShellScript
+        runs with neither AWS_REGION nor AWS_DEFAULT_REGION set and no
+        per-user boto profile. Before the fix, ``boto3.client("stepfunctions")``
+        with no ``sfn_client`` injected raised NoRegionError on every box
+        run and the execution context degraded with
+        "stepfunctions client unavailable: You must specify a region." on
+        every weekly run. Clearing both env vars and forcing krepis's
+        session/IMDS fallbacks to miss reproduces the exact box shape; the
+        client must still be constructed (via
+        krepis.aws_region.resolve_region()'s DEFAULT_REGION floor) rather
+        than raising NoRegionError."""
+        monkeypatch.delenv("AWS_REGION", raising=False)
+        monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+        from krepis import aws_region
+
+        monkeypatch.setattr(aws_region, "_from_botocore_session", lambda: None)
+        monkeypatch.setattr(aws_region, "_from_imds", lambda: None)
+
+        ctx = sos.read_execution_context("arn:x")
+
+        assert not any(
+            "NoRegionError" in n or "You must specify a region" in n
+            for n in ctx.notes
+        )
+
 
 class TestGatedOutRun:
     """The 2026-08-13 scheduled run terminated SUCCEEDED in 5.4 seconds,
