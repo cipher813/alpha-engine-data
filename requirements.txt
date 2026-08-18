@@ -64,15 +64,32 @@ arcticdb>=6.20.0
 # alpha-engine-config-I7111: MarketHoursGate + its four notify/record states
 # are new substantive Task states in BOTH weekday definitions, so the SAME
 # source-check requires their registry entries to exist in the pinned lib.
-# nousergon-lib-PR311 adds all five and MUST merge first; v0.124.53 is the
-# patch autobump that merge produces from today's 0.124.52
-# (auto-version-bump.yml is the single version writer). If another lib PR
-# merges between, this pin moves to whatever tag PR311's merge actually
-# produced — the source-check is what tells you, and it is the guard against
-# merging the SF JSON ahead of the registry entry.
+# nousergon-lib-PR311 adds all five and MUST merge first; v0.124.53 was the
+# patch autobump that merge produced from 0.124.52 (auto-version-bump.yml is
+# the single version writer). If another lib PR merges between, this pin moves
+# to whatever tag PR311's merge actually produced — the source-check is what
+# tells you, and it is the guard against merging the SF JSON ahead of the
+# registry entry.
+#
+# 2026-08-18: v0.124.53 -> v0.124.67 (alpha-engine-config-I7617). The
+# freshness scan's S3 LIST capped at 8 pages / 8000 objects and, on hitting
+# the cap, returned the newest object it had seen so far AS IF it were the
+# newest under the prefix. S3 lists lexically and these prefixes are
+# date-templated, so the unread tail is the newest part:
+# market_data/weekly/ reached 8208 objects and five registry rows paged
+# CRITICAL for artifacts that were fresh. nousergon-lib-PR326 makes
+# truncation a probe failure and raises the cap; that fix reaches the
+# freshness-monitor Lambda ONLY through this pin, which is why the bump is
+# the deploy.
+#
+# Bumped on EVERY surface in lockstep (30 files) per
+# tests/test_lib_pin_lockstep.py — the Dockerfile's hardcoded pin wins over
+# requirements.txt, and requirements-daily-news.txt and
+# deploy-infrastructure.yml carry their own copies. A single-file bump has
+# reached production as a canary ModuleNotFoundError three times.
 # (Superseded: alpha-engine-config-I7119 / nousergon-lib-PR310, merged as
 # v0.124.51, which registered RelaunchWeeklyFreshnessSpot.)
-nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.53
+nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.67
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,
