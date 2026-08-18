@@ -3709,3 +3709,119 @@ def test_gha_pause_age_comes_from_githubs_own_switch_off_date(fixed_now):
         _keyed_s3(objects), {"pr_resting_state_trend": trig}, fixed_now)
     assert out["pr_resting_state_trend"]["disabled_since"] == "2026-05-01"
     assert out["pr_resting_state_trend"]["days_disabled"] == 29
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Suppression coverage — the gap that could only be learned by being paged
+# (alpha-engine-config-I7606)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Producer suppression only ever fires for a row that DECLARED its
+# producer_trigger, so coverage of that field is the whole distance between
+# "a producer was deliberately switched off" and "Brian gets a CRITICAL page
+# for his own ruling". Measured 2026-08-18: 13 of 145 rows declared it, six of
+# them sat correctly quiet, and two that did not declare it —
+# health_alpha_engine_predictor_health_check and predictor_drift_detection —
+# had been escalating warning->critical on miss-count for producers disabled
+# under the 2026-08-07 pause (config-I6617). The mechanism worked. The field
+# was absent. Nothing anywhere reported the absence, so the page was the
+# notification channel for its own coverage gap.
+
+
+class _Spec:
+    def __init__(self, artifact_id):
+        self.artifact_id = artifact_id
+
+
+class _Result:
+    def __init__(self, state):
+        self.state = state
+
+
+def _coverage(pairs, declared, suppression=None, inventory=None):
+    import index
+    return index.suppression_coverage(
+        pairs, declared, suppression or {}, inventory,
+    )
+
+
+def test_coverage_counts_a_not_fresh_row_that_declared_nothing():
+    """The exact 2026-08-18 case: the row is stale, nothing says what produces
+    it, so no producer pause could ever explain the page."""
+    pairs = [
+        (_Spec("predictor_health"), _Result("stale")),
+        (_Spec("fresh_one"), _Result("fresh")),
+    ]
+    out = _coverage(pairs, {})
+    assert out["undeclared_not_fresh"] == 1
+    assert out["undeclared_not_fresh_ids"] == ["predictor_health"]
+    assert out["not_fresh"] == 1
+
+
+def test_a_declared_row_is_not_counted_even_when_it_is_still_stale():
+    """Suppression does not make a stale artifact fresh — the row keeps its
+    true state. What the declaration buys is that the staleness is EXPLAINED,
+    so it must not show up as a coverage gap."""
+    pairs = [(_Spec("daily_heal_summary"), _Result("stale"))]
+    out = _coverage(
+        pairs,
+        {"daily_heal_summary": "events:alpha-engine-daily-heal"},
+        {"daily_heal_summary": {"suppressed": True}},
+    )
+    assert out["undeclared_not_fresh"] == 0
+    assert out["suppressed"] == 1
+
+
+def test_missing_counts_the_same_as_stale():
+    """rag_ingestion_progress was `missing`, not `stale`, for 14 sweeps. A
+    coverage measure that only looked at staleness would have scored the
+    loudest row in the fleet as covered."""
+    pairs = [(_Spec("never_written"), _Result("missing"))]
+    assert _coverage(pairs, {})["undeclared_not_fresh"] == 1
+
+
+def test_coverage_never_guesses_that_a_disabled_producer_owns_a_row():
+    """A registry row does not say what produces it. Reporting the unreferenced
+    disabled producers NEXT TO the undeclared rows lets a human join them;
+    inferring the join here would silence pages on a resemblance."""
+    pairs = [(_Spec("orphan"), _Result("stale"))]
+    inventory = {
+        "complete": True,
+        "rows": [
+            {"trigger": "events:something-off", "referenced_by_registry": False},
+            {"trigger": "events:known", "referenced_by_registry": True},
+        ],
+    }
+    out = _coverage(pairs, {}, None, inventory)
+    assert out["undeclared_not_fresh_ids"] == ["orphan"]
+    assert out["disabled_producers_unreferenced"] == 1
+    # No field claims a link between the two.
+    assert not any("owner" in k or "likely" in k for k in out)
+
+
+def test_an_incomplete_inventory_is_reported_as_incomplete():
+    """enumerate_disabled_schedules records an ERROR row rather than returning
+    a short list. Coverage must carry that forward: an inventory that failed to
+    walk the account must never read as "nothing else is disabled"."""
+    out = _coverage([], {}, None, {"complete": False, "rows": []})
+    assert out["inventory_complete"] is False
+    assert _coverage([], {}, None, None)["inventory_complete"] is False
+
+
+def test_coverage_metrics_emit_zeros_rather_than_nothing():
+    """Zeros included, for the reason the execution-loop emitter states: the
+    absence of these datapoints means the emitter is dead, never that coverage
+    is complete."""
+    import index
+    calls = []
+
+    class _CW:
+        def put_metric_data(self, **kw):
+            calls.append(kw)
+
+    index._emit_suppression_coverage_metrics(_CW(), _coverage([], {}))
+    assert len(calls) == 1
+    names = {m["MetricName"]: m["Value"] for m in calls[0]["MetricData"]}
+    assert names["UndeclaredNotFreshRows"] == 0.0
+    assert names["RowsDeclaringProducerTrigger"] == 0.0
+    assert names["DisabledProducersUnreferenced"] == 0.0
