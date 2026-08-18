@@ -5839,7 +5839,7 @@
         {
           "Variable": "$.substrate_check_poll.Status",
           "StringEquals": "Success",
-          "Next": "CheckSkipReportCard"
+          "Next": "RunScope"
         },
         {
           "And": [
@@ -7669,7 +7669,7 @@
         "run_date.$": "$.run_date"
       },
       "ResultPath": "$.degraded_summary",
-      "Next": "CheckSkipReportCard"
+      "Next": "RunScope"
     },
     "SetReportCardDegradedSummary": {
       "Type": "Pass",
@@ -8062,6 +8062,46 @@
       },
       "ResultPath": "$.evaluator_director_gate_degraded_cause",
       "Next": "EvaluatorDirectorGateDegraded"
+    },
+    "RunScope": {
+      "Comment": "RunScope (alpha-engine-config-I7620) \u2014 derives THIS execution's own scope and writes backtest/{run_date}/run_scope.json: one row per gated stage, each DISABLED / ENABLED_COMPLETED / ENABLED_FAILED / NOT_REACHED, with the skip_* flag that decided it. WHY IT EXISTS: which stages a run actually dispatched has never been recorded anywhere a consumer could read, so the Director grades the week without knowing which producers were switched off. On 2026-08-14 it reported the DELIBERATE absence of pit_parity (skip_parity:true on the Saturday EventBridge target since 2026-08-13, a recorded ruling) as 'contamination UNKNOWN \u2014 the producer never ran this cycle' and withheld issue_filing + loop_verification on the strength of it. WHY DERIVED, NOT A REGISTRY: private-docs/ already carries thirteen registries; a fourteenth listing enabled stages would be a hand-kept COPY of a fact whose two authorities are this definition and this execution's history, and it would drift the first time a stage is added. One flag flip in the CFN preset therefore changes the pipeline, the artifact and the Director's purview together. PLACEMENT: immediately before CheckSkipReportCard, so every work stage is already in the history it reads; the three states after it (itself, ReportCard, Director) resolve from the execution input instead, and every row records which source decided it. NON-FATAL: its Catch routes to CheckSkipReportCard \u2014 an advisory scope artifact must never kill a run that produced real trading artifacts, and the handler's own fail-open path emits a scope whose every stage is NOT_REACHED, which grades NOTHING and so cannot be mistaken for a narrow-but-clean run. PREFLIGHT-AWARE: dry_run.$=$.research_dry \u2014 the Friday-PM shell run exercises the full describe+history+derive path and writes nothing. CONSUMER: crucible-evaluator reads the S3 artifact (not this Payload), so the two sides are not coupled through the SF payload shape. TIMEOUT: 45s, deliberately BELOW the Lambda's own 60s so the SF timeout is the one that binds (tests/test_sf_lambda_timeout_ordering.py) \u2014 a state whose ceiling never binds cannot be reasoned about from the definition.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-weekly-run-scope",
+        "Payload": {
+          "run_date.$": "$.run_date",
+          "dry_run.$": "$.research_dry",
+          "execution_arn.$": "$$.Execution.Id",
+          "state_machine_arn.$": "$$.StateMachine.Id",
+          "execution_input.$": "$$.Execution.Input"
+        }
+      },
+      "TimeoutSeconds": 45,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException",
+            "Lambda.SdkClientException"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Advisory \u2014 a missing scope artifact must not fail the run. The consumer treats an ABSENT run_scope.json as 'scope unknown, grade nothing', never as 'everything ran'.",
+          "Next": "CheckSkipReportCard",
+          "ResultPath": "$.run_scope_error"
+        }
+      ],
+      "ResultPath": "$.run_scope_result",
+      "Next": "CheckSkipReportCard"
     }
   }
 }

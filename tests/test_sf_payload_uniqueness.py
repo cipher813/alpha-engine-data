@@ -142,6 +142,18 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # crucible-evaluator (grading/pipeline_gates.py); its internal shape is
     # pinned by infrastructure/contracts/sf_gate_state.v1.schema.json and by
     # tests/test_sf_gate_state_wiring.py, not by this namespace registry.
+    # RunScope (alpha-engine-config-I7620) — alpha-engine-weekly-run-scope.
+    # Derives THIS execution's scope and writes backtest/{date}/run_scope.json.
+    # The three context values are the whole point: it cannot fetch its own
+    # history or definition without Execution.Id / StateMachine.Id, and
+    # Execution.Input carries the run's skip_* flags, read ONLY to explain a
+    # NOT_REACHED row (a disposition is always decided by the execution record,
+    # never by what the input asked for). dry_run.$=$.research_dry — the
+    # Friday-PM shell run derives everything and writes nothing.
+    "RunScope": frozenset({
+        "run_date.$", "dry_run.$", "execution_arn.$", "state_machine_arn.$",
+        "execution_input.$",
+    }),
     "ReportCard": frozenset({"date.$", "dry_run.$", "snapshot", "gate_state"}),
     # Director (Layer C, Part II) — alpha-engine-evaluator-director:live. Final
     # advisory task; reads the fresh report card, writes director/{date}/

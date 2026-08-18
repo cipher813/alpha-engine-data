@@ -151,8 +151,13 @@ class TestChainOrdering:
         success = next(
             r for r in choice["Choices"] if r.get("StringEquals") == "Success"
         )
-        # config#6054: success lands on the per-stage gate (Default: ReportCard).
-        assert success["Next"] == "CheckSkipReportCard"
+        # config#6054: success lands on the advisory tail (gate Default:
+        # ReportCard). alpha-engine-config-I7620: RunScope is now the tail's
+        # head — it derives this execution's own scope and must sit after every
+        # work stage and before the card that renders grades against it, so both
+        # routes into the tail pass through it.
+        assert success["Next"] == "RunScope"
+        assert states["RunScope"]["Next"] == "CheckSkipReportCard"
         assert states["CheckSkipReportCard"]["Default"] == "ReportCard"
 
 
@@ -186,10 +191,13 @@ class TestCatchSemantics:
         assert states["SubstrateHealthCheckDegraded"]["Type"] == "Pass"
         # A degraded substrate check must not skip the ReportCard/Director
         # Lambda tail — it is independent of the dashboard box. (config#6054:
-        # the tail entry is the skip gate, Default: ReportCard.)
+        # the tail entry is the skip gate, Default: ReportCard;
+        # alpha-engine-config-I7620: RunScope is now its head, so a fail-open
+        # substrate check still produces a scope block beside the card.)
         assert_degraded_continuation(
-            states, "SubstrateHealthCheckDegraded", "CheckSkipReportCard",
+            states, "SubstrateHealthCheckDegraded", "RunScope",
         )
+        assert states["RunScope"]["Next"] == "CheckSkipReportCard"
         assert states["CheckSkipReportCard"]["Default"] == "ReportCard"
 
 

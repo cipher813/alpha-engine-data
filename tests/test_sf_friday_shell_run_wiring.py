@@ -1051,11 +1051,14 @@ class TestConsolidatedNotify:
             for r in states["CheckSubstrateHealthCheckStatus"]["Choices"]
             if r.get("StringEquals") == "Success"
         )
-        # config#6054: the substrate check now lands on the per-stage skip
-        # gates rather than directly on ReportCard; the success chain is
-        # CheckSkipReportCard → ReportCard → CheckSkipDirector → Director →
-        # DirectorComplete (success-only rerun witness) → CheckShellRunNotify.
-        assert substrate_success["Next"] == "CheckSkipReportCard"
+        # config#6054: the substrate check lands on the per-stage skip gates
+        # rather than directly on ReportCard. alpha-engine-config-I7620: RunScope
+        # is now the head of that tail. The success chain is
+        # RunScope → CheckSkipReportCard → ReportCard → CheckSkipDirector →
+        # Director → DirectorComplete (success-only rerun witness) →
+        # CheckShellRunNotify.
+        assert substrate_success["Next"] == "RunScope"
+        assert states["RunScope"]["Next"] == "CheckSkipReportCard"
         assert states["CheckSkipReportCard"]["Default"] == "ReportCard"
         report_card = states["ReportCard"]
         assert report_card["Next"] == "CheckSkipDirector"
