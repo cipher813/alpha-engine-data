@@ -44,7 +44,9 @@ from features.factor_momentum import DEFAULT_FACTOR_LOADINGS, compute_factor_mom
 from features.feature_engineer import FEATURES, FEATURE_CFG, MIN_ROWS_FOR_FEATURES, compute_features
 from features.metron_supplemental import compute_metron_supplemental_features, write_metron_supplemental_snapshot
 from features.postflight import (
-    assert_no_zero_variance_features,
+    ZERO_VARIANCE_EXEMPT,
+    assert_no_dead_feature_columns,
+    find_all_null_columns,
     find_zero_variance_columns,
 )
 from features.private_pack import apply_private_features
@@ -1201,18 +1203,34 @@ def compute_and_write(
             )
             _fm_map = _fm_latest.dropna()
             n_fm = int(features_df["ticker"].map(_fm_map).notna().sum())
+            # NOT `.fillna(0.0)` (alpha-engine-config-I7539). 0.0 is a LEGAL
+            # factor-momentum reading, so back-filling it makes an uncomputed
+            # ticker indistinguishable from one whose tilt really is zero —
+            # and when the pass produced nothing at all, the whole column read
+            # as a plausible universe-wide zero. Measured 2026-08-18: this
+            # snapshot carried 0.0 for all 901 tickers while ArcticDB's daily
+            # second pass (builders/daily_append.update_factor_momentum_latest)
+            # held real values for the same date (AAPL -0.049, MSFT +0.069,
+            # XOM -0.101). Two stores disagreeing about one registered column,
+            # with the S3 side fabricating the disagreement.
+            #
+            # NaN is the honest state: absent, recoverable, and visible to the
+            # postflight guard below, which now reports an entirely-empty
+            # column as loudly as a constant one.
             features_df["factor_momentum_ratio"] = (
-                features_df["ticker"].map(_fm_map).fillna(0.0).astype(float)
+                features_df["ticker"].map(_fm_map).astype(float)
             )
             log.info(
                 "Factor-momentum second pass (daily): %d/%d tickers got a non-NaN "
-                "factor_momentum_ratio (window/skip warmup — rest fall back to 0.0)",
+                "factor_momentum_ratio (window/skip warmup — the rest stay NaN, "
+                "never a fabricated 0.0)",
                 n_fm, len(features_df),
             )
         except Exception:
             log.exception(
                 "Factor-momentum second pass failed — factor_momentum_ratio "
-                "stays at the FEATURES-loop default (0.0) for this snapshot"
+                "is left as the FEATURES-loop default for this snapshot and "
+                "the postflight guard below reports it"
             )
     else:
         log.warning(
@@ -1244,12 +1262,24 @@ def compute_and_write(
     # there is the expected shape, not a defect.
     _non_macro_features = [f for f in FEATURES if f not in GROUPS.get("macro", ())]
     if zero_variance_fatal:
-        assert_no_zero_variance_features(features_df, _non_macro_features)
+        assert_no_dead_feature_columns(features_df, _non_macro_features)
         _zero_variance: dict[str, int] = {}
+        _all_null: list[str] = []
     else:
         # Same columns, same predicate — only the consequence differs. See the
         # zero_variance_fatal note in this function's docstring.
         _zero_variance = find_zero_variance_columns(features_df, _non_macro_features)
+        _all_null = [c for c in find_all_null_columns(features_df, _non_macro_features)
+                     if c not in ZERO_VARIANCE_EXEMPT]
+        if _all_null:
+            log.error(
+                "EMPTY feature column(s) on the daily path: zero non-null values "
+                "over the whole universe — a producer that ran and wrote nothing "
+                "(alpha-engine-config-I7539). The snapshot IS still written and "
+                "this run is reported DEGRADED, not failed, matching the "
+                "zero-variance verdict's blast radius (I7572). Columns: %s",
+                _all_null,
+            )
         if _zero_variance:
             log.error(
                 "ZERO-VARIANCE feature column(s) detected on the daily path: every "
@@ -1339,8 +1369,11 @@ def compute_and_write(
         # A distinct status rather than "ok" so no caller can read a run whose
         # feature store carries a dead column as a fully clean one
         # (alpha-engine-config-I7572).
-        "status": "degraded" if _zero_variance else "ok",
+        "status": "degraded" if (_zero_variance or _all_null) else "ok",
         "zero_variance_columns": _zero_variance,
+        # Separate key, not folded into the one above: "constant" and "empty"
+        # send the reader to different producer questions.
+        "all_null_columns": _all_null,
         "date": date_str,
         "tickers_computed": n_ok,
         "tickers_skipped": n_skip,

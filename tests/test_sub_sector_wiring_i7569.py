@@ -116,7 +116,8 @@ def test_sub_sector_vs_benchmark_carries_real_variance(monkeypatch):
     def _capture_guard(features_df, feature_names, **kwargs):
         captured["features_df"] = features_df.copy()
 
-    monkeypatch.setattr(compute, "assert_no_zero_variance_features", _capture_guard)
+    # Renamed when the guard grew its all-null half (I7539).
+    monkeypatch.setattr(compute, "assert_no_dead_feature_columns", _capture_guard)
 
     result = compute.compute_and_write(
         date_str="2026-08-14", bucket="test-bucket", dry_run=True

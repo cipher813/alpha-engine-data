@@ -67,6 +67,74 @@ def find_zero_variance_columns(
     return offending
 
 
+def find_all_null_columns(
+    features_df: pd.DataFrame,
+    feature_names: list[str],
+) -> list[str]:
+    """Registered columns present in the frame with ZERO non-null values.
+
+    The companion to :func:`find_zero_variance_columns`, and the reason it
+    needs one: that function skips any column with fewer than
+    ``min_non_null`` values, deliberately, so a genuinely sparse alt-data
+    field is not reported as a constant. A column the producer never filled
+    has zero values and falls straight through that floor.
+
+    The hole opens the moment a producer stops back-filling an uncomputed
+    column with a fabricated default: it goes from LOUDLY constant to
+    SILENTLY absent (alpha-engine-config-I7539). A missing VALUE is the
+    honest state; a column that is missing EVERY value is a dead producer,
+    and both must be visible.
+
+    Sparse-but-present is NOT reported here — that is a coverage question
+    with its own surfaces. A column absent from the frame entirely is not
+    reported either: that is a schema failure, and naming it here would send
+    the reader to the wrong producer.
+    """
+    return [
+        col for col in feature_names
+        if col in features_df.columns
+        and int(pd.to_numeric(features_df[col], errors="coerce").notna().sum()) == 0
+    ]
+
+
+def assert_no_dead_feature_columns(
+    features_df: pd.DataFrame,
+    feature_names: list[str],
+    *,
+    exempt: frozenset[str] = ZERO_VARIANCE_EXEMPT,
+    min_non_null: int = DEFAULT_MIN_NON_NULL,
+) -> None:
+    """Raise loud (``RuntimeError``) if any registered column is dead in
+    EITHER sense: a cross-sectional constant, or entirely empty.
+
+    One entry point for the two halves of one question — "did this column's
+    producer actually produce anything?" — so a caller cannot wire up the
+    half that existed first and leave the other unchecked.
+    """
+    constant = find_zero_variance_columns(
+        features_df, feature_names, exempt=exempt, min_non_null=min_non_null,
+    )
+    empty = [c for c in find_all_null_columns(features_df, feature_names)
+             if c not in exempt]
+    if not constant and not empty:
+        return
+    parts = []
+    if constant:
+        parts.append(
+            "cross-sectional CONSTANT (every non-null value identical, so the "
+            f"column passes every null-coverage check and carries zero signal): {constant}"
+        )
+    if empty:
+        parts.append(
+            "entirely EMPTY (zero non-null values over the whole universe — a "
+            f"producer that ran and wrote nothing): {sorted(empty)}"
+        )
+    raise RuntimeError(
+        "Dead feature column(s) detected (alpha-engine-config-I7539). "
+        + " | ".join(parts)
+    )
+
+
 def assert_no_zero_variance_features(
     features_df: pd.DataFrame,
     feature_names: list[str],
