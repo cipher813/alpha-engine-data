@@ -102,7 +102,9 @@ def test_residual_and_factor_momentum_carry_real_variance(monkeypatch):
     def _capture_guard(features_df, feature_names, **kwargs):
         captured["features_df"] = features_df.copy()
 
-    monkeypatch.setattr(compute, "assert_no_zero_variance_features", _capture_guard)
+    # Renamed when the guard grew its all-null half (I7539, second
+    # part): one entry point now covers "constant" AND "empty".
+    monkeypatch.setattr(compute, "assert_no_dead_feature_columns", _capture_guard)
 
     result = compute.compute_and_write(
         date_str="2026-08-14", bucket="test-bucket", dry_run=True
@@ -117,3 +119,41 @@ def test_residual_and_factor_momentum_carry_real_variance(monkeypatch):
         assert len(non_null) >= 20, f"{col}: too few non-null values ({len(non_null)})"
         assert non_null.nunique() > 1, f"{col}: still constant — {non_null.unique()}"
         assert non_null.std() > 0.0, f"{col}: still zero cross-sectional variance"
+
+
+def test_an_uncomputed_factor_momentum_stays_nan_never_a_fabricated_zero(monkeypatch):
+    """0.0 is a LEGAL factor-momentum reading, so back-filling it makes an
+    uncomputed ticker indistinguishable from one whose tilt really is zero
+    (alpha-engine-config-I7539).
+
+    Measured 2026-08-18: `features/2026-08-18/technical.parquet` carried 0.0
+    for all 901 tickers while ArcticDB's daily second pass held real values
+    for the same date (AAPL -0.049, MSFT +0.069, XOM -0.101). Two stores
+    disagreeing about one registered column, with the S3 side fabricating the
+    disagreement.
+
+    RED before this change: the `.fillna(0.0)` made every unmapped ticker 0.0.
+    """
+    price_data, macro = _synthetic_universe()
+    _patch_loaders(monkeypatch, price_data, macro)
+
+    captured = {}
+
+    def _capture_guard(features_df, feature_names, **kwargs):
+        captured["features_df"] = features_df.copy()
+
+    monkeypatch.setattr(compute, "assert_no_dead_feature_columns", _capture_guard)
+    # An empty signal map: the pass ran and resolved nothing, which is the
+    # live shape this issue is about.
+    monkeypatch.setattr(
+        compute, "compute_factor_momentum_feature",
+        lambda panel: pd.Series([float("nan")] * len(panel), index=panel.index),
+    )
+
+    compute.compute_and_write(date_str="2026-08-14", bucket="test-bucket", dry_run=True)
+
+    col = captured["features_df"]["factor_momentum_ratio"]
+    assert col.isna().all(), (
+        "an uncomputed factor_momentum_ratio must be absent, not 0.0 — a "
+        f"fabricated zero is unfalsifiable downstream. Got: {col.dropna().unique()[:5]}"
+    )
