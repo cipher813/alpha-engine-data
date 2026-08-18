@@ -1159,6 +1159,90 @@ def _check_one(
 # ── Aggregation + S3 emission ───────────────────────────────────────────────
 
 
+def suppression_coverage(
+    pairs: list[tuple[Any, Any]],
+    producer_trigger_by_id: dict[str, str | list],
+    suppression_by_id: dict[str, dict[str, Any]],
+    inventory: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Which not-fresh rows nothing can explain (alpha-engine-config-I7606).
+
+    Producer suppression only ever fires for a row that DECLARED its
+    ``producer_trigger``. Coverage of that field is therefore the thing
+    standing between "a producer was deliberately switched off" and "Brian
+    gets a CRITICAL page for his own ruling" — and until now the only way to
+    learn a row was missing the declaration was to receive that page.
+
+    Measured 2026-08-18: 13 of 145 rows declared it. Two that did not —
+    ``health_alpha_engine_predictor_health_check`` and
+    ``predictor_drift_detection`` — had been escalating warning->critical on
+    miss-count for producers DISABLED under the 2026-08-07 pause ruling
+    (config-I6617), while six rows that did declare it sat correctly quiet in
+    the same sweep. The mechanism was working; the field was absent. Nothing
+    reported the absence.
+
+    This does not guess. A registry row does not say what produces it, so
+    "undeclared" here means exactly that and never "its producer is off" —
+    the inventory of what IS off is the other half, already written next door,
+    and the two are reported side by side so a human can join them. The number
+    that matters is ``undeclared_not_fresh``: rows that are stale or missing
+    and carry no declaration that could ever explain it.
+    """
+    not_fresh = [
+        spec for spec, result in pairs
+        if getattr(result, "state", None) in ("stale", "missing")
+    ]
+    undeclared = sorted(
+        spec.artifact_id for spec in not_fresh
+        if spec.artifact_id not in producer_trigger_by_id
+    )
+    disabled_rows = [
+        r for r in ((inventory or {}).get("rows") or []) if not r.get("error")
+    ]
+    return {
+        "registry_rows": len(pairs),
+        "rows_declaring_producer_trigger": len(producer_trigger_by_id),
+        "not_fresh": len(not_fresh),
+        "suppressed": len(
+            [v for v in suppression_by_id.values() if v.get("suppressed")]
+        ),
+        "undeclared_not_fresh": len(undeclared),
+        "undeclared_not_fresh_ids": undeclared,
+        # The join a human has to make by hand today: these are switched off
+        # and no registry row names them, so no artifact's page can currently
+        # be explained by them even if one of them is the cause.
+        "disabled_producers_unreferenced": len(
+            [r for r in disabled_rows if not r.get("referenced_by_registry")]
+        ),
+        "inventory_complete": bool((inventory or {}).get("complete")),
+    }
+
+
+def _emit_suppression_coverage_metrics(
+    cw_client: Any, coverage: dict[str, Any]
+) -> None:
+    """Emit coverage to CW on EVERY run, zeros included (config-I7606).
+
+    Zeros included for the reason the execution-loop emitter states: the
+    absence of these datapoints means the emitter is dead, never that coverage
+    is complete. ``UndeclaredNotFreshRows`` is the alarmable one — it is the
+    count of pages that no suppression could ever prevent.
+    """
+    cw_client.put_metric_data(
+        Namespace=CW_NAMESPACE,
+        MetricData=[
+            {"MetricName": "UndeclaredNotFreshRows",
+             "Value": float(coverage["undeclared_not_fresh"]), "Unit": "Count"},
+            {"MetricName": "RowsDeclaringProducerTrigger",
+             "Value": float(coverage["rows_declaring_producer_trigger"]),
+             "Unit": "Count"},
+            {"MetricName": "DisabledProducersUnreferenced",
+             "Value": float(coverage["disabled_producers_unreferenced"]),
+             "Unit": "Count"},
+        ],
+    )
+
+
 def _serialize_check_results(
     pairs: list[tuple[ArtifactSpec, CheckResult]], now: datetime,
     miss_counts: dict[str, int] | None = None,
@@ -1167,6 +1251,7 @@ def _serialize_check_results(
     suppression_by_id: dict[str, dict[str, Any]] | None = None,
     owning_by_id: dict[str, dict[str, Any]] | None = None,
     execution_loop: dict[str, Any] | None = None,
+    coverage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the ``check_results.json`` payload — one row per spec for
     the dashboard surface (Phase 5). ``miss_counts``/``coerced_ids``
@@ -1259,6 +1344,12 @@ def _serialize_check_results(
         # never has to fetch a second artifact to answer "is this class
         # paging about a component or about an undrained backlog?".
         "execution_loop": execution_loop,
+        # config-I7606 — the coverage of the suppression mechanism itself, on
+        # the same surface as the rows it governs, for the same reason: a
+        # consumer can now tell "quiet because its producer is deliberately
+        # off" from "loud because nothing declared what produces it" without
+        # joining two artifacts by hand.
+        "suppression_coverage": coverage,
         "results": rows,
     }
 
@@ -3178,7 +3269,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     # off?", this answers "what is off at all?", including schedules no
     # artifact row names. Written before the probe pass so a pass that raises
     # still leaves the inventory current.
-    write_disabled_producer_inventory(
+    disabled_inventory = write_disabled_producer_inventory(
         s3, now,
         {t for v in producer_trigger_by_id.values() for t in _declared_triggers(v)},
     )
@@ -3223,12 +3314,31 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     )
 
     # Emit dashboard surface + self-heartbeat.
+    # config-I7606: coverage of the suppression mechanism itself, computed
+    # before serialization so the numbers and the rows they describe come out
+    # of the same pass and cannot disagree.
+    coverage = suppression_coverage(
+        pairs, producer_trigger_by_id, suppression_by_id, disabled_inventory,
+    )
+    if coverage["undeclared_not_fresh"]:
+        logger.warning(
+            "SUPPRESSION COVERAGE: %d not-fresh row(s) declare no "
+            "producer_trigger, so no producer pause could ever explain them: "
+            "%s. %d of %d rows declare the field; %d disabled producer(s) are "
+            "named by no registry row (config-I7606).",
+            coverage["undeclared_not_fresh"],
+            coverage["undeclared_not_fresh_ids"],
+            coverage["rows_declaring_producer_trigger"],
+            coverage["registry_rows"],
+            coverage["disabled_producers_unreferenced"],
+        )
     check_results = _serialize_check_results(
         pairs, now, miss_counts=miss_counts, coerced_ids=coerced_ids,
         issue_filed_by_id=issue_filed_by_id,
         suppression_by_id=suppression_by_id,
         owning_by_id=owning_by_id,
         execution_loop=execution_loop,
+        coverage=coverage,
     )
     heartbeat = _serialize_heartbeat(pairs, now, started_at)
 
@@ -3255,6 +3365,18 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             exc_info=True,
         )
         _emit_cycle_verdict_error("execution_loop_cw_emit")
+
+    # config-I7606 — coverage on CloudWatch, in its own trap for the same
+    # reason as the pair above: a PutMetricData regression must not suppress
+    # the S3 artifact that already carries the same numbers.
+    try:
+        _emit_suppression_coverage_metrics(boto3.client("cloudwatch"), coverage)
+    except Exception as exc:  # noqa: BLE001 — secondary observability; recording surfaces: this ERROR, the CW Stage=suppression_coverage_cw_emit datapoint, and check_results.json's suppression_coverage block (already written above)
+        logger.error(
+            "suppression-coverage CW metric emit failed (non-fatal): %s", exc,
+            exc_info=True,
+        )
+        _emit_cycle_verdict_error("suppression_coverage_cw_emit")
 
     # ── Per-cycle completion rollup (L249 consumer) ─────────────────────
     # Secondary observability hung off the primary probe pass. The artifact
