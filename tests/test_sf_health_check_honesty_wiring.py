@@ -63,9 +63,12 @@ CHECKS = [
     ("WeeklySubstrateHealthCheck", "WaitForWeeklySubstrateHealthCheck",
      "CheckSubstrateHealthCheckStatus", "SubstrateHealthCheckPollWait",
      "SubstrateHealthCheckDegraded", "$.substrate_check_poll",
-     # config#6054: the tail entry is now the per-stage skip gate; its
-     # Default is ReportCard, so the degrade-then-proceed property holds.
-     "CheckSkipReportCard", 240),
+     # config#6054: the tail entry is the per-stage skip gate; its Default is
+     # ReportCard, so the degrade-then-proceed property holds.
+     # alpha-engine-config-I7620: RunScope is now the tail's head and routes
+     # straight on to that gate, so the property is unchanged — a degraded
+     # substrate check still proceeds, and now does so with a scope block.
+     "RunScope", 240),
 ]
 _IDS = [c[0] for c in CHECKS]
 

@@ -1,0 +1,4 @@
+# No third-party dependencies. boto3 is provided by the Lambda runtime, and the
+# derivation in run_scope.py is pure stdlib by design — it is the module that
+# decides what the Director may grade, so it carries no dependency that could
+# fail to import on a cold start and take the scope block down with it.

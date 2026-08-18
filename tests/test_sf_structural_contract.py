@@ -385,6 +385,22 @@ _NOTIFY_RESOURCE = "arn:aws:states:::sns:publish"
 #     needing its own tracker issue, not a leftover.
 _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
     "step_function.json": {
+        "RunScope": (
+            "alpha-engine-config-I7620. The fail-open is VISIBLE on the "
+            "consumer surface rather than through an SF flag, which is why no "
+            "flag is wired. Two cases, and both are loud: (a) the derivation "
+            "fails INSIDE the Lambda — it still writes run_scope.json, with "
+            "degraded=true and every stage NOT_REACHED, so the Report Card "
+            "renders 'SCOPE UNAVAILABLE ... 0 stages graded'; (b) the Lambda "
+            "itself fails to invoke and this Catch fires — no artifact is "
+            "written, and the consumer treats an ABSENT run_scope.json as "
+            "'scope unknown, grade nothing', never as 'everything ran'. In "
+            "neither case can a broken scope producer render as a narrow, "
+            "clean, fully green cycle, which is the property the degraded-flag "
+            "convention exists to guarantee. Adding a sixth degraded family "
+            "would require a breaking change to sf_gate_state.v1 for strictly "
+            "less signal than the artifact already carries."
+        ),
         "WeeklyRunDayGate": (
             "sf-pipeline-policy.md §5 carve-out: 'The weekly run-day gate "
             "fails open — missing a weekly run is worse than a duplicate; "

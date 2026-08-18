@@ -68,6 +68,12 @@ _FUNCTION_TIMEOUTS_SEC: dict[str, int] = {
     "alpha-engine-evaluator": 300,
     "alpha-engine-evaluator-director": 900,
     "alpha-engine-predictor-inference": 900,
+    # alpha-engine-config-I7620. Two read-only Step Functions API calls plus a
+    # pure in-memory derivation — no S3 reads, no spot, no model call. Matches
+    # the --bootstrap timeout in
+    # infrastructure/lambdas/weekly-run-scope/deploy.sh; a generous ceiling here
+    # would let an advisory state hold the tail of the weekly run.
+    "alpha-engine-weekly-run-scope": 60,
     "alpha-engine-predictor-regime-retrospective-eval": 600,
     "alpha-engine-predictor-regime-substrate": 300,
     "alpha-engine-replay-concordance": 900,
