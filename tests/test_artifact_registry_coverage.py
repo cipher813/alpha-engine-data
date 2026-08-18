@@ -179,6 +179,35 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # means the assertion itself stopped running — nobody is checking whether
     # the corpus is warm — and nothing else surfaces that.
     "rag/pipelines/assert_corpus_freshness.py": 1,
+    # health/rag_ingestion_progress/{run_date}.json — per-step progress
+    # telemetry written by the weekly RAG ingestion pipeline
+    # (alpha-engine-config-I2966, Brian directive 2026-07-18).
+    #
+    # GRANDFATHERED OUT of ARTIFACT_REGISTRY.yaml, deliberately, and this is
+    # the reconciliation of a contradiction that cost 14 CRITICAL pages
+    # (alpha-engine-config-I7603). A registry row for this artifact WAS
+    # merged in alpha-engine-config on 2026-07-23 carrying
+    # `sla_minutes_after_cron: 360`, while this producer — the only writer —
+    # was still on an unopened branch and declared itself fire-and-forget.
+    # The two halves asserted opposite things about the same key: one that
+    # the artifact is late if it misses a six-hour SLA, the other that
+    # losing a tick is acceptable by design. The row won by default because
+    # it was the half that shipped, and it escalated warning->critical on
+    # miss-count every sweep for 26 days for an artifact with no writer at
+    # all. The row was withdrawn on 2026-08-18 and is NOT reinstated here.
+    #
+    # The producer's declaration is the correct one: this is telemetry ABOUT
+    # the pipeline (step, label, timestamp — a live readout for the Fleet
+    # Status console), not pipeline output anything downstream consumes. Its
+    # PUT is fail-soft by design, so there is no SLA that could honestly be
+    # asserted over it. Same precedent as the rag/watermarks/ store above.
+    #
+    # The health signal for THIS mechanism is the RAGIngestion stage's own
+    # completion, which is already registered and already monitored. If a
+    # progress readout is ever wanted as a monitored artifact, the fail-soft
+    # PUT has to become a hard one FIRST — the SLA follows the durability
+    # guarantee, never the other way round.
+    "rag/pipelines/emit_progress.py": 1,
     "builders/migrate_universe_vwap.py": 1,
     "builders/prune_delisted_tickers.py": 1,
     # builders/backfill_delisted_audit/{date}-{HHMMSSZ}.json — per-run audit record for
