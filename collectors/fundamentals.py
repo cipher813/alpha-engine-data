@@ -330,6 +330,70 @@ NEUTRAL = {
 }
 
 
+# ── Source-key declaration + absent-source gate (alpha-engine-config-I7583) ──
+#
+# The vendor keys each output field reads, in fallback order. SINGLE OWNER:
+# _fetch_single_ticker picks through this map instead of repeating the key
+# lists inline, so the absence check cannot drift from what is actually read.
+#
+# Why this exists, and why it is separate from the collapse gate below:
+# `_pick` returns 0.0 for a key absent from the response, and nothing
+# distinguished that from a genuine zero. `capitalSpendingGrowth5Y` and
+# `freeCashFlowTTM` do not exist in Finnhub's `metric=all` response AT ALL, so
+# both read as a universe-wide 0.0 for the life of the integration with this
+# collector reporting `ok` every run. They were found by hand off a question in
+# a chat (alpha-engine-config-I7569), not by any check.
+#
+# The collapse gate catches that class by its SYMPTOM (a field carrying one
+# value across the universe). This gate catches it at the CAUSE, before any
+# default has been applied, which buys two things the symptom check cannot:
+# the error names the missing vendor keys instead of the constant they
+# produced, and it still fires when an absent field's default happens to VARY.
+_FIELD_SOURCE_KEYS: dict[str, tuple[str, ...]] = {
+    "pe_ratio": ("peTTM", "peExclExtraTTM", "peNormalizedAnnual"),
+    "pb_ratio": ("pbAnnual", "pbQuarterly"),
+    "debt_to_equity": ("totalDebt/totalEquityAnnual", "totalDebt/totalEquityQuarterly"),
+    "revenue_growth_yoy": (
+        "revenueGrowthTTMYoy", "revenueGrowthQuarterlyYoy", "revenueGrowth5Y",
+    ),
+    "gross_margin": ("grossMarginTTM", "grossMarginAnnual", "grossMargin5Y"),
+    "roe": ("roeTTM", "roeRfy"),
+    "current_ratio": ("currentRatioAnnual", "currentRatioQuarterly"),
+    "revenue_growth_3y": ("revenueGrowth3Y", "revenueGrowth5Y"),
+    "eps_growth_3y": ("epsGrowth3Y", "epsBasicExclExtraItemsAnnual5Y", "epsGrowth5Y"),
+    "payout_ratio": ("payoutRatioTTM", "payoutRatioAnnual"),
+    "dividend_yield": ("dividendYieldIndicatedAnnual", "currentDividendYieldTTM"),
+    "capex_growth_5y": ("capexCagr5Y",),
+    # fcf_yield is DERIVED (1 / P-FCF-per-share), not read directly; these are
+    # the keys whose absence makes it underivable.
+    "fcf_yield": ("pfcfShareTTM", "pfcfShareAnnual"),
+    "market_cap_raw": ("marketCapitalization",),
+}
+
+# A field absent for MORE than this fraction of the fetched universe is not
+# per-ticker sparsity (newer listings, ADRs, funds without the metric) — it is
+# the vendor not exposing the key. Set well above realistic sparsity and below
+# 1.0 so it fires before the field is fully dead rather than only at the extreme.
+_SOURCE_ABSENCE_FAIL_SHARE = 0.95
+
+# Transport-only key on the per-ticker record. Popped in collect() before the
+# snapshot is assembled — never written to S3, never seen by a consumer.
+_ABSENT_KEY = "__absent_source_fields__"
+
+
+def _absent_source_fields(metrics: dict) -> set[str]:
+    """Output fields for which NONE of the declared vendor keys is present.
+
+    A property of the RESPONSE, read before any default is applied — the one
+    point where "the vendor did not send this" and "the value is zero" are
+    still distinguishable.
+    """
+    return {
+        field for field, keys in _FIELD_SOURCE_KEYS.items()
+        if not any(k in metrics and metrics[k] is not None for k in keys)
+    }
+
+
 def _fetch_single_ticker(ticker: str) -> dict:
     """Fetch and normalize fundamental data for a single ticker via Finnhub.
 
@@ -345,35 +409,29 @@ def _fetch_single_ticker(ticker: str) -> dict:
     if not isinstance(metrics, dict) or not metrics:
         return NEUTRAL.copy()
 
+    # Recorded BEFORE any default is applied (alpha-engine-config-I7583).
+    _absent = _absent_source_fields(metrics)
+
     # P/E: TTM preferred; peExclExtraTTM smooths special-item noise; annual fallback
-    pe_raw = _pick(metrics, "peTTM", "peExclExtraTTM", "peNormalizedAnnual")
+    pe_raw = _pick(metrics, *_FIELD_SOURCE_KEYS["pe_ratio"])
 
     # P/B: annual is the canonical book-value reference; quarterly fallback for newly-listed
-    pb_raw = _pick(metrics, "pbAnnual", "pbQuarterly")
+    pb_raw = _pick(metrics, *_FIELD_SOURCE_KEYS["pb_ratio"])
 
     # D/E: Finnhub uses literal slash in field name. Quarterly fallback when annual missing.
-    de_raw = _pick(
-        metrics,
-        "totalDebt/totalEquityAnnual",
-        "totalDebt/totalEquityQuarterly",
-    )
+    de_raw = _pick(metrics, *_FIELD_SOURCE_KEYS["debt_to_equity"])
 
     # Revenue growth: TTM YoY preferred; quarterly YoY fallback; 5Y last (smooths cycles).
-    revenue_growth_raw = _pick(
-        metrics,
-        "revenueGrowthTTMYoy",
-        "revenueGrowthQuarterlyYoy",
-        "revenueGrowth5Y",
-    )
+    revenue_growth_raw = _pick(metrics, *_FIELD_SOURCE_KEYS["revenue_growth_yoy"])
 
     # Gross margin: TTM preferred; annual fallback; 5Y last.
-    gross_margin_raw = _pick(metrics, "grossMarginTTM", "grossMarginAnnual", "grossMargin5Y")
+    gross_margin_raw = _pick(metrics, *_FIELD_SOURCE_KEYS["gross_margin"])
 
     # ROE: TTM preferred; Rfy (rolling fiscal year) fallback.
-    roe_raw = _pick(metrics, "roeTTM", "roeRfy")
+    roe_raw = _pick(metrics, *_FIELD_SOURCE_KEYS["roe"])
 
     # Current ratio: annual; quarterly fallback.
-    current_ratio_raw = _pick(metrics, "currentRatioAnnual", "currentRatioQuarterly")
+    current_ratio_raw = _pick(metrics, *_FIELD_SOURCE_KEYS["current_ratio"])
 
     # FCF yield: ``freeCashFlowTTM``/``freeCashFlowAnnual`` were assumed
     # present by analogy with the old FMP integration but are absent from
@@ -384,8 +442,8 @@ def _fetch_single_ticker(ticker: str) -> dict:
     # ratio inverted: FCF yield = 1 / (P/FCF). Fall back to NEUTRAL (0.0)
     # when the ratio is missing or non-positive — inverting a non-positive
     # P/FCF would silently emit a meaningless (or sign-flipped) yield.
-    market_cap = _pick(metrics, "marketCapitalization")
-    pfcf_share = _pick(metrics, "pfcfShareTTM", "pfcfShareAnnual")
+    market_cap = _pick(metrics, *_FIELD_SOURCE_KEYS["market_cap_raw"])
+    pfcf_share = _pick(metrics, *_FIELD_SOURCE_KEYS["fcf_yield"])
     if pfcf_share and pfcf_share > 0:
         fcf_yield_raw = 1.0 / pfcf_share
     else:
@@ -406,10 +464,8 @@ def _fetch_single_ticker(ticker: str) -> dict:
     # composite ranking (base-effect noise + single-quarter anomalies
     # average out). Annual fallbacks for newer listings without a full
     # 3y history.
-    revenue_growth_3y_raw = _pick(metrics, "revenueGrowth3Y", "revenueGrowth5Y")
-    eps_growth_3y_raw = _pick(
-        metrics, "epsGrowth3Y", "epsBasicExclExtraItemsAnnual5Y", "epsGrowth5Y",
-    )
+    revenue_growth_3y_raw = _pick(metrics, *_FIELD_SOURCE_KEYS["revenue_growth_3y"])
+    eps_growth_3y_raw = _pick(metrics, *_FIELD_SOURCE_KEYS["eps_growth_3y"])
 
     # ── Stewardship pillar substrate (Phase 3a) ──
     # Payout ratio + dividend yield + capex growth proxy. Insider ownership
@@ -420,14 +476,12 @@ def _fetch_single_ticker(ticker: str) -> dict:
     # discipline" axis: payout (return-of-capital intensity), dividend
     # yield (vs. payout, identifies low-yield + low-payout = buyback-
     # heavy retainers), and capex growth (reinvestment intensity).
-    payout_ratio_raw = _pick(metrics, "payoutRatioTTM", "payoutRatioAnnual")
-    dividend_yield_raw = _pick(
-        metrics, "dividendYieldIndicatedAnnual", "currentDividendYieldTTM",
-    )
+    payout_ratio_raw = _pick(metrics, *_FIELD_SOURCE_KEYS["payout_ratio"])
+    dividend_yield_raw = _pick(metrics, *_FIELD_SOURCE_KEYS["dividend_yield"])
     # capitalSpendingGrowth5Y does not exist in Finnhub's response (same
     # absent-field problem as freeCashFlowTTM above); the real 5y CAPEX CAGR
     # field is capexCagr5Y (alpha-engine-config-I7569).
-    capex_growth_5y_raw = _pick(metrics, "capexCagr5Y")
+    capex_growth_5y_raw = _pick(metrics, *_FIELD_SOURCE_KEYS["capex_growth_5y"])
 
     # Finnhub reports growth/margin/return/payout/yield metrics as PERCENT
     # POINTS (e.g. ``grossMarginTTM: 48.65`` means 48.65%, ``roeTTM: 137.18``
@@ -465,6 +519,7 @@ def _fetch_single_ticker(ticker: str) -> dict:
         # SIZE loading's log + cross-sectional z-score downstream tames the
         # scale; clipping here would corrupt the absolute units.
         "market_cap_raw": market_cap_raw,
+        _ABSENT_KEY: _absent,
     }
 
 
@@ -510,9 +565,19 @@ def collect(
     quality_counts_by_type: dict[str, int] = {}
     quality_blocked_details: list[str] = []  # "TICKER.type" per block
 
+    absent_counts: dict[str, int] = {}
+    n_fetched = 0
+
     for ticker in tickers:
         try:
             data = _fetch_single_ticker(ticker)
+            # I7583: strip the transport-only absence set before ANY consumer
+            # (the value-range gate, NEUTRAL comparison, the snapshot) sees it.
+            _absent = data.pop(_ABSENT_KEY, None)
+            if _absent is not None:
+                n_fetched += 1
+                for _f in _absent:
+                    absent_counts[_f] = absent_counts.get(_f, 0) + 1
             # ── Write-time value-range gate ─────────────────────────────
             # Runs on the fully-shaped (clipped) per-ticker dict before it
             # is queued for the S3 snapshot. block → drop the corrupt row
@@ -605,6 +670,48 @@ def collect(
     # that is dead for every ticker passes ok_ratio 903 times over — that is
     # exactly how capitalSpendingGrowth5Y and freeCashFlowTTM went unnoticed
     # for the life of the Finnhub integration (alpha-engine-config-I7569).
+    # ── Absent-source gate (alpha-engine-config-I7583) ──────────────────────
+    # The CAUSE-side check, run before the collapse gate below, which is the
+    # SYMPTOM-side one. Both are kept: this names the missing vendor keys and
+    # fires even when an absent field's default varies; the collapse gate
+    # catches every other route to a dead column (units saturation, a scaling
+    # divisor, a vendor pinning a value) without needing to know the cause.
+    _absent_everywhere = {
+        f: n for f, n in absent_counts.items()
+        if n_fetched and (n / n_fetched) >= _SOURCE_ABSENCE_FAIL_SHARE
+    }
+    if _absent_everywhere and n_fetched >= _FIELD_COLLAPSE_MIN_TICKERS:
+        msg = (
+            "source key(s) absent from the vendor response for effectively the "
+            f"whole universe over {n_fetched} fetched tickers: "
+            + ", ".join(
+                f"{f} ({n}/{n_fetched}, reads {list(_FIELD_SOURCE_KEYS[f])})"
+                for f, n in sorted(_absent_everywhere.items())
+            )
+            + ". Each is currently being written as a default value a consumer "
+            "cannot distinguish from real data. Refusing to write the snapshot."
+        )
+        logger.error("Fundamentals absent-source gate: %s", msg)
+        return {
+            "status": "error",
+            "error": msg,
+            "tickers_ok": n_ok,
+            "tickers_error": n_err,
+            "absent_source_fields": _absent_everywhere,
+            **_quality_fields,
+        }
+    if absent_counts:
+        # Below the fail share this is ordinary per-ticker sparsity, but it is
+        # RECORDED rather than dropped: a field drifting from 5% to 60% absent
+        # is the shape of a vendor deprecating a key, and it should be visible
+        # before it crosses the threshold, not at the moment it halts a run.
+        logger.info(
+            "Fundamentals source-key coverage over %d fetched tickers "
+            "(absent counts, below the %.0f%% fail share): %s",
+            n_fetched, _SOURCE_ABSENCE_FAIL_SHARE * 100,
+            dict(sorted(absent_counts.items())),
+        )
+
     _real_records = [r for r in results.values() if r != NEUTRAL]
     if len(_real_records) < _FIELD_COLLAPSE_MIN_TICKERS:
         logger.info(
