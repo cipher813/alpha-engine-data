@@ -59,7 +59,16 @@ store:
   type: dynamodb
   table_name: flow-doctor-store
   region: us-east-1
-dedup_cooldown_minutes: 60
+# 60min was shorter than the ~24h daily-run cadence, so an UNCHANGED error
+# signature (e.g. the same zero-variance feature columns, still unfixed —
+# alpha-engine-config-I7569/I7583) re-notified every single run instead of
+# once per open episode. 10080min (7d) means: notify once, stay quiet on an
+# identical signature for a week, but a CHANGED signature (new/different
+# offending columns, a regression) still hashes differently and notifies
+# immediately — observability-policy.md §7.2a grouping-on-causal-key, not
+# a report/GitHub-issue-suppression. Raw CloudWatch ERROR logs are written
+# by the stdlib logger independently of this and are unaffected either way.
+dedup_cooldown_minutes: 10080
 rate_limits:
   max_alerts_per_day: 10
   max_issues_per_day: 3       # caps issues -> labels -> fix-PR generations
