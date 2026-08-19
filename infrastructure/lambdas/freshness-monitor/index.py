@@ -68,6 +68,7 @@ exception path is a CW Logs-level surface.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -2287,12 +2288,23 @@ def _owning_item_body_fragment(owning: dict[str, Any] | None) -> str:
     return frag
 
 
-def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
-                 consecutive_miss_runs: int = 0,
-                 producer_suppression: dict[str, Any] | None = None,
-                 owning: dict[str, Any] | None = None) -> bool:
-    """Route an alert for a non-fresh probe result. Returns True if
-    publish was attempted (OBSERVE-mode short-circuit returns False).
+def _alert_decision(spec: ArtifactSpec, result: CheckResult, now: datetime,
+                    consecutive_miss_runs: int = 0,
+                    producer_suppression: dict[str, Any] | None = None,
+                    owning: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """Decide whether this probe result belongs on the operator page, and
+    return the decision. Returns ``None`` when it does not.
+
+    **This function performs no I/O.** It carries every gate the per-artifact
+    publish path used to apply inline — states, SLA grace, OBSERVE mode,
+    producer suppression, probe-failure coercion, the config-I3086 warning
+    ladder and the §7.4a owning-item escalation basis — and hands the surviving
+    rows to :func:`_publish_digest`, which emits ONE page per sweep covering all
+    of them (config-I7713).
+
+    Splitting the decision from the delivery is what makes the rollup possible
+    at all: while each row published itself, "one page per sweep" could only
+    have been a cooldown, which suppresses facts rather than combining them.
 
     Only fires when:
       - ``result.state ∈ {missing, stale, probe_failed}``
@@ -2309,7 +2321,7 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
     how many 15min probes have already fired in this window.
     """
     if result.state not in _ALERTING_STATES:
-        return False
+        return None
 
     # config-I6570 — the producing trigger is live-confirmed DISABLED, so this
     # miss is a deliberate switch-off rather than a producer failure. Placed
@@ -2327,20 +2339,20 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
             producer_suppression["disabled_since"],
             producer_suppression["days_disabled"],
         )
-        return False
+        return None
 
     # Substrate already filters fresh/grace; the SLA-grace filter
     # mirrors the substrate's clip-at-zero arithmetic for
     # missing/stale. probe_failed has no SLA — fire immediately.
     if result.state in ("missing", "stale") and result.sla_violated_by_minutes == 0:
-        return False
+        return None
 
     if not ALERTS_ENABLED:
         logger.info(
             "OBSERVE-mode: would alert on %s state=%s reason=%r",
             spec.artifact_id, result.state, result.reason,
         )
-        return False
+        return None
 
     # Probe failures route to critical (the monitor itself is broken);
     # missing/stale respect the spec's severity. Plan §3 invariant 6.
@@ -2391,10 +2403,13 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
             "check_results.json, no SNS/Telegram",
             spec.artifact_id, result.state,
         )
-        return False
+        return None
 
-    # Compose the alert body.
-    body = (
+    # The per-artifact detail line. Identical field-for-field to the body the
+    # per-artifact page used to send, so nothing an operator or a log grep
+    # relied on lost its shape — it is now one line of a grouped page rather
+    # than a page of its own.
+    line = (
         f"artifact_id={spec.artifact_id} "
         f"owner_repo={spec.owner_repo} "
         f"state={result.state} "
@@ -2403,38 +2418,192 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
         f"reason={result.reason}"
     )
     if escalated:
-        body += (
+        line += (
             f" escalated_from=warning escalation_basis={escalation_basis}"
             f" after_consecutive_miss_runs={consecutive_miss_runs}"
         )
-    body += " " + _owning_item_body_fragment(owning)
-    dedup_key = resolve_dedup_key(spec, now)
+    line += " " + _owning_item_body_fragment(owning)
 
-    # config-I6796: `publish()` is the only channel here whose dedup actually
-    # matches the artifact's own cadence (dedup_window_min=None + a
-    # cycle-scoped dedup_key ⇒ exactly one send per cadence window). Flow-doctor's
-    # Telegram dedup is a fleet-wide 1-minute DynamoDB cooldown
-    # (flow_doctor_telegram.build_flow_doctor_config) completely decoupled from
-    # cadence — any artifact re-evaluated more than 1 minute apart (every 30-min
-    # intraday tick, or the daily vs. historical cron) re-pages Telegram even
-    # though `dedup_key` is unchanged. Gating the Telegram send on `publish()`'s
-    # own dedup verdict makes the already-correct cadence-window dedup the single
-    # source of truth for BOTH channels, instead of letting Telegram ignore it.
+    return {
+        "artifact_id": spec.artifact_id,
+        "owner_repo": spec.owner_repo,
+        "cadence": spec.cadence,
+        "alert_class": _alert_class(spec),
+        "state": result.state,
+        "canonical_key": result.canonical_key,
+        "sla_violated_by_minutes": result.sla_violated_by_minutes,
+        "severity": severity,
+        "escalated": escalated,
+        "escalation_basis": escalation_basis,
+        "consecutive_miss_runs": consecutive_miss_runs,
+        "group_key": _cause_group_key(spec),
+        "owning": owning,
+        "owning_item": owning_item,
+        "line": line,
+    }
+
+
+def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
+                 consecutive_miss_runs: int = 0,
+                 producer_suppression: dict[str, Any] | None = None,
+                 owning: dict[str, Any] | None = None) -> bool:
+    """Whether this row belongs on the sweep's page.
+
+    Retained as the boolean face of :func:`_alert_decision` — it is the gate
+    predicate the drain lane, the execution-loop records and a long tail of
+    tests are written against, and that predicate did not change. What changed
+    is that it no longer SENDS: since config-I7713 a sweep emits one grouped
+    page via :func:`_publish_digest` rather than one message per artifact.
+    """
+    return _alert_decision(
+        spec, result, now,
+        consecutive_miss_runs=consecutive_miss_runs,
+        producer_suppression=producer_suppression,
+        owning=owning,
+    ) is not None
+
+
+# ── Digest rollup (config-I7713) ────────────────────────────────────────────
+#
+# Brian, 2026-08-19: "I should only get one if it points to a singular issue,
+# instead i'm getting ~20. The single error should encompass all errors
+# currently triggering."
+#
+# The monitor used to publish once per artifact per cadence window. That dedup
+# is correct at the artifact level and useless at the operator level: on
+# 2026-08-19T12:03:13Z a single sweep emitted 17 pages, and all 17 were one
+# cause (78 registry rows carrying a weekday cadence over a once-weekly
+# producer — alpha-engine-config-I7709). Seventeen true statements about one
+# fact is not seventeen findings.
+#
+# So: ONE page per sweep, grouped by CAUSE. The grouping key is derived from
+# what the registry already declares about a row's producer, in this order:
+#
+#   1. `produced_by` — the pipeline(s) that write it. Rows that go stale
+#      together because one pipeline did not run share this key exactly.
+#   2. `producer_trigger` — the schedule/rule/workflow, for rows with no
+#      pipeline (the `continuous` tier).
+#   3. `owner_repo` — the last resort, so a row with neither declaration still
+#      lands in a named group rather than in a nameless remainder.
+#
+# Dedup is on the SET, not the artifact: the page re-fires when the set of
+# alerting artifacts CHANGES (something joined or recovered) or when the UTC
+# day rolls over, and stays quiet while the same condition persists. A cooldown
+# would have suppressed the 17th page; this suppresses nothing and says the 17
+# things once.
+
+
+def _cause_group_key(spec: ArtifactSpec) -> str:
+    """The cause this row's absence belongs to — see the module note above.
+
+    Derived, never hand-kept: every input is already declared on the row, and a
+    second copy of "what produces this" is the drift shape the registry's own
+    cadence coupling exists to prevent.
+    """
+    pipelines = sorted(
+        {
+            entry.get("pipeline")
+            for entry in (getattr(spec, "produced_by", None) or [])
+            if isinstance(entry, dict) and entry.get("pipeline")
+        }
+    )
+    if pipelines:
+        return "pipeline:" + "+".join(pipelines)
+    declared = getattr(spec, "producer_trigger", None)
+    triggers = _declared_triggers(declared) if declared else ()
+    if triggers:
+        return "trigger:" + "+".join(sorted(triggers))
+    return f"owner_repo:{spec.owner_repo}"
+
+
+def _digest_dedup_key(decisions: list[dict[str, Any]], now: datetime) -> str:
+    """One key per (distinct set of alerting artifacts, UTC day).
+
+    Hashing the SET is the whole point: an unchanged condition stays quiet, and
+    an artifact joining or recovering changes the key and re-pages, because the
+    situation genuinely changed. A time-based cooldown could not tell those
+    apart and would have to drop the new one.
+    """
+    ids = ",".join(sorted(d["artifact_id"] for d in decisions))
+    fingerprint = hashlib.sha256(ids.encode("utf-8")).hexdigest()[:16]
+    return f"freshness_digest_{now.date().isoformat()}_{fingerprint}"
+
+
+def _compose_digest(decisions: list[dict[str, Any]], now: datetime) -> str:
+    """The single page body: a one-line verdict, then one block per cause.
+
+    Ordering is deterministic (critical groups first, then by group size, then
+    by key) so the same condition renders the same way every time and a
+    diff between two pages means something.
+    """
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for decision in decisions:
+        groups[decision["group_key"]].append(decision)
+
+    n_critical = sum(1 for d in decisions if d["severity"] == "critical")
+    header = (
+        f"{len(decisions)} artifact(s) past SLA across {len(groups)} cause(s) "
+        f"({n_critical} critical) — freshness sweep {now.isoformat()}"
+    )
+
+    def _group_rank(item: tuple[str, list[dict[str, Any]]]) -> tuple:
+        key, members = item
+        has_critical = any(m["severity"] == "critical" for m in members)
+        return (0 if has_critical else 1, -len(members), key)
+
+    blocks = [header]
+    for key, members in sorted(groups.items(), key=_group_rank):
+        members.sort(key=lambda m: (m["severity"] != "critical", m["artifact_id"]))
+        worst = max(m["sla_violated_by_minutes"] for m in members)
+        # The owning item is a property of the CAUSE, so it is named once for
+        # the group rather than repeated on every member line.
+        owning_fragment = _owning_item_body_fragment(
+            next((m["owning"] for m in members if (m["owning"] or {}).get("owning_item")),
+                 members[0]["owning"])
+        )
+        blocks.append(
+            f"\n[{key}] {len(members)} artifact(s), worst "
+            f"sla_violated_by_minutes={worst}\n  {owning_fragment}"
+        )
+        for member in members:
+            blocks.append(f"  - {member['line']}")
+    return "\n".join(blocks)
+
+
+def _publish_digest(decisions: list[dict[str, Any]], now: datetime) -> int:
+    """Emit the sweep's single page. Returns the number of artifacts it covers
+    (0 when there is nothing to say, which is silence by absence of condition —
+    never by suppression).
+
+    Severity is the MAX over the covered rows: a digest containing one critical
+    row is a critical page, so grouping can never demote an alert. That is the
+    invariant that makes the rollup safe — it changes how many messages are
+    sent, never which conditions are reportable.
+    """
+    if not decisions:
+        return 0
+
+    severity = "critical" if any(
+        d["severity"] == "critical" for d in decisions
+    ) else "warning"
+    body = _compose_digest(decisions, now)
+    dedup_key = _digest_dedup_key(decisions, now)
+
     publish_result = publish(
         body,
         severity=severity,
         source="freshness-monitor",
         dedup_key=dedup_key,
-        dedup_window_min=None,  # one alert per cadence window — substrate handles cycle bucketing
+        dedup_window_min=None,
         telegram=False,
     )
     if publish_result.dedup_skipped:
         logger.info(
-            "telegram suppressed (config-I6796): %s state=%s already paged "
-            "this cadence window (%s)",
-            spec.artifact_id, result.state, publish_result.dedup_reason,
+            "digest suppressed: the same %d-artifact condition set already "
+            "paged today (%s)",
+            len(decisions), publish_result.dedup_reason,
         )
-        return True
+        return len(decisions)
 
     notify_via_flow_doctor(
         body,
@@ -2446,15 +2615,13 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
         topics=_FRESHNESS_TELEGRAM_TOPICS,
         db_basename=_DB_BASENAME,
         context={
-            "artifact_id": spec.artifact_id,
-            "state": result.state,
-            "owner_repo": spec.owner_repo,
-            "owning_item": (owning_item or {}).get("number"),
-            "owning_item_age_days": (owning_item or {}).get("age_days"),
-            "escalation_basis": escalation_basis,
+            "n_artifacts": len(decisions),
+            "n_groups": len({d["group_key"] for d in decisions}),
+            "artifact_ids": sorted(d["artifact_id"] for d in decisions),
+            "group_keys": sorted({d["group_key"] for d in decisions}),
         },
     )
-    return True
+    return len(decisions)
 
 
 # ── Key-deliverable extended-staleness escalation (config#2055 Gap 2) ───────
@@ -3058,6 +3225,7 @@ def _run_probe_pass(
     """
     pairs: list[tuple[ArtifactSpec, CheckResult]] = []
     alerted = 0
+    digest_decisions: list[dict[str, Any]] = []
     dispatched = 0
     per_spec_exceptions = 0
     prev_miss_counts = prev_miss_counts or {}
@@ -3143,14 +3311,22 @@ def _run_probe_pass(
             )
             owning_by_id[spec.artifact_id] = owning
 
-        paged = False
-        if not suppress_page and _maybe_alert(
+        # config-I7713 — decide here, deliver ONCE after the loop. `paged`
+        # keeps its exact meaning (this row is on the operator page), so the
+        # execution-loop records, the drain-candidate gate and the `alerted`
+        # count below are unchanged; only the number of MESSAGES changed.
+        decision = None
+        if not suppress_page:
+            decision = _alert_decision(
                 spec, result, now, consecutive_miss_runs=miss_runs,
                 producer_suppression=(suppression_by_id or {}).get(
                     spec.artifact_id),
-                owning=owning):
+                owning=owning,
+            )
+        paged = decision is not None
+        if paged:
+            digest_decisions.append(decision)
             alerted += 1
-            paged = True
 
         if paged:
             owning_item = (owning or {}).get("owning_item")
@@ -3178,6 +3354,21 @@ def _run_probe_pass(
             and remediation_by_id.get(spec.artifact_id) != "operator"
         ):
             drain_candidates.append(spec.artifact_id)
+
+    # config-I7713 — the sweep's SINGLE page, covering every row that decided
+    # to alert above. Trapped like every other side effect: a delivery failure
+    # must not sink check_results.json or the heartbeat, which are the durable
+    # record this page is only a notification of.
+    try:
+        _publish_digest(digest_decisions, now)
+    except Exception as digest_exc:  # noqa: BLE001 — the page is a notification; the durable record is check_results.json, and this ERROR is the recording surface for its loss
+        logger.error(
+            "FRESHNESS_DIGEST_PUBLISH_FAILED for %d artifact(s) %s "
+            "(non-fatal): %s",
+            len(digest_decisions),
+            sorted(d["artifact_id"] for d in digest_decisions),
+            digest_exc, exc_info=True,
+        )
 
     # One aggregated event-time drain per pass (config-I3282), trapped so a
     # dispatch failure can never sink the pass's primary deliverables. The

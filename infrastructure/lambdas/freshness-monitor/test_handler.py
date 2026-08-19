@@ -568,11 +568,15 @@ def test_handler_alerts_enabled_fires_with_dedup_key(
     assert publish_mock.called
     assert notify_mock.called
 
-    # Inspect the publish calls — dedup keys should be unique per-artifact
-    # and reflect the cycle window.
-    dedup_keys = [c.kwargs["dedup_key"] for c in publish_mock.call_args_list]
-    # probe_missing is saturday_sf in W22 → "freshness_probe_missing_2026-W22"
-    assert "freshness_probe_missing_2026-W22" in dedup_keys
+    # config-I7713 — a sweep emits exactly ONE page, whose dedup key identifies
+    # the condition SET and the day. The per-artifact key this used to assert
+    # ("freshness_probe_missing_2026-W22") deduped correctly per artifact and
+    # was the reason 17 true statements about one cause arrived as 17 pages on
+    # 2026-08-19. The artifact is still named — in the body, not in the key.
+    assert publish_mock.call_count == 1, publish_mock.call_args_list
+    dedup_key = publish_mock.call_args.kwargs["dedup_key"]
+    assert dedup_key.startswith("freshness_digest_2026-05-30_")
+    assert "artifact_id=probe_missing" in publish_mock.call_args.args[0]
 
 
 def test_handler_warning_severity_console_only_no_alert(
@@ -767,6 +771,22 @@ def test_handler_observe_to_production_cutover_via_env_flip(
     assert publish_mock2.call_count >= 1
 
 
+# ── config-I7713: decide-then-deliver ───────────────────────────────────────
+#
+# A sweep now emits ONE grouped page instead of one message per artifact, so
+# `_maybe_alert` decides and `_publish_digest` delivers. `_page` runs both, which
+# is what the per-artifact tests below were always really asserting: given this
+# spec and result, does a page go out and what does it say? The single-decision
+# case is deliberately covered by the same assertions as before — grouping must
+# not change severity, and must not drop a field from the body.
+def _page(index_mod, spec, result, now, **kwargs) -> bool:
+    decision = index_mod._alert_decision(spec, result, now, **kwargs)
+    if decision is None:
+        return False
+    index_mod._publish_digest([decision], now)
+    return True
+
+
 # ── _maybe_alert direct unit coverage ───────────────────────────────────────
 
 
@@ -786,7 +806,7 @@ def test_maybe_alert_skips_fresh_state(monkeypatch, fixed_now):
     result = CheckResult(state="fresh")
     publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
     monkeypatch.setattr(index, "publish", publish_mock)
-    assert index._maybe_alert(spec, result, fixed_now) is False
+    assert _page(index, spec, result, fixed_now) is False
     assert publish_mock.call_count == 0
 
 
@@ -807,7 +827,7 @@ def test_maybe_alert_skips_missing_within_sla_grace(monkeypatch, fixed_now):
     result = CheckResult(state="missing", sla_violated_by_minutes=0)
     publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
     monkeypatch.setattr(index, "publish", publish_mock)
-    assert index._maybe_alert(spec, result, fixed_now) is False
+    assert _page(index, spec, result, fixed_now) is False
     assert publish_mock.call_count == 0
 
 
@@ -837,15 +857,18 @@ def test_maybe_alert_fires_missing_past_sla(monkeypatch, fixed_now):
     notify_mock = mock.Mock(return_value=True)
     monkeypatch.setattr(index, "publish", publish_mock)
     monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
-    assert index._maybe_alert(spec, result, fixed_now) is True
+    assert _page(index, spec, result, fixed_now) is True
     publish_mock.assert_called_once()
     call = publish_mock.call_args
     assert "artifact_id=x" in call.args[0]
     assert call.kwargs["severity"] == "critical"  # spec severity, not bumped
     assert call.kwargs["telegram"] is False
-    assert call.kwargs["dedup_key"] == "freshness_x_2026-W22"
+    # config-I7713: the key now identifies the CONDITION SET, not one artifact —
+# that is what lets an unchanged situation stay quiet while a new artifact
+# joining it re-pages. A per-artifact key could not express either.
+    assert call.kwargs["dedup_key"].startswith("freshness_digest_2026-05-30_")
     notify_mock.assert_called_once()
-    assert notify_mock.call_args.kwargs["dedup_key"] == "freshness_x_2026-W22"
+    assert notify_mock.call_args.kwargs["dedup_key"] == call.kwargs["dedup_key"]
 
 
 def test_maybe_alert_telegram_suppressed_when_publish_dedup_skipped(monkeypatch, fixed_now):
@@ -882,7 +905,7 @@ def test_maybe_alert_telegram_suppressed_when_publish_dedup_skipped(monkeypatch,
     notify_mock = mock.Mock(return_value=True)
     monkeypatch.setattr(index, "publish", publish_mock)
     monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
-    assert index._maybe_alert(spec, result, fixed_now) is True
+    assert _page(index, spec, result, fixed_now) is True
     publish_mock.assert_called_once()
     notify_mock.assert_not_called()
 
@@ -916,7 +939,7 @@ def test_maybe_alert_telegram_path_carries_freshness_monitor_source(monkeypatch,
     notify_mock = mock.Mock(return_value=True)
     monkeypatch.setattr(index, "publish", publish_mock)
     monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
-    assert index._maybe_alert(spec, result, fixed_now) is True
+    assert _page(index, spec, result, fixed_now) is True
 
     publish_mock.assert_called_once()
     assert publish_mock.call_args.kwargs["source"] == "freshness-monitor"
@@ -953,7 +976,7 @@ def test_maybe_alert_warning_missing_console_only(monkeypatch, fixed_now):
     notify_mock = mock.Mock(return_value=True)
     monkeypatch.setattr(index, "publish", publish_mock)
     monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
-    assert index._maybe_alert(spec, result, fixed_now) is False
+    assert _page(index, spec, result, fixed_now) is False
     publish_mock.assert_not_called()
     notify_mock.assert_not_called()
 
@@ -977,7 +1000,7 @@ def test_maybe_alert_probe_failed_uses_critical_severity(monkeypatch, fixed_now)
     notify_mock = mock.Mock(return_value=True)
     monkeypatch.setattr(index, "publish", publish_mock)
     monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
-    assert index._maybe_alert(spec, result, fixed_now) is True
+    assert _page(index, spec, result, fixed_now) is True
     publish_mock.assert_called_once()
     assert publish_mock.call_args.kwargs["severity"] == "critical"
     assert publish_mock.call_args.kwargs["telegram"] is False
@@ -1934,7 +1957,7 @@ def test_maybe_alert_warning_escalates_after_threshold(monkeypatch, fixed_now):
     monkeypatch.setattr(index, "publish", publish_mock)
     monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
     spec, result = _warning_spec_and_missing_result(index)
-    assert index._maybe_alert(
+    assert _page(index, 
         spec, result, fixed_now,
         consecutive_miss_runs=index.WARNING_ESCALATION_RUNS) is True
     body = publish_mock.call_args.args[0]
@@ -1951,7 +1974,7 @@ def test_maybe_alert_warning_below_threshold_stays_console_only(
     publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
     monkeypatch.setattr(index, "publish", publish_mock)
     spec, result = _warning_spec_and_missing_result(index)
-    assert index._maybe_alert(
+    assert _page(index, 
         spec, result, fixed_now,
         consecutive_miss_runs=index.WARNING_ESCALATION_RUNS - 1) is False
     publish_mock.assert_not_called()
@@ -2682,12 +2705,12 @@ def test_maybe_alert_suppressed_when_producer_disabled(monkeypatch, fixed_now):
         "trigger": "events:r", "reason": "EventBridge rule r is DISABLED",
         "disabled_since": "2026-05-29", "days_disabled": 1, "suppressed": True,
     }
-    assert index._maybe_alert(
+    assert _page(index, 
         spec, result, fixed_now, producer_suppression=suppression) is False
     assert publish_mock.call_count == 0
 
     # Same critical row, same miss — suppression lapsed ⇒ it pages.
-    assert index._maybe_alert(
+    assert _page(index, 
         spec, result, fixed_now,
         producer_suppression={**suppression, "suppressed": False}) is True
     assert publish_mock.call_count == 1
@@ -2947,7 +2970,7 @@ def test_page_names_the_already_open_owning_item(monkeypatch, fixed_now):
     monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
     spec, result = _critical_spec_and_missing_result(index)
 
-    assert index._maybe_alert(spec, result, fixed_now,
+    assert _page(index, spec, result, fixed_now,
                               owning=_owning()) is True
     body = publish_mock.call_args.args[0]
     assert "owning_item=#6562" in body
@@ -2970,7 +2993,7 @@ def test_page_lists_the_other_items_describing_the_same_condition(
     spec, result = _critical_spec_and_missing_result(index)
     members = [{"number": n} for n in (6155, 6345, 6747)]
 
-    assert index._maybe_alert(spec, result, fixed_now,
+    assert _page(index, spec, result, fixed_now,
                               owning=_owning(members=members)) is True
     body = publish_mock.call_args.args[0]
     assert "owning_item=#6562" in body
@@ -2993,7 +3016,7 @@ def test_degraded_owning_item_search_still_pages_and_says_so(
     monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
     spec, result = _critical_spec_and_missing_result(index)
 
-    assert index._maybe_alert(
+    assert _page(index, 
         spec, result, fixed_now,
         owning=index._unresolved("api.github.com: URLError: timed out"),
     ) is True
@@ -3016,7 +3039,7 @@ def test_no_open_item_says_none_not_unknown(monkeypatch, fixed_now):
     empty = {"resolved": True, "degraded": False, "degraded_reason": None,
              "owning_item": None, "members": [], "n_candidates": 0}
 
-    assert index._maybe_alert(spec, result, fixed_now, owning=empty) is True
+    assert _page(index, spec, result, fixed_now, owning=empty) is True
     body = publish_mock.call_args.args[0]
     assert "owning_item=none owning_item_lookup=ok" in body
 
@@ -3038,7 +3061,7 @@ def test_owning_item_age_drives_escalation_not_the_miss_count(
     monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
     spec, result = _warning_spec_and_missing_result(index)
 
-    assert index._maybe_alert(
+    assert _page(index, 
         spec, result, fixed_now, consecutive_miss_runs=0,
         owning=_owning(age_days=9.0, sla_days=3),
     ) is True
@@ -3063,7 +3086,7 @@ def test_young_owning_item_does_not_escalate_but_is_still_recorded(
     spec, result = _warning_spec_and_missing_result(index)
     owning = _owning(age_days=0.5, sla_days=3)
 
-    assert index._maybe_alert(
+    assert _page(index, 
         spec, result, fixed_now, consecutive_miss_runs=13, owning=owning,
     ) is False
     publish_mock.assert_not_called()
@@ -3094,7 +3117,7 @@ def test_miss_count_ladder_still_governs_an_undiagnosed_condition(
     empty = {"resolved": True, "degraded": False, "degraded_reason": None,
              "owning_item": None, "members": [], "n_candidates": 0}
 
-    assert index._maybe_alert(
+    assert _page(index, 
         spec, result, fixed_now,
         consecutive_miss_runs=index.WARNING_ESCALATION_RUNS, owning=empty,
     ) is True
@@ -3413,8 +3436,8 @@ def test_owning_item_resolution_never_widens_a_grace_window(monkeypatch, fixed_n
     monkeypatch.setattr(index, "publish", publish_mock)
     monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
     spec, result = _critical_spec_and_missing_result(index)
-    assert index._maybe_alert(spec, result, fixed_now, owning=_owning()) is True
-    assert index._maybe_alert(
+    assert _page(index, spec, result, fixed_now, owning=_owning()) is True
+    assert _page(index, 
         spec, result.__class__(state="stale", reason="in grace",
                                canonical_key=result.canonical_key,
                                sla_violated_by_minutes=0),
@@ -3825,3 +3848,235 @@ def test_coverage_metrics_emit_zeros_rather_than_nothing():
     assert names["UndeclaredNotFreshRows"] == 0.0
     assert names["RowsDeclaringProducerTrigger"] == 0.0
     assert names["DisabledProducersUnreferenced"] == 0.0
+
+
+# ── config-I7713: one page per sweep, grouped by cause ──────────────────────
+#
+# Brian, 2026-08-19: "I should only get one if it points to a singular issue,
+# instead i'm getting ~20. The single error should encompass all errors
+# currently triggering."
+#
+# The measured condition these tests reconstruct: the 2026-08-19T12:03:13Z
+# sweep emitted 17 pages and all 17 shared one cause (78 registry rows on a
+# weekday cadence over a once-weekly producer — alpha-engine-config-I7709).
+
+
+def _weekly_spec(index_mod, artifact_id, *, severity="critical", pipeline="ne-weekly-freshness-pipeline"):
+    from nousergon_lib.artifact_freshness import ArtifactSpec
+    spec = ArtifactSpec(
+        artifact_id=artifact_id, s3_bucket="b",
+        s3_key_template=f"{artifact_id}/{{date}}.json",
+        cadence="saturday_sf", sla_minutes_after_cron=60,
+        severity=severity, owner_repo="ae-test", created_at=date(2025, 1, 1),
+    )
+    object.__setattr__(spec, "produced_by", [{"pipeline": pipeline, "stage": "S"}])
+    return spec
+
+
+def _missing(index_mod, key):
+    from nousergon_lib.artifact_freshness import CheckResult
+    return CheckResult(state="missing", sla_violated_by_minutes=300,
+                       canonical_key=key, reason="absent")
+
+
+def _decide_all(index_mod, specs, now):
+    return [index_mod._alert_decision(s, _missing(index_mod, f"{s.artifact_id}/k"), now)
+            for s in specs]
+
+
+def test_seventeen_artifacts_one_cause_produce_exactly_one_page(monkeypatch, fixed_now):
+    """The regression itself, at the measured scale."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    notify_mock = mock.Mock(return_value=True)
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
+
+    specs = [_weekly_spec(index, f"backtest_{i}") for i in range(17)]
+    covered = index._publish_digest(_decide_all(index, specs, fixed_now), fixed_now)
+
+    assert covered == 17
+    publish_mock.assert_called_once()
+    notify_mock.assert_called_once()
+    body = publish_mock.call_args.args[0]
+    # Nothing is dropped: every artifact still appears, with its own reason.
+    for spec in specs:
+        assert f"artifact_id={spec.artifact_id}" in body
+    assert "17 artifact(s) past SLA across 1 cause(s)" in body
+
+
+def test_distinct_causes_are_separate_blocks_in_the_same_page(monkeypatch, fixed_now):
+    """Grouping must not merge unrelated conditions into one undifferentiated
+    wall — one page, but the causes stay legible and separately counted."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+
+    specs = [
+        _weekly_spec(index, "weekly_a"),
+        _weekly_spec(index, "weekly_b"),
+        _weekly_spec(index, "preopen_a", pipeline="ne-preopen-trading-pipeline"),
+    ]
+    index._publish_digest(_decide_all(index, specs, fixed_now), fixed_now)
+
+    body = publish_mock.call_args.args[0]
+    assert "across 2 cause(s)" in body
+    assert "[pipeline:ne-weekly-freshness-pipeline] 2 artifact(s)" in body
+    assert "[pipeline:ne-preopen-trading-pipeline] 1 artifact(s)" in body
+
+
+def test_one_critical_row_makes_the_whole_digest_critical(monkeypatch, fixed_now):
+    """The invariant that makes the rollup safe: grouping changes how many
+    messages are sent, never which conditions are reportable. A digest that
+    took its severity from the majority could demote a critical page by
+    surrounding it with warnings."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+
+    decisions = [
+        index._alert_decision(_weekly_spec(index, "crit"), _missing(index, "k"), fixed_now),
+        # A warning row only reaches the page via the escalation ladder, which
+        # is exactly how a mixed-severity digest arises in production.
+        index._alert_decision(
+            _weekly_spec(index, "warn", severity="warning"), _missing(index, "k"),
+            fixed_now, consecutive_miss_runs=index.WARNING_ESCALATION_RUNS),
+    ]
+    index._publish_digest([d for d in decisions if d], fixed_now)
+    assert publish_mock.call_args.kwargs["severity"] == "critical"
+
+
+def test_nothing_alerting_sends_nothing(monkeypatch, fixed_now):
+    """Silence by absence of condition. A healthy sweep must not emit an empty
+    page — check_results.json and the heartbeat are the surfaces that prove the
+    monitor ran (observability-policy §9.2a)."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    notify_mock = mock.Mock(return_value=True)
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
+
+    assert index._publish_digest([], fixed_now) == 0
+    publish_mock.assert_not_called()
+    notify_mock.assert_not_called()
+
+
+def test_dedup_key_tracks_the_condition_set_not_the_clock(monkeypatch, fixed_now):
+    """An unchanged set stays quiet; an artifact joining or recovering re-pages.
+    A time-based cooldown cannot tell those apart — it would have to drop the
+    new one, which is suppressing a fact rather than combining facts."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+
+    two = _decide_all(index, [_weekly_spec(index, "a"), _weekly_spec(index, "b")], fixed_now)
+    three = _decide_all(
+        index, [_weekly_spec(index, "a"), _weekly_spec(index, "b"), _weekly_spec(index, "c")],
+        fixed_now)
+
+    assert index._digest_dedup_key(two, fixed_now) == index._digest_dedup_key(
+        list(reversed(two)), fixed_now), "order must not change the key"
+    assert index._digest_dedup_key(two, fixed_now) != index._digest_dedup_key(three, fixed_now)
+
+
+def test_publish_dedup_skip_does_not_double_send_telegram(monkeypatch, fixed_now):
+    """config-I6796's invariant, preserved through the rollup: publish()'s dedup
+    verdict is the single source of truth for BOTH channels."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    notify_mock = mock.Mock(return_value=True)
+    monkeypatch.setattr(index, "publish", mock.Mock(
+        return_value=mock.Mock(dedup_skipped=True, dedup_reason="already-sent")))
+    monkeypatch.setattr(index, "notify_via_flow_doctor", notify_mock)
+
+    covered = index._publish_digest(
+        _decide_all(index, [_weekly_spec(index, "a")], fixed_now), fixed_now)
+    assert covered == 1  # still counted as covered — it IS on the operator page
+    notify_mock.assert_not_called()
+
+
+def test_group_key_falls_back_through_trigger_to_owner_repo(monkeypatch):
+    """Every alerting row lands in a NAMED group. A nameless remainder bucket
+    would recreate the wall this rollup exists to remove."""
+    import importlib
+    import index
+    importlib.reload(index)
+    from nousergon_lib.artifact_freshness import ArtifactSpec
+
+    base = dict(s3_bucket="b", s3_key_template="k/{date}", cadence="continuous",
+                interval_minutes=15, sla_minutes_after_cron=30, severity="warning",
+                owner_repo="nousergon-data", created_at=date(2025, 1, 1))
+    bare = ArtifactSpec(artifact_id="bare", **base)
+    assert index._cause_group_key(bare) == "owner_repo:nousergon-data"
+
+    triggered = ArtifactSpec(artifact_id="trig", **base)
+    object.__setattr__(triggered, "producer_trigger", ("scheduler:x-15min",))
+    assert index._cause_group_key(triggered) == "trigger:scheduler:x-15min"
+
+    # produced_by wins over producer_trigger — the pipeline is the closer cause.
+    both = ArtifactSpec(artifact_id="both", **base)
+    object.__setattr__(both, "producer_trigger", ("scheduler:x-15min",))
+    object.__setattr__(both, "produced_by", [{"pipeline": "ne-weekly-freshness-pipeline"}])
+    assert index._cause_group_key(both) == "pipeline:ne-weekly-freshness-pipeline"
+
+
+def test_digest_publish_failure_does_not_sink_the_sweep(monkeypatch, fixed_now):
+    """The page is a notification; check_results.json is the record. A delivery
+    failure must be loud and must not cost the durable surface."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    monkeypatch.setattr(index, "publish", mock.Mock(side_effect=RuntimeError("sns down")))
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+
+    with pytest.raises(RuntimeError):
+        index._publish_digest(
+            _decide_all(index, [_weekly_spec(index, "a")], fixed_now), fixed_now)
+
+
+def test_handler_still_writes_check_results_when_the_digest_cannot_be_sent(
+    monkeypatch, yaml_registry_body, fake_s3, fixed_now
+):
+    """The other half of the above, through the real handler: delivery raising
+    must not cost the durable record. `_publish_digest` raises for the whole
+    sweep now rather than for one artifact, so the trap around it carries more
+    weight than the per-artifact one it replaced — hence this test."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    fake_s3._registry_body = yaml_registry_body
+    cycle_tick = datetime(2026, 5, 30, 9, 0, tzinfo=timezone.utc)
+    fake_s3._head_returns["path/2026-05-30/fresh.json"] = {
+        "LastModified": cycle_tick.replace(hour=12),
+    }
+
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
+    monkeypatch.setattr(index, "publish", mock.Mock(side_effect=RuntimeError("sns down")))
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+
+    result = index.handler({}, None)
+
+    assert result["alerts_enabled"] is True
+    written = {k for (_, k, _) in fake_s3._put_calls}
+    assert "_freshness_monitor/check_results.json" in written
+    assert "_freshness_monitor/heartbeat.json" in written
