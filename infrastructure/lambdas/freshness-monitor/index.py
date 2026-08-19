@@ -3488,8 +3488,43 @@ def _run_probe_pass(
         # `owning_item=unknown` and the page still fires. Recording
         # surfaces: the WARNING below, `owning_item_lookup_degraded_reason`
         # on the check_results row, and the OwningItemLookupDegraded metric.
+        # config-I7622 — only `missing` rows can be "never written", and only
+        # a handful are missing in any sweep (3 of 146, measured 2026-08-19), so
+        # this costs one bounded LIST each rather than a scan. Runs BEFORE the
+        # owning-item join (config-I7730) because that join's budget gate reads
+        # this answer — a never-written row cannot page, so it must not spend a
+        # GitHub query.
+        never_written: bool | None = None
+        if result.state == "missing" and len(never_written_by_id) < _NEVER_WRITTEN_PROBE_MAX:
+            never_written = _prefix_has_ever_been_written(s3_client, spec, result)
+            if never_written is not None:
+                never_written = not never_written
+            never_written_by_id[spec.artifact_id] = never_written
+
         owning: dict[str, Any] | None = None
-        if _is_confirmed_miss(result):
+        # config-I7730 — spend the budget where it can change an outcome.
+        # `_resolve_owning_item` ran for EVERY confirmed miss at 2+ GitHub
+        # searches each, against a 24-query cap. MEASURED 2026-08-19T17:02Z: 12
+        # confirmed misses, of which 9 could not page under ANY owning-item
+        # answer — 7 producer-suppressed, 2 never-written — so the cap was spent
+        # on them and the ONE row that did page carried
+        # `owning_item_lookup=degraded owning_item_lookup_reason=
+        # 'lookup_budget_exhausted'` onto Brian's Telegram page. The join that
+        # exists to explain a page was starved by rows that cannot produce one.
+        #
+        # These two gates are exactly `_alert_decision`'s own early returns,
+        # BOTH of which sit above every use of `owning`, so skipping the lookup
+        # for them cannot change any verdict — it only stops paying for an
+        # answer nothing reads. The row still reaches check_results.json with
+        # its true state; what it loses is an owning-item block on a page it was
+        # never going to appear on.
+        _suppressed = (suppression_by_id or {}).get(spec.artifact_id)
+        _cannot_page = (
+            (_suppressed and _suppressed.get("suppressed"))
+            or never_written_by_id.get(spec.artifact_id) is True
+            or suppress_page
+        )
+        if _is_confirmed_miss(result) and not _cannot_page:
             try:
                 owning = _resolve_owning_item(
                     spec.artifact_id, result.canonical_key,
@@ -3512,16 +3547,6 @@ def _run_probe_pass(
         # keeps its exact meaning (this row is on the operator page), so the
         # execution-loop records, the drain-candidate gate and the `alerted`
         # count below are unchanged; only the number of MESSAGES changed.
-        # config-I7622 — only `missing` rows can be "never written", and only
-        # a handful are missing in any sweep (3 of 146, measured 2026-08-19), so
-        # this costs one MaxKeys=1 LIST each rather than a scan.
-        never_written: bool | None = None
-        if result.state == "missing" and len(never_written_by_id) < _NEVER_WRITTEN_PROBE_MAX:
-            never_written = _prefix_has_ever_been_written(s3_client, spec, result)
-            if never_written is not None:
-                never_written = not never_written
-            never_written_by_id[spec.artifact_id] = never_written
-
         decision = None
         if not suppress_page:
             decision = _alert_decision(
