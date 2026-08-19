@@ -79,6 +79,9 @@ class TestDerivePlan:
             "skip_scanner",
             "skip_regime_substrate",
             "skip_signals_envelope",
+            # alpha-engine-config-I7726 — new stage between
+            # SignalsEnvelope and ChallengerShadow.
+            "skip_research_self_test",
             "skip_challenger_shadow",
             "skip_predictor_training",
         }
@@ -117,6 +120,9 @@ class TestDerivePlan:
             "skip_scanner",
             "skip_regime_substrate",
             "skip_signals_envelope",
+            # alpha-engine-config-I7726 — new stage between
+            # SignalsEnvelope and ChallengerShadow.
+            "skip_research_self_test",
             "skip_challenger_shadow",
             "skip_rag_ingestion",
             "skip_regime_retrospective_eval",
@@ -745,7 +751,12 @@ class TestBacktestEvalPresetLaneA:
         ("gate", "expected_skip_next"),
         [
             ("CheckSkipScanner", "CheckSkipRegimeSubstrate"),
-            ("CheckSkipSignalsEnvelope", "CheckSkipChallengerShadow"),
+            # alpha-engine-config-I7726 inserted CheckSkipResearchSelfTest
+            # between these two. The preset must route past it as well, or a
+            # Backtester+Evaluator-only replay spends a Lambda invocation on a
+            # verdict about research code it does not touch.
+            ("CheckSkipSignalsEnvelope", "CheckSkipResearchSelfTest"),
+            ("CheckSkipResearchSelfTest", "CheckSkipChallengerShadow"),
             ("CheckSkipChallengerShadow", "CheckSkipRAGIngestion"),
         ],
     )

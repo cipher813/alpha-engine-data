@@ -105,6 +105,9 @@ _EXPECTED_SKIPS = {
     # but carry no comparable live-run hazard).
     "skip_scanner",
     "skip_signals_envelope",
+    # alpha-engine-config-I7726 — ResearchSelfTest's gate, inserted between
+    # SignalsEnvelope and ChallengerShadow. Defaults false like its siblings.
+    "skip_research_self_test",
     "skip_challenger_shadow",
     "skip_rag_ingestion",
     "skip_regime_substrate",
