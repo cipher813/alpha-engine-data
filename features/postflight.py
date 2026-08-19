@@ -29,6 +29,25 @@ log = logging.getLogger(__name__)
 # defect that happens to collapse onto two values.
 ZERO_VARIANCE_EXEMPT: frozenset[str] = frozenset({"macd_cross", "macd_above_zero"})
 
+# Columns whose LATEST-row value is legitimately unknown at compute time —
+# a structural property of the pipeline's timing, not a producer defect, and
+# distinct from ZERO_VARIANCE_EXEMPT above (a binary flag that legitimately
+# reads a real, informative 0). `vwap_divergence_pct` (alpha-engine-config-
+# I7572, I7569): `collectors/daily_closes.py`'s EOD pass (`yfinance_only`
+# mode, ~1:05 PM PT) writes `VWAP=None` for every ticker's TODAY row BY
+# DESIGN — polygon's free tier 403s on a same-day grouped-daily request, so
+# the true volume-weighted price cannot be fetched same-day. The "morning
+# enrichment" pass that fills it (`polygon_only`, ~5:30 AM PT) does not run
+# until the FOLLOWING trading day. `features/compute.py` runs against the
+# EOD-pass snapshot, so the latest row's `vwap_divergence_pct` is all-NaN on
+# EVERY daily run, permanently, until VWAP enrichment is moved earlier in
+# the pipeline — that is the expected shape of this column's latest value,
+# not a dead producer, and must not trip `find_all_null_columns` /
+# `assert_no_dead_feature_columns` as a false-positive degrade every day.
+# Prior, non-latest rows DO carry a real, varying VWAP (from a prior day's
+# morning enrichment) — only the CURRENT row is structurally unknown.
+ALL_NULL_EXPECTED: frozenset[str] = frozenset({"vwap_divergence_pct"})
+
 # min_non_null mirrors the ``min_names`` floor features/factor_momentum.py
 # already uses before it will call a cross-section "populated enough to
 # rank" (20). Below that, a handful of sparse alt-data rows (options/

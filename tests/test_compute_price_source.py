@@ -33,12 +33,18 @@ class _FakeMacroLib:
 
 
 def _stub_arctic(monkeypatch, *, universe, macro_frames, macro_symbols):
-    monkeypatch.setattr(compute, "load_universe_ohlcv", lambda bucket: dict(universe))
+    # **kwargs: _load_price_source passes lookback_days=_ARCTICDB_LOOKBACK_DAYS
+    # explicitly (alpha-engine-config-I7572) rather than taking the library
+    # default, which starved the factor-momentum second pass's warmup.
+    monkeypatch.setattr(
+        compute, "load_universe_ohlcv", lambda bucket, **kwargs: dict(universe)
+    )
     monkeypatch.setattr(
         compute, "open_macro_lib", lambda bucket: _FakeMacroLib(macro_symbols)
     )
     monkeypatch.setattr(
-        compute, "load_macro_series", lambda bucket, syms: dict(macro_frames)
+        compute, "load_macro_series",
+        lambda bucket, syms, **kwargs: dict(macro_frames),
     )
 
 

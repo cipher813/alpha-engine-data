@@ -27,6 +27,7 @@ import argparse
 import io
 import json
 import logging
+import math
 import sys
 import time
 from datetime import datetime, timezone
@@ -44,6 +45,7 @@ from features.factor_momentum import DEFAULT_FACTOR_LOADINGS, compute_factor_mom
 from features.feature_engineer import FEATURES, FEATURE_CFG, MIN_ROWS_FOR_FEATURES, compute_features
 from features.metron_supplemental import compute_metron_supplemental_features, write_metron_supplemental_snapshot
 from features.postflight import (
+    ALL_NULL_EXPECTED,
     ZERO_VARIANCE_EXEMPT,
     assert_no_dead_feature_columns,
     find_all_null_columns,
@@ -154,6 +156,31 @@ def make_source_series(values: list[str] | pd.Series, index: pd.Index | None = N
 # factor-momentum composition above — tests/test_feature_warmup_rows_i7539.py
 # derives the floor from the live constants and fails if either moves.
 _FEATURE_WARMUP_ROWS = 585
+
+# alpha-engine-config-I7572 (2026-08-19, second half of the factor-momentum
+# fix): a10a95cb raised the TRADING-day floor above to 585 but nothing
+# raised the CALENDAR-day window the price source is actually READ with.
+# `_load_price_source` below calls `load_universe_ohlcv` / `load_macro_series`
+# (nousergon_lib.arcticdb) with no `lookback_days` override, so both default
+# to `_SLIM_EQUIVALENT_LOOKBACK_DAYS = 730` CALENDAR days — a
+# `date_range=(end - 730d, end)` ArcticDB read, not a row count. 730 calendar
+# days is ~730 * 252/365.25 ≈ 504 TRADING days before a single holiday is
+# subtracted — already short of the 585-row floor above, so the per-ticker
+# trim a few lines below this constant's use (`if len(df) >
+# _FEATURE_WARMUP_ROWS: trim`) was a permanent no-op: every ticker capped
+# out under 585 rows, `compute_daily_factor_returns`' warmup gate was never
+# satisfied for the whole universe, and `factor_momentum_ratio` produced
+# 0/902 non-null on the daily path EVERY run since a10a95cb landed — measured
+# live 2026-08-19 on `s3://alpha-engine-research/features/2026-08-19/
+# technical.parquet`. The second pass itself was never broken; like I7539's
+# first round, it was starved of the window it needed.
+#
+# Convert the 585 TRADING-day floor to a CALENDAR-day request (252 trading
+# days / 365.25 calendar days, the standard convention) with a 20% buffer
+# for holiday clustering — deliberately wider than _FEATURE_WARMUP_ROWS' own
+# ~16%, since this margin has to survive an actual ArcticDB date-range read
+# (weekends AND market holidays), not just a row-count derivation.
+_ARCTICDB_LOOKBACK_DAYS = math.ceil(_FEATURE_WARMUP_ROWS * 365.25 / 252 * 1.20)
 
 # Sub-sector benchmark ETFs (config#934) — SMH/IGV/XBI/PPH/XOP/KRE/ITA/GDX,
 # the distinct non-XL* symbols in constituents.GICS_SUBINDUSTRY_TO_ETF. Like
@@ -706,7 +733,14 @@ def _load_price_source(s3, bucket: str) -> dict | None:
     signature for caller compatibility but is no longer used.
     """
     try:
-        prices = load_universe_ohlcv(bucket)  # equities + SPY
+        # lookback_days=_ARCTICDB_LOOKBACK_DAYS (alpha-engine-config-I7572):
+        # the library default (730 calendar days, ~504 trading days) reads
+        # fewer rows than _FEATURE_WARMUP_ROWS needs, starving the
+        # factor-momentum second pass of warmup on every daily run — see
+        # that constant's definition for the measured evidence.
+        prices = load_universe_ohlcv(
+            bucket, lookback_days=_ARCTICDB_LOOKBACK_DAYS,
+        )  # equities + SPY
         macro_syms = set(_MACRO_SLIM_KEYS.values())
         try:
             mlib = open_macro_lib(bucket)
@@ -715,7 +749,9 @@ def _load_price_source(s3, bucket: str) -> dict | None:
             }
         except Exception as exc:  # noqa: BLE001 - XL* discovery best-effort
             log.warning("macro-lib symbol listing failed: %s", exc)
-        macro_frames = load_macro_series(bucket, macro_syms)
+        macro_frames = load_macro_series(
+            bucket, macro_syms, lookback_days=_ARCTICDB_LOOKBACK_DAYS,
+        )
         return {**prices, **macro_frames} or None
     except Exception as exc:  # noqa: BLE001 - return empty, don't run blind
         log.warning("ArcticDB universe/macro read failed: %s", exc)
@@ -1145,7 +1181,20 @@ def compute_and_write(
             row = {"ticker": ticker}
             for f in FEATURES:
                 val = latest[f] if f in latest.index else 0.0
-                row[f] = float(val) if pd.notna(val) else 0.0
+                if pd.notna(val):
+                    row[f] = float(val)
+                elif f in ALL_NULL_EXPECTED:
+                    # alpha-engine-config-I7572: a generic "not yet known" ->
+                    # 0.0 fallback silently laundered vwap_divergence_pct's
+                    # legitimate NaN (today's VWAP isn't known until the
+                    # NEXT trading day's morning enrichment pass — see
+                    # postflight.ALL_NULL_EXPECTED) into a fabricated
+                    # universe-wide constant zero, every day. 0.0 is a LEGAL
+                    # divergence reading, so preserve NaN — the registry's
+                    # documented contract — instead of manufacturing one.
+                    row[f] = float("nan")
+                else:
+                    row[f] = 0.0
             store_rows.append(row)
             n_ok += 1
 
@@ -1261,8 +1310,20 @@ def compute_and_write(
     # CONSTRUCTION (e.g. the VIX level), so zero cross-sectional variance
     # there is the expected shape, not a defect.
     _non_macro_features = [f for f in FEATURES if f not in GROUPS.get("macro", ())]
+    # alpha-engine-config-I7572: ALL_NULL_EXPECTED (vwap_divergence_pct) is
+    # all-NaN on the latest row EVERY daily run by pipeline design (see
+    # postflight.ALL_NULL_EXPECTED) — union it into the exempt set so the
+    # dead-column guard doesn't false-positive-degrade every run.
+    # assert_no_dead_feature_columns shares one `exempt` set across both its
+    # constant- and empty-column checks, so this also exempts
+    # vwap_divergence_pct from the zero-variance check — harmless in
+    # practice, since a column that is structurally all-NaN can never
+    # accumulate the min_non_null floor that check requires to fire.
+    _dead_column_exempt = ZERO_VARIANCE_EXEMPT | ALL_NULL_EXPECTED
     if zero_variance_fatal:
-        assert_no_dead_feature_columns(features_df, _non_macro_features)
+        assert_no_dead_feature_columns(
+            features_df, _non_macro_features, exempt=_dead_column_exempt,
+        )
         _zero_variance: dict[str, int] = {}
         _all_null: list[str] = []
     else:
@@ -1270,7 +1331,7 @@ def compute_and_write(
         # zero_variance_fatal note in this function's docstring.
         _zero_variance = find_zero_variance_columns(features_df, _non_macro_features)
         _all_null = [c for c in find_all_null_columns(features_df, _non_macro_features)
-                     if c not in ZERO_VARIANCE_EXEMPT]
+                     if c not in _dead_column_exempt]
         if _all_null:
             log.error(
                 "EMPTY feature column(s) on the daily path: zero non-null values "
