@@ -168,12 +168,18 @@ _REGISTRY: dict[str, dict[str, list[dict]]] = {
         ],
     },
     "infrastructure/lambdas/freshness-monitor/index.py": {
-        "_maybe_alert": [
+        # config-I7713 — the send moved from `_maybe_alert` (one message per
+        # artifact) to `_publish_digest` (ONE grouped message per sweep).
+        # `_maybe_alert` now only decides. Severity is the MAX over the covered
+        # rows, so grouping can never demote a critical artifact into a warning
+        # page; the per-artifact severities it was computed from are still on
+        # each detail line in the body.
+        "_publish_digest": [
             {
-                "event_class": "Artifact SLA miss",
-                "severity": "per-artifact spec.severity from ARTIFACT_REGISTRY.yaml (warning or critical; dynamically coerced for champion-arm)",
+                "event_class": "Artifact SLA miss (sweep digest, grouped by cause)",
+                "severity": "max over covered rows of spec.severity from ARTIFACT_REGISTRY.yaml (warning or critical; dynamically coerced for champion-arm)",
                 "silent": False,
-                "citation": "severity_taxonomy.md row: index.py:358-392,967-978",
+                "citation": "severity_taxonomy.md row: index.py:358-392,967-978; call site relocated by config-I7713 (2026-08-19)",
             },
         ],
     },
