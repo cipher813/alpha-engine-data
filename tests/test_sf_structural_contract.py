@@ -167,6 +167,8 @@ _TIMEOUT_EXEMPT: dict[str, dict[str, str]] = {
         "ParityParallel.WaitForPitParityWalkforward": "ssm:getCommandInvocation single poll — bounded by PitParityWalkforward's own executionTimeout (alpha-engine-config#6030)",
         "ParityParallel.WaitForParityReplay": "ssm:getCommandInvocation single poll — bounded by ParityReplay's own executionTimeout (alpha-engine-config#6030)",
         "WaitForPitParityCompare": "ssm:getCommandInvocation single poll — bounded by PitParityCompare's own executionTimeout (alpha-engine-config#6030)",
+        "ParityParallel.WaitForPitParityLookaheadResourceKillCheck": "ssm:getCommandInvocation single poll — bounded by PitParityLookaheadResourceKillCheck's own 60s executionTimeout (alpha-engine-config-I7267)",
+        "ParityParallel.WaitForPitParityWalkforwardResourceKillCheck": "ssm:getCommandInvocation single poll — bounded by PitParityWalkforwardResourceKillCheck's own 60s executionTimeout (alpha-engine-config-I7267)",
         "WaitForEvaluatorDiagnostics": "ssm:getCommandInvocation single poll — bounded by EvaluatorDiagnostics' own executionTimeout",
         "WaitForEvaluatorOptimize": "ssm:getCommandInvocation single poll — bounded by EvaluatorOptimize's own executionTimeout",
         "WaitForSaturdayHealthCheck": "ssm:getCommandInvocation single poll — bounded by SaturdayHealthCheck's own executionTimeout",
@@ -610,6 +612,35 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
             "Same branch-level fail-open as ParityReplay: the poll's Catch "
             "converges on ParityReplayDegraded; the flag is set at the "
             "CheckParityBranchOutcomes join (alpha-engine-config#6030)."
+        ),
+        "ParityParallel.PitParityLookaheadResourceKillCheck": (
+            "alpha-engine-config-I7267: this send/poll/parse-free marker "
+            "check runs ONLY after PitParityLookahead already exited "
+            "non-zero. Its own Catch (instance gone, SSM unreachable) is "
+            "deliberately safe-by-default: it falls through to the SAME "
+            "PitParityLookaheadDegraded branch terminal as the pass's own "
+            "Catch — never blocking, only potentially skipping the "
+            "enhanced RESOURCE_KILL classification for this one run. "
+            "$.parity_degraded is still set at the CheckParityBranchOutcomes "
+            "join exactly as for the pass's own Catch."
+        ),
+        "ParityParallel.WaitForPitParityLookaheadResourceKillCheck": (
+            "Same reasoning as PitParityLookaheadResourceKillCheck: the "
+            "poll's Catch converges on PitParityLookaheadDegraded; the flag "
+            "is set at the CheckParityBranchOutcomes join "
+            "(alpha-engine-config-I7267)."
+        ),
+        "ParityParallel.PitParityWalkforwardResourceKillCheck": (
+            "Same reasoning as PitParityLookaheadResourceKillCheck, for the "
+            "walkforward pass: Catch converges on "
+            "PitParityWalkforwardDegraded; the flag is set at the "
+            "CheckParityBranchOutcomes join (alpha-engine-config-I7267)."
+        ),
+        "ParityParallel.WaitForPitParityWalkforwardResourceKillCheck": (
+            "Same reasoning as WaitForPitParityLookaheadResourceKillCheck, "
+            "for the walkforward pass: the poll's Catch converges on "
+            "PitParityWalkforwardDegraded; the flag is set at the "
+            "CheckParityBranchOutcomes join (alpha-engine-config-I7267)."
         ),
     },
     "step_function_daily.json": {

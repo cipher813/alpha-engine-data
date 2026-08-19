@@ -308,14 +308,29 @@ class TestChainOrdering:
         assert states["AggregateParityBranchOutcomes"]["Next"] == "CheckParityBranchOutcomes"
         cbo = states["CheckParityBranchOutcomes"]
         assert cbo["Default"] == "CheckSkipPitParityCompare"
-        assert cbo["Choices"][0]["Next"] == "ParityDegraded"
-        degraded_vars = {c["Variable"] for c in cbo["Choices"][0]["Or"]}
-        assert degraded_vars == {
+        # alpha-engine-config-I7267: RESOURCE_KILL is checked FIRST (routes
+        # to the shared hard-fail path, never reaching the compare) — the
+        # pre-existing DEGRADED fold (still fail-open through the compare)
+        # is now Choices[1].
+        assert cbo["Choices"][0]["Next"] == "PitParityResourceKillDetected"
+        resource_kill_vars = {c["Variable"] for c in cbo["Choices"][0]["Or"]}
+        assert resource_kill_vars == {
             "$.parity_branch_outcomes.pit_lookahead_status",
             "$.parity_branch_outcomes.pit_walkforward_status",
             "$.parity_branch_outcomes.parity_replay_status",
         }
         for cond in cbo["Choices"][0]["Or"]:
+            assert cond["StringEquals"] == "RESOURCE_KILL"
+        assert states["PitParityResourceKillDetected"]["Next"] == "NormalizeFailureContext"
+
+        assert cbo["Choices"][1]["Next"] == "ParityDegraded"
+        degraded_vars = {c["Variable"] for c in cbo["Choices"][1]["Or"]}
+        assert degraded_vars == {
+            "$.parity_branch_outcomes.pit_lookahead_status",
+            "$.parity_branch_outcomes.pit_walkforward_status",
+            "$.parity_branch_outcomes.parity_replay_status",
+        }
+        for cond in cbo["Choices"][1]["Or"]:
             assert cond["StringEquals"] == "DEGRADED"
 
     def test_aggregate_hoists_all_three_branches(self, states):
@@ -374,7 +389,14 @@ class TestChainOrdering:
         assert b[f"Init{base}PollCount"]["Next"] == f"WaitFor{base}"
         assert b[f"WaitFor{base}"]["Next"] == f"Check{base}Status"
         check = b[f"Check{base}Status"]
-        assert check["Default"] == f"{base}Degraded"
+        if base in ("PitParityLookahead", "PitParityWalkforward"):
+            # alpha-engine-config-I7267: a terminal non-Success now routes
+            # through a marker-check for the RESOURCE_KILL classification
+            # before falling to the existing *Degraded fail-open — see
+            # test_sf_parity_resource_kill_halt_i7267.py for the full chain.
+            assert check["Default"] == f"{base}ResourceKillCheck"
+        else:
+            assert check["Default"] == f"{base}Degraded"
         success = [c["Next"] for c in check["Choices"]
                    if c.get("StringEquals") == "Success"]
         assert success == [f"{base}Complete"]
