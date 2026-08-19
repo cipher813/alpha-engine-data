@@ -100,6 +100,8 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # alpha-engine-config-I2515 Phase B: keeps the no_agent champion-baseline
     # shadow alive for the producer leaderboard post graph-runner removal.
     "ChallengerShadow": frozenset({"mode", "date.$"}),
+    # alpha-engine-config-I7726 — same research-runner Lambda, different mode.
+    "ResearchSelfTest": frozenset({"mode", "date.$"}),
     "EvalJudgeSubmitFirstSaturday": frozenset(
         {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days"}
     ),

@@ -149,9 +149,9 @@
     },
     "ApplyBacktestEvalPreset": {
       "Type": "Pass",
-      "Comment": "mode=backtest-eval ONLY (config#830; lane-A flags added config#3134). Seeds skip_* defaults that bypass every stage EXCEPT Backtester + Evaluator: the front half (lib-pin/morning-enrich/data-phase1/rag/regime/research/data-phase2/eval-judge chain/aggregate-costs/predictor-training), the post-backtest model block (predictor-backtest + portfolio-optimizer), parity, and the post-eval tail (health checks/report-card/director via skip_post_eval). skip_backtester / skip_evaluator are deliberately NOT set, so those two run. config#3134: also seeds skip_scanner and skip_challenger_shadow true (both are observe-only/side-effect producers a Backtester+Evaluator-only assessment rerun does not need \u2014 a bare mode=backtest-eval run was previously re-scanning candidates.json and re-calling the ChallengerShadow producer on every partial rerun for no benefit to the assessment). It also seeded skip_thinktank_coverage until 2026-08-10, when the ThinkTankCoverage chain was removed from this SF (Brian ruling: the Think Tank runs daily in shadow mode, outside the weekly pipeline). ALSO seeds skip_signals_envelope true HERE ONLY \u2014 SignalsEnvelope is LOAD-BEARING for a real weekly run (I2880 staleness guard; the executor hard-fails Monday without a fresh signals.json) and its own CheckSkipSignalsEnvelope gate defaults false for exactly that reason, but this preset's whole contract is 'replay Backtester+Evaluator against existing artifacts, whatever their vintage' \u2014 a backtest-eval rerun never reaches the executor and never needs a refreshed signals.json, so skipping the envelope here is safe specifically because this preset already skips everything that would consume a stale one. Merge order States.JsonMerge(preset, $, false) makes the preset the BASE and the live input ($) WIN \u2014 so an operator can still override any single flag (e.g. {\"mode\": \"backtest-eval\", \"skip_parity\": false}) and it takes effect. Mirrors InitializeInput's JsonMerge-defaults idiom.",
+      "Comment": "mode=backtest-eval ONLY (config#830; lane-A flags added config#3134). Seeds skip_* defaults that bypass every stage EXCEPT Backtester + Evaluator: the front half (lib-pin/morning-enrich/data-phase1/rag/regime/research/data-phase2/eval-judge chain/aggregate-costs/predictor-training), the post-backtest model block (predictor-backtest + portfolio-optimizer), parity, and the post-eval tail (health checks/report-card/director via skip_post_eval). skip_backtester / skip_evaluator are deliberately NOT set, so those two run. config-I7726: also seeds skip_research_self_test true \u2014 the research module\u2019s known-answer battery verifies the RESEARCH instrument, which a Backtester+Evaluator-only replay neither exercises nor consumes, so running it would spend a Lambda invocation on a verdict about code this rerun does not touch. config#3134: also seeds skip_scanner and skip_challenger_shadow true (both are observe-only/side-effect producers a Backtester+Evaluator-only assessment rerun does not need \u2014 a bare mode=backtest-eval run was previously re-scanning candidates.json and re-calling the ChallengerShadow producer on every partial rerun for no benefit to the assessment). It also seeded skip_thinktank_coverage until 2026-08-10, when the ThinkTankCoverage chain was removed from this SF (Brian ruling: the Think Tank runs daily in shadow mode, outside the weekly pipeline). ALSO seeds skip_signals_envelope true HERE ONLY \u2014 SignalsEnvelope is LOAD-BEARING for a real weekly run (I2880 staleness guard; the executor hard-fails Monday without a fresh signals.json) and its own CheckSkipSignalsEnvelope gate defaults false for exactly that reason, but this preset's whole contract is 'replay Backtester+Evaluator against existing artifacts, whatever their vintage' \u2014 a backtest-eval rerun never reaches the executor and never needs a refreshed signals.json, so skipping the envelope here is safe specifically because this preset already skips everything that would consume a stale one. Merge order States.JsonMerge(preset, $, false) makes the preset the BASE and the live input ($) WIN \u2014 so an operator can still override any single flag (e.g. {\"mode\": \"backtest-eval\", \"skip_parity\": false}) and it takes effect. Mirrors InitializeInput's JsonMerge-defaults idiom.",
       "Parameters": {
-        "merged.$": "States.JsonMerge(States.StringToJson('{\"skip_lib_pin_drift_check\":true,\"skip_morning_enrich\":true,\"skip_data_phase1\":true,\"skip_scanner\":true,\"skip_signals_envelope\":true,\"skip_challenger_shadow\":true,\"skip_rag_ingestion\":true,\"skip_regime_substrate\":true,\"skip_regime_retrospective_eval\":true,\"skip_research\":true,\"skip_data_phase2\":true,\"skip_eval_judge\":true,\"skip_rationale_clustering\":true,\"skip_replay_concordance\":true,\"skip_counterfactual\":true,\"skip_aggregate_costs\":true,\"skip_predictor_training\":true,\"skip_predictor_backtest\":true,\"skip_portfolio_optimizer_backtest\":true,\"skip_parity\":true,\"skip_post_eval\":true}'),$,false)"
+        "merged.$": "States.JsonMerge(States.StringToJson('{\"skip_lib_pin_drift_check\":true,\"skip_morning_enrich\":true,\"skip_data_phase1\":true,\"skip_scanner\":true,\"skip_signals_envelope\":true,\"skip_research_self_test\":true,\"skip_challenger_shadow\":true,\"skip_rag_ingestion\":true,\"skip_regime_substrate\":true,\"skip_regime_retrospective_eval\":true,\"skip_research\":true,\"skip_data_phase2\":true,\"skip_eval_judge\":true,\"skip_rationale_clustering\":true,\"skip_replay_concordance\":true,\"skip_counterfactual\":true,\"skip_aggregate_costs\":true,\"skip_predictor_training\":true,\"skip_predictor_backtest\":true,\"skip_portfolio_optimizer_backtest\":true,\"skip_parity\":true,\"skip_post_eval\":true}'),$,false)"
       },
       "OutputPath": "$.merged",
       "Next": "CheckSkipLibPinDriftCheck"
@@ -1230,7 +1230,7 @@
                       "BooleanEquals": true
                     }
                   ],
-                  "Next": "CheckSkipChallengerShadow"
+                  "Next": "CheckSkipResearchSelfTest"
                 }
               ],
               "Default": "SignalsEnvelope"
@@ -1278,7 +1278,7 @@
                 }
               ],
               "ResultPath": "$.signals_envelope_result",
-              "Next": "CheckSkipChallengerShadow"
+              "Next": "CheckSkipResearchSelfTest"
             },
             "CheckSkipChallengerShadow": {
               "Type": "Choice",
@@ -2594,6 +2594,69 @@
               "InputPath": "$.rag_ingestion_poll_count.polls",
               "ResultPath": "$.rag_ingestion_polls",
               "Next": "WaitForRAGIngestion"
+            },
+            "CheckSkipResearchSelfTest": {
+              "Type": "Choice",
+              "Comment": "Skip-gate for ResearchSelfTest (alpha-engine-config-I7726), same shape as CheckSkipChallengerShadow. {\"skip_research_self_test\": true} jumps straight to CheckSkipChallengerShadow \u2014 ResearchSelfTest's own convergence point, so skipping is behaviorally identical to a run that did nothing. Defaults to RUNNING: the battery is a known-answer test over the deployed instrument and costs no LLM call, so there is no reason a scheduled run or an unflagged rerun should omit its own correctness verdict.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_research_self_test",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_research_self_test",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "CheckSkipChallengerShadow"
+                }
+              ],
+              "Default": "ResearchSelfTest"
+            },
+            "ResearchSelfTest": {
+              "Type": "Task",
+              "Comment": "alpha-engine-config-I7726 \u2014 emits research/{trading_day}/self_test.json, the module's \u00a72.3a CORRECTNESS VERDICT (a known-answer battery over the DEPLOYED instrument: crucible-research scoring/self_test.py -> nousergon_lib.quant.selftest). WHY THIS STATE EXISTS: the producer has always been correct and NO LIVE TRIGGER REACHED IT. Measured 2026-08-19, the key had ZERO instances in the bucket ever, since the registry row was created 2026-08-13 \u2014 `_maybe_emit_self_test` sits at the end of the handler's weekly_run branch, this graph's only research-runner invocation is ChallengerShadow with mode=challengers_only (which returns above that branch), and the documented fallback EventBridge rule alpha-research-weekly is DISABLED. A verdict whose absence must never read as a pass had never once been emitted. Its own state rather than a graft onto ChallengerShadow because the battery does not depend on the champion graph having run and must not inherit a shadow-cohort stage's contract or failure modes.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-research-runner:live",
+                "Payload": {
+                  "mode": "self_test",
+                  "date.$": "$.run_date"
+                }
+              },
+              "TimeoutSeconds": 300,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "MaxAttempts": 1,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 1.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Non-blocking, and deliberately WITHOUT setting $.research_degraded_local. The battery's own contract is never-raises, so reaching here means the INVOCATION failed (timeout, throttle, deploy skew) rather than the numbers being wrong. A degraded flag propagates to $.degraded_summary and since config-I6891 terminates the run in DegradedRun \u2014 killing a pipeline that produced real trading artifacts over a missing observe-mode verdict. The absence is already detected where it belongs: the registry's research_self_test row pages through the freshness monitor if the artifact does not appear. The SF does not need to judge it twice.",
+                  "Next": "ResearchSelfTestFailed",
+                  "ResultPath": "$.research_self_test_error"
+                }
+              ],
+              "ResultPath": "$.research_self_test_result",
+              "Next": "CheckSkipChallengerShadow"
+            },
+            "ResearchSelfTestFailed": {
+              "Type": "Pass",
+              "Comment": "Records the invocation failure on the state payload and continues. No degraded flag \u2014 see ResearchSelfTest's Catch comment. The recording surfaces are this field, the Lambda's own logs, and the freshness monitor's page on the missing artifact.",
+              "Result": true,
+              "ResultPath": "$.research_self_test_invocation_failed",
+              "Next": "CheckSkipChallengerShadow"
             }
           }
         },

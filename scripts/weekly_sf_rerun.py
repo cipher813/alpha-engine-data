@@ -288,7 +288,15 @@ STAGES: tuple[Stage, ...] = (
     Stage(
         "signals_envelope", "skip_signals_envelope",
         "CheckSkipSignalsEnvelope", "SignalsEnvelope",
-        frozenset({"CheckSkipChallengerShadow"}),
+        # alpha-engine-config-I7726 inserted CheckSkipResearchSelfTest between
+        # SignalsEnvelope and CheckSkipChallengerShadow. BOTH are kept as
+        # witnesses: this helper derives a rerun plan from the history of a PAST
+        # execution, and every execution recorded before that change witnesses
+        # SignalsEnvelope's completion by entering CheckSkipChallengerShadow.
+        # Replacing rather than adding made `derive_plan` report signals_envelope
+        # as FAILED on every pre-change history — which is the exact class
+        # TestHistoricalWorkStateNames exists to catch, and it caught it.
+        frozenset({"CheckSkipResearchSelfTest", "CheckSkipChallengerShadow"}),
         note=(
             "SignalsEnvelope is LOAD-BEARING for a real weekly run (I2880"
             " staleness guard; the executor hard-fails Monday without a"
@@ -297,6 +305,18 @@ STAGES: tuple[Stage, ...] = (
             " execution's history shows SignalsEnvelope already ran (this"
             " witness), which is always safe to skip on the rerun."
         ),
+    ),
+    Stage(
+        # alpha-engine-config-I7726 — the module's own correctness verdict.
+        # No degraded_witness: its fail-open Catch deliberately sets no degraded
+        # flag (the battery never raises, so a Catch means the INVOCATION failed,
+        # and folding that would terminate a run that produced real trading
+        # artifacts). Its absence is detected by the freshness monitor on
+        # research/{date}/self_test.json instead — see the state's Catch comment
+        # and the _DEGRADED_FLAG_EXEMPT entry in tests/test_sf_structural_contract.py.
+        "research_self_test", "skip_research_self_test",
+        "CheckSkipResearchSelfTest", "ResearchSelfTest",
+        frozenset({"CheckSkipChallengerShadow"}),
     ),
     Stage(
         "challenger_shadow", "skip_challenger_shadow",

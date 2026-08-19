@@ -432,6 +432,29 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
             "— see that entry for the full mechanism; verified by "
             "tests/test_sf_research_predictor_degraded_wiring.py."
         ),
+        # alpha-engine-config-I7726 — the ONLY entry here that does not fold
+        # into $.research_degraded_local, and deliberately so. Every other
+        # branch-local exemption routes through a Mark*Degraded Pass because
+        # that stage's failure means its OUTPUT is untrustworthy. ResearchSelfTest
+        # is different in kind: the battery's own contract is never-raises, so
+        # reaching its Catch means the INVOCATION failed (timeout, throttle,
+        # deploy skew) — not that the numbers are wrong. Since config-I6891 a
+        # degraded summary terminates the run in DegradedRun, so folding this
+        # would kill a pipeline that produced real trading artifacts over a
+        # missing observe-mode verdict.
+        #
+        # The absence is NOT unobserved, which is what would make this a silent
+        # swallow rather than a routing choice: the registry's `research_self_test`
+        # row pages through the freshness monitor when the artifact does not
+        # appear, and `$.research_self_test_invocation_failed` records the
+        # invocation failure on the payload. Two independent surfaces, neither of
+        # them this flag.
+        "ResearchPredictorParallel.ResearchSelfTest": (
+            "Invocation-failure-only fail-open; the verdict's absence is detected "
+            "by the freshness monitor on research/{date}/self_test.json rather "
+            "than by the degraded fold, so folding it would terminate a good run "
+            "over an observe-mode stage (config-I7726)."
+        ),
         "ResearchPredictorParallel.ChallengerShadow": (
             "Same fold as Scanner (routes through MarkChallengerShadowDegraded) "
             "— see that entry for the full mechanism; verified by "
