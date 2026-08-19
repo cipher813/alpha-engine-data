@@ -1167,39 +1167,87 @@ def _is_confirmed_miss(result: CheckResult) -> bool:
 _NEVER_WRITTEN_PROBE_MAX = int(os.environ.get("NEVER_WRITTEN_PROBE_MAX", "25"))
 
 
+_NEVER_WRITTEN_SCAN_PAGES = int(os.environ.get("NEVER_WRITTEN_SCAN_PAGES", "5"))
+
+
 def _prefix_has_ever_been_written(
     s3_client: Any, spec: ArtifactSpec, result: CheckResult
 ) -> bool | None:
-    """Has ANY instance of this artifact ever existed?
+    """Has ANY instance of THIS artifact ever existed?
 
     Returns True/False, or None when the question could not be answered — which
-    is NOT the same as False and must never be rendered as "never written".
-    An unanswerable probe leaves the row on the normal page path, because the
-    failure toward which this must lean is paging about a real absence, never
-    silencing one.
+    is NOT the same as False and must never be rendered as "never written". An
+    unanswerable probe leaves the row on the normal page path, because the
+    direction this must never fail in is silencing a real absence.
 
     The recency scan that produced ``missing`` is bounded by a cadence-derived
-    window. This asks the unbounded question, over the key's own prefix, with
-    ``MaxKeys=1`` — one cheap LIST, and only for rows already in ``missing``
-    (three of 146 in the measured sweep).
+    window; this asks the unbounded question, and only for rows already in
+    ``missing`` (three of 146 in the measured sweep).
+
+    **Prefix alone is not the question (config-I7622 follow-up).** A
+    date-templated key like ``research/{date}/self_test.json`` has the fixed head
+    ``research/`` — a shared top-level prefix with thousands of unrelated objects
+    under it. Measured 2026-08-19: ``research_self_test`` resolved
+    ``never_written=False`` on a populated ``research/`` prefix while
+    ``aws s3 ls s3://alpha-engine-research/research/ --recursive | grep
+    self_test.json`` returned NOTHING — the artifact has never once been written
+    and the probe could not see it. ``backtest_contribution_lift`` sits under
+    ``backtest/`` with the same shape. So the trailing fixed segment of the
+    template is matched too, and the answer is only ``False`` when a key actually
+    bearing that suffix is found.
+
+    The scan is bounded at :data:`_NEVER_WRITTEN_SCAN_PAGES` pages of 1000. Hitting
+    the cap returns None — not False. A prefix too large to search is a question
+    left unanswered, and answering it "never written" on the strength of having
+    given up is the failure this whole function is shaped to avoid.
     """
-    key = result.canonical_key or spec.s3_key_template
-    # The template's fixed leading segment: everything before the first
-    # placeholder, trimmed to a directory boundary. For a fixed key this is the
-    # key itself, which LISTs exactly one object if it exists.
     template = spec.s3_key_template
     head = template.split("{", 1)[0]
-    prefix = head if head.endswith("/") else head.rsplit("/", 1)[0] + "/" if "/" in head else head
+    if head.endswith("/"):
+        prefix = head
+    elif "/" in head:
+        prefix = head.rsplit("/", 1)[0] + "/"
+    else:
+        prefix = head
     if not prefix:
-        prefix = key
+        prefix = result.canonical_key or template
+
+    # Everything after the LAST placeholder — e.g. "/self_test.json" for
+    # `research/{date}/self_test.json`. A template ending at a directory
+    # boundary (`groom/{date}/`) has no distinguishing trailing segment, so
+    # prefix membership IS the question there and the cheap MaxKeys=1 path is
+    # the right one.
+    suffix = template.rsplit("}", 1)[-1] if "{" in template else ""
+    if not suffix.strip("/"):
+        suffix = ""
+
     try:
-        resp = s3_client.list_objects_v2(
-            Bucket=spec.s3_bucket, Prefix=prefix, MaxKeys=1
+        if not suffix:
+            resp = s3_client.list_objects_v2(
+                Bucket=spec.s3_bucket, Prefix=prefix, MaxKeys=1
+            )
+            return int(resp["KeyCount"]) > 0
+
+        token = None
+        for _ in range(_NEVER_WRITTEN_SCAN_PAGES):
+            kwargs = {"Bucket": spec.s3_bucket, "Prefix": prefix, "MaxKeys": 1000}
+            if token:
+                kwargs["ContinuationToken"] = token
+            resp = s3_client.list_objects_v2(**kwargs)
+            for obj in resp.get("Contents") or []:
+                if str(obj.get("Key", "")).endswith(suffix):
+                    return True
+            if not resp.get("IsTruncated"):
+                return False
+            token = resp.get("NextContinuationToken")
+            if not token:
+                return False
+        logger.info(
+            "never-written probe for %s gave up after %d page(s) under %r — "
+            "recorded as UNKNOWN, so the row keeps the normal page path",
+            spec.artifact_id, _NEVER_WRITTEN_SCAN_PAGES, prefix,
         )
-        # A response that does not carry an integer KeyCount has not answered
-        # the question. Coercing it would turn "I could not tell" into "never
-        # written", which is the one direction this must never fail in.
-        return int(resp["KeyCount"]) > 0
+        return None
     except Exception as exc:  # noqa: BLE001 — unanswerable, so the row keeps the page path; this WARNING and never_written=None on the row are the recording surfaces
         logger.warning(
             "never-written probe for %s could not run (prefix=%r) — the row "
