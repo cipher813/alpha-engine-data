@@ -847,6 +847,17 @@ alert_classes:
     severities: [warning]
     intake: bus
     response: drain-queue
+  - class: research_cuts_leaderboard_alerts
+    # alpha-engine-config-I7752 static-chokepoint registration: the cuts
+    # leaderboard build is observe-only and swallows its own exception
+    # (crucible-research/scoring/leaderboard_producers.py::build_cuts_leaderboard),
+    # so this alert is the ONLY signal that a day's
+    # research/cuts_leaderboard/{date}.json was never written.
+    # publish_observe_alert defaults to severity WARN.
+    source: "research:cuts_leaderboard"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
   - class: research_experiment_record_alerts
     source: "research:experiment_record"
     severities: [warning]
@@ -897,6 +908,15 @@ alert_classes:
   # ── data plane (nousergon-data) ──
   - class: data_constituents_drift
     source: "alpha-engine-data/validators/constituents_drift_check.py"
+    severities: [dynamic]
+    intake: bus
+    response: drain-queue
+  - class: data_stage_output_sweep
+    # alpha-engine-config-I7752 static-chokepoint registration: the per-run
+    # stage-output verdict (validators/stage_output_sweep.py). Severity is
+    # chosen at emit time — `error` when the run has defects, `warn` otherwise
+    # — hence [dynamic], matching its sibling validators above.
+    source: "alpha-engine-data/validators/stage_output_sweep.py"
     severities: [dynamic]
     intake: bus
     response: drain-queue
