@@ -36,6 +36,7 @@ from pathlib import Path
 import boto3
 import pandas as pd
 from nousergon_lib.trading_calendar import add_trading_days as _add_trading_days
+from polygon_client import PolygonForbiddenError
 
 logger = logging.getLogger(__name__)
 
@@ -487,6 +488,60 @@ def _insert_rows(db_path: str, rows: list[dict]) -> int:
 
 # -- Row building (polygon.io) -----------------------------------------------
 
+# -- "not yet published" is not a collector failure (config-I7714) ------------
+#
+# Polygon returns 403 `"Attempted to request today's data before end of day"`
+# for a grouped-daily bar on the CURRENT session before its plan-tier EOD
+# publication. `polygon_client._get` raises `PolygonForbiddenError` on every 403
+# — deliberately, since data#4496: swallowing 403s once masked the 2026-04-17 to
+# 2026-04-23 VWAP outage by letting `daily_closes.collect` fall through to
+# yfinance and write VWAP=None for every stock. That raise stays.
+#
+# But this collector walks FORWARD dates from each eval_date, so it asks about
+# the current session by construction, and the request is simply early. Measured
+# 2026-08-18 (`watch-rerun-2026-08-18-3`): DataPhase1 ran to completion in 2723s
+# and then exited 1 because this collector raised, `weekly_collector.py` marked
+# the phase `partial`, and the weekly pipeline halted. It had not succeeded
+# since 2026-08-15 as a result, which is why every artifact downstream of the
+# weekly graph was four days old.
+#
+# So: exactly one 403 shape, for exactly one date range, is treated as "not yet
+# available" and yields no bars for that date. Every other 403 — an invalid key,
+# a revoked plan, an entitlement the account does not hold — still raises, which
+# is the failure mode the raise exists for. Narrowing on BOTH the message and
+# the date is what keeps this from becoming the swallow it replaces.
+
+_BEFORE_EOD_MARKER = "before end of day"
+
+
+def _grouped_daily_or_empty(polygon_client, date_str: str, *, today: date) -> dict:
+    """`get_grouped_daily`, tolerating only the before-EOD 403 for a session
+    that has not closed yet.
+
+    A 403 on a PAST date is re-raised: that session is over, so "before end of
+    day" cannot be the true explanation, and reading it as absent data would
+    silently drop returns the run needs.
+    """
+    try:
+        return polygon_client.get_grouped_daily(date_str)
+    except PolygonForbiddenError as exc:
+        if _BEFORE_EOD_MARKER not in str(exc).lower():
+            raise
+        try:
+            requested = date.fromisoformat(date_str)
+        except ValueError:
+            raise exc from None
+        if requested < today:
+            raise
+        logger.info(
+            "universe_returns: %s has not published yet (polygon 403 "
+            "'%s') — no bars for that date this run, not a collector failure "
+            "(config-I7714)",
+            date_str, _BEFORE_EOD_MARKER,
+        )
+        return {}
+
+
 def _build_rows_for_date(
     eval_date: str,
     polygon_client,
@@ -520,22 +575,31 @@ def _build_rows_for_date(
     has_90d = fwd_90d < today
 
     # Fetch grouped-daily prices for eval_date and forward dates
-    prices_t0 = polygon_client.get_grouped_daily(eval_date)
-    prices_1d = polygon_client.get_grouped_daily(str(fwd_1d)) if has_1d else {}
-    prices_3d = polygon_client.get_grouped_daily(str(fwd_3d)) if has_3d else {}
-    prices_5d = polygon_client.get_grouped_daily(str(fwd_5d))
-    prices_10d = polygon_client.get_grouped_daily(str(fwd_10d)) if has_10d else {}
-    prices_15d = polygon_client.get_grouped_daily(str(fwd_15d)) if has_15d else {}
-    prices_21d = polygon_client.get_grouped_daily(str(fwd_21d)) if has_21d else {}
-    prices_30d = polygon_client.get_grouped_daily(str(fwd_30d)) if has_30d else {}
-    prices_60d = polygon_client.get_grouped_daily(str(fwd_60d)) if has_60d else {}
-    prices_90d = polygon_client.get_grouped_daily(str(fwd_90d)) if has_90d else {}
+    prices_t0 = _grouped_daily_or_empty(polygon_client, eval_date, today=today)
+    prices_1d = _grouped_daily_or_empty(polygon_client, str(fwd_1d), today=today) if has_1d else {}
+    prices_3d = _grouped_daily_or_empty(polygon_client, str(fwd_3d), today=today) if has_3d else {}
+    prices_5d = _grouped_daily_or_empty(polygon_client, str(fwd_5d), today=today)
+    prices_10d = _grouped_daily_or_empty(polygon_client, str(fwd_10d), today=today) if has_10d else {}
+    prices_15d = _grouped_daily_or_empty(polygon_client, str(fwd_15d), today=today) if has_15d else {}
+    prices_21d = _grouped_daily_or_empty(polygon_client, str(fwd_21d), today=today) if has_21d else {}
+    prices_30d = _grouped_daily_or_empty(polygon_client, str(fwd_30d), today=today) if has_30d else {}
+    prices_60d = _grouped_daily_or_empty(polygon_client, str(fwd_60d), today=today) if has_60d else {}
+    prices_90d = _grouped_daily_or_empty(polygon_client, str(fwd_90d), today=today) if has_90d else {}
 
     if not prices_t0:
         logger.warning("No prices for eval_date %s — may be a non-trading day", eval_date)
         # Try next business day
         next_day = _add_trading_days(eval_dt, 1)
-        prices_t0 = polygon_client.get_grouped_daily(str(next_day))
+        # config-I7714 — this fallback was the one grouped-daily call with no
+        # `< today` guard at all, so on a run whose eval_date is the last closed
+        # session it asked polygon for the CURRENT one.
+        if next_day >= today:
+            logger.debug(
+                "Skipping %s: next trading day %s has not closed yet",
+                eval_date, next_day,
+            )
+            return []
+        prices_t0 = _grouped_daily_or_empty(polygon_client, str(next_day), today=today)
         if not prices_t0:
             return []
 
