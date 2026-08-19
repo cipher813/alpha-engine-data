@@ -89,7 +89,21 @@ arcticdb>=6.20.0
 # reached production as a canary ModuleNotFoundError three times.
 # (Superseded: alpha-engine-config-I7119 / nousergon-lib-PR310, merged as
 # v0.124.51, which registered RelaunchWeeklyFreshnessSpot.)
-nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.73
+#
+# alpha-engine-config-I7267 NOTE: this PR's step_function.json adds two new
+# substantive Task states (PitParityLookaheadResourceKillCheck /
+# PitParityWalkforwardResourceKillCheck) plus their WaitFor* companions.
+# tests/test_pipeline_status_registry_source_check.py therefore fails until
+# the pinned nousergon-lib carries their STATE_TO_ARCHIVE_PAGE /
+# WAIT_GROUPING entries — nousergon-lib-PR333 adds both and MUST merge
+# first; this pin does NOT move in this PR (bumping is a lockstep 30-file
+# change per tests/test_lib_pin_lockstep.py, out of scope here). Once
+# PR333 merges and auto-version-bump.yml cuts the release, an immediate
+# same-repo follow-up PR bumps this pin (and its 29 siblings) to that tag —
+# same sequencing PR311/PR326 above already established for this exact
+# class of dependency. Until then, that one source-check failure is
+# EXPECTED and tracked by this note, not a silent regression.
+nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.74
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,

@@ -99,9 +99,16 @@ def test_branch_degraded_terminal_ends_branch_success(branches, base):
 def test_branch_status_default_degrades_and_poll_is_bounded(branches, base):
     """Terminal non-Success AND poll-budget exhaustion both fall to the
     branch's Degraded terminal (a bound whose exhaustion converges on the
-    happy path is not a bound, I5687)."""
+    happy path is not a bound, I5687) — or, for the two pit_parity passes
+    (alpha-engine-config-I7267), through the RESOURCE_KILL marker check
+    first, which itself falls back to the SAME Degraded terminal on
+    anything but a confirmed marker hit (see
+    test_sf_parity_resource_kill_halt_i7267.py for that chain's shape)."""
     check = branches[base][f"Check{base}Status"]
-    assert check["Default"] == f"{base}Degraded"
+    if base in ("PitParityLookahead", "PitParityWalkforward"):
+        assert check["Default"] == f"{base}ResourceKillCheck"
+    else:
+        assert check["Default"] == f"{base}Degraded"
     loop = [c for c in check["Choices"] if "And" in c]
     assert len(loop) == 1, "the poll loop must be budget-guarded"
 
@@ -121,8 +128,15 @@ def test_no_branch_state_reaches_failure_plane(states, branches):
 
 def test_any_degraded_branch_folds_into_parity_degraded(states):
     cbo = states["CheckParityBranchOutcomes"]
-    assert cbo["Choices"][0]["Next"] == "ParityDegraded"
-    assert {c["StringEquals"] for c in cbo["Choices"][0]["Or"]} == {"DEGRADED"}
+    # alpha-engine-config-I7267: RESOURCE_KILL is checked FIRST and routes
+    # to the shared hard-fail path (never reaching the compare) — the
+    # pre-existing DEGRADED fold (still fail-open through the compare) is
+    # Choices[1]. See test_sf_parity_resource_kill_halt_i7267.py for the
+    # dedicated coverage of the new fold.
+    assert cbo["Choices"][0]["Next"] == "PitParityResourceKillDetected"
+    assert {c["StringEquals"] for c in cbo["Choices"][0]["Or"]} == {"RESOURCE_KILL"}
+    assert cbo["Choices"][1]["Next"] == "ParityDegraded"
+    assert {c["StringEquals"] for c in cbo["Choices"][1]["Or"]} == {"DEGRADED"}
     assert cbo["Default"] == "CheckSkipPitParityCompare"
 
 

@@ -629,7 +629,10 @@ def test_the_weekday_case_end_to_end_zero_failures_and_no_page(tmp_path):
     pending = {r["stage"] for r in report.results
                if r.get("unsweepable_kind") == ps.UNSWEEPABLE_UPSTREAM_PENDING}
     assert pending == {"PredictorBacktest", "PortfolioOptimizerBacktest"}
-    assert len(report.results) == report.stages_declared == 19
+    # alpha-engine-config-I7267: +2 (PitParityLookaheadResourceKillCheck,
+    # PitParityWalkforwardResourceKillCheck), both acknowledged no-dry-path
+    # stages in infrastructure/preflight_sweep_manifest.json.
+    assert len(report.results) == report.stages_declared == 21
     # It does not page and it does not claim a clean run.
     assert report.outcome == ps.OUTCOME_DEGRADED
     ps.emit(report, aws, "arn:sns")

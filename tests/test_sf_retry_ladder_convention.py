@@ -58,6 +58,12 @@ SPOT_STAGE_SEND_STATES = {
     "PitParityWalkforward",
     "ParityReplay",
     "PitParityCompare",
+    # alpha-engine-config-I7267: the RESOURCE-KILL marker check dispatched
+    # after a pass exits non-zero, on the SAME instance/document — same
+    # idempotency argument (fires only on a pre-execution SendCommand API
+    # failure).
+    "PitParityLookaheadResourceKillCheck",
+    "PitParityWalkforwardResourceKillCheck",
     "EvaluatorDiagnostics",
     "EvaluatorOptimize",
 }

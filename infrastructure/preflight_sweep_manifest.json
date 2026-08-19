@@ -16,6 +16,16 @@
       "stage": "WeeklySubstrateHealthCheck",
       "reason": "RATIFIED (alpha-engine-config#7329). Post-workload substrate/artifact assertion on the launcher box (crucible-dashboard's infrastructure/substrate_health_check.sh), same consumer-not-precondition argument as SaturdayHealthCheck. Its own dry path would be a no-op: it grades artifacts that only exist after the stages ran. step_function.json's Comment on this state records the same DELIBERATE config#902 decision as SaturdayHealthCheck — 'Deliberately does NOT thread $.preflight_args ... this pair has no skip gate by design and runs for-real even under shell_run, and substrate_health_check.sh has no --preflight-only flag to receive it' — so adding one here reverses a ruled decision rather than filling an oversight. COMPENSATING SURFACES, concretely: (1) this stage's `Catch: States.ALL` routes any boot/infra failure to `SubstrateHealthCheckDegraded`, sets `$.health_check_degraded`, and that reaches `CheckGateDegradedNotify` on every live run, same as SaturdayHealthCheck; (2) per-row validation failures (as opposed to the checker's own boot failure) are independently covered — the stage's own Comment: 'Per-row CloudWatch metrics emit to AlphaEngine/Substrate so individual rows have their own alarms', which fire regardless of whether this SF stage's own boot succeeded.",
       "acknowledged": "2026-08-14"
+    },
+    {
+      "stage": "ParityParallel.PitParityLookaheadResourceKillCheck",
+      "reason": "alpha-engine-config-I7267. Runs a single `aws s3api head-object` on the same instance, dispatched ONLY when PitParityLookahead already exited non-zero (checks for the RESOURCE_KILL marker key PitParityLookahead's own commands write). It threads no $.preflight_args and has no dry variant: there is no expensive path to short-circuit — the check IS a single, ~sub-second, already-cheap S3 API call, and running it against a marker key that (on a dry/--preflight-only day) never gets written simply resolves to 'not found', which is the correct, harmless outcome, not a defect to guard against. COMPENSATING SURFACES: (1) a substrate defect that would break this trivial head-object call (broken IAM, unreachable S3, instance gone) would first and more visibly break PitParityLookahead's own artifact PUT two steps earlier, which routes to the existing PitParityLookaheadDegraded fail-open and pages via $.parity_degraded; (2) this check's own Catch (send/poll failure) already falls back to that SAME PitParityLookaheadDegraded terminal — it can only ADD the RESOURCE_KILL classification on top of an already-covered degrade, never introduce a new uncovered failure mode.",
+      "acknowledged": "2026-08-19"
+    },
+    {
+      "stage": "ParityParallel.PitParityWalkforwardResourceKillCheck",
+      "reason": "alpha-engine-config-I7267. Same shape and argument as PitParityLookaheadResourceKillCheck, for the walkforward pass's RESOURCE_KILL marker key.",
+      "acknowledged": "2026-08-19"
     }
   ],
 

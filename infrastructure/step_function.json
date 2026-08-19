@@ -4423,7 +4423,7 @@
                   "executionTimeout": [
                     "5400"
                   ],
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug pit-lookahead --log /var/log/pit-lookahead.log -- bash infrastructure/spot_pit_lookahead.sh{}',$$.Execution.Name,$.preflight_args))"
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),'set +e',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug pit-lookahead --log /var/log/pit-lookahead.log -- bash infrastructure/spot_pit_lookahead.sh{}',$$.Execution.Name,$.preflight_args),'_pit_pass_rc=$?','if [ \"$_pit_pass_rc\" -ne 0 ] && aws s3api get-object --bucket alpha-engine-research --key \"parity/$RUN_DATE/pit_stats_lookahead.json\" /tmp/_pit_stats_lookahead_artifact.json >/dev/null 2>&1 && grep -qF \"\\\"timed_out\\\": true\" /tmp/_pit_stats_lookahead_artifact.json; then aws s3api put-object --bucket alpha-engine-research --key \"parity/$RUN_DATE/.pit_stats_lookahead.resource_kill\" --body /dev/null >/dev/null 2>&1 || true; fi','exit $_pit_pass_rc')"
                 },
                 "TimeoutSeconds": 5400
               },
@@ -4554,7 +4554,7 @@
                   "Next": "PitParityLookaheadWait"
                 }
               ],
-              "Default": "PitParityLookaheadDegraded"
+              "Default": "PitParityLookaheadResourceKillCheck"
             },
             "PitParityLookaheadWait": {
               "Type": "Pass",
@@ -4602,6 +4602,124 @@
               },
               "ResultPath": "$.branch_pit_lookahead",
               "End": true
+            },
+            "PitParityLookaheadResourceKillCheck": {
+              "Type": "Task",
+              "Comment": "alpha-engine-config-I7267 (Brian's 2026-08-13 ruling, sf-pipeline-policy \u00a73 SFP-3-resource-kill-halts-and-is-named): PitParityLookahead exited non-zero. Before folding into the existing fail-open PitParityLookaheadDegraded terminal, check for the RESOURCE-KILL marker this Task's own commands wrote (unconditionally, regardless of exit code, immediately after the pass) when the just-published parity/{run_date}/pit_stats_lookahead.json read back timed_out:true \u2014 i.e. the pass did not merely fail to conclude, it was KILLED mid-work by its internal lookahead timeout (crucible-backtester analysis/pit_parity.py _PIT_PARITY_PASS_TIMEOUT). Runs a trivial `aws s3api head-object` on the SAME EC2 instance via the SAME SSM document \u2014 uses the instance's own IAM role (already grants S3 read/write on this exact prefix, since the pass itself just wrote there), so this needs NO new Step-Functions-role IAM grant. Any send/poll failure here (instance gone, SSM unreachable) falls through to the existing PitParityLookaheadDegraded fail-open \u2014 this check can only ADD a halt, never block the pipeline.",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+              "Parameters": {
+                "DocumentName": "AWS-RunShellScript",
+                "InstanceIds.$": "$.ec2_instance_id",
+                "Parameters": {
+                  "executionTimeout": [
+                    "60"
+                  ],
+                  "commands.$": "States.Array('set -eo pipefail','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),'aws s3api head-object --bucket alpha-engine-research --key \"parity/$RUN_DATE/.pit_stats_lookahead.resource_kill\"')"
+                },
+                "TimeoutSeconds": 60
+              },
+              "TimeoutSeconds": 90,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed",
+                    "States.Timeout"
+                  ],
+                  "Comment": "alpha-engine-config-I7267: mirrors config#2279's spot-stage 4+2 jittered ladder. This send fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) \u2014 before the marker-check script ever ran on the box \u2014 so re-issue is idempotent for the same reason every sibling sendCommand state in this file is.",
+                  "MaxAttempts": 4,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                },
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "alpha-engine-config-I7267: catch-all transient tier \u2014 same idempotency argument as the tier above.",
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "PitParityLookaheadDegraded",
+                  "ResultPath": "$.pit_parity_lookahead_resource_kill_marker_error"
+                }
+              ],
+              "ResultPath": "$.pit_parity_lookahead_resource_kill_marker_result",
+              "Next": "WaitForPitParityLookaheadResourceKillCheck"
+            },
+            "WaitForPitParityLookaheadResourceKillCheck": {
+              "Type": "Task",
+              "Comment": "Poll the PitParityLookaheadResourceKillCheck SSM command. head-object exits 0 (Success) iff the RESOURCE-KILL marker key exists, non-zero (404, Failed) otherwise \u2014 no output parsing needed, just the terminal Status.",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+              "Parameters": {
+                "CommandId.$": "$.pit_parity_lookahead_resource_kill_marker_result.Command.CommandId",
+                "InstanceId.$": "$.ec2_instance_id[0]"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Ssm.InvocationDoesNotExistException",
+                    "Ssm.InvocationDoesNotExist"
+                  ],
+                  "Comment": "sendCommand returns as soon as the command is accepted, so the invocation record can lag the returned CommandId by a beat.",
+                  "MaxAttempts": 10,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 1.5
+                },
+                {
+                  "ErrorEquals": [
+                    "Ssm.SdkClientException",
+                    "States.Timeout"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 5,
+                  "BackoffRate": 1.5
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "PitParityLookaheadDegraded",
+                  "ResultPath": "$.pit_parity_lookahead_resource_kill_marker_error"
+                }
+              ],
+              "ResultSelector": {
+                "Status.$": "$.Status"
+              },
+              "ResultPath": "$.pit_parity_lookahead_resource_kill_marker_poll",
+              "Next": "CheckPitParityLookaheadResourceKillCheckOutcome"
+            },
+            "PitParityLookaheadResourceKill": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I7267 (Brian's 2026-08-13 ruling, sf-pipeline-policy \u00a73 SFP-3): PitParityLookahead was KILLED FOR RESOURCES (its own internal timeout), distinct from the generic PitParityLookaheadDegraded 'could not conclude' fail-open. Branch still ends SUCCESS (sibling-isolation, \u00a74 blast radius, unchanged) but with status RESOURCE_KILL \u2014 CheckParityBranchOutcomes reads this and routes the WHOLE SF to the hard-fail path (the shared hard-fail chokepoint) instead of the fail-open ParityDegraded continuation, so PitParityCompare/Evaluator/ReportCard/Director do not run this week and the failure is visible from get-execution-history alone.",
+              "Parameters": {
+                "status": "RESOURCE_KILL"
+              },
+              "ResultPath": "$.branch_pit_lookahead",
+              "End": true
+            },
+            "CheckPitParityLookaheadResourceKillCheckOutcome": {
+              "Type": "Choice",
+              "Comment": "alpha-engine-config-I7267: Success == the marker key exists == PitParityLookahead was killed for resources. Anything else (404/NotFound == Failed, InProgress on a <5s command, budget-less single check) falls through to the existing PitParityLookaheadDegraded fail-open \u2014 this can only ADD a halt, never remove the existing coverage.",
+              "Choices": [
+                {
+                  "Variable": "$.pit_parity_lookahead_resource_kill_marker_poll.Status",
+                  "StringEquals": "Success",
+                  "Next": "PitParityLookaheadResourceKill"
+                }
+              ],
+              "Default": "PitParityLookaheadDegraded"
             }
           }
         },
@@ -4639,7 +4757,7 @@
                   "executionTimeout": [
                     "5400"
                   ],
-                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug pit-walkforward --log /var/log/pit-walkforward.log -- bash infrastructure/spot_pit_walkforward.sh{}',$$.Execution.Name,$.preflight_args))"
+                  "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main','cd /home/ec2-user/alpha-engine-backtester','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),'set +e',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug pit-walkforward --log /var/log/pit-walkforward.log -- bash infrastructure/spot_pit_walkforward.sh{}',$$.Execution.Name,$.preflight_args),'_pit_pass_rc=$?','if [ \"$_pit_pass_rc\" -ne 0 ] && aws s3api get-object --bucket alpha-engine-research --key \"parity/$RUN_DATE/pit_stats_walkforward.json\" /tmp/_pit_stats_walkforward_artifact.json >/dev/null 2>&1 && grep -qF \"\\\"timed_out\\\": true\" /tmp/_pit_stats_walkforward_artifact.json; then aws s3api put-object --bucket alpha-engine-research --key \"parity/$RUN_DATE/.pit_stats_walkforward.resource_kill\" --body /dev/null >/dev/null 2>&1 || true; fi','exit $_pit_pass_rc')"
                 },
                 "TimeoutSeconds": 5400
               },
@@ -4770,7 +4888,7 @@
                   "Next": "PitParityWalkforwardWait"
                 }
               ],
-              "Default": "PitParityWalkforwardDegraded"
+              "Default": "PitParityWalkforwardResourceKillCheck"
             },
             "PitParityWalkforwardWait": {
               "Type": "Pass",
@@ -4818,6 +4936,124 @@
               },
               "ResultPath": "$.branch_pit_walkforward",
               "End": true
+            },
+            "PitParityWalkforwardResourceKillCheck": {
+              "Type": "Task",
+              "Comment": "alpha-engine-config-I7267 (Brian's 2026-08-13 ruling, sf-pipeline-policy \u00a73 SFP-3-resource-kill-halts-and-is-named): PitParityWalkforward exited non-zero. Before folding into the existing fail-open PitParityWalkforwardDegraded terminal, check for the RESOURCE-KILL marker this Task's own commands wrote (unconditionally, regardless of exit code, immediately after the pass) when the just-published parity/{run_date}/pit_stats_walkforward.json read back timed_out:true \u2014 i.e. the pass did not merely fail to conclude, it was KILLED mid-work by its internal walkforward timeout (crucible-backtester analysis/pit_parity.py _PIT_PARITY_PASS_TIMEOUT). Runs a trivial `aws s3api head-object` on the SAME EC2 instance via the SAME SSM document \u2014 uses the instance's own IAM role (already grants S3 read/write on this exact prefix, since the pass itself just wrote there), so this needs NO new Step-Functions-role IAM grant. Any send/poll failure here (instance gone, SSM unreachable) falls through to the existing PitParityWalkforwardDegraded fail-open \u2014 this check can only ADD a halt, never block the pipeline.",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+              "Parameters": {
+                "DocumentName": "AWS-RunShellScript",
+                "InstanceIds.$": "$.ec2_instance_id",
+                "Parameters": {
+                  "executionTimeout": [
+                    "60"
+                  ],
+                  "commands.$": "States.Array('set -eo pipefail','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1',States.Format('export RUN_DATE=\\'{}\\'',$.run_date),'aws s3api head-object --bucket alpha-engine-research --key \"parity/$RUN_DATE/.pit_stats_walkforward.resource_kill\"')"
+                },
+                "TimeoutSeconds": 60
+              },
+              "TimeoutSeconds": 90,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed",
+                    "States.Timeout"
+                  ],
+                  "Comment": "alpha-engine-config-I7267: mirrors config#2279's spot-stage 4+2 jittered ladder. This send fires only when the SendCommand API call itself failed (throttle/5xx/dead dispatch box) \u2014 before the marker-check script ever ran on the box \u2014 so re-issue is idempotent for the same reason every sibling sendCommand state in this file is.",
+                  "MaxAttempts": 4,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                },
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "alpha-engine-config-I7267: catch-all transient tier \u2014 same idempotency argument as the tier above.",
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "PitParityWalkforwardDegraded",
+                  "ResultPath": "$.pit_parity_walkforward_resource_kill_marker_error"
+                }
+              ],
+              "ResultPath": "$.pit_parity_walkforward_resource_kill_marker_result",
+              "Next": "WaitForPitParityWalkforwardResourceKillCheck"
+            },
+            "WaitForPitParityWalkforwardResourceKillCheck": {
+              "Type": "Task",
+              "Comment": "Poll the PitParityWalkforwardResourceKillCheck SSM command. head-object exits 0 (Success) iff the RESOURCE-KILL marker key exists, non-zero (404, Failed) otherwise \u2014 no output parsing needed, just the terminal Status.",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+              "Parameters": {
+                "CommandId.$": "$.pit_parity_walkforward_resource_kill_marker_result.Command.CommandId",
+                "InstanceId.$": "$.ec2_instance_id[0]"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Ssm.InvocationDoesNotExistException",
+                    "Ssm.InvocationDoesNotExist"
+                  ],
+                  "Comment": "sendCommand returns as soon as the command is accepted, so the invocation record can lag the returned CommandId by a beat.",
+                  "MaxAttempts": 10,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 1.5
+                },
+                {
+                  "ErrorEquals": [
+                    "Ssm.SdkClientException",
+                    "States.Timeout"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 5,
+                  "BackoffRate": 1.5
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "PitParityWalkforwardDegraded",
+                  "ResultPath": "$.pit_parity_walkforward_resource_kill_marker_error"
+                }
+              ],
+              "ResultSelector": {
+                "Status.$": "$.Status"
+              },
+              "ResultPath": "$.pit_parity_walkforward_resource_kill_marker_poll",
+              "Next": "CheckPitParityWalkforwardResourceKillCheckOutcome"
+            },
+            "PitParityWalkforwardResourceKill": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I7267 (Brian's 2026-08-13 ruling, sf-pipeline-policy \u00a73 SFP-3): PitParityWalkforward was KILLED FOR RESOURCES (its own internal timeout), distinct from the generic PitParityWalkforwardDegraded 'could not conclude' fail-open. Branch still ends SUCCESS (sibling-isolation, \u00a74 blast radius, unchanged) but with status RESOURCE_KILL \u2014 CheckParityBranchOutcomes reads this and routes the WHOLE SF to the hard-fail path (the shared hard-fail chokepoint) instead of the fail-open ParityDegraded continuation, so PitParityCompare/Evaluator/ReportCard/Director do not run this week and the failure is visible from get-execution-history alone.",
+              "Parameters": {
+                "status": "RESOURCE_KILL"
+              },
+              "ResultPath": "$.branch_pit_walkforward",
+              "End": true
+            },
+            "CheckPitParityWalkforwardResourceKillCheckOutcome": {
+              "Type": "Choice",
+              "Comment": "alpha-engine-config-I7267: Success == the marker key exists == PitParityWalkforward was killed for resources. Anything else (404/NotFound == Failed, InProgress on a <5s command, budget-less single check) falls through to the existing PitParityWalkforwardDegraded fail-open \u2014 this can only ADD a halt, never remove the existing coverage.",
+              "Choices": [
+                {
+                  "Variable": "$.pit_parity_walkforward_resource_kill_marker_poll.Status",
+                  "StringEquals": "Success",
+                  "Next": "PitParityWalkforwardResourceKill"
+                }
+              ],
+              "Default": "PitParityWalkforwardDegraded"
             }
           }
         },
@@ -4953,12 +5189,17 @@
             },
             "CheckParityReplayStatus": {
               "Type": "Choice",
-              "Comment": "Budget exhaustion falls through to the Default arm, i.e. it is treated as a FAILED poll rather than a silent success \u2014 a bound whose exhaustion converges on the happy path is not a bound (I5687). Terminal non-Success degrades fail-open (alpha-engine-config#6030) \u2014 it never fails the SF and never aborts sibling branches.",
+              "Comment": "Budget exhaustion falls through to the Default arm, i.e. it is treated as a FAILED poll rather than a silent success \u2014 a bound whose exhaustion converges on the happy path is not a bound (I5687). Terminal non-Success degrades fail-open (alpha-engine-config#6030) \u2014 it never fails the SF and never aborts sibling branches. alpha-engine-config-I7267: a terminal non-Success whose captured StandardErrorContent carries krepis.ssm_log_capture's own 'RESOURCE KILL (OOM):'/'RESOURCE KILL (TIMEOUT):' classification (alpha-engine-config-I7258, sf-pipeline-policy \u00a73 SFP-3) routes to ParityReplayResourceKill instead of the generic fail-open \u2014 distinct from a genuine 'could not conclude' (spot dispatch failure, poll exhaustion, unclassified script error), which still degrades exactly as before.",
               "Choices": [
                 {
                   "Variable": "$.parity_replay_poll.Status",
                   "StringEquals": "Success",
                   "Next": "ParityReplayComplete"
+                },
+                {
+                  "Variable": "$.parity_replay_poll.StandardErrorContent",
+                  "StringMatches": "*RESOURCE KILL*",
+                  "Next": "ParityReplayResourceKill"
                 },
                 {
                   "And": [
@@ -5034,6 +5275,15 @@
               },
               "ResultPath": "$.branch_parity_replay",
               "End": true
+            },
+            "ParityReplayResourceKill": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I7267 (Brian's 2026-08-13 ruling, sf-pipeline-policy \u00a73 SFP-3): ParityReplay's captured StandardErrorContent carried krepis.ssm_log_capture's RESOURCE KILL classification (alpha-engine-config-I7258) \u2014 the replay was killed for resources, not merely unable to conclude. Branch still ends SUCCESS (sibling-isolation, \u00a74 blast radius, unchanged) but with status RESOURCE_KILL \u2014 CheckParityBranchOutcomes routes the WHOLE SF to the hard-fail path instead of the fail-open ParityDegraded continuation.",
+              "Parameters": {
+                "status": "RESOURCE_KILL"
+              },
+              "ResultPath": "$.branch_parity_replay",
+              "End": true
             }
           }
         }
@@ -5064,8 +5314,25 @@
     },
     "CheckParityBranchOutcomes": {
       "Type": "Choice",
-      "Comment": "Any DEGRADED branch folds into the existing $.parity_degraded flag family (ParityDegraded \u2192 PublishParityDegraded pages immediately; CheckGateDegradedNotify carries it to the terminal notification and the Option-A degraded completion, \u00a72.3) \u2014 then the run CONTINUES to the compare either way: \u00a72.3a requires the compare to run and emit verdict UNKNOWN when a pass artifact is absent, never to be skipped because a producer died. Per-branch specifics stay on $.parity_branch_outcomes.",
+      "Comment": "Any DEGRADED branch folds into the existing $.parity_degraded flag family (ParityDegraded \u2192 PublishParityDegraded pages immediately; CheckGateDegradedNotify carries it to the terminal notification and the Option-A degraded completion, \u00a72.3) \u2014 then the run CONTINUES to the compare either way: \u00a72.3a requires the compare to run and emit verdict UNKNOWN when a pass artifact is absent, never to be skipped because a producer died. Per-branch specifics stay on $.parity_branch_outcomes. alpha-engine-config-I7267: a RESOURCE_KILL branch status (set only by PitParityLookaheadResourceKill / PitParityWalkforwardResourceKill / ParityReplayResourceKill) is checked FIRST and routes to PitParityResourceKillDetected -> the shared hard-fail path \u2014 a resource-killed pass must halt the SF before PitParityCompare ever runs (sf-pipeline-policy \u00a73 SFP-3, option (a) of the 2026-08-13 ruling: downstream stages this run simply do not run), distinct from the existing DEGRADED fold below, which still continues to the compare join (\u00a72.3a: a producer that merely could not conclude must never skip the verdict, which the compare emits as UNKNOWN).",
       "Choices": [
+        {
+          "Or": [
+            {
+              "Variable": "$.parity_branch_outcomes.pit_lookahead_status",
+              "StringEquals": "RESOURCE_KILL"
+            },
+            {
+              "Variable": "$.parity_branch_outcomes.pit_walkforward_status",
+              "StringEquals": "RESOURCE_KILL"
+            },
+            {
+              "Variable": "$.parity_branch_outcomes.parity_replay_status",
+              "StringEquals": "RESOURCE_KILL"
+            }
+          ],
+          "Next": "PitParityResourceKillDetected"
+        },
         {
           "Or": [
             {
@@ -5215,12 +5482,17 @@
     },
     "CheckPitParityCompareStatus": {
       "Type": "Choice",
-      "Comment": "Budget exhaustion falls through to the Default arm, i.e. it is treated as a FAILED poll rather than a silent success \u2014 a bound whose exhaustion converges on the happy path is not a bound (I5687). Terminal non-Success degrades fail-open (alpha-engine-config#6030) \u2014 it never fails the SF and never aborts sibling branches.",
+      "Comment": "Budget exhaustion falls through to the Default arm, i.e. it is treated as a FAILED poll rather than a silent success \u2014 a bound whose exhaustion converges on the happy path is not a bound (I5687). Terminal non-Success degrades fail-open (alpha-engine-config#6030) \u2014 it never fails the SF and never aborts sibling branches. alpha-engine-config-I7267: a terminal non-Success whose captured StandardErrorContent carries krepis.ssm_log_capture's own 'RESOURCE KILL (OOM):'/'RESOURCE KILL (TIMEOUT):' classification (alpha-engine-config-I7258, sf-pipeline-policy \u00a73 SFP-3) routes DIRECTLY to the shared hard-fail path (PitParityCompareResourceKill -> NormalizeFailureContext -> HandleFailure -> FailExecution) \u2014 the compare is sequential, not a Parallel branch, so there is no sibling-isolation reason to fail-open it. A genuine 'could not conclude' (unclassified failure) still degrades exactly as before.",
       "Choices": [
         {
           "Variable": "$.pit_parity_compare_poll.Status",
           "StringEquals": "Success",
           "Next": "PitParityCompareComplete"
+        },
+        {
+          "Variable": "$.pit_parity_compare_poll.StandardErrorContent",
+          "StringMatches": "*RESOURCE KILL*",
+          "Next": "PitParityCompareResourceKill"
         },
         {
           "And": [
@@ -8165,6 +8437,26 @@
       ],
       "ResultPath": "$.run_scope_result",
       "Next": "CheckSkipReportCard"
+    },
+    "PitParityCompareResourceKill": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I7267 (Brian's 2026-08-13 ruling, sf-pipeline-policy \u00a73 SFP-3-resource-kill-halts-and-is-named): PitParityCompare's captured StandardErrorContent carried krepis.ssm_log_capture's RESOURCE KILL classification (alpha-engine-config-I7258) \u2014 the compare join was killed for resources. Unlike a branch's own *Degraded (which must stay fail-open for sibling isolation, \u00a74), PitParityCompare is sequential \u2014 routes straight into the SAME shared hard-fail chokepoint every other genuine SF failure uses (config#1819's single Catch/Next target), so Evaluator/ReportCard/Director do not run this week and the cause is visible on the execution record's $.error.",
+      "Parameters": {
+        "Error": "PitParityResourceKillHalt",
+        "Cause.$": "States.Format('PitParityCompare was killed for resources (OOM/timeout) \u2014 see StandardErrorContent: {}', $.pit_parity_compare_poll.StandardErrorContent)"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "PitParityResourceKillDetected": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I7267 (Brian's 2026-08-13 ruling, sf-pipeline-policy \u00a73 SFP-3-resource-kill-halts-and-is-named): at least one of the three ParityParallel branches (PitParityLookahead / PitParityWalkforward / ParityReplay) was killed for resources (its own internal pass timeout, or an OOM/timeout classified by krepis.ssm_log_capture per alpha-engine-config-I7258) rather than merely failing to conclude. Routes into the SAME shared hard-fail chokepoint every other genuine SF failure uses (config#1819's single Catch/Next target: NormalizeFailureContext -> HandleFailure -> FailExecution) so PitParityCompare and every stage after it do not run this week, and the specific branch outcomes are on the execution record's $.error for forensics. This is DISTINCT from the unchanged ParityDegraded fold immediately below in CheckParityBranchOutcomes, which still fail-opens through to the compare join for a branch that genuinely could not conclude.",
+      "Parameters": {
+        "Error": "PitParityResourceKillHalt",
+        "Cause.$": "States.Format('A pit_parity/parity-replay branch was killed for resources (timeout/OOM) this run. Branch outcomes: lookahead={}, walkforward={}, parity_replay={}.', $.parity_branch_outcomes.pit_lookahead_status, $.parity_branch_outcomes.pit_walkforward_status, $.parity_branch_outcomes.parity_replay_status)"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
     }
   }
 }

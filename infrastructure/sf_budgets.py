@@ -269,6 +269,27 @@ STAGE_BUDGETS: dict[str, StageBudget] = {
         max_budget_seconds=7_200,
         pipeline_segment="parity_parallel",
     ),
+    # alpha-engine-config-I7267: trivial `aws s3api head-object` marker
+    # check, dispatched on the SAME instance only after the pass already
+    # exited non-zero — seconds of runtime, no spot boot cost (the box is
+    # already up). Budget is deliberately tiny; still inside
+    # parity_parallel since it runs concurrently with the sibling branches.
+    "PitParityLookaheadResourceKillCheck": StageBudget(
+        name="PitParityLookaheadResourceKillCheck",
+        current_timeout_seconds=60,
+        per_ticker_cost_seconds=None,
+        fixed_overhead_seconds=60,
+        max_budget_seconds=90,
+        pipeline_segment="parity_parallel",
+    ),
+    "PitParityWalkforwardResourceKillCheck": StageBudget(
+        name="PitParityWalkforwardResourceKillCheck",
+        current_timeout_seconds=60,
+        per_ticker_cost_seconds=None,
+        fixed_overhead_seconds=60,
+        max_budget_seconds=90,
+        pipeline_segment="parity_parallel",
+    ),
     # The compare join reads two small JSONs and computes numpy stats —
     # seconds of compute; the ~15 min spot boot/deps dominates.
     "PitParityCompare": StageBudget(

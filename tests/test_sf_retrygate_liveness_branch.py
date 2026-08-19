@@ -353,6 +353,23 @@ def _branch_terminal_ssm_stages():
             target = scope.get(default, {})
             if default.endswith(("Degraded", "Failed")) and not target.get("Parameters", {}).get("phase"):
                 continue
+            # alpha-engine-config-I7267: PitParityLookahead/Walkforward's
+            # Default is now an indirection — a RESOURCE_KILL marker check
+            # (own Task/Wait/Choice trio, named `{stage}ResourceKillCheck` /
+            # `WaitFor{stage}ResourceKillCheck` /
+            # `Check{stage}ResourceKillCheckOutcome`) — before falling to the
+            # SAME *Degraded terminal as before. EVERY non-Success path
+            # still survives substrate loss identically to the pre-I7267
+            # shape: the check Task's own Catch, the check Wait's own Catch,
+            # AND the check Choice's Default all land on the stage's
+            # existing *Degraded terminal — the indirection only ever ADDS a
+            # RESOURCE_KILL classification on top of an already-degraded
+            # outcome, never changes what happens to a reclaimed instance.
+            # Verified structurally (not just this exemption's say-so) by
+            # test_sf_parity_resource_kill_halt_i7267.py, which pins all
+            # three of those routes to *Degraded by name.
+            if default.endswith("ResourceKillCheck"):
+                continue
             yield name[len("Check"):-len("Status")], name, scope
 
 

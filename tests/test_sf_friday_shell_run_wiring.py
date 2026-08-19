@@ -959,13 +959,29 @@ class TestByteIdenticalAbsentPath:
         install the guard on the spot as part of its bootstrap, so I7364's
         declared floor holds there too — is tracked as
         alpha-engine-config-I7383.
+
+        2026-08-19 (alpha-engine-config-I7267): PitParityLookahead/
+        PitParityWalkforward gained a RESOURCE-KILL marker-check tail
+        (rc-capture + artifact-timed_out check + `exit $_pit_pass_rc`)
+        AFTER the launcher invocation, to preserve the pass's own exit
+        code for the existing Check*Status routing — so for these two
+        keys the launcher line is no longer `cmds[-1]`. The launcher line
+        is located by CONTENT (starts with the resolved interpreter path)
+        rather than by position, which stays correct regardless of
+        whether anything trails it.
         """
         token, log = _SPOT_STATES[name]
         slug = Path(log).stem
         cmds = _resolve_spot_commands(
             self._state(sf, name), preflight_args=" --preflight-only"
         )
-        final = cmds[-1]
+        launcher_prefix = "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run "
+        launcher_lines = [c for c in cmds if c.startswith(launcher_prefix)]
+        assert len(launcher_lines) == 1, (
+            f"{name}: expected exactly one krepis.ssm_log_capture launcher "
+            f"line, found {len(launcher_lines)} in {cmds}"
+        )
+        final = launcher_lines[0]
         expected = (
             "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python "
             "-m krepis.ssm_log_capture run "
