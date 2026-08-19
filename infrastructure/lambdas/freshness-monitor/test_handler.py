@@ -4368,3 +4368,90 @@ def test_a_prefix_shaped_template_still_uses_membership(monkeypatch):
     stub = _ListStub(0)
     assert index._prefix_has_ever_been_written(stub, spec, result) is False
     assert stub.calls[0]["MaxKeys"] == 1
+
+
+# ── config-I7730: the owning-item budget must be spent where it pages ────────
+#
+# MEASURED 2026-08-19T17:02:08Z, on Brian's Telegram page: the one paging row
+# carried `owning_item_lookup=degraded owning_item_lookup_reason=
+# 'lookup_budget_exhausted'`. The sweep had 12 confirmed misses, of which NINE
+# could not page under any owning-item answer — 7 producer-suppressed
+# (config-I6570) and 2 never-written (config-I7622) — and the 24-query cap was
+# spent on them first. The join that exists to EXPLAIN a page was starved by
+# rows that cannot produce one.
+#
+# Both gates below are exactly `_alert_decision`'s own early returns, and both
+# sit above every use of `owning`, so skipping the lookup cannot change a
+# verdict — it only stops paying for an answer nothing reads.
+
+
+def _lookup_calls(index_mod, monkeypatch):
+    """Record which artifact_ids the owning-item join is actually spent on."""
+    spent: list[str] = []
+
+    def fake(artifact_id, canonical_key, known, now, state):
+        spent.append(artifact_id)
+        return {"resolved": True, "degraded": False, "degraded_reason": None,
+                "owning_item": None, "members": [], "n_candidates": 0}
+
+    monkeypatch.setattr(index_mod, "_resolve_owning_item", fake)
+    return spent
+
+
+def test_a_suppressed_row_does_not_spend_a_github_query(
+    monkeypatch, yaml_registry_body, fake_s3, fixed_now
+):
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    fake_s3._registry_body = yaml_registry_body
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
+    monkeypatch.setattr(index, "publish", mock.Mock(return_value=mock.Mock(dedup_skipped=False)))
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+    spent = _lookup_calls(index, monkeypatch)
+
+    # Every not-fresh row reports as producer-suppressed.
+    monkeypatch.setattr(index, "apply_producer_suppression", lambda *a, **kw: {
+        aid: {"suppressed": True, "reason": "producer disabled",
+              "disabled_since": "2026-08-07", "days_disabled": 12,
+              "trigger": "scheduler:x", "pause_owner": None, "pause_owner_url": None}
+        for aid in ("probe_missing", "probe_heartbeat", "probe_fresh")
+    })
+    index.handler({}, None)
+    assert spent == [], f"budget spent on rows that cannot page: {spent}"
+
+
+def test_a_never_written_row_does_not_spend_a_github_query(monkeypatch, fixed_now):
+    """The gate reads the never-written answer, so the probe must run FIRST."""
+    import importlib
+    import index
+    importlib.reload(index)
+    # The ordering is the contract: if the probe moved back below the join, the
+    # gate would read an unpopulated dict and silently stop working.
+    src = __import__("pathlib").Path(index.__file__).read_text()
+    probe_at = src.index("never_written_by_id[spec.artifact_id] = never_written")
+    join_at = src.index("_cannot_page = (")
+    assert probe_at < join_at, (
+        "the never-written probe must run BEFORE the owning-item budget gate "
+        "that reads its answer (config-I7730)"
+    )
+
+
+def test_an_unsuppressed_paging_row_still_gets_its_lookup(
+    monkeypatch, yaml_registry_body, fake_s3, fixed_now
+):
+    """The point is not fewer lookups — it is that the row on the page gets one."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    fake_s3._registry_body = yaml_registry_body
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
+    monkeypatch.setattr(index, "publish", mock.Mock(return_value=mock.Mock(dedup_skipped=False)))
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+    spent = _lookup_calls(index, monkeypatch)
+    index.handler({}, None)
+    assert "probe_missing" in spent
