@@ -4094,16 +4094,23 @@ def test_handler_still_writes_check_results_when_the_digest_cannot_be_sent(
 
 
 class _ListStub:
-    """Minimal S3 double for the never-written probe."""
+    """Minimal S3 double for the never-written probe.
 
-    def __init__(self, key_count):
+    `key_count` drives the fixed-key path; `pages` drives the suffix-matching
+    path (config-I7622 follow-up) as a list of `list_objects_v2` responses.
+    """
+
+    def __init__(self, key_count=None, pages=None):
         self.key_count = key_count
+        self.pages = list(pages or [])
         self.calls = []
 
     def list_objects_v2(self, **kw):
         self.calls.append(kw)
         if isinstance(self.key_count, Exception):
             raise self.key_count
+        if self.pages:
+            return self.pages.pop(0)
         return {"KeyCount": self.key_count}
 
 
@@ -4177,10 +4184,9 @@ def test_probe_prefix_is_the_templates_fixed_head(monkeypatch):
     result = CheckResult(state="missing", sla_violated_by_minutes=300,
                          canonical_key="backtest/2026-08-18/contribution_lift.json",
                          reason="no instance found")
-    stub = _ListStub(0)
+    stub = _ListStub(pages=[{"Contents": [], "IsTruncated": False}])
     index._prefix_has_ever_been_written(stub, spec, result)
     assert stub.calls[0]["Prefix"] == "backtest/"
-    assert stub.calls[0]["MaxKeys"] == 1
 
 
 def test_never_written_rows_are_reported_in_the_digest_not_silenced(monkeypatch, fixed_now):
@@ -4245,3 +4251,120 @@ def test_owning_item_wall_clock_starts_at_the_first_lookup(monkeypatch):
         "the clock must not start at construction — that is the probe loop's "
         "duration, not the lookup phase's"
     )
+
+
+# ── config-I7622 follow-up: prefix membership is not the question ────────────
+#
+# MEASURED 2026-08-19: `research_self_test` (`research/{date}/self_test.json`)
+# resolved never_written=False because the `research/` prefix is populated with
+# thousands of unrelated objects — while
+# `aws s3 ls s3://alpha-engine-research/research/ --recursive | grep self_test.json`
+# returned NOTHING. The artifact has never once been written and the probe could
+# not see it. `backtest_contribution_lift` sits under `backtest/` with the same
+# shape. A shared top-level prefix answers a different question than the one
+# being asked.
+
+
+def _dated_spec(index_mod):
+    from nousergon_lib.artifact_freshness import ArtifactSpec, CheckResult
+    spec = ArtifactSpec(
+        artifact_id="research_self_test", s3_bucket="alpha-engine-research",
+        s3_key_template="research/{date}/self_test.json", cadence="weekday_sf",
+        sla_minutes_after_cron=2880, severity="warning",
+        owner_repo="crucible-research", created_at=date(2025, 1, 1),
+    )
+    result = CheckResult(state="missing", sla_violated_by_minutes=100,
+                         canonical_key="research/2026-08-19/self_test.json",
+                         reason="no instance found")
+    return spec, result
+
+
+def test_a_populated_prefix_without_the_suffix_is_never_written(monkeypatch):
+    """The regression: `research/` is full, and not one object is a self_test."""
+    import importlib
+    import index
+    importlib.reload(index)
+    spec, result = _dated_spec(index)
+    stub = _ListStub(pages=[{
+        "Contents": [{"Key": "research/2026-08-19/signals.json"},
+                     {"Key": "research/2026-08-19/rationale.json"}],
+        "IsTruncated": False,
+    }])
+    assert index._prefix_has_ever_been_written(stub, spec, result) is False
+
+
+def test_one_matching_key_anywhere_in_the_prefix_is_enough(monkeypatch):
+    import importlib
+    import index
+    importlib.reload(index)
+    spec, result = _dated_spec(index)
+    stub = _ListStub(pages=[{
+        "Contents": [{"Key": "research/2026-01-02/other.json"},
+                     {"Key": "research/2026-03-04/self_test.json"}],
+        "IsTruncated": False,
+    }])
+    assert index._prefix_has_ever_been_written(stub, spec, result) is True
+
+
+def test_the_match_can_be_on_a_later_page(monkeypatch):
+    """A match beyond the first page must still count — S3 lists lexically, so
+    the newest keys are frequently in the tail."""
+    import importlib
+    import index
+    importlib.reload(index)
+    spec, result = _dated_spec(index)
+    stub = _ListStub(pages=[
+        {"Contents": [{"Key": "research/2026-01-02/other.json"}],
+         "IsTruncated": True, "NextContinuationToken": "t1"},
+        {"Contents": [{"Key": "research/2026-08-14/self_test.json"}],
+         "IsTruncated": False},
+    ])
+    assert index._prefix_has_ever_been_written(stub, spec, result) is True
+    assert stub.calls[1]["ContinuationToken"] == "t1"
+
+
+def test_giving_up_at_the_page_cap_reports_unknown_not_never_written(monkeypatch):
+    """A prefix too large to search is a question left UNANSWERED. Answering it
+    'never written' on the strength of having given up is precisely the failure
+    this function is shaped to avoid — the row keeps its page path."""
+    monkeypatch.setenv("NEVER_WRITTEN_SCAN_PAGES", "2")
+    import importlib
+    import index
+    importlib.reload(index)
+    spec, result = _dated_spec(index)
+    stub = _ListStub(pages=[
+        {"Contents": [{"Key": f"research/x{i}/other.json"}], "IsTruncated": True,
+         "NextContinuationToken": f"t{i}"}
+        for i in range(4)
+    ])
+    assert index._prefix_has_ever_been_written(stub, spec, result) is None
+    assert len(stub.calls) == 2, "the cap must actually bound the scan"
+
+
+def test_a_truncated_page_with_no_token_stops_rather_than_looping(monkeypatch):
+    import importlib
+    import index
+    importlib.reload(index)
+    spec, result = _dated_spec(index)
+    stub = _ListStub(pages=[{"Contents": [], "IsTruncated": True}])
+    assert index._prefix_has_ever_been_written(stub, spec, result) is False
+
+
+def test_a_prefix_shaped_template_still_uses_membership(monkeypatch):
+    """`groom/{date}/` has no trailing fixed segment, so prefix membership IS
+    the question and the cheap MaxKeys=1 path is correct."""
+    import importlib
+    import index
+    importlib.reload(index)
+    from nousergon_lib.artifact_freshness import ArtifactSpec, CheckResult
+    spec = ArtifactSpec(
+        artifact_id="groom_run_artifacts", s3_bucket="alpha-engine-research",
+        s3_key_template="groom/{date}/", cadence="continuous",
+        interval_minutes=1440, sla_minutes_after_cron=60, severity="warning",
+        owner_repo="alpha-engine-config", created_at=date(2025, 1, 1),
+    )
+    result = CheckResult(state="missing", sla_violated_by_minutes=10,
+                         canonical_key="groom/2026-08-19/", reason="absent")
+    stub = _ListStub(0)
+    assert index._prefix_has_ever_been_written(stub, spec, result) is False
+    assert stub.calls[0]["MaxKeys"] == 1
