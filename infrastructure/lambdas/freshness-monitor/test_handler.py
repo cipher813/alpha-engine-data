@@ -4080,3 +4080,168 @@ def test_handler_still_writes_check_results_when_the_digest_cannot_be_sent(
     written = {k for (_, k, _) in fake_s3._put_calls}
     assert "_freshness_monitor/check_results.json" in written
     assert "_freshness_monitor/heartbeat.json" in written
+
+
+# ── config-I7622: "never once written" is not an SLA miss ───────────────────
+#
+# Brian, 2026-08-19: "if these are false alarms i don't want to receive them."
+# After the config-I7709 cadence revert and the config-I7713 rollup, the single
+# remaining page in the 2026-08-19T15:41:32Z sweep was `rag_corpus_scope_state`
+# — key `rag_corpus/scope_state/latest.json`, which no code in nousergon-data,
+# crucible-research, nousergon-lib or alpha-engine-config writes, and whose
+# `rag_corpus/` prefix does not exist in the bucket at all. It had reached 6
+# consecutive misses and escalated to the critical path.
+
+
+class _ListStub:
+    """Minimal S3 double for the never-written probe."""
+
+    def __init__(self, key_count):
+        self.key_count = key_count
+        self.calls = []
+
+    def list_objects_v2(self, **kw):
+        self.calls.append(kw)
+        if isinstance(self.key_count, Exception):
+            raise self.key_count
+        return {"KeyCount": self.key_count}
+
+
+def _missing_spec(index_mod, artifact_id="never_made", template="rag_corpus/scope_state/latest.json"):
+    from nousergon_lib.artifact_freshness import ArtifactSpec, CheckResult
+    spec = ArtifactSpec(
+        artifact_id=artifact_id, s3_bucket="alpha-engine-research",
+        s3_key_template=template, cadence="continuous", interval_minutes=1440,
+        sla_minutes_after_cron=720, severity="critical", owner_repo="nousergon-data",
+        created_at=date(2025, 1, 1),
+    )
+    result = CheckResult(state="missing", sla_violated_by_minutes=221,
+                         canonical_key=template, reason="no instance found")
+    return spec, result
+
+
+def test_a_never_written_row_does_not_page(monkeypatch, fixed_now):
+    """The regression itself: an artifact nothing has ever produced is a
+    registry/producer-birth gap, and its absence is CORRECT."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    spec, result = _missing_spec(index)
+    assert index._alert_decision(spec, result, fixed_now, never_written=True) is None
+    # ...and the identical row DOES page once an instance has existed before.
+    assert index._alert_decision(spec, result, fixed_now, never_written=False) is not None
+
+
+def test_an_unanswerable_probe_keeps_the_page_path(monkeypatch, fixed_now):
+    """`None` is not `True`. The failure this must lean toward is paging about a
+    real absence, never silencing one — so 'I could not tell' behaves exactly
+    like 'it has been written before'."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    spec, result = _missing_spec(index)
+    assert index._alert_decision(spec, result, fixed_now, never_written=None) is not None
+
+
+def test_probe_reports_none_not_false_when_s3_raises(monkeypatch):
+    """A LIST that errors must not be read as evidence of absence."""
+    import importlib
+    import index
+    importlib.reload(index)
+    spec, result = _missing_spec(index)
+    assert index._prefix_has_ever_been_written(
+        _ListStub(RuntimeError("denied")), spec, result) is None
+    # A response with no usable KeyCount is equally unanswerable.
+    assert index._prefix_has_ever_been_written(_ListStub(None), spec, result) is None
+
+
+def test_probe_distinguishes_empty_prefix_from_populated(monkeypatch):
+    import importlib
+    import index
+    importlib.reload(index)
+    spec, result = _missing_spec(index)
+    assert index._prefix_has_ever_been_written(_ListStub(0), spec, result) is False
+    assert index._prefix_has_ever_been_written(_ListStub(1), spec, result) is True
+
+
+def test_probe_prefix_is_the_templates_fixed_head(monkeypatch):
+    """A date-templated key must be probed at its fixed prefix, or the probe
+    only ever asks about one cycle and calls every dated artifact never-written."""
+    import importlib
+    import index
+    importlib.reload(index)
+    from nousergon_lib.artifact_freshness import CheckResult
+    spec, _ = _missing_spec(index, template="backtest/{trading_day}/contribution_lift.json")
+    result = CheckResult(state="missing", sla_violated_by_minutes=300,
+                         canonical_key="backtest/2026-08-18/contribution_lift.json",
+                         reason="no instance found")
+    stub = _ListStub(0)
+    index._prefix_has_ever_been_written(stub, spec, result)
+    assert stub.calls[0]["Prefix"] == "backtest/"
+    assert stub.calls[0]["MaxKeys"] == 1
+
+
+def test_never_written_rows_are_reported_in_the_digest_not_silenced(monkeypatch, fixed_now):
+    """Not paged is not the same as not said. The registry's debt stays on the
+    same surface as the real misses — an unproduced row that vanishes from every
+    surface is how one sits unnoticed for a year."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+
+    covered = index._publish_digest([], fixed_now, {"rag_corpus_scope_state": True})
+    publish_mock.assert_called_once()
+    body = publish_mock.call_args.args[0]
+    assert "1 registry row(s) never written" in body
+    assert "artifact_id=rag_corpus_scope_state never_written=true" in body
+    # A never-written-only digest is never critical — nothing is failing.
+    assert publish_mock.call_args.kwargs["severity"] == "warning"
+    assert covered == 0
+
+
+def test_never_written_only_changes_the_dedup_key_when_the_set_moves(monkeypatch, fixed_now):
+    import importlib
+    import index
+    importlib.reload(index)
+    a = index._digest_dedup_key([], fixed_now, ["x"])
+    b = index._digest_dedup_key([], fixed_now, ["x"])
+    c = index._digest_dedup_key([], fixed_now, ["x", "y"])
+    assert a == b and a != c
+
+
+def test_a_clean_sweep_with_nothing_unproduced_still_sends_nothing(monkeypatch, fixed_now):
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+    assert index._publish_digest([], fixed_now, {"a": False, "b": None}) == 0
+    publish_mock.assert_not_called()
+
+
+# ── config-I7622: the owning-item budget was measuring the probe loop ────────
+
+
+def test_owning_item_wall_clock_starts_at_the_first_lookup(monkeypatch):
+    """MEASURED 2026-08-19T15:41:32Z: 2 pages, 2 degraded lookups, on a pass with
+    11 confirmed misses and a 24-query budget. The 25s wall clock was started
+    when the state was built — before a probe loop that took 68.5s over 146 rows
+    — so it was already 40s over budget before the first GitHub query could run,
+    and every row resolved `lookup_time_budget_exhausted` no matter how few
+    misses there were. The budget was bounding the wrong interval."""
+    import importlib
+    import index
+    importlib.reload(index)
+    state = index._new_lookup_state()
+    assert state["started_at"] is None, (
+        "the clock must not start at construction — that is the probe loop's "
+        "duration, not the lookup phase's"
+    )

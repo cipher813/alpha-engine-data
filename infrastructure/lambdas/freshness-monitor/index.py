@@ -1136,6 +1136,79 @@ def _is_confirmed_miss(result: CheckResult) -> bool:
 # ── Per-spec probe (catches per-spec errors so one bad row doesn't sink the pass) ─
 
 
+# ── "never once written" is not an SLA miss (config-I7603 d2 / config-I7622) ─
+#
+# A `missing` row means the recency scan found no instance. Two very different
+# facts wear that state:
+#
+#   * an artifact that HAS been produced before and is now absent — a producer
+#     failure, which is what the SLA ladder and the page path are for;
+#   * an artifact NO CODE HAS EVER WRITTEN — a registry row registered ahead of
+#     (or instead of) its producer. Its absence is correct. Paging on it, daily,
+#     forever, is the false alarm Brian named on 2026-08-19: "if these are false
+#     alarms i don't want to receive them."
+#
+# Measured 2026-08-19T15:41:32Z: the single remaining page in the whole sweep was
+# `rag_corpus_scope_state`, whose key `rag_corpus/scope_state/latest.json` has no
+# writer anywhere in the fleet — `grep -rn scope_state` across nousergon-data,
+# crucible-research, nousergon-lib and alpha-engine-config finds none, and the
+# `rag_corpus/` prefix does not exist in the bucket at all. It had escalated to
+# the critical path on 6 consecutive misses. `backtest_contribution_lift` and
+# `rag_ingestion_progress` were the two prior instances of the same class, the
+# latter reaching 14 escalations.
+#
+# They have different causes, different owners and different fixes, and only one
+# of them is worth waking someone for. So: distinguish them, page on one, and
+# REPORT the other — never silence it. A never-written row still appears in
+# check_results.json with its true state, and still gets a standing line in the
+# digest under its own heading, so the registry's own debt stays visible without
+# being an alarm.
+
+_NEVER_WRITTEN_PROBE_MAX = int(os.environ.get("NEVER_WRITTEN_PROBE_MAX", "25"))
+
+
+def _prefix_has_ever_been_written(
+    s3_client: Any, spec: ArtifactSpec, result: CheckResult
+) -> bool | None:
+    """Has ANY instance of this artifact ever existed?
+
+    Returns True/False, or None when the question could not be answered — which
+    is NOT the same as False and must never be rendered as "never written".
+    An unanswerable probe leaves the row on the normal page path, because the
+    failure toward which this must lean is paging about a real absence, never
+    silencing one.
+
+    The recency scan that produced ``missing`` is bounded by a cadence-derived
+    window. This asks the unbounded question, over the key's own prefix, with
+    ``MaxKeys=1`` — one cheap LIST, and only for rows already in ``missing``
+    (three of 146 in the measured sweep).
+    """
+    key = result.canonical_key or spec.s3_key_template
+    # The template's fixed leading segment: everything before the first
+    # placeholder, trimmed to a directory boundary. For a fixed key this is the
+    # key itself, which LISTs exactly one object if it exists.
+    template = spec.s3_key_template
+    head = template.split("{", 1)[0]
+    prefix = head if head.endswith("/") else head.rsplit("/", 1)[0] + "/" if "/" in head else head
+    if not prefix:
+        prefix = key
+    try:
+        resp = s3_client.list_objects_v2(
+            Bucket=spec.s3_bucket, Prefix=prefix, MaxKeys=1
+        )
+        # A response that does not carry an integer KeyCount has not answered
+        # the question. Coercing it would turn "I could not tell" into "never
+        # written", which is the one direction this must never fail in.
+        return int(resp["KeyCount"]) > 0
+    except Exception as exc:  # noqa: BLE001 — unanswerable, so the row keeps the page path; this WARNING and never_written=None on the row are the recording surfaces
+        logger.warning(
+            "never-written probe for %s could not run (prefix=%r) — the row "
+            "keeps the normal page path: %s",
+            spec.artifact_id, prefix, exc,
+        )
+        return None
+
+
 def _check_one(
     s3_client: Any, spec: ArtifactSpec, now: datetime
 ) -> tuple[CheckResult, Exception | None]:
@@ -1253,6 +1326,7 @@ def _serialize_check_results(
     owning_by_id: dict[str, dict[str, Any]] | None = None,
     execution_loop: dict[str, Any] | None = None,
     coverage: dict[str, Any] | None = None,
+    never_written_by_id: dict[str, bool | None] | None = None,
 ) -> dict[str, Any]:
     """Build the ``check_results.json`` payload — one row per spec for
     the dashboard surface (Phase 5). ``miss_counts``/``coerced_ids``
@@ -1307,6 +1381,14 @@ def _serialize_check_results(
                 ),
                 "alert_suppressed": bool(
                     suppression and suppression["suppressed"]
+                ),
+                # config-I7622 — True: no instance has EVER existed under this
+                # key, so the row is a producer-birth gap and does not page.
+                # False: it has been written before and this is a real miss.
+                # None/absent: not probed, or the probe could not answer — which
+                # is NOT evidence of either, and leaves the page path intact.
+                "never_written": (never_written_by_id or {}).get(
+                    spec.artifact_id
                 ),
                 # config-I7509: the console must be able to say WHOSE decision
                 # is holding this row quiet past the 14-day clock. A suppressed
@@ -1999,7 +2081,15 @@ def _new_lookup_state() -> dict[str, Any]:
     budget, one per-artifact result cache."""
     return {
         "pat": None, "pat_error": None, "queries": 0, "cache": {},
-        "started_at": time.monotonic(),
+        # config-I7622 — started on the FIRST lookup, not here. This state is
+        # built before the probe loop, which took 68.5s over 146 rows in the
+        # 2026-08-19T15:41:32Z sweep; a wall clock started at construction was
+        # therefore already 40s past a 25s budget before the first GitHub query
+        # ran, and every row resolved `lookup_time_budget_exhausted` regardless
+        # of how few misses there were. Measured that sweep: 2 pages, 2 degraded
+        # lookups, on a pass with 11 confirmed misses — the budget was measuring
+        # the probe loop it was never meant to bound.
+        "started_at": None,
     }
 
 
@@ -2180,8 +2270,10 @@ def _resolve_owning_item(
         if state["queries"] >= OWNING_ITEM_LOOKUP_MAX_QUERIES:
             errors.append("lookup_budget_exhausted")
             break
-        if (
-            time.monotonic() - state.get("started_at", 0.0)
+        if state.get("started_at") is None:
+            state["started_at"] = time.monotonic()
+        elif (
+            time.monotonic() - state["started_at"]
             >= OWNING_ITEM_LOOKUP_MAX_SECONDS
         ):
             errors.append("lookup_time_budget_exhausted")
@@ -2291,7 +2383,8 @@ def _owning_item_body_fragment(owning: dict[str, Any] | None) -> str:
 def _alert_decision(spec: ArtifactSpec, result: CheckResult, now: datetime,
                     consecutive_miss_runs: int = 0,
                     producer_suppression: dict[str, Any] | None = None,
-                    owning: dict[str, Any] | None = None) -> dict[str, Any] | None:
+                    owning: dict[str, Any] | None = None,
+                    never_written: bool | None = None) -> dict[str, Any] | None:
     """Decide whether this probe result belongs on the operator page, and
     return the decision. Returns ``None`` when it does not.
 
@@ -2345,6 +2438,22 @@ def _alert_decision(spec: ArtifactSpec, result: CheckResult, now: datetime,
     # mirrors the substrate's clip-at-zero arithmetic for
     # missing/stale. probe_failed has no SLA — fire immediately.
     if result.state in ("missing", "stale") and result.sla_violated_by_minutes == 0:
+        return None
+
+    # config-I7603 d2 / config-I7622 — an artifact NO CODE HAS EVER WRITTEN is a
+    # registry row registered ahead of its producer, not a producer failure. Its
+    # absence is correct, so it does not page and does not climb the miss ladder.
+    # It is NOT silenced: `never_written: true` reaches check_results.json and
+    # the row gets its own standing block in the digest (see `_compose_digest`),
+    # so the registry's debt stays visible without being an alarm. `None` means
+    # the probe could not answer and the row keeps the page path.
+    if never_written is True:
+        logger.info(
+            "never-written (config-I7622): %s state=%s — no instance has ever "
+            "existed under this key, so this is a registry/producer-birth gap, "
+            "not an SLA miss; reported in the digest, not paged",
+            spec.artifact_id, result.state,
+        )
         return None
 
     if not ALERTS_ENABLED:
@@ -2446,7 +2555,8 @@ def _alert_decision(spec: ArtifactSpec, result: CheckResult, now: datetime,
 def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
                  consecutive_miss_runs: int = 0,
                  producer_suppression: dict[str, Any] | None = None,
-                 owning: dict[str, Any] | None = None) -> bool:
+                 owning: dict[str, Any] | None = None,
+                 never_written: bool | None = None) -> bool:
     """Whether this row belongs on the sweep's page.
 
     Retained as the boolean face of :func:`_alert_decision` — it is the gate
@@ -2460,6 +2570,7 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
         consecutive_miss_runs=consecutive_miss_runs,
         producer_suppression=producer_suppression,
         owning=owning,
+        never_written=never_written,
     ) is not None
 
 
@@ -2516,7 +2627,11 @@ def _cause_group_key(spec: ArtifactSpec) -> str:
     return f"owner_repo:{spec.owner_repo}"
 
 
-def _digest_dedup_key(decisions: list[dict[str, Any]], now: datetime) -> str:
+def _digest_dedup_key(
+    decisions: list[dict[str, Any]],
+    now: datetime,
+    unproduced: list[str] | None = None,
+) -> str:
     """One key per (distinct set of alerting artifacts, UTC day).
 
     Hashing the SET is the whole point: an unchanged condition stays quiet, and
@@ -2525,11 +2640,18 @@ def _digest_dedup_key(decisions: list[dict[str, Any]], now: datetime) -> str:
     apart and would have to drop the new one.
     """
     ids = ",".join(sorted(d["artifact_id"] for d in decisions))
+    # The unproduced set is part of the condition: a registry row that becomes
+    # never-written, or stops being, is a change worth re-stating once.
+    ids += "|never_written:" + ",".join(sorted(unproduced or []))
     fingerprint = hashlib.sha256(ids.encode("utf-8")).hexdigest()[:16]
     return f"freshness_digest_{now.date().isoformat()}_{fingerprint}"
 
 
-def _compose_digest(decisions: list[dict[str, Any]], now: datetime) -> str:
+def _compose_digest(
+    decisions: list[dict[str, Any]],
+    now: datetime,
+    never_written: dict[str, bool | None] | None = None,
+) -> str:
     """The single page body: a one-line verdict, then one block per cause.
 
     Ordering is deterministic (critical groups first, then by group size, then
@@ -2540,11 +2662,16 @@ def _compose_digest(decisions: list[dict[str, Any]], now: datetime) -> str:
     for decision in decisions:
         groups[decision["group_key"]].append(decision)
 
+    unproduced = sorted(
+        aid for aid, flag in (never_written or {}).items() if flag is True
+    )
     n_critical = sum(1 for d in decisions if d["severity"] == "critical")
     header = (
         f"{len(decisions)} artifact(s) past SLA across {len(groups)} cause(s) "
         f"({n_critical} critical) — freshness sweep {now.isoformat()}"
     )
+    if unproduced:
+        header += f" · {len(unproduced)} registry row(s) never written"
 
     def _group_rank(item: tuple[str, list[dict[str, Any]]]) -> tuple:
         key, members = item
@@ -2567,10 +2694,28 @@ def _compose_digest(decisions: list[dict[str, Any]], now: datetime) -> str:
         )
         for member in members:
             blocks.append(f"  - {member['line']}")
+
+    # Reported, never paged: these rows assert an SLA over a key nothing has
+    # ever written, so their absence is correct and the fix is a registry or
+    # producer-birth change, not an incident. Kept in the body so the debt is
+    # visible on the same surface as the real misses (config-I7622).
+    if unproduced:
+        blocks.append(
+            f"\n[never-written] {len(unproduced)} registry row(s) assert an SLA "
+            f"over a key that has NEVER had an instance — a producer-birth gap, "
+            f"not a producer failure. Not paged; fix is to land the producer or "
+            f"retire the row:"
+        )
+        for aid in unproduced:
+            blocks.append(f"  - artifact_id={aid} never_written=true")
     return "\n".join(blocks)
 
 
-def _publish_digest(decisions: list[dict[str, Any]], now: datetime) -> int:
+def _publish_digest(
+    decisions: list[dict[str, Any]],
+    now: datetime,
+    never_written: dict[str, bool | None] | None = None,
+) -> int:
     """Emit the sweep's single page. Returns the number of artifacts it covers
     (0 when there is nothing to say, which is silence by absence of condition —
     never by suppression).
@@ -2580,14 +2725,17 @@ def _publish_digest(decisions: list[dict[str, Any]], now: datetime) -> int:
     invariant that makes the rollup safe — it changes how many messages are
     sent, never which conditions are reportable.
     """
-    if not decisions:
+    unproduced = sorted(
+        aid for aid, flag in (never_written or {}).items() if flag is True
+    )
+    if not decisions and not unproduced:
         return 0
 
     severity = "critical" if any(
         d["severity"] == "critical" for d in decisions
     ) else "warning"
-    body = _compose_digest(decisions, now)
-    dedup_key = _digest_dedup_key(decisions, now)
+    body = _compose_digest(decisions, now, never_written)
+    dedup_key = _digest_dedup_key(decisions, now, unproduced)
 
     publish_result = publish(
         body,
@@ -3226,6 +3374,7 @@ def _run_probe_pass(
     pairs: list[tuple[ArtifactSpec, CheckResult]] = []
     alerted = 0
     digest_decisions: list[dict[str, Any]] = []
+    never_written_by_id: dict[str, bool | None] = {}
     dispatched = 0
     per_spec_exceptions = 0
     prev_miss_counts = prev_miss_counts or {}
@@ -3315,6 +3464,16 @@ def _run_probe_pass(
         # keeps its exact meaning (this row is on the operator page), so the
         # execution-loop records, the drain-candidate gate and the `alerted`
         # count below are unchanged; only the number of MESSAGES changed.
+        # config-I7622 — only `missing` rows can be "never written", and only
+        # a handful are missing in any sweep (3 of 146, measured 2026-08-19), so
+        # this costs one MaxKeys=1 LIST each rather than a scan.
+        never_written: bool | None = None
+        if result.state == "missing" and len(never_written_by_id) < _NEVER_WRITTEN_PROBE_MAX:
+            never_written = _prefix_has_ever_been_written(s3_client, spec, result)
+            if never_written is not None:
+                never_written = not never_written
+            never_written_by_id[spec.artifact_id] = never_written
+
         decision = None
         if not suppress_page:
             decision = _alert_decision(
@@ -3322,6 +3481,7 @@ def _run_probe_pass(
                 producer_suppression=(suppression_by_id or {}).get(
                     spec.artifact_id),
                 owning=owning,
+                never_written=never_written,
             )
         paged = decision is not None
         if paged:
@@ -3360,7 +3520,7 @@ def _run_probe_pass(
     # must not sink check_results.json or the heartbeat, which are the durable
     # record this page is only a notification of.
     try:
-        _publish_digest(digest_decisions, now)
+        _publish_digest(digest_decisions, now, never_written_by_id)
     except Exception as digest_exc:  # noqa: BLE001 — the page is a notification; the durable record is check_results.json, and this ERROR is the recording surface for its loss
         logger.error(
             "FRESHNESS_DIGEST_PUBLISH_FAILED for %d artifact(s) %s "
@@ -3384,7 +3544,11 @@ def _run_probe_pass(
 
     return (
         pairs, alerted, dispatched, per_spec_exceptions, miss_counts,
-        {"owning_by_id": owning_by_id, "page_records": page_records},
+        {
+            "owning_by_id": owning_by_id,
+            "page_records": page_records,
+            "never_written_by_id": never_written_by_id,
+        },
     )
 
 
@@ -3478,6 +3642,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         prev_issue_filed=prev_issue_filed,
     )
     owning_by_id = pass_telemetry["owning_by_id"]
+    never_written_by_id = pass_telemetry.get("never_written_by_id") or {}
 
     # config#2055 Gap 2 + §7.4a: extended-staleness -> Decision Queue P1,
     # skipped where an item already owns the condition. Runs after the full
@@ -3530,6 +3695,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         owning_by_id=owning_by_id,
         execution_loop=execution_loop,
         coverage=coverage,
+        never_written_by_id=never_written_by_id,
     )
     heartbeat = _serialize_heartbeat(pairs, now, started_at)
 
