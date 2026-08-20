@@ -695,9 +695,10 @@ class TestReplayConcordance:
     def test_payload_carries_required_fields(self, states):
         payload = states["ReplayConcordance"]["Parameters"]["Payload"]
         assert payload["end_time_iso.$"] == "$$.Execution.StartTime"
-        # alpha-engine-config-I2997 (2026-07-19): ReplayConcordance migrated
-        # off direct Anthropic to OpenRouter (deepseek/deepseek-v4-flash).
-        assert payload["target_models"] == ["deepseek/deepseek-v4-flash"]
+        # alpha-engine-config-I7898 (2026-08-20): ReplayConcordance migrated
+        # off the OpenRouter provider slug onto the krepis registry entry id
+        # (deepseek-v4-flash), paired with crucible-backtester-PR716.
+        assert payload["target_models"] == ["deepseek-v4-flash"]
         assert payload["window_days"] == 56
         assert payload["max_artifacts"] == 150
 
