@@ -858,6 +858,39 @@ alert_classes:
     severities: [warning]
     intake: bus
     response: drain-queue
+  - class: research_cut_promotion_alerts
+    # alpha-engine-config-I7876 static-chokepoint registration: the scanner-cut
+    # promotion engine (crucible-research/lambda/scanner_handler.py, calling
+    # scoring/cut_promotion.py::run_cut_promotion inline in the scanner
+    # Lambda handler) is FAIL-SOFT + LOUD — a promotion failure never
+    # downgrades the already-written candidates.json/membership artifacts (the
+    # champion pointer keeps naming the standing champion), but this alert is
+    # the ONLY signal that no promote/hold decision was recorded for the
+    # cycle. Introduced by the 2026-08-20 champion/challenger promotion arc;
+    # publish_observe_alert call site publishes with explicit severity="ERROR".
+    source: "research:cut_promotion"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+  - class: research_corpus_stats_alerts
+    # alpha-engine-config-I7896 static-chokepoint registration. Emitted by
+    # crucible-research/lambda/aggregate_costs_handler.py::_refresh_corpus_stats
+    # when the distillation corpus_stats refresh fails. The failure is
+    # deliberately non-fatal — the cost parquet is already written by then —
+    # but it is NOT harmless: the config#1542 kill-gate trigger reads
+    # decision_artifacts/distillation/corpus_stats/latest.json, so a frozen
+    # artifact means the 90-day clock silently stops advancing while every
+    # surface still shows a valid file. This alert is the only signal that
+    # happened. Same shape as research_cut_promotion_alerts above (I7876):
+    # an emitter shipped without its playbook row, found by the cross-repo
+    # drift check on alpha-engine-config's main rather than at either repo's
+    # own merge time.
+    # The call site passes no explicit severity, so it takes
+    # publish_observe_alert's default.
+    source: "aggregate_costs_handler:corpus_stats"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
   - class: research_experiment_record_alerts
     source: "research:experiment_record"
     severities: [warning]
