@@ -39,9 +39,23 @@ GIT_SHA="${GITHUB_SHA:-$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo 
 echo "  Stamping deploy with GIT_SHA=${GIT_SHA}"
 
 DRY_RUN=false
+# --validate-only: stamp every SF definition and run the validate-ALL preflight
+# (step 2b), then exit BEFORE the first S3 write or CloudFormation call. This is
+# the mode the PRE-MERGE check runs (alpha-engine-config-I7798), so the PR is
+# graded by the SAME validator, on the SAME stamped artifacts, in the SAME
+# all-or-nothing order the deploy uses — one implementation, not a second one
+# that can drift from it. It needs exactly states:ValidateStateMachineDefinition
+# (role ne-github-sf-validate); it deliberately performs no mutation, which is
+# also why it skips step 1's template upload rather than reordering around it.
+#
+# NOTE --dry-run is a DIFFERENT and weaker mode despite its "validate only"
+# header: it uploads the CFN template to S3 and validates THAT, then exits
+# before the SF definitions are ever stamped or validated. Tracked separately.
+VALIDATE_ONLY=false
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=true ;;
+        --validate-only) VALIDATE_ONLY=true ;;
     esac
 done
 
@@ -52,6 +66,7 @@ echo "  Stack:    $STACK_NAME"
 echo "  Region:   $REGION"
 echo "  Account:  $ACCOUNT_ID"
 echo "  Dry run:  $DRY_RUN"
+echo "  Validate only: $VALIDATE_ONLY"
 echo ""
 
 # ── 1. Upload the CFN template to S3, then validate via --template-url ───────
@@ -59,13 +74,17 @@ echo ""
 # validate-template exercises the exact artifact create-stack/update-stack
 # will read below — an S3-sourced template that fails to upload fails here,
 # not three steps later against a stale copy.
-echo "==> Uploading CloudFormation template to S3..."
-aws s3 cp "$TEMPLATE" "s3://$BUCKET/$TEMPLATE_S3_KEY" --quiet
-echo "  Uploaded to s3://$BUCKET/$TEMPLATE_S3_KEY"
+if $VALIDATE_ONLY; then
+    echo "==> Skipping CloudFormation template upload/validate (--validate-only performs no mutation)."
+else
+    echo "==> Uploading CloudFormation template to S3..."
+    aws s3 cp "$TEMPLATE" "s3://$BUCKET/$TEMPLATE_S3_KEY" --quiet
+    echo "  Uploaded to s3://$BUCKET/$TEMPLATE_S3_KEY"
 
-echo "==> Validating CloudFormation template..."
-aws cloudformation validate-template --template-url "$TEMPLATE_URL" --query "Description" --output text
-echo "  Template valid."
+    echo "==> Validating CloudFormation template..."
+    aws cloudformation validate-template --template-url "$TEMPLATE_URL" --query "Description" --output text
+    echo "  Template valid."
+fi
 
 if $DRY_RUN; then
     echo ""
@@ -189,6 +208,14 @@ if $VALIDATION_FAILED; then
     exit 1
 fi
 echo "  All Step Function definitions valid."
+
+if $VALIDATE_ONLY; then
+    echo ""
+    echo "Validate-only complete: every Step Function definition this repo would"
+    echo "deploy is accepted by AWS. No artifact was uploaded and no state machine"
+    echo "was touched."
+    exit 0
+fi
 
 echo ""
 echo "==> Uploading Step Function definitions to S3..."
