@@ -185,6 +185,65 @@ class TestFlowDoctorYamlSchema:
         assert cfg["flow_name"] == "data-collector"
         assert cfg["repo"] == "nousergon/nousergon-data"
 
+    def test_diagnosis_enabled_requires_explicit_provider(self):
+        """A config that enables diagnosis must name its provider.
+
+        flow-doctor 0.15.0 made an unset ``diagnosis.provider`` a loud
+        ConfigError at ``load_config`` time (Brian ruling: no default LLM
+        vendor, ever). This repo's pinned krepis==0.59.12 still resolves an
+        older flow-doctor (<0.10 per that krepis release's own `flow_doctor`
+        extra cap) whose parser silently defaulted `provider` to
+        `"anthropic"` instead of raising — so the installed library cannot
+        be relied on to catch this class of bug in CI today, only in a
+        strict-mode production init once the krepis pin catches up
+        (nousergon-data-PR1456). This assertion is therefore a plain
+        schema check on the yaml itself, independent of whatever
+        flow-doctor version happens to be installed: it is what let
+        alpha-engine-data-collector deploy v341 with `diagnosis.enabled:
+        true` and no `provider:` key, crashing at Lambda cold-start
+        (Runtime.ExitError, INIT_REPORT status=error) instead of failing
+        this test.
+        """
+        import yaml
+        with open(REPO_ROOT / "flow-doctor.yaml") as f:
+            cfg = yaml.safe_load(f)
+        diagnosis = cfg.get("diagnosis")
+        if not diagnosis or not diagnosis.get("enabled"):
+            return
+        provider = diagnosis.get("provider")
+        assert provider in ("router", "openai_compat"), (
+            f"diagnosis.enabled=True requires diagnosis.provider to be "
+            f"'router' or 'openai_compat', got {provider!r} — flow-doctor "
+            f"has no default LLM vendor (0.15.0)."
+        )
+        if provider == "router":
+            assert diagnosis.get("model_group") in ("low", "med", "high", "ultra"), (
+                "diagnosis.provider='router' requires diagnosis.model_group "
+                "(one of: low, med, high, ultra)"
+            )
+        if provider == "openai_compat":
+            assert diagnosis.get("base_url"), (
+                "diagnosis.provider='openai_compat' requires diagnosis.base_url"
+            )
+
+    def test_auto_fix_diagnosis_provider_agrees(self):
+        """fix/cli.py's FixGenerator reuses diagnosis.provider/model_group
+        verbatim (flow_doctor.fix.cli.generate_fix) — auto_fix.enabled must
+        not be on without the same provider contract diagnosis needs.
+        """
+        import yaml
+        with open(REPO_ROOT / "flow-doctor.yaml") as f:
+            cfg = yaml.safe_load(f)
+        auto_fix = cfg.get("auto_fix")
+        if not auto_fix or not auto_fix.get("enabled"):
+            return
+        diagnosis = cfg.get("diagnosis") or {}
+        assert diagnosis.get("provider") in ("router", "openai_compat"), (
+            "auto_fix.enabled=True generates fixes via diagnosis.provider "
+            "(flow_doctor.fix.cli) — it must be set to 'router' or "
+            "'openai_compat', same as diagnosis above."
+        )
+
     def test_yaml_has_email_and_github_notify_channels(self):
         import yaml
         with open(REPO_ROOT / "flow-doctor.yaml") as f:
