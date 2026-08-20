@@ -536,6 +536,14 @@ def main() -> int:
     if uncodified and args.strict:
         exit_code = max(exit_code, 1)
 
+    # Console publish runs on EVERY invocation — clean or not, `--report` or
+    # not — mirroring crucible-dashboard's box_health_hygiene precedent
+    # (alpha-engine-config-I7857): a surface that only publishes when
+    # something is wrong is indistinguishable from one that has died. This is
+    # DISTINCT from `_report_drift` below, which is the channel alert and
+    # stays gated on `--report` + non-empty findings.
+    _publish_console(findings, installed_count=installed_count, drift_count=len(buckets["drift"]))
+
     if findings:
         print(f"FINDINGS: {len(findings)}", file=sys.stderr)
         for f in findings:
@@ -561,6 +569,84 @@ def main() -> int:
     return exit_code
 
 
+# Timer cadence: systemd-unit-drift-check.timer fires OnCalendar=*-*-*
+# 06:17:00 UTC once daily. Declared honestly per the fleet check-result
+# contract — understating makes the console call this check stale early,
+# overstating lets a dead emitter read healthy for longer than it should.
+CONSOLE_CHECK_ID = "systemd_unit_drift"
+CONSOLE_CADENCE_MINUTES = 1440
+
+
+def _publish_console(findings: list[str], *, installed_count: int, drift_count: int) -> None:
+    """Route the standing-drift finding set to the console (alpha-engine-config-I7857).
+
+    Runs on EVERY invocation, findings or not — see the call site in `main()`.
+    This is DISTINCT from `_report_drift`: that function is the Telegram/SNS
+    channel alert (gated on `--report` and on findings being non-empty); this
+    one is the console's standing-state surface, published unconditionally so
+    the console can tell "clean" apart from "dead" via `ran_at` staleness
+    rather than the absence of a row meaning either.
+
+    Why this exists at all: `_report_drift` used to be the ONLY surface for
+    this finding, at `severity="error"` with a 24h dedup window that matches
+    the timer's own cadence exactly — so an UNCHANGED drift re-pages the
+    channel every single day it stays true, forever, with no new information
+    in the repeat. That is precisely the shape alpha-engine-config-I7857
+    audited: `krepis.alerts`' severity tiering only controls the Telegram
+    phone-push, never delivery, so there was never a tier that would have
+    kept this quiet on its own. The channel alert still fires (drift is a
+    real, actionable finding, not hygiene noise) but its repeat window is
+    widened in the same change (see `_report_drift`) — the console is what
+    makes that safe: the standing set is visible here continuously, with its
+    own count, rather than being remembered only between channel repeats.
+
+    Status is `attention`, never `error`, for a non-empty finding set: this
+    check can tell you drift EXISTS but the console's status vocabulary
+    reserves `error` for "the check itself is blind" (mirrors
+    nousergon-lib's fleet_check_result contract and pause_reconcile.py's
+    `publish_error` in this same repo) — a check that ran and found drift is
+    working exactly as designed, not broken.
+    """
+    try:
+        from nousergon_lib import fleet_check_result as fcr
+    except Exception as e:  # noqa: BLE001 — telemetry must not break the check
+        print(
+            f"[check-systemd-unit-drift] console publish skipped — "
+            f"nousergon_lib.fleet_check_result unavailable: {e}",
+            file=sys.stderr,
+        )
+        return
+
+    status = fcr.STATUS_OK if not findings else fcr.STATUS_ATTENTION
+    if findings:
+        summary = (
+            f"{len(findings)} standing finding(s) ({drift_count} drift) on "
+            f"{socket.gethostname()} out of {installed_count} installed unit(s)"
+        )
+    else:
+        summary = f"{installed_count} installed unit(s), all codified and matching"
+
+    try:
+        fcr.emit_result(
+            check_id=CONSOLE_CHECK_ID,
+            label="Systemd unit drift (installed vs repo)",
+            status=status,
+            summary=summary,
+            cadence_minutes=CONSOLE_CADENCE_MINUTES,
+            findings=[{"id": f"finding-{i}", "detail": f} for i, f in enumerate(findings)],
+            deep_link=(
+                "https://github.com/nousergon/nousergon-data/blob/main/"
+                "infrastructure/systemd/check-systemd-unit-drift.py"
+            ),
+        )
+    except Exception as e:  # noqa: BLE001 — telemetry must not break the check
+        print(
+            f"[check-systemd-unit-drift] console publish failed (best-effort, "
+            f"check result unaffected): {e}",
+            file=sys.stderr,
+        )
+
+
 def _report_drift(findings: list[str]) -> None:
     """Alert on detected systemd unit drift.
 
@@ -583,6 +669,19 @@ def _report_drift(findings: list[str]) -> None:
     `krepis.alerts` is the canonical alert CLI (config#1649). It resolves its
     own secrets, so there is no hydration list here to drift out of sync with
     flow-doctor.yaml.
+
+    **Repeat window widened 1440 -> 43200 (alpha-engine-config-I7857).** The
+    timer runs daily, and the old 1440min (24h) window matched that cadence
+    exactly — so an UNCHANGED drift re-paged the channel every single day it
+    stayed true, with no new information in the repeat. This is the same
+    condition wrongly believed fixed by tuning severity/window before
+    (`krepis.alerts` was never actually gating visibility by severity — see
+    that issue). The dedup KEY still derives from the finding SET, so a
+    drift appearing, clearing, or changing pages IMMEDIATELY regardless of
+    the window; the window governs only how often an UNCHANGED set repeats.
+    30 days mirrors the precedent set by crucible-dashboard's box_health
+    `warning` tier (same audit). The standing set stays continuously visible
+    on the console via `_publish_console` above, independent of this window.
     """
     message = (
         f"systemd unit drift on {socket.gethostname()}: "
@@ -596,11 +695,12 @@ def _report_drift(findings: list[str]) -> None:
             severity="error",
             source="check-systemd-unit-drift",
             # Dedup on the FINDINGS, not the message: the same drift persisting
-            # alerts once a day, while a new finding changes the key and pages.
+            # alerts once per window, while a new finding changes the key and
+            # pages immediately regardless of window.
             dedup_key="unit-drift-" + hashlib.sha256(
                 "|".join(sorted(findings)).encode()
             ).hexdigest()[:16],
-            dedup_window_min=1440,
+            dedup_window_min=43200,
         )
     except Exception as e:
         # Fail LOUD. A silent failure here is the exact defect this rewrite
