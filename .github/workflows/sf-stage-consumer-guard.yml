@@ -1,0 +1,111 @@
+name: SF Stage Consumer Guard
+
+# alpha-engine-config-I7839. nousergon-data-PR1464 (merged 2026-08-20T18:25:51Z)
+# removed the `Scanner` state from `infrastructure/step_function_daily.json`
+# (ne-preopen-trading-pipeline). Nothing in THIS repo's CI knew that
+# crucible-dashboard's `loaders/pipeline_status_loader.py::RELIABILITY_STAGE_ORDER`
+# still declared it, so crucible-dashboard's own CI went red on every open PR
+# (test_pipeline_status_reliability.py) until fixed after the fact in
+# crucible-dashboard-PR732. crucible-dashboard's detector is real and correct —
+# it just only runs on crucible-dashboard's own push/PR events, so it can only
+# ever catch this AFTER a producer merge, from a consumer's red build.
+#
+# This job closes the gap at the correct layer, one merge earlier: it runs
+# crucible-dashboard's OWN cross-repo consumer tests, unmodified, against THIS
+# PR's candidate SF definitions instead of against whatever crucible-dashboard's
+# CI happened to check out last. Same shape `sf-definition-validate.yml`
+# already uses for the AWS-side preflight (invoke the one real implementation
+# from the other side, don't grow a second one that can drift from it):
+#
+#   - tests/test_pipeline_status_reliability.py::test_every_declared_stage_exists_in_the_live_definition
+#     walks RELIABILITY_STAGE_ORDER (crucible-dashboard's per-pipeline stage
+#     spine, used for the Page-25 cycle-reliability strip) against the live
+#     definition — this is exactly what caught the Scanner removal, just one
+#     merge too late.
+#   - tests/test_pipeline_status_registry_drift.py::test_every_substantive_task_has_a_registry_entry
+#     walks every substantive Task state in the live definitions against
+#     nousergon_lib.pipeline_status.registry (STATE_TO_ARCHIVE_PAGE /
+#     SUBSTANTIVE_RESOURCES / WAIT_GROUPING) — catches the mirror-image defect,
+#     a newly ADDED stage with no registry entry (alpha-engine-config-I6857:
+#     `DIGEST_STATE_ORDER` carrying stale names after a state rename).
+#
+# Both already fail for the right reason and name which stage and which
+# pipeline — reusing them means this guard cannot report a different verdict
+# than crucible-dashboard's own CI does the moment it next runs.
+#
+# NOT run unconditionally: paths-scoped to the SF definitions themselves, so a
+# PR touching anything else in this repo never pays crucible-dashboard's
+# checkout + dependency-install cost. NOT a merge_group / push-to-main
+# duplicate of sf-definition-validate.yml's trigger set — this check only has
+# something to say about a PR's OWN diff (does the candidate definition still
+# satisfy a sibling repo's declared expectations), so it belongs on
+# pull_request, not on a live-vs-codified drift cadence.
+#
+# What this guard does NOT cover (traced, not assumed, while building this):
+#   - ARTIFACT_REGISTRY.yaml's per-artifact `cadence: weekday_sf` declarations
+#     (private repo, alpha-engine-config) assume a producer trigger cadence
+#     but are not cross-checked against live SF stage membership by anything
+#     today — filed separately, alpha-engine-config-I7847 (found stale by
+#     this exact PR1464 change: 3 rows still say weekday_sf).
+#   - nous-ergon-ops/nousergon-console/config.d/pipeline-reliability*.yaml
+#     stage_states lists (checked while building this: neither file names a
+#     preopen-pipeline stage, so PR1464 could not have broken them).
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'infrastructure/step_function*.json'
+      - '.github/workflows/sf-stage-consumer-guard.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sf-stage-consumer-guard-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  consumer-guard:
+    name: crucible-dashboard stage consumers vs candidate SF definitions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out nousergon-data (this PR's candidate SF definitions)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Check out crucible-dashboard (main — the consumer under test)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          repository: nousergon/crucible-dashboard
+          ref: main
+          path: .dashboard-consumer
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+        with:
+          python-version-file: .dashboard-consumer/.python-version
+
+      - name: Install crucible-dashboard's dependencies
+        working-directory: .dashboard-consumer
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      # SF_DEFS_DIR points crucible-dashboard's own tests at THIS checkout
+      # (github.workspace = the nousergon-data PR branch), not at whatever
+      # crucible-dashboard's CI last saw. Only the two tests that actually
+      # cross the repo boundary run here — the rest of crucible-dashboard's
+      # suite has nothing to say about a nousergon-data SF-definition change
+      # and would only add unrelated flakiness to this gate.
+      - name: Run crucible-dashboard's stage-consumer tests against this PR's definitions
+        working-directory: .dashboard-consumer
+        env:
+          SF_DEFS_DIR: ${{ github.workspace }}
+          CI: 'true'
+        run: >
+          pytest -v
+          tests/test_pipeline_status_reliability.py::test_every_declared_stage_exists_in_the_live_definition
+          tests/test_pipeline_status_reliability.py::test_every_pipeline_has_a_stage_order
+          tests/test_pipeline_status_registry_drift.py
