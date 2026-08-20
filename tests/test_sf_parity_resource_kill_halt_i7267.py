@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 
 import pytest
 
@@ -97,7 +98,7 @@ def test_pass_commands_write_the_marker_on_timed_out_true_only(states, base):
     """The pass's own commands.$ must (a) preserve the original exit code
     ($_pit_pass_rc, restored via the trailing `exit $_pit_pass_rc`) and (b)
     gate the marker PUT on BOTH a non-zero exit AND the artifact's own
-    `"timed_out": true` substring — never write the marker for a clean run
+    timed_out-true pattern — never write the marker for a clean run
     or for a non-timeout failure whose artifact says timed_out:false (or
     has no artifact at all, e.g. a true infra failure)."""
     for br in states["ParityParallel"]["Branches"]:
@@ -109,8 +110,12 @@ def test_pass_commands_write_the_marker_on_timed_out_true_only(states, base):
 
     assert "'set +e'" in cmds, f"{base}: must disable set -e before capturing $?"
     assert "'_pit_pass_rc=$?'" in cmds, f"{base}: must capture the pass's own exit code"
-    assert '"$_pit_pass_rc" -ne 0' in cmds, f"{base}: marker write must be gated on a non-zero exit"
-    assert '\\"timed_out\\": true' in cmds, f"{base}: marker write must be gated on the artifact's timed_out:true"
+    assert "$_pit_pass_rc -ne 0" in cmds, f"{base}: marker write must be gated on a non-zero exit"
+    assert "timed_out[^a-z]+true" in cmds, f"{base}: marker write must be gated on the artifact's timed_out:true"
+    # The escape-grammar rule this state broke on 2026-08-19 lives in
+    # test_sf_asl_intrinsic_literals.py (a backslash-escaped double quote is
+    # rejected by AWS's intrinsic parser); the marker gate is therefore
+    # written with a bracket expression instead of an escaped quote.
     assert cmds.rstrip(")").endswith("'exit $_pit_pass_rc'"), (
         f"{base}: the ORIGINAL pass exit code must be the command's final "
         f"exit — the existing Check{base}Status Success/Failed routing must "
@@ -413,3 +418,47 @@ def test_pit_parity_resource_kill_detected_carries_forensics_and_error_name(stat
     assert "Cause.$" in st["Parameters"]
     assert st["ResultPath"] == "$.error"
     assert st["Next"] == "NormalizeFailureContext"
+
+
+# --- the marker gate's grep pattern, exercised as a predicate --------------
+#
+# The gate was `grep -qF '"timed_out": true'` until 2026-08-20, when the
+# backslash-escaped quotes in that literal were found to be illegal inside an
+# ASL intrinsic (they blocked every deploy from 2026-08-19 and halted the
+# 2026-08-20 preopen). The replacement, `grep -qE 'timed_out[^a-z]+true'`, is
+# deliberately LOOSER than an exact-bytes match: it asks whether the pass
+# reported a timeout rather than how the artifact writer spaced its JSON. These
+# cases pin that the widening does not reach anything it should not.
+
+_MARKER_GATE_PATTERN = "timed_out[^a-z]+true"
+
+
+@pytest.mark.parametrize(
+    "line, expected",
+    [
+        ('  "timed_out": true,', True),
+        ('{"timed_out":true}', True),
+        ('  "timed_out" : true', True),
+        ('  "timed_out": false,', False),
+        # a later key's `true` must not satisfy the gate — the intervening
+        # lowercase key name breaks [^a-z]+
+        ('{"timed_out": false, "verdict_clean": true}', False),
+        ('{"verdict": "FAIL"}', False),
+    ],
+)
+def test_marker_gate_pattern_matches_only_a_timed_out_pass(line, expected):
+    assert bool(re.search(_MARKER_GATE_PATTERN, line)) is expected
+
+
+def test_marker_gate_pattern_is_the_one_the_definition_ships(states):
+    for base in ("PitParityLookahead", "PitParityWalkforward"):
+        for br in states["ParityParallel"]["Branches"]:
+            if base in br["States"]:
+                cmds = br["States"][base]["Parameters"]["Parameters"]["commands.$"]
+                assert _MARKER_GATE_PATTERN in cmds, (
+                    f"{base}: this module's pattern cases are asserted against a "
+                    f"pattern the definition no longer uses"
+                )
+                break
+        else:
+            pytest.fail(f"{base} not found in any ParityParallel branch")
