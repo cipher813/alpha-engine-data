@@ -36,7 +36,7 @@ alpha-engine-config-I2717/I2722 (2026-07-16): the CheckSkipChronicGapHeal gate
 + ChronicGapSelfHeal (and its liveness-poll quintet) were REMOVED entirely —
 the heal moved to a standalone EventBridge-triggered daily job, off this SF's
 critical path. alpha-engine-config-I6494: CheckSkipMorningEnrich's skip edge
-and the data-phase spot success edges now route to CheckSkipScanner (weekday
+and the data-phase spot success edges now route to CheckSkipPredictorInference (the weekday
 Scanner before PredictorInference). Likewise PredictorHealthCheck +
 PredictorDriftCheck were REMOVED and re-homed onto their own direct
 EventBridge triggers — CoverageGapChoice and FinalCoverageGate (the
@@ -68,11 +68,13 @@ _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_daily.json"
 # (gate, task, skip_flag, next_gate) in pipeline order.
 # alpha-engine-config-I2717: CheckSkipChronicGapHeal + ChronicGapSelfHeal
 # removed entirely. alpha-engine-config-I6494: CheckSkipMorningEnrich's skip
-# edge now routes to CheckSkipScanner (weekday Scanner still runs when the
+# edge now routes to CheckSkipPredictorInference (the weekday Scanner was removed by I7811 when the
 # spot data phase is skipped); Scanner then joins CheckSkipPredictorInference.
 _CHAIN = [
-    ("CheckSkipMorningEnrich", "LaunchMorningEnrichSpot", "skip_morning_enrich", "CheckSkipScanner"),
-    ("CheckSkipScanner", "Scanner", "skip_scanner", "CheckSkipPredictorInference"),
+    # I7811 (Brian ruling 2026-08-20): the scanner forms its cuts WEEKLY, so
+    # CheckSkipScanner/Scanner are gone from this pipeline and the morning-enrich
+    # skip lands on the predictor gate directly.
+    ("CheckSkipMorningEnrich", "LaunchMorningEnrichSpot", "skip_morning_enrich", "CheckSkipPredictorInference"),
     ("CheckSkipPredictorInference", "PredictorInference", "skip_predictor_inference", "CheckSkipMorningPlanner"),
     ("CheckSkipMorningPlanner", "RunMorningPlanner", "skip_morning_planner", "CheckSkipRunDaemon"),
     # config#2857 + alpha-engine-config#6692: the skip edge now routes through
@@ -178,12 +180,13 @@ class TestEntryEdgesRouteThroughGates:
 
     def test_arctic_append_spot_success_enters_scanner_gate(self, states):
         # config#1767: the Arctic append also runs on its own spot; its Success
-        # rejoins the trading path at CheckSkipScanner (alpha-engine-config-I6494:
+        # rejoins the trading path at CheckSkipPredictorInference (I7811; was CheckSkipScanner under I6494:
         # weekday Scanner runs before PredictorInference). I2717 removed the
         # intermediate CheckSkipChronicGapHeal gate (heal moved standalone).
         success = [c["Next"] for c in states["CheckMorningArcticAppendSpotStatus"]["Choices"]
                    if c.get("StringEquals") == "Success"]
-        assert success == ["CheckSkipScanner"]
+        # I7811: the scanner gate is gone; the data phase rejoins at the predictor gate.
+        assert success == ["CheckSkipPredictorInference"]
 
     def test_data_phase_no_longer_on_trading_box(self, states):
         # config#1767 deliverable #2: the trading path retains NO data-phase SSM
@@ -305,8 +308,7 @@ class TestPaths:
         order = self._walk(states, "CheckSkipMorningEnrich", skip_flags={"skip_morning_enrich"})
         assert "LaunchMorningEnrichSpot" not in order
         assert "LaunchMorningArcticAppendSpot" not in order
-        assert order[0] == "Scanner"
-        assert order.index("Scanner") < order.index("PredictorInference")
+        assert order[0] == "PredictorInference"
         assert order[-1] == "PipelineComplete"
 
     def test_happy_path_runs_data_phase_on_spot(self, states):
@@ -317,5 +319,4 @@ class TestPaths:
         # Enrich spot precedes append spot precedes Scanner precedes
         # PredictorInference (I6494); I2717 removed chronic-gap-heal hop.
         assert order.index("LaunchMorningEnrichSpot") < order.index("LaunchMorningArcticAppendSpot")
-        assert order.index("LaunchMorningArcticAppendSpot") < order.index("Scanner")
-        assert order.index("Scanner") < order.index("PredictorInference")
+        assert order.index("LaunchMorningArcticAppendSpot") < order.index("PredictorInference")

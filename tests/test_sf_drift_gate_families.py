@@ -235,6 +235,9 @@ def test_resultpath_threading_survives_to_check_degraded_outcome(sf, states):
     # alpha-engine-config#6722 added SetMutexAcquireDegradedFlag (mutex
     # acquire infra-error fail-open) and SetScannerDegradedFlag (weekday
     # Scanner fail-open) as two more Option-A-shaped setters.
+    # I7811 (Brian ruling 2026-08-20) removed SetScannerDegradedFlag with the
+    # weekday Scanner — the scanner forms its cuts WEEKLY now, so there is no
+    # weekday scanner failure left to fail open.
     overwriters = {
         name
         for name, st in states.items()
@@ -245,7 +248,6 @@ def test_resultpath_threading_survives_to_check_degraded_outcome(sf, states):
         "SetDaemonDegradedFlag",
         "SetDataSpotDegradedFlag",
         "SetMutexAcquireDegradedFlag",
-        "SetScannerDegradedFlag",
     }
 
 

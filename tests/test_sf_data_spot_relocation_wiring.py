@@ -149,8 +149,8 @@ class TestWeekdayFailureIsolation:
     # alpha-engine-config-I2717 (2026-07-16): the continue path used to be the
     # CheckSkipChronicGapHeal gate; that gate (and the heal behind it) was
     # removed entirely. alpha-engine-config-I6494: the continue path now
-    # rejoins at CheckSkipScanner (weekday Scanner before PredictorInference).
-    _CONTINUE = "CheckSkipScanner"
+    # rejoins at CheckSkipPredictorInference (I7811 removed the weekday Scanner).
+    _CONTINUE = "CheckSkipPredictorInference"
 
     def test_launch_catch_is_fail_open(self, daily):
         for name in ("LaunchMorningEnrichSpot", "LaunchMorningArcticAppendSpot"):
