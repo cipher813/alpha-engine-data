@@ -87,6 +87,11 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # config#1824 weekly run-day gate (pure calendar; mirrors LibPinDriftCheck shape).
     "WeeklyRunDayGate": frozenset({"action"}),
     "Scanner": frozenset({"dry_run_llm.$", "run_date.$"}),
+    # alpha-engine-config-I7813: the same scanner Lambda, invoked as a
+    # post-Director leaf with an explicit `mode` so it builds ONLY the
+    # observe-only scanner/leaderboard board. The literal `mode` is what
+    # keeps this payload distinct from Scanner's above.
+    "ScannerLeaderboard": frozenset({"dry_run_llm.$", "run_date.$", "mode"}),
     "RegimeSubstrate": frozenset({"action.$"}),
     "RegimeRetrospectiveEval": frozenset({"action.$"}),
     # alpha-engine-config-I2515 Phase B: replaces the removed multi-agent

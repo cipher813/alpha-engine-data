@@ -606,6 +606,22 @@ STAGES: tuple[Stage, ...] = (
         # histories only; new executions never enter it.
         degraded_witness=frozenset({"PublishDirectorDegraded"}),
     ),
+    Stage(
+        "scanner_leaderboard", "skip_scanner_leaderboard",
+        "CheckSkipScannerLeaderboard", "ScannerLeaderboard",
+        # alpha-engine-config-I7813. Success-only witness, the DirectorComplete
+        # pattern for the same reason: the leaf's success edge and every bypass
+        # path would otherwise converge on CheckShellRunNotify, so witnessing
+        # there would mark a bypassed leaf complete and skip it on the rerun
+        # (the I6055 trap). Skipping it lands on CheckShellRunNotify, so this
+        # row shares director's inverted-convention exception.
+        frozenset({"ScannerLeaderboardComplete"}),
+        degraded_witness=frozenset({
+            "ScannerLeaderboardDegraded",
+            "SetScannerLeaderboardDegradedSummary",
+            "PublishScannerLeaderboardDegraded",
+        }),
+    ),
 )
 
 STAGES_BY_NAME = {s.name: s for s in STAGES}

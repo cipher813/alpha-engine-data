@@ -126,9 +126,13 @@ class TestChainOrdering:
             c["Next"] == "ReportCardDegraded" for c in states["ReportCard"]["Catch"]
         )
         assert_degraded_continuation(states, "ReportCardDegraded", "PublishReportCardDegraded")
-        assert states["PublishReportCardDegraded"]["Next"] == "CheckShellRunNotify"
+        # alpha-engine-config-I7813: both edges now pass through the
+        # observe-only scanner leaderboard leaf's gate before the notify gate.
+        assert states["PublishReportCardDegraded"]["Next"] == "CheckSkipScannerLeaderboard"
         assert states["Director"]["Next"] == "DirectorComplete"
-        assert states["DirectorComplete"]["Next"] == "CheckShellRunNotify"
+        assert states["DirectorComplete"]["Next"] == "CheckSkipScannerLeaderboard"
+        assert states["CheckSkipScannerLeaderboard"]["Default"] == "ScannerLeaderboard"
+        assert states["ScannerLeaderboardComplete"]["Next"] == "CheckShellRunNotify"
         assert all(
             c["Next"] == "NormalizeFailureContext" for c in states["Director"]["Catch"]
         )

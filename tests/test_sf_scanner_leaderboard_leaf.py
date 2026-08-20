@@ -1,0 +1,197 @@
+"""The observe-only scanner leaderboard runs as a weekly-SF LEAF state
+(alpha-engine-config-I7813).
+
+Why this file exists rather than one more assertion bolted onto the report-card
+wiring suite: the leaf's whole value is a set of *negative* properties — it must
+not gate anything, must not be reachable before the Report Card, must not be
+skipped when the Report Card fails, and must not end the run green when it
+fails. Each of those is a different way the "moved to a leaf" claim can be true
+on paper and false in the definition.
+
+The discriminator the ruling gives (issue body): **does any stage branch on the
+number?** If a Choice or a gate reads it, it is a CONTROL and stays where it is;
+if it is only written and rendered, it is a REPORT and moves. Applied per board:
+
+- ``scanner/leaderboard/{date}.json`` — REPORT. Read by crucible-dashboard's
+  Experiments view and by gate predicates; no stage branches on it. MOVED here.
+- ``research/cuts_leaderboard/{date}.json`` — CONTROL. ``crucible-research``
+  ``scoring/cut_promotion.py`` branches on it and writes the live champion
+  pointer, so it stays inside the Scanner state with its consumer.
+- ``research/producer_leaderboard/{date}.json`` — CONTROL. ``crucible-backtester``
+  ``optimizer/champion_promotion.py`` reads it at the Backtester stage, which
+  runs EARLIER than this leaf; moving it here would starve its consumer. It also
+  already has its own TimeoutSeconds + Catch on EvalRollingMean.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+_DEF = Path(__file__).resolve().parents[1] / "infrastructure" / "step_function.json"
+
+
+@pytest.fixture(scope="module")
+def states() -> dict:
+    return json.loads(_DEF.read_text())["States"]
+
+
+def _top_level_order(defn_states: dict) -> list[str]:
+    return list(defn_states)
+
+
+def test_the_leaf_runs_after_report_card_and_director(states):
+    """Placement, asserted by REACHABILITY rather than by key order — key order
+    in a JSON object is not execution order, and asserting on it would pass for
+    a state wired anywhere."""
+    assert states["ReportCard"]["Next"] == "CheckSkipDirector"
+    assert states["CheckSkipDirector"]["Default"] == "Director"
+    assert states["Director"]["Next"] == "DirectorComplete"
+    # Every edge that previously ended the advisory tail now enters the gate.
+    assert states["DirectorComplete"]["Next"] == "CheckSkipScannerLeaderboard"
+    assert states["PublishReportCardDegraded"]["Next"] == "CheckSkipScannerLeaderboard"
+    skip_targets = {c["Next"] for c in states["CheckSkipDirector"]["Choices"]}
+    assert skip_targets == {"CheckSkipScannerLeaderboard"}
+
+
+def test_nothing_downstream_reads_the_leafs_output(states):
+    """The blast-radius test (sf-pipeline-policy.md §2.1): can this stage fail
+    without preventing any stage that does not consume its output? It can only
+    be answered YES if no Choice anywhere in the definition branches on the
+    leaf's result — the moment one does, the board is a control again and this
+    placement is wrong."""
+    blob = json.dumps(states)
+    # The Task's own ResultPath is the only place the result may appear, plus
+    # the error path's own error capture.
+    assert states["ScannerLeaderboard"]["ResultPath"] == "$.scanner_leaderboard_result"
+    assert blob.count('"$.scanner_leaderboard_result"') == 1, (
+        "something other than the leaf's own ResultPath references "
+        "$.scanner_leaderboard_result — if a Choice now branches on the board, "
+        "it is a CONTROL and must move back beside its consumer"
+    )
+
+
+def test_a_failed_report_card_does_not_skip_the_leaf(states):
+    """ReportCard's Catch bypasses the Director (no card to weigh) — but the
+    board does not consume the report card, so it must still be built. This is
+    the exact inversion §2.1 forbids: one advisory's failure silencing an
+    unrelated one."""
+    assert all(c["Next"] == "ReportCardDegraded" for c in states["ReportCard"]["Catch"])
+    assert states["ReportCardDegraded"]["Next"] == "SetReportCardDegradedSummary"
+    assert states["SetReportCardDegradedSummary"]["Next"] == "PublishReportCardDegraded"
+    assert states["PublishReportCardDegraded"]["Next"] == "CheckSkipScannerLeaderboard"
+    for catch in states["PublishReportCardDegraded"]["Catch"]:
+        assert catch["Next"] == "CheckSkipScannerLeaderboard"
+
+
+def test_the_leaf_has_its_own_timeout_below_the_function_timeout(states):
+    """alpha-engine-config-I6855's invariant: an SF budget at or above the
+    Lambda's own timeout can never bind, and the overrun then surfaces as an
+    opaque Lambda error instead of a States.Timeout naming the state. The
+    function is 450s; 440 keeps the SF the effective budget. Re-derivation from
+    a measured p95 is alpha-engine-config-I7851."""
+    leaf = states["ScannerLeaderboard"]
+    assert leaf["TimeoutSeconds"] == 440
+    assert leaf["TimeoutSeconds"] < 450
+
+
+def test_the_leaf_invokes_the_scanner_lambda_in_board_only_mode(states):
+    """The leaf reuses the scanner Lambda — so no new IAM grant, and no
+    post-merge operator step — and the ONLY thing separating it from the
+    Scanner state is the explicit mode. A leaf that dropped the mode would
+    silently re-run the whole universe scan after the Report Card and overwrite
+    the day's candidates.json."""
+    payload = states["ScannerLeaderboard"]["Parameters"]["Payload"]
+    assert (
+        states["ScannerLeaderboard"]["Parameters"]["FunctionName"]
+        == states["ResearchPredictorParallel"]["Branches"][0]["States"]["Scanner"][
+            "Parameters"
+        ]["FunctionName"]
+    ), "the leaf must reuse the Scanner state's Lambda, or it needs its own IAM grant"
+    assert payload["mode"] == "scanner_leaderboard"
+    assert payload["run_date.$"] == "$.run_date"
+
+
+def test_a_leaf_failure_degrades_the_run_loudly_and_never_silently(states):
+    """sf-pipeline-policy.md §2.3 + the 2026-07-28 Option-A ruling, accepted
+    explicitly in I7813's 'Known consequence': the board is observe-only, so its
+    failure must not stop the notify or the marker — but the run must not read
+    as a clean success either. Three obligations, each asserted:
+    the flag is set, a NAMED alert fires, and the terminal marker says DEGRADED.
+    """
+    leaf = states["ScannerLeaderboard"]
+    assert all(c["Next"] == "ScannerLeaderboardDegraded" for c in leaf["Catch"])
+    assert all(c["ResultPath"] == "$.scanner_leaderboard_error" for c in leaf["Catch"])
+
+    flag = states["ScannerLeaderboardDegraded"]
+    assert flag["Result"] is True
+    assert flag["ResultPath"] == "$.scanner_leaderboard_degraded"
+    assert flag["Next"] == "SetScannerLeaderboardDegradedSummary"
+
+    summary = states["SetScannerLeaderboardDegradedSummary"]
+    assert summary["Parameters"]["degraded"] is True
+    assert summary["ResultPath"] == "$.degraded_summary"
+    assert summary["Next"] == "PublishScannerLeaderboardDegraded"
+
+    alert = states["PublishScannerLeaderboardDegraded"]
+    assert alert["Resource"] == "arn:aws:states:::sns:publish"
+    assert "ScannerLeaderboard" in alert["Parameters"]["Subject"]
+    # Best-effort: the alert can fail without changing the outcome it reports.
+    assert alert["Next"] == "CheckShellRunNotify"
+    for catch in alert["Catch"]:
+        assert catch["Next"] == "CheckShellRunNotify"
+
+    # $.degraded_summary is what CheckDegradedOutcome routes on.
+    outcome = states["CheckDegradedOutcome"]
+    assert any(
+        cond.get("Variable") == "$.degraded_summary.degraded"
+        for choice in outcome["Choices"]
+        for cond in (choice.get("And") or [choice])
+    )
+    assert states["WriteCompletionMarkerDegraded"]["Next"] == "DegradedRun"
+    assert states["DegradedRun"]["Type"] == "Fail"
+
+
+def test_the_terminal_notify_can_never_call_a_degraded_leaf_a_success(states):
+    """Without its own rule in CheckGateDegradedNotify, a run whose only
+    degradation is the leaf falls through to NotifyComplete — 'All steps
+    completed successfully' — while terminating in DegradedRun. That exact
+    combination is what the config#6685 fix removed for the report card; this
+    pins that the leaf did not reintroduce it."""
+    gate = states["CheckGateDegradedNotify"]
+    matching = [
+        c
+        for c in gate["Choices"]
+        if any(
+            cond.get("Variable") == "$.scanner_leaderboard_degraded"
+            for cond in (c.get("And") or [c])
+        )
+    ]
+    assert len(matching) == 1
+    assert matching[0]["Next"] == "NotifyCompleteScannerLeaderboardDegraded"
+    # LAST before the clean default: a run that ALSO degraded something
+    # consequential must report that instead.
+    assert gate["Choices"][-1] is matching[0]
+    assert gate["Default"] == "NotifyComplete"
+    assert states["NotifyCompleteScannerLeaderboardDegraded"]["Next"] == "CheckDegradedOutcome"
+
+
+def test_the_leaf_is_skippable_and_witnessed_for_rerun(states):
+    """sf-pipeline-policy.md §2.5: recovery is one mechanical command, which
+    needs (a) a skip flag the rerun deriver can emit and (b) a success-ONLY
+    witness. Witnessing on the shared CheckShellRunNotify would mark a bypassed
+    leaf complete and skip it on the rerun — the I6055 trap."""
+    gate = states["CheckSkipScannerLeaderboard"]
+    assert gate["Default"] == "ScannerLeaderboard"
+    assert {c["Next"] for c in gate["Choices"]} == {"CheckShellRunNotify"}
+    assert states["ScannerLeaderboard"]["Next"] == "ScannerLeaderboardComplete"
+    assert states["ScannerLeaderboardComplete"]["Type"] == "Pass"
+    assert states["ScannerLeaderboardComplete"]["Next"] == "CheckShellRunNotify"
+    # Only the leaf's success edge enters the witness.
+    enterers = [
+        name for name, body in states.items()
+        if body.get("Next") == "ScannerLeaderboardComplete"
+    ]
+    assert enterers == ["ScannerLeaderboard"]

@@ -157,6 +157,10 @@ _EXPECTED_SKIPS = {
     # and Director independently.
     "skip_report_card",
     "skip_director",
+    # alpha-engine-config-I7813: the observe-only scanner leaderboard leaf,
+    # placed after Director. Its own gate so a rerun that already produced
+    # the board does not pay a second ~904-symbol closes-panel read.
+    "skip_scanner_leaderboard",
 }
 
 # KEYSTONE + skip-exception rewire: the 8 SPOT workload states. Under
@@ -1075,7 +1079,13 @@ class TestConsolidatedNotify:
         # is now the head of that tail. The success chain is
         # RunScope → CheckSkipReportCard → ReportCard → CheckSkipDirector →
         # Director → DirectorComplete (success-only rerun witness) →
-        # CheckShellRunNotify.
+        # CheckSkipScannerLeaderboard → ScannerLeaderboard →
+        # ScannerLeaderboardComplete (success-only rerun witness) →
+        # CheckShellRunNotify. alpha-engine-config-I7813 inserted the last three:
+        # the observe-only scanner board is a leaf AFTER the advisories, and
+        # every path that previously reached CheckShellRunNotify from this tail
+        # — ReportCard's degraded route, Director's skip route, Director's
+        # success — now passes through its gate first.
         assert substrate_success["Next"] == "RunScope"
         assert states["RunScope"]["Next"] == "CheckSkipReportCard"
         assert states["CheckSkipReportCard"]["Default"] == "ReportCard"
@@ -1083,13 +1093,25 @@ class TestConsolidatedNotify:
         assert report_card["Next"] == "CheckSkipDirector"
         assert all(c["Next"] == "ReportCardDegraded" for c in report_card["Catch"])
         assert_degraded_continuation(states, "ReportCardDegraded", "PublishReportCardDegraded")
-        assert states["PublishReportCardDegraded"]["Next"] == "CheckShellRunNotify"
+        assert states["PublishReportCardDegraded"]["Next"] == "CheckSkipScannerLeaderboard"
         assert states["CheckSkipDirector"]["Default"] == "Director"
         director = states["Director"]
         assert director["Next"] == "DirectorComplete"
-        assert states["DirectorComplete"]["Next"] == "CheckShellRunNotify"
+        assert states["DirectorComplete"]["Next"] == "CheckSkipScannerLeaderboard"
         assert all(c["Next"] == "NormalizeFailureContext" for c in director["Catch"])
         assert all(c["ResultPath"] == "$.error" for c in director["Catch"])
+        # alpha-engine-config-I7813: the leaf, and the property that makes it a
+        # leaf — a fail-open Catch that still names itself, and a success edge
+        # landing on the notify gate the tail always ended at.
+        assert states["CheckSkipScannerLeaderboard"]["Default"] == "ScannerLeaderboard"
+        leaf = states["ScannerLeaderboard"]
+        assert leaf["Next"] == "ScannerLeaderboardComplete"
+        assert states["ScannerLeaderboardComplete"]["Next"] == "CheckShellRunNotify"
+        assert all(c["Next"] == "ScannerLeaderboardDegraded" for c in leaf["Catch"])
+        assert_degraded_continuation(
+            states, "ScannerLeaderboardDegraded", "PublishScannerLeaderboardDegraded"
+        )
+        assert states["PublishScannerLeaderboardDegraded"]["Next"] == "CheckShellRunNotify"
 
     def test_advisory_tail_runs_dry_on_preflight(self, states):
         """ROADMAP L4504: ReportCard + Director were added after the shell-run

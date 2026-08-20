@@ -41,6 +41,8 @@ REAL_COMPLETION_NOTIFIERS = [
     "NotifyCompleteReportCardDegraded",
     "NotifyCompleteParityDegraded",
     "NotifyCompleteMultipleDegraded",
+    # alpha-engine-config-I7813: the observe-only scanner leaderboard leaf.
+    "NotifyCompleteScannerLeaderboardDegraded",
 ]
 
 PREFLIGHT_NOTIFIERS = [
