@@ -160,17 +160,8 @@ aws lambda invoke \
   --region "$REGION" \
   "$CANARY_OUT" > /dev/null
 
-CANARY_STATUS=$(python3 -c "
-import json, sys
-d = json.load(open('$CANARY_OUT'))
-s = d.get('status', '')
-if s in ('OK', 'SKIPPED'):
-    print(s)
-elif d.get('statusCode') == 500:
-    print('ENV_ERROR')
-else:
-    print(d.get('error', 'UNKNOWN'))
-" 2>/dev/null || echo "PARSE_ERROR")
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CANARY_STATUS=$(python3 "$SCRIPT_DIR/canary_status.py" "$CANARY_OUT" 2>/dev/null || echo "PARSE_ERROR")
 rm -f "$CANARY_OUT"
 
 if [ "$CANARY_STATUS" != "OK" ] && [ "$CANARY_STATUS" != "SKIPPED" ]; then
