@@ -9,7 +9,7 @@ skip-gate edge (CheckSkipRunDaemon) all now converge on CheckDegradedOutcome
 rather than going straight to WriteCompletionMarker. The data-spot fail-open
 path (ExtractDataSpotError) threads a $.degraded_summary flag via
 SetDataSpotDegradedFlag WITHOUT changing its own fail-open continuation
-(still proceeds to PublishDataSpotFailureImmediate -> CheckSkipScanner).
+(still proceeds to PublishDataSpotFailureImmediate -> CheckSkipPredictorInference).
 CheckDegradedOutcome is the one place deciding the terminal: Default ->
 WriteCompletionMarker (unchanged normal marker, -> PipelineComplete);
 degraded -> WriteCompletionMarkerDegraded (-> DegradedRun, Type: Fail) so
@@ -92,7 +92,7 @@ def test_data_spot_fail_open_threads_degraded_flag_without_changing_continuation
     daily_states,
 ):
     """ExtractDataSpotError/PublishDataSpotFailureImmediate must keep their
-    fail-open continuation to CheckSkipScanner (Scanner etc. still run) —
+    fail-open continuation to CheckSkipPredictorInference (I7811: the weekday Scanner is gone) —
     SetDataSpotDegradedFlag only adds the flag in between."""
     extract = daily_states["ExtractDataSpotError"]
     assert extract["Next"] == "SetDataSpotDegradedFlag"
@@ -104,9 +104,9 @@ def test_data_spot_fail_open_threads_degraded_flag_without_changing_continuation
     assert flag["Next"] == "PublishDataSpotFailureImmediate"
 
     publish = daily_states["PublishDataSpotFailureImmediate"]
-    assert publish["Next"] == "CheckSkipScanner"
+    assert publish["Next"] == "CheckSkipPredictorInference"
     (publish_catch,) = publish["Catch"]
-    assert publish_catch["Next"] == "CheckSkipScanner"
+    assert publish_catch["Next"] == "CheckSkipPredictorInference"
 
 
 def test_check_degraded_outcome_routes_through_markers(daily_states):

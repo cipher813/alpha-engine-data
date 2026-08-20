@@ -5,7 +5,7 @@ Second adoption of the config#2277 idiom ``scripts/weekly_sf_rerun.py``
 established, covering the two weekday pipelines instead of the Saturday one:
 
 - ``ne-preopen-trading-pipeline`` ("daily") — skip gates: ``skip_morning_
-  enrich``, ``skip_scanner``, ``skip_predictor_inference``,
+  enrich``, ``skip_predictor_inference``,
   ``skip_morning_planner``, ``skip_run_daemon`` (infrastructure/
   step_function_daily.json). These gates test ONLY the flag itself — no
   pipeline_role conjunction, matching the weekly SF's shape.
@@ -145,11 +145,15 @@ class Pipeline:
 
 
 DAILY_STAGES: tuple[Stage, ...] = (
+    # alpha-engine-config-I7811 (Brian ruling 2026-08-20): the `scanner` stage
+    # was REMOVED from this pipeline — the scanner forms its two cuts WEEKLY, on
+    # the Saturday pipeline, and those feed research and the predictor for the
+    # week. morning_enrich's witness therefore moved from CheckSkipScanner to
+    # CheckSkipPredictorInference. A stage table that still named `scanner`
+    # would emit `skip_scanner` into a definition with no gate to read it, and
+    # the helper's own coherence check would reject its own output.
     Stage("morning_enrich", "skip_morning_enrich",
           "CheckSkipMorningEnrich", "LaunchMorningEnrichSpot",
-          frozenset({"CheckSkipScanner"})),
-    Stage("scanner", "skip_scanner",
-          "CheckSkipScanner", "Scanner",
           frozenset({"CheckSkipPredictorInference"})),
     Stage("predictor_inference", "skip_predictor_inference",
           "CheckSkipPredictorInference", "PredictorInference",

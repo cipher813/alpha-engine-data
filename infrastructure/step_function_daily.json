@@ -1369,7 +1369,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "CheckSkipScanner"
+          "Next": "CheckSkipPredictorInference"
         }
       ],
       "Default": "InitMorningEnrichRetryCounter"
@@ -1383,96 +1383,6 @@
       },
       "ResultPath": "$.morning_enrich_retry",
       "Next": "LaunchMorningEnrichSpot"
-    },
-    "CheckSkipScanner": {
-      "Type": "Choice",
-      "Comment": "Skip-gate (alpha-engine-config-I6494). {\"skip_scanner\": true} bypasses the weekday Scanner Lambda and jumps straight to CheckSkipPredictorInference \u2014 Scanner's own success and Catch edges converge there, so skipping it is behaviorally identical to a Scanner run that did nothing. Defaults to running (Default: Scanner) so scheduled Mon\u2013Fri preopen runs and any rerun that has not explicitly set the flag are unaffected. Same entrypoint as the Saturday SF Scanner state (alpha-engine-research-scanner:live); this is the daily cadence of ONE Scanner, not a second implementation. Distinct from I5489 (weekday exercise of the FULL weekly SF).",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.skip_scanner",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.skip_scanner",
-              "BooleanEquals": true
-            }
-          ],
-          "Next": "CheckSkipPredictorInference"
-        }
-      ],
-      "Default": "Scanner"
-    },
-    "Scanner": {
-      "Type": "Task",
-      "Comment": "Weekday invoke of the SAME standalone scanner Lambda the Saturday SF runs (alpha-engine-research-scanner:live \u2014 ROADMAP L1995 / alpha-engine-config-I6494). Placed AFTER MorningArcticAppend so ArcticDB technicals for the trading day are present, and BEFORE PredictorInference so universe_membership/{date} + factor profiles (+ provenance) are fresh for the membership consumer (I6495). Features are daily-capable (I5360 / research-PR545; SCANNER_FEATURE_SOURCE default arcticdb). Status contract OK / ERROR \u2014 Catch is non-blocking at the SF layer (mirrors Saturday): Catch and Next converge on CheckSkipPredictorInference; a missing/stale membership surfaces at the predictor's own age gate rather than hard-failing preopen. dry_run_llm omitted \u2014 weekday cadence has no Friday-Preflight research_dry shell path. alpha-engine-config-I6855: 600 -> 440. The SF budget must sit BELOW the function timeout or it can never bind \u2014 on 2026-08-11 this state declared 600s while alpha-engine-research-scanner carried 300s, so both preopen invocations died at 300s with Sandbox.Timedout and the 600 described nothing. The function is now 450s (crucible-research-PR601, p95 x 1.5); 440 keeps the SF the effective budget, so a scanner overrun surfaces as States.Timeout naming this state rather than as an opaque Lambda error.",
-      "Resource": "arn:aws:states:::lambda:invoke",
-      "Parameters": {
-        "FunctionName": "alpha-engine-research-scanner:live",
-        "Payload": {
-          "run_date.$": "$.run_date"
-        }
-      },
-      "TimeoutSeconds": 440,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Lambda.ServiceException",
-            "Lambda.TooManyRequestsException",
-            "States.TaskFailed"
-          ],
-          "MaxAttempts": 1,
-          "IntervalSeconds": 60,
-          "BackoffRate": 1.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Comment": "Scanner failure must NOT halt the weekday pipeline at the SF layer (mirrors Saturday Catch \u2192 CheckSkipRegimeSubstrate). Catch routes through SetScannerDegradedFlag then converges on CheckSkipPredictorInference so daemon start still happens; membership freshness is an independent consumer concern. alpha-engine-config#6722: PredictorInference's own downstream freshness/age gate mitigates the trading-safety risk, but the terminal notify previously said nothing about the miss at all \u2014 now Option-A parity (SetDataSpotDegradedFlag shape) threads it into $.degraded_summary.",
-          "Next": "SetScannerDegradedFlag",
-          "ResultPath": "$.scanner_error"
-        }
-      ],
-      "ResultPath": "$.scanner_result",
-      "Next": "CheckSkipPredictorInference"
-    },
-    "SetScannerDegradedFlag": {
-      "Type": "Pass",
-      "Comment": "alpha-engine-config#6722 (Option-A parity with SetDataSpotDegradedFlag/SetMutexAcquireDegradedFlag, config#6692 shape): threads $.degraded_summary onto the weekday Scanner fail-open path WITHOUT changing its continuation \u2014 Next still leads to CheckSkipPredictorInference exactly as before. Last-write-wins if a later stage also degrades. Does not clobber $.scanner_error (set by Scanner's own Catch ResultPath).",
-      "Parameters": {
-        "degraded": true,
-        "reason": "daily_scanner_fail_open",
-        "run_date.$": "$.run_date",
-        "stage_error.$": "$.scanner_error"
-      },
-      "ResultPath": "$.degraded_summary",
-      "Next": "PublishScannerFailureImmediate"
-    },
-    "PublishScannerFailureImmediate": {
-      "Type": "Task",
-      "Comment": "alpha-engine-config-I6903: best-effort SNS alert that the Scanner failed \u2014 surfaces the miss at the MOMENT it happens, WITHOUT blocking the trading chain. The Scanner fail-open was the only one of the five degraded paths in this definition with no Publish state, so on 2026-08-11 there were 37 minutes of silence between the second Scanner timeout (05:32 PT) and the terminal (06:09 PT) \u2014 inside the window where an operator could still have rerun it before the 06:30 open. sf-pipeline-policy.md \u00a75 requires weekday fail-opens to set the degraded flag AND page immediately; this is the missing half. Mirrors PublishDataSpotFailureImmediate exactly, including the Catch: an SNS failure must not hard-fail a pipeline that deliberately continued.",
-      "Resource": "arn:aws:states:::sns:publish",
-      "Parameters": {
-        "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekday Scanner \u2014 FAILED (fail-open, pipeline continues)",
-        "Message.$": "States.Format('Weekday Scanner failed but the pipeline continued to predictor inference and daemon start (fail-open, config#6722). Today candidates may be stale and the universe board, membership and leaderboard were not written \u2014 the optimizer runs without per-name ADV (config-I6902). Detail: {}', States.JsonToString($.scanner_error))"
-      },
-      "ResultPath": "$.scanner_failure_notify",
-      "TimeoutSeconds": 60,
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "ResultPath": null,
-          "Next": "CheckSkipPredictorInference"
-        }
-      ],
-      "Next": "CheckSkipPredictorInference"
     },
     "CheckSkipPredictorInference": {
       "Type": "Choice",
@@ -1619,7 +1529,7 @@
           "Next": "ExtractDataSpotError"
         }
       ],
-      "Default": "CheckSkipScanner"
+      "Default": "CheckSkipPredictorInference"
     },
     "PollMorningEnrichSpot": {
       "Type": "Task",
@@ -1771,7 +1681,7 @@
     },
     "CheckMorningArcticAppendSpotLaunched": {
       "Type": "Choice",
-      "Comment": "launched:true -> poll; launched:false kill-switch -> continue.",
+      "Comment": "launched:true -> poll; launched:false kill-switch -> continue. alpha-engine-config-I7811 (Brian ruling 2026-08-20): the Scanner state and its CheckSkipScanner / SetScannerDegradedFlag / PublishScannerFailureImmediate siblings were REMOVED from this pipeline \u2014 the scanner forms its two cuts WEEKLY, on step_function.json's ResearchPredictorParallel/Scanner, and those feed research and the predictor for the week. Next is now CheckSkipPredictorInference directly. The predictor is unaffected: inference/stages/load_universe.py walks back MEMBERSHIP_MAX_AGE_DAYS=10 for universe_membership, and a weekly cut is at most 7 days old. I6494 Ruling A put the Scanner here on 2026-08-04 to satisfy that same freshness gate, which it never needed to.",
       "Choices": [
         {
           "And": [
@@ -1796,7 +1706,7 @@
           "Next": "ExtractDataSpotError"
         }
       ],
-      "Default": "CheckSkipScanner"
+      "Default": "CheckSkipPredictorInference"
     },
     "PollMorningArcticAppendSpot": {
       "Type": "Task",
@@ -1852,7 +1762,7 @@
         {
           "Variable": "$.arctic_append_poll.Status",
           "StringEquals": "Success",
-          "Next": "CheckSkipScanner"
+          "Next": "CheckSkipPredictorInference"
         },
         {
           "Variable": "$.arctic_append_poll.Status",
@@ -1938,10 +1848,10 @@
             "States.ALL"
           ],
           "ResultPath": null,
-          "Next": "CheckSkipScanner"
+          "Next": "CheckSkipPredictorInference"
         }
       ],
-      "Next": "CheckSkipScanner"
+      "Next": "CheckSkipPredictorInference"
     }
   }
 }

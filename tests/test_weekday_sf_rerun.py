@@ -105,10 +105,13 @@ class TestDerivePlan:
         plan = mod.derive_plan(mod.DAILY, _events("daily_mid_failure"))
         assert plan.run_date == "2026-08-07"
         assert "InitializeInput" in plan.run_date_provenance
-        assert plan.completed == ["morning_enrich", "scanner"]
+        # I7811 removed the `scanner` stage from the weekday pipeline — the
+        # fixture's history still contains its events, and the helper correctly
+        # no longer derives a stage from them.
+        assert plan.completed == ["morning_enrich"]
         assert plan.failed == ["predictor_inference"]
         assert plan.degraded == []
-        assert set(plan.skip_flags) == {"skip_morning_enrich", "skip_scanner"}
+        assert set(plan.skip_flags) == {"skip_morning_enrich"}
         # daily PRESERVES the original pipeline_role (role-unconditional gates)
         assert plan.emitted_role == "daily"
         assert "skip_predictor_inference" not in plan.skip_flags

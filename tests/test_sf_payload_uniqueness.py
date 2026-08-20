@@ -251,10 +251,10 @@ _WEEKDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # payload so the spot box carries per-run identity tags for cost attribution.
     "LaunchMorningEnrichSpot": frozenset({"workload", "force_on_demand.$", "execution_id.$"}),
     "LaunchMorningArcticAppendSpot": frozenset({"workload", "force_on_demand.$", "execution_id.$"}),
-    # alpha-engine-config-I6494: weekday Scanner — same Lambda as Saturday SF
-    # Scanner, payload is run_date only (no research_dry / dry_run_llm on the
-    # weekday cadence).
-    "Scanner": frozenset({"run_date.$"}),
+    # alpha-engine-config-I7811 (Brian ruling 2026-08-20): the weekday Scanner
+    # entry was REMOVED with the state. The scanner forms its two cuts WEEKLY,
+    # on the Saturday pipeline, whose own "Scanner" payload registry entry above
+    # is unaffected.
 }
 
 
