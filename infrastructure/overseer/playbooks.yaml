@@ -858,6 +858,20 @@ alert_classes:
     severities: [warning]
     intake: bus
     response: drain-queue
+  - class: research_cut_promotion_alerts
+    # alpha-engine-config-I7876 static-chokepoint registration: the scanner-cut
+    # promotion engine (crucible-research/lambda/scanner_handler.py, calling
+    # scoring/cut_promotion.py::run_cut_promotion inline in the scanner
+    # Lambda handler) is FAIL-SOFT + LOUD — a promotion failure never
+    # downgrades the already-written candidates.json/membership artifacts (the
+    # champion pointer keeps naming the standing champion), but this alert is
+    # the ONLY signal that no promote/hold decision was recorded for the
+    # cycle. Introduced by the 2026-08-20 champion/challenger promotion arc;
+    # publish_observe_alert call site publishes with explicit severity="ERROR".
+    source: "research:cut_promotion"
+    severities: [error]
+    intake: bus
+    response: drain-queue
   - class: research_experiment_record_alerts
     source: "research:experiment_record"
     severities: [warning]
