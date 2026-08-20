@@ -1,47 +1,31 @@
-"""Apply --correlation-id flag to all ssm_log_capture calls.
---correlation-id is a boolean FLAG (not a value argument)."""
-import boto3, json
-
-session = boto3.Session(profile_name="ne-admin", region_name="us-east-1")
-sfn = session.client("stepfunctions")
-
+"""Apply --correlation-id using SF-native States.Format with $.run_date."""
+import boto3, json, re
+s = boto3.Session(profile_name="ne-admin", region_name="us-east-1")
+f = s.client("stepfunctions")
 ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline"
-sm = sfn.describe_state_machine(stateMachineArn=ARN)
-definition = json.loads(sm["definition"])
-
+sm = f.describe_state_machine(stateMachineArn=ARN)
+d = json.loads(sm["definition"])
 FIXED = 0
 
-def apply_fixes(obj):
+def fix_cmd(v):
+    v = re.sub(r'\s*--correlation-id\s+(?:"[^"]*"|\S+)', '', v)
+    if '--correlation-id' not in v:
+        v = v.replace("ssm_log_capture run --slug", "ssm_log_capture run --correlation-id {} --slug")
+        v = re.sub(r"(States\.Format\('.*?ssm_log_capture.*?)'(\s*,\s*)", r"\1',$.run_date\2", v)
+    return v
+
+def walk(obj):
     global FIXED
     if isinstance(obj, dict):
-        for k, v in obj.items():
-            if k == "commands.$" and isinstance(v, str) and "ssm_log_capture" in v:
-                old = v
-                new = v
-                # Remove any previously-botched --correlation-id patterns
-                # Pattern 1 (after run, with value): run --correlation-id "sf-$(date +%s)-$$"
-                new = new.replace(' run --correlation-id "sf-$(date +%s)-$$"', "")
-                # Pattern 2 (before run, with value): --correlation-id "sf-$(date +%s)-$$" run
-                new = new.replace(' --correlation-id "sf-$(date +%s)-$$" run', " run")
-                # Pattern 3 (correct flag, already present): --correlation-id run
-                if "--correlation-id run" not in new and "--correlation-id" not in new:
-                    # Inject the flag BEFORE 'run'
-                    new = new.replace(
-                        "ssm_log_capture run --slug",
-                        "ssm_log_capture --correlation-id run --slug",
-                    )
-                if new != old:
-                    FIXED += 1
-                obj[k] = new
-            else:
-                apply_fixes(v)
+        for k in obj:
+            if k == "commands.$" and isinstance(obj[k], str) and "ssm_log_capture" in obj[k]:
+                n = fix_cmd(obj[k])
+                if n != obj[k]: FIXED += 1; obj[k] = n
+            else: walk(obj[k])
     elif isinstance(obj, list):
-        for item in obj:
-            apply_fixes(item)
+        for x in obj: walk(x)
 
-
-apply_fixes(definition)
+walk(d)
 print(f"Fixed {FIXED} ssm_log_capture calls")
-
-sfn.update_state_machine(stateMachineArn=ARN, definition=json.dumps(definition))
+f.update_state_machine(stateMachineArn=ARN, definition=json.dumps(d))
 print("State machine updated. Done.")
