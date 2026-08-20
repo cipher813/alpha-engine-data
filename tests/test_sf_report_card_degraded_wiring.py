@@ -101,12 +101,18 @@ def test_only_report_card_degraded_pass_sets_the_flag(states):
 
 def test_publish_report_card_degraded_unchanged_downstream(states):
     """The existing immediate PAGE alert (config#2302) still fires and still
-    proceeds to CheckShellRunNotify — this fix adds a flag upstream of it,
-    it does not change its own wiring."""
+    proceeds to the notify gate — this fix adds a flag upstream of it, it does
+    not change its own wiring.
+
+    alpha-engine-config-I7813 moved the gate one hop: the degraded route now
+    lands on CheckSkipScannerLeaderboard, which routes to CheckShellRunNotify
+    on the skip arm and after the leaf on the run arm. Load-bearing rather than
+    cosmetic — the observe-only board must still be built on a run whose report
+    card failed, because it does not consume the report card."""
     st = states["PublishReportCardDegraded"]
-    assert st["Next"] == "CheckShellRunNotify"
+    assert st["Next"] == "CheckSkipScannerLeaderboard"
     (catch,) = st["Catch"]
-    assert catch["Next"] == "CheckShellRunNotify"
+    assert catch["Next"] == "CheckSkipScannerLeaderboard"
 
 
 # ---------------------------------------------------------------------------

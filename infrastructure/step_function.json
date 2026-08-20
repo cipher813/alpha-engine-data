@@ -5946,7 +5946,7 @@
     },
     "CheckSkipPostEval": {
       "Type": "Choice",
-      "Comment": "Post-Evaluator tail skip-gate (config#830). {\"skip_post_eval\": true} stops the run right after Evaluator \u2014 bypassing the four full-run-only tail stages (SaturdayHealthCheck \u2192 WeeklySubstrateHealthCheck \u2192 ReportCard \u2192 Director, none of which previously had a skip gate) and routing straight to CheckShellRunNotify so the SUCCESS SNS notify (and the shell-run-tagged variant) still fire. This is the one behavioral gap a standalone Backtester\u2192Evaluator SF used to cover; closing it here lets the weekly SF reproduce that shape via mode=backtest-eval with no forked state machine. The tail stages are advisory/observability only (health checks are non-blocking; ReportCard/Director are non-fatal advisories), so stopping before them is safe for a mid-week backtester/evaluator code rerun. Missing flag = run the full tail as normal, so scheduled Saturday runs are unaffected. Both inbound edges (CheckEvaluatorStatus Success and CheckSkipEvaluator skip) converge here, preserving the prior 'Evaluator-skipped still notifies' behavior.",
+      "Comment": "Post-Evaluator tail skip-gate (config#830). {\"skip_post_eval\": true} stops the run right after Evaluator \u2014 bypassing the five full-run-only tail stages (SaturdayHealthCheck \u2192 WeeklySubstrateHealthCheck \u2192 ReportCard \u2192 Director \u2192 ScannerLeaderboard, none of which previously had a skip gate; ScannerLeaderboard is the alpha-engine-config-I7813 observe-only board leaf) and routing straight to CheckShellRunNotify so the SUCCESS SNS notify (and the shell-run-tagged variant) still fire. This is the one behavioral gap a standalone Backtester\u2192Evaluator SF used to cover; closing it here lets the weekly SF reproduce that shape via mode=backtest-eval with no forked state machine. The tail stages are advisory/observability only (health checks are non-blocking; ReportCard/Director are non-fatal advisories), so stopping before them is safe for a mid-week backtester/evaluator code rerun. Missing flag = run the full tail as normal, so scheduled Saturday runs are unaffected. Both inbound edges (CheckEvaluatorStatus Success and CheckSkipEvaluator skip) converge here, preserving the prior 'Evaluator-skipped still notifies' behavior.",
       "Choices": [
         {
           "And": [
@@ -6290,10 +6290,10 @@
           ],
           "Comment": "Best-effort alert \u2014 a publish failure must not block the non-fatal advisory path this alert decorates.",
           "ResultPath": "$.report_card_degraded_notify_error",
-          "Next": "CheckShellRunNotify"
+          "Next": "CheckSkipScannerLeaderboard"
         }
       ],
-      "Next": "CheckShellRunNotify"
+      "Next": "CheckSkipScannerLeaderboard"
     },
     "Director": {
       "Type": "Task",
@@ -6554,6 +6554,20 @@
             }
           ],
           "Next": "NotifyCompleteParityDegraded"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.scanner_leaderboard_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.scanner_leaderboard_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "alpha-engine-config-I7813. LAST in the list on purpose: a run that also degraded a gate, a health check, the parity verdict, the report card or a Branch A fail-open matches one of the rules above and gets that (more consequential) notification, while the leaf's own PublishScannerLeaderboardDegraded alert has already named it. This rule exists so a run whose ONLY degradation is the observe-only board cannot reach NotifyComplete's \"All steps completed successfully\" while terminating in DegradedRun.",
+          "Next": "NotifyCompleteScannerLeaderboardDegraded"
         }
       ],
       "Default": "NotifyComplete"
@@ -7652,15 +7666,141 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "CheckShellRunNotify"
+          "Next": "CheckSkipScannerLeaderboard"
         }
       ],
       "Default": "Director"
     },
+    "CheckSkipScannerLeaderboard": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I7813. Skip-gate for the observe-only scanner leaderboard leaf, same shape as CheckSkipReportCard / CheckSkipDirector. {\"skip_scanner_leaderboard\": true} bypasses the leaf and lands on CheckShellRunNotify \u2014 the exact edge every path into this gate used to take, so setting the flag is behaviourally identical to the pre-I7813 definition. Emitted by scripts/weekly_sf_rerun.py when the original execution already completed the leaf.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_scanner_leaderboard",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_scanner_leaderboard",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckShellRunNotify"
+        }
+      ],
+      "Default": "ScannerLeaderboard"
+    },
+    "ScannerLeaderboard": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I7813 \u2014 the observe-only scanner champion/challenger board, scanner/leaderboard/{run_date}.json, as its OWN leaf state placed after the Report Card and the Director. Same Lambda as the Scanner state in ResearchPredictorParallel, invoked with mode=scanner_leaderboard so it builds ONLY the board (crucible-research lambda/scanner_handler.py::_run_scanner_leaderboard); the scan itself, the universe-membership artifact, the funnel-cut leaderboard and the cut-promotion decision all stay in the Scanner state. WHY THIS ONE AND NOT ITS SIBLINGS: the issue's discriminator is 'does any stage branch on the number?'. research/cuts_leaderboard is read by scoring/cut_promotion.py, which writes the live champion pointer \u2014 a CONTROL, so it stays with its consumer. research/producer_leaderboard is read by crucible-backtester optimizer/champion_promotion.py, which runs at the Backtester stage EARLIER than this point \u2014 also a control, and moving it here would starve its consumer. Only scanner/leaderboard is written-and-rendered and nothing else: the dashboard's Experiments view and gate predicates poll it, no stage branches on it. So only it moves (sf-pipeline-policy.md \u00a72.1: this stage can fail without preventing any stage that does not consume its output). NO EXTRA COST: the two boards look like they shared the ~904-symbol closes panel via leaderboard_producers._PANEL_CACHE, but that cache holds ONE entry keyed on the cohort entry-date set, and the two builds walk different prefixes (candidates_shadow/ vs universe_membership/), so the second build has always paid its own read \u2014 measured 2026-08-20, 21 dates vs 23. TimeoutSeconds 440, not a fresh p95: it holds the I6855 invariant that the SF budget must sit BELOW the alpha-engine-research-scanner function timeout (450s) or it can never bind, so an overrun surfaces as States.Timeout naming THIS state. Re-derivation from a measured p95 is alpha-engine-config-I7851, gated on 3 clean weekly runs. IAM: no new grant \u2014 the same FunctionName the Scanner state already invokes.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-research-scanner:live",
+        "Payload": {
+          "run_date.$": "$.run_date",
+          "dry_run_llm.$": "$.research_dry",
+          "mode": "scanner_leaderboard"
+        }
+      },
+      "TimeoutSeconds": 440,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException",
+            "States.TaskFailed"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Fail-open on the RUN's work, never silent. The board is observe-only, so its failure must not stop the terminal notify or the completion marker \u2014 but it must not vanish either: this route sets $.scanner_leaderboard_degraded, publishes its own named SNS alert, and writes a DEGRADED completion marker so the execution terminates in DegradedRun rather than a clean success (sf-pipeline-policy.md \u00a72.3, the 2026-07-28 Option-A ruling; accepted explicitly in I7813's 'Known consequence').",
+          "Next": "ScannerLeaderboardDegraded",
+          "ResultPath": "$.scanner_leaderboard_error"
+        }
+      ],
+      "ResultPath": "$.scanner_leaderboard_result",
+      "Next": "ScannerLeaderboardComplete"
+    },
+    "ScannerLeaderboardComplete": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I7813: success-only witness for the rerun deriver (scripts/weekly_sf_rerun.py), exactly the DirectorComplete pattern and for the same reason \u2014 the success edge and every bypass path would otherwise converge on CheckShellRunNotify, leaving no state that uniquely witnesses 'the leaf actually completed' (the I6055 trap).",
+      "Next": "CheckShellRunNotify"
+    },
+    "ScannerLeaderboardDegraded": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I7813: the SF-controlled visible flag CheckGateDegradedNotify reads, set BEFORE the summary so a publish failure downstream still leaves the flag on the execution record.",
+      "Result": true,
+      "ResultPath": "$.scanner_leaderboard_degraded",
+      "Next": "SetScannerLeaderboardDegradedSummary"
+    },
+    "SetScannerLeaderboardDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I7813: mirrors SetReportCardDegradedSummary. $.degraded_summary is what CheckDegradedOutcome reads to route to WriteCompletionMarkerDegraded \u2014 without it the run would end SUCCEEDED with a board nobody wrote. Like every sibling Set*DegradedSummary in this definition it OVERWRITES an earlier stage's summary; the per-stage booleans ($.report_card_degraded, $.gate_degraded, \u2026) are what survive independently, and each degraded stage has already published its own named alert by this point.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_scanner_leaderboard_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishScannerLeaderboardDegraded"
+    },
+    "PublishScannerLeaderboardDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I7813: named alert on the leaf's fail-open path, mirroring PublishReportCardDegraded's shape exactly (config#1819 discipline: hardcoded Subject/Message constants, never States.Format against unbounded input; best-effort Catch so a publish failure cannot block the path it decorates).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline \u2014 ScannerLeaderboard WARNING (observe-only board not written)",
+        "Message": "ScannerLeaderboard (the observe-only scanner champion/challenger board, scanner/leaderboard/{run_date}.json) failed \u2014 see $.scanner_leaderboard_error on the execution record for detail. NON-FATAL for trading: nothing branches on this board, and the week's signals, predictions, report card and Director advisory are unaffected. It is NOT nothing: the scanner champion/challenger comparison has no observation for this cycle, and the run therefore terminates DEGRADED. View pipeline status: https://dashboard.nousergon.ai/pipeline-status",
+        "MessageAttributes": {}
+      },
+      "ResultPath": "$.scanner_leaderboard_degraded_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert \u2014 a publish failure must not block the non-fatal path this alert decorates. $.degraded_summary is already set, so the run still terminates DEGRADED.",
+          "ResultPath": "$.scanner_leaderboard_degraded_notify_error",
+          "Next": "CheckShellRunNotify"
+        }
+      ],
+      "Next": "CheckShellRunNotify"
+    },
+    "NotifyCompleteScannerLeaderboardDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I7813: terminal notification for a run whose ONLY degradation is the observe-only board. Registered LAST in CheckGateDegradedNotify's choice list, immediately before the clean Default \u2014 so any run that also degraded a gate, a health check, the parity verdict, the report card or a Branch A fail-open still gets that stage's (or the multi-) notification, which is the more consequential fact. This state exists so the leaf can never reach NotifyComplete's \"All steps completed successfully\" while terminating in DegradedRun.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Saturday Pipeline \u2014 DEGRADED: scanner leaderboard (run terminates FAILED)",
+        "Message": "Every WORK stage completed, and the run still terminates FAILED (config-I6891, sf-pipeline-policy.md \u00a72.3 Option A) because the ScannerLeaderboard leaf failed and scanner/leaderboard/{run_date}.json was not written; a scanner-leaderboard-degraded alert fired earlier in this run. See $.scanner_leaderboard_error on the execution record for detail. The week's trading artifacts, report card and Director advisory are unaffected \u2014 no stage branches on this board \u2014 but the scanner champion/challenger comparison has no observation for this cycle. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.notify_result",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#1819 \u2014 best-effort: a terminal notifier must never change the outcome it reports. The run still routes to CheckDegradedOutcome and terminates DEGRADED.",
+          "ResultPath": "$.notify_error",
+          "Next": "CheckDegradedOutcome"
+        }
+      ],
+      "Next": "CheckDegradedOutcome"
+    },
     "DirectorComplete": {
       "Type": "Pass",
       "Comment": "config#6054: success-only witness for the rerun deriver (scripts/weekly_sf_rerun.py). Director's success and every bypass path previously converged on CheckShellRunNotify, so no state uniquely witnessed 'Director actually completed' \u2014 the I6055-class trap: a rerun could mark a bypassed Director complete and skip it. Entered ONLY via Director's success edge.",
-      "Next": "CheckShellRunNotify"
+      "Next": "CheckSkipScannerLeaderboard"
     },
     "BacktesterLivenessGate": {
       "Type": "Choice",

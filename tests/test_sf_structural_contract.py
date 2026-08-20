@@ -139,6 +139,8 @@ _TIMEOUT_EXEMPT: dict[str, dict[str, str]] = {
         "NotifyCompleteReportCardDegraded": "sns:publish completion notifier — SDK call, not a wait (config#6685)",
         "NotifyCompleteMultipleDegraded": "sns:publish completion notifier — SDK call, not a wait (config#6685)",
         "NotifyCompleteParityDegraded": "sns:publish completion notifier — SDK call, not a wait (alpha-engine-config-I6025)",
+        "PublishScannerLeaderboardDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait (alpha-engine-config-I7813)",
+        "NotifyCompleteScannerLeaderboardDegraded": "sns:publish completion notifier — SDK call, not a wait (alpha-engine-config-I7813)",
         "NotifyShellRunComplete": "sns:publish completion notifier — SDK call, not a wait",
         "NotifyComplete": "sns:publish completion notifier — SDK call, not a wait",
         "HandleFailure": "sns:publish failure notifier — SDK call, not a wait",
@@ -267,6 +269,10 @@ _DEGRADED_FLAG_JSONPATHS: dict[str, frozenset[str]] = {
             "$.report_card_degraded",
             "$.parity_degraded",
             "$.research_predictor_degraded",
+            # alpha-engine-config-I7813: the observe-only scanner leaderboard
+            # leaf's own flag. Read LAST in CheckGateDegradedNotify, so a run
+            # that also degraded something consequential still reports that.
+            "$.scanner_leaderboard_degraded",
         }
     ),
     "step_function_daily.json": frozenset({"$.degraded_summary"}),

@@ -539,14 +539,28 @@ class TestStageTableLockstep:
                 # config#6054: DELIBERATE exception, inverted from the
                 # convention. director's witness is the success-only
                 # DirectorComplete Pass state, and its skip route lands on
-                # CheckShellRunNotify — which every bypass path also enters.
+                # CheckSkipScannerLeaderboard (alpha-engine-config-I7813 —
+                # was CheckShellRunNotify until the observe-only scanner board
+                # became a leaf state between the two) — which every bypass
+                # path also enters.
                 # Witnessing on the skip target would mark a bypassed
                 # Director complete and skip it on the rerun (the I6055
                 # trap). Cost of the inversion: an original run that SKIPPED
                 # director yields a rerun that re-runs it — the safe
                 # direction for an advisory stage.
-                assert skip_targets == {"CheckShellRunNotify"}
+                assert skip_targets == {"CheckSkipScannerLeaderboard"}
                 assert "DirectorComplete" not in skip_targets
+                continue
+            if stage.name == "scanner_leaderboard":
+                # alpha-engine-config-I7813: same inverted convention as
+                # director, and for the same I6055 reason — the witness is the
+                # success-only ScannerLeaderboardComplete Pass, while the skip
+                # route lands on CheckShellRunNotify, which every bypass path
+                # also enters. An original run that skipped the leaf yields a
+                # rerun that re-runs it: the safe direction for an observe-only
+                # board that costs one Lambda invocation.
+                assert skip_targets == {"CheckShellRunNotify"}
+                assert "ScannerLeaderboardComplete" not in skip_targets
                 continue
             if stage.name == "backtester_stage_only":
                 # config#2362 Option A additive gate: deliberately empty

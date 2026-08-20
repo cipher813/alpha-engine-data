@@ -103,7 +103,20 @@ arcticdb>=6.23.0
 # same sequencing PR311/PR326 above already established for this exact
 # class of dependency. Until then, that one source-check failure is
 # EXPECTED and tracked by this note, not a silent regression.
-nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.75
+#
+# 2026-08-20: v0.124.75 -> v0.124.78 (alpha-engine-config-I7813). The
+# observe-only scanner leaderboard became its own weekly-SF leaf state
+# (ScannerLeaderboard + PublishScannerLeaderboardDegraded +
+# NotifyCompleteScannerLeaderboardDegraded), and all three are substantive
+# Task states, so tests/test_pipeline_status_registry_source_check.py fails
+# until the pinned lib carries their STATE_TO_ARCHIVE_PAGE entries.
+# nousergon-lib-PR<N> adds all three and MUST merge first; v0.124.78 is the
+# patch autobump that merge is expected to produce from 0.124.77. If another
+# lib PR merges between, this pin moves to whatever tag PR<N>'s merge actually
+# produced — the source-check is what tells you, and it stays RED until the
+# pin is right, which is the guard against merging the SF JSON ahead of the
+# registry entry.
+nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.78
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,
