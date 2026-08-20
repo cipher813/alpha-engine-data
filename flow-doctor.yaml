@@ -82,10 +82,21 @@ github:
 # LLM root-cause diagnosis. Required for fix-PR generation (the fix CLI
 # reads the diagnosis metadata embedded in the issue body). Haiku for the
 # soak — cheap; the hard daily dollar cap is the cost backstop.
+#
+# provider: router — resolves a krepis router capability class instead of
+# holding a direct-vendor key. flow-doctor 0.15.0 removed the implicit
+# "anthropic" default (Brian ruling; the fleet's Anthropic account carries
+# a $0 balance — alpha-engine-config-I7460 — and flow-doctor must not
+# construct a direct-Anthropic client anywhere); an unset provider is now a
+# loud ConfigError at import time instead of a silent vendor pick. "router"
+# needs no api_key (krepis resolves the credential) — model_group="low"
+# matches the prior Haiku-tier cost intent; `model` is retained for
+# logging/labeling only, the router resolves the actual model.
 diagnosis:
   enabled: true
+  provider: router
+  model_group: low
   model: claude-haiku-4-5
-  api_key: ${ANTHROPIC_API_KEY}
   max_daily_cost_usd: 0.50
 
 # Auto-fix-PR generation (runs in the flow-doctor-fix GitHub Actions
