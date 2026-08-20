@@ -19,6 +19,37 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SCRIPT_PATH = _REPO_ROOT / "infrastructure" / "systemd" / "check-systemd-unit-drift.py"
 
 
+class _FakeFcr:
+    """Stand-in for ``nousergon_lib.fleet_check_result`` — no real S3 access.
+
+    Mirrors the pattern in ``tests/test_pause_reconcile.py``. Every module test
+    that reaches ``main()`` now also reaches ``_publish_console`` (alpha-engine-
+    config-I7857), and without this the un-mocked ``fcr.emit`` would construct a
+    real boto3 S3 client and attempt a live PutObject whenever local AWS creds
+    happen to be present — exactly the "tests leaked real fan-out" class this
+    repo's conftest.py already guards against for flow-doctor/SSM.
+    """
+
+    STATUS_OK = "ok"
+    STATUS_ATTENTION = "attention"
+    STATUS_ERROR = "error"
+    calls: list[dict] = []
+
+    @classmethod
+    def build(cls, **kw):
+        return kw
+
+    @classmethod
+    def emit(cls, env, dry_run=False):
+        cls.calls.append(env)
+        return "s3://fake/latest.json"
+
+    @classmethod
+    def emit_result(cls, **kw):
+        env = cls.build(**kw)
+        return cls.emit(env)
+
+
 @pytest.fixture()
 def cd(tmp_path, monkeypatch):
     """Load the module fresh per-test, pointed at an isolated repo+installed dir pair."""
@@ -33,6 +64,10 @@ def cd(tmp_path, monkeypatch):
 
     monkeypatch.setattr(module, "SCRIPT_DIR", script_dir)
     monkeypatch.setattr(module, "INSTALLED_DIR", installed_dir)
+
+    _FakeFcr.calls = []
+    monkeypatch.setitem(sys.modules, "nousergon_lib", type(sys)("nousergon_lib"))
+    monkeypatch.setattr(sys.modules["nousergon_lib"], "fleet_check_result", _FakeFcr, raising=False)
 
     return module, script_dir, installed_dir
 
@@ -155,6 +190,25 @@ class TestDriftReportingPath:
             "'drift detected' sends you to the box to find out what"
         )
 
+    def test_report_dedup_window_widened_past_the_timer_cadence(self, cd, monkeypatch):
+        """alpha-engine-config-I7857: the old 1440min (24h) window matched the
+        daily timer exactly, so an UNCHANGED drift re-paged the channel every
+        single day with no new information. Must now exceed 1440 by a wide
+        margin so the console (not a daily repeat) carries the standing state."""
+        module, _, _ = cd
+        captured = {}
+
+        def fake_publish(**kwargs):
+            captured.update(kwargs)
+
+        monkeypatch.setitem(
+            __import__("sys").modules, "krepis.alerts",
+            type("M", (), {"publish": staticmethod(fake_publish)})
+        )
+        module._report_drift(["a.service: DIVERGED"])
+
+        assert captured["dedup_window_min"] > 1440
+
     def test_report_dedups_on_findings_not_message(self, cd, monkeypatch):
         # Same drift persisting should alert once a day; DIFFERENT drift must
         # produce a different key so it pages immediately.
@@ -220,6 +274,79 @@ class TestDriftReportingPath:
             "exports FlowDoctor/FlowDoctorBuilder. Use krepis.alerts (the "
             "canonical CLI, config#1649)."
         )
+
+
+class TestConsolePublish:
+    """`_publish_console` (alpha-engine-config-I7857) — the standing-drift
+    finding set routed to the console fleet-check surface, published on every
+    run regardless of findings, distinct from the channel alert."""
+
+    def test_publishes_on_clean_run_too(self, cd):
+        """A surface that only publishes when something is wrong is
+        indistinguishable from one that has died — must publish on clean runs."""
+        module, _, _ = cd
+        module._publish_console([], installed_count=4, drift_count=0)
+
+        assert len(_FakeFcr.calls) == 1
+        assert _FakeFcr.calls[0]["status"] == "ok"
+
+    def test_findings_render_as_attention_not_error(self, cd):
+        """A check that ran and found drift is working as designed — `error`
+        is reserved for a check that could not run at all (mirrors
+        pause_reconcile.py's publish_error contract in this same repo)."""
+        module, _, _ = cd
+        module._publish_console(["a.service: DIVERGED"], installed_count=4, drift_count=1)
+
+        assert _FakeFcr.calls[0]["status"] == "attention"
+        assert _FakeFcr.calls[0]["status"] != "error"
+
+    def test_findings_are_carried_in_the_envelope(self, cd):
+        module, _, _ = cd
+        module._publish_console(
+            ["a.service: DIVERGED", "b.timer: DIVERGED"], installed_count=4, drift_count=2,
+        )
+
+        findings = _FakeFcr.calls[0]["findings"]
+        assert len(findings) == 2
+        assert any("a.service" in f["detail"] for f in findings)
+        assert any("b.timer" in f["detail"] for f in findings)
+
+    def test_main_publishes_console_on_every_run_including_clean(self, cd, monkeypatch):
+        """The end-to-end wiring: `main()` must reach `_publish_console`
+        whether or not `--report`/drift is present, mirroring box_health's
+        'publish on every run including clean ones' property."""
+        module, script_dir, installed_dir = cd
+        for name in module.ALL_UNITS:
+            content = f"UNIT {name}\n"
+            _write(script_dir / name, content)
+            _write(installed_dir / name, content)
+
+        monkeypatch.setattr("sys.argv", ["check-systemd-unit-drift.py"])
+        exit_code = module.main()
+
+        assert exit_code == 0
+        assert len(_FakeFcr.calls) == 1
+        assert _FakeFcr.calls[0]["status"] == "ok"
+
+    def test_console_publish_failure_does_not_break_the_check(self, cd, capsys):
+        """Telemetry must never fail the check itself — best-effort, logged."""
+        module, _, _ = cd
+
+        class _Boom:
+            STATUS_OK = "ok"
+            STATUS_ATTENTION = "attention"
+
+            @staticmethod
+            def emit_result(**kw):
+                raise RuntimeError("simulated S3 failure")
+
+        import sys as _sys
+        _sys.modules["nousergon_lib"].fleet_check_result = _Boom
+
+        module._publish_console(["a.service: DIVERGED"], installed_count=4, drift_count=1)
+
+        err = capsys.readouterr().err
+        assert "console publish failed" in err
 
 
 class TestCoverageAccounting:
