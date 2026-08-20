@@ -18,7 +18,7 @@ liveness-poll quintet (``InitChronicGapPoll``/``WaitForChronicGap``/
 and its skip-gate (``CheckSkipChronicGapHeal``) are now DELETED from
 ``step_function_daily.json`` — 7 states removed in total. The 5 states that
 used to route into ``CheckSkipChronicGapHeal`` now route to
-``CheckSkipScanner`` (alpha-engine-config-I6494 — weekday Scanner before
+``CheckSkipPredictorInference`` (alpha-engine-config-I6494 — weekday Scanner before
 PredictorInference): ``CheckSkipMorningEnrich``,
 ``CheckMorningEnrichSpotLaunched``, ``CheckMorningArcticAppendSpotLaunched``,
 ``CheckMorningArcticAppendSpotStatus`` (its "Success" choice), and
@@ -30,7 +30,7 @@ This test catches regressions like:
   to this SF instead of the standalone daily-heal job — reopening the exact
   preopen poll-budget risk I2717 exists to close.
 - Someone leaves a dangling reference to one of the removed state names.
-- The 5 rewired predecessors drifting off ``CheckSkipScanner``.
+- The rewired predecessors drifting off ``CheckSkipPredictorInference``.
 - ``ForceStopUnresponsiveInstance`` (SHARED with the code-freshness-gate and
   morning-planner liveness loops) getting accidentally deleted along with the
   chronic-gap quintet it used to also serve.
@@ -111,22 +111,22 @@ class TestChronicGapHealQuintetRemoved:
 
 class TestRewiredPredecessorsRouteToScannerGate:
     """The 5 states that used to enter CheckSkipChronicGapHeal now enter
-    CheckSkipScanner (alpha-engine-config-I6494 — weekday Scanner sits
+    CheckSkipPredictorInference (I7811 removed the weekday Scanner; under I6494 it sat
     between the data-phase continue path and PredictorInference)."""
 
     def test_check_skip_morning_enrich_skip_edge(self, states):
         choices = states["CheckSkipMorningEnrich"]["Choices"]
         assert len(choices) == 1
-        assert choices[0]["Next"] == "CheckSkipScanner"
+        assert choices[0]["Next"] == "CheckSkipPredictorInference"
 
     def test_morning_enrich_spot_launched_default(self, states):
         assert states["CheckMorningEnrichSpotLaunched"]["Default"] == (
-            "CheckSkipScanner"
+            "CheckSkipPredictorInference"
         )
 
     def test_arctic_append_spot_launched_default(self, states):
         assert states["CheckMorningArcticAppendSpotLaunched"]["Default"] == (
-            "CheckSkipScanner"
+            "CheckSkipPredictorInference"
         )
 
     def test_arctic_append_spot_status_success_edge(self, states):
@@ -135,12 +135,12 @@ class TestRewiredPredecessorsRouteToScannerGate:
             for c in states["CheckMorningArcticAppendSpotStatus"]["Choices"]
             if c.get("StringEquals") == "Success"
         ]
-        assert success == ["CheckSkipScanner"]
+        assert success == ["CheckSkipPredictorInference"]
 
     def test_publish_data_spot_failure_immediate_routes_forward(self, states):
         st = states["PublishDataSpotFailureImmediate"]
-        assert st["Next"] == "CheckSkipScanner"
-        assert st["Catch"][0]["Next"] == "CheckSkipScanner"
+        assert st["Next"] == "CheckSkipPredictorInference"
+        assert st["Catch"][0]["Next"] == "CheckSkipPredictorInference"
 
 
 class TestPredictorInferenceGateUnchanged:

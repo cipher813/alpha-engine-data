@@ -33,6 +33,24 @@ These tests pin:
   6. Clean payload (both false) still reaches TradingDayGate via Default.
   7. The notify state fails open (its own Catch also leads to TradingDayGate)
      so an SNS outage cannot turn a degrade into a halt.
+
+alpha-engine-config-I7799 (Brian ruling 2026-08-20) adds a FIFTH branch and
+renames the degrade reason. `sf_drift` is now a comparison of the deployed
+preopen DEFINITION against the repo's, so it halts only when the orchestration
+about to run differs from what main describes. What the old SHA-stamp
+comparison used to say survives as `deploy_stamp_stale` — this repo merged
+something it has not deployed, reaching code the pipeline invokes but does not
+embed — which DEGRADES rather than halting. Two conditions can now reach the
+one degrade path, so its `reason` is `deploy_drift_nonhalting` and the notify
+message names which fired from the probe payload rather than asserting
+CloudFormation.
+
+  8. deploy_stamp_stale=true degrades, is evaluated after the cf_drift branch
+     and before Default, and is IsPresent-guarded toward PROCEEDING — an absent
+     key means an older predictor Lambda whose sf_drift IS the stamp
+     comparison, so the coverage is still enforced one branch up, more
+     strictly.
+  9. The notify message interpolates only fields both probe versions emit.
 """
 from __future__ import annotations
 
@@ -66,9 +84,10 @@ def _guard_pairs(choice):
     return guard, comparison
 
 
-def test_gate_is_a_choice_with_four_branches_and_a_default(gate):
+def test_gate_is_a_choice_with_five_branches_and_a_default(gate):
+    # Four since config#6615; the fifth is deploy_stamp_stale (config-I7799).
     assert gate["Type"] == "Choice"
-    assert len(gate["Choices"]) == 4
+    assert len(gate["Choices"]) == 5
     assert gate["Default"] == "TradingDayGate"
 
 
@@ -145,6 +164,45 @@ def test_no_branch_routes_cf_drift_true_to_handle_failure(gate):
             assert not_clause.get("IsPresent") is True
 
 
+def test_deploy_stamp_stale_degrades_and_is_ordered_after_cf_drift(gate):
+    """config-I7799: the fifth branch. Ordered after cf_drift so a cf_drift
+    degrade is not relabelled by it, and before Default."""
+    c = gate["Choices"][4]
+    guard, comparison = _guard_pairs(c)
+    assert guard == {
+        "Variable": "$.drift_result.Payload.deploy_stamp_stale",
+        "IsPresent": True,
+    }
+    assert comparison["Variable"] == "$.drift_result.Payload.deploy_stamp_stale"
+    assert comparison["BooleanEquals"] is True
+    assert c["Next"] == "SetDeployDriftDegradedFlag"
+    assert c["Next"] != "HandleFailure"
+
+
+def test_absent_deploy_stamp_stale_does_not_halt(gate):
+    """During a rollout the predictor Lambda may not emit the field yet. No
+    branch may route its ABSENCE anywhere — Default must carry it, because the
+    old Lambda's sf_drift is the stamp comparison and already halts on it."""
+    for c in gate["Choices"]:
+        not_clause = c.get("Not") or {}
+        assert not_clause.get("Variable") != "$.drift_result.Payload.deploy_stamp_stale", (
+            "an absent deploy_stamp_stale must fall through to Default, not "
+            "be branched on — see the branch Comment (config-I7799)"
+        )
+
+
+def test_degrade_notify_only_interpolates_fields_both_probe_versions_emit(states):
+    """A States.Format on an absent path raises States.Runtime, and this
+    state's Catch would swallow the alert into TradingDayGate — losing the
+    notification precisely during the rollout window it matters in."""
+    msg = states["PublishDeployDriftDegraded"]["Parameters"]["Message.$"]
+    assert "$.drift_result.Payload.deploy_stamp_stale" not in msg, (
+        "deploy_stamp_stale must ride inside the JsonToString payload, never "
+        "as its own States.Format argument (config-I7799)"
+    )
+    assert "States.JsonToString($.drift_result.Payload)" in msg
+
+
 def test_clean_payload_reaches_trading_day_gate_via_default(gate):
     assert gate["Default"] == "TradingDayGate"
 
@@ -154,7 +212,7 @@ def test_degraded_flag_state_shape(states):
     assert st["Type"] == "Pass"
     assert st["ResultPath"] == "$.degraded_summary"
     assert st["Parameters"]["degraded"] is True
-    assert st["Parameters"]["reason"] == "deploy_drift_metadata"
+    assert st["Parameters"]["reason"] == "deploy_drift_nonhalting"
     assert st["Parameters"]["run_date.$"] == "$.run_date"
     # Mirrors SetDaemonDegradedFlag/SetDataSpotDegradedFlag's stage_error
     # convention — carries the probe's own diagnostic payload (cf_drift_reason,
@@ -235,6 +293,9 @@ def test_resultpath_threading_survives_to_check_degraded_outcome(sf, states):
     # alpha-engine-config#6722 added SetMutexAcquireDegradedFlag (mutex
     # acquire infra-error fail-open) and SetScannerDegradedFlag (weekday
     # Scanner fail-open) as two more Option-A-shaped setters.
+    # I7811 (Brian ruling 2026-08-20) removed SetScannerDegradedFlag with the
+    # weekday Scanner — the scanner forms its cuts WEEKLY now, so there is no
+    # weekday scanner failure left to fail open.
     overwriters = {
         name
         for name, st in states.items()
@@ -245,7 +306,6 @@ def test_resultpath_threading_survives_to_check_degraded_outcome(sf, states):
         "SetDaemonDegradedFlag",
         "SetDataSpotDegradedFlag",
         "SetMutexAcquireDegradedFlag",
-        "SetScannerDegradedFlag",
     }
 
 

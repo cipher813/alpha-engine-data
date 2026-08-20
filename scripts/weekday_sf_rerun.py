@@ -5,7 +5,7 @@ Second adoption of the config#2277 idiom ``scripts/weekly_sf_rerun.py``
 established, covering the two weekday pipelines instead of the Saturday one:
 
 - ``ne-preopen-trading-pipeline`` ("daily") — skip gates: ``skip_morning_
-  enrich``, ``skip_scanner``, ``skip_predictor_inference``,
+  enrich``, ``skip_predictor_inference``,
   ``skip_morning_planner``, ``skip_run_daemon`` (infrastructure/
   step_function_daily.json). These gates test ONLY the flag itself — no
   pipeline_role conjunction, matching the weekly SF's shape.
@@ -145,11 +145,15 @@ class Pipeline:
 
 
 DAILY_STAGES: tuple[Stage, ...] = (
+    # alpha-engine-config-I7811 (Brian ruling 2026-08-20): the `scanner` stage
+    # was REMOVED from this pipeline — the scanner forms its two cuts WEEKLY, on
+    # the Saturday pipeline, and those feed research and the predictor for the
+    # week. morning_enrich's witness therefore moved from CheckSkipScanner to
+    # CheckSkipPredictorInference. A stage table that still named `scanner`
+    # would emit `skip_scanner` into a definition with no gate to read it, and
+    # the helper's own coherence check would reject its own output.
     Stage("morning_enrich", "skip_morning_enrich",
           "CheckSkipMorningEnrich", "LaunchMorningEnrichSpot",
-          frozenset({"CheckSkipScanner"})),
-    Stage("scanner", "skip_scanner",
-          "CheckSkipScanner", "Scanner",
           frozenset({"CheckSkipPredictorInference"})),
     Stage("predictor_inference", "skip_predictor_inference",
           "CheckSkipPredictorInference", "PredictorInference",
@@ -247,6 +251,10 @@ class RerunPlan:
     skip_flags: dict = field(default_factory=dict)   # flag -> True
     warnings: list = field(default_factory=list)
     notes: list = field(default_factory=list)
+    # config-I7807: populated only for a preopen recovery started while the
+    # NYSE session is open. None on every other path, so a run that does not
+    # need the override never silently carries one.
+    market_hours_override: dict | None = None
 
     def rerun_input(self) -> dict:
         out = dict(self.original_input)
@@ -254,6 +262,21 @@ class RerunPlan:
         if self.emitted_role is not None:
             out["pipeline_role"] = self.emitted_role
         out.update(self.skip_flags)
+        # alpha-engine-config-I7807. A recovery started while the NYSE session
+        # is open halts at MarketHoursBoundary without this field, so a helper
+        # whose whole purpose is "recovery is ONE mechanical command"
+        # (sf-pipeline-policy §2.5) was emitting an input guaranteed to fail on
+        # the case it exists for. Measured 2026-08-20 against the morning's
+        # failed preopen: the printed input carried no override, and the same
+        # shape shows twice on 2026-08-19 — operator-rerun-...-151046 FAILED in
+        # 3s, then ...-151134-override SUCCEEDED, the same command run twice
+        # with a field added by hand.
+        #
+        # §3 makes the override "the normal instrument of this rule, not an
+        # exception to it": the boundary exists to make an in-session start
+        # DELIBERATE and AUDITABLE, not rare.
+        if self.market_hours_override is not None:
+            out["market_hours_override"] = self.market_hours_override
         return out
 
 
@@ -380,6 +403,78 @@ def _print_plan(pipeline: Pipeline, plan: RerunPlan, source_arn: str, source_sta
     )
 
 
+# ── config-I7807: the same-day recovery override ─────────────────────────────
+
+def market_is_open(sf_region: str, when: str | None = None) -> tuple[bool, dict]:
+    """Ask the SAME Lambda action `MarketHoursGate` asks.
+
+    Deliberately not a local calendar. The gate this override exists to cross
+    is decided by `alpha-engine-predictor-inference:live` / `check_market_hours`,
+    and a second implementation here could disagree with it — which would either
+    attach an override to a run that does not need one, or withhold it from a run
+    that does, on a holiday or an early close. One answer, one owner.
+    """
+    import boto3
+    lam = boto3.client("lambda", region_name=sf_region)
+    payload = {"action": "check_market_hours", "execution_input": {}}
+    if when:
+        payload["now"] = when
+    resp = lam.invoke(
+        FunctionName="alpha-engine-predictor-inference:live",
+        Payload=json.dumps(payload).encode(),
+    )
+    body = json.loads(resp["Payload"].read())
+    return bool(body.get("is_market_hours")), body
+
+
+def pipeline_is_preopen(pipeline) -> bool:
+    """Only the preopen pipeline can cross the market-hours boundary — the
+    postclose one runs after the close by construction."""
+    return getattr(pipeline, "sm_arn", "").endswith("ne-preopen-trading-pipeline")
+
+
+def session_close_utc(gate: dict) -> str:
+    """Today's NYSE close, in UTC, from the gate's own answer.
+
+    `now_et` and `session_window_et` (e.g. "09:30-16:00") both come back from
+    the gate, so the close is read from the same source that decides the
+    boundary rather than hardcoded — an early-close day has a different window
+    and the override must not outlive it.
+    """
+    from datetime import datetime
+
+    base = datetime.fromisoformat(gate.get("now_et") or "")
+    window = gate.get("session_window_et") or "09:30-16:00"
+    hh, mm = (int(x) for x in window.split("-")[-1].strip().split(":"))
+    close_et = base.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    offset = close_et.utcoffset()
+    if offset is None:
+        return close_et.isoformat() + "Z"
+    return (close_et - offset).replace(tzinfo=None).isoformat() + "Z"
+
+
+def build_market_hours_override(
+    *, source_arn: str, source_status: str, authorized_by: str,
+    reason: str | None, expires_at: str,
+) -> dict:
+    """The `{reason, authorized_by, expires_at}` shape `RecordMarketHoursOverride`
+    consumes. `reason` defaults to the sentence the two successful recoveries
+    used, naming the source execution and the standing rule — §3 wants the
+    crossing auditable, and an operator retyping it each time is how it stops
+    being."""
+    default = (
+        f"Same-day recovery of {source_status} preopen execution "
+        f"{source_arn.rsplit(':', 1)[-1]}. Standing rule sf-pipeline-policy §3 "
+        f"(SFP-3-preopen-same-day-relaunch): a failed preopen is always "
+        f"relaunched while the NYSE session is open."
+    )
+    return {
+        "reason": reason or default,
+        "authorized_by": authorized_by,
+        "expires_at": expires_at,
+    }
+
+
 def main(argv: list | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     ap.add_argument("--execution-arn", required=True,
@@ -388,6 +483,18 @@ def main(argv: list | None = None) -> int:
     mode.add_argument("--dry-run", action="store_true", help="derive + print only (default)")
     mode.add_argument("--start", action="store_true", help="StartExecution with the derived input")
     ap.add_argument("--region", default="us-east-1")
+    # config-I7807 — the same-day recovery override (sf-pipeline-policy §3).
+    ap.add_argument(
+        "--authorized-by",
+        help="who authorized crossing the market-hours boundary. REQUIRED when "
+             "recovering a preopen execution while the NYSE session is open — "
+             "§3 makes the crossing auditable, not rare.",
+    )
+    ap.add_argument(
+        "--market-hours-override-reason",
+        help="override the generated reason line (defaults to one naming the "
+             "source execution and the SFP-3 standing rule)",
+    )
     args = ap.parse_args(argv)
 
     pipeline = pipeline_for_execution_arn(args.execution_arn)
@@ -409,6 +516,40 @@ def main(argv: list | None = None) -> int:
     events = fetch_history(sf, args.execution_arn)
     plan = derive_plan(pipeline, events, start_time=desc.get("startDate"))
     name = operator_rerun_name(plan.run_date)
+
+    # config-I7807: attach the market-hours override when, and only when, the
+    # recovery would cross the boundary. Probed from the gate's own Lambda so
+    # this cannot disagree with the state that enforces it.
+    if pipeline_is_preopen(pipeline):
+        is_open, gate = market_is_open(args.region)
+        if is_open:
+            if not args.authorized_by:
+                raise SystemExit(
+                    "FATAL: the NYSE session is open "
+                    f"({gate.get('now_et')}, {gate.get('reason')!r}), so this "
+                    "recovery crosses the market-hours boundary and needs "
+                    "--authorized-by. sf-pipeline-policy §3 makes that crossing "
+                    "DELIBERATE and AUDITABLE — it does not make it rare, and "
+                    "the standing rule is that a failed preopen is relaunched "
+                    "for as long as the market is open."
+                )
+            plan.market_hours_override = build_market_hours_override(
+                source_arn=args.execution_arn,
+                source_status=source_status,
+                authorized_by=args.authorized_by,
+                reason=args.market_hours_override_reason,
+                expires_at=session_close_utc(gate),
+            )
+            plan.notes.append(
+                "market_hours_override attached — NYSE is OPEN "
+                f"({gate.get('now_et')}); "
+                f"expires_at={plan.market_hours_override['expires_at']}"
+            )
+        else:
+            plan.notes.append(
+                "no market_hours_override needed — NYSE is closed "
+                f"({gate.get('now_et')}, {gate.get('reason')!r})"
+            )
 
     # Role-gating check against the LIVE definition — protects against the
     # SF drifting away from the role assumption PIPELINES encodes (adding

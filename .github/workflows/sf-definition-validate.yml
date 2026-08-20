@@ -1,0 +1,59 @@
+# Pre-merge Step Function definition validation (alpha-engine-config-I7798).
+#
+# Runs the SAME `aws stepfunctions validate-state-machine-definition` preflight
+# `deploy-infrastructure.sh` runs at deploy time, on the SAME stamped artifacts,
+# in the SAME all-or-nothing order — via that script's `--validate-only` mode,
+# so there is one implementation rather than a second one free to drift.
+#
+# Why it exists: on 2026-08-19 an illegal ASL escape (`\"`, not one of the four
+# escapes AWS's intrinsic grammar accepts) merged in #1447. Every in-repo test
+# passed; the AWS validator ran only post-merge, and its all-or-nothing preflight
+# then blocked the deploy of ALL FOUR definitions for three consecutive merges.
+# The live SF stamp froze one SHA behind main and the 2026-08-20
+# ne-preopen-trading-pipeline halted at DeployDriftGate — a full unmanaged
+# trading session, caused by quoting in a weekly-pipeline stage.
+#
+# Credentials: `ne-github-sf-validate` (nous-ergon-ops), which holds exactly
+# states:ValidateStateMachineDefinition and nothing else. Deliberately NOT the
+# deploy role — this job runs on pull_request.
+name: Validate SF Definitions
+
+on:
+  pull_request:
+    paths:
+      - 'infrastructure/step_function*.json'
+      - 'infrastructure/deploy-infrastructure.sh'
+      - '.github/workflows/sf-definition-validate.yml'
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/step_function*.json'
+      - 'infrastructure/deploy-infrastructure.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: sf-definition-validate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: sf-definition-validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Configure AWS credentials (validate-only role)
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/ne-github-sf-validate
+          aws-region: us-east-1
+
+      - name: Validate every Step Function definition against AWS
+        run: bash infrastructure/deploy-infrastructure.sh --validate-only

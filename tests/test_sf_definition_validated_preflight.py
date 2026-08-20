@@ -124,3 +124,98 @@ def test_abort_keys_on_result_field_not_diagnostics() -> None:
 # The invariant (states:ValidateStateMachineDefinition is granted to the
 # GHA deploy role) is enforced in nous-ergon-ops/tests/ — the IAM files
 # this test read have been removed from this repo (infra/drop-iam-moved-to-ops).
+
+
+# --- the PRE-merge half of the same preflight ----------------------------
+#
+# config#1897 put the AWS validator in the deploy script. That is post-merge by
+# construction, and its all-or-nothing abort — correct in itself, since it keeps
+# the fleet off mixed SHAs — means one bad definition blocks the deploy of ALL of
+# them. Measured 2026-08-19/20 (alpha-engine-config-I7798): an illegal ASL escape
+# in the WEEKLY definition blocked three consecutive deploys, froze the live SF
+# stamp one SHA behind main, and halted the next morning's
+# ne-preopen-trading-pipeline at DeployDriftGate — a full unmanaged trading
+# session, from quoting in a different pipeline's stage.
+#
+# The fix is not a second validator: it is the SAME code path, reachable before
+# the merge. `--validate-only` stamps and validates exactly as the deploy does,
+# then exits BEFORE the first mutation, so the PR is graded by the artifact the
+# deploy would apply. These tests fail if that mode is removed, if it stops
+# covering a definition, if it gains a mutation, or if CI stops calling it.
+
+_WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "sf-definition-validate.yml"
+
+_MUTATING_CALLS = (
+    "aws s3 cp",
+    "update-state-machine",
+    "create-state-machine",
+    "deploy --stack-name",
+    "create-stack",
+    "update-stack",
+)
+
+
+def test_validate_only_mode_exists() -> None:
+    text = _script_text()
+    assert "--validate-only" in text, (
+        "deploy-infrastructure.sh must offer a --validate-only mode so the "
+        "SAME validator can run pre-merge (alpha-engine-config-I7798)."
+    )
+    assert "VALIDATE_ONLY=true" in text
+
+
+def test_validate_only_exits_after_the_preflight_and_before_any_mutation() -> None:
+    """--validate-only must reach the validate-ALL preflight and stop there.
+
+    If its exit sat BEFORE the preflight it would validate nothing; if it sat
+    AFTER a mutation it would write to production from a pull request."""
+    text = _script_text()
+    validate_at = _first_index(text, r"validate_sf_definition\s+\"\$SAT_STAMPED\"")
+    assert validate_at != -1, "validate preflight call site not found"
+
+    exit_at = text.find("Validate-only complete")
+    assert exit_at != -1, (
+        "--validate-only must announce and take its own exit after the "
+        "preflight (alpha-engine-config-I7798)."
+    )
+    assert validate_at < exit_at, (
+        "--validate-only exits before the validate-ALL preflight — it would "
+        "validate nothing."
+    )
+
+    # Comments in this script quote the very API calls being searched for, so
+    # the scan runs over executable lines only.
+    code = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+    code_exit_at = code.find("Validate-only complete")
+    assert code_exit_at != -1
+    for call in _MUTATING_CALLS:
+        at = _first_index(code, re.escape(call))
+        if at == -1 or at > code_exit_at:
+            continue
+        # A mutating call reachable before the validate-only exit must sit
+        # inside a branch the flag skips.
+        guard_at = code.find("if $VALIDATE_ONLY; then")
+        assert guard_at != -1 and guard_at < at, (
+            f"mutating call {call!r} is reachable under --validate-only — a "
+            f"pull-request check must not write to production."
+        )
+
+
+def test_ci_calls_validate_only_on_pull_request() -> None:
+    assert _WORKFLOW.is_file(), f"missing {_WORKFLOW}"
+    wf = _WORKFLOW.read_text()
+    assert "pull_request:" in wf, (
+        "the SF-definition check must run on pull_request — running it only on "
+        "main reproduces the post-merge-only gap it exists to close."
+    )
+    assert "--validate-only" in wf, (
+        "the workflow must invoke deploy-infrastructure.sh --validate-only, not "
+        "reimplement the validator."
+    )
+    assert "ne-github-sf-validate" in wf, (
+        "the workflow must assume the minimal-privilege validate role, never "
+        "the deploy role (alpha-engine-config-I7798)."
+    )
+    assert "github-actions-lambda-deploy" not in wf
