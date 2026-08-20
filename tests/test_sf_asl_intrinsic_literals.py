@@ -1,4 +1,4 @@
-"""No single quotes inside ASL intrinsic-function string literals.
+"""Legal escape sequences inside ASL intrinsic-function string literals.
 
 AWS Step Functions intrinsic-function string literals (States.Format /
 States.Array / ...) CANNOT contain or escape an embedded single quote —
@@ -19,7 +19,6 @@ one grammar rule that has actually fired, cheaply and offline.
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 
 import pytest
@@ -28,12 +27,31 @@ _INFRA = Path(__file__).resolve().parent.parent / "infrastructure"
 SF_FILES = sorted(_INFRA.glob("step_function*.json"))
 
 
+def _iter_payload_intrinsics(payload, path: str, key_path: str = ""):
+    """Yield (key_path, intrinsic) for every intrinsic string ANYWHERE inside a
+    payload template, not only at its top level.
+
+    The top-level-only walk this replaces was itself a detection blind spot:
+    the SSM ``sendCommand`` states nest their ``commands.$`` intrinsic under
+    ``Parameters/Parameters``, so neither grammar rule below could ever see the
+    field that has broken the deploy twice (2026-08-19, config-I7267)."""
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            sub = f"{key_path}/{key}" if key_path else key
+            if isinstance(value, str) and value.startswith("States."):
+                yield sub, value
+            else:
+                yield from _iter_payload_intrinsics(value, path, sub)
+    elif isinstance(payload, list):
+        for i, item in enumerate(payload):
+            yield from _iter_payload_intrinsics(item, path, f"{key_path}[{i}]")
+
+
 def _iter_intrinsic_fields(states: dict, path: str = ""):
     for name, state in states.items():
         here = f"{path}/{name}"
-        for key, value in (state.get("Parameters") or {}).items():
-            if isinstance(value, str) and value.startswith("States."):
-                yield here, key, value
+        for key, value in _iter_payload_intrinsics(state.get("Parameters") or {}, here):
+            yield here, key, value
         if "States" in state:
             yield from _iter_intrinsic_fields(state["States"], here)
         for branch in state.get("Branches", []):
@@ -44,24 +62,60 @@ def _iter_intrinsic_fields(states: dict, path: str = ""):
                 yield from _iter_intrinsic_fields(proc["States"], here)
 
 
+ASL_VALID_ESCAPES = set("\\'{}")
+
+
+def _escape_offenders(value: str):
+    """Offending offsets in one intrinsic string.
+
+    Measured against ``validate-state-machine-definition`` 2026-08-20 — the
+    ASL intrinsic grammar accepts exactly four escapes inside a ``'``-quoted
+    literal (``\\\\``, ``\\'``, ``\\{``, ``\\}``) and no backslash at all
+    outside one. A literal double quote is fine UNQUOTED (``'say " hi'``
+    validates); it is ``\\"`` — the shell habit of escaping it — that AWS
+    rejects. Likewise ``'a\\'b'`` is legal while the shell splice
+    ``'a'\\''b'`` is not."""
+    out, in_literal, i = [], False, 0
+    while i < len(value):
+        c = value[i]
+        if c == "\\":
+            nxt = value[i + 1] if i + 1 < len(value) else ""
+            if not in_literal:
+                out.append((i, f"backslash outside a quoted literal: {value[i:i+2]!r}"))
+            elif nxt not in ASL_VALID_ESCAPES:
+                out.append((i, f"illegal escape {value[i:i+2]!r} (legal: \\\\ \\' \\{{ \\}})"))
+            i += 2
+            continue
+        if c == "'":
+            in_literal = not in_literal
+        i += 1
+    return out
+
+
 @pytest.mark.parametrize("sf_path", SF_FILES, ids=lambda p: p.name)
-def test_no_single_quote_inside_intrinsic_string_literals(sf_path: Path):
+def test_intrinsic_escape_sequences_are_legal(sf_path: Path):
+    """The grammar rule that has now broken the deploy three times.
+
+    2026-07-01 and 2026-07-14: shell ``'\\''`` splices. 2026-08-19
+    (alpha-engine-config-I7267, nousergon-data #1447): ``grep -qF
+    "\\"timed_out\\": true"`` inside the two PitParity ``commands.$``
+    intrinsics. Every in-repo test passed — the AWS validator runs only inside
+    ``deploy-infrastructure.sh``, POST-merge — so its all-or-nothing preflight
+    blocked the deploy of ALL FOUR definitions for three consecutive merges,
+    froze the live SF stamp one SHA behind ``main``, and the next morning's
+    ``ne-preopen-trading-pipeline`` halted on its ``DeployDriftGate``: a whole
+    unmanaged trading session, caused by quoting in a weekly-pipeline stage."""
     doc = json.loads(sf_path.read_text())
-    offenders = []
-    for state_path, key, value in _iter_intrinsic_fields(doc.get("States", {})):
-        # every '...'-quoted literal segment inside the intrinsic call
-        for literal in re.findall(r"'((?:[^'])*)'", value):
-            # re can't see an interior quote inside a '-delimited match by
-            # construction — the real tell is the shell-style '\'' splice,
-            # which parses as literal-end + escaped-quote + literal-start:
-            pass
-        if re.search(r"'\\''", value) or re.search(r"''", value):
-            offenders.append(f"{sf_path.name}{state_path} :: {key}")
+    offenders = [
+        f"{sf_path.name}{state_path} :: {key} @ char {off}: {why}"
+        for state_path, key, value in _iter_intrinsic_fields(doc.get("States", {}))
+        for off, why in _escape_offenders(value)
+    ]
     assert not offenders, (
-        "ASL intrinsic string literals must not contain (or shell-escape) "
-        "single quotes — AWS rejects the definition at deploy time "
-        "(SCHEMA_VALIDATION_FAILED). Rephrase without apostrophes:\n  "
-        + "\n  ".join(offenders)
+        "Illegal escape sequence in an ASL intrinsic — AWS rejects the whole "
+        "definition at deploy time (SCHEMA_VALIDATION_FAILED), which blocks "
+        "the all-or-nothing deploy of EVERY definition and freezes the live "
+        "SF stamp behind main:\n  " + "\n  ".join(offenders)
     )
 
 
