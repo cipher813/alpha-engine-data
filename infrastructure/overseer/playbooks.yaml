@@ -858,6 +858,19 @@ alert_classes:
     severities: [warning]
     intake: bus
     response: drain-queue
+  - class: research_cut_promotion_error
+    # alpha-engine-config-I7826 static-chokepoint registration: the
+    # scanner-cut champion/challenger promotion engine
+    # (crucible-research/lambda/scanner_handler.py, run_cut_promotion)
+    # is observe-only and never blocks the feed — a promotion failure
+    # leaves the standing champion pointer in place — but this alert
+    # is the ONLY signal that a cycle's promotion decision was never
+    # recorded. publish_observe_alert called with explicit
+    # severity="ERROR".
+    source: "research:cut_promotion"
+    severities: [error]
+    intake: bus
+    response: drain-queue
   - class: research_experiment_record_alerts
     source: "research:experiment_record"
     severities: [warning]
