@@ -122,8 +122,27 @@ def test_a_leaf_failure_degrades_the_run_loudly_and_never_silently(states):
     the flag is set, a NAMED alert fires, and the terminal marker says DEGRADED.
     """
     leaf = states["ScannerLeaderboard"]
-    assert all(c["Next"] == "ScannerLeaderboardDegraded" for c in leaf["Catch"])
+    # alpha-engine-config-I7812: the leaf's LAST catch is the generic fail-open
+    # this test owns; the earlier one forks a resource kill (States.Timeout /
+    # Lambda.Unknown) so the terminal cause and the DEGRADED marker can name it
+    # (sf-pipeline-policy.md §3 obligation 3). Both land on a flag-setter that
+    # sets the SAME $.scanner_leaderboard_degraded and both converge on the same
+    # named alert, so every obligation below is asserted on both routes.
+    assert [c["Next"] for c in leaf["Catch"]] == [
+        "ScannerLeaderboardResourceKill",
+        "ScannerLeaderboardDegraded",
+    ]
     assert all(c["ResultPath"] == "$.scanner_leaderboard_error" for c in leaf["Catch"])
+
+    kill = states["ScannerLeaderboardResourceKill"]
+    assert kill["Result"] is True
+    assert kill["ResultPath"] == "$.scanner_leaderboard_degraded"
+    assert kill["Next"] == "SetScannerLeaderboardResourceKillSummary"
+    kill_summary = states["SetScannerLeaderboardResourceKillSummary"]
+    assert kill_summary["Parameters"]["degraded"] is True
+    assert "resource_kill" in kill_summary["Parameters"]["reason"]
+    assert kill_summary["ResultPath"] == "$.degraded_summary"
+    assert kill_summary["Next"] == "PublishScannerLeaderboardDegraded"
 
     flag = states["ScannerLeaderboardDegraded"]
     assert flag["Result"] is True
