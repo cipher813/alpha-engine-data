@@ -693,7 +693,10 @@ def _report_drift(findings: list[str]) -> None:
         publish(
             message=message,
             severity="error",
-            source="check-systemd-unit-drift",
+            # alpha-engine-config-I7740 (operator ruling 2026-08-21): source
+            # must equal the registry's declared string exactly — the
+            # registry is the contract, emitters conform to it.
+            source="alpha-engine-data/infrastructure/systemd/check-systemd-unit-drift.py",
             # Dedup on the FINDINGS, not the message: the same drift persisting
             # alerts once per window, while a new finding changes the key and
             # pages immediately regardless of window.

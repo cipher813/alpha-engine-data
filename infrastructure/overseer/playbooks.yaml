@@ -798,6 +798,21 @@ alert_classes:
     severities: [warning]
     intake: bus
     response: drain-queue
+  - class: predictor_inference
+    # alpha-engine-config-I7740 (operator ruling 2026-08-21): new registry
+    # row for a previously-undeclared source. One source string covers
+    # multiple observed failure shapes (KeyError 'offenders'/'violations',
+    # UnknownAction action='check_market_hours_typo', DRIFT ALERT confidence
+    # collapse, stage-coverage assertion — "No module named
+    # nousergon_lib.stage_coverage", and a ClientError PutMetricData
+    # AccessDenied) — the schema's `severities` enum is closed and
+    # `additionalProperties: false` forbids adding a differentiating field,
+    # so this is deliberately ONE row at [dynamic] rather than several rows
+    # keyed on an invented field the consumers do not read.
+    source: "alpha-engine-predictor-inference"
+    severities: [dynamic]
+    intake: bus
+    response: drain-queue
   - class: deploy_notification_predictor
     # config#3305 static-chokepoint registration: predictor deploy scripts
     # that call ``krepis.alerts publish --source <path>/deploy.sh``.
@@ -1012,8 +1027,12 @@ alert_classes:
     response: drain-queue
   - class: check_systemd_unit_drift
     # config-I3211 backstop registration (alpha-engine-config#5715): installed
-    # systemd units on a box diverge from what the repo expects. Alert
-    # payload's raw `Source:` field is the hyphenated `check-systemd-unit-drift`.
+    # systemd units on a box diverge from what the repo expects. Emitter
+    # corrected alpha-engine-config-I7740 (operator ruling 2026-08-21): the
+    # alert payload's `Source:` field previously drifted from this declared
+    # long-path string (was the hyphenated `check-systemd-unit-drift`) — the
+    # emitter now publishes exactly this row's `source`, per the ruling that
+    # the registry is never aliased to accept a second spelling.
     source: "alpha-engine-data/infrastructure/systemd/check-systemd-unit-drift.py"
     severities: [error]
     intake: bus
@@ -1028,6 +1047,24 @@ alert_classes:
     # extension now catches. One row covers both boxes; per-box attribution
     # rides the message body.
     source: "boot-pull"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+
+  # ── metron ──
+  - class: metron_reconciliation
+    # alpha-engine-config-I7740 (operator ruling 2026-08-21): new registry
+    # row for a previously-undeclared source. Observed: reconciliation fetch
+    # failed (IBKR Flex read timeout).
+    source: "metron"
+    severities: [dynamic]
+    intake: bus
+    response: drain-queue
+  - class: metron_deploy
+    # alpha-engine-config-I7740 (operator ruling 2026-08-21): new registry
+    # row for a previously-undeclared source. Observed: deploy FAILED at
+    # 'SSM hydration + unit install'.
+    source: "metron/deploy"
     severities: [error]
     intake: bus
     response: drain-queue
@@ -1149,6 +1186,13 @@ alert_classes:
     response: drain-queue
   - class: litellm_proxy_degraded_start
     source: "litellm-proxy-shim"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  - class: router_degraded_mode_drill
+    # alpha-engine-config-I7740 (operator ruling 2026-08-21): new registry
+    # row for a previously-undeclared source.
+    source: "router-degraded-mode-drill"
     severities: [warning]
     intake: bus
     response: drain-queue

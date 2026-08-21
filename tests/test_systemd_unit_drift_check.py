@@ -184,7 +184,9 @@ class TestDriftReportingPath:
 
         assert captured, "drift must publish an alert, not just print"
         assert captured["severity"] == "error"
-        assert captured["source"] == "check-systemd-unit-drift"
+        assert captured["source"] == (
+            "alpha-engine-data/infrastructure/systemd/check-systemd-unit-drift.py"
+        )
         assert "daily-news.service" in captured["message"], (
             "the alert must name the drifting unit — an alert that says "
             "'drift detected' sends you to the box to find out what"
