@@ -720,9 +720,27 @@ ORIGINAL_ALARM_NAMES = {
 
 
 def test_the_original_pause_caused_alarms_are_still_declared(manifest, module):
-    names = {e["name"] for e in module.alarm_entries(manifest)}
+    """Declared SOMEWHERE — `paused_alarms` or `armed_alarms`, either is a
+    declaration.
+
+    This used to require membership in `paused_alarms` specifically, which
+    made a legitimate un-pause impossible: re-arming an alarm moves its entry
+    to `armed_alarms` by design, and the assertion read that move as the
+    alarm having lost its declaration. Hit live on 2026-08-21
+    (alpha-engine-config-I8110) when the four alert-drain schedules came back
+    and their three alarms were re-armed with them.
+
+    It is the same defect the comment above ORIGINAL_ALARM_NAMES already
+    records one axis over: a frozen set that turns a correct change into a
+    failure. The property worth guarding is that an alarm silenced under
+    I7174 never becomes UNCLASSIFIED — which is exactly what the two blocks
+    together express, and what `--check` grades as `alarm-undeclared`.
+    """
+    names = ({e["name"] for e in module.alarm_entries(manifest)}
+             | set(module.armed_alarm_names()))
     assert ORIGINAL_ALARM_NAMES <= names, (
-        f"an alarm silenced under I7174 lost its declaration: "
+        f"an alarm silenced under I7174 lost its declaration entirely — it is "
+        f"in neither paused_alarms nor armed_alarms: "
         f"{ORIGINAL_ALARM_NAMES - names}"
     )
 
@@ -846,13 +864,21 @@ def classified_world(module, monkeypatch, request):
     return live
 
 
-def test_check_flags_a_justified_alarm_left_armed(module, monkeypatch, classified_world):
+def test_check_flags_a_justified_alarm_left_armed(
+        module, manifest, monkeypatch, classified_world):
     """The bug this issue fixes, induced: paused trigger, ActionsEnabled=true."""
     monkeypatch.setattr(module, "_live_state", lambda surface, name: "DISABLED")
     monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: True)
     findings = module.check()
     kinds = {(f["trigger"], f["kind"]) for f in findings}
-    for name in ORIGINAL_ALARM_NAMES:
+    # Read from the manifest's CURRENT paused_alarms, not a frozen name list.
+    # With every trigger forced DISABLED, every entry in that block is
+    # justified, so every one must be flagged — that is the property. Naming
+    # three specific alarms made this fail the moment those three were
+    # legitimately re-armed (alpha-engine-config-I8110).
+    declared = {e["name"] for e in module.alarm_entries(manifest)}
+    assert declared, "paused_alarms is empty — this test would prove nothing"
+    for name in declared:
         assert (name, "alarm-unexpectedly-enabled") in kinds, findings
 
 
@@ -1051,8 +1077,28 @@ def test_the_fourteen_hand_muted_alarms_are_all_declared(manifest, module):
         "alpha-engine-watch-plane-sf-watch-liveness-probe-invocations-floor",
         "alpha-engine-watch-plane-sf-watch-liveness-probe-throttles",
     }
-    declared = {e["name"] for e in module.alarm_entries(manifest)}
-    assert hand_muted <= declared, sorted(hand_muted - declared)
+    # Declared in EITHER block. The invariant the ruling is protecting is that
+    # a suppression never becomes UNDECLARED — not that these fourteen stay
+    # suppressed forever. Re-arming an alarm moves its entry to
+    # `armed_alarms`, and that move is the count going down BECAUSE THE
+    # CONDITION CLEARED, which is the one way this test must not forbid.
+    #
+    # Requiring `paused_alarms` specifically made a correct re-arm red: on
+    # 2026-08-21 the four alert-drain schedules came back and their four
+    # alarms were re-armed live and moved here (alpha-engine-config-I8110).
+    #
+    # The teeth are unchanged, because the only route out of `paused_alarms`
+    # is a declaration in `armed_alarms`, and `--check` then grades that live
+    # as `armed-but-silenced` if the alarm is in fact still muted. A silent
+    # shrink still cannot happen; it just is not spelled with a frozen block
+    # name any more.
+    paused = {e["name"] for e in module.alarm_entries(manifest)}
+    armed = set(module.armed_alarm_names())
+    undeclared = hand_muted - paused - armed
+    assert not undeclared, (
+        f"a hand-muted alarm lost its declaration entirely — in neither "
+        f"paused_alarms nor armed_alarms: {sorted(undeclared)}"
+    )
 
 
 def test_no_alarm_outside_the_measured_set_was_declared(manifest, module):
