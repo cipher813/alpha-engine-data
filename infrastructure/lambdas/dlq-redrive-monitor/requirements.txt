@@ -1,0 +1,6 @@
+# boto3 is provided by the Lambda python3.12 runtime; pinned for reproducible builds.
+boto3>=1.34.0
+# krepis.alerts.publish for the severity=error age-threshold page
+# (alpha-engine-config-I7857 severity floor). dedup_key/dedup_window_min
+# landed in v0.24.0.
+krepis>=0.24.0

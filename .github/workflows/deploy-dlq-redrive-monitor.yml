@@ -1,0 +1,84 @@
+name: Deploy dlq-redrive-monitor
+
+# Auto-deploy the alpha-engine-dlq-redrive-monitor Lambda CODE on merge to
+# main (alpha-engine-config-I8111). Without this workflow, a merged fix to
+# the Overseer intake DLQ's replay/age-alarm logic would sit inert until an
+# operator ran deploy.sh by hand — the same gap alert-drain-liveness-probe's
+# deploy workflow closed on 2026-08-15: a Lambda with no deploy workflow is
+# a Lambda whose repo is not its source of truth.
+#
+# Code-only: deploy.sh's flagless run performs no iam:CreateRole and no
+# Lambda creation (those are --bootstrap, operator-only — this Lambda and
+# its 30-minute schedule must first be bootstrapped from a laptop with
+# scheduler:CreateSchedule). LambdaUpdate already covers
+# arn:...:function:alpha-engine-* (nous-ergon-ops/infrastructure/iam/
+# github-actions-lambda-deploy/) — no new IAM grant needed for this workflow.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/lambdas/dlq-redrive-monitor/**'
+      - '.github/workflows/deploy-dlq-redrive-monitor.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-dlq-redrive-monitor-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy dlq-redrive-monitor Lambda (code-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: alpha-engine-data
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12 (match Lambda runtime)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Deploy dlq-redrive-monitor (code-only — no --bootstrap)
+        working-directory: alpha-engine-data
+        run: bash infrastructure/lambdas/dlq-redrive-monitor/deploy.sh
+
+      - name: Report deployed version
+        working-directory: alpha-engine-data
+        run: |
+          echo "Deployed commit: ${{ github.sha }}"
+          # Tolerate a not-yet-bootstrapped function: deploy.sh gracefully skips
+          # the code update until an operator runs --bootstrap, so this report
+          # must NOT hard-fail the job when the function does not exist yet.
+          aws lambda get-function \
+            --function-name alpha-engine-dlq-redrive-monitor \
+            --query "Configuration.[LastModified,CodeSha256]" \
+            --output text \
+            || echo "(function not bootstrapped yet — code deploy was skipped)"
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@8a904b7a817901f2520dd87131ff307ed97fee02 # main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: deploy-dlq-redrive-monitor.yml
+
+  notify-main-failure:
+    needs: [deploy]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit

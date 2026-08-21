@@ -47,6 +47,21 @@
 #   above; the SNS-only path is human-facing fire-and-forget that belongs
 #   outside the drain scope. Decision: no separate forwarder needed.
 #
+# DLQ REPLAY (alpha-engine-config-I8111): this script provisions the DLQ
+# with a 14-day retention but, until 2026-08-21, nothing ever moved a
+# message OFF it — messages sat until retention silently deleted them
+# (measured: 93 messages, oldest 9.1 days, ~4.9 days from expiry, drained
+# only by an operator coincidentally re-enabling the drain schedules).
+# `infrastructure/lambdas/dlq-redrive-monitor/` closes that: a Lambda on
+# its own 30-minute EventBridge Scheduler schedule (independent of
+# automation_pause.py and of the alert-drain schedules below, deliberately
+# — it must keep running while the drain lane is paused) that (1) redrives
+# the DLQ back to this queue via native SQS `StartMessageMoveTask`, and (2)
+# pages (severity=error) when the oldest DLQ message crosses 10 of the
+# 14-day retention. See that Lambda's index.py docstring for the full
+# mechanism, including how poison messages are distinguished from paused-
+# consumer backlog without extra code.
+#
 # IAM for emitters is a separate concern — see
 # attach_overseer_put_events_policy.sh (creates/attaches the
 # nousergon-alerts-put-events managed policy to fleet Lambda/EC2 roles).
