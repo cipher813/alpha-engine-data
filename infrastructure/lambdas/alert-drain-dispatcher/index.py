@@ -168,11 +168,12 @@ def _bootstrap_command(run_id: str, is_drill: str, model: str = "") -> str:
     is the fastest real evidence available — NOT because it is broken. The
     EPIC's original rationale ("already at 100% failure, nothing to regress")
     expired when config-I4996 restored it; it has since completed 12
-    consecutive runs. So this is a cutover of a WORKING component and carries
-    a revert lever accordingly: restoring the two lines below to
-    ``infrastructure/alert_drain_spot_bootstrap.sh --run-id … --is-drill …``
-    returns to the legacy path, which stays on disk until a real run proves
-    the unified one.
+    consecutive runs. So this was a cutover of a WORKING component and
+    carried a revert lever accordingly: restoring the two lines below to the
+    legacy per-lane bootstrap. That lever is GONE — 140 real dispatches
+    through the unified artifact between 2026-07-29 and 2026-08-21 satisfied
+    its stated condition, and alpha-engine-config-I7987 deleted the legacy
+    file. Reverting now means restoring it from git history, deliberately.
 
     ``run_id`` and ``is_drill`` are EXPORTED rather than passed as flags: the
     unified bootstrap reads ``DRAIN_RUN_ID`` / ``DRAIN_IS_DRILL`` from the

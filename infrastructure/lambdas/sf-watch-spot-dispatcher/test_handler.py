@@ -257,6 +257,8 @@ def test_valid_event_launches_spot_and_sends_async_ssm(monkeypatch):
     # Cut over to the unified artifact (EPIC config-I4992 step 4): the SF
     # fields cross as ENV, because that is what the unified bootstrap reads.
     assert "exec bash infrastructure/overseer_spot_bootstrap.sh --playbook sf-watch" in cmd
+    # Deleted by alpha-engine-config-I7987; kept as an absence guard so a
+    # revert to the legacy path is loud, not silent.
     assert "sf_watch_spot_bootstrap.sh" not in cmd
     assert 'export SF_PIPELINE="ne-weekly-freshness-pipeline"' in cmd
     assert 'export SF_CADENCE_SLUG="saturday"' in cmd
@@ -791,8 +793,8 @@ def test_missing_pipeline_name_returns_clean_false(monkeypatch):
 def test_missing_optional_fields_still_launches(monkeypatch):
     # failed_state/failed_state_detail/cause/watch_log_key/state_machine_arn/
     # is_preflight are all optional — only pipeline_name/cadence_slug/
-    # execution_arn/run_date are required (mirrors sf_watch_spot_bootstrap.sh's
-    # own FATAL check).
+    # execution_arn/run_date are required (mirrors overseer_spot_bootstrap.sh's
+    # own FATAL checks).
     idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
     event = _event()
     for optional in (

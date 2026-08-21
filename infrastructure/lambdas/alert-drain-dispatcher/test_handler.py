@@ -125,6 +125,8 @@ class TestBootstrapCommand:
         # The legacy path must be gone, not merely unreferenced — a command
         # that execs both, or the old one, is the cutover silently not
         # happening.
+        # Deleted by alpha-engine-config-I7987; kept as an absence guard so a
+        # revert to the legacy path is loud, not silent.
         assert "alert_drain_spot_bootstrap.sh" not in cmd
 
     def test_run_identity_is_exported_not_passed_as_flags(self, index_mod):

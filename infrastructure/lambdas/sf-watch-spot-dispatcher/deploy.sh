@@ -344,7 +344,7 @@ source "${SCRIPT_DIR}/../_shared/smoke.sh"
 if $SMOKE; then
   echo ""
   echo "Smoke-testing via direct invoke (synthetic saturday-sf-failure event)..."
-  echo "⚠ this fires a REAL spot box + REAL sf_watch_spot_bootstrap.sh run."
+  echo "⚠ this fires a REAL spot box + a REAL overseer_spot_bootstrap.sh --playbook sf-watch run."
   RESP=$(mktemp)
   trap "rm -f '${RESP}'" EXIT
   INVOKE_STDOUT=$(aws lambda invoke \

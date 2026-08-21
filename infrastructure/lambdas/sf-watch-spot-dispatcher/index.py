@@ -16,8 +16,8 @@ Mechanism:
   2. Wait for the instance to run + its SSM agent to come Online.
   3. Fire an async, detached `ssm send-command` (AWS-RunShellScript) carrying
      a small prelude: fetch the PAT from SSM, clone alpha-engine-config, then
-     `exec infrastructure/sf_watch_spot_bootstrap.sh` (a sibling script in
-     alpha-engine-config). The box self-terminates
+     `exec bash infrastructure/overseer_spot_bootstrap.sh --playbook
+     sf-watch` (in alpha-engine-config). The box self-terminates
      (InstanceInitiatedShutdownBehavior=terminate + its own on-box watchdog).
 
 SYNCHRONOUS CONTRACT (identical to ci-watch-dispatcher's): a GHA job invokes
@@ -57,7 +57,8 @@ CAUSE FIELD IS BASE64: `cause` (the SF failure detail) is arbitrary AWS-
 supplied text, unlike every other event field here — it is NOT regex-
 validated and is base64-encoded before being embedded in the constructed SSM
 shell command (command-injection guard; see `_bootstrap_command` and
-alpha-engine-config's `sf_watch_spot_bootstrap.sh --cause-b64`).
+alpha-engine-config's `overseer_spot_bootstrap.sh`, which decodes any
+`<NAME>_B64` passthrough into `<NAME>`).
 
 IAM PROFILE — deliberately NOT `alpha-engine-executor-profile` (shared with
 the live trading executor) NOR the OIDC-only `saturday-sf-watch-role` (which
@@ -341,9 +342,10 @@ def _resolve_event_fields(event: dict) -> dict:
 
 def _bootstrap_command(fields: dict, run_token: str) -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec the
-    sf_watch_spot_bootstrap.sh entrypoint in alpha-engine-config. Any prelude
-    failure shuts the box down so a botched launch never idles (mirrors
-    ci-watch-dispatcher's prelude fail() trap exactly).
+    unified overseer_spot_bootstrap.sh entrypoint in alpha-engine-config with
+    ``--playbook sf-watch``. Any prelude failure shuts the box down so a
+    botched launch never idles (mirrors ci-watch-dispatcher's prelude fail()
+    trap exactly).
 
     Cut over to the UNIFIED ``overseer_spot_bootstrap.sh --playbook sf-watch``
     (alpha-engine-config-I5284 / EPIC I4992 step 4). The unified artifact reads
@@ -356,9 +358,12 @@ def _bootstrap_command(fields: dict, run_token: str) -> str:
     ``<NAME>_B64`` passthrough into ``<NAME>`` (alpha-engine-config-PR5563),
     which is the same protection the legacy ``--cause-b64`` flag provided.
 
-    Revert lever: restore the flags and
-    ``exec bash infrastructure/sf_watch_spot_bootstrap.sh``. The legacy
-    bootstrap stays on disk until a real dispatch proves the unified one. ``run_token`` is deliberately NOT
+    The revert lever this docstring used to name is GONE. Its stated condition
+    — "the legacy bootstrap stays on disk until a real dispatch proves the
+    unified one" — was satisfied by 22 real dispatches between 2026-07-29 and
+    2026-08-21, and alpha-engine-config-I7987 deleted
+    ``infrastructure/sf_watch_spot_bootstrap.sh``. Reverting now means
+    restoring it from git history, deliberately. ``run_token`` is deliberately NOT
     threaded into the box: the bootstrap/run-script side keys its S3
     completion marker directly on (cadence_slug, pipeline_name, run_date) —
     it stays a Lambda-side-only correlation id (see the SSM Comment field in
