@@ -56,7 +56,8 @@ for arg in "$@"; do
   esac
 done
 
-run() { if $DRY_RUN; then echo "DRY: $*"; else "$@"; fi; }
+# shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
+source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 
 # ----- 0. Validate handler + run unit tests ---------------------------------
 python3 -c "import ast; ast.parse(open('${SCRIPT_DIR}/index.py').read()); print('index.py syntax OK')"
@@ -130,6 +131,8 @@ fi
 echo "Updating Lambda function code: ${FUNCTION_NAME}"
 run aws lambda update-function-code --function-name "${FUNCTION_NAME}" --zip-file "fileb://${ZIP}" --region "${REGION}" --query 'LastUpdateStatus' --output text
 if ! $DRY_RUN; then aws lambda wait function-updated --function-name "${FUNCTION_NAME}" --region "${REGION}"; fi
+
+verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${ZIP}"
 echo "✓ Code deployed."
 
 echo "Updating Lambda environment (flow-doctor SSM hydration)..."

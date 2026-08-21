@@ -56,13 +56,8 @@ for arg in "$@"; do
   esac
 done
 
-run() {
-  if $DRY_RUN; then
-    echo "DRY: $*"
-  else
-    "$@"
-  fi
-}
+# shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
+source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 
 # Validate index.py syntax + run handler smoke tests locally before shipping.
 python3 -c "
@@ -152,6 +147,8 @@ echo "Waiting for update to complete..."
 aws lambda wait function-updated \
   --function-name "${FUNCTION_NAME}" \
   --region "${REGION}"
+
+verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${ZIP}"
 
 # Update env config to include CHANGELOG_STRUCTURED_PREFIX (added in PR 2 of
 # the schema-discipline arc). Idempotent — overwriting in place is a no-op
