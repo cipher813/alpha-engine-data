@@ -8,6 +8,16 @@ silently re-introduce an ``os.environ.get("POLYGON_API_KEY")`` style read.
 Non-secret env vars (``LANGCHAIN_PROJECT``, ``EMAIL_SENDER``, etc.) are
 allowed for now — they migrate to alpha-engine-config YAML in PR 8 of the
 arc. The pin here is only the secret-name set.
+
+alpha-engine-config-I7925: this repo-tree scan is blind to a first-party
+*dependency* reading a pinned secret via ``os.environ.get`` from
+``site-packages`` — exactly how ``nousergon_lib.preflight`` reading
+``GITHUB_TOKEN`` bypassed this very invariant and halted preopen trading
+(alpha-engine-config-I7924). ``test_no_secret_environ_reads_in_installed_dependencies``
+below closes that gap using the scanner shared via
+``nousergon_lib.testing.secret_scan`` (lifted there rather than copied a
+third time — this repo, crucible-predictor, and nousergon-lib's own suite
+all call it; see nousergon-lib#345).
 """
 
 from __future__ import annotations
@@ -15,7 +25,16 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
+from nousergon_lib.testing.secret_scan import scan_installed_packages
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# First-party packages this repo installs whose installed tree must also be
+# clean of a pinned-secret os.environ.get read — the repo-tree scan below
+# cannot see inside site-packages.
+_DEPENDENCY_PACKAGES = ("nousergon_lib", "krepis")
 
 # Secret names that must NEVER be read via os.environ.get / os.getenv.
 # EMAIL_SENDER + EMAIL_RECIPIENTS aren't secrets per se but live in SSM
@@ -80,3 +99,26 @@ def test_no_secret_environ_reads():
         "`from nousergon_lib.secrets import get_secret` instead:\n"
         + "\n".join(f"  {p}:{ln}  {name}" for p, ln, name in violations)
     )
+
+
+def test_no_secret_environ_reads_in_installed_dependencies():
+    """The repo-tree scan above cannot see an installed dependency's source.
+
+    ``nousergon_lib.preflight._github_auth_headers()`` reading
+    ``GITHUB_TOKEN`` via a literal ``os.environ.get`` from site-packages is
+    exactly the surface that let an expired credential halt preopen trading
+    (alpha-engine-config-I7924) while this repo's own scan reported clean.
+    """
+    violations, missing = scan_installed_packages(_DEPENDENCY_PACKAGES, _PINNED_SECRETS)
+    if violations:
+        raise AssertionError(
+            "Found os.environ.get reads of pinned secrets inside an "
+            "INSTALLED first-party dependency — this repo's own tree scan "
+            "cannot see this surface:\n"
+            + "\n".join(f"  {v}" for v in violations)
+        )
+    if missing:
+        pytest.skip(
+            "first-party package(s) not importable in this environment — "
+            f"the invariant is unverified against them this run: {', '.join(missing)}"
+        )
