@@ -21,8 +21,8 @@ per-dispatcher):
   2. Wait for the instance to run + its SSM agent to come Online.
   3. Fire an async, detached `ssm send-command` (AWS-RunShellScript) carrying
      a small prelude: fetch the PAT from SSM, clone alpha-engine-config, then
-     `exec infrastructure/ci_watch_spot_bootstrap.sh` (built by a sibling
-     agent in alpha-engine-config). The box self-terminates
+     `exec bash infrastructure/overseer_spot_bootstrap.sh --playbook
+     ci-watch` (in alpha-engine-config). The box self-terminates
      (InstanceInitiatedShutdownBehavior=terminate + its own on-box watchdog).
 
 SYNCHRONOUS CONTRACT (the key divergence from groom's fail-loud posture): a
@@ -425,9 +425,9 @@ def _bootstrap_command(repo: str, sha: str, run_id: str, run_url: str,
                        workflow: str, branch: str, run_token: str,
                        is_drill: str = "false", model: str = "") -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec the
-    ci_watch_spot_bootstrap.sh entrypoint (built by a sibling agent in
-    alpha-engine-config). Any prelude failure shuts the box down so a botched
-    launch never idles (mirrors groom's prelude fail() trap exactly).
+    unified overseer_spot_bootstrap.sh entrypoint in alpha-engine-config with
+    ``--playbook ci-watch``. Any prelude failure shuts the box down so a
+    botched launch never idles (mirrors groom's prelude fail() trap exactly).
 
     Cut over to the UNIFIED ``overseer_spot_bootstrap.sh --playbook ci-watch``
     (alpha-engine-config-I5284 / EPIC I4992 step 3). The unified artifact reads
@@ -437,9 +437,12 @@ def _bootstrap_command(repo: str, sha: str, run_id: str, run_url: str,
     exports. Passing them as flags would leave every one unset and the agent
     would diagnose nothing, silently.
 
-    Revert lever: restore the flags and
-    ``exec bash infrastructure/ci_watch_spot_bootstrap.sh``. The legacy
-    bootstrap stays on disk until a real dispatch proves the unified one. ``run_token`` is deliberately NOT threaded
+    The revert lever this docstring used to name is GONE. Its stated
+    condition — "the legacy bootstrap stays on disk until a real dispatch
+    proves the unified one" — was satisfied by 84 real dispatches between
+    2026-07-29 and 2026-08-21, and alpha-engine-config-I7987 deleted
+    ``infrastructure/ci_watch_spot_bootstrap.sh``. Reverting now means
+    restoring it from git history, deliberately. ``run_token`` is deliberately NOT threaded
     into the box: the bootstrap/run-script side keys its S3 completion
     marker directly on repo+sha (no per-attempt dispatch token, unlike
     groom's ``GROOM_RUN_TOKEN``), so there is no in-box consumer for it — it

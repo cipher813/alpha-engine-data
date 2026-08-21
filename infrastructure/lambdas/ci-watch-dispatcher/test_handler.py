@@ -233,6 +233,8 @@ def test_valid_event_launches_spot_and_sends_async_ssm(monkeypatch):
     # Passed as flags they would every one arrive unset and the agent would
     # diagnose nothing, silently.
     assert "exec bash infrastructure/overseer_spot_bootstrap.sh --playbook ci-watch" in cmd
+    # The legacy per-lane bootstrap was deleted by alpha-engine-config-I7987;
+    # this stays as an absence guard so a revert to it is loud, not silent.
     assert "ci_watch_spot_bootstrap.sh" not in cmd
     assert 'export CI_REPO="nousergon/alpha-engine-config"' in cmd
     assert 'export CI_SHA="abc1234def5678900000000000000000000abcd"' in cmd

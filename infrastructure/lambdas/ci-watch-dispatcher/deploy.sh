@@ -273,7 +273,7 @@ source "${SCRIPT_DIR}/../_shared/smoke.sh"
 if $SMOKE; then
   echo ""
   echo "Smoke-testing via direct invoke (synthetic CI-failure event)..."
-  echo "⚠ this fires a REAL spot box + REAL ci_watch_spot_bootstrap.sh run."
+  echo "⚠ this fires a REAL spot box + a REAL overseer_spot_bootstrap.sh --playbook ci-watch run."
   RESP=$(mktemp)
   trap "rm -f '${RESP}'" EXIT
   INVOKE_STDOUT=$(aws lambda invoke \
