@@ -1109,6 +1109,11 @@ alert_classes:
     severities: [critical]
     intake: bus
     response: drain-queue
+  - class: alpha_engine_preopen_deploy_readiness_probe
+    source: "alpha-engine-preopen-deploy-readiness-probe"
+    severities: [critical]
+    intake: bus
+    response: drain-queue
   - class: weekly_sf_recovery_metric
     source: "nousergon-data/scripts/weekly_sf_recovery_metric.py"
     severities: [error]
