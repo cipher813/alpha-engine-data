@@ -16,14 +16,44 @@
 # Credentials: `ne-github-sf-validate` (nous-ergon-ops), which holds exactly
 # states:ValidateStateMachineDefinition and nothing else. Deliberately NOT the
 # deploy role — this job runs on pull_request.
+#
+# Two-job shape (alpha-engine-config-I7798 remaining deliverable, 2026-08-21):
+# a WORKFLOW-level `paths:` filter on `pull_request` means a PR touching none
+# of the infra paths below never reports the `sf-definition-validate` context
+# AT ALL — promoting that context to a required status check then blocks
+# every such PR forever at "Expected — waiting for status" (measured live,
+# reverted the same day). Mirrors rehearsal-path-guard.yml /
+# canary-replay.yml: `label` runs on every `pull_request` event and decides
+# (via dorny/paths-filter) whether this PR touches an infra path; the named
+# `sf-definition-validate` job always RUNS on merge_group/push/
+# workflow_dispatch, and on `pull_request` either runs (path touched) or
+# reports SKIPPED (path untouched) — both outcomes satisfy a required check,
+# unlike a context that never appears. The job NAME stays exactly
+# `sf-definition-validate` so promoting it to a required check later needs
+# no branch-protection edit beyond adding the (now-always-reported) name.
+#
+# `token: ''` + explicit `base:` (alpha-engine-config-I6909): dorny/paths-filter
+# defaults to the GitHub REST API on `pull_request` events, which intermittently
+# failed with a TLS "self-signed certificate" error on GitHub-hosted runners (4
+# of 15 runs in a 2h window, 2026-08-11, three unrelated branches — a runner/
+# network flake, not caused by any PR's content). An empty token switches the
+# action to local `git diff` against the supplied base SHA instead, which needs
+# no outbound API call at all and so cannot hit this failure class.
+#
+# `merge_group` cannot carry a `paths:` filter (unsupported by GitHub Actions
+# on that event type) — it already ran the validate job unconditionally
+# before this change, so `label`'s `if:` only gates the `pull_request` event
+# and merge-queue graduation keeps validating every time, which is the
+# correct behavior right before a merge to main.
+#
+# infra path list MUST stay in lockstep with `push`'s own `paths:` filter
+# below, MINUS this workflow file itself (a direct push of just this file
+# changes no SF definition, so re-running validate on push is pointless) —
+# pinned by tests/test_sf_definition_validate_lockstep.py.
 name: Validate SF Definitions
 
 on:
   pull_request:
-    paths:
-      - 'infrastructure/step_function*.json'
-      - 'infrastructure/deploy-infrastructure.sh'
-      - '.github/workflows/sf-definition-validate.yml'
   merge_group:
     types: [checks_requested]
   push:
@@ -35,17 +65,45 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: sf-definition-validate-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  validate:
+  label:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      infra_changed: ${{ steps.filter.outputs.infra_changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          token: ''
+          base: ${{ github.event.pull_request.base.sha }}
+          filters: |
+            infra_changed:
+              - 'infrastructure/step_function*.json'
+              - 'infrastructure/deploy-infrastructure.sh'
+              - '.github/workflows/sf-definition-validate.yml'
+
+  sf-definition-validate:
     name: sf-definition-validate
+    needs: label
+    # `always()` overrides the default "skip if a dependency was skipped" —
+    # `label` itself is skipped outright on merge_group/push/workflow_dispatch
+    # (its `if:` excludes those events), and this job must still run for
+    # them. On `pull_request`, this job runs only when `label` found an
+    # infra-path change, and reports SKIPPED otherwise.
+    if: always() && (github.event_name != 'pull_request' || needs.label.outputs.infra_changed == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
