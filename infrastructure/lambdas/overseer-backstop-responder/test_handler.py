@@ -556,3 +556,131 @@ def test_the_responders_own_alarm_is_never_actionable(wired):
     assert wired["lambda"].invocations == []
     assert "allowlist" in out["outcome"]["skipped"]
     assert wired["pages"], "it must still page with full plane state"
+
+
+# ── Property 5: only ALARM is an incident (alpha-engine-config-I8109) ───────
+#
+# The responder read `AlarmName` and `NewStateReason` and never
+# `NewStateValue`, so a recovery rendered identically to an outage: the
+# "🚨 OVERSEER BACKSTOP" header, the full plane-state dump, and a RECOVERY
+# block. 45 alarms in this account carry `OKActions` pointing at the backstop
+# topic, so this was a class over all of them.
+#
+# Measured instance: `alpha-engine-pipeline-deadman-weekly-freshness` was
+# created 2026-08-21 14:32 PDT, sat INSUFFICIENT_DATA, and transitioned to OK
+# at 15:10 PDT — firing OKActions and paging Brian as an emergency about a
+# pipeline that was fine. CloudWatch's OK-reason text reuses the phrase
+# "Threshold Crossed", which is why the reason string cannot substitute for
+# the state field.
+
+
+def _sns_state(alarm: str, state: str, reason: str = "Threshold Crossed") -> dict:
+    return {"Records": [{"Sns": {"Message": json.dumps(
+        {"AlarmName": alarm, "NewStateReason": reason,
+         "NewStateValue": state})}}]}
+
+
+def test_ok_transition_does_not_page_as_an_incident(wired):
+    index.handler(_sns_state(INTAKE_AGE, "OK"), None)
+    page = wired["pages"][0]
+    assert "🚨" not in page, "a recovery must not carry the incident siren"
+    assert "RECOVERED" in page
+    assert "PLANE STATE" not in page, (
+        "the evidence dump exists to help someone act; on a green transition "
+        "there is nothing to act on"
+    )
+
+
+def test_insufficient_data_does_not_page_as_an_incident(wired):
+    index.handler(_sns_state(INTAKE_AGE, "INSUFFICIENT_DATA"), None)
+    page = wired["pages"][0]
+    assert "🚨" not in page
+    assert "no data" in page
+
+
+def test_a_non_alarm_state_never_attempts_recovery(wired):
+    """INTAKE_AGE is in the allowlist and WOULD dispatch on ALARM."""
+    out = index.handler(_sns_state(INTAKE_AGE, "OK"), None)
+    assert wired["lambda"].invocations == [], (
+        "a recovery notice must not trigger a recovery action"
+    )
+    assert out["outcome"]["skipped"].startswith("state=OK")
+
+
+def test_an_ok_transition_does_not_consume_the_cooldown_window(wired):
+    """A recovery must not spend the incident budget of the incident it ends.
+
+    The cooldown is what makes a second ALARM inside the window escalate as
+    "the earlier recovery did NOT fix this". If an OK transition claimed the
+    window, the next real firing would be misread as a second attempt.
+    """
+    index.handler(_sns_state(INTAKE_AGE, "OK"), None)
+    index.handler(_sns(INTAKE_AGE), None)
+    assert wired["lambda"].invocations, (
+        "the ALARM after the OK must still be treated as a FIRST attempt"
+    )
+
+
+def test_alarm_state_is_unchanged_by_the_new_branch(wired):
+    """Regression guard: the incident path keeps every property above."""
+    out = index.handler(_sns_state(INTAKE_AGE, "ALARM"), None)
+    page = wired["pages"][0]
+    assert "🚨 OVERSEER BACKSTOP" in page
+    assert "PLANE STATE" in page
+    assert "RECOVERY" in page
+    assert out["state"] == "ALARM"
+
+
+def test_an_unparseable_event_is_treated_as_an_incident(wired):
+    """Fail toward the loud side: a malformed event is never downgraded."""
+    out = index.handler({"Records": [{"Sns": {"Message": "{not json"}}]}, None)
+    assert out["state"] == "ALARM"
+    assert "🚨" in wired["pages"][0]
+
+
+def test_a_missing_state_field_is_treated_as_an_incident(wired):
+    """Older SNS shapes, and every existing test's payload, omit the field."""
+    out = index.handler(_sns(INTAKE_AGE), None)
+    assert out["state"] == "ALARM"
+
+
+# ── Property 6: a paused probe is state, not blindness ─────────────────────
+#
+# `_probe_health()` read only `AWS/Lambda Invocations`, so the liveness probe
+# Brian disabled on 2026-08-07 (alpha-engine-config-I6617) was reported in
+# every page as "the probe is not running at all" — which reads as plane-wide
+# blindness rather than as his own ruling. overseer-policy §7: a deliberate
+# operator disable is state, surfaced in every assurance report, never paged.
+
+
+def _silence_probe_metrics(wired):
+    """Zero Invocations and zero Errors — the shape a switched-off probe has."""
+    wired["cloudwatch"].get_metric_statistics = (
+        lambda **kwargs: {"Datapoints": []}
+    )
+
+
+def test_a_paused_probe_reports_as_paused_not_as_dead(wired, monkeypatch):
+    monkeypatch.setattr(index, "_paused_trigger_names",
+                        lambda: set(index.PROBE_TRIGGERS))
+    _silence_probe_metrics(wired)
+    health = index._probe_health()
+    assert "PAUSED by declaration" in health
+    assert "BY DESIGN" in health
+
+
+def test_a_probe_with_a_live_trigger_still_reports_as_dead(wired, monkeypatch):
+    monkeypatch.setattr(index, "_paused_trigger_names",
+                        lambda: {index.PROBE_TRIGGERS[0]})
+    _silence_probe_metrics(wired)
+    health = index._probe_health()
+    assert "not running at all" in health
+
+
+def test_an_unreadable_manifest_does_not_claim_the_probe_is_paused(
+        wired, monkeypatch):
+    monkeypatch.setattr(index, "_paused_trigger_names", lambda: None)
+    _silence_probe_metrics(wired)
+    health = index._probe_health()
+    assert "UNREADABLE" in health
+    assert "PAUSED by declaration" not in health
