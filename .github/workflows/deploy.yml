@@ -71,15 +71,23 @@ jobs:
       # matched what was actually installed, so this alert path had been
       # silently dead (ModuleNotFoundError swallowed by `|| true`) since the
       # nousergon_lib migration landed — the exact L221 failure mode this
-      # step exists to prevent. Pin matches requirements.txt's `krepis>=0.6.0`
-      # floor. No extras needed (alerts uses boto3/SNS, preinstalled on
-      # ubuntu-latest).
+      # step exists to prevent. No extras needed (alerts uses boto3/SNS,
+      # preinstalled on ubuntu-latest).
+      #
+      # Raised to >=0.59.24 (alpha-engine-config-I8030/I8037): this is also
+      # the krepis that `deploy.sh` uses to run
+      # `python3 -m krepis.aws remove-lambda-env` on this same runner —
+      # requirements.txt's exact `krepis==` pin governs the Docker image,
+      # not this step. A floor stated as `>=0.6.0` "worked" only because an
+      # unbounded `pip install` resolves to the latest published release —
+      # luck, not a control, the same shape crucible-research-PR716 found
+      # and fixed for its own runner-side floor.
       - name: Set up Python for canary-rollback alert publish
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
-      - name: Install krepis for deploy.sh alerts call
-        run: pip install "krepis>=0.6.0"
+      - name: Install krepis for deploy.sh alerts + env-convergence calls
+        run: pip install "krepis>=0.59.24"
 
       - name: Deploy Phase 2 Lambda (alpha-engine-data-collector)
         working-directory: alpha-engine-data
