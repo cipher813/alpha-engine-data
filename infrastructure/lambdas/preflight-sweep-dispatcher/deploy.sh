@@ -193,13 +193,14 @@ if $BOOTSTRAP; then
   # sibling dispatcher's identical bootstrap-before-CFN ordering).
   RULE_ARN="arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${RULE_NAME}"
   echo "  Granting events.amazonaws.com invoke permission from ${RULE_ARN}"
-  run aws lambda add-permission \
+  run_tolerating "ResourceConflictException" \
+    aws lambda add-permission \
     --function-name "${FUNCTION_NAME}" \
     --statement-id "eventbridge-${RULE_NAME}" \
     --action lambda:InvokeFunction \
     --principal events.amazonaws.com \
     --source-arn "${RULE_ARN}" \
-    --region "${REGION}" 2>/dev/null || true  # swallowed: idempotent re-bootstrap hits ResourceConflictException when the statement already exists; add-permission has no --if-not-exists, and a stale statement here is harmless (same-shaped statement every time)
+    --region "${REGION}"   # swallowed: idempotent re-bootstrap hits ResourceConflictException when the statement already exists; add-permission has no --if-not-exists, and a stale statement here is harmless (same-shaped statement every time)
 fi
 
 # ----- 3. Update function code (always after bootstrap, idempotent) ---------

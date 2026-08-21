@@ -133,11 +133,16 @@ fi
 if [ "$CUTOVER" -eq 1 ]; then
     echo "==> CUTOVER: repointing $RULE_NAME at $FUNCTION_NAME"
     TARGET_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
-    aws lambda add-permission --function-name "$FUNCTION_NAME" \
+    # `|| echo "(permission exists)"` reported that same reassuring line for
+    # AccessDenied and a malformed source-arn too, with the real message sent
+    # to /dev/null (alpha-engine-config-I8125). The conflict is the ONE benign
+    # failure; everything else means the rule cannot invoke this function.
+    run_tolerating "ResourceConflictException" \
+      aws lambda add-permission --function-name "$FUNCTION_NAME" \
         --statement-id "${RULE_NAME}-invoke" --action lambda:InvokeFunction \
         --principal events.amazonaws.com \
         --source-arn "arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${RULE_NAME}" \
-        --region "$REGION" >/dev/null 2>&1 || echo "    (permission exists)"
+        --region "$REGION"
     aws events put-targets --rule "$RULE_NAME" \
         --targets "[{\"Id\":\"1\",\"Arn\":\"${TARGET_ARN}\"}]" --region "$REGION"
     echo "    $RULE_NAME now targets $FUNCTION_NAME."
