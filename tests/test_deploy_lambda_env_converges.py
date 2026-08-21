@@ -101,3 +101,33 @@ def test_krepis_pin_can_supply_the_subcommand() -> None:
     assert parts >= (0, 59, 23), (
         f"requirements.txt pins krepis {version}; remove-lambda-env needs >= 0.59.23"
     )
+
+
+def test_krepis_pin_does_not_need_the_deploy_role_to_list_aliases() -> None:
+    """krepis 0.59.23's `remove_lambda_environment_keys` enumerated Lambda
+    aliases unconditionally, including under `--defer-publish` — which the
+    call site above passes. This repo's deploy role does not hold
+    `lambda:ListAliases`. The failure lands after the image is pushed and
+    $LATEST is updated, and before `publish-version` and the alias move: a
+    PARTIAL deploy, with the `live` alias serving a stale image while main
+    has moved on — the SHA drift the preopen `DeployDriftGate` halts on
+    (alpha-engine-config-I8030, mirroring crucible-predictor's fix for
+    I7925/deploy run 32509752554).
+
+    krepis 0.59.24 skips the enumeration under `defer_publish` (krepis#176).
+    An older pin reintroduces the partial deploy, so the floor is pinned
+    here rather than left to memory.
+    """
+    req = Path(__file__).resolve().parents[1] / "requirements.txt"
+    line = next(
+        ln
+        for ln in req.read_text(encoding="utf-8").splitlines()
+        if ln.startswith("krepis==")
+    )
+    version = line.split("==", 1)[1].split()[0].strip()
+    parts = tuple(int(p) for p in version.split("."))
+    assert parts >= (0, 59, 24), (
+        f"requirements.txt pins krepis {version}; --defer-publish needs >= "
+        f"0.59.24 or the deploy fails on lambda:ListAliases and leaves a "
+        f"PARTIAL deploy (alpha-engine-config-I8030)"
+    )
