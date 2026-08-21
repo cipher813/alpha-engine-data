@@ -606,6 +606,11 @@ def reconcile(
                 ),
             })
 
+    # The declaration's own shape, offline (alpha-engine-config-I8047). Kept in
+    # `automation_pause` and merely re-exported into this verdict rather than
+    # re-derived: a second copy of the grammar is a second place to loosen it.
+    findings.extend(ap.declaration_findings(m))
+
     return sorted(findings, key=lambda f: (f["kind"], f["trigger"]))
 
 
@@ -626,7 +631,9 @@ def declared_alarm_gaps(manifest: dict | None = None) -> list[dict]:
             "id": entry["name"], "kind": "declared-silenced-alarm",
             "detail": (
                 f"silenced because {', '.join(entry['watches'])} "
-                f"{'is' if len(entry['watches']) == 1 else 'are'} paused. {entry['reason']}"
+                f"{'is' if len(entry['watches']) == 1 else 'are'} paused; owned by "
+                f"{entry['issue'] or '<UNOWNED>'}, re-exam "
+                f"{entry['re_exam'] or '<UNDATED>'}. {entry['reason']}"
             ),
         }
         for entry in ap.alarm_entries(m)
