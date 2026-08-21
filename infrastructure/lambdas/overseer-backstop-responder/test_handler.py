@@ -202,6 +202,19 @@ def _manifest_names() -> set[str]:
     for surface in ("events_rules", "scheduler_schedules"):
         names |= set(m["paused"][surface])
     names |= {k for k in m.get("pending", {}) if not k.startswith("_")}
+    # `not_paused` counts too. This is a SPELLING check, and a trigger that is
+    # deliberately live is spelled correctly — it is simply not paused right
+    # now. Restricting the known set to `paused` + `pending` made a legitimate
+    # un-pause fail as a typo: when the four alert-drain schedules were
+    # re-enabled on 2026-08-21 and moved to `not_paused` per the manifest's own
+    # procedure, this guard reported that they "appear nowhere"
+    # (alpha-engine-config-I8110).
+    #
+    # It also inverted the guard's own purpose. `_pause_verdict()` reads a name
+    # it cannot find as NOT PAUSED, so the failure mode being guarded is a name
+    # the manifest has never heard of. A name sitting in `not_paused` is one the
+    # manifest knows and has classified — the opposite of the defect.
+    names |= {k for k in m.get("not_paused", {}) if not k.startswith("_")}
     return names
 
 
@@ -214,7 +227,7 @@ def test_declared_triggers_all_exist_in_the_repo_manifest():
     notices — it compares against the real repo manifest, not a fixture.
     """
     known = _manifest_names()
-    assert known, "the repo manifest parsed to zero paused triggers"
+    assert known, "the repo manifest parsed to zero declared triggers"
     for alarm, spec in index.ALARM_ACTIONS.items():
         for trigger in spec["triggers"]:
             assert trigger in known, (
