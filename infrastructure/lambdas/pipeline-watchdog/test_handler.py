@@ -1958,3 +1958,145 @@ def test_list_bucket_prefix_condition_covers_the_same_pipelines():
             f"CompletionMarkerRead grants the object read — the two must list "
             f"the same pipelines."
         )
+
+
+# ── alpha-engine-config-I8045: a run-day gate no-op is not a clear ────────
+#
+# Real executions of `ne-weekly-freshness-pipeline`, captured live 2026-08-21
+# with `AWS_PROFILE=ne-admin aws stepfunctions list-executions`:
+#
+#   2026-08-21T02:00:49  SUCCEEDED  5.705s   InitializeInput -> ... -> WeeklyRunDaySkip
+#   2026-08-20T02:00:49  SUCCEEDED  3.465s   InitializeInput -> ... -> WeeklyRunDaySkip
+#   2026-08-15T02:00:49  FAILED     3h53m    died inside PredictorBacktest
+#
+# The cron fires THU-SAT and the gate self-selects the one correct day, so
+# two of three firings terminate SUCCEEDED in seconds having dispatched
+# nothing. That is correct behaviour. Reading it as a watchdog clear is not.
+
+_GATEOUT_0821 = 5.705   # measured
+_GATEOUT_0820 = 3.465   # measured
+_REAL_FAILED = 14003.967  # measured
+
+
+def _row(*, seconds_ago: float, duration: float, arn: str = "arn:aws:states:us-east-1:1:execution:sf:e"):
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(seconds=seconds_ago)
+    return {"startDate": start, "stopDate": start + timedelta(seconds=duration), "executionArn": arn}
+
+
+def test_a_gate_noop_alone_no_longer_reads_as_a_watchdog_clear():
+    """RED before I8045: this returned CLEAR off the 3.5s 08-20 gate-out."""
+    client = _make_status_filtered_sfn_client(
+        {"SUCCEEDED": [_row(seconds_ago=3600, duration=_GATEOUT_0820)]}
+    )
+    result = index._check_sf(
+        sf_label="Saturday SF",
+        sf_arn=SAT_ARN,
+        is_watch_day=True,
+        skip_reason_if_not_watching="(unused)",
+        window_seconds=7 * 24 * 3600,
+        client=client,
+        gate_noop_aware=True,
+    )
+    assert result.outcome == "ONLY_GATE_SKIPS", "a designed no-op is not a clear"
+    # ...and it does not page: the silence deadman owns that alert.
+    assert result.alert_emitted is False
+
+
+def test_a_gate_noop_no_longer_masks_a_real_failure_in_the_same_window():
+    """The operational harm. The 7-day weekly window held BOTH the 08-15
+    failure and the 08-20/08-21 gate-outs; the gate-outs cleared the check
+    and the failure never paged."""
+    client = _make_status_filtered_sfn_client(
+        {
+            "SUCCEEDED": [
+                _row(seconds_ago=3600, duration=_GATEOUT_0821, arn="…:e21"),
+                _row(seconds_ago=90000, duration=_GATEOUT_0820, arn="…:e20"),
+            ],
+            "FAILED": [_row(seconds_ago=6 * 24 * 3600, duration=_REAL_FAILED, arn="…:e15")],
+        }
+    )
+    result = index._check_sf(
+        sf_label="Saturday SF",
+        sf_arn=SAT_ARN,
+        is_watch_day=True,
+        skip_reason_if_not_watching="(unused)",
+        window_seconds=7 * 24 * 3600,
+        client=client,
+        gate_noop_aware=True,
+    )
+    assert result.outcome == "FIRED_AND_FAILED", (
+        "two gate-outs must not clear a window whose only real run failed"
+    )
+    assert result.alert_emitted is True
+    message = _alerts_mod.publish.call_args.kwargs["message"]
+    assert "FAILED=1" in message
+    # The skips are named, not hidden — the reader can see why the count of
+    # executions exceeds the count of real runs.
+    assert "GATE_SKIP=2" in message
+
+
+def test_the_same_window_read_status_blind_still_clears_proving_the_defect():
+    """The RED half, executable: with gate_noop_aware off — which is what
+    every call site did before I8045 — the identical window reports CLEAR."""
+    client = _make_status_filtered_sfn_client(
+        {
+            "SUCCEEDED": [_row(seconds_ago=3600, duration=_GATEOUT_0821)],
+            "FAILED": [_row(seconds_ago=6 * 24 * 3600, duration=_REAL_FAILED)],
+        }
+    )
+    result = index._check_sf(
+        sf_label="Saturday SF",
+        sf_arn=SAT_ARN,
+        is_watch_day=True,
+        skip_reason_if_not_watching="(unused)",
+        window_seconds=7 * 24 * 3600,
+        client=client,
+        gate_noop_aware=False,
+    )
+    assert result.outcome == "CLEAR"
+    assert result.alert_emitted is False
+
+
+def test_a_real_weekly_run_is_not_mistaken_for_a_gate_noop():
+    """The inverse failure — reporting a genuine success as a skip would
+    page through working behaviour, which is the fix that must not happen."""
+    client = _make_status_filtered_sfn_client(
+        {"SUCCEEDED": [_row(seconds_ago=3600, duration=_REAL_FAILED)]}
+    )
+    result = index._check_sf(
+        sf_label="Saturday SF",
+        sf_arn=SAT_ARN,
+        is_watch_day=True,
+        skip_reason_if_not_watching="(unused)",
+        window_seconds=7 * 24 * 3600,
+        client=client,
+        gate_noop_aware=True,
+    )
+    assert result.outcome == "CLEAR"
+    assert result.alert_emitted is False
+
+
+def test_the_gate_noop_ceiling_is_the_deadmans_and_not_a_second_copy():
+    """Two checks in one Lambda disagreeing about what a no-op is was the
+    2026-08-16 defect; the constant is imported, never restated."""
+    assert index.GATE_NOOP_MAX_SECONDS is _deadman.GATE_NOOP_MAX_SECONDS
+    assert _GATEOUT_0821 < index.GATE_NOOP_MAX_SECONDS
+    assert _REAL_FAILED > index.GATE_NOOP_MAX_SECONDS
+
+
+def test_the_other_two_pipelines_are_untouched_by_gate_bucketing():
+    """Only the weekly SF has a run-day gate; the preopen/postclose checks
+    must keep their exact prior behaviour."""
+    client = _make_status_filtered_sfn_client(
+        {"SUCCEEDED": [_row(seconds_ago=60, duration=2.0)]}
+    )
+    result = index._check_sf(
+        sf_label="Weekday SF",
+        sf_arn=WKD_ARN,
+        is_watch_day=True,
+        skip_reason_if_not_watching="(unused)",
+        window_seconds=24 * 3600,
+        client=client,
+    )
+    assert result.outcome == "CLEAR"
