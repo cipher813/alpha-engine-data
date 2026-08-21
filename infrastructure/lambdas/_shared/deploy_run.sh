@@ -41,6 +41,27 @@
 # Reads $DRY_RUN if the caller defines it (as most deploy.sh scripts do);
 # defaults to false (real run) when unset, so a caller with no --dry-run flag
 # of its own (thinktank-spot-dispatcher) does not need to add one.
+#
+# TRANSPORT DECISION (alpha-engine-config-I8033 deliverable 3): every
+# deploy.sh here uploads via a direct `--zip-file fileb://...` PUT, never
+# via S3 (`--code S3Bucket=...`). Moving to S3 was evaluated and REJECTED for
+# now: it would add an S3 write step plus an `s3:PutObject` grant to every
+# one of the 43 lambdas' iam-policy.json (each independently reviewed —
+# infrastructure/iam/README.md's single-writer rule), a materially larger
+# IAM surface, for a failure that verify_code_deployed() above already turns
+# loud regardless of transport. The connection-close measured 2026-08-21 was
+# 1 failure in this repo's deploy history, not a recurring pattern; a bigger
+# transport migration is disproportionate to that base rate. Tracked as a
+# follow-up (alpha-engine-config-I8043) rather than silently dropped.
+#
+# What ships instead: retry envvars, set here so every deploy.sh gets them
+# without an operator having to rediscover
+# `AWS_RETRY_MODE=adaptive AWS_MAX_ATTEMPTS=10` (what actually cleared the
+# measured failure) by hand. `:-` so an operator's own environment always
+# wins. adaptive mode also backs off client-side request rate on repeated
+# throttling/connection errors, not just retrying blindly.
+export AWS_RETRY_MODE="${AWS_RETRY_MODE:-adaptive}"
+export AWS_MAX_ATTEMPTS="${AWS_MAX_ATTEMPTS:-10}"
 
 run() {
   if ${DRY_RUN:-false}; then
