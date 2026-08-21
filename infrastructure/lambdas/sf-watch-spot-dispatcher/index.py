@@ -650,6 +650,69 @@ def _state_machine_arn_from_execution(execution_arn: str) -> str:
     return without_name.replace(":execution:", ":stateMachine:", 1)
 
 
+# Terminal states that end an execution SUCCEEDED having deliberately done
+# no work. Reaching one is CORRECT behaviour — and it is NOT a recovery.
+#
+# alpha-engine-config-I8045. `ne-weekly-freshness-pipeline` fires THU-SAT and
+# self-selects its run day; on the other two days it terminates SUCCEEDED in
+# 2.7-5.7s at `WeeklyRunDaySkip` having entered five states and dispatched
+# nothing. Measured live 2026-08-21 across the trailing 30 executions.
+#
+# SINGLE SOURCE: `nousergon_lib.pipeline_status.registry.SKIP_TERMINALS`
+# (nousergon-lib-PR347). This copy exists only because this Lambda cannot
+# take the lib pin until that PR merges and publishes, and because its
+# `deploy.sh` vendoring list is held by a concurrent session. Replace this
+# constant and `_reached_declared_skip_terminal` with
+# `nousergon_lib.pipeline_status.classify_work` when the pin lands —
+# alpha-engine-config-I8045 deliverable 1 follow-up.
+_SKIP_TERMINALS = {
+    "ne-weekly-freshness-pipeline": frozenset({"WeeklyRunDaySkip", "ShellRunComplete"}),
+    "ne-preopen-trading-pipeline": frozenset({"NotifyHolidaySkip"}),
+    "ne-postclose-trading-pipeline": frozenset(),
+}
+
+
+def _reached_declared_skip_terminal(execution_arn: str, *, client=None) -> bool:
+    """Did this SUCCEEDED execution end at a DECLARED no-work terminal?
+
+    One `GetExecutionHistory` call with `reverseOrder=True`, so the terminal
+    entered state is in the first page regardless of how long the run was.
+
+    Fail-safe posture matches the rest of this function: on ANY error, or on
+    a state machine with no declared skip terminals, returns False — i.e.
+    "not a skip", which lets the caller treat a SUCCEEDED execution as a
+    genuine recovery exactly as it did before. A broken check must never
+    invent a repair dispatch, and it must never invent a stand-down either;
+    False is the pre-I8045 behaviour, so a failure here degrades to the old
+    reading rather than to a new one. Every such degradation is logged.
+    """
+    sm_name = execution_arn.split(":")[6] if len(execution_arn.split(":")) > 6 else ""
+    skips = _SKIP_TERMINALS.get(sm_name, frozenset())
+    if not skips:
+        return False
+    try:
+        sfn = client or boto3.client("stepfunctions", region_name=REGION)
+        resp = sfn.get_execution_history(
+            executionArn=execution_arn, maxResults=50, reverseOrder=True
+        )
+    except Exception as exc:  # noqa: BLE001 — fail-safe, recorded on this WARNING
+        logger.warning(
+            "skip-terminal check GetExecutionHistory failed for %s (treating as a "
+            "real run, which is the pre-I8045 reading): %s: %s",
+            execution_arn, type(exc).__name__, exc,
+        )
+        return False
+    for event in resp.get("events") or []:
+        details = event.get("stateEnteredEventDetails")
+        if details and details.get("name"):
+            return str(details["name"]) in skips
+    logger.warning(
+        "skip-terminal check found no stateEntered event for %s — treating as a "
+        "real run", execution_arn,
+    )
+    return False
+
+
 def _reevaluate_after_defer(fields: dict) -> dict | None:
     """On a DEFERRED invocation (defer_generation >= 1), re-check the state
     machine before dispatching: the live box that forced the defer may have
@@ -684,23 +747,44 @@ def _reevaluate_after_defer(fields: dict) -> dict | None:
 
     latest = executions[0]  # ListExecutions returns newest-first
     status = str(latest.get("status") or "")
+    latest_arn = str(latest.get("executionArn") or "")
     if status in ("RUNNING", "SUCCEEDED", "PENDING_REDRIVE"):
         # RUNNING/SUCCEEDED: the live box (or an operator) already recovered
         # the pipeline. PENDING_REDRIVE: a redrive is in flight — launching a
         # repair box now would duplicate it.
-        logger.info(
-            "deferred re-evaluation: latest execution %s is %s — recovered, "
-            "no dispatch needed", latest.get("executionArn"), status,
-        )
-        return {"launched": False, "reason": "recovered",
-                "latest_execution_arn": latest.get("executionArn"),
-                "latest_status": status}
+        #
+        # ...unless the SUCCEEDED execution is a declared no-work skip
+        # (alpha-engine-config-I8045). The deferred path re-checks the state
+        # machine minutes-to-hours after a real failure, and on the weekly SF
+        # a THU/FRI run-day gate-out lands in exactly that window: a 3-second
+        # SUCCEEDED execution that entered no stage would stand the repair
+        # dispatch down and leave the real failure unrepaired, silently,
+        # reporting "recovered". A skip is not a recovery — nothing happened.
+        if status == "SUCCEEDED" and _reached_declared_skip_terminal(latest_arn):
+            logger.info(
+                "deferred re-evaluation: latest execution %s SUCCEEDED at a declared "
+                "no-work terminal — this is a designed skip, NOT a recovery; "
+                "proceeding with the repair dispatch", latest_arn,
+            )
+        else:
+            logger.info(
+                "deferred re-evaluation: latest execution %s is %s — recovered, "
+                "no dispatch needed", latest_arn, status,
+            )
+            return {"launched": False, "reason": "recovered",
+                    "latest_execution_arn": latest.get("executionArn"),
+                    "latest_status": status}
 
     # FAILED / TIMED_OUT / ABORTED — still broken; retarget the dispatch at
     # the NEWEST failed execution so the repair agent diagnoses the current
     # failure, not a stale one. The ARN comes from AWS but is embedded into a
     # shell command downstream — hold it to the same allowlist as the event's.
-    newest_arn = str(latest.get("executionArn") or "")
+    #
+    # Retarget ONLY when the newest execution is itself a failure. A declared
+    # no-work skip fell through to here (above); pointing the repair agent at
+    # a 3-second gate-out would hand it an execution with no failure to
+    # diagnose, so the originally-reported failed execution stays the target.
+    newest_arn = latest_arn if status in ("FAILED", "TIMED_OUT", "ABORTED") else ""
     if _ARN_RE.match(newest_arn):
         if newest_arn != fields["execution_arn"]:
             logger.info(
@@ -713,8 +797,9 @@ def _reevaluate_after_defer(fields: dict) -> dict | None:
         # rather than embedding an unvalidated string into the SSM shell
         # command; recorded via this WARNING log.
         logger.warning(
-            "deferred re-evaluation: newest execution ARN %r fails the ARN "
-            "allowlist — keeping the original execution_arn", newest_arn,
+            "deferred re-evaluation: newest execution ARN %r is not a retarget "
+            "candidate (malformed, or a non-failure terminal) — keeping the "
+            "original execution_arn %s", newest_arn, fields["execution_arn"],
         )
     return None
 

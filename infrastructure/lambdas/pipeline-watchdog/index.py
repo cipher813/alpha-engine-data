@@ -195,6 +195,7 @@ from nousergon_lib.flow_doctor_fleet import PIPELINE_OBSERVER_TELEGRAM_TOPICS
 # ``main``), so this costs the Lambda no cold-start weight beyond the file.
 try:  # deployed layout: flat next to index.py in /var/task
     from weekly_sf_silence_deadman import (  # noqa: E402
+        GATE_NOOP_MAX_SECONDS,
         _is_gate_noop,
         compute_expected_slots,
         evaluate,
@@ -207,6 +208,7 @@ except ModuleNotFoundError:  # in-repo layout (pytest, ci.yml glob runner)
         0, str(Path(__file__).resolve().parents[3] / "scripts")
     )
     from weekly_sf_silence_deadman import (  # noqa: E402
+        GATE_NOOP_MAX_SECONDS,
         _is_gate_noop,
         compute_expected_slots,
         evaluate,
@@ -493,12 +495,51 @@ def _pipeline_role(client: object, execution_arn: str) -> Optional[str]:
     return role if isinstance(role, str) and role else None
 
 
+# Pseudo-status for a SUCCEEDED execution that deliberately did no work.
+# It is NOT "SUCCEEDED" and it is NOT a failure — a third bucket, so no
+# caller can accidentally sum it into either (alpha-engine-config-I8045).
+GATE_SKIP = "GATE_SKIP"
+
+
+def _row_is_gate_noop(exec_row: "dict", status_filter: str) -> bool:
+    """Is this ListExecutions row a run-day-gate no-op?
+
+    ``ne-weekly-freshness-pipeline``'s cron fires THU-SAT and the gate
+    self-selects the single correct day; on the other two days the execution
+    terminates SUCCEEDED in 2.7-5.7s at ``WeeklyRunDaySkip`` having entered
+    five states and dispatched nothing. Measured live 2026-08-21 across the
+    trailing 30 executions: EVERY scheduled SUCCEEDED run in that window was
+    one of these, and the liveness check below read them as a clear.
+
+    Uses ``GATE_NOOP_MAX_SECONDS`` — the SAME ceiling
+    ``weekly_sf_silence_deadman._is_gate_noop`` applies, imported rather than
+    restated, so the two checks in this one Lambda can never disagree about
+    what a no-op is (the I6991/2026-08-16 failure mode).
+
+    Costs no extra API call: ``ListExecutions`` already returns startDate and
+    stopDate. The stronger predicate — the DECLARED terminal state, which
+    also catches a SUCCEEDED-but-dispatched-nothing run of any duration — is
+    `nousergon_lib.pipeline_status.classify_work` (nousergon-lib-PR347); this
+    Lambda adopts it when it can take the pin.
+    """
+    if status_filter != "SUCCEEDED":
+        return False
+    start = exec_row.get("startDate")
+    stop = exec_row.get("stopDate")
+    if start is None or stop is None:
+        return False
+    if not hasattr(start, "astimezone") or not hasattr(stop, "astimezone"):
+        return False
+    return (stop - start).total_seconds() < GATE_NOOP_MAX_SECONDS
+
+
 def _status_counts_in_window(
     sf_arn: str,
     window_seconds: int,
     *,
     client: Optional[object] = None,
     role_filter: Optional[frozenset] = None,
+    gate_noop_aware: bool = False,
 ) -> "dict[str, int]":
     """Return counts of executions that STARTED for ``sf_arn`` in the last
     ``window_seconds``, keyed by terminal status (``RUNNING``, ``SUCCEEDED``,
@@ -570,8 +611,11 @@ def _status_counts_in_window(
                     else start.replace(tzinfo=timezone.utc)
                 )
                 if start_utc >= cutoff_utc:
+                    bucket = status_filter
+                    if gate_noop_aware and _row_is_gate_noop(exec_row, status_filter):
+                        bucket = GATE_SKIP
                     if role_filter is None:
-                        counts[status_filter] = counts.get(status_filter, 0) + 1
+                        counts[bucket] = counts.get(bucket, 0) + 1
                         continue
                     described += 1
                     if described > _MAX_ROLE_DESCRIBES:
@@ -588,7 +632,7 @@ def _status_counts_in_window(
                     if _pipeline_role(client, exec_row.get("executionArn")) in (
                         role_filter
                     ):
-                        counts[status_filter] = counts.get(status_filter, 0) + 1
+                        counts[bucket] = counts.get(bucket, 0) + 1
                 else:
                     # Executions are returned newest-first; once we see one
                     # older than the cutoff we can stop paging this status.
@@ -687,6 +731,7 @@ def _check_sf(
     window_seconds: int,
     client: Optional[object] = None,
     role_filter: Optional[frozenset] = None,
+    gate_noop_aware: bool = False,
 ) -> CheckResult:
     if not is_watch_day:
         logger.info(
@@ -700,16 +745,50 @@ def _check_sf(
         )
 
     counts = _status_counts_in_window(
-        sf_arn, window_seconds, client=client, role_filter=role_filter
+        sf_arn,
+        window_seconds,
+        client=client,
+        role_filter=role_filter,
+        gate_noop_aware=gate_noop_aware,
     )
     seen = sum(counts.values())
+    gate_skips = counts.get(GATE_SKIP, 0)
     # "Fired" and "healthy" are separate questions (alpha-engine-config-I6991).
     # RUNNING counts as healthy-so-far — a still-in-flight execution is not a
     # failure and must not be reported as one. Only SUCCEEDED/RUNNING clear
     # the check; a window whose every execution terminated FAILED/TIMED_OUT/
     # ABORTED is an alert, not a "watchdog clear".
+    # A run-day gate no-op is bucketed as GATE_SKIP and is deliberately in
+    # NEITHER term (alpha-engine-config-I8045). It is not a success — it
+    # dispatched nothing — and it is not a failure — it was correct to do
+    # nothing. Before I8045 it landed in `SUCCEEDED` and cleared this check
+    # on its own, so a window holding one gate-out and one genuinely failed
+    # weekly run reported "watchdog clear" and the failure never paged.
     healthy_seen = counts.get("SUCCEEDED", 0) + counts.get("RUNNING", 0)
     window_hours = window_seconds // 3600
+
+    if healthy_seen == 0 and gate_skips > 0 and gate_skips == seen:
+        # Everything in the window was a designed skip. The schedule fired and
+        # the control plane is fine, so this is neither NEVER_FIRED nor
+        # FIRED_AND_FAILED — and it does NOT page from here: the weekly-SF
+        # silence deadman owns the "the real run is missing" alert, and
+        # `observability-policy.md` §7.2a is one notification per failure, not
+        # one per detector that noticed it. Recorded loudly and carried on the
+        # CheckResult so the absence is visible rather than inferred.
+        logger.warning(
+            "watchdog: sf=%s saw %d execution(s) in the last %dh and EVERY one was "
+            "a run-day-gate no-op (<%ds, dispatched nothing). Not a clear: no real "
+            "run succeeded. The weekly-SF silence deadman owns the page for this "
+            "condition; this check reports ONLY_GATE_SKIPS.",
+            sf_label, seen, window_hours, GATE_NOOP_MAX_SECONDS,
+        )
+        return CheckResult(
+            sf_label=sf_label,
+            sf_arn=sf_arn,
+            checked=True,
+            executions_seen=seen,
+            outcome="ONLY_GATE_SKIPS",
+        )
 
     if healthy_seen > 0:
         logger.info(
@@ -1725,6 +1804,9 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         window_seconds=_eod_window_seconds(now_utc),
     )
     saturday = _check_sf(
+        # alpha-engine-config-I8045: the weekly SF is the one state machine
+        # with a run-day gate, so it is the one that needs GATE_SKIP bucketing.
+        gate_noop_aware=True,
         sf_label="Saturday SF",
         sf_arn=SATURDAY_SF_ARN,
         is_watch_day=is_sunday,
