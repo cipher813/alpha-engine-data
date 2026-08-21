@@ -133,8 +133,12 @@ echo "  $FUNCTION_NAME deployed."
 # ── Converge the Lambda environment (alpha-engine-config-I7925) ─────────────
 # $FUNCTION_NAME was one of eleven fleet-wide Lambdas carrying a GITHUB_TOKEN
 # set by hand and refreshed by nothing — no repo, IaC file or script here
-# ever wrote this function's environment. That token expired 2026-06-03; on
-# 2026-08-21 a first-party dependency picked it up out of site-packages,
+# ever wrote this function's environment. The environment carried a STALE
+# COPY of the credential — set from an older SSM parameter version and
+# never re-derived on deploy — that GitHub rejected while the SSM
+# parameter's own value remained valid the whole time
+# (alpha-engine-config-I7968 tracks the mis-attribution). On 2026-08-21
+# a first-party dependency picked it up out of site-packages,
 # sent it to GitHub, got a 401, and halted the preopen trading pipeline
 # (alpha-engine-config-I7924). alpha-engine-predictor-inference
 # (crucible-predictor) was the one of eleven that broke and was fixed first
