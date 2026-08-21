@@ -835,7 +835,14 @@ def classified_world(module, monkeypatch, request):
     live = {e["name"]: False for e in module.alarm_entries()}
     live.update({name: True for name in module.armed_alarm_names()})
     if request.node.get_closest_marker("real_alarm_scan") is None:
-        monkeypatch.setattr(module, "_live_breaching_alarms", lambda: live)
+        # ONE stub, at the single primitive both populations derive from
+        # (alpha-engine-config-I8047). Stubbing `_live_breaching_alarms` alone
+        # left `_live_silenced_alarms` reaching the network the moment it was
+        # added — the fixture's docstring above predicted exactly that, and the
+        # fix is to stub the enumeration rather than each view of it.
+        monkeypatch.setattr(
+            module, "_live_alarm_actions",
+            lambda: {n: {"enabled": e, "breaching": True} for n, e in live.items()})
     return live
 
 
@@ -928,13 +935,13 @@ def test_an_armed_alarm_that_vanished_is_a_finding(module, monkeypatch,
 def test_describe_alarms_pagination_is_followed(module, monkeypatch):
     """A truncated first page would silently shrink the population being graded.
 
-    Opts out of the autouse stub — this is the one test whose subject IS
-    `_live_breaching_alarms`. It fakes `_aws` instead, so it still never reaches
-    the network.
+    Opts out of the autouse stub — this is the one test whose subject IS the
+    live enumeration. It fakes `_aws` instead, so it still never reaches the
+    network.
     """
     pages = [
-        ('{"a": [{"n": "a1", "e": true}], "t": "tok"}', None),
-        ('{"a": [{"n": "a2", "e": false}], "t": null}', "tok"),
+        ('{"a": [{"n": "a1", "e": true, "b": "breaching"}], "t": "tok"}', None),
+        ('{"a": [{"n": "a2", "e": false, "b": "breaching"}], "t": null}', "tok"),
     ]
     seen: list[str | None] = []
 
@@ -997,3 +1004,183 @@ def test_alarms_are_silenced_not_deleted(module):
     assert "delete-alarms" not in src, (
         "a paused alarm must be silenced (disable-alarm-actions), never deleted"
     )
+
+
+# ── the suppression's REASON, not its resource (alpha-engine-config-I8047) ───
+#
+# Brian ruled option (b) on 2026-08-21: the fourteen alarms he disabled by hand
+# on 2026-08-13/14 stay muted, and the mute becomes a DECLARED, SELF-EXPIRING
+# suppression rather than an undeclared one. `watches` already grades the
+# resource condition. These grade the two things that make the REASON
+# gradeable, which is the condition that actually rots (-I8090).
+
+
+def test_every_paused_alarm_names_an_owning_issue_and_a_re_exam_date(manifest, module):
+    """The data half of the ruling. Without both fields the sweep that grades
+    them against the clock and the tracker is satisfied vacuously."""
+    for entry in module.alarm_entries(manifest):
+        assert module.DECLARATION_ISSUE_RE.match(entry["issue"]), (
+            f"{entry['name']} carries issue={entry['issue']!r}; a suppression whose "
+            f"owner cannot be resolved can never be found stale"
+        )
+        assert module.DECLARATION_DATE_RE.match(entry["re_exam"]), (
+            f"{entry['name']} carries re_exam={entry['re_exam']!r}; a suppression "
+            f"with no expiry outlives its justification silently"
+        )
+
+
+def test_the_fourteen_hand_muted_alarms_are_all_declared(manifest, module):
+    """The exact set measured live on 2026-08-21 via
+    `describe-alarms --query 'MetricAlarms[?ActionsEnabled==`false`]'`, and the
+    set CloudTrail shows Brian disabling on 2026-08-13/14. Pinned literally so a
+    silent shrink of the declaration set is a test failure rather than a smaller
+    number in a report."""
+    hand_muted = {
+        "alpha-engine-ssm-reachability-probe-dead",
+        "alpha-engine-ssm-reachability-probe-unreachable",
+        "alpha-engine-watch-plane-alert-drain-liveness-probe-invocations-floor",
+        "alpha-engine-watch-plane-canary-replay-liveness-probe-invocations-floor",
+        "alpha-engine-watch-plane-ci-watch-liveness-probe-invocations-floor",
+        "alpha-engine-watch-plane-overseer-intake-age",
+        "alpha-engine-watch-plane-overseer-intake-dlq-depth",
+        "alpha-engine-watch-plane-overseer-intake-dlq-severe-content",
+        "alpha-engine-watch-plane-overseer-liveness-probe-errors",
+        "alpha-engine-watch-plane-overseer-liveness-probe-invocations-floor",
+        "alpha-engine-watch-plane-overseer-liveness-probe-throttles",
+        "alpha-engine-watch-plane-sf-watch-liveness-probe-errors",
+        "alpha-engine-watch-plane-sf-watch-liveness-probe-invocations-floor",
+        "alpha-engine-watch-plane-sf-watch-liveness-probe-throttles",
+    }
+    declared = {e["name"] for e in module.alarm_entries(manifest)}
+    assert hand_muted <= declared, sorted(hand_muted - declared)
+
+
+def test_no_alarm_outside_the_measured_set_was_declared(manifest, module):
+    """The other direction, and the one the ruling is emphatic about. Declaring
+    a suppression is how a count goes down without a condition clearing;
+    `alpha-engine-eval-quality-regression` (latched 106 days, ARMED, the live
+    surface for -I7038) and `alpha-engine-saturday-sf-failed` (true, first
+    correct reading in 53 days) must never appear here."""
+    declared = {e["name"] for e in module.alarm_entries(manifest)}
+    for never in ("alpha-engine-eval-quality-regression",
+                  "alpha-engine-saturday-sf-failed",
+                  "alpha-engine-weekday-sf-failed",
+                  "alpha-engine-eod-sf-failed",
+                  "router-degraded-mode-drill-uncovered-class",
+                  "alpha-engine-director-plan-latency"):
+        assert never not in declared, (
+            f"{never} is an ARMED alarm reporting a real condition; declaring it "
+            f"suppressed would clear a count by silencing the finding"
+        )
+
+
+def _mutated(field: str, value):
+    """The manifest with one paused_alarms entry's declaration broken."""
+    m = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    m["paused_alarms"]["alpha-engine-watch-plane-sf-watch-liveness-probe-errors"][field] = value
+    return m
+
+
+def test_a_declaration_with_no_owning_issue_is_a_finding(module):
+    """RED proof 1 — an unowned declaration cannot be graded against the
+    tracker, so it can never be found stale."""
+    findings = module.declaration_findings(_mutated("issue", ""))
+    assert ("alpha-engine-watch-plane-sf-watch-liveness-probe-errors",
+            "alarm-declaration-unowned") in {(f["trigger"], f["kind"]) for f in findings}
+
+
+def test_a_declaration_with_a_free_text_owner_is_a_finding(module):
+    """A free-text owner is the defect one step earlier: it LOOKS owned. Same
+    shape as the `Pause-owner:` line -I7524 had to make explicit after prose
+    matching declared 40 of 48 triggers owned and 0 latched."""
+    findings = module.declaration_findings(_mutated("issue", "tracked by Brian"))
+    assert "alarm-declaration-unowned" in {f["kind"] for f in findings}
+
+
+def test_a_declaration_with_no_re_exam_date_is_a_finding(module):
+    """RED proof 2 — no date means nothing can ever be past it."""
+    findings = module.declaration_findings(_mutated("re_exam", ""))
+    assert ("alpha-engine-watch-plane-sf-watch-liveness-probe-errors",
+            "alarm-declaration-undated") in {(f["trigger"], f["kind"]) for f in findings}
+
+
+def test_a_re_exam_that_is_not_a_real_date_is_a_finding(module):
+    findings = module.declaration_findings(_mutated("re_exam", "2026-02-31"))
+    assert "alarm-declaration-undated" in {f["kind"] for f in findings}
+
+
+def test_the_live_manifest_produces_no_declaration_findings(module):
+    """The GREEN direction, asserted explicitly: every one of the fourteen
+    carries a well-formed declaration today."""
+    assert module.declaration_findings() == []
+
+
+def test_declaration_findings_never_move_live_state(module, monkeypatch):
+    """A suppression whose reason expired must be REPORTED, never auto-re-armed.
+
+    `enforce()` re-enables an alarm whose `watches` justification lapsed, and
+    that is safe: the same manifest edit that restores the trigger makes it
+    happen. An expiry is different — it is a calendar tick, and re-arming the
+    response plane's own liveness alarms on one would undo a ruling of Brian's
+    unattended (`principles.md` 2.5). So the declaration predicate is
+    deliberately absent from `alarm_justified()` and therefore from `enforce()`.
+    """
+    broken = _mutated("re_exam", "1999-01-01")
+    monkeypatch.setattr(module, "load_manifest", lambda: broken)
+    monkeypatch.setattr(module, "_live_state", lambda surface, name: "DISABLED")
+    monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: False)
+    acted: list = []
+    monkeypatch.setattr(module, "_set_alarm_actions",
+                        lambda name, enabled: acted.append((name, enabled)))
+    module.enforce(alarms_only=True)
+    assert acted == [], (
+        "an expired declaration re-armed an alarm unattended — that is Brian's "
+        "ruling to revisit, not the enforcer's"
+    )
+
+
+# ── an UNDECLARED mute, of any alarm, is still a defect ─────────────────────
+
+
+def test_a_hand_muted_undeclared_alarm_is_a_finding(module, monkeypatch):
+    """RED proof 4 — the half of the ruling that must not weaken."""
+    world = {e["name"]: {"enabled": False, "breaching": True}
+             for e in module.alarm_entries()}
+    world.update({n: {"enabled": True, "breaching": True}
+                  for n in module.armed_alarm_names()})
+    world["alpha-engine-some-new-detector"] = {"enabled": False, "breaching": False}
+    monkeypatch.setattr(module, "_live_alarm_actions", lambda: world)
+    kinds = {(f["trigger"], f["kind"]) for f in module.alarm_coverage_findings()}
+    assert ("alpha-engine-some-new-detector", "alarm-undeclared-silence") in kinds, kinds
+
+
+def test_the_undeclared_silence_scan_is_not_limited_to_breaching_alarms(module, monkeypatch):
+    """The precise gap -I8047 closes. Nine of the fourteen alarms Brian muted
+    are `notBreaching`; the pre-existing completeness scan enumerated only
+    `TreatMissingData=breaching`, so an undeclared mute of any of them was
+    invisible to every check in the fleet."""
+    world = {e["name"]: {"enabled": False, "breaching": True}
+             for e in module.alarm_entries()}
+    world.update({n: {"enabled": True, "breaching": True}
+                  for n in module.armed_alarm_names()})
+    world["alpha-engine-quiet-mute"] = {"enabled": False, "breaching": False}
+    monkeypatch.setattr(module, "_live_alarm_actions", lambda: world)
+    findings = module.alarm_coverage_findings()
+    assert {"alpha-engine-quiet-mute"} == {
+        f["trigger"] for f in findings if f["kind"] == "alarm-undeclared-silence"}
+    assert not [f for f in findings if f["kind"] == "alarm-undeclared"], (
+        "the breaching scan must not also report it — one mute, one finding"
+    )
+
+
+def test_an_armed_alarm_is_never_reported_as_an_undeclared_silence(module, monkeypatch):
+    """`armed-but-silenced` already owns the armed block; two findings for one
+    condition is how a report gets skimmed."""
+    world = {e["name"]: {"enabled": False, "breaching": True}
+             for e in module.alarm_entries()}
+    world.update({n: {"enabled": False, "breaching": True}
+                  for n in module.armed_alarm_names()})
+    monkeypatch.setattr(module, "_live_alarm_actions", lambda: world)
+    findings = module.alarm_coverage_findings()
+    assert not [f for f in findings if f["kind"] == "alarm-undeclared-silence"]
+    assert {f["kind"] for f in findings} == {"armed-but-silenced"}
