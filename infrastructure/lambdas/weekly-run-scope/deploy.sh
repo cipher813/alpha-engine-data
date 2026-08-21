@@ -40,7 +40,8 @@ for arg in "$@"; do
   esac
 done
 
-run() { if $DRY_RUN; then echo "  DRY-RUN: $*"; else "$@"; fi; }
+# shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
+source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 
 # ----- 0. Tests gate the deploy -------------------------------------------
 # The derivation runs against captured real executions and needs no AWS, so
@@ -85,6 +86,7 @@ if $BOOTSTRAP; then
       --environment 'Variables={LOG_LEVEL=INFO,RESEARCH_BUCKET=alpha-engine-research}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
+    verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${ZIP}"
     exit 0
   fi
   echo "  Lambda exists, code will be updated below"
@@ -96,3 +98,6 @@ run aws lambda update-function-code \
   --zip-file "fileb://${ZIP}" \
   --region "${REGION}" \
   --query 'LastModified' --output text
+
+verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${ZIP}"
+

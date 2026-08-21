@@ -59,9 +59,8 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-run() {
-  if $DRY_RUN; then echo "DRY: $*"; else "$@"; fi
-}
+# shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
+source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 
 # ----- 0. Scratch dirs + validate handler syntax -----------------------------
 
@@ -204,6 +203,8 @@ run aws lambda update-function-code \
 if ! $DRY_RUN; then
   aws lambda wait function-updated --function-name "${FUNCTION_NAME}" --region "${REGION}"
 fi
+
+verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${ZIP}"
 echo "✓ Code deployed."
 
 # ----- 4. Optional backfill --------------------------------------------------

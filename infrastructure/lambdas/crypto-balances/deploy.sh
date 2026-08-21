@@ -63,13 +63,8 @@ for arg in "$@"; do
   esac
 done
 
-run() {
-  if $DRY_RUN; then
-    echo "DRY: $*"
-  else
-    "$@"
-  fi
-}
+# shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
+source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 
 # ----- 0. Validate handler + run unit tests ----------------------------------
 
@@ -189,6 +184,8 @@ run aws lambda update-function-code --function-name "${FUNCTION_NAME}" \
 if ! $DRY_RUN; then
   aws lambda wait function-updated --function-name "${FUNCTION_NAME}" --region "${REGION}"
 fi
+
+verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${ZIP}"
 
 # Ensure the runtime config matches (idempotent) — the BTC all-script-types xpub scan + ETH
 # token enumeration need headroom beyond the original 60s.

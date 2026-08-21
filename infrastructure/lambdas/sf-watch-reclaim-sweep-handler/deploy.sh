@@ -141,9 +141,8 @@ if $RECONCILE_SCHEDULES && ! $BOOTSTRAP_IAM && ! $APPLY_IAM && ! $SMOKE; then
   CODE_DEPLOY=false
 fi
 
-run() {
-  if $DRY_RUN; then echo "DRY: $*"; else "$@"; fi
-}
+# shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
+source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 
 # ----- 0. Validate handler + run unit tests ----------------------------------
 
@@ -352,6 +351,8 @@ if $BOOTSTRAPPED; then
   if ! $DRY_RUN; then
     aws lambda wait function-updated --function-name "${FUNCTION_NAME}" --region "${REGION}"
   fi
+
+  verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${ZIP}"
 
   echo "✓ Code deployed."
 

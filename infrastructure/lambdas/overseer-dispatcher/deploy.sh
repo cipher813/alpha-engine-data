@@ -53,13 +53,8 @@ for arg in "$@"; do
   esac
 done
 
-run() {
-  if $DRY_RUN; then
-    echo "DRY: $*"
-  else
-    "$@"
-  fi
-}
+# shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
+source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 
 # ----- 0. Scratch dir + validate handler syntax -----------------------------
 PKG=$(mktemp -d)
@@ -158,6 +153,7 @@ run aws lambda update-function-code \
 
 if ! $DRY_RUN; then
   aws lambda wait function-updated --function-name "${FUNCTION_NAME}" --region "${REGION}"
+  verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${ZIP}"
   # Preserve operator-owned runtime flags across redeploys (config#1818 class).
   CURRENT_ENABLED=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" OVERSEER_DISPATCH_ENABLED true)
   aws lambda update-function-configuration \

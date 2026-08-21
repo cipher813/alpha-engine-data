@@ -85,13 +85,8 @@ for arg in "$@"; do
   esac
 done
 
-run() {
-  if $DRY_RUN; then
-    echo "DRY: $*"
-  else
-    "$@"
-  fi
-}
+# shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
+source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 
 # ----- Apply IAM only, then EXIT (config#2825, config-I6661) ---------------
 # Placed FIRST, before packaging, deliberately. "only" has to mean the whole
@@ -371,6 +366,8 @@ if ! $DRY_RUN; then
     --function-name "${FUNCTION_NAME}" \
     --region "${REGION}"
 fi
+
+verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${ZIP}"
 
 echo "✓ Code deployed."
 

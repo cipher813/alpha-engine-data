@@ -42,6 +42,8 @@ RULE_NAME="alpha-research-thinktank-daily"
 # rotation does not silently change where a Think Tank page lands.
 SNS_TOPIC_ARN="${SNS_TOPIC_ARN:-arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
+source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 BUILD_DIR="$(mktemp -d)"
 trap 'rm -rf "$BUILD_DIR"' EXIT
 
@@ -107,6 +109,8 @@ aws lambda update-function-code --function-name "$FUNCTION_NAME" \
     --zip-file fileb:///tmp/thinktank-spot-dispatcher.zip \
     --region "$REGION" --query 'LastModified' --output text
 aws lambda wait function-updated --function-name "$FUNCTION_NAME" --region "$REGION"
+
+verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "/tmp/thinktank-spot-dispatcher.zip"
 
 if [ "$SMOKE" -eq 1 ]; then
     echo "==> SMOKE: firing ONE real Think Tank run on a REAL spot box"
