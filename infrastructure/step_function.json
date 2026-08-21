@@ -5,9 +5,9 @@
   "States": {
     "InitializeInput": {
       "Type": "Pass",
-      "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + ec2_instance_id explicitly; manual runs for partial-execution testing often omit sns_topic_arn, which previously caused HandleFailure/NotifyComplete to error on missing JSONPath. States.JsonMerge with user-input as the second arg lets explicit values win. | 2026-05-17: also stamps run_date = date($$.Execution.StartTime) so every spot stage of one execution keys backtest/{date}/ off ONE date (fixes the Backtester=05-17 vs Evaluator=05-18 UTC-midnight split). User-passed run_date still wins. | 2026-05-18 (shell-run keystone): also seeds the dry-path control vars at their NON-DRY identity values \u2014 preflight_args=\"\" (empty spot-command suffix), research_dry=false, data_phase2_dry=false, regime_action=\"produce\". These exist on EVERY run so the spot States.Format / Lambda Payload .$ references always resolve; on the real Saturday run (no shell_run) they hold these identity values, making every spot command string byte-identical to pre-keystone and every Lambda Payload behaviourally identical (handlers default dry_run_llm/dry_run to false; regime action 'produce' is the pre-keystone hardcoded value). ApplyShellRunDefaults (shell_run=true only) overrides them with the dry values. innermost defaults blob is merged UNDER run_date which is merged UNDER sns_topic_arn which is merged UNDER the user input, so user/ApplyShellRunDefaults values always win. PROVENANCE (config#2281): the sns_topic_arn default in the JsonMerge floor hand-carries the account/region literal (arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts) as a FLOOR ONLY \u2014 $$.Execution.Input wins the merge, so the authoritative source is the CALLER: the EventBridge schedule's Input (CFN alpha-engine-orchestration.yaml should pass sns_topic_arn via !Sub/!Ref so account/region live in ONE place \u2014 that Input change rides the CFN file in alpha-engine-config, not this repo) or an operator StartExecution payload. The floor is retained DELIBERATELY: a bare manual console start with no input must still alert instead of dying in HandleFailure on a missing $.sns_topic_arn. tests/test_sf_sns_arn_single_source.py pins that no publish state hardcodes a TopicArn and no NEW copy of the literal can ship outside the two declared floors (here + NormalizeFailureContext). | 2026-08-13 (alpha-engine-config-I7282, sf-pipeline-policy.md \u00a72.3a rule 3): the floor also seeds the four degraded-flag FAMILIES (gate_degraded / health_check_degraded / parity_degraded / research_predictor_degraded) at false, and both pre-spend gate probe results at {\"Payload\":{\"status\":\"UNKNOWN\"}}. Two reasons, and the second is the load-bearing one. (a) HAZARD: each family is written ONLY by its own degraded Pass state, so on the clean path it is ABSENT, not false \u2014 a bare $.gate_degraded reference in the ReportCard/Director Payload would raise States.Runtime on exactly the runs that are WORKING. Seeding is the same guarded-read convention SetLibPinGateDegradedSummary's Comment documents for stage_error, applied at the floor instead of by omission. (b) BOTH POLARITIES: \u00a72.3a requires the surface to state the verdict on a clean run too \u2014 a field that appears only on the bad path cannot be distinguished from a producer that broke. SAFE against the notifier: every Choice reading a family is And(IsPresent, BooleanEquals:true), so present-and-false selects exactly what absent selected (tests/test_sf_gate_state_wiring.py::test_seeding_does_not_change_the_degraded_notifier_selection pins that). The probe seeds carry status=UNKNOWN and deliberately NO has_drift/has_violation key \u2014 a gate that has not run is not a gate that found nothing (config-I7048/I7277); they are overwritten by the Task's own ResultPath the moment the gate actually runs, and survive only on the skip path and the Catch path, which is precisely when UNKNOWN is the true answer.",
+      "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + ec2_instance_id explicitly; manual runs for partial-execution testing often omit sns_topic_arn, which previously caused HandleFailure/NotifyComplete to error on missing JSONPath. States.JsonMerge with user-input as the second arg lets explicit values win. | 2026-05-17: also stamps run_date = date($$.Execution.StartTime) so every spot stage of one execution keys backtest/{date}/ off ONE date (fixes the Backtester=05-17 vs Evaluator=05-18 UTC-midnight split). User-passed run_date still wins. | 2026-05-18 (shell-run keystone): also seeds the dry-path control vars at their NON-DRY identity values \u2014 preflight_args=\"\" (empty spot-command suffix), research_dry=false, data_phase2_dry=false, regime_action=\"produce\". These exist on EVERY run so the spot States.Format / Lambda Payload .$ references always resolve; on the real Saturday run (no shell_run) they hold these identity values, making every spot command string byte-identical to pre-keystone and every Lambda Payload behaviourally identical (handlers default dry_run_llm/dry_run to false; regime action 'produce' is the pre-keystone hardcoded value). ApplyShellRunDefaults (shell_run=true only) overrides them with the dry values. innermost defaults blob is merged UNDER run_date which is merged UNDER sns_topic_arn which is merged UNDER the user input, so user/ApplyShellRunDefaults values always win. PROVENANCE (config#2281): the sns_topic_arn default in the JsonMerge floor hand-carries the account/region literal (arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts) as a FLOOR ONLY \u2014 $$.Execution.Input wins the merge, so the authoritative source is the CALLER: the EventBridge schedule's Input (CFN alpha-engine-orchestration.yaml should pass sns_topic_arn via !Sub/!Ref so account/region live in ONE place \u2014 that Input change rides the CFN file in alpha-engine-config, not this repo) or an operator StartExecution payload. The floor is retained DELIBERATELY: a bare manual console start with no input must still alert instead of dying in HandleFailure on a missing $.sns_topic_arn. tests/test_sf_sns_arn_single_source.py pins that no publish state hardcodes a TopicArn and no NEW copy of the literal can ship outside the two declared floors (here + NormalizeFailureContext). | 2026-08-13 (alpha-engine-config-I7282, sf-pipeline-policy.md \u00a72.3a rule 3): the floor also seeds the four degraded-flag FAMILIES (gate_degraded / health_check_degraded / parity_degraded / research_predictor_degraded) at false, and both pre-spend gate probe results at {\"Payload\":{\"status\":\"UNKNOWN\"}}. Two reasons, and the second is the load-bearing one. (a) HAZARD: each family is written ONLY by its own degraded Pass state, so on the clean path it is ABSENT, not false \u2014 a bare $.gate_degraded reference in the ReportCard/Director Payload would raise States.Runtime on exactly the runs that are WORKING. Seeding is the same guarded-read convention SetLibPinGateDegradedSummary's Comment documents for stage_error, applied at the floor instead of by omission. (b) BOTH POLARITIES: \u00a72.3a requires the surface to state the verdict on a clean run too \u2014 a field that appears only on the bad path cannot be distinguished from a producer that broke. SAFE against the notifier: every Choice reading a family is And(IsPresent, BooleanEquals:true), so present-and-false selects exactly what absent selected (tests/test_sf_gate_state_wiring.py::test_seeding_does_not_change_the_degraded_notifier_selection pins that). The probe seeds carry status=UNKNOWN and deliberately NO has_drift/has_violation key \u2014 a gate that has not run is not a gate that found nothing (config-I7048/I7277); they are overwritten by the Task's own ResultPath the moment the gate actually runs, and survive only on the skip path and the Catch path, which is precisely when UNKNOWN is the true answer. | 2026-08-20 (alpha-engine-config-I7812): the floor also seeds scanner_resource_kill=false, for the same two reasons the I7282 degraded families are seeded here. (a) HAZARD: BranchAComplete/BranchAFailed hoist it via Parameters.$, which throws States.Runtime on any path that never set it \u2014 and it is set only by ScannerResourceKill, i.e. only on a Scanner resource kill. (b) BOTH POLARITIES (sf-pipeline-policy.md \u00a72.3a rule 3): a field that appears only on the bad path cannot be distinguished from a producer that broke. SAFE against the notifier: the one Choice that reads it (CheckScannerResourceKillReason) is And(IsPresent, BooleanEquals:true), so present-and-false selects exactly what absent selected.",
       "Parameters": {
-        "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"substrate_relaunch_attempts\":0,\"preflight_args\":\"\",\"skip_weekly_run_day_gate\":false,\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\",\"gate_degraded\":false,\"health_check_degraded\":false,\"parity_degraded\":false,\"research_predictor_degraded\":false,\"libpin_drift_result\":{\"Payload\":{\"status\":\"UNKNOWN\",\"reason\":\"gate_did_not_run\"}},\"pipeline_contract_result\":{\"Payload\":{\"status\":\"UNKNOWN\",\"reason\":\"gate_did_not_run\"}}}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
+        "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"substrate_relaunch_attempts\":0,\"preflight_args\":\"\",\"skip_weekly_run_day_gate\":false,\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\",\"gate_degraded\":false,\"health_check_degraded\":false,\"parity_degraded\":false,\"research_predictor_degraded\":false,\"scanner_resource_kill\":false,\"libpin_drift_result\":{\"Payload\":{\"status\":\"UNKNOWN\",\"reason\":\"gate_did_not_run\"}},\"pipeline_contract_result\":{\"Payload\":{\"status\":\"UNKNOWN\",\"reason\":\"gate_did_not_run\"}}}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
       },
       "OutputPath": "$.merged",
       "Next": "CheckWeeklyRunDayGate"
@@ -1083,7 +1083,7 @@
           "States": {
             "InitResearchDegradedFlag": {
               "Type": "Pass",
-              "Comment": "alpha-engine-config#6722: seeds the branch-local $.research_degraded_local marker every fail-open Catch inside Branch A threads through (the Scanner/RegimeSubstrate/ChallengerShadow/RegimeRetrospectiveEval research-substep group, ThinkTankDegraded's flag, the eval-judge chain, and AggregateCosts's named sf-pipeline-policy.md \u00a75 cost-aggregation carve-out). Must be seeded BEFORE any Mark*Degraded state or BranchAComplete's Parameters.$ extraction would throw States.Runtime on a clean run that never sets it. Folded into the top-level $.research_predictor_degraded at AggregateBranchOutcomes/CheckResearchPredictorDegraded (mirrors CheckParityBranchOutcomes' branch-status fold, alpha-engine-config#6030) since a Parallel branch cannot write an outer-scope JSONPath directly \u2014 ASL scopes each branch to its own copy of the state.",
+              "Comment": "alpha-engine-config#6722: seeds the branch-local $.research_degraded_local marker every fail-open Catch inside Branch A threads through (the Scanner/RegimeSubstrate/ChallengerShadow/RegimeRetrospectiveEval research-substep group, ThinkTankDegraded's flag, the eval-judge chain, and AggregateCosts's named sf-pipeline-policy.md \u00a75 cost-aggregation carve-out). Must be seeded BEFORE any Mark*Degraded state or BranchAComplete's Parameters.$ extraction would throw States.Runtime on a clean run that never sets it. Folded into the top-level $.research_predictor_degraded at AggregateBranchOutcomes/CheckResearchPredictorDegraded (mirrors CheckParityBranchOutcomes' branch-status fold, alpha-engine-config#6030) since a Parallel branch cannot write an outer-scope JSONPath directly \u2014 ASL scopes each branch to its own copy of the state. | alpha-engine-config-I7812: the sibling $.scanner_resource_kill marker is NOT seeded here \u2014 it is seeded false in InitializeInput's JsonMerge floor instead (the alpha-engine-config-I7282 idiom), because unlike $.research_degraded_local it must also exist on the paths that never enter this branch state.",
               "Result": false,
               "ResultPath": "$.research_degraded_local",
               "Next": "CheckSkipScanner"
@@ -1123,6 +1123,14 @@
               "Retry": [
                 {
                   "ErrorEquals": [
+                    "States.Timeout",
+                    "Lambda.Unknown"
+                  ],
+                  "MaxAttempts": 0,
+                  "Comment": "alpha-engine-config-I7812 / sf-pipeline-policy.md \u00a73 obligation 2 \u2014 NEVER auto-retry an unchanged resource kill. This retrier exists to EXCLUDE the kill errors from the broad States.TaskFailed retrier below: ASL evaluates retriers in order and States.TaskFailed matches a Lambda.Unknown runtime exit (an OOM or a Sandbox.Timedout), so without this zero-attempt entry a kill would be replayed once on the same substrate with the same workload \u2014 one loud failure converted into a quiet loop."
+                },
+                {
+                  "ErrorEquals": [
                     "Lambda.ServiceException",
                     "Lambda.TooManyRequestsException",
                     "States.TaskFailed"
@@ -1133,6 +1141,15 @@
                 }
               ],
               "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.Timeout",
+                    "Lambda.Unknown"
+                  ],
+                  "Comment": "alpha-engine-config-I7812 \u2014 sf-pipeline-policy.md \u00a73 (SFP-3-resource-kill-halts-and-is-named, Brian's 2026-08-13 ruling). A resource kill is NOT the generic fail-open below it: the process is gone, so nothing was raised and the scan cannot report what it would have found. States.Timeout is the SF budget (440s) binding; Lambda.Unknown is the function's own 450s Sandbox.Timedout or an OOM. Both route here, where the run's LOAD-BEARING deliverable is PROVEN present or absent before anything is allowed to continue. WHY THE CONDITION IS THE MEMBERSHIP POINTER: the 2026-08-20 kill (alpha-engine-config-I7812) landed AFTER universe_membership wrote at 08:48:05 and before research/cuts_leaderboard/2026-08-20.json \u2014 so the day's primary data was intact and only observe-only boards were lost. That run must be treated differently from one killed before the membership artifact landed, which would leave the predictor scoring a frozen population.",
+                  "Next": "ScannerResourceKill",
+                  "ResultPath": "$.scanner_error"
+                },
                 {
                   "ErrorEquals": [
                     "States.ALL"
@@ -1151,6 +1168,100 @@
               "Result": true,
               "ResultPath": "$.research_degraded_local",
               "Next": "CheckSkipRegimeSubstrate"
+            },
+            "ScannerResourceKill": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I7812: records that Scanner was killed for RESOURCES (timeout/OOM) rather than failing a domain check, BEFORE the artifact probe decides halt-or-degrade \u2014 so the classification survives on the execution record even if the probe itself dies. Hoisted post-join by BranchAComplete and read by CheckScannerResourceKillReason, which is what puts the words 'resource kill' into the DegradedRun terminal cause and the DEGRADED completion marker on the fail-open path.",
+              "Result": true,
+              "ResultPath": "$.scanner_resource_kill",
+              "Next": "ProbeUniverseMembershipPointer"
+            },
+            "ProbeUniverseMembershipPointer": {
+              "Type": "Task",
+              "Comment": "alpha-engine-config-I7812: the conditional in 'fail-open conditioned on universe_membership'. HeadObject on the POINTER key, with the config#2253 ValidatePredictorSkipWeightsFresh idiom lifting LastModified's date part for a lexicographic compare against $.run_date (both 'YYYY-MM-DD', so string ordering IS date ordering). WHY THE POINTER AND NOT THE DATED KEY: crucible-research scoring/universe_membership.py::write_universe_membership_to_s3 writes runs/{stamp}.json, then universe_membership/{trading_day}/membership.json, then universe_membership/latest.json \u2014 the pointer lands LAST, so a fresh pointer proves all three landed. It also sidesteps a real trap: the dated key is keyed on the TRADING DAY (scanner_handler normalizes via nousergon_lib.dates.resolve_trading_day), while this SF's $.run_date is the CALENDAR date of Execution.StartTime \u2014 on the Saturday weekly run those differ by a day (and by more across a holiday), and ASL has no calendar with which to close the gap. A freshness compare on a fixed key needs no date arithmetic at all. Deliberately aws-sdk:s3, not a Lambda: zero boot cost, and aws-sdk:s3 is NOT in nousergon_lib.pipeline_status SUBSTANTIVE_RESOURCES, so this stays console-invisible plumbing needing no cross-repo registry entry. IAM: s3:GetObject on this one key (Sid HeadUniverseMembershipPointer, nous-ergon-ops infrastructure/iam/alpha-engine-step-functions-role \u2014 applied before merge, iam-drift-check enforces).",
+              "Resource": "arn:aws:states:::aws-sdk:s3:headObject",
+              "Parameters": {
+                "Bucket": "alpha-engine-research",
+                "Key": "universe_membership/latest.json"
+              },
+              "TimeoutSeconds": 30,
+              "ResultSelector": {
+                "pointer_last_modified_date.$": "States.ArrayGetItem(States.StringSplit($.LastModified, 'T'), 0)"
+              },
+              "ResultPath": "$.universe_membership_probe",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 5,
+                  "BackoffRate": 2.0,
+                  "Comment": "Transient S3 5xx/throttle only. A genuine 403/404 burns ~15s then falls through to the Catch, which HALTS \u2014 never to the fail-open."
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "The probe could not establish the condition. UNKNOWN is not a pass (sf-pipeline-policy.md \u00a72.3a rule 2): the conditional fail-open is legal only when the primary deliverable is PROVEN present, so an unmeasurable probe halts exactly as an absent artifact does \u2014 with its own distinct Error name so the operator can tell 'the artifact is missing' from 'we could not look'.",
+                  "Next": "ScannerMembershipProbeUnknownHalt",
+                  "ResultPath": "$.universe_membership_probe_error"
+                }
+              ],
+              "Next": "CheckUniverseMembershipFresh"
+            },
+            "CheckUniverseMembershipFresh": {
+              "Type": "Choice",
+              "Comment": "alpha-engine-config-I7812: pointer rewritten on or after $.run_date \u21d2 this cycle's universe-membership artifact landed before the kill \u21d2 the run's LOAD-BEARING output survived and only observe-only work (research/cuts_leaderboard, the cut-promotion decision) was truncated \u21d2 fail-open, DEGRADED and NAMED. Anything else \u2014 older pointer, or a LastModified that did not serialize as an ISO date \u2014 HALTS. The StringMatches '20*-*-*' shape guard is carried over from config#2253 verbatim and is load-bearing for the same reason: if aws-sdk ever returned an HTTP-date or an epoch string, a bare lexicographic >= against 'YYYY-MM-DD' could silently WRONG-PASS, and a wrong pass here is the whole defect this state exists to prevent.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.universe_membership_probe.pointer_last_modified_date",
+                      "StringMatches": "20*-*-*"
+                    },
+                    {
+                      "Variable": "$.universe_membership_probe.pointer_last_modified_date",
+                      "StringGreaterThanEqualsPath": "$.run_date"
+                    }
+                  ],
+                  "Next": "ScannerResourceKillDegraded"
+                }
+              ],
+              "Default": "ScannerResourceKillHalt"
+            },
+            "ScannerResourceKillDegraded": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I7812: the CONDITIONAL fail-open \u2014 reached only with the membership pointer proven fresh for this run_date. Threads the same $.research_degraded_local marker every other Branch-A fail-open uses and continues to CheckSkipRegimeSubstrate, Scanner's own convergence point, so nothing about the rest of the branch changes. The run does NOT end clean: $.scanner_resource_kill (set by ScannerResourceKill) is hoisted post-join and turns the terminal cause and the completion marker into a named resource kill rather than the generic branch fail-open, per sf-pipeline-policy.md \u00a73 obligation 3.",
+              "Result": true,
+              "ResultPath": "$.research_degraded_local",
+              "Next": "CheckSkipRegimeSubstrate"
+            },
+            "ScannerResourceKillHalt": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I7812 / sf-pipeline-policy.md \u00a73 obligation 1 \u2014 HALT. The kill landed before this cycle's universe-membership artifact was written, so the predictor would resolve tomorrow's scoring universe from a frozen population \u2014 the exact defect alpha-engine-config-I4818 built that artifact to end, and the one that ran for three weekly cycles unnoticed because its producer's disappearance was silent. Routes into Branch A's own hard-fail chokepoint (NormalizeBranchAFailureContext \u2192 PublishResearchFailureImmediate \u2192 BranchAFailed), so the sibling PredictorTraining branch is never cancelled and the SF fails after the join via CheckBranchOutcomes. The named Error + Cause reach the operator through that state's SNS message and through FailExecution's CausePath, both of which render States.JsonToString($.error). Cause is a constant and the variable detail rides as sibling keys: $.scanner_error and $.universe_membership_probe are both guaranteed present on this path (a Catch ResultPath and a Task ResultPath respectively), but a States.Format over them would be one more error handler able to destroy its own error, which is the failure mode NormalizeBranchAFailureContext exists for.",
+              "Parameters": {
+                "Error": "ScannerResourceKillHalt",
+                "Cause": "RESOURCE KILL (TIMEOUT/OOM): the weekly-SF Scanner state was killed at its 440s budget (SF TimeoutSeconds 440 sits below the alpha-engine-research-scanner function timeout of 450s so the SF is the binding budget), and s3://alpha-engine-research/universe_membership/latest.json was NOT rewritten for this run_date \u2014 this cycle's universe-membership artifact was never written. HALTING per sf-pipeline-policy.md \u00a73: a resource kill is never a degrade, and the predictor must not resolve its scoring universe from a stale membership pointer. Do NOT re-run unchanged: replaying the same workload on the same substrate reproduces the kill and turns one loud failure into a quiet loop. Establish why the scan exceeded its budget first (alpha-engine-config-I7812; the timeout's own re-derivation from a measured p95 is alpha-engine-config-I7851). Detail on the execution record: $.scanner_error, $.universe_membership_probe.",
+                "scanner_error.$": "$.scanner_error",
+                "universe_membership_probe.$": "$.universe_membership_probe"
+              },
+              "ResultPath": "$.error",
+              "Next": "NormalizeBranchAFailureContext"
+            },
+            "ScannerMembershipProbeUnknownHalt": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I7812 / sf-pipeline-policy.md \u00a72.3a rule 2 \u2014 a verdict that could not be produced propagates as UNKNOWN, never as pass. Distinct from ScannerResourceKillHalt on purpose: 'the membership artifact is missing' and 'the probe could not tell us' lead an operator to different next actions, and collapsing them is how an unmeasured state gets reported as a measured one. Same terminal route, same halt.",
+              "Parameters": {
+                "Error": "ScannerResourceKillMembershipUnknownHalt",
+                "Cause": "RESOURCE KILL (TIMEOUT/OOM): the weekly-SF Scanner state was killed at its 440s budget, and the follow-up HeadObject on s3://alpha-engine-research/universe_membership/latest.json could not establish whether this cycle's universe-membership artifact was written (S3 error, missing key, or an unparseable LastModified). UNKNOWN is not a pass (sf-pipeline-policy.md \u00a72.3a): the conditional fail-open is legal only when the primary deliverable is PROVEN present, so this HALTS. Check the pointer by hand before any rerun, and do NOT re-run the scan unchanged. Detail on the execution record: $.scanner_error, $.universe_membership_probe_error.",
+                "scanner_error.$": "$.scanner_error",
+                "universe_membership_probe_error.$": "$.universe_membership_probe_error"
+              },
+              "ResultPath": "$.error",
+              "Next": "NormalizeBranchAFailureContext"
             },
             "CheckSkipRegimeSubstrate": {
               "Type": "Choice",
@@ -2561,18 +2672,20 @@
               "Comment": "Branch A (Scanner \u2192 RegimeSubstrate \u2192 SignalsEnvelope \u2192 ChallengerShadow \u2192 RAG chain \u2192 RegimeRetrospectiveEval \u2192 DataPhase2 \u2192 eval-judge chain \u2192 EvalRollingMean \u2192 RationaleClustering \u2192 ReplayConcordance \u2192 Counterfactual \u2192 AggregateCosts) completed (config-I2515 Phase B reorder \u2014 the multi-agent Research graph runner was removed). Records branch_a_status=OK so the post-join AggregateBranchOutcomes can decide whether to halt the SF. End:true so the Parallel branch SUCCEEDS \u2014 it must never throw, because a thrown branch would cancel the sibling PredictorTraining branch (default SF Parallel semantics). alpha-engine-config#6722: also hoists $.research_degraded_local (seeded false by InitResearchDegradedFlag, set true by any of Branch A's internal fail-open Mark*Degraded states) as branch_a_degraded \u2014 read by AggregateBranchOutcomes/CheckResearchPredictorDegraded post-join since a Parallel branch cannot write an outer-scope JSONPath directly.",
               "Parameters": {
                 "branch_a_status": "OK",
-                "branch_a_degraded.$": "$.research_degraded_local"
+                "branch_a_degraded.$": "$.research_degraded_local",
+                "scanner_resource_kill.$": "$.scanner_resource_kill"
               },
               "ResultPath": "$.branch_a",
               "End": true
             },
             "BranchAFailed": {
               "Type": "Pass",
-              "Comment": "Branch A hard-failed (SignalsEnvelope failure \u2014 the LOAD-BEARING signals.json producer post config-I2515 Phase B \u2014 RAGIngestion failure, or DataPhase2 failure). Records branch_a_status=FAILED + the captured $.error as DATA and End:true \u2014 the branch SUCCEEDS in SF terms so the sibling PredictorTraining branch is NEVER abandoned by Parallel's cancel-siblings default. The SF is failed AFTER the join by CheckBranchOutcomes. Recovery: if Branch B completed + promoted weights to S3, the re-run uses {\"skip_predictor_training\": true} (weights are already live) and re-runs only Branch A. alpha-engine-config#6722: branch_a_degraded is fixed false here \u2014 a hard FAILED branch is reported via CheckBranchOutcomes' Or-gate before AggregateBranchOutcomes' degraded-fold is ever consulted, but the field must still exist unconditionally so that Parameters.$ extraction never throws States.Runtime.",
+              "Comment": "Branch A hard-failed (SignalsEnvelope failure \u2014 the LOAD-BEARING signals.json producer post config-I2515 Phase B \u2014 RAGIngestion failure, or DataPhase2 failure). Records branch_a_status=FAILED + the captured $.error as DATA and End:true \u2014 the branch SUCCEEDS in SF terms so the sibling PredictorTraining branch is NEVER abandoned by Parallel's cancel-siblings default. The SF is failed AFTER the join by CheckBranchOutcomes. Recovery: if Branch B completed + promoted weights to S3, the re-run uses {\"skip_predictor_training\": true} (weights are already live) and re-runs only Branch A. alpha-engine-config#6722: branch_a_degraded is fixed false here \u2014 a hard FAILED branch is reported via CheckBranchOutcomes' Or-gate before AggregateBranchOutcomes' degraded-fold is ever consulted, but the field must still exist unconditionally so that Parameters.$ extraction never throws States.Runtime. | alpha-engine-config-I7812: scanner_resource_kill is fixed false here for the same reason branch_a_degraded is \u2014 a hard FAILED branch is reported by CheckBranchOutcomes' Or-gate before the degraded fold is consulted, but AggregateBranchOutcomes' Parameters.$ extraction runs first and would throw States.Runtime on a missing field.",
               "Parameters": {
                 "branch_a_status": "FAILED",
                 "branch_a_error.$": "$.error",
-                "branch_a_degraded": false
+                "branch_a_degraded": false,
+                "scanner_resource_kill": false
               },
               "ResultPath": "$.branch_a",
               "End": true
@@ -3763,12 +3876,13 @@
     },
     "AggregateBranchOutcomes": {
       "Type": "Pass",
-      "Comment": "Parallel join sync point. $.parallel_result is the 2-element array of each branch's final effective input (branch order matches the Branches array: [0]=Research branch, [1]=PredictorTraining branch). Each branch terminal wrote its status under $.branch_a / $.branch_b, so hoist both statuses to a flat path for the Choice. This is the natural Backtester sync point \u2014 Backtester needs BOTH Research signal history AND PredictorTraining weights. alpha-engine-config#6722: also hoists branch_a_degraded/branch_b_degraded \u2014 the branch-local $.research_degraded_local marker each branch threads through its own internal fail-open Catch routes (Branch A: Scanner/RegimeSubstrate/ChallengerShadow/RegimeRetrospectiveEval/ThinkTankDegraded/the eval-judge chain/AggregateCosts; Branch B: the model-zoo rotation group), folded here since a Parallel branch cannot write an outer-scope JSONPath directly \u2014 mirrors CheckParityBranchOutcomes' branch-status fold (alpha-engine-config#6030). Every branch terminal (BranchAComplete/BranchAFailed, BranchBComplete/BranchBFailed/PredictorTrainingSkipped) sets its *_degraded field unconditionally, so this Parameters.$ extraction never throws States.Runtime.",
+      "Comment": "Parallel join sync point. $.parallel_result is the 2-element array of each branch's final effective input (branch order matches the Branches array: [0]=Research branch, [1]=PredictorTraining branch). Each branch terminal wrote its status under $.branch_a / $.branch_b, so hoist both statuses to a flat path for the Choice. This is the natural Backtester sync point \u2014 Backtester needs BOTH Research signal history AND PredictorTraining weights. alpha-engine-config#6722: also hoists branch_a_degraded/branch_b_degraded \u2014 the branch-local $.research_degraded_local marker each branch threads through its own internal fail-open Catch routes (Branch A: Scanner/RegimeSubstrate/ChallengerShadow/RegimeRetrospectiveEval/ThinkTankDegraded/the eval-judge chain/AggregateCosts; Branch B: the model-zoo rotation group), folded here since a Parallel branch cannot write an outer-scope JSONPath directly \u2014 mirrors CheckParityBranchOutcomes' branch-status fold (alpha-engine-config#6030). Every branch terminal (BranchAComplete/BranchAFailed, BranchBComplete/BranchBFailed/PredictorTrainingSkipped) sets its *_degraded field unconditionally, so this Parameters.$ extraction never throws States.Runtime. | alpha-engine-config-I7812: also hoists scanner_resource_kill \u2014 set by ScannerResourceKill on the conditional fail-open path and seeded false by InitScannerResourceKillFlag, so this extraction is total.",
       "Parameters": {
         "branch_a_status.$": "$.parallel_result[0].branch_a.branch_a_status",
         "branch_b_status.$": "$.parallel_result[1].branch_b.branch_b_status",
         "branch_a_degraded.$": "$.parallel_result[0].branch_a.branch_a_degraded",
-        "branch_b_degraded.$": "$.parallel_result[1].branch_b.branch_b_degraded"
+        "branch_b_degraded.$": "$.parallel_result[1].branch_b.branch_b_degraded",
+        "scanner_resource_kill.$": "$.parallel_result[0].branch_a.scanner_resource_kill"
       },
       "ResultPath": "$.branch_outcomes",
       "Next": "CheckBranchOutcomes"
@@ -3835,6 +3949,37 @@
       "Result": true,
       "ResultPath": "$.research_predictor_degraded",
       "Next": "SetResearchPredictorDegradedSummary"
+    },
+    "CheckScannerResourceKillReason": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I7812 / sf-pipeline-policy.md \u00a73 obligation 3 \u2014 NAME IT at the top of what the reader sees. The family boolean $.research_predictor_degraded selects WHICH completion notification fires; $.degraded_summary.reason is what the DegradedRun terminal renders as the execution's Cause and what WriteCompletionMarkerDegraded embeds in _sf_completion/. Without this split a Scanner killed for resources and a Scanner that merely errored produce a byte-identical terminal cause, which is exactly the test \u00a73 sets: 'read the last failure of any pipeline stage \u2014 can you tell from the failure cause ALONE whether it was killed for resources?'. Placed after SetResearchPredictorDegradedSummary, so the generic reason is written first and this overwrites it only for a resource kill \u2014 the same last-write-wins convention the sibling summary states already document. IsPresent-guarded per config#2275, so a run predating the flag (an in-flight execution across a deploy) selects the unchanged generic reason rather than throwing.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.branch_outcomes.scanner_resource_kill",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.branch_outcomes.scanner_resource_kill",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "SetScannerResourceKillDegradedSummary"
+        }
+      ],
+      "Default": "CheckSkipBacktester"
+    },
+    "SetScannerResourceKillDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I7812: the resource-kill twin of SetResearchPredictorDegradedSummary \u2014 same ResultPath, same continuation (CheckSkipBacktester), same last-write-wins convention; only the reason differs, and the reason is the whole point. 'membership_intact' is not decoration: it states the condition CheckUniverseMembershipFresh actually verified, so a reader of the DEGRADED completion marker knows the day's universe-membership artifact is trustworthy and that what was lost is the observe-only tail (research/cuts_leaderboard, the cut-promotion decision).",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_scanner_resource_kill_membership_intact",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "CheckSkipBacktester"
     },
     "ExtractParallelBranchError": {
       "Type": "Pass",
@@ -7707,6 +7852,14 @@
       "Retry": [
         {
           "ErrorEquals": [
+            "States.Timeout",
+            "Lambda.Unknown"
+          ],
+          "MaxAttempts": 0,
+          "Comment": "alpha-engine-config-I7812 / sf-pipeline-policy.md \u00a73 obligation 2 \u2014 NEVER auto-retry an unchanged resource kill. This retrier exists to EXCLUDE the kill errors from the broad States.TaskFailed retrier below: ASL evaluates retriers in order and States.TaskFailed matches a Lambda.Unknown runtime exit (an OOM or a Sandbox.Timedout), so without this zero-attempt entry a kill would be replayed once on the same substrate with the same workload \u2014 one loud failure converted into a quiet loop."
+        },
+        {
+          "ErrorEquals": [
             "Lambda.ServiceException",
             "Lambda.TooManyRequestsException",
             "States.TaskFailed"
@@ -7717,6 +7870,15 @@
         }
       ],
       "Catch": [
+        {
+          "ErrorEquals": [
+            "States.Timeout",
+            "Lambda.Unknown"
+          ],
+          "Comment": "alpha-engine-config-I7812 \u2014 class sweep alongside the Scanner state: the leaf invokes the SAME alpha-engine-research-scanner function under the same 440s budget, so it carries the same undifferentiated-kill defect. It keeps I7813's fail-open (its only deliverable is an observe-only board, nothing downstream consumes it, and the run already terminates in DegradedRun rather than a clean success \u2014 so \u00a73's 'do not proceed as if measured' is already satisfied by the terminal), and gains what it lacked: a kill that says it is a kill. There is no artifact condition to evaluate here, unlike Scanner \u2014 the board IS the whole deliverable, so there is no partial success to distinguish.",
+          "Next": "ScannerLeaderboardResourceKill",
+          "ResultPath": "$.scanner_leaderboard_error"
+        },
         {
           "ErrorEquals": [
             "States.ALL"
@@ -7747,6 +7909,24 @@
       "Parameters": {
         "degraded": true,
         "reason": "weekly_scanner_leaderboard_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishScannerLeaderboardDegraded"
+    },
+    "ScannerLeaderboardResourceKill": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I7812: sets the SAME $.scanner_leaderboard_degraded flag ScannerLeaderboardDegraded sets \u2014 CheckGateDegradedNotify's selection, NotifyCompleteScannerLeaderboardDegraded and the DegradedRun terminal are all unchanged. Only the degraded_summary reason forks, one state below.",
+      "Result": true,
+      "ResultPath": "$.scanner_leaderboard_degraded",
+      "Next": "SetScannerLeaderboardResourceKillSummary"
+    },
+    "SetScannerLeaderboardResourceKillSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I7812: mirrors SetScannerLeaderboardDegradedSummary exactly, with a reason that names the resource kill so the DegradedRun cause and the DEGRADED completion marker distinguish 'the board build failed' from 'the invocation was killed at its 440s budget'. Continues to the existing PublishScannerLeaderboardDegraded, so no new alert source is introduced.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_scanner_leaderboard_resource_kill",
         "run_date.$": "$.run_date"
       },
       "ResultPath": "$.degraded_summary",
@@ -8093,14 +8273,14 @@
     },
     "SetResearchPredictorDegradedSummary": {
       "Type": "Pass",
-      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state CheckSkipBacktester routed to before. Split from SetResearchPredictorDegraded because a Pass has exactly one ResultPath and SetResearchPredictorDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier.",
+      "Comment": "alpha-engine-config-I6891: writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, WITHOUT changing this fail-open path's continuation \u2014 Next is the state CheckSkipBacktester routed to before. Split from SetResearchPredictorDegraded because a Pass has exactly one ResultPath and SetResearchPredictorDegraded's is the family boolean CheckGateDegradedNotify selects the completion notifier off; the two are different axes (family -> which email, summary -> the terminal cause) and collapsing them would lose the accumulation across families that a multi-degraded run needs. Last-write-wins if a later stage also degrades \u2014 same convention step_function_daily.json documents on SetDaemonDegradedFlag; every family boolean set on the way stays on the record, so the notifier still names the full combination. Deliberately carries NO stage_error: each of these setters is reachable from BOTH a Catch (which writes $.<stage>_error) and a Choice (which does not), so an unguarded stage_error.$ would throw States.Runtime on the Choice path \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. The underlying exception stays on the execution record at its own path and is named by the completion notifier. | alpha-engine-config-I7812: Next is now CheckScannerResourceKillReason rather than CheckSkipBacktester. The continuation is unchanged in substance \u2014 that Choice's Default is CheckSkipBacktester and its one rule only overwrites this reason with a more specific one. The fork sits AFTER this state, not before SetResearchPredictorDegraded, so the I6891 setter -> its-own-summary convention (tests/sf_degraded_summary_helpers.py::assert_degraded_continuation) still holds for the family flag.",
       "Parameters": {
         "degraded": true,
         "reason": "weekly_research_predictor_branch_fail_open",
         "run_date.$": "$.run_date"
       },
       "ResultPath": "$.degraded_summary",
-      "Next": "CheckSkipBacktester"
+      "Next": "CheckScannerResourceKillReason"
     },
     "SetParityDegradedSummary": {
       "Type": "Pass",

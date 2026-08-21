@@ -164,7 +164,19 @@ def test_branch_a_owner_catch_routes_through_a_mark_state(branch_a, owner):
     all four eval-judge submit/poll/process states share
     MarkEvalJudgeDegraded — the pre-existing convergence on EvalRollingMean
     is unchanged, only detoured through the flag-setter)."""
-    (catch,) = branch_a[owner]["Catch"]
+    catches = branch_a[owner]["Catch"]
+    # alpha-engine-config-I7812: Scanner carries a SECOND, EARLIER Catch for
+    # States.Timeout / Lambda.Unknown — a resource kill is not a domain failure
+    # and must not fold into this generic fail-open (sf-pipeline-policy.md §3);
+    # it is asserted in tests/test_sf_scanner_resource_kill_i7812.py. Every
+    # owner's LAST catch is still the States.ALL fail-open this test owns, and
+    # no other owner may grow a second one without a declared reason.
+    assert len(catches) == (2 if owner == "Scanner" else 1), (
+        f"{owner} has {len(catches)} Catch entries; only Scanner has a declared "
+        "resource-kill fork (alpha-engine-config-I7812)"
+    )
+    catch = catches[-1]
+    assert catch["ErrorEquals"] == ["States.ALL"]
     assert catch["Next"].startswith("Mark") and catch["Next"].endswith("Degraded")
     assert catch["Next"] in branch_a
     assert branch_a[catch["Next"]]["ResultPath"] == "$.research_degraded_local"
@@ -296,7 +308,16 @@ def test_set_research_predictor_degraded_shape(states):
     assert st["Type"] == "Pass"
     assert st["Result"] is True
     assert st["ResultPath"] == "$.research_predictor_degraded"
-    assert_degraded_continuation(states, "SetResearchPredictorDegraded", "CheckSkipBacktester")
+    # alpha-engine-config-I7812: the family flag still routes through its own
+    # summary; that summary now continues into the resource-kill reason fork,
+    # whose Default is the unchanged CheckSkipBacktester.
+    assert_degraded_continuation(
+        states, "SetResearchPredictorDegraded", "CheckScannerResourceKillReason"
+    )
+    fork = states["CheckScannerResourceKillReason"]
+    assert fork["Type"] == "Choice"
+    assert fork["Default"] == "CheckSkipBacktester"
+    assert states["SetScannerResourceKillDegradedSummary"]["Next"] == "CheckSkipBacktester"
 
 
 def test_only_set_research_predictor_degraded_writes_the_flag(states):
