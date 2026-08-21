@@ -1,0 +1,49 @@
+{
+  "$comment": "SF-level consumer contract for the staged Step Function DEFINITIONS this repo's deploy uploads to S3 (alpha-engine-config-I7927; M0 rule: producer/consumer contract at birth, filed here at the moment the artifact acquired a second, trading-critical consumer). PRODUCER: infrastructure/deploy-infrastructure.sh, step 2 — it stamps '[git:<sha>] ' onto each definition's top-level Comment and uploads EXACTLY the bytes it then feeds to update-state-machine, so the S3 copy and the live definition are written from one source in one run. CONSUMERS: (1) CloudFormation, via DefinitionS3Location, on stack-create or resource replacement; (2) infrastructure/step-functions/check-definition-drift.py, the three-way repo/live/S3 drift backstop; (3) NEW as of I7927 — crucible-predictor inference/deploy_drift.py::_fetch_s3_definition, the preopen and postclose DeployDriftCheck probe, which reads these objects to obtain the EXPECTED definition and the expected deploy SHA without calling api.github.com. That third consumer is why this contract exists: DeployDriftGate halts the trading day when it cannot reach a verdict, so the key names below are now trading-critical, and changing one in the deploy would silently take the probe off its in-region source and back onto GitHub with nothing failing. ENFORCED BY tests/test_sf_definition_s3_consumer_contract.py, which pins this file against deploy-infrastructure.sh's actual upload lines.",
+  "contract_id": "sf_definition_s3-1.0.0",
+  "bucket": "alpha-engine-research",
+  "producer": {
+    "script": "infrastructure/deploy-infrastructure.sh",
+    "step": "2. Stamp SF definitions with git SHA + upload to S3",
+    "stamp": "The top-level `Comment` is rewritten to `[git:<sha>] <original>`.rstrip() before upload. The same stamped bytes are passed to update-state-machine in step 3 and the same <sha> is applied as the CloudFormation stack's `git-sha` tag in step 4, so all three artifacts name one deploy.",
+    "key_rule": "The S3 key is the definition's own repo path, verbatim. The consumers rely on that identity rather than on a separate mapping, so the two never need separate upkeep."
+  },
+  "definitions": [
+    {
+      "pipeline": "ne-weekly-freshness-pipeline",
+      "repo_path": "infrastructure/step_function.json",
+      "s3_key": "infrastructure/step_function.json",
+      "drift_probe_consumer": false,
+      "note": "Stamp semantics only in the drift probe — no market-open deadline, so a lost weekly run costs a rerun rather than a session."
+    },
+    {
+      "pipeline": "ne-preopen-trading-pipeline",
+      "repo_path": "infrastructure/step_function_daily.json",
+      "s3_key": "infrastructure/step_function_daily.json",
+      "drift_probe_consumer": true,
+      "note": "TRADING-CRITICAL. crucible-predictor _SF_DEFINITION_PATHS maps this pipeline to this exact path and reads s3://alpha-engine-research/<that path>. DeployDriftGate halts on a verdict it cannot reach."
+    },
+    {
+      "pipeline": "ne-postclose-trading-pipeline",
+      "repo_path": "infrastructure/step_function_eod.json",
+      "s3_key": "infrastructure/step_function_eod.json",
+      "drift_probe_consumer": true
+    },
+    {
+      "pipeline": "alpha-engine-groom-dispatch",
+      "repo_path": "infrastructure/step_function_groom.json",
+      "s3_key": "infrastructure/step_function_groom.json",
+      "drift_probe_consumer": false
+    }
+  ],
+  "consumer": {
+    "repo": "nousergon/crucible-predictor",
+    "symbol": "inference/deploy_drift.py::_fetch_s3_definition",
+    "reads": [
+      "the canonicalised definition body, as the EXPECTED definition for sf_drift",
+      "the `[git:<sha>]` stamp inside the body, as the EXPECTED deploy SHA for cf_drift and for asserting the S3 copy describes the live machine"
+    ],
+    "missing_input_behavior": "Falls back to the raw.githubusercontent comparison, then to the stamp verdict. With no expectation obtainable at all, sf_drift and cf_drift are OMITTED and DeployDriftGate's IsPresent guard halts — fail closed on unknown, never a defaulted false (alpha-engine-config-I7048, Brian ruling 2026-08-09 config#6615)."
+  },
+  "change_rule": "Renaming or re-prefixing any s3_key above, or dropping the Comment stamp, breaks the preopen probe's in-region source SILENTLY — it degrades to the GitHub path, which is exactly the dependency I7927 removed, and nothing fails until the morning GitHub is down. Change this file in the same commit, or not at all."
+}
