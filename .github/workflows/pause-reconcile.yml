@@ -104,7 +104,7 @@ jobs:
       # shape, every call site). Same pin as requirements.txt, for the reason
       # deploy-infrastructure.yml states.
       - name: Install nousergon-lib (envelope builder for the console row)
-        run: pip install "nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.78"
+        run: pip install "nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.79"
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3

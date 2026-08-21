@@ -34,6 +34,8 @@ jobs:
     name: Stamp SF + CF with main HEAD
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      blast_radius_message: ${{ steps.blast_radius.outputs.message }}
 
     steps:
       - name: Checkout
@@ -67,7 +69,7 @@ jobs:
         # those are for other subsystems; alerts.publish needs none of them).
         # Same pin as requirements.txt so this step's nousergon_lib.alerts
         # behavior never drifts from the rest of the repo's alerting.
-        run: pip install "nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.78"
+        run: pip install "nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.79"
 
       - name: Verify SF definitions match live + S3-staged copies (config#2391)
         run: python3 infrastructure/step-functions/check-definition-drift.py
@@ -79,8 +81,38 @@ jobs:
           deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
           deploy_workflow: deploy-infrastructure.yml
 
+      # alpha-engine-config-I7800: computed unconditionally (always()) so it
+      # runs on both a clean deploy (harmless, unused) and a failure (visible
+      # in this job's own log/output either way). Pure stdlib
+      # (datetime/zoneinfo) — no pip install, so it can't itself fail on a
+      # dependency problem and mask the real deploy failure this step exists
+      # to annotate. NOT yet threaded into notify-main-failure's Telegram
+      # alert (see that job's comment) — a follow-up PR wires
+      # `blast_radius_message` in once nousergon-lib-PR343 merges and this
+      # job's `outputs.blast_radius_message` (still declared below) gets a
+      # safe main-SHA-pinned consumer.
+      - name: Compute blast radius (I7800)
+        id: blast_radius
+        if: always()
+        run: |
+          MSG="$(python3 infrastructure/deploy_blast_radius.py --message-only)"
+          echo "message<<BLASTRADIUS_EOF" >> "$GITHUB_OUTPUT"
+          echo "$MSG" >> "$GITHUB_OUTPUT"
+          echo "BLASTRADIUS_EOF" >> "$GITHUB_OUTPUT"
+          echo "$MSG"
+
   # Alert (Telegram) on genuine post-merge failure of this workflow on the
   # default branch. Reusable workflow + transport in nousergon-lib. config#1128.
+  #
+  # alpha-engine-config-I7800: deliberately pinned to the SAME merged main SHA
+  # this job used before this PR (unchanged) — NOT to nousergon-lib-PR343's
+  # branch commit. That branch commit becomes unreachable and garbage-
+  # collectable the moment PR343 is squash-merged (this org squash-merges with
+  # delete_branch_on_merge=true), which would silently break the ONE workflow
+  # whose job is to notify when something else already failed. Threading
+  # blast_radius_message through here is deliberately deferred to a follow-up
+  # PR opened after nousergon-lib-PR343 merges and re-pins this line to the
+  # resulting main SHA — this PR carries no reference to an unmerged commit.
   notify-main-failure:
     needs: [deploy-infrastructure]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
