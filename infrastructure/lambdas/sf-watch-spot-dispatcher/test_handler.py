@@ -127,17 +127,37 @@ class _FakeScheduler:
 
 
 class _FakeSfn:
-    def __init__(self, executions=None, error=None):
+    def __init__(self, executions=None, error=None, terminal_states=None, history_error=None):
         self.calls = []
+        self.history_calls = []
         # newest-first, mirroring the real ListExecutions ordering.
         self.executions = list(executions or [])
         self.error = error
+        # execution ARN -> the state it terminated at. Anything not named
+        # here answers with a real workload state, so an execution a test
+        # does not speak about reads as a genuine run (I8045).
+        self.terminal_states = dict(terminal_states or {})
+        self.history_error = history_error
 
     def list_executions(self, **kw):
         self.calls.append(kw)
         if self.error is not None:
             raise self.error
         return {"executions": self.executions}
+
+    def get_execution_history(self, **kw):
+        self.history_calls.append(kw)
+        if self.history_error is not None:
+            raise self.history_error
+        assert kw.get("reverseOrder") is True, (
+            "the terminal state must be read from the REVERSED history, or a "
+            "long execution's terminal falls off the first page"
+        )
+        name = self.terminal_states.get(kw["executionArn"], "WriteCompletionMarker")
+        return {"events": [
+            {"type": "ExecutionSucceeded"},
+            {"type": "SucceedStateEntered", "stateEnteredEventDetails": {"name": name}},
+        ]}
 
 
 class _FakeContext:
@@ -1053,3 +1073,110 @@ def test_non_drill_dispatch_carries_no_drill_tag_and_is_drill_false(monkeypatch)
     assert "sf-watch-drill" not in calls["extra_tags"]
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
     assert 'export SF_IS_DRILL="false"' in cmd
+
+
+# ── alpha-engine-config-I8045 — a designed skip is not a recovery ─────────
+#
+# `ne-weekly-freshness-pipeline`'s cron fires THU-SAT and the run-day gate
+# self-selects the one correct day. Captured live 2026-08-21: the 08-20 and
+# 08-21 scheduled executions both terminated SUCCEEDED in 3.5s / 5.7s at
+# `WeeklyRunDaySkip`, entering five states and dispatching nothing.
+#
+# The deferred path re-checks the state machine minutes-to-hours after a real
+# failure — precisely the window a THU/FRI gate-out lands in. Reading it as
+# "recovered" stands the repair dispatch down and leaves the real failure
+# unrepaired, while reporting success.
+
+_WEEKLY_EXEC = "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline"
+
+
+def test_a_run_day_gate_out_is_not_a_recovery_and_the_repair_still_dispatches(monkeypatch):
+    launched = []
+    idx = _load(
+        monkeypatch,
+        launch_impl=lambda types_, subnets, **kw: launched.append(True) or "i-new",  # noqa: E731
+        env={"SF_WATCH_DISPATCH_ENABLED": "true"},
+        sfn=_FakeSfn(
+            executions=[
+                {"executionArn": f"{_WEEKLY_EXEC}:gate-out", "status": "SUCCEEDED"},
+                {"executionArn": f"{_WEEKLY_EXEC}:run-1", "status": "FAILED"},
+            ],
+            terminal_states={f"{_WEEKLY_EXEC}:gate-out": "WeeklyRunDaySkip"},
+        ),
+    )
+    out = idx.handler(_event(defer_generation=1), _FakeContext())
+    assert out.get("reason") != "recovered", (
+        "a 3-second WeeklyRunDaySkip must never stand the repair dispatch down"
+    )
+    assert launched == [True], "the repair box must still launch"
+    # And the dispatch must NOT be retargeted at the gate-out — a skip has no
+    # failure for the repair agent to diagnose.
+    (sent,) = idx._test_ssm.sent
+    assert "gate-out" not in json.dumps(sent)
+
+
+def test_a_genuine_success_is_still_a_recovery(monkeypatch):
+    """The inverse failure. Treating every SUCCEEDED as a skip would launch a
+    repair box against a healthy pipeline on every deferred invocation."""
+    launched = []
+    idx = _load(
+        monkeypatch,
+        launch_impl=lambda types_, subnets, **kw: launched.append(True) or "i-new",  # noqa: E731
+        env={"SF_WATCH_DISPATCH_ENABLED": "true"},
+        sfn=_FakeSfn(
+            executions=[{"executionArn": f"{_WEEKLY_EXEC}:real", "status": "SUCCEEDED"}],
+            terminal_states={f"{_WEEKLY_EXEC}:real": "WriteCompletionMarker"},
+        ),
+    )
+    out = idx.handler(_event(defer_generation=1), _FakeContext())
+    assert out["reason"] == "recovered"
+    assert launched == []
+
+
+def test_the_shell_run_terminal_is_also_a_declared_skip(monkeypatch):
+    """`ShellRunComplete` is the Friday-PM preflight-only terminal: green,
+    no completion marker, no artifacts. Also not a recovery."""
+    launched = []
+    idx = _load(
+        monkeypatch,
+        launch_impl=lambda types_, subnets, **kw: launched.append(True) or "i-new",  # noqa: E731
+        env={"SF_WATCH_DISPATCH_ENABLED": "true"},
+        sfn=_FakeSfn(
+            executions=[
+                {"executionArn": f"{_WEEKLY_EXEC}:shell", "status": "SUCCEEDED"},
+                {"executionArn": f"{_WEEKLY_EXEC}:run-1", "status": "FAILED"},
+            ],
+            terminal_states={f"{_WEEKLY_EXEC}:shell": "ShellRunComplete"},
+        ),
+    )
+    idx.handler(_event(defer_generation=1), _FakeContext())
+    assert launched == [True]
+
+
+def test_a_broken_history_read_degrades_to_the_pre_i8045_reading(monkeypatch):
+    """Fail-safe posture, stated. A broken check must not invent a repair
+    dispatch; it degrades to treating the success as real, which is exactly
+    what this code did before, and logs."""
+    launched = []
+    idx = _load(
+        monkeypatch,
+        launch_impl=lambda types_, subnets, **kw: launched.append(True) or "i-new",  # noqa: E731
+        env={"SF_WATCH_DISPATCH_ENABLED": "true"},
+        sfn=_FakeSfn(
+            executions=[{"executionArn": f"{_WEEKLY_EXEC}:x", "status": "SUCCEEDED"}],
+            history_error=RuntimeError("AccessDenied"),
+        ),
+    )
+    out = idx.handler(_event(defer_generation=1), _FakeContext())
+    assert out["reason"] == "recovered"
+    assert launched == []
+
+
+def test_only_one_extra_api_call_and_only_on_a_succeeded_latest(monkeypatch):
+    """A RUNNING or FAILED latest must not pay for a history read."""
+    idx = _load(
+        monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"},
+        sfn=_FakeSfn(executions=[{"executionArn": f"{_WEEKLY_EXEC}:r", "status": "RUNNING"}]),
+    )
+    idx.handler(_event(defer_generation=1), _FakeContext())
+    assert idx._test_sfn.history_calls == []
