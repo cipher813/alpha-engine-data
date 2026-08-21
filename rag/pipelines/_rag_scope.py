@@ -59,9 +59,13 @@ account-wide 5 req/min, for names no arm decides on.
       → attractiveness_top_60   this scope, and Think Tank's window
         → attractiveness_top_20 the predictor's scored cut
 
-``scanner_candidates`` is still emitted by the producer — it remains the
-incumbent challenger arm and the week-over-week churn baseline
-(alpha-engine-config-I4983). Only its role as the *corpus scope* changed.
+``scanner_candidates`` was retired outright (alpha-engine-config-I7818,
+crucible-research-PR697/crucible-dashboard-PR738): the producer no longer
+emits it. The live scanner cut is ``scanner_champion_60`` (basis=
+``scanner_champion_rank``, the sector teams' input set — renamed from
+``scanner_gate_baseline_60``, itself the successor to ``scanner_candidates``
+per I7578); it plays no role here, since this module's scope is
+``attractiveness_top_60`` regardless of which cut is the scanner's champion.
 
 WHY NOT THE TOP-20 PREDICTOR CUT. Scoping the corpus to 20 would starve the
 Think Tank challenger, whose input is the 60, and make the champion/challenger
