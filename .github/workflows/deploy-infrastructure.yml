@@ -82,10 +82,15 @@ jobs:
           deploy_workflow: deploy-infrastructure.yml
 
       # alpha-engine-config-I7800: computed unconditionally (always()) so it
-      # runs on both a clean deploy (harmless, unused) and a failure (feeds
-      # notify-main-failure below). Pure stdlib (datetime/zoneinfo) — no pip
-      # install, so it can't itself fail on a dependency problem and mask the
-      # real deploy failure this step exists to annotate.
+      # runs on both a clean deploy (harmless, unused) and a failure (visible
+      # in this job's own log/output either way). Pure stdlib
+      # (datetime/zoneinfo) — no pip install, so it can't itself fail on a
+      # dependency problem and mask the real deploy failure this step exists
+      # to annotate. NOT yet threaded into notify-main-failure's Telegram
+      # alert (see that job's comment) — a follow-up PR wires
+      # `blast_radius_message` in once nousergon-lib-PR343 merges and this
+      # job's `outputs.blast_radius_message` (still declared below) gets a
+      # safe main-SHA-pinned consumer.
       - name: Compute blast radius (I7800)
         id: blast_radius
         if: always()
@@ -99,17 +104,17 @@ jobs:
   # Alert (Telegram) on genuine post-merge failure of this workflow on the
   # default branch. Reusable workflow + transport in nousergon-lib. config#1128.
   #
-  # alpha-engine-config-I7800: pinned to a commit on nousergon-lib's
-  # feat/notify-message-override-i7800 branch (predates that branch's merge
-  # to main — GitHub resolves a workflow_call ref from any pushed commit, not
-  # just main history, so this works regardless of merge order). Re-pin to
-  # nousergon-lib@main HEAD once nousergon-lib-PR<TBD> (the notify-ci-
-  # failure.yml `blast_radius_message` input) merges — tracked in this PR's
-  # body, not left as a silent follow-up.
+  # alpha-engine-config-I7800: deliberately pinned to the SAME merged main SHA
+  # this job used before this PR (unchanged) — NOT to nousergon-lib-PR343's
+  # branch commit. That branch commit becomes unreachable and garbage-
+  # collectable the moment PR343 is squash-merged (this org squash-merges with
+  # delete_branch_on_merge=true), which would silently break the ONE workflow
+  # whose job is to notify when something else already failed. Threading
+  # blast_radius_message through here is deliberately deferred to a follow-up
+  # PR opened after nousergon-lib-PR343 merges and re-pins this line to the
+  # resulting main SHA — this PR carries no reference to an unmerged commit.
   notify-main-failure:
     needs: [deploy-infrastructure]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@a5394d3754c1b6bbf4365a29808f191bbd37cd50 # feat/notify-message-override-i7800 (alpha-engine-config-I7800) — re-pin to main once nousergon-lib-PR<TBD> merges
-    with:
-      blast_radius_message: ${{ needs.deploy-infrastructure.outputs.blast_radius_message }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
     secrets: inherit
