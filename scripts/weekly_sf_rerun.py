@@ -277,7 +277,19 @@ STAGES: tuple[Stage, ...] = (
         # $.research_degraded_local (folded into the top-level
         # $.research_predictor_degraded post-join) without changing the
         # continuation.
-        degraded_witness=frozenset({"MarkScannerDegraded"}),
+        # alpha-engine-config-I7812: a Scanner RESOURCE KILL (States.Timeout /
+        # Lambda.Unknown) that is allowed to fail-open — i.e. the run's
+        # universe_membership pointer was proven fresh before the kill —
+        # continues to the SAME CheckSkipRegimeSubstrate convergence point via
+        # ScannerResourceKillDegraded, so it is a degraded witness exactly like
+        # MarkScannerDegraded. The two HALT routes (ScannerResourceKillHalt,
+        # ScannerMembershipProbeUnknownHalt) are deliberately NOT witnesses: they
+        # fail the branch, and a rerun must re-run the scan.
+        degraded_witness=frozenset({
+            "MarkScannerDegraded",
+            "ScannerResourceKillDegraded",
+            "SetScannerResourceKillDegradedSummary",
+        }),
     ),
     Stage(
         "regime_substrate", "skip_regime_substrate",
@@ -616,10 +628,15 @@ STAGES: tuple[Stage, ...] = (
         # (the I6055 trap). Skipping it lands on CheckShellRunNotify, so this
         # row shares director's inverted-convention exception.
         frozenset({"ScannerLeaderboardComplete"}),
+        # alpha-engine-config-I7812 adds the resource-kill fork: same fail-open,
+        # same PublishScannerLeaderboardDegraded, only the degraded_summary
+        # reason differs — so both of its states witness the same stage.
         degraded_witness=frozenset({
             "ScannerLeaderboardDegraded",
             "SetScannerLeaderboardDegradedSummary",
             "PublishScannerLeaderboardDegraded",
+            "ScannerLeaderboardResourceKill",
+            "SetScannerLeaderboardResourceKillSummary",
         }),
     ),
 )

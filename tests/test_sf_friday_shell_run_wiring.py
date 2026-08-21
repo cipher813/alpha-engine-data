@@ -1107,7 +1107,13 @@ class TestConsolidatedNotify:
         leaf = states["ScannerLeaderboard"]
         assert leaf["Next"] == "ScannerLeaderboardComplete"
         assert states["ScannerLeaderboardComplete"]["Next"] == "CheckShellRunNotify"
-        assert all(c["Next"] == "ScannerLeaderboardDegraded" for c in leaf["Catch"])
+        # alpha-engine-config-I7812: a resource kill forks one state earlier so
+        # the terminal cause can name it; both routes set the same
+        # $.scanner_leaderboard_degraded flag and converge on the same alert.
+        assert [c["Next"] for c in leaf["Catch"]] == [
+            "ScannerLeaderboardResourceKill",
+            "ScannerLeaderboardDegraded",
+        ]
         assert_degraded_continuation(
             states, "ScannerLeaderboardDegraded", "PublishScannerLeaderboardDegraded"
         )
