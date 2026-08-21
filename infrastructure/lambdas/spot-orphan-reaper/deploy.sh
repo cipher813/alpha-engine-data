@@ -71,13 +71,8 @@ for arg in "$@"; do
   esac
 done
 
-run() {
-  if $DRY_RUN; then
-    echo "DRY: $*"
-  else
-    "$@"
-  fi
-}
+# shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
+source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 
 # ----- 0. Scratch dir + validate handler syntax -----------------------------
 # PKG (the Lambda-zip staging dir) is created up front; the shared handler-
@@ -161,6 +156,7 @@ if $BOOTSTRAP; then
       --environment "${PROD_ENV}" \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
+    verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${ZIP}"
   fi
 
   # EventBridge hourly trigger
@@ -223,6 +219,8 @@ if ! $BOOTSTRAP; then
       --function-name "${FUNCTION_NAME}" \
       --region "${REGION}"
   fi
+
+  verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${ZIP}"
 fi
 
 echo "✓ Code deployed."

@@ -106,13 +106,8 @@ for arg in "$@"; do
   esac
 done
 
-run() {
-  if $DRY_RUN; then
-    echo "DRY: $*"
-  else
-    "$@"
-  fi
-}
+# shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
+source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 
 # ----- TARGET_FUNCTIONS drift audit (config#862) ----------------------------
 # Read-only. List live alpha-engine-* Lambdas, subtract the recursion-guard
@@ -243,6 +238,7 @@ if $BOOTSTRAP; then
       --environment 'Variables={CHANGELOG_BUCKET=alpha-engine-research,CHANGELOG_STRUCTURED_PREFIX=changelog/entries,CHANGELOG_QUARANTINE_PREFIX=changelog/quarantine}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
+    verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${ZIP}"
   fi
 fi
 
@@ -269,6 +265,8 @@ if ! $BOOTSTRAP; then
       --function-name "${FUNCTION_NAME}" \
       --region "${REGION}"
   fi
+
+  verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${ZIP}"
 
   echo "Ensuring env config..."
   run aws lambda update-function-configuration \
