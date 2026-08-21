@@ -138,6 +138,28 @@ _CLI_SOURCE_DYNAMIC = re.compile(r"""--source[\s'\",]+[{$]""")
 # every invocation died on an argparse error the callers swallowed.
 MISSING_SOURCE_SENTINEL = "<missing --source>"
 
+# THE SCANNER MUST NOT SCAN ITSELF (alpha-engine-config-I7896, caught by this
+# guard on its OWN first CI run — nousergon-data-PR1479, run 32436244797).
+#
+# In alpha-engine-config this file was never in the scanned set, so it never
+# came up. Here it is: nousergon-data is one of the nine repos the fleet sweep
+# walks. And these two modules are the one place in the fleet whose JOB is to
+# spell out every publish shape — the docstrings carry
+# `alerts.publish(source="...")`, `--source X`, and a bare `python -m
+# krepis.alerts publish` with no --source as illustrations. The scanner read
+# its own examples as live emitters and reported three: `...`, `X`, and
+# `<missing --source>`.
+#
+# The exclusion is BY EXACT RELATIVE PATH, not by filename and not by "any
+# file that talks about krepis.alerts". A rule of the second kind would blind
+# the scanner to a real emitter that happens to mention the CLI in a comment
+# — the same over-broad instinct that made a box_health.sh PROSE comment
+# false-positive as a sourceless invocation on this check's first live run.
+SELF_EXCLUDED_RELPATHS: frozenset[str] = frozenset({
+    "infrastructure/overseer/alert_class_registry_drift.py",
+    "infrastructure/overseer/alert_class_pr_guard.py",
+})
+
 
 def _find_cli_source_literals(file_text: str) -> tuple[set[str], int]:
     """CLI-shaped invocations: (literal sources found, count with no --source).
@@ -264,6 +286,12 @@ def _scan_repo(repo_root: Path, patterns: list[tuple[str, str, bool]]) -> dict[s
 
         # Skip test files — test source literals are fake/throwaway values.
         if _is_test_file(scan_file, repo_root):
+            continue
+
+        # Skip this scanner and its PR-time guard: their docstrings spell out
+        # every publish shape by design, and the scanner read those examples
+        # as live emitters. See SELF_EXCLUDED_RELPATHS above.
+        if scan_file.relative_to(repo_root).as_posix() in SELF_EXCLUDED_RELPATHS:
             continue
 
         try:

@@ -15,11 +15,11 @@ name: alert-class-pr-guard
 # research:cut_promotion (crucible-research-PR673 -> alpha-engine-config-I7876)
 # and aggregate_costs_handler:corpus_stats (alpha-engine-config-I7896).
 #
-# WHAT THIS IS. A reusable workflow (`workflow_call`) that every emitter repo
-# calls from its own pull_request CI, plus this repo's own pull_request
-# trigger. It runs infrastructure/overseer/alert_class_pr_guard.py against the
-# CALLER's checkout at the PR's base and head and fails only on the DELTA --
-# pre-existing drift never blocks an unrelated PR. This extends the mechanism
+# WHAT THIS IS. This repo's own copy of a check that each of the nine emitter
+# repos carries: check this repo out, run
+# infrastructure/overseer/alert_class_pr_guard.py against the graded repo at
+# the PR's base and head, fail only on the DELTA -- pre-existing drift never
+# blocks an unrelated PR. This extends the mechanism
 # alpha-engine-config-I7860 / -PR7871 established for the fleet observability
 # registry ("a PR that adds an unregistered component fails its OWN check") to
 # the second registry with the same cross-repo shape.
@@ -52,6 +52,18 @@ name: alert-class-pr-guard
 # second, and an unavailable lookup fails the guard as UNMEASURED -- it never
 # degrades into "no violation". Safe precisely because of (1).
 #
+# WHY NOT A REUSABLE WORKFLOW. `uses: nousergon/nousergon-data/.github/
+# workflows/...@main` would have collapsed each caller to three lines, but
+# `@main` is a MUTABLE ref and the fleet action-pin guard rejects it
+# (measured 2026-08-20 on nousergon-lib-PR341: "is pinned to `main`, a mutable
+# ref"). Pinning to a SHA instead would freeze every caller at one revision of
+# the guard and demand nine follow-up PRs after every change here -- and the
+# SHA would not exist until this PR merged. Checking this repo out as DATA and
+# running the script keeps ONE implementation, keeps every caller on the
+# current guard, and pins only SHA-pinned actions. It is the same shape
+# alpha-engine-config's pr-guard-observability.yml already uses against
+# nous-ergon-ops (alpha-engine-config-I7860).
+#
 # runs-on: ubuntu-latest, deliberately NOT the CI_RUNNER_MODE codebuild
 # ternary. Every repo that calls this workflow is PUBLIC, and public repos get
 # unlimited free GitHub-hosted Actions minutes; routing them to self-hosted
@@ -59,7 +71,6 @@ name: alert-class-pr-guard
 
 on:
   pull_request:
-  workflow_call:
 
 permissions:
   contents: read

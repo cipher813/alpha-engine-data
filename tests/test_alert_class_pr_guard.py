@@ -385,3 +385,48 @@ def test_class_name_is_always_schema_legal():
 # BOTH checkouts are present, so it is the only place the assertion can HARD
 # FAIL rather than skip. A permanently-skipped test here would be a component
 # emitting nothing, rendered green.
+
+
+# ── the scanner must not scan itself ────────────────────────────────────────
+
+
+def test_the_scanner_and_guard_modules_are_excluded_from_the_scan(fleet):
+    """Caught by this guard on its OWN first CI run (nousergon-data-PR1479,
+    run 32436244797): it reported `...`, `X` and `<missing --source>` as live
+    emitters, all of them ILLUSTRATIONS in these two modules' docstrings. In
+    alpha-engine-config the scanner was never in the scanned set; here it is.
+    """
+    repo = fleet["registry"]
+    for rel in sorted(d.SELF_EXCLUDED_RELPATHS):
+        dst = repo / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text((_OVERSEER / Path(rel).name).read_text(encoding="utf-8"))
+    _commit(repo, "the scanner and guard themselves")
+
+    assert _run([
+        "--repo", "nousergon-data", "--repo-root", str(repo),
+        "--base", "HEAD~1", "--head", "HEAD", "--no-pending-tolerance",
+    ]) == 0
+
+
+def test_the_self_exclusion_is_by_exact_path_not_by_filename(fleet, capsys):
+    """A rule keyed on the basename — or worse, on 'mentions krepis.alerts' —
+    would blind the scanner to a real emitter somewhere else in the tree. Only
+    those two exact relative paths are exempt."""
+    repo = fleet["emitter"]
+    impostor = repo / "lambda" / "alert_class_pr_guard.py"
+    _emitter(impostor, "impostor:not_exempt")
+    _commit(repo, "same filename, different path")
+
+    assert _run([
+        "--repo", "crucible-research", "--repo-root", str(repo),
+        "--playbooks", str(fleet["playbooks"]),
+        "--base", fleet["base"], "--head", "HEAD", "--no-pending-tolerance",
+    ]) == 1
+    assert "impostor:not_exempt" in capsys.readouterr().err
+
+
+def test_the_self_exclusion_names_files_that_actually_exist():
+    """A path that stops resolving is an exemption nobody notices went stale."""
+    for rel in d.SELF_EXCLUDED_RELPATHS:
+        assert (_OVERSEER.parent.parent / rel).is_file(), rel
