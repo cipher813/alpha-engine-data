@@ -131,3 +131,38 @@ def test_krepis_pin_does_not_need_the_deploy_role_to_list_aliases() -> None:
         f"0.59.24 or the deploy fails on lambda:ListAliases and leaves a "
         f"PARTIAL deploy (alpha-engine-config-I8030)"
     )
+
+
+def test_deploy_workflow_krepis_floor_matches_the_defer_publish_fix() -> None:
+    """`deploy.sh` runs on the GHA runner, not inside the Docker image, so
+    `python3 -m krepis.aws remove-lambda-env` resolves whatever krepis
+    `.github/workflows/deploy.yml` installs — requirements.txt's exact pin
+    (tested above) governs the Lambda image and does not reach this call.
+
+    Before this test the workflow floor was `krepis>=0.6.0`: it "worked"
+    only because an unbounded `pip install` resolves to the latest published
+    release, not because the floor stated the requirement — the same "luck,
+    not a control" shape crucible-research-PR716 found on its own runner
+    floor for alpha-engine-config-I8037. A pin-resolution change (a new
+    dependency capping krepis lower, or a private index serving stale
+    releases) would silently reintroduce the PARTIAL deploy with no local
+    signal, which is why the floor is pinned in a test rather than left to
+    the installer's default behavior.
+    """
+    workflow = (
+        Path(__file__).resolve().parents[1] / ".github" / "workflows" / "deploy.yml"
+    )
+    text = workflow.read_text(encoding="utf-8")
+    line = next(
+        ln
+        for ln in text.splitlines()
+        if "pip install" in ln and "krepis" in ln
+    )
+    version = line.split("krepis>=", 1)[1].split('"', 1)[0].strip()
+    parts = tuple(int(p) for p in version.split("."))
+    assert parts >= (0, 59, 24), (
+        f"deploy.yml's runner krepis floor is {version}; the runner also "
+        f"executes krepis.aws remove-lambda-env and needs >= 0.59.24 or a "
+        f"resolvable-lower install silently reintroduces the PARTIAL "
+        f"deploy (alpha-engine-config-I8030)"
+    )
