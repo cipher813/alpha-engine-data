@@ -130,6 +130,43 @@ else
 fi
 echo "  $FUNCTION_NAME deployed."
 
+# ── Converge the Lambda environment (alpha-engine-config-I7925) ─────────────
+# $FUNCTION_NAME was one of eleven fleet-wide Lambdas carrying a GITHUB_TOKEN
+# set by hand and refreshed by nothing — no repo, IaC file or script here
+# ever wrote this function's environment. That token expired 2026-06-03; on
+# 2026-08-21 a first-party dependency picked it up out of site-packages,
+# sent it to GitHub, got a 401, and halted the preopen trading pipeline
+# (alpha-engine-config-I7924). alpha-engine-predictor-inference
+# (crucible-predictor) was the one of eleven that broke and was fixed first
+# (crucible-predictor-PR535) — this mirrors that same convergence.
+#
+# DENY-LIST, deliberately, not an allow-list: this function carries
+# operator-set flags and provider keys codified nowhere (FMP_API_KEY,
+# FINNHUB_API_KEY, EDGAR_IDENTITY, …), and asserting a complete key set
+# would delete them. The allow-list end state is tracked separately
+# (alpha-engine-config-I7958).
+#
+# Read-modify-write via the shared `krepis.aws remove-lambda-env` CLI — a
+# bare `aws lambda update-function-configuration --environment` REPLACES the
+# whole variable map.
+#
+# `--defer-publish`: this function is alias-pinned (the Saturday SF invokes
+# `${FUNCTION_NAME}:live`, per the header note above) and `publish-version`
+# below snapshots configuration into the version the alias will serve — so
+# the removal must land on $LATEST BEFORE that publish, exactly like the
+# memory/timeout convergence this script already performs. Placed after
+# publish-version it would mutate $LATEST only and be a silent no-op on the
+# alias (L4497).
+# `--missing-ok`: every deploy after the first finds the key already gone.
+LAMBDA_ENV_DENIED_KEYS=(GITHUB_TOKEN)
+
+echo "  Converging Lambda environment (removing denied keys)..."
+aws lambda wait function-updated --function-name "$FUNCTION_NAME" --region "$REGION" 2>/dev/null || sleep 5
+python3 -m krepis.aws remove-lambda-env \
+  --function-name "$FUNCTION_NAME" --region "$REGION" \
+  --defer-publish --missing-ok \
+  "${LAMBDA_ENV_DENIED_KEYS[@]/#/--unset=}"
+
 # Publish version and update 'live' alias
 echo "  Publishing Lambda version..."
 aws lambda wait function-updated --function-name "$FUNCTION_NAME" --region "$REGION" 2>/dev/null || sleep 5
