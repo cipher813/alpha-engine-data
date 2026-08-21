@@ -11,10 +11,27 @@ Background:
   cohort. Friday-Preflight SF couldn't detect this directly because the
   Saturday constituents collector hadn't run yet.
 
-  BUT: Wikipedia's S&P 500/400 lists are the SOURCE OF TRUTH the collector
-  pulls from. We can read Wikipedia DIRECTLY from any Friday-Preflight
-  Lambda + diff against ArcticDB universe, with zero dependency on the
+  The fix: read membership DIRECTLY from any Friday-Preflight Lambda and
+  diff it against the ArcticDB universe, with zero dependency on the
   Saturday collector cadence.
+
+  MEMBERSHIP SOURCE — no longer Wikipedia. Since alpha-engine-config-I2812
+  the ground truth is the SSGA SPDR daily holdings files (SPY / MDY), read
+  through ``collectors.constituents._fetch_constituents``; Wikipedia is
+  retained for GICS sector/sub-industry attestation only. Wikipedia's
+  community-edited pages lag real index changes by weeks in the removal
+  direction, which was the root cause of I2703/I2812. The docstring and the
+  alert text below both said "Wikipedia" long after the source moved —
+  corrected 2026-08-21 under alpha-engine-config-I8094, because an alert
+  that misnames its own upstream sends every triage session to the wrong
+  system first.
+
+  WHAT A HIT ACTUALLY THREATENS. Not ``ResearchPreflight``: that stage
+  checks only ``macro.SPY`` freshness and cannot fail on ticker
+  completeness. The reachable gate is ``fetch_price_data``'s 5% per-ticker
+  error-rate ceiling in crucible-research, so the alert states the observed
+  fraction against that ceiling rather than asserting a failure. See the
+  comment above the message construction.
 
 Usage:
 
@@ -47,6 +64,14 @@ from collectors.constituents import _fetch_constituents
 from features.compute import _SKIP_TICKERS, _is_sector_etf
 
 logger = logging.getLogger(__name__)
+
+# Mirrored from crucible-research
+# `data/fetchers/price_fetcher.py::_MAX_ERR_RATE`. This validator does not
+# import crucible-research (separate repo, no dependency edge), so the value is
+# duplicated deliberately and named here so the drift is greppable from both
+# sides. It is used ONLY to phrase this alert's consequence clause — nothing
+# here gates on it.
+_RESEARCH_MAX_ERR_RATE = 0.05
 
 
 def _open_universe_lib(bucket: str):
@@ -157,15 +182,62 @@ def check_drift(
             f" ... +{len(missing_from_arctic) - 20} more"
             if len(missing_from_arctic) > 20 else ""
         )
+        # The consequence clause names the gate that can ACTUALLY fail on this
+        # input, and the margin it has (alpha-engine-config-I8094).
+        #
+        # It used to say "Saturday SF will likely fail at Research preflight".
+        # Both halves were wrong, and the pairing turned routine index
+        # reconstitution into an overnight-urgency page:
+        #
+        #   * `crucible-research/preflight.py::_check_arcticdb_universe` does
+        #     not look at ticker completeness at all — it asserts `macro.SPY`
+        #     is fresh within 5 trading days. No number of missing
+        #     constituents can fail it.
+        #   * The gate that CAN fail is
+        #     `crucible-research/data/fetchers/price_fetcher.py::fetch_price_data`,
+        #     which raises `PriceFetchError` above `_MAX_ERR_RATE = 0.05`. On
+        #     2026-08-21 the drift was 2 of 903 comparable tickers — 0.2%
+        #     against a 5% ceiling, two orders of magnitude of headroom — and
+        #     the alert still told the reader the pipeline was about to fail.
+        #
+        # So the fraction is computed and stated. A reader deciding whether to
+        # act tonight needs the margin, not an adjective.
+        err_fraction = len(missing_from_arctic) / max(len(comparable_wiki), 1)
+        consequence = (
+            f"Blast radius: {len(missing_from_arctic)} of "
+            f"{len(comparable_wiki)} comparable tickers = {err_fraction:.2%} "
+            f"against the {_RESEARCH_MAX_ERR_RATE:.0%} per-ticker error-rate "
+            f"ceiling in crucible-research "
+            f"data/fetchers/price_fetcher.py::fetch_price_data "
+            f"(_MAX_ERR_RATE). "
+        )
+        if err_fraction > _RESEARCH_MAX_ERR_RATE:
+            consequence += (
+                "OVER the ceiling — Research WILL raise PriceFetchError "
+                "unless the Saturday backfill covers these first."
+            )
+        else:
+            consequence += (
+                "UNDER the ceiling — Research will not hard-fail on this "
+                "alone. weekly_collector.py Phase 1 runs constituents -> "
+                "historical_constituents -> prices.collect -> "
+                "builders.backfill BEFORE ResearchPredictorParallel, and "
+                "prices.collect refreshes any ticker with no parquet, so the "
+                "scheduled Saturday run is expected to absorb this. A ticker "
+                "still missing AFTER that run is the finding worth paging on."
+            )
         message = (
             f"Friday-Preflight constituents drift detected: "
-            f"{len(missing_from_arctic)} Wikipedia-listed S&P ticker(s) "
+            f"{len(missing_from_arctic)} SSGA-listed S&P ticker(s) "
             f"missing from ArcticDB universe "
             f"(threshold={max_stragglers}). "
             f"Missing: {', '.join(preview)}{suffix}. "
-            f"Saturday SF will likely fail at Research preflight unless "
-            f"backfill picks these up. Investigate constituents collector + "
-            f"backfill TOCTOU. See ROADMAP P0 (g) + L1316."
+            f"{consequence} "
+            f"Membership source is the SSGA SPY/MDY daily holdings files "
+            f"(alpha-engine-config-I2812); Wikipedia supplies GICS sector "
+            f"attestation only. Common benign cause: an official index "
+            f"add/rename in the last few sessions. "
+            f"Tracker: alpha-engine-config-I8094."
         )
         try:
             publish_result = alerts.publish(
