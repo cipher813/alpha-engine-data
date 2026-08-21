@@ -271,11 +271,22 @@ def test_non_service_lifecycles_match_the_registry(mod):
 
 def _manifest_with_alarm(watches: dict[str, str] | None = None,
                           alarm_watches: list[str] | None = None,
-                          reason: str = "r") -> dict:
+                          reason: str = "r",
+                          issue: str = "alpha-engine-config-I6984",
+                          re_exam: str = "2999-01-01") -> dict:
+    """A synthetic manifest with one `paused_alarms` entry.
+
+    `issue`/`re_exam` default to a well-formed, far-future declaration
+    (alpha-engine-config-I8047) so a test about the ALARM STATE directions is
+    not also asserting the declaration's shape. Overriding either is how the
+    declaration direction is proven RED — see
+    `test_an_undeclared_owner_is_a_finding_in_the_reconciler` below.
+    """
     m = _manifest(paused=watches or {})
     m["paused_alarms"] = {
         "_why": "prose, must be skipped",
-        "probe-alarm": {"reason": reason, "watches": alarm_watches or []},
+        "probe-alarm": {"reason": reason, "watches": alarm_watches or [],
+                        "issue": issue, "re_exam": re_exam},
     }
     return m
 
@@ -556,3 +567,39 @@ def test_the_run_summary_is_written_by_the_same_invocation_as_the_verdict(mod):
         "the reconciler runs more than once per workflow run; one run, one verdict"
     )
     assert "--markdown" in text and "--github-output" in text
+
+
+def test_an_undeclared_owner_is_a_finding_in_the_reconciler(mod):
+    """The reconciler carries the declaration verdict too — one report, not a
+    second surface a reader has to know to check (alpha-engine-config-I8047)."""
+    m = _manifest_with_alarm(watches={"tick": "ruled off"}, alarm_watches=["tick"],
+                             issue="")
+    findings = _reconcile(
+        mod, manifest=m, rows={},
+        triggers=[{"surface": "events", "name": "tick", "state": "DISABLED"}],
+        alarm_actions_of=lambda name: False,
+    )
+    assert ("alarm-declaration-unowned", "probe-alarm") in [
+        (f["kind"], f["trigger"]) for f in findings]
+
+
+def test_an_undated_declaration_is_a_finding_in_the_reconciler(mod):
+    m = _manifest_with_alarm(watches={"tick": "ruled off"}, alarm_watches=["tick"],
+                             re_exam="soon")
+    findings = _reconcile(
+        mod, manifest=m, rows={},
+        triggers=[{"surface": "events", "name": "tick", "state": "DISABLED"}],
+        alarm_actions_of=lambda name: False,
+    )
+    assert ("alarm-declaration-undated", "probe-alarm") in [
+        (f["kind"], f["trigger"]) for f in findings]
+
+
+def test_a_declared_gap_row_names_its_owner_and_expiry(mod):
+    """The console row is the surface a human reads; a declared gap that does
+    not say what would end it is the prose the ruling replaced."""
+    m = _manifest_with_alarm(watches={"tick": "ruled off"}, alarm_watches=["tick"])
+    rows = mod.declared_alarm_gaps(m)
+    assert rows, "the justified entry must render as a declared gap"
+    assert "alpha-engine-config-I6984" in rows[0]["detail"]
+    assert "2999-01-01" in rows[0]["detail"]
