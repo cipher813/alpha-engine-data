@@ -21,6 +21,19 @@ framework: scanner filter lift, sector team lift, CIO lift, predictor lift,
 execution lift.
 
 Target table: universe_returns in research.db (~900 rows/date, ~47K rows/year).
+
+UNITS -- every ``return_{h}d`` / ``spy_return_{h}d`` / ``sector_etf_return_5d``
+column this collector writes is a **DECIMAL FRACTION** (0.05 = +5%), produced by
+``_pct_return`` = ``close_end / close_start - 1.0`` and rounded to 4dp. The
+``log_*`` columns are natural-log returns.
+
+That matters because a column named ``return_5d`` ALSO exists in
+``score_performance`` in the SAME database, in **2dp PERCENT POINTS** -- measured
+range [-20.42, 22.70] against [-0.2042, 0.2270] for the same quantity in the
+long-format ``score_performance_outcomes`` store, i.e. exactly 100x. Two columns,
+one bare name, opposite conventions (alpha-engine-config-I7936). A consumer that
+cannot tell which one it received must raise rather than coerce; see
+``crucible-backtester/analysis/shadow_book.py``.
 """
 
 from __future__ import annotations
@@ -58,7 +71,31 @@ _SECTOR_TO_ETF = {
 
 _ETF_TO_SECTOR = {v: k for k, v in _SECTOR_TO_ETF.items()}
 _SECTOR_ETFS = set(_SECTOR_TO_ETF.values())
-_SKIP_TICKERS = _SECTOR_ETFS | {"SPY", "VIX", "^VIX", "^TNX", "^IRX"}
+
+# Nasdaq / NYSE TEST SECURITIES. These are not companies: the exchanges publish
+# them so market participants can exercise their feeds, and their quoted prices
+# are arbitrary. Polygon's grouped-daily endpoint returns them alongside real
+# listings, so they have been in this table since its first row.
+#
+# Measured on live research.db (2026-08-21, alpha-engine-config-I7936):
+# 916 rows across ten of these symbols. ZWZZT closed at 19.44 on 2026-03-30 and
+# 129,998.70 five sessions later, so its return_5d is
+# 129998.70 / 19.44 - 1 = 6686.1759 -- the maximum of the whole column, over
+# 2,012,661 rows, and the anchor observation on I7936. It is arithmetically
+# correct and completely meaningless.
+#
+# Cost of leaving them in: the universe-wide mean 5-day return is 0.004758 with
+# them and 0.001418 without, so ~70% of the reported mean of the denominator
+# for every lift calculation in the backtester came from test securities.
+_TEST_SECURITIES = {
+    "ZAZZT", "ZBZX", "ZBZZT", "ZCZZT", "ZEXIT", "ZIEXT", "ZJZZT",
+    "ZTEST", "ZVV", "ZVZZT", "ZWZZT", "ZXIET", "ZXZZT",
+    "CBO", "CBX", "IBM6", "LOPP", "NTEST",
+}
+
+_SKIP_TICKERS = (
+    _SECTOR_ETFS | {"SPY", "VIX", "^VIX", "^TNX", "^IRX"} | _TEST_SECURITIES
+)
 
 _CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS universe_returns (
@@ -365,6 +402,33 @@ def _ensure_table(db_path: str) -> None:
         for col, col_type in _NEW_COLUMNS_DECAY_LADDER:
             if col not in cols:
                 conn.execute(f"ALTER TABLE universe_returns ADD COLUMN {col} {col_type}")
+        # alpha-engine-config-I7936 — exchange test securities are not
+        # companies, and this table is the DENOMINATOR for every lift
+        # calculation in the backtester evaluation framework. They entered via
+        # polygon's grouped-daily endpoint, which returns the whole tape; the
+        # producer now skips them (_TEST_SECURITIES), and this removes the rows
+        # already stored.
+        #
+        # Deliberately a STANDING INVARIANT enforced on every run rather than a
+        # one-shot migration: if a new test symbol is ever listed, or a
+        # partially-migrated copy of research.db is restored from a backup, the
+        # next collection heals it. Runs in-region as part of the weekly
+        # collector, so no operator step and no laptop write.
+        #
+        # Measured before this landed (2026-08-21): 1,397 rows. ZWZZT's
+        # 6686.1759 was the maximum of return_5d over 2,012,661 rows
+        # (19.44 -> 129,998.70 in five sessions); the universe-wide mean 5-day
+        # return was 0.004758 with these rows and 0.001418 without.
+        placeholders = ", ".join("?" for _ in _TEST_SECURITIES)
+        purged = conn.execute(
+            f"DELETE FROM universe_returns WHERE ticker IN ({placeholders})",
+            tuple(sorted(_TEST_SECURITIES)),
+        ).rowcount
+        if purged:
+            logger.warning(
+                "universe_returns: purged %d exchange-test-security row(s) "
+                "(alpha-engine-config-I7936)", purged,
+            )
         conn.commit()
     finally:
         conn.close()
