@@ -58,13 +58,8 @@ for arg in "$@"; do
   esac
 done
 
-run() {
-  if $DRY_RUN; then
-    echo "DRY: $*"
-  else
-    "$@"
-  fi
-}
+# shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
+source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 
 PKG="$(mktemp -d)"
 trap 'rm -rf "${PKG}"' EXIT
@@ -157,6 +152,7 @@ if $BOOTSTRAP; then
       --environment "${PROD_ENV}" \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
+    verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${PKG}/function.zip"
   fi
 
   echo "  Creating EventBridge rule: ${RULE_NAME}"
@@ -199,6 +195,8 @@ if ! $BOOTSTRAP; then
   if ! $DRY_RUN; then
     aws lambda wait function-updated --function-name "${FUNCTION_NAME}" --region "${REGION}"
   fi
+
+  verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${PKG}/function.zip"
 fi
 
 echo "✓ Code deployed."

@@ -42,7 +42,8 @@ for arg in "$@"; do
   esac
 done
 
-run() { if $DRY_RUN; then echo "[dry-run] $*"; else "$@"; fi; }
+# shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
+source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 
 if $BOOTSTRAP; then
   echo "== mock execution role =="
@@ -79,6 +80,9 @@ if aws lambda get-function --function-name "${FUNCTION_NAME}" --region "${REGION
   run aws lambda update-function-code --function-name "${FUNCTION_NAME}" \
     --zip-file "fileb://${ZIP}" --region "${REGION}" \
     --query LastUpdateStatus --output text
+
+  verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${ZIP}"
+
 else
   run aws lambda create-function --function-name "${FUNCTION_NAME}" \
     --runtime python3.12 \
@@ -86,6 +90,8 @@ else
     --handler index.handler --zip-file "fileb://${ZIP}" \
     --timeout 60 --memory-size 256 --region "${REGION}" \
     --query FunctionArn --output text
+
+  verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${ZIP}"
 fi
 
 echo "Done. Build/refresh the staging state machine with:"

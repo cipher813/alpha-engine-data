@@ -57,7 +57,8 @@ for arg in "$@"; do
   esac
 done
 
-run() { if $DRY_RUN; then echo "DRY: $*"; else "$@"; fi; }
+# shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
+source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 
 # ----- 0. Validate handler syntax + preflight unit tests ---------------------
 PKG=$(mktemp -d)
@@ -182,6 +183,7 @@ run aws lambda update-function-code \
 
 if ! $DRY_RUN; then
   aws lambda wait function-updated --function-name "${FUNCTION_NAME}" --region "${REGION}"
+  verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${ZIP}"
   CURRENT_ENABLED=$(preserve_env_flag "${FUNCTION_NAME}" "${REGION}" ALERT_DRAIN_DISPATCH_ENABLED true)
   aws lambda update-function-configuration \
     --function-name "${FUNCTION_NAME}" \
