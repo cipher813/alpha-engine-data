@@ -88,12 +88,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 MANIFEST = Path(__file__).parent.resolve() / "automation_pause.json"
 REGION = "us-east-1"
+
+#: Every ``paused_alarms`` entry must name the OPEN tracker issue whose closure
+#: ends the pause, in the fleet's own reference grammar. A free-text owner is
+#: one nothing can resolve, which is the defect this field exists to remove
+#: (alpha-engine-config-I8047 / -I8090).
+DECLARATION_ISSUE_RE = re.compile(r"^alpha-engine-config-I\d+$")
+
+#: And the date past which the suppression is no longer justified by anything.
+DECLARATION_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def load_manifest(path: Path = MANIFEST) -> dict:
@@ -174,6 +185,13 @@ def alarm_entries(manifest: dict | None = None) -> list[dict]:
             "name": name,
             "reason": entry.get("reason", ""),
             "watches": list(entry.get("watches", [])),
+            # alpha-engine-config-I8047. Surfaced with the same `.get` default
+            # as `reason` rather than a KeyError, because a malformed entry must
+            # reach `declaration_findings()` and be REPORTED, not crash the
+            # whole check — a detector that dies on the defect it looks for is
+            # indistinguishable from one that found nothing.
+            "issue": entry.get("issue", ""),
+            "re_exam": entry.get("re_exam", ""),
         })
     return out
 
@@ -275,23 +293,34 @@ def _alarm_actions_enabled(name: str) -> bool | None:
     return out == "True"
 
 
-def _live_breaching_alarms() -> dict[str, bool]:
-    """``{alarm name: ActionsEnabled}`` for every live alarm that latches on silence.
+def _live_alarm_actions() -> dict[str, dict[str, bool]]:
+    """``{alarm name: {"enabled": ActionsEnabled, "breaching": bool}}`` for EVERY live alarm.
 
-    ``TreatMissingData=breaching`` is the whole population that can go ALARM with
-    nothing wrong, so it is the population the two manifest blocks must between
-    them cover. Paginated explicitly: DescribeAlarms caps at 100 per page and a
-    truncated first page would silently shrink the very set being graded for
-    completeness.
+    One enumeration, two populations, because the manifest is graded against
+    both and two independent scans of the same account can disagree with each
+    other about it.
+
+    ``TreatMissingData=breaching`` is the population that can go ALARM with
+    nothing wrong, so it is what ``armed_alarms`` must classify. ``enabled`` is
+    a WIDER question and is asked of every alarm (alpha-engine-config-I8047):
+    an alarm muted by hand cannot page whatever its missing-data treatment is,
+    and restricting the silence scan to the breaching subset made an undeclared
+    mute of a ``notBreaching`` alarm invisible. That is not hypothetical — nine
+    of the fourteen alarms Brian disabled by hand on 2026-08-13/14 are
+    ``notBreaching``, so had they never been declared, the completeness check
+    would have reported nothing at all.
+
+    Paginated explicitly: DescribeAlarms caps at 100 per page and a truncated
+    first page would silently shrink the very set being graded for completeness.
     """
-    alarms: dict[str, bool] = {}
+    alarms: dict[str, dict[str, bool]] = {}
     token: str | None = None
     while True:
         args = [
             "cloudwatch", "describe-alarms", "--max-items", "100",
             "--query",
-            "{a: MetricAlarms[?TreatMissingData=='breaching'].{n: AlarmName, e: ActionsEnabled}, "
-            "t: NextToken}",
+            "{a: MetricAlarms[].{n: AlarmName, e: ActionsEnabled, "
+            "b: TreatMissingData}, t: NextToken}",
             "--output", "json",
         ]
         if token:
@@ -301,10 +330,28 @@ def _live_breaching_alarms() -> dict[str, bool]:
             raise RuntimeError(f"aws cloudwatch describe-alarms: {err}")
         page = json.loads(out or "{}")
         for row in page.get("a") or []:
-            alarms[row["n"]] = bool(row["e"])
+            alarms[row["n"]] = {
+                "enabled": bool(row["e"]),
+                "breaching": row.get("b") == "breaching",
+            }
         token = page.get("t")
         if not token:
             return alarms
+
+
+def _live_breaching_alarms() -> dict[str, bool]:
+    """``{alarm name: ActionsEnabled}`` for every live alarm that latches on silence."""
+    return {n: v["enabled"] for n, v in _live_alarm_actions().items() if v["breaching"]}
+
+
+def _live_silenced_alarms() -> set[str]:
+    """Every live alarm whose actions are OFF, regardless of missing-data treatment.
+
+    The population `alarm_coverage_findings()` grades for DECLARATION. A muted
+    alarm is indistinguishable from a healthy one on every surface, so the
+    question "is this mute declared" is asked of all of them.
+    """
+    return {n for n, v in _live_alarm_actions().items() if not v["enabled"]}
 
 
 def _set_alarm_actions(name: str, enabled: bool) -> None:
@@ -431,7 +478,74 @@ def alarm_findings() -> list[dict]:
                 ),
             })
 
+    out.extend(declaration_findings())
     out.extend(alarm_coverage_findings())
+    return out
+
+
+def declaration_findings(manifest: dict | None = None) -> list[dict]:
+    """Is every ``paused_alarms`` entry's REASON still gradeable — not just its resource?
+
+    ``alarm_justified()`` asks whether the trigger a suppression ``watches`` is
+    still paused. That is the WEAKER of the two conditions
+    (alpha-engine-config-I8090): what rots is the justification. A declaration
+    saying "silenced under the 2026-08-12 ruling" keeps looking true forever,
+    including after the ruling has been executed, reversed, or closed without
+    the work.
+
+    Two fields make the reason gradeable, and this function asserts only that
+    they are PRESENT and WELL-FORMED. It deliberately does not resolve the
+    issue's state or compare the date to today:
+
+      * resolving the issue needs a credential for `nousergon/alpha-engine-config`,
+        which this repo has none of and should not acquire to read a tracker;
+      * so both temporal predicates are graded in one place, by
+        `alpha-engine-config`'s `suppression-declaration-sweep`, which runs in
+        the repo that owns the tracker and reads this manifest from the public
+        checkout. Splitting "expired" from "owning issue closed" across two
+        reports would give two half-answers to one question.
+
+    What this DOES do is make that sweep impossible to satisfy vacuously: an
+    entry with no `issue` cannot be graded against the tracker at all, and an
+    entry with no `re_exam` has no date to be past. An ungradeable declaration
+    reads exactly like a healthy one, which is the whole class.
+    """
+    out: list[dict] = []
+    for entry in alarm_entries(manifest):
+        name, issue, re_exam = entry["name"], entry["issue"], entry["re_exam"]
+        if not DECLARATION_ISSUE_RE.match(issue):
+            out.append({
+                "trigger": name, "surface": "cloudwatch",
+                "kind": "alarm-declaration-unowned",
+                "detail": (
+                    f"paused_alarms entry carries issue={issue!r}, which is not a "
+                    f"resolvable tracker reference (expected e.g. "
+                    f"'alpha-engine-config-I6984'). A suppression whose owner cannot "
+                    f"be resolved can never be found stale — the clock and the "
+                    f"tracker are the only two things that can retire it, and this "
+                    f"field is what makes the second one reachable."
+                ),
+            })
+        if not DECLARATION_DATE_RE.match(re_exam):
+            out.append({
+                "trigger": name, "surface": "cloudwatch",
+                "kind": "alarm-declaration-undated",
+                "detail": (
+                    f"paused_alarms entry carries re_exam={re_exam!r}, which is not an "
+                    f"ISO date (YYYY-MM-DD). Without one the suppression has no expiry "
+                    f"and outlives its justification silently, which is "
+                    f"alpha-engine-config-I8047 one level up."
+                ),
+            })
+            continue
+        try:
+            date.fromisoformat(re_exam)
+        except ValueError:
+            out.append({
+                "trigger": name, "surface": "cloudwatch",
+                "kind": "alarm-declaration-undated",
+                "detail": f"re_exam={re_exam!r} is not a real calendar date.",
+            })
     return out
 
 
@@ -448,6 +562,31 @@ def alarm_coverage_findings() -> list[dict]:
     declared_paused = {e["name"] for e in alarm_entries()}
     declared_armed = armed_alarm_names()
     live = _live_breaching_alarms()
+
+    # ── an UNDECLARED mute, of any alarm (alpha-engine-config-I8047) ────────
+    #
+    # The breaching scan below asks "is every alarm that can latch on silence
+    # classified". This asks the narrower, louder question the ruling turns on:
+    # is every alarm that is CURRENTLY SILENCED declared as such. The two
+    # populations are not the same, and the difference is where the defect
+    # lives — nine of the fourteen alarms Brian muted by hand on 2026-08-13/14
+    # are `notBreaching`, so the breaching scan could not have seen them had
+    # they never been declared. Codifying those fourteen as declared,
+    # self-expiring suppressions is only half the ruling; this is the half that
+    # must not weaken, because a mute nobody declared is still the defect.
+    for name in sorted(_live_silenced_alarms() - declared_paused - declared_armed):
+        out.append({
+            "trigger": name, "surface": "cloudwatch", "kind": "alarm-undeclared-silence",
+            "detail": (
+                "ActionsEnabled=false live, and it appears in neither paused_alarms "
+                "nor armed_alarms. A detector was muted with nothing recording who "
+                "did it, why, or what would end it — and a muted alarm is "
+                "indistinguishable from a healthy one on every surface the fleet "
+                "reads. Either re-arm it, or add a paused_alarms entry naming the "
+                "trigger(s) it watches, the owning issue and a re_exam date. "
+                "observability-policy 8.3: DISABLED is DECLARED, never inferred."
+            ),
+        })
 
     for name in sorted(set(live) - declared_paused - declared_armed):
         out.append({
