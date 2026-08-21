@@ -60,6 +60,8 @@ import os
 import sys
 from typing import Optional
 
+import boto3
+
 from collectors.constituents import _fetch_constituents
 from features.compute import _SKIP_TICKERS, _is_sector_etf
 
@@ -74,6 +76,38 @@ logger = logging.getLogger(__name__)
 _RESEARCH_MAX_ERR_RATE = 0.05
 
 
+#: The dated artifact Phase 1 writes only when it actually COLLECTS.
+#: ``spot_data_phase1.sh --preflight-only`` (the Friday shell run) enters
+#: ``DataPhase1`` and validates without collecting, so entered-stage
+#: membership cannot separate the two — the produced artifact can.
+_COLLECTION_ARTIFACT = "market_data/weekly/{run_date}/constituents.json"
+
+
+def collection_ran(s3, bucket: str, run_date: str) -> bool | None:
+    """Did THIS run_date's Phase 1 actually collect, or only preflight?
+
+    Returns True/False, or ``None`` when the question could not be answered
+    (no S3 client, denied, transport error). ``None`` is not "no": the caller
+    keeps gating on an unanswered question, because excusing a drift on a
+    failed probe is how a real gap becomes invisible.
+    """
+    key = _COLLECTION_ARTIFACT.format(run_date=run_date)
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        response = getattr(exc, "response", None)
+        code = (response or {}).get("Error", {}).get("Code")
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return False
+        logger.warning(
+            "collection_ran probe on s3://%s/%s raised (%s: %s) — the question is "
+            "UNANSWERED, so the drift check keeps gating rather than excusing itself",
+            bucket, key, type(exc).__name__, exc,
+        )
+        return None
+
+
 def _open_universe_lib(bucket: str):
     """Open the ArcticDB universe library for read-only symbol listing."""
     from store.arctic_store import get_universe_lib
@@ -86,6 +120,8 @@ def check_drift(
     max_stragglers: int = 0,
     alert: bool = True,
     alert_severity: str = "error",
+    run_date: str | None = None,
+    s3_client=None,
 ) -> dict:
     """Run the Wikipedia → ArcticDB constituents drift check.
 
@@ -98,6 +134,14 @@ def check_drift(
         alert: if True, fire an `nousergon_lib.alerts.publish` on drift.
             If False, return the diff without alerting (diagnostic mode).
         alert_severity: severity tag for the published alert.
+        run_date: the pipeline run date this check is asserting over. When
+            given, drift is GATING only if that run_date's Phase 1 actually
+            collected (see :func:`collection_ran`). On a preflight-only run
+            the live index has moved but nothing was collected to move
+            ArcticDB with it, so the drift is real, expected, and not this
+            run's failure — it is reported, not raised. Omit to gate
+            unconditionally.
+        s3_client: injected boto3 S3 client (tests).
 
     Returns:
         dict with keys: status (`ok` | `drift_detected` | `error`),
@@ -156,17 +200,61 @@ def check_drift(
 
     within_threshold = len(missing_from_arctic) <= max_stragglers
 
+    # ── is this run allowed to be judged on it? (alpha-engine-config-I8094) ──
+    #
+    # The population changes when S&P reconstitutes, mid-week. The pipeline
+    # absorbs that on its own: `collectors/prices.py::_find_stale_fast` counts
+    # a ticker with no parquet as stale and fetches its 10y history, then
+    # `builders/backfill.py` (Phase 1 step 8, passed the run_date so it reads
+    # THIS week's constituents rather than the not-yet-advanced pointer)
+    # writes its ArcticDB row. Measured 2026-08-16, the run after a
+    # reconstitution: missing_from_arctic=0, only_in_arctic=0.
+    #
+    # What cannot absorb it is a run that does not collect. The Friday shell
+    # run's DataPhase1 invokes `spot_data_phase1.sh --preflight-only`, so it
+    # ENTERS the stage and produces nothing — entered-stage membership cannot
+    # tell the two apart, which is why this keys on the produced artifact.
+    # Measured on execution friday-shell-2026-08-21-eod-2026-08-21-1787342451:
+    # SUI and VMRK joined the index after the 2026-08-18 collection, so the
+    # check failed the gate on a gap the run had no mechanism to close, took
+    # the whole weekly pipeline to DEGRADED, and asked a human to hand-run a
+    # backfill the next scheduled run would have done by itself.
+    collected: bool | None = None
+    if run_date:
+        collected = collection_ran(s3_client or boto3.client("s3"), bucket, run_date)
+    gating = within_threshold or collected is not False
+
+    if not within_threshold and not gating:
+        status = "drift_deferred"
+    elif not within_threshold:
+        status = "drift_detected"
+    else:
+        status = "ok"
+
     result = {
-        "status": "ok" if within_threshold else "drift_detected",
+        "status": status,
         "wikipedia_count": len(wikipedia_set),
         "arctic_count": len(arctic_set),
         "missing_from_arctic": missing_from_arctic,
         "only_in_arctic": only_in_arctic,
         "max_stragglers": max_stragglers,
         "within_threshold": within_threshold,
+        "run_date": run_date,
+        "collection_ran": collected,
+        "gating": gating,
     }
 
-    if not within_threshold and alert:
+    if not within_threshold and not gating:
+        logger.info(
+            "Constituents drift DEFERRED: %d ticker(s) %s joined the index since the "
+            "last collection, and run_date=%s did not collect (no %s) — the next "
+            "collecting run fetches their history and writes their ArcticDB row "
+            "without any manual backfill. Reported, not raised.",
+            len(missing_from_arctic), missing_from_arctic[:20], run_date,
+            _COLLECTION_ARTIFACT.format(run_date=run_date),
+        )
+
+    if not within_threshold and gating and alert:
         try:
             from nousergon_lib import alerts  # noqa: PLC0415
         except ImportError as exc:
@@ -272,6 +360,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--alert-severity", default="error",
         choices=["info", "warn", "warning", "error", "critical"],
     )
+    parser.add_argument(
+        "--run-date", default=None,
+        help=(
+            "pipeline run date this check asserts over. When given, drift is "
+            "gating only if that run_date's Phase 1 actually collected — a "
+            "preflight-only run cannot have moved ArcticDB to match an index "
+            "that reconstituted after the last collection "
+            "(alpha-engine-config-I8094)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -284,12 +382,24 @@ def main(argv: Optional[list[str]] = None) -> int:
         max_stragglers=args.max_stragglers,
         alert=not args.no_alert,
         alert_severity=args.alert_severity,
+        run_date=args.run_date,
     )
 
     if result["status"] == "error":
         logger.error("Drift check failed at stage=%s: %s",
                      result.get("stage"), result.get("error"))
         return 2
+
+    if result["status"] == "drift_deferred":
+        logger.warning(
+            "DRIFT DEFERRED: %d ticker(s) missing from ArcticDB (%s), but "
+            "run_date=%s did not collect — the next collecting run absorbs the "
+            "index change with no manual backfill. Not failing this run.",
+            len(result["missing_from_arctic"]),
+            result["missing_from_arctic"][:20],
+            result["run_date"],
+        )
+        return 0
 
     if result["status"] == "drift_detected":
         logger.error(

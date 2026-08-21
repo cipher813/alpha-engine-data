@@ -266,3 +266,145 @@ def test_alert_cites_the_live_tracker_not_archived_roadmap_lines():
     assert "I8094" in msg
     assert "ROADMAP P0 (g)" not in msg
     assert "L1316" not in msg
+
+# ── run-scope: drift is gating only when this run actually collected ────────
+# alpha-engine-config-I8094. The population changes mid-week; Phase 1 absorbs
+# it (prices fetches the ticker with no parquet, backfill writes its ArcticDB
+# row). A preflight-only run enters DataPhase1 and collects nothing, so it
+# cannot close a gap the index opened after the last collection — and must not
+# fail the pipeline for it.
+
+
+class _S3:
+    """Minimal head_object stub. ``outcome`` is True / False / an exception."""
+
+    def __init__(self, outcome):
+        self.outcome = outcome
+        self.calls: list[tuple[str, str]] = []
+
+    def head_object(self, Bucket, Key):  # noqa: N803 — boto3 kwarg casing
+        self.calls.append((Bucket, Key))
+        if self.outcome is True:
+            return {"ContentLength": 1}
+        if self.outcome is False:
+            raise _client_error("404")
+        raise self.outcome
+
+
+def _client_error(code: str) -> Exception:
+    exc = Exception(f"head_object failed: {code}")
+    exc.response = {"Error": {"Code": code}}
+    return exc
+
+
+def _drift(s3, run_date):
+    from validators.constituents_drift_check import check_drift
+
+    fake_fetch = MagicMock(return_value=(["AAPL", "SUI"], {}, {}, {}, 1, 1))
+    fake_lib = MagicMock()
+    fake_lib.list_symbols.return_value = ["AAPL"]
+    with patch("validators.constituents_drift_check._fetch_constituents", fake_fetch), \
+         patch("validators.constituents_drift_check._open_universe_lib",
+               return_value=fake_lib):
+        return check_drift(alert=False, run_date=run_date, s3_client=s3)
+
+
+def test_drift_on_a_run_that_did_not_collect_is_deferred_not_detected():
+    result = _drift(_S3(False), "2026-08-21")
+    assert result["status"] == "drift_deferred"
+    assert result["gating"] is False
+    assert result["collection_ran"] is False
+    # The finding itself is unchanged — deferred means not-this-run's-failure,
+    # never not-reported.
+    assert result["missing_from_arctic"] == ["SUI"]
+    assert result["within_threshold"] is False
+
+
+def test_drift_on_a_run_that_did_collect_still_gates():
+    result = _drift(_S3(True), "2026-08-22")
+    assert result["status"] == "drift_detected"
+    assert result["gating"] is True
+    assert result["collection_ran"] is True
+
+
+def test_an_unanswerable_probe_keeps_gating():
+    """AccessDenied is not permission to excuse the drift."""
+    result = _drift(_S3(_client_error("AccessDenied")), "2026-08-22")
+    assert result["collection_ran"] is None
+    assert result["gating"] is True
+    assert result["status"] == "drift_detected"
+
+
+def test_without_a_run_date_the_check_gates_unconditionally():
+    """Callers that supply no run_date get the pre-I8094 behaviour."""
+    result = _drift(None, None)
+    assert result["collection_ran"] is None
+    assert result["gating"] is True
+    assert result["status"] == "drift_detected"
+
+
+def test_no_drift_is_ok_regardless_of_whether_the_run_collected():
+    from validators.constituents_drift_check import check_drift
+
+    fake_fetch = MagicMock(return_value=(["AAPL"], {}, {}, {}, 1, 0))
+    fake_lib = MagicMock()
+    fake_lib.list_symbols.return_value = ["AAPL"]
+    s3 = _S3(False)
+    with patch("validators.constituents_drift_check._fetch_constituents", fake_fetch), \
+         patch("validators.constituents_drift_check._open_universe_lib",
+               return_value=fake_lib):
+        result = check_drift(alert=False, run_date="2026-08-21", s3_client=s3)
+    assert result["status"] == "ok"
+    assert result["gating"] is True
+
+
+def test_deferred_drift_publishes_no_alert():
+    """A deferred finding must not page: it names work the next scheduled run
+    does by itself, and a page nobody can act on is the cry-wolf surface."""
+    from validators.constituents_drift_check import check_drift
+
+    fake_fetch = MagicMock(return_value=(["AAPL", "SUI"], {}, {}, {}, 1, 1))
+    fake_lib = MagicMock()
+    fake_lib.list_symbols.return_value = ["AAPL"]
+    published: list = []
+
+    class _Alerts:
+        @staticmethod
+        def publish(*args, **kwargs):
+            published.append((args, kwargs))
+            raise AssertionError("deferred drift must not publish an alert")
+
+    with patch("validators.constituents_drift_check._fetch_constituents", fake_fetch), \
+         patch("validators.constituents_drift_check._open_universe_lib",
+               return_value=fake_lib), \
+         patch.dict("sys.modules", {"nousergon_lib.alerts": _Alerts}):
+        result = check_drift(alert=True, run_date="2026-08-21", s3_client=_S3(False))
+    assert result["status"] == "drift_deferred"
+    assert published == []
+
+
+def test_main_exits_zero_on_deferred_drift_and_one_when_gating():
+    from validators import constituents_drift_check as mod
+
+    deferred = {
+        "status": "drift_deferred", "missing_from_arctic": ["SUI"],
+        "run_date": "2026-08-21", "max_stragglers": 0,
+    }
+    gating = {
+        "status": "drift_detected", "missing_from_arctic": ["SUI"],
+        "run_date": "2026-08-22", "max_stragglers": 0,
+    }
+    with patch.object(mod, "check_drift", return_value=deferred):
+        assert mod.main(["--run-date", "2026-08-21", "--no-alert"]) == 0
+    with patch.object(mod, "check_drift", return_value=gating):
+        assert mod.main(["--run-date", "2026-08-22", "--no-alert"]) == 1
+
+
+def test_collection_ran_probes_the_dated_constituents_artifact():
+    from validators.constituents_drift_check import collection_ran
+
+    s3 = _S3(True)
+    assert collection_ran(s3, "alpha-engine-research", "2026-08-22") is True
+    assert s3.calls == [
+        ("alpha-engine-research", "market_data/weekly/2026-08-22/constituents.json"),
+    ]
