@@ -134,7 +134,7 @@ nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nouse
 # cannot run the commands the SF emits. 0.18.8 is also the version that made
 # the correlation id MANDATORY (`run` exits 2 without it), so this floor pins
 # both halves of the same contract. See tests/test_sf_krepis_correlation_id.py.
-# NOTE (this PR, flow-doctor-provider fix): krepis==0.59.12's own
+# NOTE (this PR, flow-doctor-provider fix): krepis==0.59.21's own
 # `flow_doctor` extra caps `flow-doctor[diagnosis,s3]` to `<0.10` — a version
 # that predates RouterProvider (added 0.12.0) entirely, so the
 # `diagnosis.provider: router` set below in flow-doctor.yaml is inert until
@@ -144,4 +144,4 @@ nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nouse
 # before or together with this PR — see tests/test_flow_doctor_wiring.py's
 # test_diagnosis_enabled_requires_explicit_provider docstring for why the
 # schema-level guard does not depend on the installed flow-doctor version.
-krepis==0.59.12  # pinned per §139 — first-party/fast-moving deps are pinned, never floored; alpha-engine-config-I7009 (relaunch-decision --json), I7372 (spot_bootstrap: scan_for_inline_bootstraps + --max-runtime-seconds + extra_clones, all first shipped in 0.59.6). Bumped 0.59.6 -> 0.59.12 for krepis.aws_region.resolve_region() (krepis-PR160, alpha-engine-config-I7428) — validators/stage_output_sweep.py's stepfunctions client needs it. main was at 0.59.11 when krepis-PR160 opened; VERIFIED 2026-08-17 after that merge — autobump published exactly 0.59.12, present on both the PyPI JSON API and the simple index (separate caches; a pin chained behind a release fails with an error reading exactly like 'that version does not exist').
+krepis==0.59.21  # pinned per §139 — first-party/fast-moving deps are pinned, never floored; alpha-engine-config-I7009 (relaunch-decision --json), I7372 (spot_bootstrap: scan_for_inline_bootstraps + --max-runtime-seconds + extra_clones, all first shipped in 0.59.6). Bumped 0.59.6 -> 0.59.12 for krepis.aws_region.resolve_region() (krepis-PR160, alpha-engine-config-I7428) — validators/stage_output_sweep.py's stepfunctions client needs it. main was at 0.59.11 when krepis-PR160 opened; VERIFIED 2026-08-17 after that merge — autobump published exactly 0.59.12, present on both the PyPI JSON API and the simple index (separate caches; a pin chained behind a release fails with an error reading exactly like 'that version does not exist').
