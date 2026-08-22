@@ -20,6 +20,18 @@ This is the denominator for all lift calculations in the backtester evaluation
 framework: scanner filter lift, sector team lift, CIO lift, predictor lift,
 execution lift.
 
+``return_30d``, ``return_60d``, ``return_90d``, ``log_return_60d`` and
+``log_return_90d`` were DROPPED 2026-08-22 (alpha-engine-config-I8185):
+measured 0-of-2.14M non-null (``return_30d`` frozen at eval_date 2026-03-30),
+grep-verified with no consumer across `crucible-*` / `nousergon-data`. Root
+cause was `_get_existing_dates` gating re-processing on 5d/21d completeness
+only, so a date already 21d-complete was never revisited when its later
+30d/60d/90d windows closed — see that function's docstring for the full
+diagnosis (config#2972). The sibling `spy_return_{30,60,90}d`,
+`beat_spy_{30,60,90}d` and `log_spy_return_{60,90}d` columns are unaffected —
+`beat_spy_{30,60,90}d` is still derived from the underlying (unstored)
+return, and were not in scope for this fix.
+
 Target table: universe_returns in research.db (~900 rows/date, ~47K rows/year).
 
 UNITS -- every ``return_{h}d`` / ``spy_return_{h}d`` / ``sector_etf_return_5d``
@@ -107,13 +119,10 @@ CREATE TABLE IF NOT EXISTS universe_returns (
     return_5d REAL,
     return_10d REAL,
     return_21d REAL,
-    return_30d REAL,
     spy_return_5d REAL,
     spy_return_10d REAL,
     spy_return_21d REAL,
     spy_return_30d REAL,
-    return_60d REAL,
-    return_90d REAL,
     spy_return_60d REAL,
     spy_return_90d REAL,
     beat_spy_5d INTEGER,
@@ -124,8 +133,6 @@ CREATE TABLE IF NOT EXISTS universe_returns (
     beat_spy_90d INTEGER,
     log_return_21d REAL,
     log_spy_return_21d REAL,
-    log_return_60d REAL,
-    log_return_90d REAL,
     log_spy_return_60d REAL,
     log_spy_return_90d REAL,
     sector_etf TEXT,
@@ -158,16 +165,14 @@ _NEW_COLUMNS_21D = [
     ("log_spy_return_21d", "REAL"),
 ]
 
-# W3.1 (L4469): 60d/90d horizon columns (return + SPY-relative + beat + log).
+# W3.1 (L4469): 60d/90d horizon columns (SPY-relative + beat + log-spy).
+# return_60d/return_90d/log_return_60d/log_return_90d DROPPED 2026-08-22
+# (alpha-engine-config-I8185) — see module docstring.
 _NEW_COLUMNS_60_90D = [
-    ("return_60d", "REAL"),
-    ("return_90d", "REAL"),
     ("spy_return_60d", "REAL"),
     ("spy_return_90d", "REAL"),
     ("beat_spy_60d", "INTEGER"),
     ("beat_spy_90d", "INTEGER"),
-    ("log_return_60d", "REAL"),
-    ("log_return_90d", "REAL"),
     ("log_spy_return_60d", "REAL"),
     ("log_spy_return_90d", "REAL"),
 ]
@@ -386,7 +391,9 @@ def _ensure_table(db_path: str) -> None:
     try:
         conn.execute(_CREATE_TABLE_SQL)
         cols = {r[1] for r in conn.execute("PRAGMA table_info(universe_returns)").fetchall()}
-        for col, col_type in [("return_30d", "REAL"), ("spy_return_30d", "REAL"), ("beat_spy_30d", "INTEGER")]:
+        # return_30d DROPPED 2026-08-22 (alpha-engine-config-I8185) — see
+        # module docstring. spy_return_30d/beat_spy_30d are unaffected.
+        for col, col_type in [("spy_return_30d", "REAL"), ("beat_spy_30d", "INTEGER")]:
             if col not in cols:
                 conn.execute(f"ALTER TABLE universe_returns ADD COLUMN {col} {col_type}")
         for col, col_type in _NEW_COLUMNS_21D:
@@ -448,23 +455,20 @@ def _get_existing_dates(db_path: str, today: date | None = None) -> set[str]:
     full row idempotently — re-fetching polygon prices for the same eval_date
     yields the same historical close, so the 5d/10d/30d cells are unchanged.
 
-    KNOWN GAP (config#2972, confirmed separate from the 21d investigation —
-    NOT fixed here, scoped as a follow-up): this gating only ever checks
-    return_5d/return_21d. A date that already has both populated is marked
-    "existing" (skippable) permanently, even though its 60d/90d columns
-    (_NEW_COLUMNS_60_90D, added by #357 well after this function was
-    written) may still be NULL and their forward windows may not have
-    closed yet at the time 21d was graded. Combined with
+    RESOLVED (config#2972 / alpha-engine-config-I8185): this gating only ever
+    checked return_5d/return_21d, so a date already 21d-complete was never
+    revisited when its later 30d/60d/90d windows closed. Combined with
     `_trading_days_to_process`'s bounded max_lookback walk (default 90
     trading days from `today`), any date whose 21d window closed outside
-    that walk depth never gets reconsidered for 60d/90d backfill at all.
-    This is the actual, confirmed reason log_return_60d/log_return_90d are
-    NULL fleet-wide as of this writing — a real but pre-existing/separate
-    bug from the 21d "gap" this docstring's neighboring logic addresses.
-    A proper fix needs its own gating column (e.g. a 4th MAX(...60d...) /
-    MAX(...90d...) CASE clause here) sized against its own lookback horizon;
-    left as a follow-up rather than folded into this PR to keep the fix
-    scoped to the investigated issue.
+    that walk depth never got reconsidered for 60d/90d backfill at all —
+    the confirmed, sole reason `return_30d`/`return_60d`/`return_90d`/
+    `log_return_60d`/`log_return_90d` were 0-of-2.14M non-null fleet-wide.
+    Rather than add a per-horizon gating column to populate columns nothing
+    consumes, alpha-engine-config-I8185 DROPPED those five columns instead
+    (grep-verified no consumer across `crucible-*`/`nousergon-data`) — see
+    the module docstring. This function's 5d/21d gating is therefore
+    correct as written: nothing beyond 21d is stored anymore, so nothing
+    beyond 21d needs its own completeness gate.
     """
     today = today or date.today()
     conn = sqlite3.connect(db_path)
@@ -503,35 +507,36 @@ def _insert_rows(db_path: str, rows: list[dict]) -> int:
         inserted = 0
         for row in rows:
             try:
+                # return_30d/return_60d/return_90d/log_return_60d/log_return_90d
+                # DROPPED 2026-08-22 (alpha-engine-config-I8185) — no longer
+                # written; see module docstring.
                 conn.execute(
                     "INSERT OR REPLACE INTO universe_returns "
                     "(ticker, eval_date, sector, close_price, "
-                    "return_5d, return_10d, return_21d, return_30d, "
+                    "return_5d, return_10d, return_21d, "
                     "spy_return_5d, spy_return_10d, spy_return_21d, spy_return_30d, "
                     "beat_spy_5d, beat_spy_10d, beat_spy_21d, beat_spy_30d, "
                     "log_return_21d, log_spy_return_21d, "
-                    "return_60d, return_90d, spy_return_60d, spy_return_90d, "
+                    "spy_return_60d, spy_return_90d, "
                     "beat_spy_60d, beat_spy_90d, "
-                    "log_return_60d, log_return_90d, log_spy_return_60d, log_spy_return_90d, "
+                    "log_spy_return_60d, log_spy_return_90d, "
                     "sector_etf, sector_etf_return_5d, beat_sector_5d, "
                     "return_1d, return_3d, return_15d, "
                     "spy_return_1d, spy_return_3d, spy_return_15d, "
                     "beat_spy_1d, beat_spy_3d, beat_spy_15d, "
                     "log_return_1d, log_return_3d, log_return_15d, "
                     "log_spy_return_1d, log_spy_return_3d, log_spy_return_15d) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                    "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "?, ?, ?, ?, ?, ?, ?, ?, ?, "
                     "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         row["ticker"], row["eval_date"], row["sector"], row["close_price"],
-                        row["return_5d"], row["return_10d"], row["return_21d"], row["return_30d"],
+                        row["return_5d"], row["return_10d"], row["return_21d"],
                         row["spy_return_5d"], row["spy_return_10d"], row["spy_return_21d"], row["spy_return_30d"],
                         row["beat_spy_5d"], row["beat_spy_10d"], row["beat_spy_21d"], row["beat_spy_30d"],
                         row["log_return_21d"], row["log_spy_return_21d"],
-                        row.get("return_60d"), row.get("return_90d"),
                         row.get("spy_return_60d"), row.get("spy_return_90d"),
                         row.get("beat_spy_60d"), row.get("beat_spy_90d"),
-                        row.get("log_return_60d"), row.get("log_return_90d"),
                         row.get("log_spy_return_60d"), row.get("log_spy_return_90d"),
                         row["sector_etf"], row["sector_etf_return_5d"], row["beat_sector_5d"],
                         row.get("return_1d"), row.get("return_3d"), row.get("return_15d"),
@@ -728,6 +733,10 @@ def _build_rows_for_date(
         ret_10d = _pct_return(close_t0, close_10d) if has_10d else None
         ret_15d = _pct_return(close_t0, close_15d) if has_15d else None
         ret_21d = _pct_return(close_t0, close_21d) if has_21d else None
+        # ret_30d/ret_60d/ret_90d are kept as locals (not persisted as
+        # return_30d/return_60d/return_90d — DROPPED 2026-08-22,
+        # alpha-engine-config-I8185) because beat_spy_30d/60d/90d still
+        # derive from them below.
         ret_30d = _pct_return(close_t0, close_30d) if has_30d else None
         ret_60d = _pct_return(close_t0, close_60d) if has_60d else None
         ret_90d = _pct_return(close_t0, close_90d) if has_90d else None
@@ -735,8 +744,6 @@ def _build_rows_for_date(
         log_ret_3d = _log_return(close_t0, close_3d) if has_3d else None
         log_ret_15d = _log_return(close_t0, close_15d) if has_15d else None
         log_ret_21d = _log_return(close_t0, close_21d) if has_21d else None
-        log_ret_60d = _log_return(close_t0, close_60d) if has_60d else None
-        log_ret_90d = _log_return(close_t0, close_90d) if has_90d else None
 
         # Sector classification
         sector_etf = sector_map.get(ticker) if sector_map else None
@@ -751,7 +758,6 @@ def _build_rows_for_date(
             "return_5d": round(ret_5d, 4) if ret_5d is not None else None,
             "return_10d": round(ret_10d, 4) if ret_10d is not None else None,
             "return_21d": round(ret_21d, 4) if ret_21d is not None else None,
-            "return_30d": round(ret_30d, 4) if ret_30d is not None else None,
             "spy_return_5d": round(spy_ret_5d, 4) if spy_ret_5d is not None else None,
             "spy_return_10d": round(spy_ret_10d, 4) if spy_ret_10d is not None else None,
             "spy_return_21d": round(spy_ret_21d, 4) if spy_ret_21d is not None else None,
@@ -760,16 +766,12 @@ def _build_rows_for_date(
             "beat_spy_10d": int(ret_10d > spy_ret_10d) if ret_10d is not None and spy_ret_10d is not None else None,
             "beat_spy_21d": int(ret_21d > spy_ret_21d) if ret_21d is not None and spy_ret_21d is not None else None,
             "beat_spy_30d": int(ret_30d > spy_ret_30d) if ret_30d is not None and spy_ret_30d is not None else None,
-            "return_60d": round(ret_60d, 4) if ret_60d is not None else None,
-            "return_90d": round(ret_90d, 4) if ret_90d is not None else None,
             "spy_return_60d": round(spy_ret_60d, 4) if spy_ret_60d is not None else None,
             "spy_return_90d": round(spy_ret_90d, 4) if spy_ret_90d is not None else None,
             "beat_spy_60d": int(ret_60d > spy_ret_60d) if ret_60d is not None and spy_ret_60d is not None else None,
             "beat_spy_90d": int(ret_90d > spy_ret_90d) if ret_90d is not None and spy_ret_90d is not None else None,
             "log_return_21d": round(log_ret_21d, 6) if log_ret_21d is not None else None,
             "log_spy_return_21d": round(log_spy_ret_21d, 6) if log_spy_ret_21d is not None else None,
-            "log_return_60d": round(log_ret_60d, 6) if log_ret_60d is not None else None,
-            "log_return_90d": round(log_ret_90d, 6) if log_ret_90d is not None else None,
             "log_spy_return_60d": round(log_spy_ret_60d, 6) if log_spy_ret_60d is not None else None,
             "log_spy_return_90d": round(log_spy_ret_90d, 6) if log_spy_ret_90d is not None else None,
             "sector_etf": sector_etf,
