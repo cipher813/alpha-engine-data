@@ -80,8 +80,12 @@ _FUNCTION_TIMEOUTS_SEC: dict[str, int] = {
     # count (single digits), not by the ticker universe. Matches the
     # --bootstrap timeout in
     # infrastructure/lambdas/weekly-coverage-sweep/deploy.sh; the SF state's
-    # 90s ceiling is deliberately below it so the SF is the one that binds.
-    "alpha-engine-weekly-coverage-sweep": 120,
+    # 240s ceiling is deliberately below it so the SF is the one that binds.
+    # MEASURED 2026-08-22 on the first live invocation: 29.4s at 1024 MB,
+    # 675 MB peak, over a 40-execution walk. The original 120s/256 MB sizing
+    # timed out — at 256 MB the function used 256 of 256 and Lambda scales CPU
+    # with memory, so it was CPU-throttled as well as memory-starved.
+    "alpha-engine-weekly-coverage-sweep": 300,
     "alpha-engine-predictor-regime-retrospective-eval": 600,
     "alpha-engine-predictor-regime-substrate": 300,
     "alpha-engine-replay-concordance": 900,

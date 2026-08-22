@@ -117,8 +117,17 @@ def handler(event, _context):
         # construction, every IAM grant the real run needs, the derivation —
         # and writes nothing. The same dry contract every advisory producer on
         # this pipeline honours.
+        #
+        # The outcome is the REAL one, not a hardcoded clean. Measured
+        # 2026-08-22 on the first live dry invocation: the sweep found 28
+        # absent verdicts and 1 finding, and this branch returned
+        # ``outcome: clean`` anyway — a rehearsal that reports green whatever
+        # it saw certifies nothing, and is the same "no data rendered as
+        # healthy" defect (principles.md §2.7) the whole sweep exists to
+        # detect. What ``dry_run`` withholds is the WRITES and the page, never
+        # the verdict.
         return {
-            "outcome": OUTCOME_CLEAN,
+            "outcome": OUTCOME_FINDINGS if sweep.should_alert else OUTCOME_CLEAN,
             "dry_run": True,
             "run_date": run_date,
             "explanation": explanation,

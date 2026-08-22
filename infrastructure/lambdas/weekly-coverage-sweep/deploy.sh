@@ -84,8 +84,8 @@ if $BOOTSTRAP; then
       --role "${ROLE_ARN}" \
       --handler index.handler \
       --zip-file "fileb://${ZIP}" \
-      --timeout 120 \
-      --memory-size 256 \
+      --timeout 300 \
+      --memory-size 1024 \
       --environment 'Variables={LOG_LEVEL=INFO,RESEARCH_BUCKET=alpha-engine-research,PIPELINE=ne-weekly-freshness-pipeline}' \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
