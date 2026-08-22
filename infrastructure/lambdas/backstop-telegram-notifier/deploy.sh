@@ -127,13 +127,14 @@ echo "Reconciling SNS subscription: ${BACKSTOP_TOPIC_ARN} -> ${FUNCTION_NAME}"
 
 # Give SNS permission to invoke the Lambda (idempotent — 2>/dev/null||true on
 # existing statements)
-run aws lambda add-permission \
+run_tolerating "ResourceConflictException" \
+  aws lambda add-permission \
   --function-name "${FUNCTION_NAME}" \
   --statement-id "sns-${BACKSTOP_TOPIC_NAME}" \
   --action lambda:InvokeFunction \
   --principal sns.amazonaws.com \
   --source-arn "${BACKSTOP_TOPIC_ARN}" \
-  --region "${REGION}" 2>/dev/null || true
+  --region "${REGION}"
 
 # Check if an SNS->Lambda subscription already exists
 EXISTING_SUB=$(aws sns list-subscriptions-by-topic \

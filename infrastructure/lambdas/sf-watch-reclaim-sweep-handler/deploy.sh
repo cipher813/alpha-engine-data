@@ -261,13 +261,14 @@ if $BOOTSTRAP_IAM; then
       --rule "${rule}" \
       --targets "Id=1,Arn=${FN_ARN}" \
       --region "${REGION}"
-    run aws lambda add-permission \
+    run_tolerating "ResourceConflictException" \
+      aws lambda add-permission \
       --function-name "${FUNCTION_NAME}" \
       --statement-id "eventbridge-${rule}" \
       --action lambda:InvokeFunction \
       --principal events.amazonaws.com \
       --source-arn "arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${rule}" \
-      --region "${REGION}" 2>/dev/null || true
+      --region "${REGION}"
   done
 fi
 

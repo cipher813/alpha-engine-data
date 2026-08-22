@@ -91,6 +91,14 @@ ROUTER_FUNCTION = os.environ.get(
 PROBE_FUNCTION = os.environ.get(
     "OVERSEER_PROBE_FUNCTION", "alpha-engine-overseer-liveness-probe"
 )
+# The probe's ONLY two triggers. Kept beside PROBE_FUNCTION rather than read
+# out of ALARM_ACTIONS because `_probe_health()` runs on every firing, for every
+# alarm, and must not depend on which alarm happened to fire.
+PROBE_TRIGGERS = (
+    "alpha-engine-overseer-liveness-0650-daily",
+    "alpha-engine-overseer-liveness-1450-daily",
+)
+
 INTAKE_QUEUE = os.environ.get("OVERSEER_INTAKE_QUEUE", "nousergon-overseer-intake")
 INTAKE_DLQ = os.environ.get("OVERSEER_INTAKE_DLQ", "nousergon-overseer-intake-dlq")
 
@@ -381,6 +389,20 @@ def _probe_health() -> str:
             stats[metric] = int(sum(p["Sum"] for p in pts))
         inv, err = stats.get("Invocations", 0), stats.get("Errors", 0)
         if inv == 0:
+            # A deliberately-disabled component is STATE, not an incident
+            # (overseer-policy §7). This Lambda already carries the pause
+            # manifest on disk for `_pause_verdict()`; not consulting it here
+            # meant a probe Brian switched off on 2026-08-07 was reported as
+            # "not running at all" in every page for two weeks, which reads as
+            # a plane-wide blindness rather than as his own ruling.
+            paused = _paused_trigger_names()
+            if paused is None:
+                return ("NOT INVOKED in 24h — and the pause manifest is "
+                        "UNREADABLE, so whether that is deliberate is unknown")
+            if all(t in paused for t in PROBE_TRIGGERS):
+                return ("NOT INVOKED in 24h — PAUSED by declaration, both "
+                        "triggers off in automation_pause.json. Not running "
+                        "BY DESIGN, not a fault")
             return "NOT INVOKED in 24h — the probe is not running at all"
         if err >= inv:
             return f"{inv} invocations, {err} errors in 24h — failing EVERY run"
@@ -536,9 +558,44 @@ def _telegram(text: str) -> bool:
         return False
 
 
-def _render(alarm: str, reason: str, evidence: dict, outcome: dict) -> str:
+# How each CloudWatch state renders. ALARM is the only one that is an incident.
+#
+# The responder used to read `AlarmName` and `NewStateReason` and nothing else,
+# so every transition — including a recovery — rendered as "🚨 OVERSEER
+# BACKSTOP" with the full plane-state dump beneath it. 45 alarms in this
+# account carry `OKActions` pointing at the backstop topic, so this was a
+# 45-alarm class, not one alarm's quirk. Measured instance: on 2026-08-21 the
+# newly-created `alpha-engine-pipeline-deadman-weekly-freshness` went
+# INSUFFICIENT_DATA -> OK at 15:10 PDT and paged as an emergency. CloudWatch's
+# OK-reason text reuses the phrase "Threshold Crossed", so the reason string
+# alone cannot tell a reader which direction it moved — the state field is the
+# only thing that can, and it was the one field not being read.
+STATE_RENDER = {
+    "ALARM": ("🚨 OVERSEER BACKSTOP", True),
+    "OK": ("🟢 BACKSTOP RECOVERED", False),
+    "INSUFFICIENT_DATA": ("⚪ BACKSTOP — no data", False),
+}
+
+
+def _render(alarm: str, reason: str, evidence: dict, outcome: dict,
+            state: str = "ALARM") -> str:
+    header, is_incident = STATE_RENDER.get(state, ("🔔 BACKSTOP", True))
+
+    if not is_incident:
+        # A recovery needs the fact and nothing else. The plane-state dump and
+        # the RECOVERY block exist to help someone act; on a green transition
+        # there is nothing to act on, and printing them anyway is what made a
+        # recovery indistinguishable from an outage at a glance.
+        return "\n".join([
+            f"{header} — {alarm}",
+            "",
+            f"State is now {state}. No action taken and none needed.",
+            "",
+            f"Reason: {reason or '(none given)'}",
+        ])
+
     lines = [
-        f"🚨 OVERSEER BACKSTOP — {alarm}",
+        f"{header} — {alarm}",
         "",
         f"Alarm reason: {reason or '(none given)'}",
         "",
@@ -575,14 +632,33 @@ def _render(alarm: str, reason: str, evidence: dict, outcome: dict) -> str:
 
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     now = _utcnow()
-    alarm, reason = "(unknown)", ""
+    # Default ALARM: an event we could not parse is treated as an incident, not
+    # silently downgraded to a recovery. Failing toward the loud side is the
+    # posture the rest of this Lambda already takes.
+    alarm, reason, state = "(unknown)", "", "ALARM"
     try:
         record = (event.get("Records") or [{}])[0]
         msg = json.loads(record.get("Sns", {}).get("Message") or "{}")
         alarm = msg.get("AlarmName") or "(unknown)"
         reason = msg.get("NewStateReason") or ""
+        state = msg.get("NewStateValue") or "ALARM"
     except Exception as exc:  # noqa: BLE001 — page anyway; a malformed event is itself news
         reason = f"(could not parse SNS message: {type(exc).__name__})"
+
+    # A non-ALARM transition gathers no evidence and attempts no recovery.
+    #
+    # This returns BEFORE `_claim_attempt()` deliberately. The cooldown window
+    # is what makes a second ALARM inside it escalate as "the earlier recovery
+    # did NOT fix this"; letting an OK transition consume that window would
+    # make the next real firing look like a first attempt, or make a first
+    # attempt look like a second. A recovery must not spend the incident
+    # budget of the incident it is ending.
+    if state != "ALARM":
+        text = _render(alarm, reason, {}, {}, state=state)
+        print(text)
+        return {"alarm": alarm, "state": state, "paged": _telegram(text),
+                "evidence": {}, "outcome": {"skipped": f"state={state} — "
+                                            f"not an incident"}}
 
     evidence = {
         "dispatch": _dispatch_state(),
@@ -611,10 +687,11 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         else:
             outcome = {"result": _attempt(spec), "rationale": spec["rationale"]}
 
-    text = _render(alarm, reason, evidence, outcome)
+    text = _render(alarm, reason, evidence, outcome, state=state)
     print(text)
     paged = _telegram(text)
     return {
-        "alarm": alarm, "paged": paged, "evidence": evidence, "outcome": outcome,
+        "alarm": alarm, "state": state, "paged": paged,
+        "evidence": evidence, "outcome": outcome,
         "window": _window_start(now),
     }
