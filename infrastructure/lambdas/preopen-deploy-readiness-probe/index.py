@@ -21,6 +21,14 @@ timezone, DST-correct) — 45 minutes before the 05:15 PT preopen trigger.
      inside the preopen SF itself — one implementation, not a second one
      free to drift; see `alpha-engine-predictor/inference/deploy_drift.py`).
   3. `sf_drift=false` -> clean. Write the verdict, no page, no dispatch.
+  3a. `sf_drift` ABSENT (or `sf_drift_state == "unmeasured"`) -> the probe
+     could not measure definition freshness at all. NOT clean: this is the
+     exact input the preopen `DeployDriftGate` fail-closed branch halts on
+     45 minutes later, so it pages immediately, with runway, and does NOT
+     self-heal — a `workflow_dispatch` on an unmeasured verdict acts on
+     evidence nobody has (alpha-engine-config-I8142). Reading absence as
+     clean is the same defect one hop downstream from the one I8142 fixed
+     in the probe itself.
   4. `sf_drift=true` -> self-heal: fire a `workflow_dispatch` on
      `nousergon-data`'s `deploy-infrastructure.yml` (it is idempotent by
      design — re-running it is always safe, see that workflow's own header
@@ -225,6 +233,65 @@ def _poll_dispatch_conclusion(dispatched_at: datetime) -> tuple[str, str]:
     )
 
 
+#: The three states a drift verdict can be in. `check_deploy_drift` OMITS
+#: `sf_drift` when it could not measure it (alpha-engine-config-I7048, I7924,
+#: I8142) and, since I8142, also states it positively in `sf_drift_state`. Read
+#: the positive field when the predictor Lambda is new enough to emit it, and
+#: fall back to key presence otherwise, so this probe is correct across the
+#: rollout window rather than only after it.
+_DRIFT = "drift"
+_NO_DRIFT = "no_drift"
+_UNMEASURED = "unmeasured"
+
+
+def _drift_state(drift: dict) -> str:
+    """Three states, never two. `drift.get("sf_drift")` collapses "no" and "no
+    answer" into one falsy value — the shape behind every instance of this
+    defect class, including the one on the halting gate itself (I8142)."""
+    state = drift.get("sf_drift_state")
+    if state in (_DRIFT, _NO_DRIFT, _UNMEASURED):
+        return state
+    if "sf_drift" not in drift:
+        return _UNMEASURED
+    return _DRIFT if drift["sf_drift"] else _NO_DRIFT
+
+
+def _page_unmeasured(drift: dict) -> None:
+    """The verdict could not be measured. The preopen gate halts on exactly this
+    payload (`Not IsPresent($.drift_result.Payload.sf_drift) -> HandleFailure`),
+    so the whole point of this probe — runway before the 05:15 PT trigger — is
+    to say so now rather than let the session discover it."""
+    message = (
+        f"Preopen deploy-readiness probe (alpha-engine-config-I8142): the "
+        f"deploy-drift verdict is UNMEASURED — the probe could not determine "
+        f"whether the live preopen definition matches what the deploy "
+        f"published, so THE 05:15 PT PREOPEN WILL HALT at DeployDriftGate "
+        f"(its fail-closed branch reads an absent sf_drift). "
+        f"{_ET_PREOPEN_NOTE}. sf_drift_reason={drift.get('sf_drift_reason')!r} "
+        f"sf_definition_reason={drift.get('sf_definition_reason')!r} "
+        f"live_definition_error={drift.get('live_definition_error')!r} "
+        f"sf_sha={drift.get('sf_sha')!r} upstream_sha={drift.get('upstream_sha')!r}. "
+        f"No self-heal was attempted: a deploy dispatch on an unmeasured "
+        f"verdict would act on evidence nobody has. "
+        f"`live_definition_unreadable` means the predictor role could not run "
+        f"states:DescribeStateMachine on the preopen state machine — check the "
+        f"DeployDriftProbe statement of alpha-engine-predictor-inference's role "
+        f"(nous-ergon-ops/infrastructure/iam) before the trigger."
+    )
+    result = alerts.publish(
+        message=message,
+        severity="critical",
+        source="alpha-engine-preopen-deploy-readiness-probe",
+        sns=True,
+        telegram=False,
+        sns_topic_arn=SNS_TOPIC_ARN,
+    )
+    logger.error(
+        "DEPLOY-READINESS-PROBE ALERT: sf_drift UNMEASURED (reason=%s) sns_ok=%s",
+        drift.get("sf_drift_reason"), result.sns.ok,
+    )
+
+
 def _page(drift: dict, self_heal_detail: str) -> None:
     message = (
         f"Preopen deploy-readiness probe (alpha-engine-config-I7800): the "
@@ -273,14 +340,27 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     s3client = boto3.client("s3", region_name=REGION)
 
     drift = _invoke_check_deploy_drift(lam_client)
+    state = _drift_state(drift)
     verdict: dict = {
         "date": str(today),
         "sf_drift_initial": drift.get("sf_drift"),
+        "sf_drift_state_initial": state,
         "cf_drift_initial": drift.get("cf_drift"),
         "drift_initial": drift,
     }
 
-    if not drift.get("sf_drift"):
+    if state == _UNMEASURED:
+        # alpha-engine-config-I8142. `drift.get("sf_drift")` read absence as
+        # clean, so an unmeasured verdict — the very input the preopen gate
+        # halts on — produced action=noop reason=clean and no page, 45 minutes
+        # before the session it had already decided.
+        verdict["action"] = "paged"
+        verdict["reason"] = "unmeasured"
+        _page_unmeasured(drift)
+        _write_verdict(s3client, today, verdict)
+        return verdict
+
+    if state == _NO_DRIFT:
         verdict["action"] = "noop"
         verdict["reason"] = "clean"
         _write_verdict(s3client, today, verdict)
@@ -305,10 +385,19 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         self_heal_detail = dispatch_detail
 
     drift_after = _invoke_check_deploy_drift(lam_client)
+    state_after = _drift_state(drift_after)
     verdict["sf_drift_after_self_heal"] = drift_after.get("sf_drift")
+    verdict["sf_drift_state_after_self_heal"] = state_after
     verdict["drift_after_self_heal"] = drift_after
 
-    if drift_after.get("sf_drift"):
+    if state_after == _UNMEASURED:
+        # I8142, the same collapse on the re-probe: an unmeasured verdict here
+        # is not "the self-heal worked", it is "we no longer know", and the
+        # preopen gate will still halt on it.
+        verdict["action"] = "paged"
+        verdict["reason"] = "unmeasured_after_self_heal"
+        _page_unmeasured(drift_after)
+    elif state_after == _DRIFT:
         verdict["action"] = "paged"
         verdict["reason"] = "still_drifted_after_self_heal"
         _page(drift_after, self_heal_detail)
