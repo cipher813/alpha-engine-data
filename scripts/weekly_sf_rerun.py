@@ -124,6 +124,15 @@ CADENCE_ROLES = frozenset({"daily", "weekly", "eod", "shell-run", "exercise"})
 TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"})
 RERUNNABLE_SOURCE_STATUSES = frozenset({"FAILED", "TIMED_OUT", "ABORTED"})
 
+# The CADENCE trigger's declared input — the single source of truth for the
+# scheduled run's own skip set (tests/test_saturday_trigger_skip_parity.py
+# pins that this is where it lives, and that a disable here names its
+# re-enable issue).
+_CFN_ORCHESTRATION = (
+    Path(__file__).resolve().parent.parent
+    / "infrastructure" / "cloudformation" / "alpha-engine-orchestration.yaml"
+)
+
 
 # ---------------------------------------------------------------------------
 # Declarative stage table — pinned against infrastructure/step_function.json
@@ -669,6 +678,58 @@ BACKTESTER_OVERSHADOWED = (
 )
 
 
+class CadenceSkipsUnreadable(RuntimeError):
+    """The cadence trigger's declared input could not be read.
+
+    Raised rather than defaulted. An empty cadence-skip set and an unreadable
+    one are the same value and opposite facts: the first says the scheduled run
+    skips nothing, the second says we do not know — and defaulting the second to
+    the first silently re-enables every stage the cadence has deliberately
+    disabled, which is precisely the failure this loader exists to prevent.
+    """
+
+
+def cadence_declared_skips(path: Path = None) -> dict:
+    """The ``skip_*`` flags the SCHEDULED weekly run declares for itself.
+
+    Parsed out of ``SaturdayTrigger.Targets[saturday-pipeline].Input`` in
+    ``infrastructure/cloudformation/alpha-engine-orchestration.yaml`` — the
+    declared source of truth for the cadence input, and the same block
+    ``tests/test_saturday_trigger_skip_parity.py`` reads. Textual rather than
+    via a YAML loader because the value is a ``!Sub`` block scalar whose CFN
+    intrinsics ``yaml.safe_load`` cannot resolve; only ``skip_*`` keys are read,
+    and every ``${...}`` placeholder sits in a value this function ignores.
+    """
+    p = _CFN_ORCHESTRATION if path is None else path
+    try:
+        text = p.read_text()
+    except OSError as e:
+        raise CadenceSkipsUnreadable(f"cannot read {p}: {e}") from e
+    try:
+        start = text.index("SaturdayTrigger:")
+    except ValueError as e:
+        raise CadenceSkipsUnreadable(
+            f"{p} has no SaturdayTrigger resource — the cadence trigger moved "
+            f"or was renamed; retarget this loader rather than defaulting it"
+        ) from e
+    m = re.search(r"\n          Input: !Sub \|\n(.*?)\n\n", text[start:], re.S)
+    if not m:
+        raise CadenceSkipsUnreadable(
+            f"{p}: SaturdayTrigger target Input block not found — the CFN shape "
+            f"changed; retarget this loader rather than defaulting it"
+        )
+    try:
+        payload = json.loads(m.group(1))
+    except json.JSONDecodeError as e:
+        raise CadenceSkipsUnreadable(
+            f"{p}: SaturdayTrigger Input is not parseable JSON: {e}"
+        ) from e
+    return {
+        k: v for k, v in payload.items()
+        if k.startswith("skip_") and v is True
+    }
+
+
 @dataclass
 class RerunPlan:
     run_date: str
@@ -684,6 +745,10 @@ class RerunPlan:
     # skip_* keys inherited from the source execution's own input, dropped by
     # rerun_input() and reported by the plan printer. See its docstring.
     dropped_inherited_skips: list = field(default_factory=list)
+
+    # skip_* keys the CADENCE trigger declares for itself, re-applied by
+    # rerun_input() and reported separately from the derived set.
+    cadence_skips: list = field(default_factory=list)
 
     def rerun_input(self) -> dict:
         """The emitted StartExecution input.
@@ -709,17 +774,41 @@ class RerunPlan:
         never clear an inherited one. Dropping them is what makes the emitted
         input equal the printed plan. A skip the operator genuinely wants is
         re-passed explicitly, which is also the only form that leaves a record.
+
+        **Except the ones the cadence declares for itself** (2026-08-22,
+        alpha-engine-config-I8153). I7259's rule is right about *ad-hoc* flags
+        and wrong about *declared* ones, and until this change it could not tell
+        them apart. ``skip_parity`` is not an operator's stray flag: it is a
+        standing disable declared in the cadence trigger's own CFN Input under a
+        Brian ruling, with a tracked re-enable issue (I7309) and two blockers
+        that make the stage unable to finish in any budget. Dropping it meant
+        every mechanical rerun of a scheduled run silently RE-ENABLED a stage
+        the cadence has disabled — so ``--start`` launched a doomed parity
+        family, and the operator's only defence was reading a NOTE and
+        hand-editing the emitted JSON. That is three actions and a piece of
+        tribal knowledge against `sf-pipeline-policy.md` §2.5's target of one.
+
+        The distinction is DECLARED versus AD-HOC, not inherited versus derived.
+        Cadence-declared skips are re-applied from their source of truth and
+        printed on their own line; every other inherited flag is still dropped,
+        exactly as I7259 requires. An unreadable declaration RAISES — see
+        ``CadenceSkipsUnreadable``.
         """
         out = {
             k: v for k, v in self.original_input.items()
             if not k.startswith("skip_")
         }
+        declared = cadence_declared_skips()
+        self.cadence_skips = sorted(declared)
         self.dropped_inherited_skips = sorted(
             k for k in self.original_input
-            if k.startswith("skip_") and k not in self.skip_flags
+            if k.startswith("skip_")
+            and k not in self.skip_flags
+            and k not in declared
         )
         out["run_date"] = self.run_date
         out["pipeline_role"] = EMITTED_ROLE
+        out.update(declared)
         out.update(self.skip_flags)
         return out
 
@@ -1133,6 +1222,13 @@ def _print_plan(plan: RerunPlan, source_arn: str, source_status: str, name: str,
     # Populates plan.dropped_inherited_skips as a side effect; call before
     # reporting them.
     _emitted = plan.rerun_input()
+    if plan.cadence_skips:
+        print(
+            f"cadence skips    : {', '.join(plan.cadence_skips)} "
+            "[declared by the scheduled trigger's own CFN Input, re-applied so "
+            "a recovery runs what the cadence runs — NOT derived from what the "
+            "source execution completed]"
+        )
     if plan.dropped_inherited_skips:
         print(
             f"dropped skips    : {', '.join(plan.dropped_inherited_skips)} "
