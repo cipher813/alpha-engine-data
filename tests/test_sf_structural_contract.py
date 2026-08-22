@@ -393,6 +393,18 @@ _NOTIFY_RESOURCE = "arn:aws:states:::sns:publish"
 #     needing its own tracker issue, not a leftover.
 _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
     "step_function.json": {
+        # alpha-engine-config-I8214: the coverage sweep runs AFTER
+        # WriteCompletionMarker — after the pipeline's real success terminal.
+        # A degraded flag exists to make a fail-open visible in the RUN's own
+        # outcome; this run's outcome is already decided and written, and the
+        # sweep may not change it (sf-pipeline-policy §2.1 blast radius), so
+        # the flag would have no reader. The fail-open is made visible the
+        # only way that is honest here: its own SNS page from
+        # WeeklyCoverageSweepUnavailable, into a terminal named
+        # WeeklyCoverageSweepUnobserved — which says the coverage SURFACE, not
+        # the run, is the thing without a verdict.
+        "WeeklyCoverageSweep": "observe-only tail downstream of the success terminal — pages via its own SNS state; a degraded flag would have no reader, the run's outcome being already written",
+
         "RunScope": (
             "alpha-engine-config-I7620. The fail-open is VISIBLE on the "
             "consumer surface rather than through an SF flag, which is why no "

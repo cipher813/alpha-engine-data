@@ -1,0 +1,68 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-weekly-coverage-sweep:*"
+    },
+    {
+      "Sid": "ReadTheCyclesExecutions",
+      "Effect": "Allow",
+      "Action": [
+        "states:ListExecutions",
+        "states:DescribeExecution",
+        "states:GetExecutionHistory"
+      ],
+      "Resource": [
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
+        "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:*"
+      ]
+    },
+    {
+      "Sid": "ReadTheStageVerdictAndFreshnessSurfaces",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research",
+        "arn:aws:s3:::alpha-engine-research/_stage_coverage/*",
+        "arn:aws:s3:::alpha-engine-research/_freshness_monitor/*"
+      ]
+    },
+    {
+      "Sid": "WriteTheSweepArtifact",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/_stage_coverage/_sweep/*"
+    },
+    {
+      "Sid": "AugmentTheCompletionMarker",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research/_sf_completion/*"
+    },
+    {
+      "Sid": "PublishSweepMetrics",
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*"
+    },
+    {
+      "Sid": "PageWhenTheSweepFindsAGap",
+      "Effect": "Allow",
+      "Action": "sns:Publish",
+      "Resource": "arn:aws:sns:us-east-1:711398986525:alpha-engine-watchdog-alerts"
+    }
+  ]
+}

@@ -6879,7 +6879,7 @@
         "Bucket": "alpha-engine-research",
         "Key.$": "States.Format('_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.run_date)",
         "ContentType": "application/json",
-        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"substrate_relaunches\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, $.substrate_relaunch_attempts)"
+        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"substrate_relaunches\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, $.substrate_relaunch_attempts)"
       },
       "TimeoutSeconds": 60,
       "Retry": [
@@ -6893,7 +6893,7 @@
           "Comment": "Transient S3 fault coverage \u2014 mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
         }
       ],
-      "End": true
+      "Next": "WeeklyCoverageSweep"
     },
     "NotifyShellRunComplete": {
       "Type": "Task",
@@ -8505,6 +8505,110 @@
       "Type": "Succeed",
       "Comment": "alpha-engine-config-I6891: the clean Friday-PM preflight terminal. Byte-equivalent in outcome to the End: true NotifyShellRunComplete previously carried \u2014 a green preflight still ends SUCCEEDED and still writes no completion marker; only the degraded edge changed."
     },
+    "WeeklyCoverageSweep": {
+      "Comment": "WeeklyCoverageSweep (alpha-engine-config-I8214, carrying I8154 deliverable 4 and I8186's state-machine half) \u2014 runs nousergon_lib's stage-coverage sweep over THIS cycle and augments the completion marker the previous state just wrote with the cycle's real shape. WHY IT EXISTS: the sweep's READER shipped in nousergon-lib and nothing called it, so it detected nothing. This state is its caller. PLACEMENT: immediately after WriteCompletionMarker, deliberately \u2014 the marker must exist before it can be augmented. The marker the SF writes claims only 'this SF execution reached its terminal' (claim: sf_execution_terminal, cycle_verdict: unknown); this state is what upgrades that to a cycle verdict. On 2026-08-22 the marker was written by an execution that entered 1 of 16 declared stages and said nothing about it. WHY A LAMBDA AND NOT AN SSM COMMAND: this pipeline has no always-on box \u2014 $.ec2_instance_id is an ephemeral spot, and since alpha-engine-config-I8162 a recovery run whose every box stage is skipped carries NO instance id at all, which is exactly the run that most needs a coverage verdict. A sweep dereferencing it would throw States.Runtime one state after the pipeline's own success terminal. Mirrors weekly-run-scope, the sibling Lambda that reads the same execution history for the same pipeline. OBSERVE-ONLY TAIL, a design constraint not an omission: everything from here down is downstream of the real success terminal and must never turn a completed weekly run into a failure (sf-pipeline-policy \u00a72.1 blast radius). Every terminal below is a Succeed, and the Catch routes to the unobserved terminal rather than to a failure. THREE OUTCOMES AND 'DID NOT RUN' IS NOT ONE OF THE OTHER TWO: the handler returns outcome clean / findings / unavailable. Findings have ALREADY paged from inside the handler (krepis.alerts, deduped per pipeline+run_date), so nothing pages again here; 'unavailable' is the one case the sweep cannot page for itself, so the state machine does it. Collapsing unavailable into findings renders an unobserved surface as a detection, and collapsing it into clean renders it green (principles.md \u00a72.7). PREFLIGHT-AWARE: dry_run.$ = $.research_dry \u2014 the Friday-PM shell run exercises the whole read path and every IAM grant, and writes nothing. TIMEOUT: 90s, deliberately BELOW the Lambda's own 120s so the SF ceiling is the one that binds (tests/test_sf_lambda_timeout_ordering.py). DEGRADED PATH DELIBERATELY NOT WIRED: WriteCompletionMarkerDegraded must keep flowing straight into DegradedRun (a Fail state) or sf-telegram-notifier's 'Error: DegradedRun' consumer contract breaks (alpha-engine-config-I6891). A degraded cycle's coverage is swept out-of-band instead.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-weekly-coverage-sweep",
+        "Payload": {
+          "run_date.$": "$.run_date",
+          "dry_run.$": "$.research_dry",
+          "state_machine_arn.$": "$$.StateMachine.Id"
+        }
+      },
+      "TimeoutSeconds": 90,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException",
+            "Lambda.SdkClientException"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "A sweep that could not be INVOKED is the did-not-run case, and it is the one case the handler cannot report for itself because it never started. Routes to the unobserved terminal, which pages \u2014 never to the clean one.",
+          "Next": "WeeklyCoverageSweepUnavailable",
+          "ResultPath": "$.coverage_sweep_error"
+        }
+      ],
+      "ResultSelector": {
+        "outcome.$": "$.Payload.outcome",
+        "payload.$": "$.Payload"
+      },
+      "ResultPath": "$.coverage_sweep",
+      "Next": "CheckWeeklyCoverageSweepOutcome"
+    },
+    "CheckWeeklyCoverageSweepOutcome": {
+      "Type": "Choice",
+      "Comment": "The handler's outcome IS the verdict; each value gets its own named terminal so the execution history says which happened. $.coverage_sweep.outcome is safe to dereference un-guarded: the sole predecessor pins it via ResultSelector (config#2275 rule 3b). The Default is the UNOBSERVED terminal, not the clean one \u2014 an outcome this Choice does not recognise is an unknown state of the coverage surface, and unknown is never rendered green.",
+      "Choices": [
+        {
+          "Variable": "$.coverage_sweep.outcome",
+          "StringEquals": "clean",
+          "Next": "WeeklyCoverageSweepClean"
+        },
+        {
+          "Variable": "$.coverage_sweep.outcome",
+          "StringEquals": "findings",
+          "Next": "WeeklyCoverageSweepFindings"
+        }
+      ],
+      "Default": "WeeklyCoverageSweepUnavailable"
+    },
+    "WeeklyCoverageSweepClean": {
+      "Type": "Succeed",
+      "Comment": "outcome=clean: the sweep ran and found no coverage gap. The marker WriteCompletionMarker wrote a moment earlier now carries the cycle's real shape, so its cycle_verdict is no longer 'unknown'."
+    },
+    "WeeklyCoverageSweepFindings": {
+      "Type": "Succeed",
+      "Comment": "outcome=findings: the sweep ran and found a gap. It has ALREADY paged from inside the handler (krepis.alerts, dedup_key stage-coverage-sweep/<pipeline>/<run_date>) \u2014 no second publish here, which would render one finding as two incidents. Succeed rather than Fail because the weekly run itself completed: this terminal reports on the SWEEP, and failing the execution would retroactively mark a good run bad, which is the misattribution alpha-engine-config-I8045 is about."
+    },
+    "WeeklyCoverageSweepUnavailable": {
+      "Type": "Task",
+      "Comment": "outcome=unavailable, an unrecognised outcome, or an invoke failure: the sweep DID NOT RUN, or ran and could not publish what it found. This is the branch that must page from the state machine, because a handler that never started cannot page for itself, and 'found nothing' and 'did not run' are different facts (principles.md \u00a72.7). Fail-open to Succeed after publishing: the weekly run completed and its completion is not in question \u2014 what is unobserved is the coverage check over it.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline - stage-coverage sweep DID NOT RUN",
+        "Message.$": "States.Format('The weekly run for {} completed and wrote its completion marker, but the stage-coverage sweep did not run, or ran and could not publish its result. The marker therefore keeps its bare envelope claim - cycle_verdict unknown - and no coverage verdict exists for this cycle. This is an UNOBSERVED surface, not a clean result. Re-run it by invoking the alpha-engine-weekly-coverage-sweep Lambda with run_date {} and state_machine_arn arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline.', $.run_date, $.run_date)"
+      },
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#1819 notifier convention: a failed notify must not fail the run.",
+          "Next": "WeeklyCoverageSweepUnobserved",
+          "ResultPath": "$.coverage_sweep_notify_error"
+        }
+      ],
+      "ResultPath": "$.coverage_sweep_notify_result",
+      "Next": "WeeklyCoverageSweepUnobserved"
+    },
+    "WeeklyCoverageSweepUnobserved": {
+      "Type": "Succeed",
+      "Comment": "Terminal for the did-not-run case, named for what is true \u2014 the coverage surface is unobserved for this cycle \u2014 rather than for the run, which completed."
+    },
     "WriteCompletionMarkerDegraded": {
       "Type": "Task",
       "Comment": "alpha-engine-config-I6891, the DEGRADED twin of WriteCompletionMarker (shape mirrored from step_function_daily.json per the shared-code rule). Writes the SAME key as the clean marker with status DEGRADED and the full $.degraded_summary embedded, so a marker reader (pipeline-watchdog, sf-telegram-notifier, weekly_sf_recovery_metric) can tell a run that really worked from one that only ended. Deliberately EXCLUDES the Friday-PM preflight paths for the same reason WriteCompletionMarker does. No swallow-all Catch, same as the clean twin: a marker that cannot be written means this execution's own completion is unverifiable, which is the ambiguity the feature exists to surface rather than mask. ResultPath is LOAD-BEARING, not hygiene (alpha-engine-config-I6891): a Task with no ResultPath defaults to $, so the putObject result REPLACES the whole state input and the DegradedRun terminal's CausePath dereference of $.degraded_summary.reason cannot resolve. The execution then fails with States.Runtime instead of DegradedRun \u2014 and Error: DegradedRun is a consumer contract: sf-telegram-notifier's _is_degraded_run() keys its DEGRADED rendering off exactly that string, so every honestly-degraded run rendered as an ordinary crash-red FAILED with a truncated cause. Shipped in both weekday definitions since config#6692/#6722; the weekly one inherited it by mirroring them and it is fixed in all three here.",
@@ -8513,7 +8617,7 @@
         "Bucket": "alpha-engine-research",
         "Key.$": "States.Format('_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.run_date)",
         "ContentType": "application/json",
-        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"degraded_summary\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, States.JsonToString($.degraded_summary))"
+        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"degraded_summary\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, States.JsonToString($.degraded_summary))"
       },
       "ResultPath": "$.degraded_marker_result",
       "TimeoutSeconds": 60,

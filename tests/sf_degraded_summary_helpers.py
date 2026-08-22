@@ -121,5 +121,55 @@ def assert_completion_notifier_chain(states: dict, notifier: str) -> None:
     assert "Cause" not in states["DegradedRun"]
 
     clean_marker = states["WriteCompletionMarker"]
-    assert clean_marker["End"] is True
     assert '"status":"SUCCEEDED"' in clean_marker["Parameters"]["Body.$"]
+    # alpha-engine-config-I8214: the clean marker no longer ENDS the execution;
+    # it hands off to the observe-only stage-coverage sweep, which augments the
+    # marker it just wrote with the cycle's real shape. The property the old
+    # `End is True` line stood for — a clean run terminates SUCCEEDED, never
+    # Fail — is asserted below over the whole tail, which is strictly more than
+    # the line it replaced: an observe-only tail that could fail a completed run
+    # would be the exact defect I8214's own comment forbids.
+    assert "End" not in clean_marker
+    assert clean_marker["Next"] == "WeeklyCoverageSweep"
+    assert_observe_only_tail(states, "WeeklyCoverageSweep")
+
+
+def assert_observe_only_tail(states: dict, entry: str) -> None:
+    """Every path out of `entry` reaches a Succeed, and none reaches a Fail.
+
+    An observe-only tail sits downstream of a pipeline's real success terminal.
+    It may page, it may write, it may find nothing — but it may not turn a
+    completed run into a failed one (sf-pipeline-policy §2.1 blast radius). A
+    reachability walk rather than a hand-listed set of terminals, so a state
+    added to the tail later is covered by this assertion existing.
+    """
+    seen: set[str] = set()
+    stack = [entry]
+    terminals: set[str] = set()
+    while stack:
+        name = stack.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        st = states[name]
+        assert st["Type"] != "Fail", (
+            f"{name} is reachable from the observe-only tail at {entry} and is a "
+            "Fail state — a tail downstream of the success terminal must never "
+            "fail a run that already completed"
+        )
+        nexts = []
+        if "Next" in st:
+            nexts.append(st["Next"])
+        for choice in st.get("Choices", []) or []:
+            nexts.append(choice["Next"])
+        if st.get("Default"):
+            nexts.append(st["Default"])
+        for catch in st.get("Catch", []) or []:
+            nexts.append(catch["Next"])
+        if not nexts:
+            assert st["Type"] == "Succeed" or st.get("End") is True, (
+                f"{name} terminates the tail without being a Succeed"
+            )
+            terminals.add(name)
+        stack.extend(nexts)
+    assert terminals, f"no terminal reachable from {entry}"

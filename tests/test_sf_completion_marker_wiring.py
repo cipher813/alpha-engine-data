@@ -63,7 +63,18 @@ def test_marker_state_shape(weekly_states):
     assert "ne-weekly-freshness-pipeline" in body
     assert "$$.Execution.Id" in body
     assert "$.run_date" in body
-    assert st["End"] is True
+    # I8214: the marker hands off to the observe-only coverage sweep instead of
+    # ending the execution. The sweep augments the object this state just wrote.
+    assert "End" not in st
+    assert st["Next"] == "WeeklyCoverageSweep"
+    assert '"claim":"sf_execution_terminal"' in body, (
+        "the marker must name what its write actually asserts — the SF execution "
+        "reached its terminal — rather than implying the cycle completed"
+    )
+    assert '"cycle_verdict":"unknown"' in body, (
+        "a consumer reading the marker BEFORE the sweep augments it must resolve "
+        "to UNKNOWN, never to an implied pass (sf-pipeline-policy §2.3a)"
+    )
     # Deliberate: no swallow-all Catch (unlike the SNS notifiers) — a marker
     # that genuinely cannot be written should surface as a real failure,
     # not be silently swallowed the way a non-fatal notify is.
