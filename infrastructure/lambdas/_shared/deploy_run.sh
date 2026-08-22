@@ -77,6 +77,62 @@ run() {
   return 0
 }
 
+# run_tolerating <error-substring> <command...>
+#
+# For the one shape `run` cannot express: a command whose failure is EXPECTED
+# and benign for exactly one reason, and fatal for every other.
+#
+# WHY THIS EXISTS (alpha-engine-config-I8125). `run` above calls `exit`, not
+# `return`. That is deliberate and correct — but `exit` inside a function
+# terminates the SHELL, and `cmd || true` cannot catch it: `||` guards a
+# non-zero RETURN, and there is no return to guard. So the moment run() started
+# exiting, every pre-existing `run ... || true` in this repo became fatal
+# rather than tolerant, silently and everywhere at once.
+#
+# Measured 2026-08-21: 24 sites across 20 of 43 deploy.sh scripts, every one an
+# `aws lambda add-permission` — the call that returns ResourceConflictException
+# whenever its statement-id already exists, i.e. on EVERY deploy after the
+# first. Twenty Lambdas became undeployable in a single merge, and
+# `deploy-overseer-backstop-responder` failed five consecutive times before
+# anyone read the log. The guard's own `2>/dev/null` on those call sites
+# suppressed the message that would have named it.
+#
+# `|| true` was always too broad anyway: it swallowed AccessDenied and a
+# malformed ARN exactly as readily as the conflict it was written for. This
+# names the tolerated failure, so anything else still fails loud — strictly
+# stronger than what it replaces, which is why the fix is this rather than
+# restoring a `return`.
+#
+#   run_tolerating "ResourceConflictException" \
+#     aws lambda add-permission --function-name "$FN" --statement-id "$SID" ...
+#
+# stderr is captured rather than discarded so the tolerated case can be
+# RECOGNISED; on a match it is reported at info level, never hidden. Do not
+# add `2>/dev/null` at the call site — that is what made the original failure
+# unreadable.
+run_tolerating() {
+  local expected="${1:?run_tolerating: expected-error substring required}"
+  shift
+  if ${DRY_RUN:-false}; then
+    echo "DRY: $*"
+    return 0
+  fi
+  local output status=0
+  output="$("$@" 2>&1)" || status=$?
+  if [ "${status}" -eq 0 ]; then
+    [ -n "${output}" ] && echo "${output}"
+    return 0
+  fi
+  if [[ "${output}" == *"${expected}"* ]]; then
+    echo "  (tolerated: ${expected}) $1 ${2:-}"
+    return 0
+  fi
+  echo "ERROR: command failed (exit ${status}): $*" >&2
+  echo "ERROR: ${output}" >&2
+  echo "ERROR: tolerated failures for this call are limited to: ${expected}" >&2
+  exit "${status}"
+}
+
 # verify_code_deployed <function-name> <region> <zip-path>
 #
 # Reads back the LIVE CodeSha256 after an update-function-code /

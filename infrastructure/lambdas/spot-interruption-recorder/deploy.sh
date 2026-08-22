@@ -157,11 +157,12 @@ if $BOOTSTRAP; then
     --region "${REGION}" --query 'RuleArn' --output text
   run aws events put-targets --rule "${TICK_RULE}" \
     --targets "Id=1,Arn=${FN_ARN}" --region "${REGION}"
-  run aws lambda add-permission --function-name "${FUNCTION_NAME}" \
+  run_tolerating "ResourceConflictException" \
+    aws lambda add-permission --function-name "${FUNCTION_NAME}" \
     --statement-id "eventbridge-${TICK_RULE}" --action lambda:InvokeFunction \
     --principal events.amazonaws.com \
     --source-arn "arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${TICK_RULE}" \
-    --region "${REGION}" 2>/dev/null || true
+    --region "${REGION}"
 
   echo "  Creating EventBridge rule: ${WARN_RULE} ($(pause_state "${WARN_RULE}"))"
   run aws events put-rule --name "${WARN_RULE}" \
@@ -171,11 +172,12 @@ if $BOOTSTRAP; then
     --region "${REGION}" --query 'RuleArn' --output text
   run aws events put-targets --rule "${WARN_RULE}" \
     --targets "Id=1,Arn=${FN_ARN}" --region "${REGION}"
-  run aws lambda add-permission --function-name "${FUNCTION_NAME}" \
+  run_tolerating "ResourceConflictException" \
+    aws lambda add-permission --function-name "${FUNCTION_NAME}" \
     --statement-id "eventbridge-${WARN_RULE}" --action lambda:InvokeFunction \
     --principal events.amazonaws.com \
     --source-arn "arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${WARN_RULE}" \
-    --region "${REGION}" 2>/dev/null || true
+    --region "${REGION}"
 fi
 
 # ----- 3. Update function code ----------------------------------------------

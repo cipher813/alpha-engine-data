@@ -142,9 +142,10 @@ FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
 run aws events put-targets --rule "${RULE_NAME}" --targets "Id=1,Arn=${FN_ARN}" --region "${REGION}"
 
 RULE_ARN="arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${RULE_NAME}"
-run aws lambda add-permission --function-name "${FUNCTION_NAME}" \
+run_tolerating "ResourceConflictException" \
+  aws lambda add-permission --function-name "${FUNCTION_NAME}" \
   --statement-id "eventbridge-${RULE_NAME}" --action lambda:InvokeFunction \
-  --principal events.amazonaws.com --source-arn "${RULE_ARN}" --region "${REGION}" 2>/dev/null || true
+  --principal events.amazonaws.com --source-arn "${RULE_ARN}" --region "${REGION}"
 
 # ----- 3. Update function code (always after bootstrap, idempotent) ---------
 

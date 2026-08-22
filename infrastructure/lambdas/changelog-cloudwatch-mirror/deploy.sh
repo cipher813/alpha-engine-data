@@ -311,7 +311,19 @@ if $BOOTSTRAP || $WIRE_SUBS; then
       --action lambda:InvokeFunction \
       --principal "logs.${REGION}.amazonaws.com" \
       --source-arn "arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:${LOG_GROUP}:*" \
-      --region "${REGION}" 2>&1) || true
+      --region "${REGION}" 2>&1) || PERM_RC=$?
+    # Not `|| true`: that swallowed AccessDenied and a malformed source-arn
+    # exactly as readily as the conflict it was written for, and a deploy that
+    # could not grant CloudWatch Logs permission to invoke this function has
+    # not deployed (alpha-engine-config-I8125). This call keeps its own
+    # capture rather than moving to run_tolerating because PERM_OUT is read
+    # below to decide the propagation sleep.
+    if [ "${PERM_RC:-0}" -ne 0 ] && [[ "${PERM_OUT}" != *ResourceConflictException* ]]; then
+      echo "ERROR: add-permission failed for ${PERM_SID} (exit ${PERM_RC}):" >&2
+      echo "ERROR: ${PERM_OUT}" >&2
+      exit "${PERM_RC}"
+    fi
+    PERM_RC=0
 
     # IAM/Lambda permission propagation is eventually consistent —
     # put-subscription-filter validates the resource policy and fails
