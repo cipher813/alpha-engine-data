@@ -1,0 +1,96 @@
+name: Pause Check Alert
+
+# alpha-engine-config-I8110 deliverable 1. automation_pause.py --check
+# already runs daily in sf-arn-drift-check.yml, but that workflow's only
+# reader on a finding is a GitHub Actions red X plus whatever downstream
+# groom triages it — and the groom has been paused since 2026-08-12
+# (alpha-engine-config-I6984). The 2026-08-21 drift (four
+# alpha-engine-alert-drain-*utc schedules re-enabled, their four watch-plane
+# alarms left muted) sat live for 1h20m and was found by hand; --check would
+# have caught it same-cycle had anything besides the paused groom been
+# reading its output. "A guard whose only reader is paused is not a guard."
+#
+# This workflow IS that reader. It is deliberately its OWN workflow rather
+# than a step added to sf-arn-drift-check.yml, for the same reason
+# pause-reconcile.yml is its own workflow rather than a step there: sharing a
+# job would make this check's alert path indistinguishable from any other
+# step's failure on that job, and its cadence needs to be independent of
+# sf-arn-drift-check.yml's (daily, tied to the IAM-drift sweep it rides
+# alongside).
+#
+# CADENCE IS HOURS, NOT DAYS — the whole point of this issue. Six times a
+# day (every 4 hours) bounds the worst-case time-to-page at 4h, well inside
+# "would have caught the 2026-08-21 drift the same day" and cheap: each run
+# is a handful of read-only DescribeRule/GetSchedule/DescribeAlarms calls
+# against one account, the same calls sf-arn-drift-check.yml already makes
+# once a day.
+#
+# DELIVERY, NOT JUST DETECTION. `--alert-on-fail` fans a finding out through
+# krepis.alerts at severity=error (SEVERITY_PHONE_PUSH) — the only severity
+# this caller can rely on reaching Brian by phone push with no groom, sweep,
+# or console reader in the loop (alpha-engine-config-I7857: every severity
+# is delivered to the channel, but only error/critical also buzz the phone,
+# and with the groom paused nothing is reading the channel text). This is
+# ADDITIVE to sf-arn-drift-check.yml's existing --check step, which stays as
+# the CI-visible, PR-adjacent signal; this workflow is the paging path that
+# does not depend on anyone looking at Actions.
+#
+# NOT the enforcement half. This workflow only ever runs `--check
+# --alert-on-fail` — it never calls `--enforce`, on triggers or on alarms.
+# The scheduled `--enforce --alarms-only` reconciliation already exists and
+# already runs independently of the groom, unconditionally on every trigger
+# of sf-arn-drift-check.yml including its own daily cron (deliverable 2 —
+# see that workflow's "Paused-component alarm actions reconciled with the
+# manifest (live)" step, added alpha-engine-config-I7174/I7023). This
+# workflow adds nothing there; it exists solely to make sure a --check
+# finding is never silent again.
+#
+# NOT a pull_request check, for the reason sf-arn-drift-check.yml and
+# pause-reconcile.yml both state at length: every comparison here is
+# CODIFIED-manifest vs LIVE AWS, which says nothing about a PR's diff and
+# would put a red X on PRs that did not cause it and cannot clear it.
+
+on:
+  schedule:
+    - cron: '15 */4 * * *'   # every 4 hours, offset from the :30/:50 daily sweeps
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+jobs:
+  check-and-alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-iam-drift-check
+          aws-region: us-east-1
+
+      # krepis is required only by --alert-on-fail (imported lazily inside
+      # automation_pause.py::alert_on_findings so the bare --check step in
+      # sf-arn-drift-check.yml keeps needing nothing beyond the stdlib). Same
+      # pin floor and same install pattern as deploy.yml's canary-rollback
+      # alert step ("Install krepis for deploy.sh alerts call") — read-only
+      # here too, no extras needed (alerts uses boto3/SNS, preinstalled on
+      # ubuntu-latest).
+      - name: Set up Python for the alert-publish path
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install krepis for automation_pause.py --alert-on-fail
+        run: pip install "krepis>=0.6.0"
+
+      # No `if:` — the invariant is about live AWS state and it must be
+      # reachable on every trigger this workflow has, the same reachability
+      # property tests/test_automation_pause.py::test_ci_runs_the_pause_check
+      # already pins for the daily step. This job's whole reason to exist is
+      # to page when --check fails, so a gated step here would silently
+      # reintroduce the exact defect this issue closes.
+      - name: Scheduled-automation pause still holds (live) — page on drift
+        run: python3 infrastructure/automation_pause.py --check --alert-on-fail

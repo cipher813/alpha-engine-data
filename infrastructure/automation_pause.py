@@ -75,13 +75,23 @@ Usage:
   ./infrastructure/automation_pause.py --enforce --alarms-only  # touch ONLY alarm actions;
                                                     # never disables/enables a trigger
   ./infrastructure/automation_pause.py --check --json
+  ./infrastructure/automation_pause.py --check --alert-on-fail  # page via krepis.alerts
+                                                    # (severity=error) on any finding —
+                                                    # independent of any groom/sweep
+                                                    # consumer (alpha-engine-config-I8110);
+                                                    # run by pause-check-alert.yml on its own
+                                                    # 4-hourly schedule, needs krepis installed
 
 ``--check`` needs ``events:DescribeRule`` + ``scheduler:GetSchedule`` +
 ``cloudwatch:DescribeAlarms``; ``--enforce`` additionally needs
 ``events:DisableRule`` + ``scheduler:UpdateSchedule`` +
 ``cloudwatch:EnableAlarmActions`` + ``cloudwatch:DisableAlarmActions``. CI runs
 ``--check`` (read-only) and ``--enforce --alarms-only`` (alarm actions only)
-under the ``github-actions-iam-drift-check`` role.
+under the ``github-actions-iam-drift-check`` role, daily in
+``sf-arn-drift-check.yml``; ``pause-check-alert.yml`` runs ONLY
+``--check --alert-on-fail`` (same role, same read-only permission set) on its
+own schedule so a finding pages even while the groom that would otherwise
+triage a red CI job is paused.
 """
 
 from __future__ import annotations
@@ -627,6 +637,65 @@ def alarm_coverage_findings() -> list[dict]:
     return out
 
 
+def alert_on_findings(findings: list[dict], source: str = __file__) -> None:
+    """Page independently of any groom or sweep consumer (alpha-engine-config-I8110).
+
+    ``--check`` already runs inside ``sf-arn-drift-check.yml``'s daily cron —
+    but that workflow's only reader, when a finding lands, is a GitHub Actions
+    red X plus whatever downstream groom triages it, and the groom has been
+    paused since 2026-08-12 (alpha-engine-config-I6984). The 2026-08-21
+    drift (four schedules re-enabled, four alarms left muted) sat live for
+    1h20m and was found by hand — ``--check`` would have caught it same-cycle
+    had anything besides the paused groom been reading its output. This is
+    that reader: it fans the finding out through ``krepis.alerts``, which pages
+    Brian directly and needs no groom, no sweep, and no console reader in the
+    loop.
+
+    Severity is pinned to ``"error"`` deliberately, never ``"warning"``.
+    alpha-engine-config-I7857 established that krepis.alerts delivers every
+    severity to SNS/Telegram — nothing here is EVER dropped by severity choice
+    — but only ``error``/``critical`` also trigger the Telegram phone push
+    (``krepis.alerts.SEVERITY_PHONE_PUSH``). With the groom paused there is no
+    other consumer watching the channel text, so the phone push is the only
+    delivery this caller can rely on actually reaching Brian.
+
+    ``krepis`` is imported lazily, inside this function, so that plain
+    ``--check`` (the mode ``sf-arn-drift-check.yml`` already runs, with no
+    krepis installed in that job) keeps working with nothing beyond the
+    stdlib. Only the caller that opts into ``--alert-on-fail`` needs the
+    dependency, and the workflow that passes that flag installs it.
+
+    ``krepis.alerts.publish`` is best-effort and never raises on a channel
+    failure (SNS/Telegram errors are caught and logged internally per its own
+    docstring) — this function does not swallow anything further; a genuine
+    defect here (e.g. krepis not installed despite the flag being passed)
+    surfaces as an uncaught exception and a red job, which is the correct
+    failure mode for a paging path that silently no-oped once already
+    (config#1646).
+    """
+    from krepis.alerts import publish
+
+    kinds = sorted(f"{f['kind']}:{f['surface']}:{f['trigger']}" for f in findings)
+    kind_summary = ", ".join(sorted({f["kind"] for f in findings}))
+    headline = f"automation_pause.py --check: {len(findings)} finding(s) — {kind_summary}"
+    body = "\n".join(
+        f"  [{f['kind']}] {f['surface']}:{f['trigger']} — {f['detail']}" for f in findings
+    )
+    publish(
+        f"{headline}\n{body}",
+        severity="error",
+        source=source,
+        # Keyed on the exact finding set, not a fixed string: a rerun within
+        # the window that finds the SAME drift collapses to one page, but any
+        # change to what is wrong (new trigger, cleared trigger, new kind)
+        # mints a fresh key and pages again immediately rather than waiting
+        # out the window. 180min is just under this check's own 4-hour
+        # schedule, so an unresolved drift still pages on every cycle.
+        dedup_key="automation-pause-check:" + ",".join(kinds),
+        dedup_window_min=180,
+    )
+
+
 def enforce(alarms_only: bool = False) -> list[str]:
     """Drive live AWS to match the manifest.
 
@@ -669,9 +738,15 @@ def main() -> int:
     ap.add_argument("--alarms-only", action="store_true",
                      help="with --enforce, touch ONLY CloudWatch alarm-action state; "
                           "never disable or enable a trigger")
+    ap.add_argument("--alert-on-fail", action="store_true",
+                     help="with --check, page via krepis.alerts (severity=error) when "
+                          "findings exist — independent of any groom/sweep consumer "
+                          "(alpha-engine-config-I8110); requires krepis installed")
     args = ap.parse_args()
     if args.alarms_only and not args.enforce:
         ap.error("--alarms-only only makes sense with --enforce")
+    if args.alert_on_fail and not args.check:
+        ap.error("--alert-on-fail only makes sense with --check")
 
     entries = paused_entries()
 
@@ -689,6 +764,8 @@ def main() -> int:
             return 0
 
         findings = check()
+        if findings and args.alert_on_fail:
+            alert_on_findings(findings)
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
