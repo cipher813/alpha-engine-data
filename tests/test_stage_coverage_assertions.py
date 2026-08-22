@@ -47,6 +47,12 @@ def _states(definition: dict) -> dict[str, dict]:
                 walk(branch["States"])
             if "Iterator" in body:
                 walk(body["Iterator"]["States"])
+            # Newer ASL Map states use ItemProcessor rather than Iterator
+            # (e.g. TrainSpecDispatch, nested inside ModelZoo's Map) — both
+            # must be walked or a state nested only under ItemProcessor is
+            # silently invisible to every totality test in this file.
+            if "ItemProcessor" in body:
+                walk(body["ItemProcessor"]["States"])
 
     walk(definition["States"])
     return out
@@ -115,6 +121,36 @@ def test_each_launcher_passes_the_run_window(stage: str, script: str) -> None:
     while the consumer reads last week's belief."""
     body = _script(script)
     assert '--window-start "$_STAGE_WINDOW_START"' in body
+
+
+@pytest.mark.parametrize(
+    ("stage", "script"),
+    sorted(_launcher_stages_in_this_repo().items()),
+)
+def test_each_launcher_passes_an_explicit_run_date(stage: str, script: str) -> None:
+    """alpha-engine-config-I8155: on the 2026-08-22 weekly run every one of
+    these launchers wrote its verdict under an EMPTY run_date, because the
+    CLI's argparse default (`os.environ.get("RUN_DATE", "")`) resolves empty
+    when the launcher never receives RUN_DATE — which none of these do. The
+    fix is explicit: `--run-date "$EXECUTION_RUN_DATE"`, never a bare
+    `krepis.stage_coverage assert` relying on the CLI default, and never
+    `$RUN_DATE` — that name is reassigned to the trading day by
+    crucible-backtester's infrastructure/_spot_common.sh, so a carrier other
+    code rewrites is exactly the defect this fixes."""
+    body = _script(script)
+    for line in body.splitlines():
+        if CLI_MODULE in line and "assert --stage" in line and f"--stage {stage}" in line:
+            assert '--run-date "$EXECUTION_RUN_DATE"' in line, (
+                f"{script}: the {stage} assertion does not pass an explicit "
+                "--run-date $EXECUTION_RUN_DATE"
+            )
+            assert "$RUN_DATE" not in line.replace("$EXECUTION_RUN_DATE", ""), (
+                f"{script}: the {stage} assertion's --run-date must never read "
+                "the $RUN_DATE carrier — see alpha-engine-config-I8155"
+            )
+            break
+    else:
+        pytest.fail(f"{script}: no assert --stage {stage} line found")
 
 
 def test_the_window_is_captured_before_the_workload_not_after() -> None:
@@ -210,7 +246,7 @@ def test_the_multimode_launcher_asserts_only_the_phase2_stage() -> None:
 def test_weekly_preflight_records_its_no_output_declaration() -> None:
     body = (INFRA / "lambdas" / "weekly-preflight" / "index.py").read_text()
     assert "from krepis.stage_coverage import assert_stage_coverage" in body
-    assert '_assert_stage_coverage("WeeklyPreflight", started)' in body
+    assert '_assert_stage_coverage("WeeklyPreflight", started, run_date)' in body
     assert '"stage_coverage"' in body
 
 
@@ -221,6 +257,62 @@ def test_the_spot_dispatcher_derives_which_of_its_two_stages_ran() -> None:
         INFRA / "lambdas" / "weekly-freshness-spot-dispatcher" / "index.py"
     ).read_text()
     assert '"RelaunchWeeklyFreshnessSpot" if force_on_demand else "DispatchWeeklyFreshnessSpot"' in body
+
+
+# ── alpha-engine-config-I8155: the two Lambdas pass a real run_date ──────────
+
+
+def test_weekly_preflight_threads_the_event_run_date() -> None:
+    """`WeeklyPreflight`'s Task already passes `Payload.$="$"` (config-I7443),
+    so `event["run_date"]` is the state input's `$.run_date` — no SF-side
+    Payload change needed, only wiring it into the assertion call."""
+    body = (INFRA / "lambdas" / "weekly-preflight" / "index.py").read_text()
+    assert 'run_date = event.get("run_date")' in body
+    assert "def _assert_stage_coverage(stage: str, started: datetime, run_date: str | None) -> dict:" in body
+    assert "assert_stage_coverage(stage, window_start=started, run_date=run_date)" in body
+
+
+def test_weekly_preflight_never_fabricates_a_run_date() -> None:
+    """A missing run_date on the event must report UNMEASURED, never invent a
+    date — that is exactly the defect alpha-engine-config-I8155 fixes."""
+    body = (INFRA / "lambdas" / "weekly-preflight" / "index.py").read_text()
+    fn = body[body.index("def _assert_stage_coverage(stage: str, started: datetime, run_date"):]
+    assert "if not run_date:" in fn
+    guard = fn[: fn.index("try:\n        from krepis.stage_coverage")]
+    assert '"status": "UNMEASURED"' in guard
+
+
+def test_the_spot_dispatcher_sf_payloads_carry_run_date() -> None:
+    """DispatchWeeklyFreshnessSpot and RelaunchWeeklyFreshnessSpot previously
+    passed a narrow Payload with no run_date at all — this Lambda's
+    stage-coverage verdict has been writing under an empty run_date since
+    I7214 shipped. Both states now thread `$.run_date` explicitly."""
+    definition = json.loads(SF_DEFINITION.read_text())
+    states = _states(definition)
+    for name in ("DispatchWeeklyFreshnessSpot", "RelaunchWeeklyFreshnessSpot"):
+        payload = states[name]["Parameters"]["Payload"]
+        assert payload.get("run_date.$") == "$.run_date", (
+            f"{name}: Payload does not thread $.run_date"
+        )
+
+
+def test_the_spot_dispatcher_threads_the_event_run_date() -> None:
+    body = (
+        INFRA / "lambdas" / "weekly-freshness-spot-dispatcher" / "index.py"
+    ).read_text()
+    assert 'str(event.get("run_date", "")).strip() or None' in body
+    assert "def _assert_stage_coverage(stage: str, started: datetime.datetime, run_date: str | None) -> dict:" in body
+    assert "assert_stage_coverage(stage, window_start=started, run_date=run_date)" in body
+
+
+def test_the_spot_dispatcher_never_fabricates_a_run_date() -> None:
+    body = (
+        INFRA / "lambdas" / "weekly-freshness-spot-dispatcher" / "index.py"
+    ).read_text()
+    fn = body[body.index("def _assert_stage_coverage(stage: str, started: datetime.datetime, run_date"):]
+    assert "if not run_date:" in fn
+    guard = fn[: fn.index("try:\n        from krepis.stage_coverage")]
+    assert '"status": "UNMEASURED"' in guard
 
 
 @pytest.mark.parametrize(
@@ -269,3 +361,193 @@ def test_the_weekly_preflight_lambda_has_no_coverage_action_dispatch() -> None:
 
 def test_the_end_of_run_module_is_gone() -> None:
     assert not (REPO / "sf_stage_coverage.py").exists()
+
+
+# ── alpha-engine-config-I8155: EXECUTION_RUN_DATE reaches every SSM state ────
+#
+# On the 2026-08-22 weekly run, krepis.stage_coverage verdicts split across
+# TWO run_date prefixes for one execution: the 8 shell/subprocess launchers
+# (this section's targets) wrote run_date="" because they never received
+# RUN_DATE at all; the crucible-backtester family wrote run_date to the
+# TRADING DAY because infrastructure/_spot_common.sh in that repo reassigns
+# RUN_DATE. EXECUTION_RUN_DATE is the fix: a NEW carrier, exported from
+# $.run_date (InitializeInput's single stamp, never rewritten anywhere in
+# this definition) into every coverage-asserting SSM state, and never
+# normalized by anything downstream.
+
+#: Every SSM sendCommand state whose command runs a launcher that performs a
+#: stage-coverage assertion. Deliberately excludes the two bare
+#: `aws s3api head-object` resource-kill-check states (PitParityLookaheadKillCheck-
+#: shaped) and ResolveZooSpecs (resolves rotation spec ids only, no assertion).
+_COVERAGE_ASSERTING_SSM_STATES = frozenset({
+    "MorningEnrich", "DataPhase1", "RAGIngestion", "DataPhase2",
+    "PredictorTraining", "TrainSpecDispatch", "ModelZooSelect",
+    "SaturdayHealthCheck", "WeeklySubstrateHealthCheck",
+    "Backtester", "PredictorBacktest", "PortfolioOptimizerBacktest",
+    "PitParityLookahead", "PitParityWalkforward", "ParityReplay",
+    "PitParityCompare", "EvaluatorDiagnostics", "EvaluatorOptimize",
+})
+
+_EXECUTION_RUN_DATE_EXPORT = "export EXECUTION_RUN_DATE="
+
+
+def _sf_states() -> dict[str, dict]:
+    return _states(json.loads(SF_DEFINITION.read_text()))
+
+
+@pytest.mark.parametrize("name", sorted(_COVERAGE_ASSERTING_SSM_STATES))
+def test_every_coverage_asserting_ssm_state_exports_execution_run_date(name: str) -> None:
+    states = _sf_states()
+    assert name in states, f"{name}: state not found in the live SF definition"
+    text = _ssm_command_text(states[name])
+    assert _EXECUTION_RUN_DATE_EXPORT in text, (
+        f"{name}: does not export EXECUTION_RUN_DATE — its stage-coverage "
+        "assertion (if any) has no reliable run_date carrier"
+    )
+    assert "$.run_date" in text, f"{name}: EXECUTION_RUN_DATE is not sourced from $.run_date"
+
+
+def test_execution_run_date_covers_every_task_state_with_a_krepis_assertion() -> None:
+    """The set above is asserted against the live definition, not just
+    hand-listed: any Task state whose command names krepis.stage_coverage
+    but lacks the export is a miss this test must catch even if the curated
+    set above goes stale."""
+    states = _sf_states()
+    missing = []
+    for name, body in states.items():
+        if body.get("Type") != "Task" or "sendCommand" not in body.get("Resource", ""):
+            continue
+        text = _ssm_command_text(body)
+        # A state whose *own* SSM command invokes krepis.stage_coverage
+        # directly (none do today — the CLI runs inside the launcher script
+        # over on the box) OR whose named launcher script is one of this
+        # repo's coverage-asserting scripts.
+        match = re.search(r"bash infrastructure/(spot_[a-z0-9_]+\.sh)", text)
+        if not match:
+            continue
+        script_path = INFRA / match.group(1)
+        if not script_path.exists() or CLI_MODULE not in script_path.read_text():
+            continue
+        missing.append(name)
+    # Every discovered state must actually carry the export.
+    for name in missing:
+        text = _ssm_command_text(states[name])
+        assert _EXECUTION_RUN_DATE_EXPORT in text, (
+            f"{name}: backs a coverage-asserting launcher but its SSM state "
+            "does not export EXECUTION_RUN_DATE"
+        )
+
+
+def test_run_date_export_does_not_replace_the_backtester_family_run_date() -> None:
+    """RUN_DATE is load-bearing for `parity/$RUN_DATE/...` S3 keys in the
+    crucible-backtester family — EXECUTION_RUN_DATE is ADDED alongside it,
+    never a replacement."""
+    states = _sf_states()
+    backtester_family = {
+        "Backtester", "PredictorBacktest", "PortfolioOptimizerBacktest",
+        "PitParityLookahead", "PitParityWalkforward", "ParityReplay",
+        "PitParityCompare", "EvaluatorDiagnostics", "EvaluatorOptimize",
+    }
+    for name in backtester_family:
+        text = _ssm_command_text(states[name])
+        assert "export RUN_DATE=" in text, f"{name}: lost its load-bearing RUN_DATE export"
+        assert _EXECUTION_RUN_DATE_EXPORT in text
+
+
+def test_the_resource_kill_check_states_do_not_export_execution_run_date() -> None:
+    """These two states run a bare `aws s3api head-object` — no launcher, no
+    assertion — so they must not gain the export."""
+    states = _sf_states()
+    for name, body in states.items():
+        text = _ssm_command_text(body)
+        if "aws s3api head-object" in text and "krepis.ssm_log_capture" not in text:
+            assert _EXECUTION_RUN_DATE_EXPORT not in text, (
+                f"{name}: a bare resource-kill-check state gained an unneeded export"
+            )
+
+
+def test_resolve_zoo_specs_is_not_a_coverage_asserting_state() -> None:
+    """ResolveZooSpecs only lists rotation spec ids — it must stay out of the
+    export set (and out of _COVERAGE_ASSERTING_SSM_STATES above)."""
+    states = _sf_states()
+    text = _ssm_command_text(states["ResolveZooSpecs"])
+    assert CLI_MODULE not in text
+    assert _EXECUTION_RUN_DATE_EXPORT not in text
+
+
+# ── config-I8155: the Lambda-backed coverage stages get $.run_date too ───────
+#
+# The SSM half above carries EXECUTION_RUN_DATE to the launcher scripts. The
+# Lambda half needs the same identity in its EVENT, and five states did not
+# have it: WeeklyRunDayGate, LibPinDriftCheck, PipelineContractCheck (all
+# `alpha-engine-predictor:live`) and RegimeSubstrate /
+# RegimeRetrospectiveEval carried Payloads holding ONLY `action`.
+#
+# Those five wrote a CORRECT run_date on 2026-08-22 — and only by
+# coincidence. Their handlers substituted `datetime.now(timezone.utc).date()`
+# or a calendar date derived from it, which equals `$.run_date` exactly when
+# the stage runs on the same UTC day the execution started. An execution
+# beginning 23:50 UTC, a stage crossing midnight, or any redrive of an older
+# run_date splits them — and the split is invisible, because the verdict
+# still lands under a plausible-looking prefix.
+#
+# "Right for the wrong reason" is not a passing state for an identity field.
+
+_LAMBDA_COVERAGE_STATES: dict[str, str] = {
+    "WeeklyRunDayGate": "alpha-engine-predictor-inference",
+    "LibPinDriftCheck": "alpha-engine-predictor-inference",
+    "PipelineContractCheck": "alpha-engine-predictor-inference",
+    "RegimeSubstrate": "alpha-engine-predictor-regime-substrate",
+    "RegimeRetrospectiveEval": "alpha-engine-predictor-regime-retrospective-eval",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_LAMBDA_COVERAGE_STATES))
+def test_every_lambda_coverage_state_threads_the_execution_run_date(name: str) -> None:
+    states = _sf_states()
+    assert name in states, f"{name}: state not found in the live SF definition"
+    payload = states[name]["Parameters"]["Payload"]
+    assert payload.get("run_date.$") == "$.run_date", (
+        f"{name}: Payload does not thread $.run_date, so its handler has no "
+        "way to learn the execution's identity and must either fabricate one "
+        "(forbidden) or record UNMEASURED. Payload is "
+        f"{sorted(payload)} (alpha-engine-config-I8155)."
+    )
+
+
+def test_no_lambda_coverage_state_substitutes_a_derived_date_for_run_date() -> None:
+    """`$.run_date` and nothing else. A Payload wiring `run_date` to a
+    trading-day or cycle field would satisfy the presence test above while
+    reintroducing exactly the split it exists to prevent."""
+    states = _sf_states()
+    for name in sorted(_LAMBDA_COVERAGE_STATES):
+        wired = states[name]["Parameters"]["Payload"].get("run_date.$")
+        assert wired == "$.run_date", (
+            f"{name}: run_date is wired to {wired!r}. It must be the "
+            "execution's own $.run_date — cycle_date is derived separately by "
+            "krepis via last_closed_trading_day() and is a different question."
+        )
+
+
+def test_the_lambda_coverage_state_set_is_not_silently_smaller_than_reality() -> None:
+    """Guard the guard. The curated set above is a claim about the pipeline;
+    if a Lambda-backed Task state's function is one of the named coverage
+    functions and it is absent from the set, the set is stale and this test —
+    not a quiet pass — is what says so."""
+    states = _sf_states()
+    functions = set(_LAMBDA_COVERAGE_STATES.values())
+    discovered = set()
+    for name, body in states.items():
+        if body.get("Type") != "Task" or "lambda:invoke" not in body.get("Resource", ""):
+            continue
+        fn = str(body.get("Parameters", {}).get("FunctionName", ""))
+        if any(fn.startswith(f"{f}:") or fn == f for f in functions):
+            discovered.add(name)
+    unlisted = sorted(discovered - set(_LAMBDA_COVERAGE_STATES))
+    assert not unlisted, (
+        "Lambda state(s) on a coverage-asserting function are missing from "
+        f"_LAMBDA_COVERAGE_STATES: {unlisted}. Add them (and thread "
+        "$.run_date into their Payloads) or the curated set is a smaller "
+        "world than its name implies."
+    )
+    assert discovered, "the lambda-state scan found nothing — it cannot pass vacuously"

@@ -6,6 +6,7 @@
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
     "export RUN_DATE='2026-05-18'",
+    "export EXECUTION_RUN_DATE='2026-05-18'",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug backtester --log /var/log/backtester.log -- bash infrastructure/spot_backtester.sh"
   ],
   "DataPhase1": [
@@ -14,6 +15,7 @@
     "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-data",
     "export HOME=/home/ec2-user",
+    "export EXECUTION_RUN_DATE='2026-05-18'",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug data-weekly --log /var/log/data-weekly.log -- bash infrastructure/spot_data_phase1.sh"
   ],
   "DataPhase2": [
@@ -21,6 +23,7 @@
     "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-data",
     "export HOME=/home/ec2-user",
+    "export EXECUTION_RUN_DATE='2026-05-18'",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug data-phase2 --log /var/log/data-phase2.log -- bash infrastructure/spot_data_weekly.sh --phase2-only"
   ],
   "DriftDetection": [
@@ -38,6 +41,7 @@
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
     "export RUN_DATE='2026-05-18'",
+    "export EXECUTION_RUN_DATE='2026-05-18'",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug evaluator-diagnostics --log /var/log/evaluator-diagnostics.log -- bash infrastructure/spot_evaluator.sh --eval-half=diagnostics"
   ],
   "EvaluatorOptimize": [
@@ -47,6 +51,7 @@
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
     "export RUN_DATE='2026-05-18'",
+    "export EXECUTION_RUN_DATE='2026-05-18'",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug evaluator-optimize --log /var/log/evaluator-optimize.log -- bash infrastructure/spot_evaluator.sh --eval-half=optimize"
   ],
   "MorningEnrich": [
@@ -55,6 +60,7 @@
     "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-data",
     "export HOME=/home/ec2-user",
+    "export EXECUTION_RUN_DATE='2026-05-18'",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug morning-enrich --log /var/log/morning-enrich.log -- bash infrastructure/spot_morning_enrich.sh"
   ],
   "ParityReplay": [
@@ -64,6 +70,7 @@
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
     "export RUN_DATE='2026-05-18'",
+    "export EXECUTION_RUN_DATE='2026-05-18'",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug parity-replay --log /var/log/parity-replay.log -- bash infrastructure/spot_parity_replay.sh"
   ],
   "PitParityCompare": [
@@ -73,6 +80,7 @@
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
     "export RUN_DATE='2026-05-18'",
+    "export EXECUTION_RUN_DATE='2026-05-18'",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug parity-compare --log /var/log/parity-compare.log -- bash infrastructure/spot_parity_compare.sh"
   ],
   "PitParityLookahead": [
@@ -82,6 +90,7 @@
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
     "export RUN_DATE='2026-05-18'",
+    "export EXECUTION_RUN_DATE='2026-05-18'",
     "set +e",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug pit-lookahead --log /var/log/pit-lookahead.log -- bash infrastructure/spot_pit_lookahead.sh",
     "_pit_pass_rc=$?",
@@ -95,6 +104,7 @@
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
     "export RUN_DATE='2026-05-18'",
+    "export EXECUTION_RUN_DATE='2026-05-18'",
     "set +e",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug pit-walkforward --log /var/log/pit-walkforward.log -- bash infrastructure/spot_pit_walkforward.sh",
     "_pit_pass_rc=$?",
@@ -108,6 +118,7 @@
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
     "export RUN_DATE='2026-05-18'",
+    "export EXECUTION_RUN_DATE='2026-05-18'",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug portfolio-optimizer --log /var/log/portfolio-optimizer.log -- bash infrastructure/spot_portfolio_optimizer_backtest.sh"
   ],
   "PredictorBacktest": [
@@ -117,6 +128,7 @@
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
     "export RUN_DATE='2026-05-18'",
+    "export EXECUTION_RUN_DATE='2026-05-18'",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug predictor-backtest --log /var/log/predictor-backtest.log -- bash infrastructure/spot_predictor_backtest.sh"
   ],
   "PredictorTraining": [
@@ -127,6 +139,7 @@
     "cd /home/ec2-user/alpha-engine-predictor",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
+    "export EXECUTION_RUN_DATE='2026-05-18'",
     "export ALPHA_ENGINE_EXPERIMENT_ID=reference",
     "export PREDICTOR_DEFER_TRAINING_EMAIL=1",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug predictor-training --log /var/log/predictor-training.log -- bash infrastructure/spot_predictor_training.sh"
@@ -136,6 +149,7 @@
     "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
     "cd /home/ec2-user/alpha-engine-data",
     "export HOME=/home/ec2-user",
+    "export EXECUTION_RUN_DATE='2026-05-18'",
     "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id test-execution-name --slug rag-ingestion --log /var/log/rag-ingestion.log -- bash infrastructure/spot_rag_ingestion.sh"
   ]
 }
