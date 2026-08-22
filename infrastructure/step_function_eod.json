@@ -242,7 +242,7 @@
           "Next": "AcquireMutex"
         }
       ],
-      "Default": "StartTradingInstance"
+      "Default": "DeployDriftCheck"
     },
     "AcquireMutex": {
       "Type": "Task",
@@ -289,7 +289,7 @@
         }
       ],
       "ResultPath": "$.mutex_result",
-      "Next": "StartTradingInstance"
+      "Next": "DeployDriftCheck"
     },
     "SetMutexAcquireDegradedFlag": {
       "Type": "Pass",
@@ -301,7 +301,7 @@
         "stage_error.$": "$.mutex_error"
       },
       "ResultPath": "$.degraded_summary",
-      "Next": "StartTradingInstance"
+      "Next": "DeployDriftCheck"
     },
     "MutexConflict": {
       "Type": "Fail",
@@ -2357,6 +2357,165 @@
       "Type": "Fail",
       "Error": "EODPipelineFailure",
       "Cause": "EOD pipeline failed \u2014 trading instance stopped, check logs."
+    },
+    "DeployDriftCheck": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I8102. Asks the predictor probe whether the EOD orchestration about to run is the one nousergon-data@main describes, by canonical-JSON comparison of the DEPLOYED definition body against the copy deploy-infrastructure.sh published to S3 (I7799/I7927 semantics, the same predicate the preopen pipeline has enforced since 2026-08-21). sf_name is explicit: without it the probe answers about the PREOPEN state machine and this gate would read a verdict about a pipeline that is not itself (crucible-predictor-PR545 made the key load-bearing and made an undeclared name RAISE rather than silently fall through to stamp semantics). Sited here \u2014 after the mutex, before StartTradingInstance \u2014 so the question is asked before this pipeline spends anything, per sf-pipeline-policy \u00a72.2. OBSERVE MODE (sf-pipeline-policy \u00a77a, clause SFP-7a-new-guard-observes-first). PROMOTION CRITERION: after 10 consecutive postclose executions in which this gate reached StartTradingInstance without routing here, OR on 2026-09-08, whichever comes first, the three would-halt branches of DeployDriftGate and DeployDriftCheck's Catch flip their Next to HandleFailure and these two observe-only Pass states are deleted. That is the whole promotion diff. Tracked with a Re-exam date on the issue named in the PR body; a guard parked in observe mode indefinitely is the failure \u00a77a exists to prevent, not its goal.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-predictor-inference:live",
+        "Payload": {
+          "action": "check_deploy_drift",
+          "sf_name": "ne-postclose-trading-pipeline"
+        }
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 15,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "The probe itself could not answer \u2014 invoke failure, timeout, or the UnknownAction/ValueError crucible-predictor-PR545 raises for an undeclared sf_name. That is an UNMEASURED verdict, never a pass (\u00a72.3a rule 2). At promotion this Next becomes HandleFailure, which is what the preopen definition already does; during the observe window it pages and proceeds.",
+          "Next": "SetDeployDriftProbeUnreadableFlag",
+          "ResultPath": "$.drift_error"
+        }
+      ],
+      "ResultPath": "$.drift_result",
+      "Next": "DeployDriftGate"
+    },
+    "DeployDriftGate": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I8102 \u2014 the postclose twin of the preopen DeployDriftGate, with the SAME branch families and a DIFFERENT argument for them, because the two pipelines fail differently.\n\nWhy sf_drift is a HALT family here, not a degrade: the EOD pipeline writes the day's book \u2014 the position snapshot, EODReconcile, the eod_pnl row, the NAV the next morning's planner and every report read. If the deployed orchestration differs from what main describes, the SEQUENCE that produces those numbers is unknown, so a run that completes is asserting a guarantee nobody established (\u00a72.3a rule 3, principles \u00a72.7). A silently wrong EOD is worse than a halted one, and unlike preopen there is no market-open deadline: a lost postclose run costs a mechanical rerun (weekday_sf_rerun.py, \u00a72.5), not an unmanaged real-money session. That asymmetry is the whole reason I7799 moved the preopen gate OFF the stamp, and it does not transfer.\n\nWhy it does not halt YET: \u00a77a \u2014 a check newly added to a scheduled pipeline path whose verdict can fail a run observes before it enforces. This gate's blast radius on THIS path has never been observed, and \u00a71.3 makes that expensive to get wrong: every trading day must terminate with a postclose completion marker and an eod_pnl row, INCLUDING days when nothing traded \u2014 position marks and NAV are facts about the book, not about the pipeline. A false halt here therefore does not merely lose a run, it puts a hole in NAV continuity. \u00a77a.2's own precedent is an EOD gap of exactly this shape: a correct guard whose unobserved blast radius took the price-append and reconcile path down with it. OBSERVE MODE (sf-pipeline-policy \u00a77a, clause SFP-7a-new-guard-observes-first). PROMOTION CRITERION: after 10 consecutive postclose executions in which this gate reached StartTradingInstance without routing here, OR on 2026-09-08, whichever comes first, the three would-halt branches of DeployDriftGate and DeployDriftCheck's Catch flip their Next to HandleFailure and these two observe-only Pass states are deleted. That is the whole promotion diff. Tracked with a Re-exam date on the issue named in the PR body; a guard parked in observe mode indefinitely is the failure \u00a77a exists to prevent, not its goal.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.drift_result.Payload.sf_drift",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.drift_result.Payload.sf_drift",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "sf_drift=true \u2014 the deployed postclose definition differs from the one the last deploy published. Orchestration semantics for the run that writes the day's NAV are unknown. HALT family (\u00a73); routed to the observe path until promotion.",
+          "Next": "SetDeployDriftObserveWouldHaltFlag"
+        },
+        {
+          "Not": {
+            "Variable": "$.drift_result.Payload.sf_drift",
+            "IsPresent": true
+          },
+          "Comment": "sf_drift absent \u2014 the probe could not measure definition freshness. Fail CLOSED on unknown, the convention config-I2767 set and I7799 preserved: an unmeasured field is never a pass. HALT family; observe path until promotion.",
+          "Next": "SetDeployDriftObserveWouldHaltFlag"
+        },
+        {
+          "Not": {
+            "Variable": "$.drift_result.Payload.cf_drift",
+            "IsPresent": true
+          },
+          "Comment": "cf_drift absent \u2014 the gate cannot classify a drift signal as halt-vs-degrade without it, so it may not silently pick either. HALT family; observe path until promotion.",
+          "Next": "SetDeployDriftObserveWouldHaltFlag"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.drift_result.Payload.cf_drift",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.drift_result.Payload.cf_drift",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "cf_drift=true with the definition intact is CloudFormation stack state/template drift \u2014 orchestration METADATA, not the sequence that writes the book. \u00a73 degrades and pages. This branch is non-halting by design and stays non-halting after promotion (config-I6615, the 2026-08-05/07 case).",
+          "Next": "SetDeployDriftDegradedFlag"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.drift_result.Payload.deploy_stamp_stale",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.drift_result.Payload.deploy_stamp_stale",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "deploy_stamp_stale=true \u2014 nousergon-data has merged something it has not deployed, reaching a Lambda, collector or script this pipeline INVOKES but does not embed. Real, and not a reason to skip the day's reconcile: degrades and pages (I7799). Evaluated after cf_drift so a cf_drift degrade is not relabelled, and before Default. Deliberately not IsPresent-guarded toward failure: an absent key means a predictor Lambda older than I7799, whose sf_drift IS the stamp verdict and is enforced one branch up, more strictly.",
+          "Next": "SetDeployDriftDegradedFlag"
+        }
+      ],
+      "Default": "StartTradingInstance"
+    },
+    "SetDeployDriftObserveWouldHaltFlag": {
+      "Type": "Pass",
+      "Comment": "OBSERVE-MODE ONLY, deleted at promotion. Records that DeployDriftGate took a HALT-family branch and did not halt. Writes $.degraded_summary in the Option-A shape (config#6692) the EOD's other degrade flags use, so CheckDegradedOutcome routes this execution's terminal to WriteCompletionMarkerDegraded/DegradedRun rather than a plain SUCCEEDED marker \u2014 the observe verdict is a real ERROR on a real surface, distinguishable from the enforcing one only by what it does to the run (\u00a77a obligation 3), never a suppression. OBSERVE MODE (sf-pipeline-policy \u00a77a, clause SFP-7a-new-guard-observes-first). PROMOTION CRITERION: after 10 consecutive postclose executions in which this gate reached StartTradingInstance without routing here, OR on 2026-09-08, whichever comes first, the three would-halt branches of DeployDriftGate and DeployDriftCheck's Catch flip their Next to HandleFailure and these two observe-only Pass states are deleted. That is the whole promotion diff. Tracked with a Re-exam date on the issue named in the PR body; a guard parked in observe mode indefinitely is the failure \u00a77a exists to prevent, not its goal.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "eod_deploy_drift_observe_would_halt",
+        "run_date.$": "$.run_date",
+        "stage_error.$": "$.drift_result.Payload"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishDeployDriftDegraded"
+    },
+    "SetDeployDriftProbeUnreadableFlag": {
+      "Type": "Pass",
+      "Comment": "OBSERVE-MODE ONLY, deleted at promotion. DeployDriftCheck's Catch target: the probe raised or timed out, so there is no $.drift_result.Payload to read and the would-halt Pass above would itself raise States.Runtime on it. Carries $.drift_error instead. Same reason family, distinct value, so the page says WHICH unmeasured shape occurred. OBSERVE MODE (sf-pipeline-policy \u00a77a, clause SFP-7a-new-guard-observes-first). PROMOTION CRITERION: after 10 consecutive postclose executions in which this gate reached StartTradingInstance without routing here, OR on 2026-09-08, whichever comes first, the three would-halt branches of DeployDriftGate and DeployDriftCheck's Catch flip their Next to HandleFailure and these two observe-only Pass states are deleted. That is the whole promotion diff. Tracked with a Re-exam date on the issue named in the PR body; a guard parked in observe mode indefinitely is the failure \u00a77a exists to prevent, not its goal.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "eod_deploy_drift_observe_probe_unreadable",
+        "run_date.$": "$.run_date",
+        "stage_error.$": "$.drift_error"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishDeployDriftDegraded"
+    },
+    "SetDeployDriftDegradedFlag": {
+      "Type": "Pass",
+      "Comment": "The permanently NON-HALTING branch of DeployDriftGate: the deployed postclose definition matches what the deploy published, and a condition that is real but not book-correctness-critical is true \u2014 cf_drift (CloudFormation stack state) and/or deploy_stamp_stale (merged-but-undeployed code this pipeline invokes). Both degrade per \u00a73. WHICH one fired is carried in stage_error rather than in this state's static reason, because a Choice cannot format a message per branch. Parity with SetMutexAcquireDegradedFlag/SetDataSpotDegradedFlag (config#6692 Option-A); last write wins if a later stage also degrades. Survives promotion unchanged.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "deploy_drift_nonhalting",
+        "run_date.$": "$.run_date",
+        "stage_error.$": "$.drift_result.Payload"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishDeployDriftDegraded"
+    },
+    "PublishDeployDriftDegraded": {
+      "Type": "Task",
+      "Comment": "One page for all three non-Default routes. It interpolates ONLY $.degraded_summary.reason and the summary itself \u2014 both written by whichever Pass state routed here, so no path can leave a States.Format argument unresolvable. That matters more than naming the probe's fields inline: a States.Runtime here would be swallowed by this state's own Catch and the page would be lost precisely on the paths that most need it (the preopen twin's Comment records the same hazard). TopicArn is the literal alerts ARN, not $.sns_topic_arn, matching every other publish in this definition \u2014 a malformed input field must not be able to silence the alert. Its Catch leads onward to StartTradingInstance so an SNS outage can never convert a degrade into a halt.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Pipeline \u2014 DEGRADED (deploy drift; EOD proceeds)",
+        "Message.$": "States.Format('DeployDriftGate degraded this EOD run without halting it. reason={} \u2014 eod_deploy_drift_observe_would_halt means the gate took a HALT-family branch and did NOT halt because it is still in sf-pipeline-policy 7a observe mode: READ THIS ONE, it is what the enforcing gate would have stopped. eod_deploy_drift_observe_probe_unreadable means the probe could not answer at all. deploy_drift_nonhalting is the permanent degrade family (cf_drift and/or deploy_stamp_stale) and proceeds by design. This execution will complete DEGRADED, not SUCCEEDED. Full summary: {}', $.degraded_summary.reason, States.JsonToString($.degraded_summary))"
+      },
+      "ResultPath": "$.deploy_drift_degraded_notify",
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "StartTradingInstance"
+        }
+      ],
+      "Next": "StartTradingInstance"
     }
   }
 }
