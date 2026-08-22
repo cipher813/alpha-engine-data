@@ -78,7 +78,14 @@ class TestGateRouting:
     def test_gate_invokes_predictor_calendar_action(self, states):
         gate = states["WeeklyRunDayGate"]
         assert gate["Parameters"]["FunctionName"] == "alpha-engine-predictor-inference:live"
-        assert gate["Parameters"]["Payload"] == {"action": "check_weekly_run_day"}
+        assert gate["Parameters"]["Payload"] == {
+            "action": "check_weekly_run_day",
+            # alpha-engine-config-I8155: the execution's own run_date, so the
+            # handler's stage-coverage verdict is keyed on the run rather than
+            # on datetime.now() — which agrees with it only while the stage
+            # runs on the same UTC day the execution started.
+            "run_date.$": "$.run_date",
+        }
         assert gate["Next"] == "WeeklyRunDayGateChoice"
         (catch,) = gate["Catch"]
         assert catch["Next"] == "WeeklyRunDayGateFailed"
