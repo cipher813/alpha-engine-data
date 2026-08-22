@@ -822,6 +822,19 @@ alert_classes:
     response: drain-queue
 
   # ── research (crucible-research) ──
+  # alpha-engine-config-I8177 (crucible-research-PR724). The weekly
+  # eval_rolling_mean Lambda hangs four best-effort aggregations off the
+  # rolling-mean run (calibration_kappa, control_bands, agent_quality,
+  # producer_leaderboard). Their failure must not sink the primary deliverable
+  # — but recording it only in a WARN log and an unread return field is how the
+  # agent_quality producer stayed broken for two months while eight report-card
+  # components read N/A. All four now publish here at ERROR, deduped per
+  # producer per ISO week.
+  - class: research_eval_rolling_mean_producer_failure
+    source: "crucible-research/eval_rolling_mean_handler"
+    severities: [error]
+    intake: bus
+    response: drain-queue
   - class: research_score_aggregator_gap
     source: "research:score_aggregator"
     severities: [warning]
