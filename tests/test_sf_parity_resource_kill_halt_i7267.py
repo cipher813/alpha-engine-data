@@ -178,8 +178,14 @@ def test_resource_kill_terminal_ends_branch_success_with_resource_kill_status(br
     resource_kill = branches[base][f"{base}ResourceKill"]
     assert resource_kill["Type"] == "Pass"
     assert resource_kill.get("End") is True
-    assert resource_kill["Parameters"] == {"status": "RESOURCE_KILL"}
-    assert resource_kill["ResultPath"] == degraded["ResultPath"]
+    # alpha-engine-config-I8194: both terminals now nest their envelope
+    # under the same branch key and carry no ResultPath; the mirror
+    # assertion is on that key rather than on ResultPath.
+    assert resource_kill["Parameters"] == {
+        next(iter(degraded["Parameters"])): {"status": "RESOURCE_KILL"}
+    }
+    assert "ResultPath" not in resource_kill
+    assert set(resource_kill["Parameters"]) == set(degraded["Parameters"])
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +243,10 @@ def test_timed_out_true_execution_history_reaches_the_hard_fail_terminal(states,
     assert success_next == f"{base}ResourceKill"
 
     terminal = b[f"{base}ResourceKill"]
-    assert terminal["Parameters"]["status"] == "RESOURCE_KILL"
+    # alpha-engine-config-I8194: envelope nested under the branch key.
+    assert list(terminal["Parameters"].values()) == [
+        {"status": "RESOURCE_KILL"}
+    ]
     assert terminal.get("End") is True  # branch ends SUCCESS — siblings unaffected
 
     # Post-join: simulate the aggregate/fold reading this branch's status.
@@ -295,7 +304,9 @@ def test_non_timeout_failure_execution_history_still_reaches_compare(states, bra
     assert outcome["Default"] == f"{base}Degraded"
 
     degraded = b[f"{base}Degraded"]
-    assert degraded["Parameters"] == {"status": "DEGRADED"}
+    # alpha-engine-config-I8194: envelope nested under the branch key.
+    assert list(degraded["Parameters"].values()) == [{"status": "DEGRADED"}]
+    assert "ResultPath" not in degraded
     assert degraded.get("End") is True
 
     cbo = states["CheckParityBranchOutcomes"]
@@ -337,8 +348,15 @@ def test_parity_replay_resource_kill_classified_from_standard_error_content(bran
     terminal = b["ParityReplayResourceKill"]
     assert terminal["Type"] == "Pass"
     assert terminal.get("End") is True
-    assert terminal["Parameters"] == {"status": "RESOURCE_KILL"}
-    assert terminal["ResultPath"] == b["ParityReplayDegraded"]["ResultPath"]
+    # alpha-engine-config-I8194: envelope nested under the branch key,
+    # ResultPath gone; the mirror assertion moves to the key.
+    assert terminal["Parameters"] == {
+        "branch_parity_replay": {"status": "RESOURCE_KILL"}
+    }
+    assert "ResultPath" not in terminal
+    assert set(terminal["Parameters"]) == set(
+        b["ParityReplayDegraded"]["Parameters"]
+    )
 
     cbo_choice_vars = {
         c["Variable"] for c in

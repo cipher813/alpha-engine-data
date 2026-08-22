@@ -1079,7 +1079,7 @@
     },
     "ResearchPredictorParallel": {
       "Type": "Parallel",
-      "Comment": "Research and PredictorTraining are DATA-INDEPENDENT (no S3/db data flows between them \u2014 see CLAUDE.md Architecture). They previously ran sequentially ONLY to 'spread API load', a now-STALE rationale: predictor TRAINING (training/train_handler.py) reads ArcticDB + CPU LightGBM and makes NO Anthropic calls (the yfinance fallback was removed by predictor PR #6; train_handler yfinance docstrings are stale). Research's only heavy load is Anthropic. They do not contend on the rate-limited API, so they run in parallel here to decouple PredictorTraining from Research's variable <=75-min strict-retry runtime and shorten SF wall-clock. Branch A = the full Research-consuming chain (DataPhase2 + eval-judge chain + agent-justification triple), Branch B = the PredictorTraining quartet. PER-BRANCH ERROR ISOLATION: each branch ends in a branch-local Pass terminal (End:true) that records OK/FAILED as DATA \u2014 a branch NEVER throws, so SF Parallel's default cancel-all-siblings-on-error behaviour can never abandon or waste an in-flight (or completed+S3-promoted) sibling. The SF is failed AFTER the join by CheckBranchOutcomes if either branch recorded FAILED. The Parallel-level Catch is a defense-in-depth backstop for genuine SF-engine Parallel errors only (the branches themselves always succeed). (config#885: the Scanner\u2192RAGIngestion\u2192RegimeSubstrate\u2192RegimeRetrospectiveEval chain was relocated FROM top-level INTO Branch A's head so PredictorTraining (Branch B) now forks parallel to it directly after DataPhase1 \u2014 Predictor \u22a5 Scanner/RAG/Regime, all of which produce side-effect S3/ArcticDB artifacts, never SF-state JSON consumed by Branch B or any post-join state. Their in-branch error edges were rewired to the branch-fail path PublishResearchFailureImmediate\u2192BranchAFailed.)",
+      "Comment": "Research and PredictorTraining are DATA-INDEPENDENT (no S3/db data flows between them \u2014 see CLAUDE.md Architecture). They previously ran sequentially ONLY to 'spread API load', a now-STALE rationale: predictor TRAINING (training/train_handler.py) reads ArcticDB + CPU LightGBM and makes NO Anthropic calls (the yfinance fallback was removed by predictor PR #6; train_handler yfinance docstrings are stale). Research's only heavy load is Anthropic. They do not contend on the rate-limited API, so they run in parallel here to decouple PredictorTraining from Research's variable <=75-min strict-retry runtime and shorten SF wall-clock. Branch A = the full Research-consuming chain (DataPhase2 + eval-judge chain + agent-justification triple), Branch B = the PredictorTraining quartet. PER-BRANCH ERROR ISOLATION: each branch ends in a branch-local Pass terminal (End:true) that records OK/FAILED as DATA \u2014 a branch NEVER throws, so SF Parallel's default cancel-all-siblings-on-error behaviour can never abandon or waste an in-flight (or completed+S3-promoted) sibling. The SF is failed AFTER the join by CheckBranchOutcomes if either branch recorded FAILED. The Parallel-level Catch is a defense-in-depth backstop for genuine SF-engine Parallel errors only (the branches themselves always succeed). (config#885: the Scanner\u2192RAGIngestion\u2192RegimeSubstrate\u2192RegimeRetrospectiveEval chain was relocated FROM top-level INTO Branch A's head so PredictorTraining (Branch B) now forks parallel to it directly after DataPhase1 \u2014 Predictor \u22a5 Scanner/RAG/Regime, all of which produce side-effect S3/ArcticDB artifacts, never SF-state JSON consumed by Branch B or any post-join state. Their in-branch error edges were rewired to the branch-fail path PublishResearchFailureImmediate\u2192BranchAFailed.) alpha-engine-config-I8194: every branch terminal replaces its payload (Parameters/Result nested under the old ResultPath key, no ResultPath), so this Parallel's result is bounded by the number of branches rather than by branch state. tests/test_sf_parallel_branch_payload.py derives that invariant from the definition \u2014 do not reintroduce a ResultPath on a branch terminal.",
       "Branches": [
         {
           "StartAt": "InitResearchDegradedFlag",
@@ -2674,25 +2674,27 @@
             },
             "BranchAComplete": {
               "Type": "Pass",
-              "Comment": "Branch A (Scanner \u2192 RegimeSubstrate \u2192 SignalsEnvelope \u2192 ChallengerShadow \u2192 RAG chain \u2192 RegimeRetrospectiveEval \u2192 DataPhase2 \u2192 eval-judge chain \u2192 EvalRollingMean \u2192 RationaleClustering \u2192 ReplayConcordance \u2192 Counterfactual \u2192 AggregateCosts) completed (config-I2515 Phase B reorder \u2014 the multi-agent Research graph runner was removed). Records branch_a_status=OK so the post-join AggregateBranchOutcomes can decide whether to halt the SF. End:true so the Parallel branch SUCCEEDS \u2014 it must never throw, because a thrown branch would cancel the sibling PredictorTraining branch (default SF Parallel semantics). alpha-engine-config#6722: also hoists $.research_degraded_local (seeded false by InitResearchDegradedFlag, set true by any of Branch A's internal fail-open Mark*Degraded states) as branch_a_degraded \u2014 read by AggregateBranchOutcomes/CheckResearchPredictorDegraded post-join since a Parallel branch cannot write an outer-scope JSONPath directly.",
+              "Comment": "Branch A (Scanner \u2192 RegimeSubstrate \u2192 SignalsEnvelope \u2192 ChallengerShadow \u2192 RAG chain \u2192 RegimeRetrospectiveEval \u2192 DataPhase2 \u2192 eval-judge chain \u2192 EvalRollingMean \u2192 RationaleClustering \u2192 ReplayConcordance \u2192 Counterfactual \u2192 AggregateCosts) completed (config-I2515 Phase B reorder \u2014 the multi-agent Research graph runner was removed). Records branch_a_status=OK so the post-join AggregateBranchOutcomes can decide whether to halt the SF. End:true so the Parallel branch SUCCEEDS \u2014 it must never throw, because a thrown branch would cancel the sibling PredictorTraining branch (default SF Parallel semantics). alpha-engine-config#6722: also hoists $.research_degraded_local (seeded false by InitResearchDegradedFlag, set true by any of Branch A's internal fail-open Mark*Degraded states) as branch_a_degraded \u2014 read by AggregateBranchOutcomes/CheckResearchPredictorDegraded post-join since a Parallel branch cannot write an outer-scope JSONPath directly. alpha-engine-config-I8194 (States.DataLimitExceeded on ParityParallel, measured on friday-shell-2026-08-14-validate-i7386): this terminal no longer carries ResultPath, so the branch's OUTPUT is exactly this envelope instead of the branch's whole ~108 KB effective input with the envelope merged in. The keys are unchanged \u2014 the envelope is nested under the same key the old ResultPath wrote to \u2014 so every post-join JSONPath resolves exactly as before. The branch's substantive result is an S3 artifact the join reads (artifact-by-reference), never SF state.",
               "Parameters": {
-                "branch_a_status": "OK",
-                "branch_a_degraded.$": "$.research_degraded_local",
-                "scanner_resource_kill.$": "$.scanner_resource_kill"
+                "branch_a": {
+                  "branch_a_status": "OK",
+                  "branch_a_degraded.$": "$.research_degraded_local",
+                  "scanner_resource_kill.$": "$.scanner_resource_kill"
+                }
               },
-              "ResultPath": "$.branch_a",
               "End": true
             },
             "BranchAFailed": {
               "Type": "Pass",
-              "Comment": "Branch A hard-failed (SignalsEnvelope failure \u2014 the LOAD-BEARING signals.json producer post config-I2515 Phase B \u2014 RAGIngestion failure, or DataPhase2 failure). Records branch_a_status=FAILED + the captured $.error as DATA and End:true \u2014 the branch SUCCEEDS in SF terms so the sibling PredictorTraining branch is NEVER abandoned by Parallel's cancel-siblings default. The SF is failed AFTER the join by CheckBranchOutcomes. Recovery: if Branch B completed + promoted weights to S3, the re-run uses {\"skip_predictor_training\": true} (weights are already live) and re-runs only Branch A. alpha-engine-config#6722: branch_a_degraded is fixed false here \u2014 a hard FAILED branch is reported via CheckBranchOutcomes' Or-gate before AggregateBranchOutcomes' degraded-fold is ever consulted, but the field must still exist unconditionally so that Parameters.$ extraction never throws States.Runtime. | alpha-engine-config-I7812: scanner_resource_kill is fixed false here for the same reason branch_a_degraded is \u2014 a hard FAILED branch is reported by CheckBranchOutcomes' Or-gate before the degraded fold is consulted, but AggregateBranchOutcomes' Parameters.$ extraction runs first and would throw States.Runtime on a missing field.",
+              "Comment": "Branch A hard-failed (SignalsEnvelope failure \u2014 the LOAD-BEARING signals.json producer post config-I2515 Phase B \u2014 RAGIngestion failure, or DataPhase2 failure). Records branch_a_status=FAILED + the captured $.error as DATA and End:true \u2014 the branch SUCCEEDS in SF terms so the sibling PredictorTraining branch is NEVER abandoned by Parallel's cancel-siblings default. The SF is failed AFTER the join by CheckBranchOutcomes. Recovery: if Branch B completed + promoted weights to S3, the re-run uses {\"skip_predictor_training\": true} (weights are already live) and re-runs only Branch A. alpha-engine-config#6722: branch_a_degraded is fixed false here \u2014 a hard FAILED branch is reported via CheckBranchOutcomes' Or-gate before AggregateBranchOutcomes' degraded-fold is ever consulted, but the field must still exist unconditionally so that Parameters.$ extraction never throws States.Runtime. | alpha-engine-config-I7812: scanner_resource_kill is fixed false here for the same reason branch_a_degraded is \u2014 a hard FAILED branch is reported by CheckBranchOutcomes' Or-gate before the degraded fold is consulted, but AggregateBranchOutcomes' Parameters.$ extraction runs first and would throw States.Runtime on a missing field. alpha-engine-config-I8194 (States.DataLimitExceeded on ParityParallel, measured on friday-shell-2026-08-14-validate-i7386): this terminal no longer carries ResultPath, so the branch's OUTPUT is exactly this envelope instead of the branch's whole ~108 KB effective input with the envelope merged in. The keys are unchanged \u2014 the envelope is nested under the same key the old ResultPath wrote to \u2014 so every post-join JSONPath resolves exactly as before. The branch's substantive result is an S3 artifact the join reads (artifact-by-reference), never SF state.",
               "Parameters": {
-                "branch_a_status": "FAILED",
-                "branch_a_error.$": "$.error",
-                "branch_a_degraded": false,
-                "scanner_resource_kill": false
+                "branch_a": {
+                  "branch_a_status": "FAILED",
+                  "branch_a_error.$": "$.error",
+                  "branch_a_degraded": false,
+                  "scanner_resource_kill": false
+                }
               },
-              "ResultPath": "$.branch_a",
               "End": true
             },
             "InitRAGIngestionPollCount": {
@@ -2896,13 +2898,14 @@
             },
             "PredictorTrainingSkipped": {
               "Type": "Pass",
-              "Comment": "config#2253 branch-B skip terminal. Reads as a SUCCEEDED branch to AggregateBranchOutcomes/CheckBranchOutcomes \u2014 the join reads $.parallel_result[1].branch_b.branch_b_status (+ branch_b_degraded, alpha-engine-config#6722), and this records the identical branch_b_status=OK contract as BranchBComplete \u2014 plus an explicit skipped:true marker for execution-history forensics (no fabricated training payload beyond what routing requires). branch_b_degraded is fixed false: this path never reaches the model-zoo rotation (the skip claim is validated fresh weights, so there is nothing to rotate), and the field must exist unconditionally so AggregateBranchOutcomes' Parameters.$ extraction never throws States.Runtime. End:true so the sibling Research branch is never cancelled (the per-branch error-isolation invariant).",
+              "Comment": "config#2253 branch-B skip terminal. Reads as a SUCCEEDED branch to AggregateBranchOutcomes/CheckBranchOutcomes \u2014 the join reads $.parallel_result[1].branch_b.branch_b_status (+ branch_b_degraded, alpha-engine-config#6722), and this records the identical branch_b_status=OK contract as BranchBComplete \u2014 plus an explicit skipped:true marker for execution-history forensics (no fabricated training payload beyond what routing requires). branch_b_degraded is fixed false: this path never reaches the model-zoo rotation (the skip claim is validated fresh weights, so there is nothing to rotate), and the field must exist unconditionally so AggregateBranchOutcomes' Parameters.$ extraction never throws States.Runtime. End:true so the sibling Research branch is never cancelled (the per-branch error-isolation invariant). alpha-engine-config-I8194 (States.DataLimitExceeded on ParityParallel, measured on friday-shell-2026-08-14-validate-i7386): this terminal no longer carries ResultPath, so the branch's OUTPUT is exactly this envelope instead of the branch's whole ~108 KB effective input with the envelope merged in. The keys are unchanged \u2014 the envelope is nested under the same key the old ResultPath wrote to \u2014 so every post-join JSONPath resolves exactly as before. The branch's substantive result is an S3 artifact the join reads (artifact-by-reference), never SF state.",
               "Result": {
-                "branch_b_status": "OK",
-                "skipped": true,
-                "branch_b_degraded": false
+                "branch_b": {
+                  "branch_b_status": "OK",
+                  "skipped": true,
+                  "branch_b_degraded": false
+                }
               },
-              "ResultPath": "$.branch_b",
               "End": true
             },
             "PredictorTraining": {
@@ -3664,23 +3667,25 @@
             },
             "BranchBComplete": {
               "Type": "Pass",
-              "Comment": "Branch B (PredictorTraining quartet) completed (training success; the L4544 model-zoo rotation, if it ran, is best-effort and converges here regardless of outcome). The skip_predictor_training path terminates at its own PredictorTrainingSkipped terminal (config#2253) with the same branch_b_status=OK contract plus a skipped:true marker. Records branch_b_status=OK. End:true so the branch SUCCEEDS and never cancels the sibling Research branch. alpha-engine-config#6722: also hoists $.research_degraded_local (seeded false by InitPredictorDegradedFlag, set true by MarkModelZooDegraded) as branch_b_degraded \u2014 read by AggregateBranchOutcomes/CheckResearchPredictorDegraded post-join since a Parallel branch cannot write an outer-scope JSONPath directly.",
+              "Comment": "Branch B (PredictorTraining quartet) completed (training success; the L4544 model-zoo rotation, if it ran, is best-effort and converges here regardless of outcome). The skip_predictor_training path terminates at its own PredictorTrainingSkipped terminal (config#2253) with the same branch_b_status=OK contract plus a skipped:true marker. Records branch_b_status=OK. End:true so the branch SUCCEEDS and never cancels the sibling Research branch. alpha-engine-config#6722: also hoists $.research_degraded_local (seeded false by InitPredictorDegradedFlag, set true by MarkModelZooDegraded) as branch_b_degraded \u2014 read by AggregateBranchOutcomes/CheckResearchPredictorDegraded post-join since a Parallel branch cannot write an outer-scope JSONPath directly. alpha-engine-config-I8194 (States.DataLimitExceeded on ParityParallel, measured on friday-shell-2026-08-14-validate-i7386): this terminal no longer carries ResultPath, so the branch's OUTPUT is exactly this envelope instead of the branch's whole ~108 KB effective input with the envelope merged in. The keys are unchanged \u2014 the envelope is nested under the same key the old ResultPath wrote to \u2014 so every post-join JSONPath resolves exactly as before. The branch's substantive result is an S3 artifact the join reads (artifact-by-reference), never SF state.",
               "Parameters": {
-                "branch_b_status": "OK",
-                "branch_b_degraded.$": "$.research_degraded_local"
+                "branch_b": {
+                  "branch_b_status": "OK",
+                  "branch_b_degraded.$": "$.research_degraded_local"
+                }
               },
-              "ResultPath": "$.branch_b",
               "End": true
             },
             "BranchBFailed": {
               "Type": "Pass",
-              "Comment": "Branch B (PredictorTraining) failed/timed-out (SSM non-Success normalized by ExtractPredictorError, or a Task Catch). Records branch_b_status=FAILED + $.error as DATA, End:true so the branch SUCCEEDS and the sibling Research branch runs to its own completion \u2014 a completed Research branch's signals.json / decision_artifacts are NOT silently discarded. The SF is failed AFTER the join by CheckBranchOutcomes. NOTE: if PredictorTraining promoted weights to S3 before failing a later poll, those weights persist; the recovery re-run skips the genuinely-completed branch. alpha-engine-config#6722: branch_b_degraded is fixed false here \u2014 a hard FAILED branch is reported via CheckBranchOutcomes' Or-gate before AggregateBranchOutcomes' degraded-fold is ever consulted, but the field must still exist unconditionally so Parameters.$ extraction never throws States.Runtime.",
+              "Comment": "Branch B (PredictorTraining) failed/timed-out (SSM non-Success normalized by ExtractPredictorError, or a Task Catch). Records branch_b_status=FAILED + $.error as DATA, End:true so the branch SUCCEEDS and the sibling Research branch runs to its own completion \u2014 a completed Research branch's signals.json / decision_artifacts are NOT silently discarded. The SF is failed AFTER the join by CheckBranchOutcomes. NOTE: if PredictorTraining promoted weights to S3 before failing a later poll, those weights persist; the recovery re-run skips the genuinely-completed branch. alpha-engine-config#6722: branch_b_degraded is fixed false here \u2014 a hard FAILED branch is reported via CheckBranchOutcomes' Or-gate before AggregateBranchOutcomes' degraded-fold is ever consulted, but the field must still exist unconditionally so Parameters.$ extraction never throws States.Runtime. alpha-engine-config-I8194 (States.DataLimitExceeded on ParityParallel, measured on friday-shell-2026-08-14-validate-i7386): this terminal no longer carries ResultPath, so the branch's OUTPUT is exactly this envelope instead of the branch's whole ~108 KB effective input with the envelope merged in. The keys are unchanged \u2014 the envelope is nested under the same key the old ResultPath wrote to \u2014 so every post-join JSONPath resolves exactly as before. The branch's substantive result is an S3 artifact the join reads (artifact-by-reference), never SF state.",
               "Parameters": {
-                "branch_b_status": "FAILED",
-                "branch_b_error.$": "$.error",
-                "branch_b_degraded": false
+                "branch_b": {
+                  "branch_b_status": "FAILED",
+                  "branch_b_error.$": "$.error",
+                  "branch_b_degraded": false
+                }
               },
-              "ResultPath": "$.branch_b",
               "End": true
             },
             "InitPredictorPollCount": {
@@ -3881,7 +3886,7 @@
     },
     "AggregateBranchOutcomes": {
       "Type": "Pass",
-      "Comment": "Parallel join sync point. $.parallel_result is the 2-element array of each branch's final effective input (branch order matches the Branches array: [0]=Research branch, [1]=PredictorTraining branch). Each branch terminal wrote its status under $.branch_a / $.branch_b, so hoist both statuses to a flat path for the Choice. This is the natural Backtester sync point \u2014 Backtester needs BOTH Research signal history AND PredictorTraining weights. alpha-engine-config#6722: also hoists branch_a_degraded/branch_b_degraded \u2014 the branch-local $.research_degraded_local marker each branch threads through its own internal fail-open Catch routes (Branch A: Scanner/RegimeSubstrate/ChallengerShadow/RegimeRetrospectiveEval/ThinkTankDegraded/the eval-judge chain/AggregateCosts; Branch B: the model-zoo rotation group), folded here since a Parallel branch cannot write an outer-scope JSONPath directly \u2014 mirrors CheckParityBranchOutcomes' branch-status fold (alpha-engine-config#6030). Every branch terminal (BranchAComplete/BranchAFailed, BranchBComplete/BranchBFailed/PredictorTrainingSkipped) sets its *_degraded field unconditionally, so this Parameters.$ extraction never throws States.Runtime. | alpha-engine-config-I7812: also hoists scanner_resource_kill \u2014 set by ScannerResourceKill on the conditional fail-open path and seeded false by InitScannerResourceKillFlag, so this extraction is total.",
+      "Comment": "Parallel join sync point. $.parallel_result is the 2-element array of each branch's bounded outcome envelope (branch order matches the Branches array: [0]=Research branch, [1]=PredictorTraining branch). alpha-engine-config-I8194: each branch terminal replaces its payload rather than merging into it, so the array is a few hundred bytes regardless of how much state a branch accumulated \u2014 the 256 KB per-transition ceiling can no longer be reached through this join. The keys below are unchanged by that fix. Each branch terminal wrote its status under $.branch_a / $.branch_b, so hoist both statuses to a flat path for the Choice. This is the natural Backtester sync point \u2014 Backtester needs BOTH Research signal history AND PredictorTraining weights. alpha-engine-config#6722: also hoists branch_a_degraded/branch_b_degraded \u2014 the branch-local $.research_degraded_local marker each branch threads through its own internal fail-open Catch routes (Branch A: Scanner/RegimeSubstrate/ChallengerShadow/RegimeRetrospectiveEval/ThinkTankDegraded/the eval-judge chain/AggregateCosts; Branch B: the model-zoo rotation group), folded here since a Parallel branch cannot write an outer-scope JSONPath directly \u2014 mirrors CheckParityBranchOutcomes' branch-status fold (alpha-engine-config#6030). Every branch terminal (BranchAComplete/BranchAFailed, BranchBComplete/BranchBFailed/PredictorTrainingSkipped) sets its *_degraded field unconditionally, so this Parameters.$ extraction never throws States.Runtime. | alpha-engine-config-I7812: also hoists scanner_resource_kill \u2014 set by ScannerResourceKill on the conditional fail-open path and seeded false by InitScannerResourceKillFlag, so this extraction is total.",
       "Parameters": {
         "branch_a_status.$": "$.parallel_result[0].branch_a.branch_a_status",
         "branch_b_status.$": "$.parallel_result[1].branch_b.branch_b_status",
@@ -4537,7 +4542,7 @@
     },
     "ParityParallel": {
       "Type": "Parallel",
-      "Comment": "alpha-engine-config#6030 (Brian ruling 2026-08-01; sf-pipeline-policy \u00a72.1 atomic): the old Parity state bundled THREE logical stages (pit_parity lookahead pass ~13 min, pit_parity walkforward pass ~10 min, parity replay ~2.5 min) behind one spot_parity.sh invocation with internal skip flags \u2014 the prohibited pattern verbatim. None consumes another's output, yet all three died together (2026-08-01: SIGKILLed at the 2h bound with zero partial artifacts). Now each is an independent branch: its own spot instance, script, timeout, failure route and skip flag \u2014 one branch's failure never aborts its siblings (every branch converges on its own *Degraded terminal; the Parallel's Catch below is ONLY the backstop for a genuine SF-engine error, mirroring ResearchPredictorParallel's). The join (PitParityCompare) runs after ALL branches settle and emits the verdict \u2014 UNKNOWN when a pass artifact is missing (\u00a72.3a). The memory constraint that shaped the old design (two ~3 GB passes on one box, I6026) disappears: each pass gets its own instance.",
+      "Comment": "alpha-engine-config#6030 (Brian ruling 2026-08-01; sf-pipeline-policy \u00a72.1 atomic): the old Parity state bundled THREE logical stages (pit_parity lookahead pass ~13 min, pit_parity walkforward pass ~10 min, parity replay ~2.5 min) behind one spot_parity.sh invocation with internal skip flags \u2014 the prohibited pattern verbatim. None consumes another's output, yet all three died together (2026-08-01: SIGKILLed at the 2h bound with zero partial artifacts). Now each is an independent branch: its own spot instance, script, timeout, failure route and skip flag \u2014 one branch's failure never aborts its siblings (every branch converges on its own *Degraded terminal; the Parallel's Catch below is ONLY the backstop for a genuine SF-engine error, mirroring ResearchPredictorParallel's). The join (PitParityCompare) runs after ALL branches settle and emits the verdict \u2014 UNKNOWN when a pass artifact is missing (\u00a72.3a). The memory constraint that shaped the old design (two ~3 GB passes on one box, I6026) disappears: each pass gets its own instance. alpha-engine-config-I8194: every branch terminal replaces its payload (Parameters/Result nested under the old ResultPath key, no ResultPath), so this Parallel's result is bounded by the number of branches rather than by branch state. tests/test_sf_parallel_branch_payload.py derives that invariant from the definition \u2014 do not reintroduce a ResultPath on a branch terminal.",
       "Branches": [
         {
           "StartAt": "CheckSkipPitParityLookahead",
@@ -4728,29 +4733,32 @@
             },
             "PitParityLookaheadComplete": {
               "Type": "Pass",
-              "Comment": "Branch success terminal \u2014 the witness state scripts/weekly_sf_rerun.py keys on ('entered => completed'). Writes the branch status under $.branch_pit_lookahead for AggregateParityBranchOutcomes.",
+              "Comment": "Branch success terminal \u2014 the witness state scripts/weekly_sf_rerun.py keys on ('entered => completed'). Writes the branch status under $.branch_pit_lookahead for AggregateParityBranchOutcomes. alpha-engine-config-I8194 (States.DataLimitExceeded on ParityParallel, measured on friday-shell-2026-08-14-validate-i7386): this terminal no longer carries ResultPath, so the branch's OUTPUT is exactly this envelope instead of the branch's whole ~108 KB effective input with the envelope merged in. The keys are unchanged \u2014 the envelope is nested under the same key the old ResultPath wrote to \u2014 so every post-join JSONPath resolves exactly as before. The branch's substantive result is an S3 artifact the join reads (artifact-by-reference), never SF state.",
               "Parameters": {
-                "status": "OK"
+                "branch_pit_lookahead": {
+                  "status": "OK"
+                }
               },
-              "ResultPath": "$.branch_pit_lookahead",
               "End": true
             },
             "PitParityLookaheadSkipped": {
               "Type": "Pass",
-              "Comment": "Branch skip terminal ({\"skip_pit_parity_lookahead\": true}) \u2014 recorded distinctly from OK/DEGRADED so the aggregate and the rerun helper can tell 'ran clean' from 'operator skipped'.",
+              "Comment": "Branch skip terminal ({\"skip_pit_parity_lookahead\": true}) \u2014 recorded distinctly from OK/DEGRADED so the aggregate and the rerun helper can tell 'ran clean' from 'operator skipped'. alpha-engine-config-I8194 (States.DataLimitExceeded on ParityParallel, measured on friday-shell-2026-08-14-validate-i7386): this terminal no longer carries ResultPath, so the branch's OUTPUT is exactly this envelope instead of the branch's whole ~108 KB effective input with the envelope merged in. The keys are unchanged \u2014 the envelope is nested under the same key the old ResultPath wrote to \u2014 so every post-join JSONPath resolves exactly as before. The branch's substantive result is an S3 artifact the join reads (artifact-by-reference), never SF state.",
               "Parameters": {
-                "status": "SKIPPED"
+                "branch_pit_lookahead": {
+                  "status": "SKIPPED"
+                }
               },
-              "ResultPath": "$.branch_pit_lookahead",
               "End": true
             },
             "PitParityLookaheadDegraded": {
               "Type": "Pass",
-              "Comment": "THE BRANCH-LEVEL FAIL-OPEN MARKER (alpha-engine-config#6030). Every non-success path of this branch converges here \u2014 send/poll Catch, terminal non-Success command status, poll-budget exhaustion \u2014 and the branch ENDS SUCCESS with status DEGRADED so the SF Parallel never kills the sibling branches (\u00a74 blast radius; mirrors ThinkTankDegraded's fail-open shape). The degradation is NOT silent: CheckParityBranchOutcomes folds any DEGRADED branch into the existing $.parity_degraded flag family (ParityDegraded \u2192 PublishParityDegraded pages immediately; CheckGateDegradedNotify carries it to the terminal notification per \u00a72.3), and the PitParityCompare join emits the parity verdict as UNKNOWN when this branch's artifact is consequently absent (\u00a72.3a \u2014 absence of a verdict is never a pass). Specifics on the execution record: $.pit_parity_lookahead_poll / $.pit_parity_lookahead_error.",
+              "Comment": "THE BRANCH-LEVEL FAIL-OPEN MARKER (alpha-engine-config#6030). Every non-success path of this branch converges here \u2014 send/poll Catch, terminal non-Success command status, poll-budget exhaustion \u2014 and the branch ENDS SUCCESS with status DEGRADED so the SF Parallel never kills the sibling branches (\u00a74 blast radius; mirrors ThinkTankDegraded's fail-open shape). The degradation is NOT silent: CheckParityBranchOutcomes folds any DEGRADED branch into the existing $.parity_degraded flag family (ParityDegraded \u2192 PublishParityDegraded pages immediately; CheckGateDegradedNotify carries it to the terminal notification per \u00a72.3), and the PitParityCompare join emits the parity verdict as UNKNOWN when this branch's artifact is consequently absent (\u00a72.3a \u2014 absence of a verdict is never a pass). Specifics on the execution record: $.pit_parity_lookahead_poll / $.pit_parity_lookahead_error. alpha-engine-config-I8194 (States.DataLimitExceeded on ParityParallel, measured on friday-shell-2026-08-14-validate-i7386): this terminal no longer carries ResultPath, so the branch's OUTPUT is exactly this envelope instead of the branch's whole ~108 KB effective input with the envelope merged in. The keys are unchanged \u2014 the envelope is nested under the same key the old ResultPath wrote to \u2014 so every post-join JSONPath resolves exactly as before. The branch's substantive result is an S3 artifact the join reads (artifact-by-reference), never SF state.",
               "Parameters": {
-                "status": "DEGRADED"
+                "branch_pit_lookahead": {
+                  "status": "DEGRADED"
+                }
               },
-              "ResultPath": "$.branch_pit_lookahead",
               "End": true
             },
             "PitParityLookaheadResourceKillCheck": {
@@ -4852,11 +4860,12 @@
             },
             "PitParityLookaheadResourceKill": {
               "Type": "Pass",
-              "Comment": "alpha-engine-config-I7267 (Brian's 2026-08-13 ruling, sf-pipeline-policy \u00a73 SFP-3): PitParityLookahead was KILLED FOR RESOURCES (its own internal timeout), distinct from the generic PitParityLookaheadDegraded 'could not conclude' fail-open. Branch still ends SUCCESS (sibling-isolation, \u00a74 blast radius, unchanged) but with status RESOURCE_KILL \u2014 CheckParityBranchOutcomes reads this and routes the WHOLE SF to the hard-fail path (the shared hard-fail chokepoint) instead of the fail-open ParityDegraded continuation, so PitParityCompare/Evaluator/ReportCard/Director do not run this week and the failure is visible from get-execution-history alone.",
+              "Comment": "alpha-engine-config-I7267 (Brian's 2026-08-13 ruling, sf-pipeline-policy \u00a73 SFP-3): PitParityLookahead was KILLED FOR RESOURCES (its own internal timeout), distinct from the generic PitParityLookaheadDegraded 'could not conclude' fail-open. Branch still ends SUCCESS (sibling-isolation, \u00a74 blast radius, unchanged) but with status RESOURCE_KILL \u2014 CheckParityBranchOutcomes reads this and routes the WHOLE SF to the hard-fail path (the shared hard-fail chokepoint) instead of the fail-open ParityDegraded continuation, so PitParityCompare/Evaluator/ReportCard/Director do not run this week and the failure is visible from get-execution-history alone. alpha-engine-config-I8194 (States.DataLimitExceeded on ParityParallel, measured on friday-shell-2026-08-14-validate-i7386): this terminal no longer carries ResultPath, so the branch's OUTPUT is exactly this envelope instead of the branch's whole ~108 KB effective input with the envelope merged in. The keys are unchanged \u2014 the envelope is nested under the same key the old ResultPath wrote to \u2014 so every post-join JSONPath resolves exactly as before. The branch's substantive result is an S3 artifact the join reads (artifact-by-reference), never SF state.",
               "Parameters": {
-                "status": "RESOURCE_KILL"
+                "branch_pit_lookahead": {
+                  "status": "RESOURCE_KILL"
+                }
               },
-              "ResultPath": "$.branch_pit_lookahead",
               "End": true
             },
             "CheckPitParityLookaheadResourceKillCheckOutcome": {
@@ -5062,29 +5071,32 @@
             },
             "PitParityWalkforwardComplete": {
               "Type": "Pass",
-              "Comment": "Branch success terminal \u2014 the witness state scripts/weekly_sf_rerun.py keys on ('entered => completed'). Writes the branch status under $.branch_pit_walkforward for AggregateParityBranchOutcomes.",
+              "Comment": "Branch success terminal \u2014 the witness state scripts/weekly_sf_rerun.py keys on ('entered => completed'). Writes the branch status under $.branch_pit_walkforward for AggregateParityBranchOutcomes. alpha-engine-config-I8194 (States.DataLimitExceeded on ParityParallel, measured on friday-shell-2026-08-14-validate-i7386): this terminal no longer carries ResultPath, so the branch's OUTPUT is exactly this envelope instead of the branch's whole ~108 KB effective input with the envelope merged in. The keys are unchanged \u2014 the envelope is nested under the same key the old ResultPath wrote to \u2014 so every post-join JSONPath resolves exactly as before. The branch's substantive result is an S3 artifact the join reads (artifact-by-reference), never SF state.",
               "Parameters": {
-                "status": "OK"
+                "branch_pit_walkforward": {
+                  "status": "OK"
+                }
               },
-              "ResultPath": "$.branch_pit_walkforward",
               "End": true
             },
             "PitParityWalkforwardSkipped": {
               "Type": "Pass",
-              "Comment": "Branch skip terminal ({\"skip_pit_parity_walkforward\": true}) \u2014 recorded distinctly from OK/DEGRADED so the aggregate and the rerun helper can tell 'ran clean' from 'operator skipped'.",
+              "Comment": "Branch skip terminal ({\"skip_pit_parity_walkforward\": true}) \u2014 recorded distinctly from OK/DEGRADED so the aggregate and the rerun helper can tell 'ran clean' from 'operator skipped'. alpha-engine-config-I8194 (States.DataLimitExceeded on ParityParallel, measured on friday-shell-2026-08-14-validate-i7386): this terminal no longer carries ResultPath, so the branch's OUTPUT is exactly this envelope instead of the branch's whole ~108 KB effective input with the envelope merged in. The keys are unchanged \u2014 the envelope is nested under the same key the old ResultPath wrote to \u2014 so every post-join JSONPath resolves exactly as before. The branch's substantive result is an S3 artifact the join reads (artifact-by-reference), never SF state.",
               "Parameters": {
-                "status": "SKIPPED"
+                "branch_pit_walkforward": {
+                  "status": "SKIPPED"
+                }
               },
-              "ResultPath": "$.branch_pit_walkforward",
               "End": true
             },
             "PitParityWalkforwardDegraded": {
               "Type": "Pass",
-              "Comment": "THE BRANCH-LEVEL FAIL-OPEN MARKER (alpha-engine-config#6030). Every non-success path of this branch converges here \u2014 send/poll Catch, terminal non-Success command status, poll-budget exhaustion \u2014 and the branch ENDS SUCCESS with status DEGRADED so the SF Parallel never kills the sibling branches (\u00a74 blast radius; mirrors ThinkTankDegraded's fail-open shape). The degradation is NOT silent: CheckParityBranchOutcomes folds any DEGRADED branch into the existing $.parity_degraded flag family (ParityDegraded \u2192 PublishParityDegraded pages immediately; CheckGateDegradedNotify carries it to the terminal notification per \u00a72.3), and the PitParityCompare join emits the parity verdict as UNKNOWN when this branch's artifact is consequently absent (\u00a72.3a \u2014 absence of a verdict is never a pass). Specifics on the execution record: $.pit_parity_walkforward_poll / $.pit_parity_walkforward_error.",
+              "Comment": "THE BRANCH-LEVEL FAIL-OPEN MARKER (alpha-engine-config#6030). Every non-success path of this branch converges here \u2014 send/poll Catch, terminal non-Success command status, poll-budget exhaustion \u2014 and the branch ENDS SUCCESS with status DEGRADED so the SF Parallel never kills the sibling branches (\u00a74 blast radius; mirrors ThinkTankDegraded's fail-open shape). The degradation is NOT silent: CheckParityBranchOutcomes folds any DEGRADED branch into the existing $.parity_degraded flag family (ParityDegraded \u2192 PublishParityDegraded pages immediately; CheckGateDegradedNotify carries it to the terminal notification per \u00a72.3), and the PitParityCompare join emits the parity verdict as UNKNOWN when this branch's artifact is consequently absent (\u00a72.3a \u2014 absence of a verdict is never a pass). Specifics on the execution record: $.pit_parity_walkforward_poll / $.pit_parity_walkforward_error. alpha-engine-config-I8194 (States.DataLimitExceeded on ParityParallel, measured on friday-shell-2026-08-14-validate-i7386): this terminal no longer carries ResultPath, so the branch's OUTPUT is exactly this envelope instead of the branch's whole ~108 KB effective input with the envelope merged in. The keys are unchanged \u2014 the envelope is nested under the same key the old ResultPath wrote to \u2014 so every post-join JSONPath resolves exactly as before. The branch's substantive result is an S3 artifact the join reads (artifact-by-reference), never SF state.",
               "Parameters": {
-                "status": "DEGRADED"
+                "branch_pit_walkforward": {
+                  "status": "DEGRADED"
+                }
               },
-              "ResultPath": "$.branch_pit_walkforward",
               "End": true
             },
             "PitParityWalkforwardResourceKillCheck": {
@@ -5186,11 +5198,12 @@
             },
             "PitParityWalkforwardResourceKill": {
               "Type": "Pass",
-              "Comment": "alpha-engine-config-I7267 (Brian's 2026-08-13 ruling, sf-pipeline-policy \u00a73 SFP-3): PitParityWalkforward was KILLED FOR RESOURCES (its own internal timeout), distinct from the generic PitParityWalkforwardDegraded 'could not conclude' fail-open. Branch still ends SUCCESS (sibling-isolation, \u00a74 blast radius, unchanged) but with status RESOURCE_KILL \u2014 CheckParityBranchOutcomes reads this and routes the WHOLE SF to the hard-fail path (the shared hard-fail chokepoint) instead of the fail-open ParityDegraded continuation, so PitParityCompare/Evaluator/ReportCard/Director do not run this week and the failure is visible from get-execution-history alone.",
+              "Comment": "alpha-engine-config-I7267 (Brian's 2026-08-13 ruling, sf-pipeline-policy \u00a73 SFP-3): PitParityWalkforward was KILLED FOR RESOURCES (its own internal timeout), distinct from the generic PitParityWalkforwardDegraded 'could not conclude' fail-open. Branch still ends SUCCESS (sibling-isolation, \u00a74 blast radius, unchanged) but with status RESOURCE_KILL \u2014 CheckParityBranchOutcomes reads this and routes the WHOLE SF to the hard-fail path (the shared hard-fail chokepoint) instead of the fail-open ParityDegraded continuation, so PitParityCompare/Evaluator/ReportCard/Director do not run this week and the failure is visible from get-execution-history alone. alpha-engine-config-I8194 (States.DataLimitExceeded on ParityParallel, measured on friday-shell-2026-08-14-validate-i7386): this terminal no longer carries ResultPath, so the branch's OUTPUT is exactly this envelope instead of the branch's whole ~108 KB effective input with the envelope merged in. The keys are unchanged \u2014 the envelope is nested under the same key the old ResultPath wrote to \u2014 so every post-join JSONPath resolves exactly as before. The branch's substantive result is an S3 artifact the join reads (artifact-by-reference), never SF state.",
               "Parameters": {
-                "status": "RESOURCE_KILL"
+                "branch_pit_walkforward": {
+                  "status": "RESOURCE_KILL"
+                }
               },
-              "ResultPath": "$.branch_pit_walkforward",
               "End": true
             },
             "CheckPitParityWalkforwardResourceKillCheckOutcome": {
@@ -5401,38 +5414,42 @@
             },
             "ParityReplayComplete": {
               "Type": "Pass",
-              "Comment": "Branch success terminal \u2014 the witness state scripts/weekly_sf_rerun.py keys on ('entered => completed'). Writes the branch status under $.branch_parity_replay for AggregateParityBranchOutcomes.",
+              "Comment": "Branch success terminal \u2014 the witness state scripts/weekly_sf_rerun.py keys on ('entered => completed'). Writes the branch status under $.branch_parity_replay for AggregateParityBranchOutcomes. alpha-engine-config-I8194 (States.DataLimitExceeded on ParityParallel, measured on friday-shell-2026-08-14-validate-i7386): this terminal no longer carries ResultPath, so the branch's OUTPUT is exactly this envelope instead of the branch's whole ~108 KB effective input with the envelope merged in. The keys are unchanged \u2014 the envelope is nested under the same key the old ResultPath wrote to \u2014 so every post-join JSONPath resolves exactly as before. The branch's substantive result is an S3 artifact the join reads (artifact-by-reference), never SF state.",
               "Parameters": {
-                "status": "OK"
+                "branch_parity_replay": {
+                  "status": "OK"
+                }
               },
-              "ResultPath": "$.branch_parity_replay",
               "End": true
             },
             "ParityReplaySkipped": {
               "Type": "Pass",
-              "Comment": "Branch skip terminal ({\"skip_parity_replay\": true}) \u2014 recorded distinctly from OK/DEGRADED so the aggregate and the rerun helper can tell 'ran clean' from 'operator skipped'.",
+              "Comment": "Branch skip terminal ({\"skip_parity_replay\": true}) \u2014 recorded distinctly from OK/DEGRADED so the aggregate and the rerun helper can tell 'ran clean' from 'operator skipped'. alpha-engine-config-I8194 (States.DataLimitExceeded on ParityParallel, measured on friday-shell-2026-08-14-validate-i7386): this terminal no longer carries ResultPath, so the branch's OUTPUT is exactly this envelope instead of the branch's whole ~108 KB effective input with the envelope merged in. The keys are unchanged \u2014 the envelope is nested under the same key the old ResultPath wrote to \u2014 so every post-join JSONPath resolves exactly as before. The branch's substantive result is an S3 artifact the join reads (artifact-by-reference), never SF state.",
               "Parameters": {
-                "status": "SKIPPED"
+                "branch_parity_replay": {
+                  "status": "SKIPPED"
+                }
               },
-              "ResultPath": "$.branch_parity_replay",
               "End": true
             },
             "ParityReplayDegraded": {
               "Type": "Pass",
-              "Comment": "THE BRANCH-LEVEL FAIL-OPEN MARKER (alpha-engine-config#6030). Every non-success path of this branch converges here \u2014 send/poll Catch, terminal non-Success command status, poll-budget exhaustion \u2014 and the branch ENDS SUCCESS with status DEGRADED so the SF Parallel never kills the sibling branches (\u00a74 blast radius; mirrors ThinkTankDegraded's fail-open shape). The degradation is NOT silent: CheckParityBranchOutcomes folds any DEGRADED branch into the existing $.parity_degraded flag family (ParityDegraded \u2192 PublishParityDegraded pages immediately; CheckGateDegradedNotify carries it to the terminal notification per \u00a72.3), and the PitParityCompare join emits the parity verdict as UNKNOWN when this branch's artifact is consequently absent (\u00a72.3a \u2014 absence of a verdict is never a pass). Specifics on the execution record: $.parity_replay_poll / $.parity_replay_error.",
+              "Comment": "THE BRANCH-LEVEL FAIL-OPEN MARKER (alpha-engine-config#6030). Every non-success path of this branch converges here \u2014 send/poll Catch, terminal non-Success command status, poll-budget exhaustion \u2014 and the branch ENDS SUCCESS with status DEGRADED so the SF Parallel never kills the sibling branches (\u00a74 blast radius; mirrors ThinkTankDegraded's fail-open shape). The degradation is NOT silent: CheckParityBranchOutcomes folds any DEGRADED branch into the existing $.parity_degraded flag family (ParityDegraded \u2192 PublishParityDegraded pages immediately; CheckGateDegradedNotify carries it to the terminal notification per \u00a72.3), and the PitParityCompare join emits the parity verdict as UNKNOWN when this branch's artifact is consequently absent (\u00a72.3a \u2014 absence of a verdict is never a pass). Specifics on the execution record: $.parity_replay_poll / $.parity_replay_error. alpha-engine-config-I8194 (States.DataLimitExceeded on ParityParallel, measured on friday-shell-2026-08-14-validate-i7386): this terminal no longer carries ResultPath, so the branch's OUTPUT is exactly this envelope instead of the branch's whole ~108 KB effective input with the envelope merged in. The keys are unchanged \u2014 the envelope is nested under the same key the old ResultPath wrote to \u2014 so every post-join JSONPath resolves exactly as before. The branch's substantive result is an S3 artifact the join reads (artifact-by-reference), never SF state.",
               "Parameters": {
-                "status": "DEGRADED"
+                "branch_parity_replay": {
+                  "status": "DEGRADED"
+                }
               },
-              "ResultPath": "$.branch_parity_replay",
               "End": true
             },
             "ParityReplayResourceKill": {
               "Type": "Pass",
-              "Comment": "alpha-engine-config-I7267 (Brian's 2026-08-13 ruling, sf-pipeline-policy \u00a73 SFP-3): ParityReplay's captured StandardErrorContent carried krepis.ssm_log_capture's RESOURCE KILL classification (alpha-engine-config-I7258) \u2014 the replay was killed for resources, not merely unable to conclude. Branch still ends SUCCESS (sibling-isolation, \u00a74 blast radius, unchanged) but with status RESOURCE_KILL \u2014 CheckParityBranchOutcomes routes the WHOLE SF to the hard-fail path instead of the fail-open ParityDegraded continuation.",
+              "Comment": "alpha-engine-config-I7267 (Brian's 2026-08-13 ruling, sf-pipeline-policy \u00a73 SFP-3): ParityReplay's captured StandardErrorContent carried krepis.ssm_log_capture's RESOURCE KILL classification (alpha-engine-config-I7258) \u2014 the replay was killed for resources, not merely unable to conclude. Branch still ends SUCCESS (sibling-isolation, \u00a74 blast radius, unchanged) but with status RESOURCE_KILL \u2014 CheckParityBranchOutcomes routes the WHOLE SF to the hard-fail path instead of the fail-open ParityDegraded continuation. alpha-engine-config-I8194 (States.DataLimitExceeded on ParityParallel, measured on friday-shell-2026-08-14-validate-i7386): this terminal no longer carries ResultPath, so the branch's OUTPUT is exactly this envelope instead of the branch's whole ~108 KB effective input with the envelope merged in. The keys are unchanged \u2014 the envelope is nested under the same key the old ResultPath wrote to \u2014 so every post-join JSONPath resolves exactly as before. The branch's substantive result is an S3 artifact the join reads (artifact-by-reference), never SF state.",
               "Parameters": {
-                "status": "RESOURCE_KILL"
+                "branch_parity_replay": {
+                  "status": "RESOURCE_KILL"
+                }
               },
-              "ResultPath": "$.branch_parity_replay",
               "End": true
             }
           }
@@ -5453,7 +5470,7 @@
     },
     "AggregateParityBranchOutcomes": {
       "Type": "Pass",
-      "Comment": "Parallel join sync point (mirrors AggregateBranchOutcomes). $.parity_parallel_result is the 3-element array of each branch's final effective input (branch order matches the Branches array: [0]=PitParityLookahead, [1]=PitParityWalkforward, [2]=ParityReplay). Each branch terminal wrote its status (OK | DEGRADED | SKIPPED) under $.branch_pit_lookahead / $.branch_pit_walkforward / $.branch_parity_replay \u2014 hoist all three to a flat path for the Choice.",
+      "Comment": "Parallel join sync point (mirrors AggregateBranchOutcomes). $.parity_parallel_result is the 3-element array of each branch's bounded outcome envelope (branch order matches the Branches array: [0]=PitParityLookahead, [1]=PitParityWalkforward, [2]=ParityReplay). alpha-engine-config-I8194: this join FAILED the run with States.DataLimitExceeded on friday-shell-2026-08-14-validate-i7386 \u2014 all three branches SUCCEEDED and each returned its whole ~108 KB effective input, 323,876 bytes of array against a 262,144-byte ceiling. Each branch terminal now replaces its payload instead of merging into it, so the array is a few hundred bytes and the parity passes' substantive results are read from S3 (parity/{run_date}/pit_stats_*.json) by PitParityCompare, never carried in SF state. The three JSONPaths below are unchanged by that fix. Each branch terminal wrote its status (OK | DEGRADED | SKIPPED) under $.branch_pit_lookahead / $.branch_pit_walkforward / $.branch_parity_replay \u2014 hoist all three to a flat path for the Choice.",
       "Parameters": {
         "pit_lookahead_status.$": "$.parity_parallel_result[0].branch_pit_lookahead.status",
         "pit_walkforward_status.$": "$.parity_parallel_result[1].branch_pit_walkforward.status",
