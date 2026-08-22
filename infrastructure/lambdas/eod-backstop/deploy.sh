@@ -186,13 +186,14 @@ if $BOOTSTRAP; then
     --region "${REGION}"
 
   RULE_ARN="arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${RULE_NAME}"
-  run aws lambda add-permission \
+  run_tolerating "ResourceConflictException" \
+    aws lambda add-permission \
     --function-name "${FUNCTION_NAME}" \
     --statement-id "eventbridge-${RULE_NAME}" \
     --action lambda:InvokeFunction \
     --principal events.amazonaws.com \
     --source-arn "${RULE_ARN}" \
-    --region "${REGION}" 2>/dev/null || true
+    --region "${REGION}"
 
   echo "  NOTE: rule is DISABLED. After soak: aws events enable-rule --name ${RULE_NAME} --region ${REGION}"
 fi

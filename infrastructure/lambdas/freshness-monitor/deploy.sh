@@ -259,13 +259,14 @@ if $BOOTSTRAP; then
     --region "${REGION}"
 
   RULE_ARN="arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${RULE_NAME}"
-  run aws lambda add-permission \
+  run_tolerating "ResourceConflictException" \
+    aws lambda add-permission \
     --function-name "${FUNCTION_NAME}" \
     --statement-id "eventbridge-${RULE_NAME}" \
     --action lambda:InvokeFunction \
     --principal events.amazonaws.com \
     --source-arn "${RULE_ARN}" \
-    --region "${REGION}" 2>/dev/null || true
+    --region "${REGION}"
 
   # Historical-mode cron: daily at 04:00 UTC, off-peak. Fires the same
   # Lambda with event={"mode": "historical"} so it probes the last N
@@ -302,13 +303,14 @@ EOF
   rm -f "${HIST_TARGET_JSON}"
 
   HIST_RULE_ARN="arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${HISTORICAL_RULE_NAME}"
-  run aws lambda add-permission \
+  run_tolerating "ResourceConflictException" \
+    aws lambda add-permission \
     --function-name "${FUNCTION_NAME}" \
     --statement-id "eventbridge-${HISTORICAL_RULE_NAME}" \
     --action lambda:InvokeFunction \
     --principal events.amazonaws.com \
     --source-arn "${HIST_RULE_ARN}" \
-    --region "${REGION}" 2>/dev/null || true
+    --region "${REGION}"
 
   # Intraday mini-rule (config#1297): 30-min, weekdays 14-21 UTC (covers US
   # market hours 13:30-20:00 UTC with a buffer either side). Fires the same
@@ -343,13 +345,14 @@ EOF
   rm -f "${INTRADAY_TARGET_JSON}"
 
   INTRADAY_RULE_ARN="arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${INTRADAY_RULE_NAME}"
-  run aws lambda add-permission \
+  run_tolerating "ResourceConflictException" \
+    aws lambda add-permission \
     --function-name "${FUNCTION_NAME}" \
     --statement-id "eventbridge-${INTRADAY_RULE_NAME}" \
     --action lambda:InvokeFunction \
     --principal events.amazonaws.com \
     --source-arn "${INTRADAY_RULE_ARN}" \
-    --region "${REGION}" 2>/dev/null || true
+    --region "${REGION}"
 fi
 
 # ----- 3. Update function code (always after bootstrap, idempotent) ---------

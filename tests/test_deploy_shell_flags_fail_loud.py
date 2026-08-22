@@ -167,3 +167,115 @@ def test_every_lambda_deploy_script_sources_deploy_run() -> None:
         "run() and verify_code_deployed() (alpha-engine-config-I8033):\n  "
         + "\n  ".join(sorted(violations))
     )
+
+
+# ---------------------------------------------------------------------------
+# `run ... || true` is a silent lie now (alpha-engine-config-I8125).
+#
+# run() calls `exit`, not `return`. `exit` inside a function terminates the
+# SHELL, and `cmd || true` cannot catch it — `||` guards a non-zero RETURN and
+# there is no return to guard. So the moment run() started exiting, every
+# pre-existing `run ... || true` became fatal rather than tolerant, silently
+# and everywhere at once.
+#
+# Measured 2026-08-21: 24 sites across 20 of 43 deploy.sh scripts, all
+# `aws lambda add-permission` — which returns ResourceConflictException
+# whenever its statement-id already exists, i.e. on EVERY deploy after the
+# first. Twenty Lambdas became undeployable in one merge, and
+# deploy-overseer-backstop-responder failed five consecutive times before the
+# log was read.
+#
+# The pattern reads as tolerant and behaves as fatal, which is the worst
+# combination a reviewer can be shown. It must never come back.
+# ---------------------------------------------------------------------------
+
+import re  # noqa: E402
+
+
+def _logical_lines(text: str) -> list[str]:
+    """Join backslash continuations so a wrapped command is one line."""
+    return re.sub(r"\\\n\s*", " ", text).splitlines()
+
+
+def test_no_run_invocation_is_guarded_by_or_true() -> None:
+    """`run ... || true` cannot do what it says. Use run_tolerating."""
+    offenders = []
+    for path in _lambda_deploy_scripts():
+        for line in _logical_lines(path.read_text()):
+            stripped = line.strip()
+            if stripped.startswith("run ") and "|| true" in stripped:
+                offenders.append(f"{path.parent.name}: {stripped[:90]}")
+    assert not offenders, (
+        "`run ... || true` reads as tolerant and is fatal — run() exits, and "
+        "`||` cannot catch an exit. Use `run_tolerating \"<ErrorName>\" ...`, "
+        "which names the ONE failure that is benign and still fails loud on "
+        "every other:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_run_tolerating_exists_and_names_its_expected_error() -> None:
+    """The helper must require an expected-error argument.
+
+    A `run_tolerating` with an optional pattern would decay straight back
+    into `|| true` at the first call site that omitted it.
+    """
+    src = (_REPO_ROOT / "infrastructure/lambdas/_shared/deploy_run.sh").read_text()
+    assert "run_tolerating()" in src
+    assert "run_tolerating: expected-error substring required" in src, (
+        "the expected-error argument must be mandatory, or the helper "
+        "degrades to the unconditional swallow it replaces"
+    )
+    assert 'exit "${status}"' in src, "an unexpected failure must still exit"
+
+
+def test_every_add_permission_tolerates_only_the_conflict() -> None:
+    """`aws lambda add-permission` is idempotent-by-conflict.
+
+    It legitimately fails with ResourceConflictException when the statement
+    already exists — the steady state on every deploy after the first — and
+    must NOT be tolerated for AccessDenied or a malformed ARN, which is
+    exactly what the old `|| true` swallowed alongside it.
+    """
+    for path in _lambda_deploy_scripts():
+        lines = _logical_lines(path.read_text())
+        for idx, line in enumerate(lines):
+            if "aws lambda add-permission" not in line:
+                continue
+            # Either the shared wrapper, or a call site that captures the
+            # output itself and checks it — changelog-cloudwatch-mirror reads
+            # PERM_OUT to decide a propagation sleep, so it keeps its own
+            # capture. What is NOT acceptable either way is an unconditional
+            # swallow: the conflict is the ONE benign failure here.
+            # Comment lines are excluded: a comment EXPLAINING why `|| true`
+            # was removed must not read as `|| true` still being there.
+            window_lines = [
+                ln for ln in lines[max(0, idx - 1):idx + 15]
+                if not ln.strip().startswith("#")
+            ]
+            window = " ".join(window_lines)
+            assert "ResourceConflictException" in window, (
+                f"{path.parent.name}: add-permission tolerates exactly one "
+                f"failure — ResourceConflictException, the steady state on "
+                f"every deploy after the first. Wrap it in run_tolerating, or "
+                f"capture and check the output. Got: {line.strip()[:90]}"
+            )
+            assert "|| true" not in window, (
+                f"{path.parent.name}: `|| true` on add-permission swallows "
+                f"AccessDenied and a malformed ARN alongside the conflict"
+            )
+
+
+def test_no_tolerated_call_discards_its_own_stderr() -> None:
+    """`2>/dev/null` on a tolerated call is what made the outage unreadable.
+
+    run_tolerating captures stderr so the tolerated case can be RECOGNISED
+    and reported; discarding it at the call site defeats that and leaves a
+    failing deploy with no message, which is how five consecutive failures
+    went unexplained.
+    """
+    offenders = []
+    for path in _lambda_deploy_scripts():
+        for line in _logical_lines(path.read_text()):
+            if "run_tolerating" in line and "2>/dev/null" in line:
+                offenders.append(f"{path.parent.name}: {line.strip()[:90]}")
+    assert not offenders, "\n  ".join(["tolerated calls must not hide stderr:"] + offenders)
