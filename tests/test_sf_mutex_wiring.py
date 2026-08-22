@@ -116,7 +116,13 @@ FORMER_FIRST_STATE_BY_SF = {
     # run's ForceStopInstance) and the first ssm:sendCommand died with
     # Ssm.InvalidInstanceIdException. The mutex still routes to the pipeline's
     # first post-mutex work state — that state is just the ensure-running gate now.
-    "eod": ("step_function_eod.json", "StartTradingInstance"),
+    # alpha-engine-config-I8102 (2026-08-21): the EOD SF's first post-mutex
+    # state is now DeployDriftCheck, the same seam the weekday SF uses above.
+    # StartTradingInstance still follows immediately — the drift gate asks
+    # whether the orchestration about to write the day's book matches what the
+    # deploy published, and asking it BEFORE ec2:startInstances is the point
+    # (sf-pipeline-policy 2.2, everything cheaply knowable before spend).
+    "eod": ("step_function_eod.json", "DeployDriftCheck"),
 }
 
 

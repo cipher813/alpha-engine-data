@@ -544,6 +544,16 @@ class TestEODSFTopLevelFieldsClosed:
             "market_hours_override_malformed_notify",
             "market_hours_override_notify",
             "market_hours_unverified_notify",
+            # alpha-engine-config-I8102 — the DeployDriftCheck namespace.
+            # $.drift_result is the probe payload DeployDriftGate keys on;
+            # $.drift_error is the Catch path's, kept SEPARATE because on that
+            # path there is no Payload and a Pass reading $.drift_result.Payload
+            # would raise States.Runtime. $.deploy_drift_degraded_notify is the
+            # sns:publish result, named to be read by nothing (same convention
+            # as degraded_marker_result above).
+            "drift_result",
+            "drift_error",
+            "deploy_drift_degraded_notify",
             "ec2_instance_id",
             "eod_poll",
             "eod_result",

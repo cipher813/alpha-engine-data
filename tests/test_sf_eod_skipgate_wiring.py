@@ -110,14 +110,39 @@ class TestEntryEdgesRouteThroughGates:
         # is SSM-Online — converges on the CheckSkipPostMarketData rerun-gate
         # chain. (The ensure-running block is pinned in detail by
         # test_sf_eod_instance_start_wiring.py.)
-        assert states["CheckMutexRole"]["Default"] == "StartTradingInstance"
-        assert states["AcquireMutex"]["Next"] == "StartTradingInstance"
+        # alpha-engine-config-I8102: the three mutex edges now enter
+        # DeployDriftCheck, and EVERY route out of the drift block converges
+        # on StartTradingInstance — the gate is inserted in front of the
+        # ensure-running guard, not in place of it, so the invariant this test
+        # protects (no ssm:sendCommand before the box is confirmed
+        # SSM-Online) is unchanged. Asserted as convergence rather than as
+        # three literal edges so a fourth route added later cannot slip past
+        # either state.
+        assert states["CheckMutexRole"]["Default"] == "DeployDriftCheck"
+        assert states["AcquireMutex"]["Next"] == "DeployDriftCheck"
         failopen = [c["Next"] for c in states["AcquireMutex"]["Catch"]
                     if "States.ALL" in c["ErrorEquals"]]
-        # alpha-engine-config#6722: routes through SetMutexAcquireDegradedFlag
-        # before continuing to StartTradingInstance exactly as before.
+        # alpha-engine-config#6722: the fail-open threads $.degraded_summary
+        # through SetMutexAcquireDegradedFlag before continuing.
         assert failopen == ["SetMutexAcquireDegradedFlag"]
-        assert states["SetMutexAcquireDegradedFlag"]["Next"] == "StartTradingInstance"
+        assert states["SetMutexAcquireDegradedFlag"]["Next"] == "DeployDriftCheck"
+        assert states["DeployDriftCheck"]["Next"] == "DeployDriftGate"
+        drift_exits = {states["DeployDriftGate"]["Default"]}
+        for choice in states["DeployDriftGate"]["Choices"]:
+            drift_exits.add(states[choice["Next"]]["Next"])
+        for catch in states["DeployDriftCheck"]["Catch"]:
+            drift_exits.add(states[catch["Next"]]["Next"])
+        # Every non-Default route lands on the single notify state, which then
+        # continues to StartTradingInstance (and its own Catch does too).
+        resolved = set()
+        for exit_state in drift_exits:
+            if exit_state == "PublishDeployDriftDegraded":
+                notify = states[exit_state]
+                resolved.add(notify["Next"])
+                resolved.update(c["Next"] for c in notify["Catch"])
+            else:
+                resolved.add(exit_state)
+        assert resolved == {"StartTradingInstance"}, resolved
         # The ensure-running block's SSM-ready path must land on the first gate,
         # which is now the hoisted deploy-refresh gate (config#1549).
         online = [c["Next"] for c in states["SSMReadyChoice"]["Choices"]
