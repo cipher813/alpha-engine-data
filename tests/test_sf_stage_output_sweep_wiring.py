@@ -50,13 +50,29 @@ def test_run_date_is_still_threaded(substrate_command):
     assert "$.run_date" in substrate_command
 
 
+def test_execution_run_date_is_also_exported(substrate_command):
+    """alpha-engine-config-I8155: WeeklySubstrateHealthCheck already threads
+    $.run_date as a --run-date CLI arg to substrate_health_check.sh, but the
+    krepis.stage_coverage assertions this stage's SIBLING launchers make need
+    the same value as an environment variable, never $RUN_DATE (reassigned to
+    the trading day by crucible-backtester's infrastructure/_spot_common.sh).
+    """
+    assert "export EXECUTION_RUN_DATE=" in substrate_command
+    assert "$.run_date" in substrate_command
+
+
 def test_format_argument_order_matches_the_placeholders(substrate_command):
     """`States.Format` is positional, so an argument appended in the wrong
     order silently swaps the run date and the execution ARN — the sweep would
     then head keys under a date that is an ARN and report every artifact
     missing, with no error anywhere.
+
+    Locates the specific `States.Format(...)` call that builds the
+    krepis.ssm_log_capture command line — NOT `substrate_command`'s first
+    `States.Format(`, which since alpha-engine-config-I8155 is the earlier
+    `export EXECUTION_RUN_DATE=...` call this state also carries.
     """
-    start = substrate_command.index("States.Format(")
+    start = substrate_command.index("States.Format('/home/ec2-user")
     fragment = substrate_command[start:]
     assert fragment.index("$$.Execution.Name") < fragment.index("$.run_date")
     assert fragment.index("$.run_date") < fragment.index("$$.Execution.Id")
