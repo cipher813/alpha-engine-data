@@ -79,10 +79,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
+import boto3
 import yaml
 
 HERE = Path(__file__).parent.resolve()
@@ -107,6 +110,16 @@ _AWS_MANAGED_PREFIX = "DO-NOT-DELETE-"
 CHECK_ID = "automation-pause-reconcile"
 CHECK_LABEL = "automation pause: manifest vs registry vs live AWS"
 CADENCE_MINUTES = 1440  # the daily sf-arn-drift-check sweep
+
+#: alpha-engine-config-I8189 — a machine-readable declared-pause set, so a
+#: cross-repo consumer (crucible-evaluator's groom tile) can render "declared
+#: off" instead of inferring "did not run or its writer broke" from absent
+#: artifacts. One producer of pause truth (this module, already running daily
+#: at 09:50 UTC), on the evaluator's existing S3 read path.
+PAUSED_LANES_KEY = "ops/checks/automation-pause-reconcile/paused_lanes.json"
+PAUSED_LANES_SCHEMA_VERSION = 1
+
+logger = logging.getLogger(__name__)
 
 
 # ── register 3: live AWS ─────────────────────────────────────────────────────
@@ -820,6 +833,55 @@ def publish_error(error: str, dry_run: bool = False) -> str | None:
     return fcr.emit(env, dry_run=dry_run)
 
 
+def publish_paused_lanes(manifest: dict | None = None, dry_run: bool = False) -> str | None:
+    """Publish the machine-readable declared-pause set (alpha-engine-config-I8189).
+
+    A DATA artifact, not this check's own status envelope — deliberately a
+    separate S3 key from `publish()`'s `fcr.emit` (which writes this check's
+    console row, not a fact other repos read). The evaluator's groom tile
+    (`crucible-evaluator/grading/tiles/groom.py`) reads this key to render a
+    declared-off state for the paused groom lanes instead of inferring
+    "groomer did not run or its writer broke" from absent artifacts —
+    `observability-policy.md` §8.3 forbids inferring DISABLED, and forbids the
+    symmetric failure of a declared pause rendering as an undeclared gap.
+
+    ``paused`` is exactly ``automation_pause.paused_names(manifest)`` — the
+    existing helper that already computes "every name for which DISABLED is
+    the intended live state" (``paused`` + ``pending`` blocks) — not
+    reimplemented here.
+
+    Never raises: a failed publish of this artifact must not fail the check
+    itself, the same posture `publish()`/`publish_error()` already take via
+    `fcr.emit`. On any exception this logs a warning and returns None.
+    """
+    generated_at = datetime.now(UTC).isoformat()
+    try:
+        paused = sorted(ap.paused_names(manifest))
+        body = {
+            "schema_version": PAUSED_LANES_SCHEMA_VERSION,
+            "generated_at": generated_at,
+            "paused": paused,
+        }
+        uri = f"s3://{REGISTRY_BUCKET}/{PAUSED_LANES_KEY}"
+        if dry_run:
+            logger.info("[dry-run] would publish %s (%d paused lane(s))", uri, len(paused))
+            return None
+        boto3.client("s3").put_object(
+            Bucket=REGISTRY_BUCKET, Key=PAUSED_LANES_KEY,
+            Body=json.dumps(body, indent=2).encode(),
+            ContentType="application/json",
+        )
+        return uri
+    except Exception:  # noqa: BLE001 — a failed publish must not fail the check
+        logger.warning(
+            "could not publish declared-pause lane set to s3://%s/%s — "
+            "cross-repo consumers (e.g. crucible-evaluator's groom tile) will "
+            "not see this run's paused-lane set until the next scheduled run",
+            REGISTRY_BUCKET, PAUSED_LANES_KEY, exc_info=True,
+        )
+        return None
+
+
 def main() -> int:
     ap_ = argparse.ArgumentParser(
         description="reconcile the pause manifest, the observability registry and live AWS")
@@ -866,6 +928,10 @@ def main() -> int:
         # a check must not go red because its telemetry did. The verdict below
         # is unaffected either way.
         publish(findings, checked=len(triggers), dry_run=args.dry_run, declared_gaps=gaps)
+        # alpha-engine-config-I8189: the declared-pause lane set, a separate
+        # data artifact for cross-repo consumers. Same dry_run handling, same
+        # never-raises posture as `publish()` above.
+        publish_paused_lanes(dry_run=args.dry_run)
 
     print(annotation(findings, len(triggers)))
     if args.markdown:

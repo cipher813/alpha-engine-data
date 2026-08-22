@@ -21,6 +21,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -603,3 +604,129 @@ def test_a_declared_gap_row_names_its_owner_and_expiry(mod):
     assert rows, "the justified entry must render as a declared gap"
     assert "alpha-engine-config-I6984" in rows[0]["detail"]
     assert "2999-01-01" in rows[0]["detail"]
+
+
+
+
+# ── alpha-engine-config-I8189: machine-readable declared-pause lane set ─────
+#
+# The groom pause manifest lives in THIS repo; the evaluator (crucible-
+# evaluator's groom tile, a Lambda with no checkout) needs a machine-readable
+# fact instead of inferring "paused" from absent artifacts (forbidden by
+# observability-policy.md §8.3). This is the nousergon-data producer half —
+# `publish_paused_lanes` publishes the set `automation_pause.paused_names()`
+# already computes to a stable S3 key on the evaluator's existing read path.
+# The consumer half lands separately in crucible-evaluator.
+
+_KNOWN_GROOM_LANES = {
+    "alpha-engine-groom-lane-reconciler-5min",
+    "alpha-engine-groom-sweep-0000-daily",
+    "alpha-engine-groom-sweep-0800-daily",
+    "alpha-engine-groom-sweep-1600-daily",
+    "alpha-engine-scheduled-groom-0400-daily",
+    "alpha-engine-scheduled-groom-1200-daily",
+    "alpha-engine-scheduled-groom-2000-daily",
+    "alpha-engine-scheduled-groom-sun0900-weekly",
+}
+
+
+class _InMemoryS3:
+    """Minimal in-memory S3 mock (put_object only — this module never reads
+    this key back). No moto dep — mirrors
+    tests/test_daily_append_schema_drift.py::_InMemoryS3 /
+    tests/test_news_aggregates.py::_InMemoryS3, this repo's established
+    convention for S3-touching tests (deliberately no moto dependency)."""
+
+    def __init__(self) -> None:
+        self.puts: list[dict] = []
+
+    def put_object(self, *, Bucket, Key, Body, ContentType=None):
+        self.puts.append({"Bucket": Bucket, "Key": Key, "Body": Body, "ContentType": ContentType})
+        return {"ETag": "stub"}
+
+
+def test_publish_paused_lanes_writes_the_exact_contract_shape(mod, monkeypatch):
+    s3 = _InMemoryS3()
+    monkeypatch.setattr(mod, "boto3", MagicMock(client=lambda *a, **k: s3))
+
+    m = _manifest(
+        paused={name: "groom pause (alpha-engine-config-I6617)" for name in _KNOWN_GROOM_LANES},
+    )
+    uri = mod.publish_paused_lanes(m, dry_run=False)
+
+    assert uri == f"s3://{mod.REGISTRY_BUCKET}/{mod.PAUSED_LANES_KEY}"
+    assert len(s3.puts) == 1
+    put = s3.puts[0]
+    assert put["Bucket"] == mod.REGISTRY_BUCKET
+    assert put["Key"] == mod.PAUSED_LANES_KEY
+    assert put["ContentType"] == "application/json"
+
+    body = json.loads(put["Body"])
+    assert body["schema_version"] == 1
+    assert set(body.keys()) == {"schema_version", "generated_at", "paused"}
+    # generated_at parses as a UTC ISO8601 timestamp.
+    datetime.datetime.fromisoformat(body["generated_at"])
+    assert body["paused"] == sorted(body["paused"]), "paused list must be sorted"
+
+
+def test_publish_paused_lanes_matches_paused_names_including_the_eight_groom_lanes(mod, monkeypatch):
+    s3 = _InMemoryS3()
+    monkeypatch.setattr(mod, "boto3", MagicMock(client=lambda *a, **k: s3))
+
+    m = _manifest(
+        paused={name: "groom pause (alpha-engine-config-I6617)" for name in _KNOWN_GROOM_LANES},
+    )
+    mod.publish_paused_lanes(m, dry_run=False)
+
+    body = json.loads(s3.puts[0]["Body"])
+    assert set(body["paused"]) == mod.ap.paused_names(m)
+    assert _KNOWN_GROOM_LANES.issubset(set(body["paused"])), (
+        "all 8 known groom lanes must be present in the published paused set"
+    )
+
+
+def test_publish_paused_lanes_uses_the_live_manifest_by_default(mod, manifest):
+    """Sanity check against the real, checked-in manifest (not a synthetic
+    one): the 8 known groom lanes are actually paused there today."""
+    assert _KNOWN_GROOM_LANES.issubset(mod.ap.paused_names(manifest))
+
+
+def test_publish_paused_lanes_never_raises_on_a_publish_failure(mod, monkeypatch):
+    class _BrokenS3:
+        def put_object(self, **kw):
+            raise RuntimeError("S3 is down")
+
+    monkeypatch.setattr(mod, "boto3", MagicMock(client=lambda *a, **k: _BrokenS3()))
+
+    m = _manifest(paused={"tick": "x"})
+    result = mod.publish_paused_lanes(m, dry_run=False)  # must not raise
+    assert result is None
+
+
+def test_publish_paused_lanes_dry_run_does_not_write(mod, monkeypatch):
+    s3 = _InMemoryS3()
+    monkeypatch.setattr(mod, "boto3", MagicMock(client=lambda *a, **k: s3))
+
+    m = _manifest(paused={"tick": "x"})
+    result = mod.publish_paused_lanes(m, dry_run=True)
+    assert result is None
+    assert s3.puts == []
+
+
+def test_main_calls_publish_paused_lanes_after_publish(mod, monkeypatch):
+    """Wired into main() right after the existing publish() call, same
+    dry_run handling — verified by call order, not by re-testing publish()."""
+    calls: list[str] = []
+    monkeypatch.setattr(mod, "live_triggers", lambda: [])
+    monkeypatch.setattr(mod, "load_registry", lambda registry_dir=None: {})
+    monkeypatch.setattr(mod, "reconcile", lambda **kw: [])
+    monkeypatch.setattr(mod, "declared_alarm_gaps", lambda manifest=None: [])
+    monkeypatch.setattr(mod, "publish", lambda *a, **kw: calls.append("publish"))
+    monkeypatch.setattr(mod, "publish_paused_lanes", lambda *a, **kw: calls.append("publish_paused_lanes"))
+    monkeypatch.setattr(sys, "argv", ["pause_reconcile.py", "--check", "--publish", "--dry-run"])
+
+    mod.main()
+
+    assert calls == ["publish", "publish_paused_lanes"], (
+        "publish_paused_lanes must run right after publish(), same --publish/--dry-run gate"
+    )
