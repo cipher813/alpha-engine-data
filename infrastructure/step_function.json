@@ -43,7 +43,8 @@
       "Parameters": {
         "FunctionName": "alpha-engine-predictor-inference:live",
         "Payload": {
-          "action": "check_weekly_run_day"
+          "action": "check_weekly_run_day",
+          "run_date.$": "$.run_date"
         }
       },
       "TimeoutSeconds": 60,
@@ -183,7 +184,8 @@
       "Parameters": {
         "FunctionName": "alpha-engine-predictor-inference:live",
         "Payload": {
-          "action": "check_lib_pin_drift"
+          "action": "check_lib_pin_drift",
+          "run_date.$": "$.run_date"
         }
       },
       "TimeoutSeconds": 60,
@@ -268,7 +270,8 @@
       "Parameters": {
         "FunctionName": "alpha-engine-predictor-inference:live",
         "Payload": {
-          "action": "check_pipeline_contract"
+          "action": "check_pipeline_contract",
+          "run_date.$": "$.run_date"
         }
       },
       "TimeoutSeconds": 60,
@@ -1290,7 +1293,8 @@
               "Parameters": {
                 "FunctionName": "alpha-engine-predictor-regime-substrate:live",
                 "Payload": {
-                  "action.$": "$.regime_action"
+                  "action.$": "$.regime_action",
+                  "run_date.$": "$.run_date"
                 }
               },
               "TimeoutSeconds": 270,
@@ -1714,7 +1718,8 @@
               "Parameters": {
                 "FunctionName": "alpha-engine-predictor-regime-retrospective-eval:live",
                 "Payload": {
-                  "action.$": "$.regime_action"
+                  "action.$": "$.regime_action",
+                  "run_date.$": "$.run_date"
                 }
               },
               "TimeoutSeconds": 570,

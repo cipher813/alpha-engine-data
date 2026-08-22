@@ -74,10 +74,15 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # before MorningEnrich (alpha-engine-substrate-health-gate Lambda).
     "SubstrateHealthGate": frozenset({"instance_id.$"}),
     # L4517: preventive cross-repo lib-pin drift gate (predictor-inference Lambda).
-    "LibPinDriftCheck": frozenset({"action"}),
+    # alpha-engine-config-I8155: +run_date.$ — the stage-coverage verdict this
+    # Lambda writes is keyed on the execution's own run_date, and without it
+    # in the Payload the handler substituted datetime.now(), which matches
+    # $.run_date only while the stage runs on the same UTC day the execution
+    # started.
+    "LibPinDriftCheck": frozenset({"action", "run_date.$"}),
     # config#693 (L4595): pre-spend pipeline-contract preflight gate, wired
     # directly after LibPinDriftGate's pass-through (predictor-inference Lambda).
-    "PipelineContractCheck": frozenset({"action"}),
+    "PipelineContractCheck": frozenset({"action", "run_date.$"}),  # +run_date.$ (I8155)
     # config#2348: pre-spend evaluator Lambda-SHA drift gate pair, wired
     # directly after PipelineContractGate's pass-through. Two separate Lambda
     # invokes (grading, then director) — each checks its OWN :live alias's
@@ -85,15 +90,15 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "EvaluatorDeployDriftCheck": frozenset({"action"}),
     "EvaluatorDirectorDeployDriftCheck": frozenset({"action"}),
     # config#1824 weekly run-day gate (pure calendar; mirrors LibPinDriftCheck shape).
-    "WeeklyRunDayGate": frozenset({"action"}),
+    "WeeklyRunDayGate": frozenset({"action", "run_date.$"}),  # +run_date.$ (I8155)
     "Scanner": frozenset({"dry_run_llm.$", "run_date.$"}),
     # alpha-engine-config-I7813: the same scanner Lambda, invoked as a
     # post-Director leaf with an explicit `mode` so it builds ONLY the
     # observe-only scanner/leaderboard board. The literal `mode` is what
     # keeps this payload distinct from Scanner's above.
     "ScannerLeaderboard": frozenset({"dry_run_llm.$", "run_date.$", "mode"}),
-    "RegimeSubstrate": frozenset({"action.$"}),
-    "RegimeRetrospectiveEval": frozenset({"action.$"}),
+    "RegimeSubstrate": frozenset({"action.$", "run_date.$"}),  # +run_date.$ (I8155)
+    "RegimeRetrospectiveEval": frozenset({"action.$", "run_date.$"}),  # +run_date.$ (I8155)
     # alpha-engine-config-I2515 Phase B: replaces the removed multi-agent
     # Research state as the signals.json producer.
     # config-I2916: preflight.$=$.research_dry threads the Friday-PM shell-run

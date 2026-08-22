@@ -473,3 +473,81 @@ def test_resolve_zoo_specs_is_not_a_coverage_asserting_state() -> None:
     text = _ssm_command_text(states["ResolveZooSpecs"])
     assert CLI_MODULE not in text
     assert _EXECUTION_RUN_DATE_EXPORT not in text
+
+
+# ── config-I8155: the Lambda-backed coverage stages get $.run_date too ───────
+#
+# The SSM half above carries EXECUTION_RUN_DATE to the launcher scripts. The
+# Lambda half needs the same identity in its EVENT, and five states did not
+# have it: WeeklyRunDayGate, LibPinDriftCheck, PipelineContractCheck (all
+# `alpha-engine-predictor:live`) and RegimeSubstrate /
+# RegimeRetrospectiveEval carried Payloads holding ONLY `action`.
+#
+# Those five wrote a CORRECT run_date on 2026-08-22 — and only by
+# coincidence. Their handlers substituted `datetime.now(timezone.utc).date()`
+# or a calendar date derived from it, which equals `$.run_date` exactly when
+# the stage runs on the same UTC day the execution started. An execution
+# beginning 23:50 UTC, a stage crossing midnight, or any redrive of an older
+# run_date splits them — and the split is invisible, because the verdict
+# still lands under a plausible-looking prefix.
+#
+# "Right for the wrong reason" is not a passing state for an identity field.
+
+_LAMBDA_COVERAGE_STATES: dict[str, str] = {
+    "WeeklyRunDayGate": "alpha-engine-predictor-inference",
+    "LibPinDriftCheck": "alpha-engine-predictor-inference",
+    "PipelineContractCheck": "alpha-engine-predictor-inference",
+    "RegimeSubstrate": "alpha-engine-predictor-regime-substrate",
+    "RegimeRetrospectiveEval": "alpha-engine-predictor-regime-retrospective-eval",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_LAMBDA_COVERAGE_STATES))
+def test_every_lambda_coverage_state_threads_the_execution_run_date(name: str) -> None:
+    states = _sf_states()
+    assert name in states, f"{name}: state not found in the live SF definition"
+    payload = states[name]["Parameters"]["Payload"]
+    assert payload.get("run_date.$") == "$.run_date", (
+        f"{name}: Payload does not thread $.run_date, so its handler has no "
+        "way to learn the execution's identity and must either fabricate one "
+        "(forbidden) or record UNMEASURED. Payload is "
+        f"{sorted(payload)} (alpha-engine-config-I8155)."
+    )
+
+
+def test_no_lambda_coverage_state_substitutes_a_derived_date_for_run_date() -> None:
+    """`$.run_date` and nothing else. A Payload wiring `run_date` to a
+    trading-day or cycle field would satisfy the presence test above while
+    reintroducing exactly the split it exists to prevent."""
+    states = _sf_states()
+    for name in sorted(_LAMBDA_COVERAGE_STATES):
+        wired = states[name]["Parameters"]["Payload"].get("run_date.$")
+        assert wired == "$.run_date", (
+            f"{name}: run_date is wired to {wired!r}. It must be the "
+            "execution's own $.run_date — cycle_date is derived separately by "
+            "krepis via last_closed_trading_day() and is a different question."
+        )
+
+
+def test_the_lambda_coverage_state_set_is_not_silently_smaller_than_reality() -> None:
+    """Guard the guard. The curated set above is a claim about the pipeline;
+    if a Lambda-backed Task state's function is one of the named coverage
+    functions and it is absent from the set, the set is stale and this test —
+    not a quiet pass — is what says so."""
+    states = _sf_states()
+    functions = set(_LAMBDA_COVERAGE_STATES.values())
+    discovered = set()
+    for name, body in states.items():
+        if body.get("Type") != "Task" or "lambda:invoke" not in body.get("Resource", ""):
+            continue
+        fn = str(body.get("Parameters", {}).get("FunctionName", ""))
+        if any(fn.startswith(f"{f}:") or fn == f for f in functions):
+            discovered.add(name)
+    unlisted = sorted(discovered - set(_LAMBDA_COVERAGE_STATES))
+    assert not unlisted, (
+        "Lambda state(s) on a coverage-asserting function are missing from "
+        f"_LAMBDA_COVERAGE_STATES: {unlisted}. Add them (and thread "
+        "$.run_date into their Payloads) or the curated set is a smaller "
+        "world than its name implies."
+    )
+    assert discovered, "the lambda-state scan found nothing — it cannot pass vacuously"
