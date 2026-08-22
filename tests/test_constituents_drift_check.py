@@ -100,14 +100,14 @@ def test_check_drift_sector_etf_excluded():
     assert result["status"] == "ok"
 
 
-def test_check_drift_wikipedia_fetch_failure_returns_error():
+def test_check_drift_membership_fetch_failure_returns_error():
     from validators.constituents_drift_check import check_drift
 
     fake_fetch = MagicMock(side_effect=Exception("Wikipedia 503"))
     with patch("validators.constituents_drift_check._fetch_constituents", fake_fetch):
         result = check_drift(alert=False)
     assert result["status"] == "error"
-    assert result["stage"] == "wikipedia_fetch"
+    assert result["stage"] == "membership_fetch"
 
 
 def test_check_drift_arctic_failure_returns_error():
@@ -408,3 +408,58 @@ def test_collection_ran_probes_the_dated_constituents_artifact():
     assert s3.calls == [
         ("alpha-engine-research", "market_data/weekly/2026-08-22/constituents.json"),
     ]
+
+
+# ── the module may not name Wikipedia as the membership source ──────────────
+# alpha-engine-config-I8094. nousergon-data#1495 corrected the alert message
+# and the docstring, and the same claim survived in four other places: the
+# module summary line, the `Composes with` closing paragraph (which asserted
+# the opposite of the paragraph above it), the `--max-stragglers` help text,
+# both `main()` log lines, and the `wikipedia_count` result key. A file that
+# contradicts itself about its own upstream sends triage to the wrong system
+# whichever half is read first.
+
+
+def test_result_names_the_membership_source_not_wikipedia():
+    from validators.constituents_drift_check import check_drift
+
+    fake_fetch = MagicMock(return_value=(["AAPL", "MSFT"], {}, {}, {}, 2, 0))
+    fake_lib = MagicMock()
+    fake_lib.list_symbols.return_value = ["AAPL", "MSFT"]
+    with patch("validators.constituents_drift_check._fetch_constituents", fake_fetch), \
+         patch("validators.constituents_drift_check._open_universe_lib",
+               return_value=fake_lib):
+        result = check_drift(alert=False)
+    assert result["membership_count"] == 2
+    assert "wikipedia_count" not in result
+
+
+def test_no_line_claims_wikipedia_is_the_membership_source():
+    """Wikipedia may only appear where it is being CORRECTED or where it is
+    named as the GICS attestation source — never as the list of members."""
+    import inspect
+
+    from validators import constituents_drift_check as mod
+
+    src = inspect.getsource(mod)
+    offenders = []
+    for lineno, line in enumerate(src.splitlines(), start=1):
+        if "ikipedia" not in line:
+            continue
+        allowed = (
+            "GICS" in line
+            or "no longer" in line
+            or "at the time" in line
+            or "supplies" in line
+            or "community-edited" in line
+            or "retained for" in line
+            or "long after the source moved" in line
+            or "may only appear" in line
+            or "the membership source" in line
+        )
+        if not allowed:
+            offenders.append((lineno, line.strip()))
+    assert not offenders, (
+        "these lines still present Wikipedia as the membership source "
+        f"(it moved to the SSGA holdings files in I2812): {offenders}"
+    )

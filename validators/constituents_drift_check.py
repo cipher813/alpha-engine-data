@@ -1,11 +1,12 @@
 """
 validators/constituents_drift_check.py — Friday-Preflight detection of
-Wikipedia-vs-ArcticDB constituents drift (close 5/23-SF P0 (g)).
+index-membership-vs-ArcticDB constituents drift (close 5/23-SF P0 (g)).
 
 Background:
 
-  The 2026-05-23 SF FAILED at Research because BNY/P/SN were Wikipedia-
-  listed S&P members but missing from ArcticDB universe — the constituents
+  The 2026-05-23 SF FAILED at Research because BNY/P/SN were listed S&P
+  members (Wikipedia was the membership source at the time) but missing
+  from the ArcticDB universe — the constituents
   collector advanced the `latest_weekly.json` pointer AFTER the backfill
   ran, so the backfill saw last-week's constituents and skipped the new
   cohort. Friday-Preflight SF couldn't detect this directly because the
@@ -17,10 +18,11 @@ Background:
 
   MEMBERSHIP SOURCE — no longer Wikipedia. Since alpha-engine-config-I2812
   the ground truth is the SSGA SPDR daily holdings files (SPY / MDY), read
-  through ``collectors.constituents._fetch_constituents``; Wikipedia is
-  retained for GICS sector/sub-industry attestation only. Wikipedia's
-  community-edited pages lag real index changes by weeks in the removal
-  direction, which was the root cause of I2703/I2812. The docstring and the
+  through ``collectors.constituents._fetch_constituents``.
+  Wikipedia is retained for GICS sector/sub-industry attestation only,
+  and for nothing else: its community-edited pages lag real index changes
+  by weeks in the removal direction, which was the root cause of
+  I2703/I2812. The docstring and the
   alert text below both said "Wikipedia" long after the source moved —
   corrected 2026-08-21 under alpha-engine-config-I8094, because an alert
   that misnames its own upstream sends every triage session to the wrong
@@ -37,8 +39,11 @@ Usage:
 
   python -m validators.constituents_drift_check          # checks + alerts on diff
   python -m validators.constituents_drift_check --no-alert  # diagnostic, no SNS/Telegram
+  python -m validators.constituents_drift_check --run-date 2026-08-22  # gate only if
+                                                                       # that run
+                                                                       # collected
   python -m validators.constituents_drift_check --max-stragglers 20  # allow up to N
-                                                                      # Wikipedia tickers
+                                                                      # index members
                                                                       # missing from
                                                                       # arctic before
                                                                       # firing alert
@@ -47,9 +52,9 @@ Exit code 0 on clean diff (or under-threshold drift), 1 on alert-worthy
 drift. SF Catch on the WeeklySubstrateHealthCheck state turns exit-1 into
 an alert.
 
-Composes with [[feedback_no_silent_fails]]: Wikipedia is the upstream
-authority; if it lists a ticker that ArcticDB universe lacks, that's the
-exact failure surface that hit production on 5/23.
+Composes with [[feedback_no_silent_fails]]: the SSGA holdings files are
+the upstream authority; if they list a ticker the ArcticDB universe lacks,
+that's the exact failure surface that hit production on 5/23.
 """
 
 from __future__ import annotations
@@ -123,11 +128,11 @@ def check_drift(
     run_date: str | None = None,
     s3_client=None,
 ) -> dict:
-    """Run the Wikipedia → ArcticDB constituents drift check.
+    """Run the index-membership → ArcticDB constituents drift check.
 
     Args:
         bucket: S3 bucket holding the ArcticDB universe library.
-        max_stragglers: number of Wikipedia tickers allowed to be missing
+        max_stragglers: number of index members allowed to be missing
             from ArcticDB before firing the alert. Default 0 (strict — any
             missing ticker fires). Set higher to tolerate known
             churn-in delay (e.g. the 1-Saturday backfill lag).
@@ -145,7 +150,7 @@ def check_drift(
 
     Returns:
         dict with keys: status (`ok` | `drift_detected` | `error`),
-        wikipedia_count, arctic_count, missing_from_arctic (list),
+        membership_count, arctic_count, missing_from_arctic (list),
         only_in_arctic (list), within_threshold (bool).
     """
     try:
@@ -153,17 +158,17 @@ def check_drift(
             _fetch_constituents()
         )
     except Exception as exc:
-        logger.exception("Wikipedia constituents fetch failed")
+        logger.exception("Index-membership constituents fetch failed")
         return {
             "status": "error",
             "error": str(exc),
-            "stage": "wikipedia_fetch",
+            "stage": "membership_fetch",
         }
 
-    wikipedia_set = set(tickers)
+    membership_set = set(tickers)
     logger.info(
-        "Wikipedia constituents: %d tickers (S&P 500=%d, S&P 400=%d)",
-        len(wikipedia_set), sp500_count, sp400_count,
+        "Index membership (SSGA holdings): %d tickers (S&P 500=%d, S&P 400=%d)",
+        len(membership_set), sp500_count, sp400_count,
     )
 
     try:
@@ -179,9 +184,9 @@ def check_drift(
 
     # Strip macro/sector members and known-non-stock tickers from the
     # comparison surface — the universe-write set is
-    # `wikipedia ∩ ¬_SKIP_TICKERS ∩ ¬sector_etfs` per builders/backfill.py.
+    # `membership ∩ ¬_SKIP_TICKERS ∩ ¬sector_etfs` per builders/backfill.py.
     comparable_wiki = {
-        t for t in wikipedia_set
+        t for t in membership_set
         if t not in _SKIP_TICKERS and not _is_sector_etf(t)
     }
     comparable_arctic = {
@@ -233,7 +238,7 @@ def check_drift(
 
     result = {
         "status": status,
-        "wikipedia_count": len(wikipedia_set),
+        "membership_count": len(membership_set),
         "arctic_count": len(arctic_set),
         "missing_from_arctic": missing_from_arctic,
         "only_in_arctic": only_in_arctic,
@@ -353,7 +358,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument("--bucket", default="alpha-engine-research")
     parser.add_argument("--max-stragglers", type=int, default=0,
-                        help="Wikipedia tickers allowed missing from ArcticDB")
+                        help="index members allowed missing from ArcticDB")
     parser.add_argument("--no-alert", action="store_true",
                         help="diagnostic mode — no SNS/Telegram alert on drift")
     parser.add_argument(
@@ -403,7 +408,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if result["status"] == "drift_detected":
         logger.error(
-            "DRIFT DETECTED: %d Wikipedia tickers missing from ArcticDB "
+            "DRIFT DETECTED: %d index member(s) missing from ArcticDB "
             "(threshold=%d). Missing: %s",
             len(result["missing_from_arctic"]),
             result["max_stragglers"],
@@ -411,7 +416,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         return 1
 
-    logger.info("Drift check OK: arctic covers all Wikipedia-listed tickers")
+    logger.info("Drift check OK: arctic covers every listed index member")
     return 0
 
 
