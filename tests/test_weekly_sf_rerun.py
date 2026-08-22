@@ -1059,3 +1059,62 @@ class TestPredictorSkipFreshness:
             mod.check_predictor_skip_freshness(
                 s3, "2026-08-16", {"skip_predictor_training": True}
             )
+
+
+class TestCadenceDeclaredSkipsAreCarried:
+    """alpha-engine-config-I8153.
+
+    A skip the CADENCE declares for itself is not an operator's stray flag, and
+    dropping it made every mechanical rerun of a scheduled run silently
+    RE-ENABLE a stage the cadence has deliberately disabled. On 2026-08-22 that
+    meant `--start` would have launched the full parity family — a stage
+    alpha-engine-config-I7309 records as unable to finish in any budget — and
+    the only defence was reading a NOTE and hand-editing the emitted JSON.
+    """
+
+    def test_the_cadence_trigger_declares_skip_parity(self, mod):
+        """The loader reads the real CFN, not a fixture: if the declaration
+        moves or is renamed, this fails here rather than at 02:00 on a
+        Saturday."""
+        assert mod.cadence_declared_skips() == {"skip_parity": True}
+
+    def test_the_emitted_input_carries_it(self, mod):
+        plan = mod.derive_plan(_events("director_degraded"))
+        emitted = plan.rerun_input()
+        assert emitted.get("skip_parity") is True, (
+            "the rerun no longer carries the cadence's own skip_parity — a "
+            "recovery would run a stage the scheduled run does not"
+        )
+        assert "skip_parity" in plan.cadence_skips
+
+    def test_it_is_reported_apart_from_the_derived_set(self, mod):
+        """It is NOT derived from what the source execution completed, so it
+        must not read as if it were — the derived set is this script's product
+        and its provenance is the whole reason to trust it."""
+        plan = mod.derive_plan(_events("director_degraded"))
+        plan.rerun_input()
+        assert "skip_parity" not in plan.skip_flags
+        assert "skip_parity" not in plan.dropped_inherited_skips
+
+    def test_a_non_declared_inherited_flag_is_still_dropped(self, mod):
+        """I7259 is unchanged for ad-hoc flags — the new rule splits DECLARED
+        from AD-HOC, it does not re-open inheritance."""
+        plan = mod.derive_plan(_events("director_degraded"))
+        plan.original_input = dict(plan.original_input)
+        plan.original_input["skip_pit_parity_compare"] = True
+        emitted = plan.rerun_input()
+        assert "skip_pit_parity_compare" not in emitted
+        assert "skip_pit_parity_compare" in plan.dropped_inherited_skips
+
+    def test_an_unreadable_declaration_raises_rather_than_defaulting(self, mod, tmp_path):
+        """An empty cadence-skip set and an unreadable one are the same value
+        and opposite facts. Defaulting the second to the first re-enables every
+        stage the cadence disables, silently."""
+        missing = tmp_path / "nope.yaml"
+        with pytest.raises(mod.CadenceSkipsUnreadable):
+            mod.cadence_declared_skips(missing)
+
+        shapeless = tmp_path / "shapeless.yaml"
+        shapeless.write_text("Resources:\n  SomethingElse: {}\n")
+        with pytest.raises(mod.CadenceSkipsUnreadable):
+            mod.cadence_declared_skips(shapeless)
