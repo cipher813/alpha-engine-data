@@ -349,6 +349,385 @@ class TestVerdicts:
         assert f["verdict"] not in sos.DEFECT_VERDICTS
 
 
+# ---------------------------------------------------------------------------
+# I7392 — run-mode awareness: the `dry` verdict, same-cycle sibling
+# attribution, self-exclusion, alert suppression, and run_mode parsing.
+# ---------------------------------------------------------------------------
+
+
+class TestDryVerdict:
+    """The 2026-08-21 Friday shell run: ApplyShellRunDefaults guarantees zero
+    producer writes, by construction. A missing/stale key on that run is not
+    a defect — it is the dry-path contract working as designed.
+    """
+
+    def _one(self, template, head_map, run_mode, **kw):
+        decls = sos.declared_outputs([_row("a", template, "Backtester")], pipeline=PIPELINE)
+        kw.setdefault("execution_start", EXEC_START)
+        kw.setdefault("cycle_date", RUN_DATE)
+        return sos.evaluate(
+            decls, run_date=RUN_DATE, head=_head_from(head_map), run_mode=run_mode, **kw
+        )[0]
+
+    def test_missing_key_on_a_dry_run_is_dry_not_missing(self):
+        f = self._one("b/{date}.json", {}, sos.RUN_MODE_DRY)
+        assert f["verdict"] == sos.DRY
+        assert f["verdict"] != sos.MISSING
+        assert f["verdict"] not in sos.DEFECT_VERDICTS
+
+    def test_stale_key_on_a_dry_run_is_dry_not_stale(self):
+        f = self._one(
+            "b/{date}.json",
+            {f"b/{RUN_DATE}.json": EXEC_START - timedelta(days=5)},
+            sos.RUN_MODE_DRY,
+        )
+        assert f["verdict"] == sos.DRY
+        assert f["verdict"] != sos.STALE
+        assert f["verdict"] not in sos.DEFECT_VERDICTS
+
+    def test_missing_key_on_a_real_run_is_still_missing(self):
+        """The carve-out is scoped to run_mode=dry only — a real weekly or
+        exercise run with a genuinely missing artifact must still fail loud.
+        """
+        f = self._one("b/{date}.json", {}, "weekly")
+        assert f["verdict"] == sos.MISSING
+
+    def test_missing_key_with_unknown_run_mode_is_still_missing(self):
+        """Unknown run_mode must never be treated as license to go quiet —
+        same "fail toward asserting" rule as entered_stages=None."""
+        f = self._one("b/{date}.json", {}, None)
+        assert f["verdict"] == sos.MISSING
+
+    def test_a_key_actually_written_under_a_dry_run_still_reports_wrote(self):
+        """SignalsEnvelope/ChallengerShadow run for-real even under
+        shell_run=true — a key they DID write must still read WROTE, not be
+        swept into the dry downgrade."""
+        f = self._one(
+            "b/{date}.json",
+            {f"b/{RUN_DATE}.json": EXEC_START + timedelta(hours=1)},
+            sos.RUN_MODE_DRY,
+        )
+        assert f["verdict"] == sos.WROTE
+
+    def test_s3_error_on_a_dry_run_is_still_unmeasured_not_dry(self):
+        """Predicate 3 (analogous to I7392's sibling issue I7412's own
+        predicate 3): the dry path must still fail loud on a real defect. A
+        denied S3 read on a dry run is a harness fault, not evidence the
+        dry-path contract explains an absence."""
+        f = self._one(
+            "b/{date}.json", {f"b/{RUN_DATE}.json": "error:AccessDenied"}, sos.RUN_MODE_DRY
+        )
+        assert f["verdict"] == sos.UNMEASURED
+        assert f["verdict"] != sos.DRY
+
+
+class TestSiblingAttribution:
+    """I7392 item D: three artifacts on the 2026-08-21 run were flagged STALE
+    at 14min-1h old — written by the postclose pipeline for the SAME cycle,
+    minutes before this execution started. Anchored on cycle_date instead of
+    execution_start, that stops reading as a silent stage.
+    """
+
+    def _one(self, last_modified, cycle_date=RUN_DATE, run_mode=None):
+        decls = sos.declared_outputs([_row("a", "b/{date}.json", "Backtester")], pipeline=PIPELINE)
+        head = _head_from({f"b/{RUN_DATE}.json": last_modified})
+        return sos.evaluate(
+            decls, run_date=RUN_DATE, execution_start=EXEC_START, head=head,
+            cycle_date=cycle_date, run_mode=run_mode,
+        )[0]
+
+    def test_same_cycle_write_minutes_before_start_is_wrote_by_sibling(self):
+        f = self._one(EXEC_START - timedelta(minutes=14))
+        assert f["verdict"] == sos.WROTE_BY_SIBLING
+        assert f["verdict"] not in sos.DEFECT_VERDICTS
+        assert "cycle_date" in f["detail"]
+
+    def test_same_cycle_write_one_hour_before_start_is_wrote_by_sibling(self):
+        f = self._one(EXEC_START - timedelta(hours=1))
+        assert f["verdict"] == sos.WROTE_BY_SIBLING
+
+    def test_a_prior_cycle_write_is_still_stale(self):
+        """The regression guard: an object genuinely from an OLDER cycle
+        (last_modified's date != cycle_date) must not be laundered into
+        wrote_by_sibling just because it predates execution_start."""
+        f = self._one(EXEC_START - timedelta(days=87))
+        assert f["verdict"] == sos.STALE
+
+    def test_sibling_attribution_beats_the_dry_downgrade(self):
+        """A same-cycle sibling write explains the object regardless of THIS
+        run's own mode — it must not collapse into `dry` on a shell run."""
+        f = self._one(EXEC_START - timedelta(minutes=14), run_mode=sos.RUN_MODE_DRY)
+        assert f["verdict"] == sos.WROTE_BY_SIBLING
+
+
+class TestSelfExclusion:
+    """I7392 item C: the sweep's own verdict key is checked before it is
+    written, so asserting it against itself is a guaranteed false MISSING on
+    every run, forever — on real scheduled runs too, not only rehearsals.
+    """
+
+    def test_own_verdict_key_is_excluded_not_evaluated(self):
+        row = _row(
+            "stage_output_sweep_verdict",
+            sos.VERDICT_KEY_TEMPLATE.replace("{pipeline}", PIPELINE).replace(
+                "{run_date}", "{run_date}"
+            ),
+            "WeeklySubstrateHealthCheck",
+        )
+        decls = sos.declared_outputs([row], pipeline=PIPELINE)
+        findings = sos.evaluate(
+            decls, run_date=RUN_DATE, execution_start=EXEC_START, head=_head_from({}),
+            cycle_date=RUN_DATE, pipeline=PIPELINE, verdict_bucket=sos.DEFAULT_BUCKET,
+        )
+        assert findings == []
+
+    def test_a_different_pipelines_verdict_key_is_not_excluded(self):
+        """The exclusion is scoped to THIS pipeline's own verdict key —
+        another pipeline's verdict artifact is a real declared artifact."""
+        other_pipeline = "ne-preopen-trading-pipeline"
+        row = _row(
+            "other_verdict",
+            sos.VERDICT_KEY_TEMPLATE.replace("{pipeline}", other_pipeline).replace(
+                "{run_date}", "{run_date}"
+            ),
+            "SomeStage",
+        )
+        decls = sos.declared_outputs([row], pipeline=PIPELINE)
+        findings = sos.evaluate(
+            decls, run_date=RUN_DATE, execution_start=EXEC_START, head=_head_from({}),
+            cycle_date=RUN_DATE, pipeline=PIPELINE, verdict_bucket=sos.DEFAULT_BUCKET,
+        )
+        assert len(findings) == 1
+        assert findings[0]["verdict"] == sos.MISSING
+
+    def test_without_a_pipeline_argument_self_exclusion_is_a_no_op(self):
+        """Backward-compatible default: callers that do not pass `pipeline`
+        (e.g. call sites predating I7392) see the pre-existing behaviour."""
+        row = _row(
+            "stage_output_sweep_verdict",
+            sos.VERDICT_KEY_TEMPLATE.replace("{pipeline}", PIPELINE).replace(
+                "{run_date}", "{run_date}"
+            ),
+            "WeeklySubstrateHealthCheck",
+        )
+        decls = sos.declared_outputs([row], pipeline=PIPELINE)
+        findings = sos.evaluate(
+            decls, run_date=RUN_DATE, execution_start=EXEC_START, head=_head_from({}),
+            cycle_date=RUN_DATE,
+        )
+        assert len(findings) == 1
+        assert findings[0]["verdict"] == sos.MISSING
+
+
+class TestParseRunMode:
+    def test_shell_run_true_is_dry_regardless_of_pipeline_role(self):
+        notes: list[str] = []
+        mode = sos._parse_run_mode(
+            json.dumps({"shell_run": True, "pipeline_role": "shell-run", "skip_parity": True}),
+            notes=notes,
+        )
+        assert mode == sos.RUN_MODE_DRY
+        assert notes == []
+
+    def test_pipeline_role_used_when_shell_run_absent(self):
+        notes: list[str] = []
+        mode = sos._parse_run_mode(json.dumps({"pipeline_role": "weekly"}), notes=notes)
+        assert mode == "weekly"
+        assert notes == []
+
+    def test_pipeline_role_exercise(self):
+        notes: list[str] = []
+        mode = sos._parse_run_mode(json.dumps({"pipeline_role": "exercise"}), notes=notes)
+        assert mode == "exercise"
+
+    def test_shell_run_false_falls_back_to_pipeline_role(self):
+        notes: list[str] = []
+        mode = sos._parse_run_mode(
+            json.dumps({"shell_run": False, "pipeline_role": "weekly"}), notes=notes,
+        )
+        assert mode == "weekly"
+
+    def test_missing_input_degrades_to_none_with_a_note(self):
+        notes: list[str] = []
+        mode = sos._parse_run_mode(None, notes=notes)
+        assert mode is None
+        assert len(notes) == 1
+
+    def test_unparseable_json_degrades_to_none_with_a_note(self):
+        notes: list[str] = []
+        mode = sos._parse_run_mode("{not json", notes=notes)
+        assert mode is None
+        assert len(notes) == 1
+
+    def test_non_object_json_degrades_to_none_with_a_note(self):
+        notes: list[str] = []
+        mode = sos._parse_run_mode("[1, 2, 3]", notes=notes)
+        assert mode is None
+        assert len(notes) == 1
+
+    def test_neither_field_present_degrades_to_none_with_a_note(self):
+        notes: list[str] = []
+        mode = sos._parse_run_mode(json.dumps({"skip_parity": True}), notes=notes)
+        assert mode is None
+        assert len(notes) == 1
+
+
+class TestExecutionContextRunMode:
+    def test_shell_run_input_sets_dry_run_mode(self):
+        class _Sfn(_FakeSfn):
+            def describe_execution(self, executionArn):  # noqa: N803
+                return {
+                    "startDate": EXEC_START,
+                    "status": "FAILED",
+                    "input": json.dumps({"shell_run": True, "pipeline_role": "shell-run"}),
+                }
+
+        ctx = sos.read_execution_context("arn:x", sfn_client=_Sfn())
+        assert ctx.run_mode == sos.RUN_MODE_DRY
+
+    def test_weekly_input_sets_weekly_run_mode(self):
+        class _Sfn(_FakeSfn):
+            def describe_execution(self, executionArn):  # noqa: N803
+                return {
+                    "startDate": EXEC_START,
+                    "status": "SUCCEEDED",
+                    "input": json.dumps({"pipeline_role": "weekly"}),
+                }
+
+        ctx = sos.read_execution_context("arn:x", sfn_client=_Sfn())
+        assert ctx.run_mode == "weekly"
+
+
+class TestShouldAlert:
+    def _doc(self, **kw):
+        base = {"enforce": False, "run_mode": None}
+        base.update(kw)
+        return base
+
+    def test_observe_weekly_alerts(self):
+        assert sos._should_alert(self._doc(run_mode="weekly")) is True
+
+    def test_observe_dry_run_suppresses(self):
+        assert sos._should_alert(self._doc(run_mode=sos.RUN_MODE_DRY)) is False
+
+    def test_observe_exercise_suppresses(self):
+        assert sos._should_alert(self._doc(run_mode="exercise")) is False
+
+    def test_observe_unknown_run_mode_alerts(self):
+        """Fail toward alerting on an unresolved run_mode — same posture as
+        entered_stages=None and cycle_date=None elsewhere in this module."""
+        assert sos._should_alert(self._doc(run_mode=None)) is True
+
+    def test_enforce_mode_always_alerts_even_on_dry(self):
+        assert sos._should_alert(self._doc(enforce=True, run_mode=sos.RUN_MODE_DRY)) is True
+
+
+class TestEmitMetrics:
+    class _FakeCloudWatch:
+        def __init__(self):
+            self.calls = []
+
+        def put_metric_data(self, **kw):
+            self.calls.append(kw)
+
+    def test_emits_stage_output_defects_dimensioned_by_pipeline_and_run_mode(self):
+        cw = self._FakeCloudWatch()
+        document = {
+            "pipeline": PIPELINE, "run_mode": sos.RUN_MODE_DRY,
+            "defects": [{}, {}],
+        }
+        sos._emit_metrics(cw, document)
+        assert len(cw.calls) == 1
+        call = cw.calls[0]
+        assert call["Namespace"] == "AlphaEngine/Substrate"
+        datum = call["MetricData"][0]
+        assert datum["MetricName"] == "StageOutputDefects"
+        assert datum["Value"] == 2.0
+        dims = {d["Name"]: d["Value"] for d in datum["Dimensions"]}
+        assert dims == {"Pipeline": PIPELINE, "RunMode": sos.RUN_MODE_DRY}
+
+    def test_unknown_run_mode_dimensions_as_the_literal_string(self):
+        cw = self._FakeCloudWatch()
+        sos._emit_metrics(cw, {"pipeline": PIPELINE, "run_mode": None, "defects": []})
+        dims = {d["Name"]: d["Value"] for d in cw.calls[0]["MetricData"][0]["Dimensions"]}
+        assert dims["RunMode"] == "unknown"
+
+    def test_sweep_metric_emit_failure_does_not_lose_the_verdict(self, registry_file):
+        """Matches _publish_verdict's contract: a CW-emit fault must not sink
+        the sweep's primary deliverable (I7392 item E, freshness-monitor's
+        split-trap convention)."""
+        class _BoomCloudWatch:
+            def put_metric_data(self, **kw):
+                raise RuntimeError("cloudwatch down")
+
+        s3 = _FakeS3({f"good/{RUN_DATE}.json": EXEC_START + timedelta(hours=1)})
+        doc = sos.sweep(
+            run_date=RUN_DATE, cycle_date=RUN_DATE, execution_start=EXEC_START,
+            registry_path=registry_file, s3_client=s3, cloudwatch_client=_BoomCloudWatch(),
+            alert=False, emit_metrics=True,
+        )
+        assert doc["status"] == "stage_output_missing"
+
+    def test_emit_metrics_default_off_does_not_touch_boto3(self, registry_file, monkeypatch):
+        """sweep()'s default must not construct a real boto3 CloudWatch
+        client — every other test in this file relies on that, and a
+        default-on metric emit would silently start making live AWS calls."""
+        def _boom(*a, **kw):
+            raise AssertionError("boto3.client must not be called when emit_metrics=False")
+
+        import boto3
+
+        monkeypatch.setattr(boto3, "client", _boom)
+        s3 = _FakeS3({f"good/{RUN_DATE}.json": EXEC_START + timedelta(hours=1)})
+        doc = sos.sweep(
+            run_date=RUN_DATE, cycle_date=RUN_DATE, execution_start=EXEC_START,
+            registry_path=registry_file, s3_client=s3, alert=False,
+        )
+        assert doc["status"] == "stage_output_missing"
+
+
+class TestSweepRunModeIntegration:
+    """End-to-end: run_mode threaded from sweep()'s explicit argument through
+    to the published document and the alert-suppression decision."""
+
+    def test_dry_run_mode_downgrades_defects_and_suppresses_the_alert(
+        self, registry_file, monkeypatch
+    ):
+        alerted = []
+        monkeypatch.setattr(sos, "_alert", lambda doc: alerted.append(doc))
+        s3 = _FakeS3({f"good/{RUN_DATE}.json": EXEC_START + timedelta(hours=1)})
+        doc = sos.sweep(
+            run_date=RUN_DATE, cycle_date=RUN_DATE, execution_start=EXEC_START,
+            registry_path=registry_file, s3_client=s3, run_mode=sos.RUN_MODE_DRY,
+        )
+        assert doc["counts"].get(sos.DRY) == 1
+        assert doc["defects"] == []
+        assert doc["status"] == "ok"
+        assert alerted == []
+
+    def test_weekly_run_mode_still_alerts_on_a_real_defect(self, registry_file, monkeypatch):
+        alerted = []
+        monkeypatch.setattr(sos, "_alert", lambda doc: alerted.append(doc))
+        s3 = _FakeS3({f"good/{RUN_DATE}.json": EXEC_START + timedelta(hours=1)})
+        doc = sos.sweep(
+            run_date=RUN_DATE, cycle_date=RUN_DATE, execution_start=EXEC_START,
+            registry_path=registry_file, s3_client=s3, run_mode="weekly",
+        )
+        assert doc["status"] == "stage_output_missing"
+        assert len(alerted) == 1
+
+    def test_exercise_run_mode_publishes_but_does_not_alert(self, registry_file, monkeypatch):
+        alerted = []
+        monkeypatch.setattr(sos, "_alert", lambda doc: alerted.append(doc))
+        s3 = _FakeS3({f"good/{RUN_DATE}.json": EXEC_START + timedelta(hours=1)})
+        doc = sos.sweep(
+            run_date=RUN_DATE, cycle_date=RUN_DATE, execution_start=EXEC_START,
+            registry_path=registry_file, s3_client=s3, run_mode="exercise",
+        )
+        assert doc["status"] == "stage_output_missing"
+        assert alerted == []
+
+
 class TestEnteredStages:
     def test_stage_not_entered_is_skipped_when_the_set_is_known(self):
         decls = sos.declared_outputs([_row("a", "b/{date}.json", "Backtester")], pipeline=PIPELINE)
@@ -791,7 +1170,11 @@ class TestExecutionContext:
         )
         assert ctx.start == EXEC_START
         assert ctx.entered_stages == frozenset({"A", "B"})
-        assert ctx.notes == []
+        # _FakeSfn's describe_execution carries no 'input' field, so run_mode
+        # degrades to UNKNOWN with one context note — never to silence.
+        assert ctx.run_mode is None
+        assert len(ctx.notes) == 1
+        assert "run_mode is UNKNOWN" in ctx.notes[0]
 
     def test_paginates_the_history(self):
         """A four-hour weekly run's history runs to thousands of events; a
@@ -967,7 +1350,7 @@ class TestAlertBody:
             "pipeline": PIPELINE, "run_date": RUN_DATE, "enforce": False,
             "entered_stages_known": False,
             "defects": [{"stage": "ParityReplay", "artifact_id": "parity_report",
-                         "verdict": sos.STALE}],
+                         "verdict": sos.STALE, "severity": "critical"}],
             "unmeasured": [{"stage": "Backtester", "artifact_id": "x",
                             "verdict": sos.UNMEASURED}],
         })
@@ -975,7 +1358,47 @@ class TestAlertBody:
         assert "OBSERVE" in message
         assert "DEFECT" in message and "UNMEASURED" in message
         assert "NOT evidence of health" in message
+        assert "1 artifact(s) across 1 stage(s)" in message
+        # severity comes from the MAX finding severity ("critical" here), not
+        # from the defect COUNT — see the warning-only test below for the
+        # other polarity (I7392 item B).
         assert published["kw"]["severity"] == "error"
+
+    def test_many_warning_defects_alert_at_warn_not_error(self, monkeypatch):
+        """The regression this replaces: 82 warning-severity findings alone
+        used to force severity='error' purely from the defect COUNT. Now the
+        MAX finding severity decides — all-warning stays 'warn' regardless
+        of how many there are.
+        """
+        published = {}
+
+        class _Result:
+            any_ok = True
+
+        class _Alerts:
+            @staticmethod
+            def publish(message, **kw):
+                published["kw"] = kw
+                published["message"] = message
+                return _Result()
+
+        import sys as _sys
+
+        monkeypatch.setitem(_sys.modules, "nousergon_lib", type("M", (), {"alerts": _Alerts}))
+        monkeypatch.setitem(_sys.modules, "nousergon_lib.alerts", _Alerts)
+
+        sos._alert({
+            "pipeline": PIPELINE, "run_date": RUN_DATE, "enforce": False,
+            "entered_stages_known": True,
+            "defects": [
+                {"stage": f"Stage{i}", "artifact_id": f"a{i}",
+                 "verdict": sos.MISSING, "severity": "warning"}
+                for i in range(82)
+            ],
+            "unmeasured": [],
+        })
+        assert published["kw"]["severity"] == "warn"
+        assert "82 artifact(s) across 82 stage(s)" in published["message"]
 
     def test_unmeasured_only_alerts_at_warn_not_error(self, monkeypatch):
         published = {}

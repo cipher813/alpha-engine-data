@@ -72,6 +72,24 @@ always in the alarming direction. The verdict set keeps the two apart:
                   no stage is ever declared skipped, because "I don't know
                   which stages ran" must not become "the stage was allowed not
                   to run"
+  ``dry``         (alpha-engine-config-I7392) the stage entered but this
+                  execution ran under the dry-path contract (``shell_run``),
+                  which forbids every routed producer from writing. A
+                  would-be ``missing``/``stale`` verdict downgrades to
+                  ``dry`` here rather than being reported as either — counted
+                  in NEITHER ``defects`` NOR ``wrote``, exactly like
+                  ``skipped``/``unresolved``. Only reachable when the run's
+                  ``run_mode`` resolved to ``"dry"``; a stage that DID write
+                  under a dry run (an exempted producer — SignalsEnvelope,
+                  ChallengerShadow) still reports ``wrote``, because the key
+                  check happens before this downgrade
+  ``wrote_by_sibling``
+                  (I7392) the key exists, predates ``execution_start``, but
+                  its ``LastModified`` falls on this run's ``cycle_date`` —
+                  the signature of a same-cycle sibling pipeline (e.g. the
+                  postclose SF) writing the artifact minutes before this
+                  execution started, not of a silent stage. Not a defect;
+                  distinct from ``wrote`` so it stays visible in the counts
 
 ``unmeasured`` is deliberately NOT silent. Absence of a measurement is a
 first-class finding with its own exit code and its own alert, because the
@@ -161,11 +179,13 @@ UNRESOLVED_PRODUCER_STAGE = "UNRESOLVED"
 # Verdicts. Ordered worst-first for reporting; the ordering is not a severity
 # ladder used for suppression — every non-`wrote` verdict is reported.
 WROTE = "wrote"
+WROTE_BY_SIBLING = "wrote_by_sibling"
 STALE = "stale"
 MISSING = "missing"
 UNMEASURED = "unmeasured"
 UNRESOLVED = "unresolved"
 SKIPPED = "skipped"
+DRY = "dry"
 
 #: Verdicts that mean "this run has a data defect".
 DEFECT_VERDICTS = frozenset({MISSING, STALE})
@@ -173,6 +193,19 @@ DEFECT_VERDICTS = frozenset({MISSING, STALE})
 #: Verdicts that mean "the check could not answer". Never merged into
 #: :data:`DEFECT_VERDICTS` — see the module docstring.
 UNMEASURED_VERDICTS = frozenset({UNMEASURED})
+
+#: alpha-engine-config-I7392 — the ``run_mode`` discriminator meaning "this
+#: execution ran under the dry-path contract (``shell_run``), which forbids
+#: every routed producer from writing". Distinct from the ``dry`` VERDICT
+#: above: this is the run-level classification; that is the per-finding
+#: outcome it produces.
+RUN_MODE_DRY = "dry"
+
+#: The one run_mode that is a genuine, artifact-producing run. Any other
+#: resolved run_mode (``"exercise"``, ``RUN_MODE_DRY``) — or an unresolved one
+#: — suppresses the OBSERVE-mode alert per I7392 item B; verdict publish and
+#: the CloudWatch metric still happen regardless.
+RUN_MODE_WEEKLY = "weekly"
 
 _PLACEHOLDER_RE = re.compile(r"\{([a-z_]+)\}")
 
@@ -191,22 +224,77 @@ _ENTERED_EVENT_SUFFIX = "StateEntered"
 class ExecutionContext:
     """What the sweep could establish about the execution it is asserting over.
 
-    Both fields degrade INDEPENDENTLY and honestly. A denied
-    ``GetExecutionHistory`` must not take the start time down with it, and
-    neither failure may be reported as a fact about the pipeline.
+    All three fields degrade INDEPENDENTLY and honestly. A denied
+    ``GetExecutionHistory`` must not take the start time down with it, a
+    malformed ``input`` must not take either down with it, and no failure may
+    be reported as a fact about the pipeline.
     """
 
-    __slots__ = ("start", "entered_stages", "notes")
+    __slots__ = ("start", "entered_stages", "notes", "run_mode")
 
     def __init__(
         self,
         start: datetime | None = None,
         entered_stages: frozenset[str] | None = None,
         notes: list[str] | None = None,
+        run_mode: str | None = None,
     ) -> None:
         self.start = start
         self.entered_stages = entered_stages
         self.notes = notes or []
+        self.run_mode = run_mode
+
+
+def _parse_run_mode(raw_input: Any, *, notes: list[str]) -> str | None:
+    """Classify an execution's ``run_mode`` from its ``describe_execution``
+    ``input`` (alpha-engine-config-I7392).
+
+    ``shell_run: true`` is the sole gate ``CheckShellRun``
+    (``nousergon-data/infrastructure/step_function.json``) tests before
+    routing to ``ApplyShellRunDefaults``, which threads ``--preflight-only``
+    into every spot stage and ``dry_run``/``research_dry`` into every
+    LLM/Lambda stage — so ``shell_run=true`` is treated as authoritative over
+    whatever ``pipeline_role`` says. Absent that, ``pipeline_role`` (e.g.
+    ``"weekly"``, ``"exercise"``) is reported as-is.
+
+    Returns ``None`` — never a guess — when ``input`` is missing, not a
+    string, or not parseable JSON, or when neither field is present. The
+    caller renders ``None`` as "degrade to today's behaviour", which for
+    finding classification means no ``missing``/``stale`` verdict is ever
+    downgraded to ``dry``, and for alerting means the OBSERVE-mode
+    non-weekly suppression in ``_should_alert`` never fires on a guess.
+    """
+    if not isinstance(raw_input, str):
+        notes.append(
+            "describe_execution returned no usable 'input' — run_mode is "
+            "UNKNOWN, degrading to today's behaviour (no dry-verdict "
+            "downgrade, no alert suppression)"
+        )
+        return None
+    try:
+        payload = json.loads(raw_input)
+    except Exception as exc:  # noqa: BLE001
+        notes.append(
+            f"execution input is not parseable JSON ({type(exc).__name__}: "
+            f"{exc}) — run_mode is UNKNOWN, degrading to today's behaviour"
+        )
+        return None
+    if not isinstance(payload, dict):
+        notes.append(
+            "execution input parsed but is not a JSON object — run_mode is "
+            "UNKNOWN, degrading to today's behaviour"
+        )
+        return None
+    if payload.get("shell_run") is True:
+        return RUN_MODE_DRY
+    role = payload.get("pipeline_role")
+    if isinstance(role, str) and role:
+        return role
+    notes.append(
+        "execution input carries neither shell_run=true nor a usable "
+        "pipeline_role — run_mode is UNKNOWN, degrading to today's behaviour"
+    )
+    return None
 
 
 def read_execution_context(
@@ -254,10 +342,12 @@ def read_execution_context(
             context.start = _utc(start)
         else:
             context.notes.append("describe_execution returned no usable startDate")
+        context.run_mode = _parse_run_mode(described.get("input"), notes=context.notes)
     except Exception as exc:  # noqa: BLE001
         context.notes.append(
             f"describe_execution failed ({type(exc).__name__}: {exc}) — staleness "
-            f"is undecidable for this run"
+            f"is undecidable for this run, and run_mode is UNKNOWN (degrading to "
+            f"today's behaviour — never to silence)"
         )
 
     try:
@@ -500,6 +590,9 @@ def evaluate(
     head: Callable[[str, str], tuple[str, Any]],
     entered_stages: frozenset[str] | None = None,
     cycle_date: str | None = None,
+    run_mode: str | None = None,
+    pipeline: str | None = None,
+    verdict_bucket: str = DEFAULT_BUCKET,
 ) -> list[dict]:
     """Assign a verdict to every declared (stage, artifact) pair.
 
@@ -519,7 +612,23 @@ def evaluate(
             stage absent from it is ``skipped`` (a degraded run legitimately
             skips stages, and a detector that cries wolf on those is a detector
             that gets turned off).
+        run_mode: (I7392) ``RUN_MODE_DRY`` when this execution ran under the
+            dry-path contract. Only then does a would-be ``missing``/``stale``
+            verdict downgrade to ``dry``. ``None`` (unknown) never downgrades
+            — see the module docstring's ``dry`` verdict entry.
+        pipeline, verdict_bucket: (I7392) when both are supplied, a
+            declaration whose resolved key equals THIS sweep's own verdict
+            key (``VERDICT_KEY_TEMPLATE`` for this ``pipeline``/``run_date``
+            in ``verdict_bucket``) is excluded entirely rather than evaluated
+            — the sweep checks its declared artifacts before writing its own
+            verdict, so that key is guaranteed ``missing`` on every run,
+            forever, and is not a finding about the pipeline.
     """
+    self_key = (
+        VERDICT_KEY_TEMPLATE.format(pipeline=pipeline, run_date=run_date)
+        if pipeline
+        else None
+    )
     findings: list[dict] = []
     for declaration in declarations:
         stage = declaration["stage"]
@@ -563,14 +672,35 @@ def evaluate(
             continue
 
         finding["key"] = key
+
+        # I7392 self-exclusion: this sweep's own verdict key is checked
+        # BEFORE it is written (evaluate() runs, then _publish_verdict()), so
+        # asserting it here is a guaranteed false MISSING on every run,
+        # scheduled or rehearsal alike. Excluded rather than evaluated —
+        # never appears in findings at all.
+        if (
+            self_key is not None
+            and declaration["bucket"] == verdict_bucket
+            and key == self_key
+        ):
+            continue
+
         state, detail = head(declaration["bucket"], key)
 
         if state == "error":
             finding["verdict"] = UNMEASURED
             finding["detail"] = f"S3 head_object could not answer: {detail}"
         elif state == "absent":
-            finding["verdict"] = MISSING
-            finding["detail"] = "no object at the declared key"
+            if run_mode == RUN_MODE_DRY:
+                finding["verdict"] = DRY
+                finding["detail"] = (
+                    "no object at the declared key, but this execution ran "
+                    "under the dry-path contract (shell_run=true), which "
+                    "forbids the declaring stage from writing — not a defect"
+                )
+            else:
+                finding["verdict"] = MISSING
+                finding["detail"] = "no object at the declared key"
         else:
             last_modified = _utc(detail) if isinstance(detail, datetime) else None
             finding["last_modified"] = (
@@ -591,6 +721,31 @@ def evaluate(
                 )
             elif last_modified >= execution_start:
                 finding["verdict"] = WROTE
+            elif cycle_date and last_modified.date().isoformat() == cycle_date:
+                # I7392 same-cycle sibling attribution: the object predates
+                # THIS execution but was written on the same cycle_date — the
+                # signature of a sibling pipeline (e.g. postclose) writing the
+                # artifact for the same cycle shortly before this execution
+                # started, not of a silent stage. Checked before the `dry`
+                # downgrade below: a sibling-written object explains itself
+                # regardless of this run's own mode.
+                age = execution_start - last_modified
+                finding["verdict"] = WROTE_BY_SIBLING
+                finding["detail"] = (
+                    f"object predates this execution by {age.days}d "
+                    f"{age.seconds // 3600}h{age.seconds % 3600 // 60}m but was "
+                    f"written on this run's cycle_date={cycle_date} — attributed "
+                    f"to a same-cycle sibling pipeline, not a silent stage"
+                )
+            elif run_mode == RUN_MODE_DRY:
+                age = execution_start - last_modified
+                finding["verdict"] = DRY
+                finding["detail"] = (
+                    f"object predates this execution by {age.days}d "
+                    f"{age.seconds // 3600}h and this execution ran under the "
+                    f"dry-path contract (shell_run=true), which forbids the "
+                    f"declaring stage from writing — not a defect"
+                )
             else:
                 age = execution_start - last_modified
                 finding["verdict"] = STALE
@@ -638,9 +793,12 @@ def sweep(
     execution_arn: str | None = None,
     sfn_client: Any = None,
     cycle_date: str | None = None,
+    run_mode: str | None = None,
+    cloudwatch_client: Any = None,
     alert: bool = True,
     publish: bool = True,
     enforce: bool = False,
+    emit_metrics: bool = False,
 ) -> dict:
     """Assert every artifact this pipeline's stages declare was written by this
     run. Returns the full verdict document; never raises for a finding.
@@ -657,6 +815,8 @@ def sweep(
             execution_start = context.start
         if entered_stages is None:
             entered_stages = context.entered_stages
+        if run_mode is None:
+            run_mode = context.run_mode
         for note in context_notes:
             logger.warning("Execution context degraded: %s", note)
 
@@ -672,6 +832,7 @@ def sweep(
             "pipeline": pipeline,
             "run_date": run_date,
             "enforce": enforce,
+            "run_mode": run_mode,
             "error": str(exc),
             "checked": 0,
             "counts": {},
@@ -693,6 +854,9 @@ def sweep(
         head=lambda b, k: _head(s3_client, b, k),
         entered_stages=entered_stages,
         cycle_date=cycle_date,
+        run_mode=run_mode,
+        pipeline=pipeline,
+        verdict_bucket=bucket,
     )
     summary = summarise(findings)
 
@@ -703,6 +867,7 @@ def sweep(
         "run_date": run_date,
         "cycle_date": cycle_date,
         "enforce": enforce,
+        "run_mode": run_mode,
         "execution_start": (
             execution_start.isoformat() if execution_start else None
         ),
@@ -721,16 +886,89 @@ def sweep(
     }
 
     logger.info(
-        "Stage-output sweep pipeline=%s run_date=%s enforce=%s: %s",
-        pipeline, run_date, enforce, summary["counts"],
+        "Stage-output sweep pipeline=%s run_date=%s enforce=%s run_mode=%s: %s",
+        pipeline, run_date, enforce, run_mode, summary["counts"],
     )
 
     if publish:
         _publish_verdict(s3_client, bucket, document)
-    if alert and summary["status"] != "ok":
+
+    # I7392 item E — best-effort, independently trapped (matches
+    # freshness-monitor's split-trap convention): a PutMetricData grant
+    # regression must never suppress the verdict artifact already written
+    # above, and a metric-emit failure must never be reported as a sweep
+    # finding.
+    if emit_metrics:
+        try:
+            _emit_metrics(cloudwatch_client, document)
+        except Exception as exc:  # noqa: BLE001 — secondary observability
+            logger.warning(
+                "Stage-output CW metric emit failed (non-fatal): %s", exc,
+                exc_info=True,
+            )
+
+    if alert and summary["status"] != "ok" and _should_alert(document):
         _alert(document)
+    elif alert and summary["status"] != "ok":
+        logger.info(
+            "Stage-output alert SUPPRESSED: OBSERVE mode, run_mode=%s is not "
+            "%r — findings are still in the published verdict artifact "
+            "(alpha-engine-config-I7392)",
+            run_mode, RUN_MODE_WEEKLY,
+        )
 
     return document
+
+
+def _should_alert(document: dict) -> bool:
+    """I7392 item B: OBSERVE mode on a non-weekly run_mode publishes the
+    verdict artifact and the metric, but nothing to the alert bus.
+
+    ENFORCE mode always alerts on a finding — enforcement failing a run
+    silently, with no alert explaining why, would be worse than the noise
+    this suppresses. An UNKNOWN run_mode (``None``) never suppresses either:
+    failing toward alerting matches every other honest-degradation rule in
+    this module (entered_stages, cycle_date) — "I don't know the run_mode"
+    must not become "assume it's safe to stay quiet".
+    """
+    if document.get("enforce"):
+        return True
+    run_mode = document.get("run_mode")
+    if run_mode is None:
+        return True
+    return run_mode == RUN_MODE_WEEKLY
+
+
+def _emit_metrics(cloudwatch_client: Any, document: dict) -> None:
+    """I7392 item E: ``StageOutputDefects`` in ``AlphaEngine/Substrate``,
+    dimensioned by Pipeline + RunMode (both bounded-cardinality — never the
+    high-cardinality run id/date, per observability-policy §4).
+
+    ``alpha-engine-dashboard-role`` already carries
+    ``cloudwatch:PutMetricData`` scoped to the ``AlphaEngine``/``AlphaEngine/*``
+    namespace condition (policy ``alpha-engine-cloudwatch-metrics``, measured
+    2026-08-21) — this needs no new IAM grant.
+    """
+    if cloudwatch_client is None:
+        import boto3  # noqa: PLC0415
+
+        cloudwatch_client = boto3.client("cloudwatch")
+
+    run_mode = document.get("run_mode") or "unknown"
+    cloudwatch_client.put_metric_data(
+        Namespace="AlphaEngine/Substrate",
+        MetricData=[
+            {
+                "MetricName": "StageOutputDefects",
+                "Dimensions": [
+                    {"Name": "Pipeline", "Value": document["pipeline"]},
+                    {"Name": "RunMode", "Value": run_mode},
+                ],
+                "Value": float(len(document["defects"])),
+                "Unit": "Count",
+            }
+        ],
+    )
 
 
 def _publish_verdict(s3_client: Any, bucket: str, document: dict) -> None:
@@ -788,11 +1026,16 @@ def _alert(document: dict) -> None:
     defects = document["defects"]
     unmeasured = document["unmeasured"]
     mode = "ENFORCE" if document["enforce"] else "OBSERVE (exit 0 by design)"
+    # I7392 item B: 97 was ARTIFACTS across 18 STAGES, not 97 stages — the
+    # prior "{n} stage(s)" wording overstated the finding 5.4x on the
+    # 2026-08-21 run. Report both numbers explicitly.
+    defect_stage_count = len({f["stage"] for f in defects})
 
     parts = [
         f"Stage-output sweep [{mode}] {document['pipeline']} "
         f"run_date={document['run_date']}: "
-        f"{len(defects)} stage(s) produced NO output for this run, "
+        f"{len(defects)} artifact(s) across {defect_stage_count} stage(s) "
+        f"produced NO output for this run, "
         f"{len(unmeasured)} could NOT be measured."
     ]
     if defects:
@@ -809,9 +1052,17 @@ def _alert(document: dict) -> None:
         )
     parts.append(f"Full verdict: s3://alpha-engine-research/"
                  f"{VERDICT_KEY_TEMPLATE.format(**{k: document[k] for k in ('pipeline', 'run_date')})}"
-                 " (alpha-engine-config-I7167).")
+                 " (alpha-engine-config-I7167, I7392).")
 
-    severity = "error" if defects else "warn"
+    # I7392 item B: severity from the MAX finding severity, not the defect
+    # COUNT — 82 warning-severity findings alone used to force "error" on the
+    # 2026-08-21 run. "critical" (registry row severity) maps to alert
+    # severity "error"; any other defect (or none) maps to "warn".
+    severity = (
+        "error"
+        if any(f.get("severity") == "critical" for f in defects)
+        else "warn"
+    )
     try:
         result = alerts.publish(
             " ".join(parts),
@@ -884,6 +1135,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--no-alert", action="store_true")
     parser.add_argument("--no-publish", action="store_true",
                         help="skip writing the verdict artifact")
+    parser.add_argument(
+        "--no-metrics", action="store_true",
+        help="skip emitting the StageOutputDefects CloudWatch metric "
+             "(AlphaEngine/Substrate, alpha-engine-config-I7392)",
+    )
+    parser.add_argument(
+        "--run-mode", default=None,
+        help="override the run_mode classification (RUN_MODE_DRY='dry', "
+             "'weekly', 'exercise', ...). Normally derived from "
+             "--execution-arn's describe_execution input "
+             "(alpha-engine-config-I7392); an explicit value wins over that "
+             "read, same precedence as --execution-start",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -915,9 +1179,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         registry_path=args.registry,
         execution_arn=args.execution_arn,
         cycle_date=args.cycle_date,
+        run_mode=args.run_mode,
         alert=not args.no_alert,
         publish=not args.no_publish,
         enforce=args.enforce,
+        emit_metrics=not args.no_metrics,
     )
 
     code = exit_code(document)
