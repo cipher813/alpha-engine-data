@@ -584,6 +584,21 @@ def orig_spot_cmds() -> dict:
       stage of the weekly pipeline was broken between the two merges.
       Tracked SOTA close: alpha-engine-config-I7383.
 
+    - **Regenerated 2026-08-22** (alpha-engine-config-I8155): every
+      coverage-asserting spot state now exports `EXECUTION_RUN_DATE` from
+      `$.run_date` alongside its existing exports (immediately after
+      `export RUN_DATE=...` on the 9 crucible-backtester-family keys here,
+      after `export HOME=...` on MorningEnrich/DataPhase1/DataPhase2/
+      RAGIngestion which have no `RUN_DATE` export at all). A deliberate,
+      reviewed absent-path change confined to the new export line — fixes
+      the 2026-08-22 weekly run where `krepis.stage_coverage` verdicts split
+      across an empty run_date (the 4 shell-launcher stages, which never
+      received `RUN_DATE`) and the trading-day run_date (the 9 backtester
+      stages, whose `RUN_DATE` is reassigned by
+      crucible-backtester's `infrastructure/_spot_common.sh`).
+      `EXECUTION_RUN_DATE` is a NEW carrier for exactly that reason: it is
+      never normalized by anything downstream.
+
     Regenerate ONLY on a deliberate, reviewed change to a spot state's
     absent-path (`preflight_args=""`) command, by re-extracting the
     resolved spot commands from the new `origin/main` SF.
