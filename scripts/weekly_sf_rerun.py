@@ -8,8 +8,15 @@ Derives, from a FAILED ``ne-weekly-freshness-pipeline`` execution, the exact
   output — a fresh manual rerun without an explicit run_date gets a NEW date
   stamped from Execution.StartTime and writes to different artifact prefixes,
   orphaning the prior partial run);
-- the derived ``skip_*`` flag set for every stage the failed execution
-  completed CLEANLY (re-running a succeeded side-effecting stage duplicates
+- the derived ``skip_*`` flag set for every stage the recovery CHAIN
+  completed CLEANLY — the scheduled run plus every prior
+  ``watch-rerun-<run_date>-N``, resolved LATEST-ATTEMPT-WINS
+  (alpha-engine-config-I8161: deriving from the latest failed execution alone
+  means deriving from the last RERUN, whose history contains only the stages
+  it did not skip, so each successive recovery lost more of the original
+  run's progress). Read from execution HISTORIES, never from a previous
+  input's flags, which is what keeps it immune to
+  alpha-engine-config-I7259 (re-running a succeeded side-effecting stage duplicates
   its effects — 2026-07-11: duplicate model-zoo promotion emails,
   config#2252). A stage that DEGRADED — ran, failed, and was absorbed by a
   ``Publish*Degraded`` route so the pipeline could continue (alpha-engine-
@@ -95,7 +102,7 @@ import json
 import re
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 # sys.path insertion (not a package import) so this resolves identically
@@ -678,6 +685,210 @@ BACKTESTER_OVERSHADOWED = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Spot-dispatch necessity — which stages actually need the weekly box
+# (alpha-engine-config-I8162)
+# ---------------------------------------------------------------------------
+# Every recovery used to boot a spot instance unconditionally: CheckSpotDispatchNeeded
+# asked only "is $.ec2_instance_id already present?", so a rerun whose derived skip
+# set left no box stage standing still spent ~4 minutes in
+# DispatchWeeklyFreshnessSpot -> WaitForWeeklyFreshnessSpotBootstrap booting a box
+# nothing used (measured on watch-rerun-2026-08-22-1). Recovery is exactly when the
+# skip set is largest, so the most-often-unnecessary stage was the one that always ran.
+#
+# The predicate the SF now carries is DERIVED here rather than hand-listed there, and
+# tests/test_weekly_sf_rerun.py pins the two against each other. Hand-listing would
+# drift in the asymmetric direction: a stage that needs the box behind a flag the SF
+# thinks covers it FAILS the run, where an unnecessary boot only costs four minutes.
+#
+# Nothing below is a literal list of box stages. The box states are found by their
+# reference to $.ec2_instance_id in the live definition; ownership by a skip flag is
+# established by REACHABILITY — a flag owns a box state when setting that flag (and
+# nothing else) makes the state unreachable.
+
+SPOT_DISPATCH_GATE = "CheckSpotDispatchNeeded"
+# The state every path through the dispatch gate converges on: the IsPresent
+# passthrough (via NormalizeEc2InstanceId), the fresh-boot path (via
+# RouteAfterBootstrapSuccess), and the new no-box-stage bypass. Reachability is
+# measured from HERE so the boot machinery's own $.ec2_instance_id references
+# (WaitForWeeklyFreshnessSpotBootstrap et al.) are structurally excluded: they are
+# how the box is acquired, never a reason to acquire it.
+SPOT_DISPATCH_CONVERGENCE = "CheckShellRun"
+
+
+def _flat_states(sm_def: dict) -> dict:
+    """Every state in the definition by name, Parallel branches and Map
+    iterators flattened in (state names are unique across the definition)."""
+    return dict(_walk_states(sm_def.get("States", {})))
+
+
+def _rule_skip_flag(rule: dict) -> str | None:
+    """The single ``skip_*`` key a Choice rule tests, or None if the rule
+    tests anything else (or more than one thing)."""
+    flags = set()
+    other = False
+
+    def rec(node):
+        nonlocal other
+        if not isinstance(node, dict):
+            return
+        var = node.get("Variable")
+        if isinstance(var, str) and var.startswith("$.skip_"):
+            flags.add(var.removeprefix("$."))
+        elif var is not None:
+            other = True
+        for key in ("And", "Or"):
+            for sub in node.get(key, []) or []:
+                rec(sub)
+        if "Not" in node:
+            rec(node["Not"])
+
+    rec(rule)
+    if other or len(flags) != 1:
+        return None
+    return flags.pop()
+
+
+def _reachable_from(sm_def: dict, start: str, flags: dict) -> set:
+    """States reachable from ``start`` when the ``skip_*`` keys in ``flags``
+    are true on the execution input.
+
+    A three-valued walk: a Choice rule testing a flag in ``flags`` is taken
+    definitively (and its Default becomes unreachable); every other branch is
+    UNKNOWN and both arms are followed. Unknown-as-both makes the result an
+    over-approximation of what runs, which is the safe direction for the one
+    question this answers — "could any state that needs the box still run?"
+    An over-approximation can only make the pipeline boot a box it did not
+    need; an under-approximation would deny one a stage then SSM-invokes onto.
+
+    Catch/Retry targets are followed too: a box state reached only from a
+    failure route still needs a box.
+    """
+    states = _flat_states(sm_def)
+    seen: set = set()
+    stack = [start]
+    while stack:
+        name = stack.pop()
+        if name in seen or name not in states:
+            continue
+        seen.add(name)
+        state = states[name]
+        nxt: set = set()
+        if state.get("Type") == "Choice":
+            for rule in state.get("Choices", []):
+                flag = _rule_skip_flag(rule)
+                if flag is not None and flags.get(flag) is True:
+                    nxt.add(rule["Next"])
+                    break          # this rule matches; Default is unreachable
+                if flag is not None and flag in flags:
+                    continue       # known false — this arm cannot be taken
+                nxt.add(rule["Next"])
+            else:
+                if "Default" in state:
+                    nxt.add(state["Default"])
+        else:
+            if "Next" in state:
+                nxt.add(state["Next"])
+        for catch in state.get("Catch", []) or []:
+            if "Next" in catch:
+                nxt.add(catch["Next"])
+        if state.get("Type") == "Parallel":
+            for branch in state.get("Branches", []):
+                if branch.get("StartAt"):
+                    nxt.add(branch["StartAt"])
+        if state.get("Type") == "Map":
+            it = state.get("Iterator") or state.get("ItemProcessor") or {}
+            if it.get("StartAt"):
+                nxt.add(it["StartAt"])
+        stack.extend(nxt)
+    return seen
+
+
+def _states_referencing_instance(sm_def: dict) -> set:
+    """Every state whose own body dereferences ``$.ec2_instance_id`` — the
+    SSM sendCommand / getCommandInvocation pairs and the Lambda payloads that
+    address the box. Read from the definition, never listed."""
+    # Comment is prose; Branches/Iterator/ItemProcessor hold OTHER states, whose
+    # references belong to them and are counted when the walk reaches them —
+    # folding a container's children into the container would make every Parallel
+    # a box state and no skip flag could ever clear it.
+    nested = {"Comment", "Branches", "Iterator", "ItemProcessor"}
+    out = set()
+    for name, state in _flat_states(sm_def).items():
+        body = json.dumps({k: v for k, v in state.items() if k not in nested})
+        if "ec2_instance_id" in body:
+            out.add(name)
+    return out
+
+
+def box_states_needing_dispatch(sm_def: dict, flags: dict | None = None) -> set:
+    """Box-addressing states still reachable past the dispatch gate under
+    ``flags``. Empty => this execution has no use for a spot instance."""
+    reachable = _reachable_from(sm_def, SPOT_DISPATCH_CONVERGENCE, flags or {})
+    return _states_referencing_instance(sm_def) & reachable
+
+
+def box_dispatch_flags(sm_def: dict) -> tuple:
+    """The ``skip_*`` conjunction under which no box-addressing state can run.
+
+    Derived from the definition, never listed. ``STAGES`` supplies the flag
+    universe — it is already pinned against ``infrastructure/step_function.json``
+    by ``tests/test_weekly_sf_rerun.py`` — and the definition decides which of
+    those flags the conjunction needs:
+
+    1. START from every stage flag and PROVE the conjunction sound: with all of
+       them true, no box-addressing state may remain reachable. It raises if one
+       does, because a box stage behind no skip flag must fail the build here
+       rather than be denied a boot it then SSM-invokes onto.
+    2. MINIMISE finest-to-coarsest: drop a flag when the ones that remain still
+       leave zero box states reachable. Every drop is PROVEN redundant by
+       re-running the reachability check, so the surviving conjunction is exactly
+       as strong as the full one — it just spells the condition in the coarse
+       flags a recovery plan actually emits (``skip_backtester`` rather than
+       ``skip_backtester_stage_only`` plus the four parity branch flags).
+
+    Reachability, not topology reading, is what establishes ownership; and
+    because the walk over-approximates (§``_reachable_from``), every flag this
+    returns is genuinely load-bearing for the bypass.
+    """
+    kept = list(dict.fromkeys(s.flag for s in STAGES))
+    uncovered = box_states_needing_dispatch(sm_def, {f: True for f in kept})
+    if uncovered:
+        raise SystemExit(
+            f"FATAL: box-addressing state(s) {sorted(uncovered)} are reachable "
+            f"even with EVERY stage skip flag set — they belong to no skippable "
+            "stage, so CheckSpotDispatchNeeded cannot be given a sound bypass "
+            "predicate. Add the stage's CheckSkip* gate (and its STAGES row) "
+            "before extending the gate."
+        )
+    for flag in reversed(list(kept)):
+        trial = [f for f in kept if f != flag]
+        if not box_states_needing_dispatch(sm_def, {f: True for f in trial}):
+            kept = trial
+    return tuple(kept)
+
+
+def spot_dispatch_bypass_rule(sm_def: dict) -> dict:
+    """The Choice rule ``CheckSpotDispatchNeeded`` carries for the bypass:
+    every box stage skipped => route straight to the convergence, booting
+    nothing. Each conjunct is the repo's canonical
+    ``And[IsPresent, BooleanEquals]`` pair (tests/test_sf_choice_guards.py:
+    an unguarded absent path is a States.Runtime that bypasses the failure
+    normalizers)."""
+    return {
+        "And": [
+            {
+                "And": [
+                    {"Variable": f"$.{flag}", "IsPresent": True},
+                    {"Variable": f"$.{flag}", "BooleanEquals": True},
+                ]
+            }
+            for flag in box_dispatch_flags(sm_def)
+        ],
+        "Next": SPOT_DISPATCH_CONVERGENCE,
+    }
+
+
 class CadenceSkipsUnreadable(RuntimeError):
     """The cadence trigger's declared input could not be read.
 
@@ -749,6 +960,14 @@ class RerunPlan:
     # skip_* keys the CADENCE trigger declares for itself, re-applied by
     # rerun_input() and reported separately from the derived set.
     cadence_skips: list = field(default_factory=list)
+
+    # The recovery CHAIN this plan was derived from, oldest first, source last
+    # (alpha-engine-config-I8161) — and, per stage, WHICH of those executions
+    # witnessed the surviving verdict. Auditability is the property that makes
+    # a derived skip set trustworthy at all: a skip whose evidence cannot be
+    # named is indistinguishable from an inherited flag.
+    chain: list = field(default_factory=list)
+    witnessed_by: dict = field(default_factory=dict)
 
     def rerun_input(self) -> dict:
         """The emitted StartExecution input.
@@ -871,13 +1090,18 @@ def _simulate_reachable_works(flags: dict, original_input: dict) -> set:
     return ran
 
 
-def derive_plan(events: list[dict], start_time: datetime | None = None) -> RerunPlan:
-    entered = entered_states(events)
-    original_input = execution_input(events)
-    run_date, provenance = derive_run_date(events, start_time)
-    plan = RerunPlan(run_date=run_date, run_date_provenance=provenance,
-                     original_input=original_input)
+def classify_stages(entered: set) -> dict:
+    """One execution's verdict per stage: ``"degraded"`` | ``"completed"`` |
+    ``"failed"``. A stage the execution never attempted is ABSENT from the
+    result — "not observed here" and "did not complete" are different facts,
+    and collapsing them is what made a chained recovery lose the original
+    run's progress (alpha-engine-config-I8161).
 
+    Reads only the set of states an execution ENTERED. It never reads an
+    execution's ``skip_*`` input, which is what keeps the chain derivation
+    immune to alpha-engine-config-I7259's flag-propagation trap.
+    """
+    out: dict = {}
     for stage in STAGES:
         if entered & stage.degraded_witness:
             # Ran, failed, absorbed fail-open (Publish*Degraded route): the
@@ -885,21 +1109,98 @@ def derive_plan(events: list[dict], start_time: datetime | None = None) -> Rerun
             # continuing past a degradation is NOT evidence of completion
             # (I6055: the 2026-08-01 Director hard-fail recorded as
             # "post_eval complete", then skipped by the next rerun).
-            plan.degraded.append(stage.name)
-            plan.notes.append(
-                f"{stage.name}: DEGRADED (entered "
-                f"{sorted(entered & stage.degraded_witness)}) — NOT skipped; "
-                "the rerun re-runs it to retry the absorbed failure"
-            )
+            out[stage.name] = "degraded"
         elif entered & stage.witness:
+            out[stage.name] = "completed"
+        elif stage.detect_failure and (
+            stage.work in entered or (entered & stage.historical_work)
+        ):
+            out[stage.name] = "failed"
+    return out
+
+
+def resolve_chain(links: list) -> tuple:
+    """Fold a recovery CHAIN into one verdict per stage, latest attempt wins.
+
+    ``links`` is ``[(label, entered_states), ...]`` in CHRONOLOGICAL order,
+    the source execution last. Returns ``(outcome_by_stage, witness_by_stage)``
+    where the witness names the execution whose history established the
+    surviving verdict.
+
+    alpha-engine-config-I8161. ``weekly_sf_rerun.py`` defaults to the LATEST
+    failed execution, which after one recovery is the RERUN — and a rerun's
+    history contains only the stages it did not skip, so everything the
+    ORIGINAL run completed reads as not-completed. Measured 2026-08-22:
+    ``skip_backtester``, ``skip_predictor_backtest`` and
+    ``skip_portfolio_optimizer_backtest`` moved from *derived skips* (deriving
+    from the scheduled run) to *dropped skips* (deriving from
+    ``watch-rerun-2026-08-22-1``), so a second recovery would have re-run the
+    whole backtester family — hours of spot compute — for stages that had
+    completed cleanly four hours earlier. Each successive recovery lost more of
+    the original run's progress, inverting the point of the helper.
+
+    The completed set is a property of the ``run_date``, not of one execution.
+    LATEST-ATTEMPT-WINS is the resolution rule and it cuts both ways: a stage
+    that completed in run 1 and failed in run 3 must re-run; a stage that
+    completed in run 1 and was never attempted again stays completed.
+
+    This is evidence-based and therefore immune to alpha-engine-config-I7259:
+    it reads execution HISTORIES, never a previous input's flags. Inheriting
+    ``skip_*`` keys propagates a hand-added flag forever; witnessing a state
+    entry cannot, because a flag nobody's execution acted on leaves no trace in
+    any history.
+    """
+    outcome: dict = {}
+    witness: dict = {}
+    for label, entered in links:
+        for name, verdict in classify_stages(entered).items():
+            outcome[name] = verdict
+            witness[name] = label
+    return outcome, witness
+
+
+def derive_plan(
+    events: list[dict],
+    start_time: datetime | None = None,
+    prior_histories: list | None = None,
+    source_label: str = "source execution",
+) -> RerunPlan:
+    """Derive the recovery plan from the source execution, optionally folding
+    in the EARLIER executions of the same ``run_date`` (``prior_histories`` as
+    ``[(label, events), ...]``, chronological). See ``resolve_chain``: without
+    the chain, every recovery after the first loses the original run's
+    progress (alpha-engine-config-I8161).
+    """
+    entered = entered_states(events)
+    original_input = execution_input(events)
+    run_date, provenance = derive_run_date(events, start_time)
+    plan = RerunPlan(run_date=run_date, run_date_provenance=provenance,
+                     original_input=original_input)
+
+    links = [(label, entered_states(evs)) for label, evs in (prior_histories or [])]
+    links.append((source_label, entered))
+    plan.chain = [label for label, _ in links]
+    entered_by_label = dict(links)
+    outcome, plan.witnessed_by = resolve_chain(links)
+
+    for stage in STAGES:
+        verdict = outcome.get(stage.name)
+        if verdict == "degraded":
+            plan.degraded.append(stage.name)
+            saw = plan.witnessed_by[stage.name]
+            plan.notes.append(
+                f"{stage.name}: DEGRADED in {saw} (entered "
+                f"{sorted(entered_by_label[saw] & stage.degraded_witness)}) "
+                "— NOT skipped; the rerun re-runs it to retry the absorbed "
+                "failure"
+            )
+        elif verdict == "completed":
             plan.completed.append(stage.name)
             if stage.emit_skip:
                 plan.skip_flags[stage.flag] = True
             elif stage.note:
                 plan.notes.append(f"{stage.name}: {stage.note}")
-        elif stage.detect_failure and (
-            stage.work in entered or (entered & stage.historical_work)
-        ):
+        elif verdict == "failed":
             plan.failed.append(stage.name)
 
     if not plan.failed and not plan.degraded:
@@ -1112,6 +1413,91 @@ def next_rerun_name(sf, sm_arn: str, run_date: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# The recovery CHAIN (alpha-engine-config-I8161)
+# ---------------------------------------------------------------------------
+# The completed set for a recovery is a property of the RUN_DATE, not of one
+# execution: the scheduled run plus every watch-rerun-<run_date>-N. Deriving
+# from the last link alone loses everything the original run completed, because
+# a rerun's history contains only the stages it did not skip.
+
+# How far either side of run_date a same-run_date execution may have STARTED.
+# The scheduled run stamps run_date from its own UTC start date, and recoveries
+# follow over the next days (a cross-UTC-midnight recovery of a Saturday cycle
+# is routine — alpha-engine-config-I7443). Purely a bound on how many
+# executions get described; the run_date comparison below is what decides
+# membership.
+CHAIN_WINDOW_DAYS_BEFORE = 1
+CHAIN_WINDOW_DAYS_AFTER = 6
+
+
+def chain_candidates(executions: list, run_date: str, source_arn: str, source_start) -> tuple:
+    """Split ``executions`` into (candidates, non_terminal) for the chain of
+    ``run_date``, oldest first.
+
+    A candidate is TERMINAL, is not the source itself, and started no later
+    than the source — the source is the frontier the operator chose (with
+    ``--execution-arn``, deliberately), and evidence from after it is not part
+    of the chain being recovered. Non-terminal executions in the window are
+    returned separately so the caller can say so rather than silently treat a
+    RUNNING execution's partial history as evidence.
+    """
+    lo = date.fromisoformat(run_date) - timedelta(days=CHAIN_WINDOW_DAYS_BEFORE)
+    hi = date.fromisoformat(run_date) + timedelta(days=CHAIN_WINDOW_DAYS_AFTER)
+    cands, non_terminal = [], []
+    for ex in executions:
+        if ex["executionArn"] == source_arn:
+            continue
+        started = ex["startDate"]
+        if not (lo <= started.astimezone(timezone.utc).date() <= hi):
+            continue
+        if source_start is not None and started > source_start:
+            continue
+        (cands if ex["status"] in TERMINAL_STATUSES else non_terminal).append(ex)
+    cands.sort(key=lambda e: e["startDate"])
+    return cands, non_terminal
+
+
+def collect_chain_histories(sf, sm_arn: str, run_date: str, source: dict) -> tuple:
+    """``([(label, events), ...], warnings)`` for every EARLIER terminal
+    execution of ``run_date``, oldest first.
+
+    Fails LOUDLY if a candidate's history cannot be read. A dropped link is not
+    the conservative direction it looks like: a stage that completed in run 1
+    and FAILED in run 2 reverts to "completed" the moment run 2 goes missing,
+    and the recovery then skips a stage that must re-run.
+    """
+    cands, non_terminal = chain_candidates(
+        list_all_executions(sf, sm_arn), run_date,
+        source["executionArn"], source.get("startDate"),
+    )
+    histories, warnings = [], []
+    if non_terminal:
+        warnings.append(
+            "chain: execution(s) "
+            f"{[e['name'] for e in non_terminal]} are non-terminal in this "
+            "run_date's window and were EXCLUDED — a partial history is not "
+            "evidence. Re-derive once they finish."
+        )
+    for ex in cands:
+        if effective_run_date_of(sf, ex) != run_date:
+            continue
+        try:
+            events = fetch_history(sf, ex["executionArn"])
+        except Exception as exc:  # noqa: BLE001 — an unreadable link is a WRONG plan, not a smaller one
+            raise SystemExit(
+                f"FATAL: could not read the execution history of chain member "
+                f"{ex['name']} ({ex['executionArn']}): {exc!r}. Refusing to "
+                "derive a skip set from an INCOMPLETE chain — a missing link "
+                "can silently turn a stage that FAILED in a later run back "
+                "into 'completed' from an earlier one, which is exactly the "
+                "swallow this helper exists to prevent "
+                "(alpha-engine-config-I8161)."
+            ) from exc
+        histories.append((ex["name"], events))
+    return histories, warnings
+
+
+# ---------------------------------------------------------------------------
 # Skip-coherence pre-flight (alpha-engine-config-I7443, sf-pipeline-policy
 # §2.5: "a skip-set that leaves a downstream JSONPath unresolvable must be
 # rejected by the helper, not discovered as a States.Runtime error thirty
@@ -1213,12 +1599,28 @@ def check_predictor_skip_freshness(s3, run_date: str, skip_flags: dict) -> None:
 def _print_plan(plan: RerunPlan, source_arn: str, source_status: str, name: str, sm_arn: str) -> None:
     print(f"source execution : {source_arn} ({source_status})")
     print(f"run_date         : {plan.run_date}  [{plan.run_date_provenance}]")
+    # alpha-engine-config-I8161: the chain, and which link witnessed what. A
+    # derived skip set whose evidence cannot be named is indistinguishable from
+    # an inherited flag, and auditability is the property that makes this
+    # script trustworthy at all.
+    print(f"chain            : {' -> '.join(plan.chain)}")
     print(f"rerun name       : {name}")
     print(f"pipeline_role    : {EMITTED_ROLE}")
     print(f"completed stages : {', '.join(plan.completed) or '(none)'}")
     print(f"degraded stages  : {', '.join(plan.degraded) or '(none)'}")
     print(f"failed stages    : {', '.join(plan.failed) or '(none identified)'}")
     print(f"derived skips    : {', '.join(sorted(plan.skip_flags)) or '(none)'}")
+    for label in plan.chain:
+        seen = [
+            f"{name} ({plan_verdict})"
+            for name, plan_verdict in (
+                *((n, "completed") for n in plan.completed),
+                *((n, "degraded") for n in plan.degraded),
+                *((n, "failed") for n in plan.failed),
+            )
+            if plan.witnessed_by.get(name) == label
+        ]
+        print(f"  witnessed by {label}: {', '.join(seen) or '(nothing that survives)'}")
     # Populates plan.dropped_inherited_skips as a side effect; call before
     # reporting them.
     _emitted = plan.rerun_input()
@@ -1299,7 +1701,21 @@ def main(argv: list | None = None) -> int:
     verify_skip_flags_live(sm_def, EMITTED_ROLE)
 
     events = fetch_history(sf, source_arn)
-    plan = derive_plan(events, start_time=source.get("startDate"))
+    # alpha-engine-config-I8161: derive from the CHAIN of executions sharing
+    # this run_date, not from the source alone. run_date is resolved first
+    # (cheaply, from the source's own history) because it is what defines the
+    # chain's membership.
+    chain_run_date, _prov = derive_run_date(events, source.get("startDate"))
+    prior, chain_warnings = collect_chain_histories(
+        sf, args.state_machine_arn, chain_run_date, source
+    )
+    plan = derive_plan(
+        events,
+        start_time=source.get("startDate"),
+        prior_histories=prior,
+        source_label=source_arn.rsplit(":", 1)[-1],
+    )
+    plan.warnings.extend(chain_warnings)
     name = next_rerun_name(sf, args.state_machine_arn, plan.run_date)
     sm_name = args.state_machine_arn.rsplit(":", 1)[-1]
     source_role = execution_input(events).get("pipeline_role")

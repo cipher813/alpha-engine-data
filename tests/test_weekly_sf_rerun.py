@@ -1118,3 +1118,331 @@ class TestCadenceDeclaredSkipsAreCarried:
         shapeless.write_text("Resources:\n  SomethingElse: {}\n")
         with pytest.raises(mod.CadenceSkipsUnreadable):
             mod.cadence_declared_skips(shapeless)
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I8161 — chained recovery derives from the CHAIN
+# ---------------------------------------------------------------------------
+
+def _chain_history(entered, *, run_date="2026-08-22", extra_input=None):
+    """A synthetic history: the ExecutionStarted event plus one stateEntered
+    event per name in ``entered`` (order preserved, though nothing reads it)."""
+    inp = {"pipeline_role": "weekly", "run_date": run_date}
+    if extra_input:
+        inp.update(extra_input)
+    events = [{
+        "type": "ExecutionStarted",
+        "executionStartedEventDetails": {"input": json.dumps(inp)},
+    }]
+    events += [
+        {"type": "ChoiceStateEntered", "stateEnteredEventDetails": {"name": n}}
+        for n in entered
+    ]
+    return events
+
+
+# The backtester family is the measured instance (alpha-engine-config-I8161):
+# skip_backtester's skip route jumps straight to CheckSkipEvaluator, so a rerun
+# that honours it enters NONE of the family's witnesses — every stage the
+# ORIGINAL run completed there reads as not-completed in the rerun's own history.
+_RUN1_COMPLETED_THROUGH_THE_BACKTESTER_FAMILY = [
+    "InitializeInput", "CheckSkipBacktester", "Backtester",
+    "CheckSkipPredictorBacktest",              # witness: backtester
+    "PredictorBacktest",
+    "CheckSkipPortfolioOptimizerBacktest",     # witness: predictor_backtest
+    "PortfolioOptimizerBacktest",
+    "CheckSkipParity",                         # witness: portfolio_optimizer_backtest
+    "CheckSkipEvaluator", "EvaluatorDiagnostics",   # ... and dies here
+]
+_RUN2_SKIPPED_THEM_AND_DIED_AT_THE_SAME_PLACE = [
+    "InitializeInput", "CheckSkipBacktester",
+    "CheckSkipEvaluator", "EvaluatorDiagnostics",
+]
+
+
+class TestChainedRecoveryKeepsTheOriginalRunsProgress:
+    """alpha-engine-config-I8161.
+
+    ``weekly_sf_rerun.py`` defaults to the LATEST failed execution, which after
+    one recovery is the RERUN — whose history contains only the stages it did
+    not skip. Measured 2026-08-22: ``skip_backtester``,
+    ``skip_predictor_backtest`` and ``skip_portfolio_optimizer_backtest`` moved
+    from *derived skips* (deriving from the scheduled run) to *dropped skips*
+    (deriving from ``watch-rerun-2026-08-22-1``), so a second recovery would
+    have re-run the backtester family — hours of spot compute — for stages that
+    completed cleanly four hours earlier.
+    """
+
+    def test_a_second_recovery_still_skips_what_the_first_run_completed(self, mod):
+        """The guard the issue specifies: run 1 completes A and B then fails at
+        C; run 2 skips A and B and fails at C again; run 3's plan skips A and B.
+        Against the pre-fix single-execution derivation this FAILS — run 2's
+        history witnesses none of them."""
+        plan = mod.derive_plan(
+            _chain_history(_RUN2_SKIPPED_THEM_AND_DIED_AT_THE_SAME_PLACE),
+            prior_histories=[(
+                "scheduled-run",
+                _chain_history(_RUN1_COMPLETED_THROUGH_THE_BACKTESTER_FAMILY),
+            )],
+            source_label="watch-rerun-2026-08-22-1",
+        )
+        assert plan.failed == ["evaluator"]
+        for flag in (
+            "skip_backtester",
+            "skip_predictor_backtest",
+            "skip_portfolio_optimizer_backtest",
+        ):
+            assert plan.skip_flags.get(flag) is True, (
+                f"{flag} was completed by the scheduled run and never attempted "
+                "again — a second recovery must not re-burn it"
+            )
+
+    def test_the_source_alone_would_lose_them(self, mod):
+        """The same source execution WITHOUT the chain — the measured pre-fix
+        behaviour, kept as the contrast that makes the fix legible."""
+        plan = mod.derive_plan(_chain_history(_RUN2_SKIPPED_THEM_AND_DIED_AT_THE_SAME_PLACE))
+        assert "skip_backtester" not in plan.skip_flags
+        assert "skip_predictor_backtest" not in plan.skip_flags
+
+    def test_latest_attempt_wins_when_a_completed_stage_later_fails(self, mod):
+        """A stage that completed in run 1 and FAILED in run 3 must re-run —
+        the chain is a union resolved by recency, never a monotone union of
+        completions."""
+        plan = mod.derive_plan(
+            _chain_history([
+                "InitializeInput", "CheckSkipBacktester", "Backtester",
+                # no CheckSkipPredictorBacktest: Backtester ran and died
+            ]),
+            prior_histories=[(
+                "scheduled-run",
+                _chain_history(_RUN1_COMPLETED_THROUGH_THE_BACKTESTER_FAMILY),
+            )],
+            source_label="watch-rerun-2026-08-22-1",
+        )
+        assert "backtester" in plan.failed
+        assert "skip_backtester" not in plan.skip_flags
+        assert plan.witnessed_by["backtester"] == "watch-rerun-2026-08-22-1"
+
+    def test_an_unattempted_stage_keeps_the_earlier_verdict(self, mod):
+        """...and the other direction: completed in run 1, never attempted
+        again, stays completed — with the earlier run named as the witness."""
+        plan = mod.derive_plan(
+            _chain_history(_RUN2_SKIPPED_THEM_AND_DIED_AT_THE_SAME_PLACE),
+            prior_histories=[(
+                "scheduled-run",
+                _chain_history(_RUN1_COMPLETED_THROUGH_THE_BACKTESTER_FAMILY),
+            )],
+            source_label="watch-rerun-2026-08-22-1",
+        )
+        assert plan.witnessed_by["backtester"] == "scheduled-run"
+        assert plan.witnessed_by["evaluator"] == "watch-rerun-2026-08-22-1"
+        assert plan.chain == ["scheduled-run", "watch-rerun-2026-08-22-1"]
+
+    def test_a_degraded_stage_in_a_later_link_beats_an_earlier_completion(self, mod):
+        """I6055's rule composes with the chain: degraded is re-run, and a
+        LATER degradation overrides an earlier clean completion."""
+        plan = mod.derive_plan(
+            _chain_history([
+                "InitializeInput", "CheckSkipBacktester", "Backtester",
+                "CheckSkipPredictorBacktest", "PredictorBacktest",
+                "CheckSkipPortfolioOptimizerBacktest",
+                "PortfolioOptimizerBacktest", "CheckSkipParity",
+                "CheckSkipEvaluator", "EvaluatorDiagnostics",
+                "CheckSkipPostEval", "SaturdayHealthCheck",
+                "SaturdayHealthCheckDegraded",
+            ]),
+            prior_histories=[(
+                "scheduled-run",
+                _chain_history(
+                    _RUN1_COMPLETED_THROUGH_THE_BACKTESTER_FAMILY
+                    + ["CheckSkipPostEval", "SaturdayHealthCheck", "CheckShellRunNotify"]
+                ),
+            )],
+            source_label="watch-rerun-2026-08-22-1",
+        )
+        assert "post_eval" in plan.degraded
+        assert "post_eval" not in plan.completed
+
+    def test_the_chain_reads_histories_never_a_previous_inputs_flags(self, mod):
+        """Immunity to alpha-engine-config-I7259 is structural, not a rule the
+        chain has to remember: a hand-added ``skip_*`` on an EARLIER execution's
+        input leaves no trace in any history, so it cannot propagate."""
+        plan = mod.derive_plan(
+            _chain_history(_RUN2_SKIPPED_THEM_AND_DIED_AT_THE_SAME_PLACE),
+            prior_histories=[(
+                "scheduled-run",
+                _chain_history(
+                    _RUN1_COMPLETED_THROUGH_THE_BACKTESTER_FAMILY,
+                    extra_input={"skip_rationale_clustering": True},
+                ),
+            )],
+            source_label="watch-rerun-2026-08-22-1",
+        )
+        assert "skip_rationale_clustering" not in plan.skip_flags
+        assert "rationale_clustering" not in plan.completed
+
+
+class TestChainMembership:
+    """Which executions the chain is built FROM — pure, so the membership rule
+    is testable without AWS."""
+
+    @staticmethod
+    def _ex(name, day, hour, status="FAILED"):
+        return {
+            "executionArn": f"arn:aws:states:us-east-1:1:execution:sm:{name}",
+            "name": name,
+            "status": status,
+            "startDate": datetime(2026, 8, day, hour, tzinfo=timezone.utc),
+        }
+
+    def test_earlier_terminal_executions_are_candidates_oldest_first(self, mod):
+        source = self._ex("watch-rerun-2026-08-22-2", 22, 15)
+        execs = [
+            source,
+            self._ex("watch-rerun-2026-08-22-1", 22, 14),
+            self._ex("scheduled", 22, 9, status="FAILED"),
+        ]
+        cands, non_terminal = mod.chain_candidates(
+            execs, "2026-08-22", source["executionArn"], source["startDate"]
+        )
+        assert [e["name"] for e in cands] == ["scheduled", "watch-rerun-2026-08-22-1"]
+        assert non_terminal == []
+
+    def test_the_source_is_the_frontier(self, mod):
+        """An execution that started AFTER the source is not part of the chain
+        being recovered — with --execution-arn the operator chose that frontier
+        deliberately."""
+        source = self._ex("watch-rerun-2026-08-22-1", 22, 14)
+        later = self._ex("watch-rerun-2026-08-22-2", 22, 15)
+        cands, _ = mod.chain_candidates(
+            [source, later], "2026-08-22", source["executionArn"], source["startDate"]
+        )
+        assert cands == []
+
+    def test_a_running_execution_is_excluded_and_reported(self, mod):
+        """A partial history is not evidence — and its exclusion is said out
+        loud rather than inferred from a shorter skip set."""
+        source = self._ex("watch-rerun-2026-08-22-2", 22, 15)
+        running = self._ex("watch-rerun-2026-08-22-1", 22, 14, status="RUNNING")
+        cands, non_terminal = mod.chain_candidates(
+            [source, running], "2026-08-22",
+            source["executionArn"], source["startDate"],
+        )
+        assert cands == []
+        assert [e["name"] for e in non_terminal] == ["watch-rerun-2026-08-22-1"]
+
+    def test_a_far_older_cycle_is_out_of_the_window(self, mod):
+        source = self._ex("watch-rerun-2026-08-22-1", 22, 14)
+        old = self._ex("scheduled-prev-week", 15, 9)
+        cands, _ = mod.chain_candidates(
+            [source, old], "2026-08-22", source["executionArn"], source["startDate"]
+        )
+        assert cands == []
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I8162 — no spot boot when no box stage survives
+# ---------------------------------------------------------------------------
+
+def _rule_matches(rule: dict, flags: dict) -> bool:
+    """Evaluate one Choice rule (nested And of IsPresent/BooleanEquals pairs,
+    or the bare IsPresent passthrough) against an execution input."""
+    if "And" in rule:
+        return all(_rule_matches(sub, flags) for sub in rule["And"])
+    var = rule["Variable"].removeprefix("$.")
+    if "IsPresent" in rule:
+        return (var in flags) is rule["IsPresent"]
+    if "BooleanEquals" in rule:
+        return flags.get(var) is rule["BooleanEquals"]
+    raise AssertionError(f"unhandled comparison in {rule}")
+
+
+def _dispatch_gate_next(state: dict, flags: dict) -> str:
+    for rule in state["Choices"]:
+        if _rule_matches(rule, flags):
+            return rule["Next"]
+    return state["Default"]
+
+
+class TestSpotDispatchOnlyWhenABoxStageSurvives:
+    """alpha-engine-config-I8162.
+
+    ``watch-rerun-2026-08-22-1`` spent 07:25:26 -> 07:29:29 PT — 4 of the run's
+    16 minutes — in ``DispatchWeeklyFreshnessSpot`` ->
+    ``WaitForWeeklyFreshnessSpotBootstrap``. Recovery is exactly when the skip
+    set is largest, so the most often-unnecessary stage was the one that always
+    ran.
+
+    The predicate is DERIVED from ``STAGES`` by reachability over the live
+    definition, never hand-listed in the SF: hand-listing drifts in the
+    asymmetric direction, where the pipeline denies a boot to a stage that then
+    SSM-invokes onto a box it does not have — which FAILS a run rather than
+    costing four minutes.
+    """
+
+    def test_the_sf_branch_is_exactly_the_derived_predicate(self, mod, sf_def):
+        gate = sf_def["States"]["CheckSpotDispatchNeeded"]
+        assert gate["Choices"][1] == mod.spot_dispatch_bypass_rule(sf_def), (
+            "CheckSpotDispatchNeeded's bypass branch has drifted from "
+            "scripts/weekly_sf_rerun.py::spot_dispatch_bypass_rule — regenerate "
+            "it there rather than hand-editing the definition"
+        )
+
+    def test_the_passthrough_branch_and_default_are_unchanged(self, mod, sf_def):
+        gate = sf_def["States"]["CheckSpotDispatchNeeded"]
+        assert gate["Choices"][0] == {
+            "Variable": "$.ec2_instance_id",
+            "IsPresent": True,
+            "Next": "NormalizeEc2InstanceId",
+        }
+        assert gate["Default"] == "DispatchWeeklyFreshnessSpot"
+        assert len(gate["Choices"]) == 2
+
+    def test_every_flag_in_the_branch_is_a_real_stage_flag(self, mod, sf_def):
+        flags = mod.box_dispatch_flags(sf_def)
+        assert set(flags) <= {s.flag for s in mod.STAGES}
+        assert flags, "the box-stage set cannot be empty — this SF runs on a box"
+
+    def test_skipping_every_box_stage_routes_past_the_dispatch(self, mod, sf_def):
+        gate = sf_def["States"]["CheckSpotDispatchNeeded"]
+        flags = {f: True for f in mod.box_dispatch_flags(sf_def)}
+        assert _dispatch_gate_next(gate, flags) == mod.SPOT_DISPATCH_CONVERGENCE
+
+    @pytest.mark.parametrize("held_back", range(8))
+    def test_leaving_any_one_box_stage_unskipped_still_dispatches(
+        self, mod, sf_def, held_back
+    ):
+        """The asymmetric direction, one stage at a time: a run that still has
+        a box stage to execute must still get a box."""
+        gate = sf_def["States"]["CheckSpotDispatchNeeded"]
+        derived = mod.box_dispatch_flags(sf_def)
+        if held_back >= len(derived):
+            pytest.skip("fewer box stages than the parametrization covers")
+        flags = {f: True for f in derived if f != derived[held_back]}
+        assert _dispatch_gate_next(gate, flags) == "DispatchWeeklyFreshnessSpot", (
+            f"{derived[held_back]} is unskipped — that stage SSM-invokes onto "
+            "$.ec2_instance_id and the run would fail without a box"
+        )
+
+    def test_the_predicate_is_sound_against_the_definition_itself(self, mod, sf_def):
+        """Not just 'the two files agree' — with the derived flags set, NO state
+        that dereferences $.ec2_instance_id is reachable past the gate, and
+        dropping any one of them puts at least one back."""
+        derived = mod.box_dispatch_flags(sf_def)
+        assert mod.box_states_needing_dispatch(
+            sf_def, {f: True for f in derived}
+        ) == set()
+        for flag in derived:
+            partial = {f: True for f in derived if f != flag}
+            assert mod.box_states_needing_dispatch(sf_def, partial), (
+                f"{flag} is redundant — box_dispatch_flags must not emit a "
+                "conjunct that carries no coverage"
+            )
+
+    def test_a_present_ec2_instance_id_still_wins(self, mod, sf_def):
+        """The rerun helper passes a still-live launcher box through verbatim;
+        that branch must keep precedence over the new bypass."""
+        gate = sf_def["States"]["CheckSpotDispatchNeeded"]
+        flags = {f: True for f in mod.box_dispatch_flags(sf_def)}
+        flags["ec2_instance_id"] = "i-abc"
+        assert _dispatch_gate_next(gate, flags) == "NormalizeEc2InstanceId"
