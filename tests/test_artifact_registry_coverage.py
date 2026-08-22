@@ -89,6 +89,16 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # alpha-engine-config-PR7225; pinned here so this repo's guard is honest
     # about the new PUT site either way.
     "validators/stage_output_sweep.py": 1,
+    # alpha-engine-config-I8189 — the declared-pause lane set,
+    # s3://alpha-engine-research/ops/checks/automation-pause-reconcile/paused_lanes.json.
+    # One PUT per daily pause-reconcile.yml run (09:50 UTC), from
+    # `publish_paused_lanes()`, called right after the existing `publish()`
+    # call in `main()`. Registered rather than grandfathered — a stale/absent
+    # copy silently reproduces I8189 in the consumer (crucible-evaluator's
+    # groom tile falls back to inferring "did not run" from absent
+    # artifacts). The row rides alpha-engine-config-PR8199; pinned here so
+    # this repo's guard is honest about the new PUT site either way.
+    "infrastructure/pause_reconcile.py": 1,
     # alpha-engine-config-I7249 — the daily all-stage --preflight-only sweep's
     # own outputs, written by AwsSurface.put_json/put_text from emit():
     #   _preflight_sweep/{run_id}/report.json   (the run's durable record)
