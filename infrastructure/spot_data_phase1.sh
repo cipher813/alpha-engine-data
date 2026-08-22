@@ -155,6 +155,12 @@ emit_heartbeat
 # See spot_morning_enrich.sh for the full rationale. OBSERVE MODE — the CLI
 # exits 0 for every verdict, and `|| echo ... >&2` rather than `|| true` keeps
 # an unreachable assertion distinguishable from a covered stage.
-"$LIB_PYTHON" -m krepis.stage_coverage assert --stage DataPhase1 --window-start "$_STAGE_WINDOW_START" || echo "WARNING: stage-coverage assertion did not run for DataPhase1 (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
+# --run-date is explicit ($EXECUTION_RUN_DATE, not $RUN_DATE): this launcher
+# never receives RUN_DATE at all, and even where RUN_DATE does exist elsewhere
+# in the fleet it is reassigned to the trading day by crucible-backtester's
+# infrastructure/_spot_common.sh — a carrier other code rewrites is exactly the
+# defect alpha-engine-config-I8155 fixes. EXECUTION_RUN_DATE is exported by
+# step_function.json from $.run_date and is never normalized by anything.
+"$LIB_PYTHON" -m krepis.stage_coverage assert --stage DataPhase1 --window-start "$_STAGE_WINDOW_START" --run-date "$EXECUTION_RUN_DATE" || echo "WARNING: stage-coverage assertion did not run for DataPhase1 (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
 
 echo "==> DataPhase1 complete."
