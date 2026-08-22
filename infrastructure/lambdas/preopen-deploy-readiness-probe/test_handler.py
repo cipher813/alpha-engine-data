@@ -164,3 +164,111 @@ class TestVerdictWrite:
 
         _, kwargs = s3_mock.put_object.call_args
         assert kwargs["Key"] == "deploy_readiness/2026-08-21.json"
+
+
+# ── alpha-engine-config-I8142: absence is not clean ──────────────────────────
+#
+# `check_deploy_drift` OMITS `sf_drift` when it could not measure it, and the
+# preopen `DeployDriftGate` halts on exactly that payload. This probe read the
+# same payload with `drift.get("sf_drift")` — falsy — and wrote
+# action=noop reason=clean, 45 minutes before the session it had already
+# decided. The three states must stay three all the way down.
+
+def _unmeasured_payload(**extra) -> dict:
+    """The literal shape the probe emits post-I8142: no `sf_drift` key at all,
+    with the positive state field and the typed cause beside it."""
+    body = {
+        "sf_sha": None,
+        "upstream_sha": "def5678",
+        "sf_drift_state": "unmeasured",
+        "sf_drift_reason": "live_definition_unreadable",
+        "sf_definition_reason": "live_definition_unreadable",
+        "live_definition_error": {
+            "reason": "describe_state_machine_error",
+            "detail": "AccessDeniedException: not authorized",
+        },
+        "cf_drift": False,
+        "cf_drift_reason": "in_sync",
+    }
+    body.update(extra)
+    return body
+
+
+class TestUnmeasuredVerdict:
+    def _run(self, payloads):
+        s3_mock = MagicMock()
+        lam_mock = _lam_client(payloads)
+
+        def boto_side_effect(service, **kw):
+            return lam_mock if service == "lambda" else s3_mock
+
+        with patch("index.is_trading_day", return_value=True), \
+             patch("index.boto3.client", side_effect=boto_side_effect), \
+             patch("index._dispatch_deploy_infrastructure") as mock_dispatch, \
+             patch("index.alerts.publish") as mock_publish:
+            mock_publish.return_value = MagicMock(sns=MagicMock(ok=True))
+            result = index.handler({}, None)
+        return result, mock_publish, mock_dispatch, s3_mock
+
+    def test_an_unmeasured_verdict_pages_and_is_never_reported_clean(self):
+        result, mock_publish, mock_dispatch, s3_mock = self._run(
+            [_unmeasured_payload()],
+        )
+        assert result["action"] == "paged"
+        assert result["reason"] == "unmeasured"
+        assert result["sf_drift_state_initial"] == "unmeasured"
+        mock_publish.assert_called_once()
+        assert mock_publish.call_args.kwargs["severity"] == "critical"
+        # No self-heal: a deploy dispatch on an unmeasured verdict acts on
+        # evidence nobody has.
+        mock_dispatch.assert_not_called()
+        s3_mock.put_object.assert_called_once()
+
+    def test_the_page_names_the_unreadable_definition_and_the_halt(self):
+        _, mock_publish, _, _ = self._run([_unmeasured_payload()])
+        message = mock_publish.call_args.kwargs["message"]
+        assert "UNMEASURED" in message
+        assert "PREOPEN WILL HALT" in message
+        assert "live_definition_unreadable" in message
+
+    def test_absence_of_the_key_is_unmeasured_without_the_state_field(self):
+        """Rollout safety: a predictor Lambda older than I8142 omits `sf_drift`
+        without emitting `sf_drift_state`. Key presence must still decide."""
+        payload = _unmeasured_payload()
+        payload.pop("sf_drift_state")
+        result, mock_publish, _, _ = self._run([payload])
+        assert result["action"] == "paged"
+        assert result["reason"] == "unmeasured"
+        mock_publish.assert_called_once()
+
+    def test_an_unmeasured_reprobe_is_not_a_self_heal(self):
+        """The same collapse on the second read: after a dispatch, an
+        unmeasured verdict is 'we no longer know', not 'fixed'."""
+        s3_mock = MagicMock()
+        lam_mock = _lam_client([_lambda_payload(sf_drift=True), _unmeasured_payload()])
+
+        def boto_side_effect(service, **kw):
+            return lam_mock if service == "lambda" else s3_mock
+
+        with patch("index.is_trading_day", return_value=True), \
+             patch("index.boto3.client", side_effect=boto_side_effect), \
+             patch("index._dispatch_deploy_infrastructure", return_value=(True, "dispatched ok")), \
+             patch("index._poll_dispatch_conclusion", return_value=("success", "run completed: success")), \
+             patch("index.alerts.publish") as mock_publish:
+            mock_publish.return_value = MagicMock(sns=MagicMock(ok=True))
+            result = index.handler({}, None)
+
+        assert result["action"] == "paged"
+        assert result["reason"] == "unmeasured_after_self_heal"
+        assert result["sf_drift_state_after_self_heal"] == "unmeasured"
+        mock_publish.assert_called_once()
+
+
+class TestDriftStateHelper:
+    def test_the_three_states_are_three(self):
+        assert index._drift_state({"sf_drift": True}) == "drift"
+        assert index._drift_state({"sf_drift": False}) == "no_drift"
+        assert index._drift_state({}) == "unmeasured"
+        # The positive field wins when present — it is the one the producer
+        # states rather than the one a consumer infers.
+        assert index._drift_state({"sf_drift_state": "unmeasured"}) == "unmeasured"
