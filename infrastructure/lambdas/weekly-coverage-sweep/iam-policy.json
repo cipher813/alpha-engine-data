@@ -48,9 +48,13 @@
       "Effect": "Allow",
       "Action": [
         "s3:GetObject",
+        "s3:ListBucket",
         "s3:PutObject"
       ],
-      "Resource": "arn:aws:s3:::alpha-engine-research/_sf_completion/*"
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research",
+        "arn:aws:s3:::alpha-engine-research/_sf_completion/*"
+      ]
     },
     {
       "Sid": "PublishSweepMetrics",
