@@ -582,11 +582,12 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         "stage_coverage": _assert_stage_coverage(
             "RelaunchWeeklyFreshnessSpot" if force_on_demand else "DispatchWeeklyFreshnessSpot",
             started,
+            str(event.get("run_date", "")).strip() or None,
         ),
     }
 
 
-def _assert_stage_coverage(stage: str, started: datetime.datetime) -> dict:
+def _assert_stage_coverage(stage: str, started: datetime.datetime, run_date: str | None) -> dict:
     """Record this stage's own output verdict (alpha-engine-config-I7214).
 
     Both stages this Lambda backs are INFRASTRUCTURE/GATE stages: they
@@ -599,10 +600,21 @@ def _assert_stage_coverage(stage: str, started: datetime.datetime) -> dict:
     Never alters the handler's outcome. The ImportError branch is loud rather
     than silent because the nousergon-lib pin may predate the module, and an
     inert assertion must be distinguishable from a covered stage.
+
+    ``run_date`` comes from the state's ``Payload.run_date.$: "$.run_date"``
+    (alpha-engine-config-I8155 — DispatchWeeklyFreshnessSpot and
+    RelaunchWeeklyFreshnessSpot previously passed a narrow Payload with no
+    run_date at all, so this verdict has been writing under an empty
+    run_date since I7214 shipped). Never fabricated: a missing/blank
+    run_date is reported UNMEASURED rather than defaulting to any derived
+    date — inventing one here is exactly the defect I8155 fixes.
     """
+    if not run_date:
+        logger.error("stage-coverage assertion has no run_date for %s — event carried none", stage)
+        return {"stage": stage, "status": "UNMEASURED", "reason": "no run_date on state input"}
     try:
         from krepis.stage_coverage import assert_stage_coverage
     except ImportError as exc:
         logger.error("stage-coverage assertion unavailable for %s: %s", stage, exc)
         return {"stage": stage, "status": "UNMEASURED", "reason": str(exc)}
-    return assert_stage_coverage(stage, window_start=started)
+    return assert_stage_coverage(stage, window_start=started, run_date=run_date)

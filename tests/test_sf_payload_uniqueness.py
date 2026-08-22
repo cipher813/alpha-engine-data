@@ -178,8 +178,12 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # config-I7119's SubstrateRelaunchGate recovers only the 8 top-level sites,
     # and the 5 inside ResearchPredictorParallel are unreachable from it by ASL
     # scoping. Removing the reclaim is the only measure covering all 13.
+    # alpha-engine-config-I8155: run_date.$ added — this Lambda's stage-
+    # coverage verdict (DispatchWeeklyFreshnessSpot / RelaunchWeeklyFreshnessSpot,
+    # both INFRASTRUCTURE/GATE stages) had been writing under an empty
+    # run_date since I7214 shipped, because neither Payload carried one.
     "DispatchWeeklyFreshnessSpot": frozenset(
-        {"execution_id.$", "force_on_demand"}
+        {"execution_id.$", "run_date.$", "force_on_demand"}
     ),
     # config-I7119: the SAME dispatcher, invoked to replace a launcher box that
     # was reclaimed mid-run. force_on_demand was added to the dispatcher in
@@ -189,7 +193,7 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # two payloads are now identical. A literal `true`, not a `.$` path: the
     # decision is structural, never execution input.
     "RelaunchWeeklyFreshnessSpot": frozenset(
-        {"execution_id.$", "force_on_demand"}
+        {"execution_id.$", "run_date.$", "force_on_demand"}
     ),
 }
 
