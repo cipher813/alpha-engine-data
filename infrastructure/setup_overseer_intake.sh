@@ -47,6 +47,26 @@
 #   above; the SNS-only path is human-facing fire-and-forget that belongs
 #   outside the drain scope. Decision: no separate forwarder needed.
 #
+# DLQ REPLAY (alpha-engine-config-I8111): this script provisions the DLQ
+# with a 14-day retention but, until 2026-08-21, nothing ever moved a
+# message OFF it — messages sat until retention silently deleted them
+# (measured: 93 messages, oldest 9.1 days, ~4.9 days from expiry, drained
+# only by an operator coincidentally re-enabling the drain schedules).
+# Per Brian's ruling (alpha-engine-config-I8120): a pause suspends ACTION,
+# never OBSERVATION. So this is two independent pieces, not one Lambda:
+#   - DETECTION stays armed through a pause: the DLQ age-vs-retention
+#     threshold (10 of 14 days) is a plain CloudWatch alarm,
+#     `alpha-engine-watch-plane-overseer-intake-dlq-age`, codified in
+#     nous-ergon-ops/infrastructure/cloudwatch/alarms/ (an alarm is an
+#     account resource — this PUBLIC repo does not author them, see
+#     setup_watch_plane_alarms.sh's own retirement note above).
+#   - ACTION is reactivation-gated: `infrastructure/reactivate_paused_lane.py`
+#     redrives the DLQ (`infrastructure/dlq_redrive.py`, native SQS
+#     `StartMessageMoveTask`) BEFORE re-enabling a paused lane's triggers,
+#     so "before or with the first run" holds by construction. There is no
+#     standing schedule that mutates this queue — only the reactivation
+#     path does, and only when a human runs it.
+#
 # IAM for emitters is a separate concern — see
 # attach_overseer_put_events_policy.sh (creates/attaches the
 # nousergon-alerts-put-events managed policy to fleet Lambda/EC2 roles).
