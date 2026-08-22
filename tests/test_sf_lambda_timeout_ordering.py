@@ -74,6 +74,14 @@ _FUNCTION_TIMEOUTS_SEC: dict[str, int] = {
     # infrastructure/lambdas/weekly-run-scope/deploy.sh; a generous ceiling here
     # would let an advisory state hold the tail of the weekly run.
     "alpha-engine-weekly-run-scope": 60,
+    # alpha-engine-config-I8214. ListExecutions + one DescribeExecution and
+    # GetExecutionHistory per contributing execution, a prefix listing, one
+    # PUT and one marker read-modify-write. Bounded by the cycle's execution
+    # count (single digits), not by the ticker universe. Matches the
+    # --bootstrap timeout in
+    # infrastructure/lambdas/weekly-coverage-sweep/deploy.sh; the SF state's
+    # 90s ceiling is deliberately below it so the SF is the one that binds.
+    "alpha-engine-weekly-coverage-sweep": 120,
     "alpha-engine-predictor-regime-retrospective-eval": 600,
     "alpha-engine-predictor-regime-substrate": 300,
     "alpha-engine-replay-concordance": 900,

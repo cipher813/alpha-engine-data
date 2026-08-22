@@ -73,6 +73,12 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # config#2249: fast pre-dispatch substrate health gate, immediately
     # before MorningEnrich (alpha-engine-substrate-health-gate Lambda).
     "SubstrateHealthGate": frozenset({"instance_id.$"}),
+    # alpha-engine-config-I8214: the stage-coverage sweep at the tail of the
+    # run. Deliberately NOT threading execution_arn: the sweep reads the whole
+    # CYCLE (every contributing execution for this run_date), not this one
+    # execution — passing an execution arn would invite a handler that reads
+    # only its own caller, which is the 1-of-16 reading I8186 is about.
+    "WeeklyCoverageSweep": frozenset({"run_date.$", "dry_run.$", "state_machine_arn.$"}),
     # L4517: preventive cross-repo lib-pin drift gate (predictor-inference Lambda).
     # alpha-engine-config-I8155: +run_date.$ — the stage-coverage verdict this
     # Lambda writes is keyed on the execution's own run_date, and without it
