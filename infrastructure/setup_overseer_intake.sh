@@ -52,15 +52,20 @@
 # message OFF it — messages sat until retention silently deleted them
 # (measured: 93 messages, oldest 9.1 days, ~4.9 days from expiry, drained
 # only by an operator coincidentally re-enabling the drain schedules).
-# `infrastructure/lambdas/dlq-redrive-monitor/` closes that: a Lambda on
-# its own 30-minute EventBridge Scheduler schedule (independent of
-# automation_pause.py and of the alert-drain schedules below, deliberately
-# — it must keep running while the drain lane is paused) that (1) redrives
-# the DLQ back to this queue via native SQS `StartMessageMoveTask`, and (2)
-# pages (severity=error) when the oldest DLQ message crosses 10 of the
-# 14-day retention. See that Lambda's index.py docstring for the full
-# mechanism, including how poison messages are distinguished from paused-
-# consumer backlog without extra code.
+# Per Brian's ruling (alpha-engine-config-I8120): a pause suspends ACTION,
+# never OBSERVATION. So this is two independent pieces, not one Lambda:
+#   - DETECTION stays armed through a pause: the DLQ age-vs-retention
+#     threshold (10 of 14 days) is a plain CloudWatch alarm,
+#     `alpha-engine-watch-plane-overseer-intake-dlq-age`, codified in
+#     nous-ergon-ops/infrastructure/cloudwatch/alarms/ (an alarm is an
+#     account resource — this PUBLIC repo does not author them, see
+#     setup_watch_plane_alarms.sh's own retirement note above).
+#   - ACTION is reactivation-gated: `infrastructure/reactivate_paused_lane.py`
+#     redrives the DLQ (`infrastructure/dlq_redrive.py`, native SQS
+#     `StartMessageMoveTask`) BEFORE re-enabling a paused lane's triggers,
+#     so "before or with the first run" holds by construction. There is no
+#     standing schedule that mutates this queue — only the reactivation
+#     path does, and only when a human runs it.
 #
 # IAM for emitters is a separate concern — see
 # attach_overseer_put_events_policy.sh (creates/attaches the
