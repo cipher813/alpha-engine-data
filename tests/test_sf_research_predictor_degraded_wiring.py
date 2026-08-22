@@ -232,32 +232,38 @@ def test_mark_model_zoo_degraded_shape(branch_b):
 
 def test_branch_a_complete_hoists_local_flag(branch_a):
     st = branch_a["BranchAComplete"]
-    assert st["Parameters"]["branch_a_status"] == "OK"
-    assert st["Parameters"]["branch_a_degraded.$"] == "$.research_degraded_local"
+    assert st["Parameters"]["branch_a"]["branch_a_status"] == "OK"
+    assert (
+        st["Parameters"]["branch_a"]["branch_a_degraded.$"]
+        == "$.research_degraded_local"
+    )
 
 
 def test_branch_a_failed_sets_degraded_false(branch_a):
     st = branch_a["BranchAFailed"]
-    assert st["Parameters"]["branch_a_status"] == "FAILED"
-    assert st["Parameters"]["branch_a_degraded"] is False
+    assert st["Parameters"]["branch_a"]["branch_a_status"] == "FAILED"
+    assert st["Parameters"]["branch_a"]["branch_a_degraded"] is False
 
 
 def test_branch_b_complete_hoists_local_flag(branch_b):
     st = branch_b["BranchBComplete"]
-    assert st["Parameters"]["branch_b_status"] == "OK"
-    assert st["Parameters"]["branch_b_degraded.$"] == "$.research_degraded_local"
+    assert st["Parameters"]["branch_b"]["branch_b_status"] == "OK"
+    assert (
+        st["Parameters"]["branch_b"]["branch_b_degraded.$"]
+        == "$.research_degraded_local"
+    )
 
 
 def test_branch_b_failed_sets_degraded_false(branch_b):
     st = branch_b["BranchBFailed"]
-    assert st["Parameters"]["branch_b_status"] == "FAILED"
-    assert st["Parameters"]["branch_b_degraded"] is False
+    assert st["Parameters"]["branch_b"]["branch_b_status"] == "FAILED"
+    assert st["Parameters"]["branch_b"]["branch_b_degraded"] is False
 
 
 def test_predictor_training_skipped_sets_degraded_false(branch_b):
     st = branch_b["PredictorTrainingSkipped"]
-    assert st["Result"]["branch_b_status"] == "OK"
-    assert st["Result"]["branch_b_degraded"] is False
+    assert st["Result"]["branch_b"]["branch_b_status"] == "OK"
+    assert st["Result"]["branch_b"]["branch_b_degraded"] is False
 
 
 # ---------------------------------------------------------------------------

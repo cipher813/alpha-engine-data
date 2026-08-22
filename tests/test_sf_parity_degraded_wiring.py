@@ -44,6 +44,17 @@ _BRANCH_VARS = {
     "ParityReplay": "parity_replay",
 }
 
+# alpha-engine-config-I8194: the key each branch terminal nests its outcome
+# envelope under. It used to be the terminal's ResultPath; the terminal now
+# replaces its payload instead of merging into it, so the same name is the
+# sole top-level key of Parameters and $.parity_parallel_result[i].<key>
+# .status resolves unchanged.
+_BRANCH_ENVELOPE_KEYS = {
+    "PitParityLookahead": "branch_pit_lookahead",
+    "PitParityWalkforward": "branch_pit_walkforward",
+    "ParityReplay": "branch_parity_replay",
+}
+
 
 @pytest.fixture(scope="module")
 def states() -> dict:
@@ -92,7 +103,12 @@ def test_branch_degraded_terminal_ends_branch_success(branches, base):
     st = branches[base][f"{base}Degraded"]
     assert st["Type"] == "Pass"
     assert st.get("End") is True
-    assert st["Parameters"] == {"status": "DEGRADED"}
+    # alpha-engine-config-I8194: envelope nested under the branch key,
+    # no ResultPath — the branch returns the envelope, not its payload.
+    assert st["Parameters"] == {
+        _BRANCH_ENVELOPE_KEYS[base]: {"status": "DEGRADED"}
+    }
+    assert "ResultPath" not in st
 
 
 @pytest.mark.parametrize("base", _BRANCH_BASES)

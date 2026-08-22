@@ -475,24 +475,33 @@ class TestBranchBContents:
         skipped = branch_b["PredictorTrainingSkipped"]
         assert skipped["Type"] == "Pass"
         assert skipped["End"] is True
-        assert skipped["ResultPath"] == "$.branch_b"
-        assert skipped["Result"]["branch_b_status"] == "OK"
-        assert skipped["Result"]["skipped"] is True
+        # alpha-engine-config-I8194: the envelope moved INSIDE Parameters
+        # under the key the old ResultPath named, and ResultPath is gone —
+        # a branch terminal must REPLACE its payload, not merge into it, or
+        # the branch returns its whole ~108 KB effective input and the join
+        # trips States.DataLimitExceeded. Every post-join JSONPath is
+        # unchanged. tests/test_sf_parallel_branch_payload.py owns the
+        # definition-derived form of this invariant.
+        assert "ResultPath" not in skipped
+        assert set(skipped["Result"]) == {"branch_b"}
+        assert skipped["Result"]["branch_b"]["branch_b_status"] == "OK"
+        assert skipped["Result"]["branch_b"]["skipped"] is True
         # Exactly the success contract + the marker + the degraded field
         # (alpha-engine-config#6722: fixed false — this path never reaches
         # the model-zoo rotation, and the field must exist unconditionally
         # so AggregateBranchOutcomes' Parameters.$ extraction never throws).
-        assert set(skipped["Result"]) == {
+        assert set(skipped["Result"]["branch_b"]) == {
             "branch_b_status", "skipped", "branch_b_degraded",
         }
-        assert skipped["Result"]["branch_b_degraded"] is False
+        assert skipped["Result"]["branch_b"]["branch_b_degraded"] is False
         # Contract equivalence with the real success terminal.
         complete = branch_b["BranchBComplete"]
         assert (
-            skipped["Result"]["branch_b_status"]
-            == complete["Parameters"]["branch_b_status"]
+            skipped["Result"]["branch_b"]["branch_b_status"]
+            == complete["Parameters"]["branch_b"]["branch_b_status"]
         )
-        assert skipped["ResultPath"] == complete["ResultPath"]
+        assert set(skipped["Result"]) == set(complete["Parameters"])
+        assert "ResultPath" not in complete
 
     # test_validation_head_object_key_is_iam_granted was ported to
     # nous-ergon-ops — the SF role policy
@@ -742,25 +751,40 @@ class TestPerBranchErrorIsolation:
         # alpha-engine-config#6722: BranchAComplete moved from a bare
         # Result to Parameters so it can also hoist branch_a_degraded.$
         # from the branch-local $.research_degraded_local marker.
-        ok = branch_a["BranchAComplete"]
-        assert ok["Parameters"]["branch_a_status"] == "OK"
-        assert ok["Parameters"]["branch_a_degraded.$"] == "$.research_degraded_local"
-        assert ok["ResultPath"] == "$.branch_a"
-        bad = branch_a["BranchAFailed"]
-        assert bad["Parameters"]["branch_a_status"] == "FAILED"
-        assert bad["Parameters"]["branch_a_error.$"] == "$.error"
-        assert bad["Parameters"]["branch_a_degraded"] is False
-        assert bad["ResultPath"] == "$.branch_a"
+        # alpha-engine-config-I8194: the envelope moved INSIDE Parameters
+        # under the key the old ResultPath named, and ResultPath is gone —
+        # a branch terminal must REPLACE its payload, not merge into it, or
+        # the branch returns its whole ~108 KB effective input and the join
+        # trips States.DataLimitExceeded. Every post-join JSONPath is
+        # unchanged. tests/test_sf_parallel_branch_payload.py owns the
+        # definition-derived form of this invariant.
+        ok = branch_a["BranchAComplete"]["Parameters"]["branch_a"]
+        assert ok["branch_a_status"] == "OK"
+        assert ok["branch_a_degraded.$"] == "$.research_degraded_local"
+        assert "ResultPath" not in branch_a["BranchAComplete"]
+        bad = branch_a["BranchAFailed"]["Parameters"]["branch_a"]
+        assert bad["branch_a_status"] == "FAILED"
+        assert bad["branch_a_error.$"] == "$.error"
+        assert bad["branch_a_degraded"] is False
+        assert "ResultPath" not in branch_a["BranchAFailed"]
 
     def test_branch_b_records_status(self, branch_b):
-        ok = branch_b["BranchBComplete"]
-        assert ok["Parameters"]["branch_b_status"] == "OK"
-        assert ok["Parameters"]["branch_b_degraded.$"] == "$.research_degraded_local"
-        assert ok["ResultPath"] == "$.branch_b"
-        bad = branch_b["BranchBFailed"]
-        assert bad["Parameters"]["branch_b_status"] == "FAILED"
-        assert bad["Parameters"]["branch_b_error.$"] == "$.error"
-        assert bad["Parameters"]["branch_b_degraded"] is False
+        # alpha-engine-config-I8194: the envelope moved INSIDE Parameters
+        # under the key the old ResultPath named, and ResultPath is gone —
+        # a branch terminal must REPLACE its payload, not merge into it, or
+        # the branch returns its whole ~108 KB effective input and the join
+        # trips States.DataLimitExceeded. Every post-join JSONPath is
+        # unchanged. tests/test_sf_parallel_branch_payload.py owns the
+        # definition-derived form of this invariant.
+        ok = branch_b["BranchBComplete"]["Parameters"]["branch_b"]
+        assert ok["branch_b_status"] == "OK"
+        assert ok["branch_b_degraded.$"] == "$.research_degraded_local"
+        assert "ResultPath" not in branch_b["BranchBComplete"]
+        bad = branch_b["BranchBFailed"]["Parameters"]["branch_b"]
+        assert bad["branch_b_status"] == "FAILED"
+        assert bad["branch_b_error.$"] == "$.error"
+        assert bad["branch_b_degraded"] is False
+        assert "ResultPath" not in branch_b["BranchBFailed"]
 
     def test_no_branch_state_routes_to_top_level_handle_failure(
         self, parallel
@@ -1215,9 +1239,9 @@ class TestNoDanglingTargetsAnywhere:
         error-isolation contract). Branch B gained a third terminal in
         config#2253: PredictorTrainingSkipped (validated-skip success)."""
         expected = [
-            ("$.branch_a", {"BranchAComplete", "BranchAFailed"}),
+            ("branch_a", {"BranchAComplete", "BranchAFailed"}),
             (
-                "$.branch_b",
+                "branch_b",
                 {
                     "BranchBComplete",
                     "BranchBFailed",
@@ -1229,8 +1253,15 @@ class TestNoDanglingTargetsAnywhere:
             ends = {
                 k for k, v in b["States"].items() if v.get("End") is True
             }
-            result_path, names = expected[bi]
+            envelope_key, names = expected[bi]
             assert ends == names, (bi, ends)
             for k in ends:
-                assert b["States"][k]["Type"] == "Pass", (bi, k)
-                assert b["States"][k]["ResultPath"] == result_path, (bi, k)
+                st = b["States"][k]
+                assert st["Type"] == "Pass", (bi, k)
+                # alpha-engine-config-I8194: the terminal REPLACES the
+                # branch payload — the envelope key that used to be the
+                # ResultPath is now the sole top-level key of
+                # Parameters/Result, and ResultPath is absent.
+                assert "ResultPath" not in st, (bi, k)
+                body = st.get("Parameters", st.get("Result"))
+                assert set(body) == {envelope_key}, (bi, k)
