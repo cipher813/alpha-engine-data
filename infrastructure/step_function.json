@@ -7432,12 +7432,113 @@
     },
     "CheckSpotDispatchNeeded": {
       "Type": "Choice",
-      "Comment": "config#2248 (root-cause fix for the always-on dashboard box SPOF): the 14 downstream sendCommand/Lambda states (MorningEnrich through WeeklySubstrateHealthCheck, plus SubstrateHealthGate's Payload) all key off $.ec2_instance_id. That field is no longer a hardcoded literal in the SaturdayTrigger EventBridge Input or the Friday shell-run trigger Lambda (both stripped by config#2248) \u2014 it is populated HERE, either by an already-present operator/rerun value (this Choice's first branch: scripts/weekly_sf_rerun.py's rerun_input() passes the ORIGINAL failed execution's ec2_instance_id through verbatim, so a watch-rerun reuses the same still-live launcher box instead of paying for a second spot launch) or by a fresh ephemeral spot this Choice's Default branch dispatches via DispatchWeeklyFreshnessSpot. Sits where CheckMutexRole's cadence-acquire path (via AcquireMutex) AND its bypass Default (operator/recovery/non-cadence roles, which skip the mutex entirely) BOTH converge -- so every execution passes through this gate exactly once, regardless of pipeline_role, never burning a spot launch on a mutex conflict -- and BEFORE CheckShellRun / any of the 14 consumer states (nothing may reference $.ec2_instance_id before this gate resolves it).",
+      "Comment": "config#2248 (root-cause fix for the always-on dashboard box SPOF): the 14 downstream sendCommand/Lambda states (MorningEnrich through WeeklySubstrateHealthCheck, plus SubstrateHealthGate's Payload) all key off $.ec2_instance_id. That field is no longer a hardcoded literal in the SaturdayTrigger EventBridge Input or the Friday shell-run trigger Lambda (both stripped by config#2248) — it is populated HERE, either by an already-present operator/rerun value (this Choice's first branch: scripts/weekly_sf_rerun.py's rerun_input() passes the ORIGINAL failed execution's ec2_instance_id through verbatim, so a watch-rerun reuses the same still-live launcher box instead of paying for a second spot launch) or by a fresh ephemeral spot this Choice's Default branch dispatches via DispatchWeeklyFreshnessSpot. Sits where CheckMutexRole's cadence-acquire path (via AcquireMutex) AND its bypass Default (operator/recovery/non-cadence roles, which skip the mutex entirely) BOTH converge -- so every execution passes through this gate exactly once, regardless of pipeline_role, never burning a spot launch on a mutex conflict -- and BEFORE CheckShellRun / any of the 14 consumer states (nothing may reference $.ec2_instance_id before this gate resolves it). alpha-engine-config-I8162 adds the SECOND branch: bypass the dispatch entirely when EVERY stage that SSM-invokes onto $.ec2_instance_id is skipped by this execution's input, landing straight on the same CheckShellRun convergence with no ec2_instance_id at all (nothing downstream dereferences it once all of those stages are gated off). Recovery is exactly when the skip set is largest, so the most often-unnecessary stage was the one that always ran: watch-rerun-2026-08-22-1 spent 4 of its 16 minutes in DispatchWeeklyFreshnessSpot -> WaitForWeeklyFreshnessSpotBootstrap. The conjunction is NOT hand-maintained here: it is DERIVED from scripts/weekly_sf_rerun.py's STAGES table by reachability over this definition (box_dispatch_flags) and pinned to this state by tests/test_weekly_sf_rerun.py::TestSpotDispatchOnlyWhenABoxStageSurvives. Edit it there, never here — the two drifting in the other direction denies a boot to a stage that then SSM-invokes onto a box it does not have, which FAILS a run rather than costing four minutes.",
       "Choices": [
         {
           "Variable": "$.ec2_instance_id",
           "IsPresent": true,
           "Next": "NormalizeEc2InstanceId"
+        },
+        {
+          "And": [
+            {
+              "And": [
+                {
+                  "Variable": "$.skip_morning_enrich",
+                  "IsPresent": true
+                },
+                {
+                  "Variable": "$.skip_morning_enrich",
+                  "BooleanEquals": true
+                }
+              ]
+            },
+            {
+              "And": [
+                {
+                  "Variable": "$.skip_data_phase1",
+                  "IsPresent": true
+                },
+                {
+                  "Variable": "$.skip_data_phase1",
+                  "BooleanEquals": true
+                }
+              ]
+            },
+            {
+              "And": [
+                {
+                  "Variable": "$.skip_rag_ingestion",
+                  "IsPresent": true
+                },
+                {
+                  "Variable": "$.skip_rag_ingestion",
+                  "BooleanEquals": true
+                }
+              ]
+            },
+            {
+              "And": [
+                {
+                  "Variable": "$.skip_data_phase2",
+                  "IsPresent": true
+                },
+                {
+                  "Variable": "$.skip_data_phase2",
+                  "BooleanEquals": true
+                }
+              ]
+            },
+            {
+              "And": [
+                {
+                  "Variable": "$.skip_predictor_training",
+                  "IsPresent": true
+                },
+                {
+                  "Variable": "$.skip_predictor_training",
+                  "BooleanEquals": true
+                }
+              ]
+            },
+            {
+              "And": [
+                {
+                  "Variable": "$.skip_backtester",
+                  "IsPresent": true
+                },
+                {
+                  "Variable": "$.skip_backtester",
+                  "BooleanEquals": true
+                }
+              ]
+            },
+            {
+              "And": [
+                {
+                  "Variable": "$.skip_evaluator",
+                  "IsPresent": true
+                },
+                {
+                  "Variable": "$.skip_evaluator",
+                  "BooleanEquals": true
+                }
+              ]
+            },
+            {
+              "And": [
+                {
+                  "Variable": "$.skip_post_eval",
+                  "IsPresent": true
+                },
+                {
+                  "Variable": "$.skip_post_eval",
+                  "BooleanEquals": true
+                }
+              ]
+            }
+          ],
+          "Next": "CheckShellRun"
         }
       ],
       "Default": "DispatchWeeklyFreshnessSpot"
