@@ -195,9 +195,23 @@ GROOM_MAX_DISPATCHES_DAILY = int(os.environ.get("GROOM_MAX_DISPATCHES_DAILY", "4
 # anti-starvation escape valve (they contributed ZERO demand), so they only
 # ever got worked when unrelated issue demand happened to launch a run.
 DEMAND_GATE_ENABLED = os.environ.get("GROOM_DEMAND_GATE_ENABLED", "true").lower() == "true"
+# ── declared roster mirror (alpha-engine-config-I8197) ───────────────────────
+# The `backlog` role from alpha-engine-config/private-docs/REPO_ROSTER.yaml, the
+# single declaration of which org repos hold a groomed backlog. This repo is
+# public and the Lambda deploy artifact is bundled without that private file, so
+# this list is a DECLARED MIRROR: it is registered in the roster's `mirrors:`
+# block and `check_repo_roster_drift.py --live` fails whenever it stops matching
+# the role. A mirror is legal; a mirror that drifts is a CI failure.
+#
+# It had drifted by four repos — symposion, claude-code-config, nousergon-console
+# and oiax were groomed backlogs that this dispatcher's demand gate could not
+# see, so their demand counted as zero toward every tier floor. Do not hand-edit:
+# change the roster, then mirror it here in the same change.
 BACKLOG_REPOS = (
     "nousergon/alpha-engine-config", "nousergon/metron-ops",
-    "nousergon/vires-ops", "nousergon/telos-ops",
+    "nousergon/vires-ops", "nousergon/telos-ops", "nousergon/symposion",
+    "nousergon/claude-code-config", "nousergon/nousergon-console",
+    "nousergon/oiax",
 )
 # config-I3227: the org this Lambda's PR enumeration searches org-wide. Never
 # a hardcoded repo list (config#2294 precedent — see alpha-engine-config's
