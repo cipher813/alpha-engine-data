@@ -62,3 +62,15 @@ bash infrastructure/lambdas/weekly-coverage-sweep/deploy.sh --apply-iam  # IAM o
 ```
 
 Managed outside CloudFormation, same rationale as `weekly-run-scope`.
+
+## Rehearsal path
+
+`infrastructure/lambdas/weekly-coverage-sweep/test_handler.py` — run pre-merge
+by `.github/workflows/ci.yml`'s `infrastructure/lambdas/*/test_handler.py` glob
+and pre-deploy by `_shared/run_handler_tests.sh`, so neither gate can drift from
+the other.
+
+Beyond the unit tests, the Friday-PM shell run is a live rehearsal: the SF
+threads `dry_run.$ = $.research_dry`, so the whole read path — client
+construction, every IAM grant the real run needs, the coverage derivation —
+executes against real infrastructure and writes nothing.
