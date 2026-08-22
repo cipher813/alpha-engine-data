@@ -172,6 +172,25 @@ def test_a_failed_page_does_not_turn_a_finding_into_a_clean_result():
     assert out["outcome"] == index.OUTCOME_FINDINGS
 
 
+def test_dry_run_reports_the_real_outcome_not_a_hardcoded_clean():
+    """A rehearsal that reports green whatever it saw certifies nothing.
+
+    Measured 2026-08-22 on the FIRST live dry invocation: the sweep found 28
+    absent verdicts and 1 finding, and this branch returned `outcome: clean`
+    anyway. That is the same "no data rendered as healthy" defect
+    (principles.md 2.7) the whole sweep exists to detect, shipped inside the
+    detector. What dry_run withholds is the WRITES and the page — never the
+    verdict.
+    """
+    index, calls = _install_stubs(sweep=_Sweep(should_alert=True))
+    out = index.handler({"run_date": "2026-08-22", "dry_run": True}, None)
+    assert out["outcome"] == index.OUTCOME_FINDINGS
+    assert out["dry_run"] is True
+    assert calls.get("published") is None, "a dry run must not write"
+    assert calls.get("augmented") is None, "a dry run must not touch the marker"
+    assert calls.get("alerted") is None, "a dry run must not page"
+
+
 def test_dry_run_writes_nothing():
     """The Friday-PM preflight exercises the read path and every IAM grant it
     needs, and must not touch the marker or the artifact."""
