@@ -413,8 +413,13 @@ class TestChainOrdering:
             st = b[terminal]
             assert st["Type"] == "Pass"
             assert st.get("End") is True, f"{terminal} must End the branch"
-            assert st["Parameters"] == {"status": status}
-            assert st["ResultPath"] == f"$.{branch_key}"
+            # alpha-engine-config-I8194: the status envelope is nested
+            # under branch_key INSIDE Parameters and ResultPath is gone,
+            # so the branch returns ~40 bytes instead of its whole
+            # effective input. $.parity_parallel_result[i].{branch_key}
+            # .status still resolves exactly as before.
+            assert st["Parameters"] == {branch_key: {"status": status}}
+            assert "ResultPath" not in st
 
     def test_backtest_reachable_strictly_before_parity(self, sf, states):
         """Walk the HAPPY path from StartAt and assert Backtester (backtest

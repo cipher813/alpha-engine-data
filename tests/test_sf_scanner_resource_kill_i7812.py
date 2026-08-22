@@ -241,10 +241,17 @@ def test_the_kill_marker_is_seeded_both_polarities_and_hoisted_out_of_the_branch
     assert '"scanner_resource_kill":false' in floor
     assert branch_a["ScannerResourceKill"]["ResultPath"] == "$.scanner_resource_kill"
     assert branch_a["ScannerResourceKill"]["Result"] is True
-    assert branch_a["BranchAComplete"]["Parameters"]["scanner_resource_kill.$"] == (
-        "$.scanner_resource_kill"
+    # alpha-engine-config-I8194: the hoisted fields moved one level down,
+    # inside the branch_a envelope that Parameters now IS (no ResultPath).
+    assert branch_a["BranchAComplete"]["Parameters"]["branch_a"][
+        "scanner_resource_kill.$"
+    ] == "$.scanner_resource_kill"
+    assert (
+        branch_a["BranchAFailed"]["Parameters"]["branch_a"][
+            "scanner_resource_kill"
+        ]
+        is False
     )
-    assert branch_a["BranchAFailed"]["Parameters"]["scanner_resource_kill"] is False
     assert states["AggregateBranchOutcomes"]["Parameters"]["scanner_resource_kill.$"] == (
         "$.parallel_result[0].branch_a.scanner_resource_kill"
     )
