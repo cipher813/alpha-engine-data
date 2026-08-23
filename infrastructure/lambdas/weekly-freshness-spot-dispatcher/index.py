@@ -416,10 +416,10 @@ python3.12 -m venv .venv || fail "data venv create failed"
 .venv/bin/pip install --upgrade pip -q || fail "data pip upgrade failed"
 [ -f requirements.txt ] || fail "alpha-engine-data requirements.txt missing"
 .venv/bin/pip install -q -r requirements.txt || fail "data requirements install failed"
-# krepis is not in alpha-engine-data's requirements.txt but stage_output_sweep
-# and the ssm_log_capture wrapper resolve krepis modules; install it explicitly
-# rather than letting an import failure read as a domain finding.
-.venv/bin/pip install -q 'krepis>=0.59.8' || fail "data krepis install failed"
+# Keep the dispatch box on the same released contract as its packaged Lambda.
+# A floor here would let a later bootstrap resolve a pre-I8155 stage-coverage
+# implementation even though the repository pin has already moved.
+.venv/bin/pip install -q 'krepis==0.59.31' || fail "data krepis install failed"
 chown -R ec2-user:ec2-user /home/ec2-user/alpha-engine-data/.venv || fail "data venv chown failed"
 trap - EXIT
 aws s3 cp {log} "{s3_log}" --region {REGION} --quiet || true
