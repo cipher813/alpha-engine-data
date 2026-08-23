@@ -8,6 +8,6 @@
 #     unconditional dependency of nousergon-lib, no extra needed)
 #
 # FLOOR, not a preference: coverage.py and completion_marker.py first exist in
-# v0.124.86. A lower pin makes this handler fail its import and return
+# v0.124.87. A lower pin makes this handler fail its import and return
 # outcome=unavailable every week — which pages honestly, but detects nothing.
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.86
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.87
