@@ -16,4 +16,4 @@
 # only the LAMBDA_CAPABILITIES profile (AWS control plane), and every check
 # needing more is reported status="skip" rather than executed.
 aws-assume-role-lib
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.86
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.87

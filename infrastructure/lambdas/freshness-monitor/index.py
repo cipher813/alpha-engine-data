@@ -92,7 +92,7 @@ from nousergon_lib.artifact_freshness import (
     resolve_current_cycle,
     resolve_dedup_key,
 )
-from nousergon_lib.trading_calendar import previous_trading_day
+from nousergon_lib.trading_calendar import last_closed_trading_day, previous_trading_day
 from flow_doctor_telegram import notify_via_flow_doctor
 from nousergon_lib.flow_doctor_fleet import FleetTelegramTopic
 
@@ -1759,10 +1759,15 @@ def _resolve_recovery_params(
         return {}
     cycle_tick, cycle_label = resolve_current_cycle(spec, now)
     iso = cycle_tick.date().isoformat()
+    # Match nousergon_lib.artifact_freshness._format_key (I8240): {date} is
+    # the cycle/calendar axis; {trading_day} is last_closed_trading_day.
+    trading_day = last_closed_trading_day(cycle_tick).isoformat()
     resolved: dict[str, Any] = {}
     for k, v in params.items():
         if isinstance(v, str):
-            resolved[k] = v.format(date=iso, trading_day=iso, cycle_label=cycle_label)
+            resolved[k] = v.format(
+                date=iso, trading_day=trading_day, cycle_label=cycle_label,
+            )
         else:
             resolved[k] = v
     return resolved
