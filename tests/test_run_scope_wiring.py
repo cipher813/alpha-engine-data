@@ -71,6 +71,11 @@ def test_it_runs_after_every_work_stage_and_before_the_report_card(states):
     assert predecessors == {
         "CheckSubstrateHealthCheckStatus",
         "SetSubstrateHealthCheckDegradedSummary",
+        # alpha-engine-config-I8167: CheckSkipSaturdayHealthCheck's bypass
+        # route (skip_saturday_health_check=true) lands here directly,
+        # bypassing SaturdayHealthCheck/WeeklySubstrateHealthCheck entirely
+        # — a third route into the post-eval tail, alongside the two above.
+        "CheckSkipSaturdayHealthCheck",
     }
 
 

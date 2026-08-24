@@ -570,32 +570,55 @@ STAGES: tuple[Stage, ...] = (
         # rerun derived from one of those must still attribute the failure.
         historical_work=frozenset({"Evaluator"}),
     ),
-    # config#6054: the coarse post_eval span is SPLIT. The two health checks
-    # keep no flag of their own — they are advisory, idempotent, and cheap,
-    # so a tail rerun simply re-runs them (their degraded markers are carried
-    # by the post_eval alias row below, informationally; a health-check
-    # degradation alone never forces a ReportCard re-run, which is why they
-    # are NOT in report_card's degraded_witness). skip_post_eval survives in
-    # the DEFINITION as a deprecated whole-tail alias (CheckSkipPostEval)
-    # for in-flight inputs; the deriver no longer emits it — it emits the
-    # per-stage flags below.
+    # config#6054: the coarse post_eval span is SPLIT — ReportCard/Director
+    # got their own rows below. alpha-engine-config-I8167 splits it FURTHER:
+    # the two health checks now sit behind their OWN gate
+    # (CheckSkipSaturdayHealthCheck / skip_saturday_health_check, this row),
+    # reached one hop downstream of the deprecated whole-tail
+    # CheckSkipPostEval alias (the post_eval row right below). Root cause:
+    # skip_post eval could never be the flag the I8162 spot-dispatch bypass
+    # emits, because setting it ALSO bypasses ReportCard/Director/
+    # ScannerLeaderboard — flags a mechanical recovery must never silently
+    # set. This row owns emission (emit_skip=True, the default): a recovery
+    # chain that witnessed both health checks complete (RunScope entered)
+    # emits skip_saturday_health_check=true, the flag CheckSpotDispatchNeeded's
+    # bypass conjunction now tests instead of skip_post_eval.
     Stage(
-        "post_eval", "skip_post_eval",
-        "CheckSkipPostEval", "SaturdayHealthCheck",
-        frozenset({"CheckShellRunNotify"}),
-        # Health-check degraded routes only (config#2276) — ReportCard's
-        # and Director's moved to their own rows below (config#6054).
+        "saturday_health_check", "skip_saturday_health_check",
+        "CheckSkipSaturdayHealthCheck", "SaturdayHealthCheck",
+        frozenset({"RunScope"}),
+        # Same degraded routes the coarse post_eval row used to own — a
+        # health-check degradation is fail-open and continues to RunScope,
+        # so entering one of these must still force a re-run rather than
+        # read as "completed" (I6055). Ownership moved here from post_eval;
+        # never duplicate a degraded route across two rows
+        # (test_every_degraded_state_is_mapped enforces exactly one owner).
         degraded_witness=frozenset({
             "SaturdayHealthCheckDegraded", "SetSaturdayHealthCheckDegradedSummary",
             "SubstrateHealthCheckDegraded", "SetSubstrateHealthCheckDegradedSummary",
         }),
+    ),
+    Stage(
+        "post_eval", "skip_post_eval",
+        "CheckSkipPostEval", "SaturdayHealthCheck",
+        frozenset({"CheckShellRunNotify"}),
         emit_skip=False,
+        # detect_failure=False (alpha-engine-config-I8167): shares its `work`
+        # state with "saturday_health_check" above, which now owns
+        # completion/failure/degraded detection for the physical
+        # SaturdayHealthCheck/WeeklySubstrateHealthCheck pair — same shared-work
+        # convention as "backtester_stage_only" sharing "backtester"'s work.
+        # A second row detecting the same work state would double-count it
+        # without changing any outcome.
+        detect_failure=False,
         note=(
-            "skip_post_eval is a DEPRECATED whole-tail alias (config#6054): "
-            "the deriver emits skip_report_card / skip_director instead; the "
-            "health checks re-run on any tail rerun (advisory + idempotent). "
-            "Remove the alias once a full cycle has passed on the split "
-            "flags."
+            "skip_post_eval is a DEPRECATED whole-tail alias (config#6054, "
+            "config-I8167): the deriver emits skip_report_card / "
+            "skip_director / skip_saturday_health_check instead. Kept in "
+            "the DEFINITION only for in-flight inputs that still set it — "
+            "its meaning (bypass the entire post-Evaluator tail, including "
+            "ReportCard/Director/ScannerLeaderboard) is UNCHANGED. Remove "
+            "the alias once a full cycle has passed on the split flags."
         ),
     ),
     Stage(
@@ -658,6 +681,7 @@ STAGES: tuple[Stage, ...] = (
 )
 
 STAGES_BY_NAME = {s.name: s for s in STAGES}
+STAGES_BY_FLAG = {s.flag: s for s in STAGES}
 BRANCH_A_STAGES = frozenset({
     # alpha-engine-config-I2515 Phase B: "research" removed (the
     # multi-agent Research state — and its skip_research flag /
@@ -865,6 +889,28 @@ def box_dispatch_flags(sm_def: dict) -> tuple:
         trial = [f for f in kept if f != flag]
         if not box_states_needing_dispatch(sm_def, {f: True for f in trial}):
             kept = trial
+    # alpha-engine-config-I8167: every surviving conjunct must be a flag this
+    # SCRIPT can actually set — a conjunct backed only by a stage with
+    # emit_skip=False is a predicate no producer emits, which reads as live
+    # in the definition (CheckSpotDispatchNeeded's Choice tests it) while
+    # being permanently unreachable from any input this script derives. This
+    # is exactly the shape I8162 shipped: skip_post_eval was the sole
+    # coverer of the health-check span and carried emit_skip=False, so the
+    # bypass could never fire from a mechanical recovery's derived input.
+    # Fail the build here rather than let it recur silently.
+    non_emittable = [f for f in kept if not STAGES_BY_FLAG[f].emit_skip]
+    if non_emittable:
+        raise SystemExit(
+            f"FATAL: CheckSpotDispatchNeeded's bypass conjunction would "
+            f"include {non_emittable}, whose STAGES row(s) carry "
+            "emit_skip=False — this script's deriver can never SET that "
+            "flag, so the bypass predicate reads as live but is dead code "
+            "for every input derive_plan() produces (alpha-engine-config-"
+            "I8162 / I8167). Either give the stage that uniquely covers "
+            "this span its own emit_skip=True STAGES row, or prove it "
+            "genuinely redundant (drop it) so the minimization above "
+            "removes it instead."
+        )
     return tuple(kept)
 
 
@@ -1081,12 +1127,15 @@ def _simulate_reachable_works(flags: dict, original_input: dict) -> set:
         run_linear(["backtester", "predictor_backtest", "portfolio_optimizer_backtest"])
         run_parity_family()
     # config#6054 split the coarse post_eval span: post_eval survives as the
-    # deprecated whole-tail alias (its health checks re-run on any tail rerun)
-    # while report_card / director are now independently gated. All three are
-    # modeled here so the degraded-aware reachability guard (which now folds
-    # DEGRADED stages into must_rerun) can see post_eval — its health-check
-    # degraded_witness — as reachable when a tail rerun re-runs the span.
-    run_linear(["evaluator", "post_eval", "report_card", "director"])
+    # deprecated whole-tail alias while report_card / director are
+    # independently gated. alpha-engine-config-I8167 split it further —
+    # saturday_health_check now owns the two health-check states behind its
+    # own gate, one hop downstream of post_eval's (still-live) whole-tail
+    # alias. All four are modeled here so the degraded-aware reachability
+    # guard (which folds DEGRADED stages into must_rerun) can see
+    # saturday_health_check — its health-check degraded_witness — as
+    # reachable when a tail rerun re-runs the span.
+    run_linear(["evaluator", "saturday_health_check", "post_eval", "report_card", "director"])
     return ran
 
 

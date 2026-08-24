@@ -157,6 +157,12 @@ _EXPECTED_SKIPS = {
     # and Director independently.
     "skip_report_card",
     "skip_director",
+    # alpha-engine-config-I8167: health-check-only gate, one hop downstream
+    # of skip_post_eval's (still-live) whole-tail alias — bypasses only
+    # SaturdayHealthCheck/WeeklySubstrateHealthCheck, leaving ReportCard/
+    # Director/ScannerLeaderboard unaffected. emit_skip=True in STAGES, so
+    # this is the flag a mechanical recovery's derived input actually sets.
+    "skip_saturday_health_check",
     # alpha-engine-config-I7813: the observe-only scanner leaderboard leaf,
     # placed after Director. Its own gate so a rerun that already produced
     # the board does not pay a second ~904-symbol closes-panel read.

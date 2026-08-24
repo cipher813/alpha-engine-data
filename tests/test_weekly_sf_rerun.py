@@ -298,9 +298,15 @@ class TestDerivePlan:
         backward compatibility with pre-fix execution histories — new
         executions never enter it."""
         plan = mod.derive_plan(_events("director_degraded"))
-        # the degraded tail must re-run — never skipped, never "completed"
-        assert "post_eval" in plan.degraded
-        assert "post_eval" not in plan.completed
+        # the degraded tail must re-run — never skipped, never "completed".
+        # alpha-engine-config-I8167: ownership of the health-check degraded
+        # routes moved from the deprecated "post_eval" alias row to the new
+        # "saturday_health_check" row (emit_skip=True) — post_eval no longer
+        # carries a degraded_witness at all.
+        assert "saturday_health_check" in plan.degraded
+        assert "saturday_health_check" not in plan.completed
+        assert "skip_saturday_health_check" not in plan.skip_flags
+        assert "post_eval" not in plan.degraded
         assert "skip_post_eval" not in plan.skip_flags
         # the degradation must be surfaced in the derivation notes
         # (PublishDirectorDegraded retained in degraded_witness for backward compat)
@@ -1260,8 +1266,15 @@ class TestChainedRecoveryKeepsTheOriginalRunsProgress:
             )],
             source_label="watch-rerun-2026-08-22-1",
         )
-        assert "post_eval" in plan.degraded
-        assert "post_eval" not in plan.completed
+        # alpha-engine-config-I8167: degraded-route ownership moved to the
+        # new "saturday_health_check" row. "post_eval" (the deprecated,
+        # emit_skip=False whole-tail alias) still reads "completed" from the
+        # prior link's witness (CheckShellRunNotify) — informational only,
+        # since emit_skip=False means it never emits skip_post_eval.
+        assert "saturday_health_check" in plan.degraded
+        assert "saturday_health_check" not in plan.completed
+        assert "post_eval" not in plan.degraded
+        assert "skip_post_eval" not in plan.skip_flags
 
     def test_the_chain_reads_histories_never_a_previous_inputs_flags(self, mod):
         """Immunity to alpha-engine-config-I7259 is structural, not a rule the
@@ -1446,3 +1459,109 @@ class TestSpotDispatchOnlyWhenABoxStageSurvives:
         flags = {f: True for f in mod.box_dispatch_flags(sf_def)}
         flags["ec2_instance_id"] = "i-abc"
         assert _dispatch_gate_next(gate, flags) == "NormalizeEc2InstanceId"
+
+    def test_every_conjunct_is_emittable(self, mod, sf_def):
+        """alpha-engine-config-I8167: every flag CheckSpotDispatchNeeded's
+        bypass conjunction tests must be a flag derive_plan() can actually
+        SET (emit_skip=True) — a conjunct backed only by an emit_skip=False
+        stage reads as live in the definition but is dead code for every
+        input this script derives. This is a direct assertion pinning
+        box_dispatch_flags' own I8167 guard against the live definition, not
+        just a unit test of the guard in isolation (see the two tests
+        below for that)."""
+        for flag in mod.box_dispatch_flags(sf_def):
+            stage = mod.STAGES_BY_FLAG[flag]
+            assert stage.emit_skip, (
+                f"{flag} ({stage.name}) is in the bypass conjunction but "
+                "its STAGES row carries emit_skip=False — no input "
+                "derive_plan() emits can ever satisfy the bypass. Give the "
+                "stage its own emit_skip=True row (skip_saturday_health_check "
+                "did this for the health-check span) or prove it redundant."
+            )
+
+    def test_skip_saturday_health_check_is_emit_skip_true(self, mod):
+        """Pins the specific I8167 fix: the health-check span's flag is
+        emittable, replacing the old skip_post_eval conjunct (emit_skip=False,
+        a deliberately DEPRECATED alias — see its STAGES row's note)."""
+        assert mod.STAGES_BY_NAME["saturday_health_check"].emit_skip is True
+        assert mod.STAGES_BY_NAME["post_eval"].emit_skip is False
+
+    def test_a_non_emittable_sole_coverer_fails_the_build(
+        self, mod, sf_def, monkeypatch
+    ):
+        """Regression guard reproducing the exact I8162 defect shape this
+        issue fixes: a box-addressing span whose ONLY covering STAGES row
+        carries emit_skip=False must fail box_dispatch_flags() loudly,
+        never silently ship a dead conjunct. Simulated by removing the
+        (emittable) saturday_health_check row from STAGES so skip_post_eval
+        — emit_skip=False — becomes, once again, the sole flag the
+        reachability minimization can find to cover the health-check span
+        against the REAL, unmodified step_function.json."""
+        trimmed = tuple(
+            s for s in mod.STAGES if s.name != "saturday_health_check"
+        )
+        monkeypatch.setattr(mod, "STAGES", trimmed)
+        monkeypatch.setattr(
+            mod, "STAGES_BY_NAME", {s.name: s for s in trimmed}
+        )
+        monkeypatch.setattr(
+            mod, "STAGES_BY_FLAG", {s.flag: s for s in trimmed}
+        )
+        with pytest.raises(SystemExit, match="emit_skip=False"):
+            mod.box_dispatch_flags(sf_def)
+
+    def test_a_helper_generated_director_only_recovery_satisfies_the_bypass(
+        self, mod, sf_def
+    ):
+        """alpha-engine-config-I8167 closes-when: a recovery whose chain
+        witnessed every box stage complete (everything but Director) derives
+        an input that SATISFIES CheckSpotDispatchNeeded's bypass conjunction.
+        Before this fix the bypass was unreachable from any input
+        derive_plan() could produce — its sole health-check conjunct
+        (skip_post_eval) carried emit_skip=False, so no derived input ever
+        set it. Synthesized minimally: one stateEnteredEventDetails per
+        witness state for each of the 8 box-conjunct stages, plus Director's
+        own work state entered-but-not-completed (the recovery target)."""
+        events = [
+            {
+                "type": "ExecutionStarted",
+                "executionStartedEventDetails": {
+                    "input": json.dumps({
+                        "pipeline_role": "watch-rerun",
+                        "run_date": "2026-08-24",
+                    }),
+                },
+            },
+            *[
+                {"type": "TaskStateEntered", "stateEnteredEventDetails": {"name": n}}
+                for n in [
+                    "CheckSkipDataPhase1",               # morning_enrich witness
+                    "ResearchPredictorParallel",          # data_phase1 witness
+                    "CheckSkipRegimeRetrospectiveEval",   # rag_ingestion witness
+                    "CheckSkipEvalJudge",                 # data_phase2 witness
+                    "ResolveZooSpecs",                    # predictor_training witness
+                    "CheckSkipPredictorBacktest",         # backtester witness
+                    "CheckSkipPostEval",                  # evaluator witness
+                    "RunScope",                           # saturday_health_check witness (I8167)
+                    "Director",                           # director's WORK state: entered, unfinished
+                ]
+            ],
+        ]
+        plan = mod.derive_plan(events)
+        assert "director" in plan.failed
+
+        derived_box_flags = set(mod.box_dispatch_flags(sf_def))
+        assert derived_box_flags <= set(plan.skip_flags), (
+            f"missing box-conjunct flags: {derived_box_flags - set(plan.skip_flags)}"
+        )
+        assert all(plan.skip_flags[f] is True for f in derived_box_flags)
+        # skip_saturday_health_check specifically — not the old, non-emittable
+        # skip_post_eval conjunct — is what got emitted.
+        assert plan.skip_flags.get("skip_saturday_health_check") is True
+
+        gate = sf_def["States"]["CheckSpotDispatchNeeded"]
+        assert _dispatch_gate_next(gate, plan.skip_flags) == mod.SPOT_DISPATCH_CONVERGENCE, (
+            "a helper-generated Director-only recovery input must take the "
+            "spot-dispatch bypass, not boot a box to re-run advisory, "
+            "idempotent health checks"
+        )
