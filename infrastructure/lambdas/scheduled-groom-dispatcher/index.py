@@ -209,7 +209,7 @@ DEMAND_GATE_ENABLED = os.environ.get("GROOM_DEMAND_GATE_ENABLED", "true").lower(
 # change the roster, then mirror it here in the same change.
 BACKLOG_REPOS = (
     "nousergon/alpha-engine-config", "nousergon/metron-ops",
-    "nousergon/vires-ops", "nousergon/telos-ops", "nousergon/symposion",
+    "nousergon/vires-ops", "nousergon/telos-ops",
     "nousergon/claude-code-config", "nousergon/nousergon-console",
     "nousergon/oiax", "nousergon/scannerctl",
 )
