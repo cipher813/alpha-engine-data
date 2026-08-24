@@ -900,6 +900,24 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+  - class: research_weekly_ledger_alerts
+    # alpha-engine-config-I8264 static-chokepoint registration. Emitted by
+    # crucible-research/lambda/scanner_handler.py after
+    # scoring/weekly_ledger.py::record_completed_week reports a week that
+    # CLOSED and could not be recorded (`unmeasurable`, or an unhandled
+    # error). The universe-cut slot's ledger is append-only and forward-only:
+    # a run records the one week that just ended, and no later run can go back
+    # and fill it, so an unrecorded week is permanently unrecorded. The write
+    # is observe-only and never reds the Scanner run, which is exactly why the
+    # failure needs a surface with a consumer rather than a WARN
+    # (ARCHITECTURE §61(a); champion-challenger-policy.md §7.2 — an
+    # unmeasurable result must not render as an empty success). A week that
+    # simply did not close is `skipped` and does NOT alert.
+    # The call site publishes with explicit severity="ERROR".
+    source: "research:weekly_ledger"
+    severities: [error]
+    intake: bus
+    response: drain-queue
   - class: research_corpus_stats_alerts
     # alpha-engine-config-I7896 static-chokepoint registration. Emitted by
     # crucible-research/lambda/aggregate_costs_handler.py::_refresh_corpus_stats
