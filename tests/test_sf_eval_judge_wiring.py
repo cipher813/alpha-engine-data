@@ -212,7 +212,11 @@ class TestSkipBacktesterPreservesEvalJudge:
             == "CheckSkipPostEval"
         )
         # The tail gate defaults to the full health-check tail (normal run).
-        assert states["CheckSkipPostEval"]["Default"] == "SaturdayHealthCheck"
+        # alpha-engine-config-I8167: the tail gate now defaults one hop
+        # downstream, to the new health-check-only skip gate — which itself
+        # defaults to SaturdayHealthCheck on a normal run.
+        assert states["CheckSkipPostEval"]["Default"] == "CheckSkipSaturdayHealthCheck"
+        assert states["CheckSkipSaturdayHealthCheck"]["Default"] == "SaturdayHealthCheck"
 
 
 class TestSkipEvalJudge:
@@ -920,4 +924,8 @@ class TestJudgeChainBeforePredictor:
             == "CheckSkipPostEval"
         )
         # The tail gate defaults to the full health-check tail on a normal run.
-        assert states["CheckSkipPostEval"]["Default"] == "SaturdayHealthCheck"
+        # alpha-engine-config-I8167: the tail gate now defaults one hop
+        # downstream, to the new health-check-only skip gate — which itself
+        # defaults to SaturdayHealthCheck on a normal run.
+        assert states["CheckSkipPostEval"]["Default"] == "CheckSkipSaturdayHealthCheck"
+        assert states["CheckSkipSaturdayHealthCheck"]["Default"] == "SaturdayHealthCheck"

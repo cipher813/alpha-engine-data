@@ -6113,7 +6113,7 @@
     },
     "CheckSkipPostEval": {
       "Type": "Choice",
-      "Comment": "Post-Evaluator tail skip-gate (config#830). {\"skip_post_eval\": true} stops the run right after Evaluator \u2014 bypassing the five full-run-only tail stages (SaturdayHealthCheck \u2192 WeeklySubstrateHealthCheck \u2192 ReportCard \u2192 Director \u2192 ScannerLeaderboard, none of which previously had a skip gate; ScannerLeaderboard is the alpha-engine-config-I7813 observe-only board leaf) and routing straight to CheckShellRunNotify so the SUCCESS SNS notify (and the shell-run-tagged variant) still fire. This is the one behavioral gap a standalone Backtester\u2192Evaluator SF used to cover; closing it here lets the weekly SF reproduce that shape via mode=backtest-eval with no forked state machine. The tail stages are advisory/observability only (health checks are non-blocking; ReportCard/Director are non-fatal advisories), so stopping before them is safe for a mid-week backtester/evaluator code rerun. Missing flag = run the full tail as normal, so scheduled Saturday runs are unaffected. Both inbound edges (CheckEvaluatorStatus Success and CheckSkipEvaluator skip) converge here, preserving the prior 'Evaluator-skipped still notifies' behavior.",
+      "Comment": "Post-Evaluator tail skip-gate (config#830). {\"skip_post_eval\": true} stops the run right after Evaluator \u2014 bypassing the five full-run-only tail stages (SaturdayHealthCheck \u2192 WeeklySubstrateHealthCheck \u2192 ReportCard \u2192 Director \u2192 ScannerLeaderboard, none of which previously had a skip gate; ScannerLeaderboard is the alpha-engine-config-I7813 observe-only board leaf) and routing straight to CheckShellRunNotify so the SUCCESS SNS notify (and the shell-run-tagged variant) still fire. This is the one behavioral gap a standalone Backtester\u2192Evaluator SF used to cover; closing it here lets the weekly SF reproduce that shape via mode=backtest-eval with no forked state machine. The tail stages are advisory/observability only (health checks are non-blocking; ReportCard/Director are non-fatal advisories), so stopping before them is safe for a mid-week backtester/evaluator code rerun. Missing flag = run the full tail as normal, so scheduled Saturday runs are unaffected. Both inbound edges (CheckEvaluatorStatus Success and CheckSkipEvaluator skip) converge here, preserving the prior 'Evaluator-skipped still notifies' behavior. alpha-engine-config-I8167: skip_post_eval keeps this exact whole-tail meaning \u2014 the health-check-only bypass now lives one hop downstream at CheckSkipSaturdayHealthCheck, so a skip_post_eval=true run never reaches that gate at all.",
       "Choices": [
         {
           "And": [
@@ -6127,6 +6127,26 @@
             }
           ],
           "Next": "CheckShellRunNotify"
+        }
+      ],
+      "Default": "CheckSkipSaturdayHealthCheck"
+    },
+    "CheckSkipSaturdayHealthCheck": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I8167: health-check-only skip-gate, split out of the coarse CheckSkipPostEval span (config#6054 had already stopped emitting skip_post_eval for this purpose \u2014 see the post_eval Stage row's note in scripts/weekly_sf_rerun.py \u2014 but left no flag a mechanical recovery could actually set to reach the I8162 spot-dispatch bypass; skip_post_eval could not be reused because it also bypasses ReportCard/Director/ScannerLeaderboard, which I8162's bypass conjunction must not silently skip). {\"skip_saturday_health_check\": true} bypasses ONLY the two health-observe stages (SaturdayHealthCheck \u2192 WeeklySubstrateHealthCheck and their Wait/poll/Degraded satellites) and lands on RunScope \u2014 the same convergence point CheckSubstrateHealthCheckStatus's own Success edge and SetSubstrateHealthCheckDegradedSummary already use \u2014 so ReportCard, Director and ScannerLeaderboard are unaffected. Ruled 2026-08-24 (alpha-engine-config-I8167, operator decision (a)): the health checks are advisory and idempotent, which argues for a cheap re-run skip, not for booting a spot instance merely to re-run them. Missing flag = run both health checks as normal, so scheduled Saturday runs are unaffected. Sits strictly downstream of CheckSkipPostEval's Default so skip_post_eval=true (whole-tail) still short-circuits before ever reaching this gate.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_saturday_health_check",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_saturday_health_check",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "RunScope"
         }
       ],
       "Default": "SaturdayHealthCheck"
@@ -7432,7 +7452,7 @@
     },
     "CheckSpotDispatchNeeded": {
       "Type": "Choice",
-      "Comment": "config#2248 (root-cause fix for the always-on dashboard box SPOF): the 14 downstream sendCommand/Lambda states (MorningEnrich through WeeklySubstrateHealthCheck, plus SubstrateHealthGate's Payload) all key off $.ec2_instance_id. That field is no longer a hardcoded literal in the SaturdayTrigger EventBridge Input or the Friday shell-run trigger Lambda (both stripped by config#2248) — it is populated HERE, either by an already-present operator/rerun value (this Choice's first branch: scripts/weekly_sf_rerun.py's rerun_input() passes the ORIGINAL failed execution's ec2_instance_id through verbatim, so a watch-rerun reuses the same still-live launcher box instead of paying for a second spot launch) or by a fresh ephemeral spot this Choice's Default branch dispatches via DispatchWeeklyFreshnessSpot. Sits where CheckMutexRole's cadence-acquire path (via AcquireMutex) AND its bypass Default (operator/recovery/non-cadence roles, which skip the mutex entirely) BOTH converge -- so every execution passes through this gate exactly once, regardless of pipeline_role, never burning a spot launch on a mutex conflict -- and BEFORE CheckShellRun / any of the 14 consumer states (nothing may reference $.ec2_instance_id before this gate resolves it). alpha-engine-config-I8162 adds the SECOND branch: bypass the dispatch entirely when EVERY stage that SSM-invokes onto $.ec2_instance_id is skipped by this execution's input, landing straight on the same CheckShellRun convergence with no ec2_instance_id at all (nothing downstream dereferences it once all of those stages are gated off). Recovery is exactly when the skip set is largest, so the most often-unnecessary stage was the one that always ran: watch-rerun-2026-08-22-1 spent 4 of its 16 minutes in DispatchWeeklyFreshnessSpot -> WaitForWeeklyFreshnessSpotBootstrap. The conjunction is NOT hand-maintained here: it is DERIVED from scripts/weekly_sf_rerun.py's STAGES table by reachability over this definition (box_dispatch_flags) and pinned to this state by tests/test_weekly_sf_rerun.py::TestSpotDispatchOnlyWhenABoxStageSurvives. Edit it there, never here — the two drifting in the other direction denies a boot to a stage that then SSM-invokes onto a box it does not have, which FAILS a run rather than costing four minutes.",
+      "Comment": "config#2248 (root-cause fix for the always-on dashboard box SPOF): the 14 downstream sendCommand/Lambda states (MorningEnrich through WeeklySubstrateHealthCheck, plus SubstrateHealthGate's Payload) all key off $.ec2_instance_id. That field is no longer a hardcoded literal in the SaturdayTrigger EventBridge Input or the Friday shell-run trigger Lambda (both stripped by config#2248) — it is populated HERE, either by an already-present operator/rerun value (this Choice's first branch: scripts/weekly_sf_rerun.py's rerun_input() passes the ORIGINAL failed execution's ec2_instance_id through verbatim, so a watch-rerun reuses the same still-live launcher box instead of paying for a second spot launch) or by a fresh ephemeral spot this Choice's Default branch dispatches via DispatchWeeklyFreshnessSpot. Sits where CheckMutexRole's cadence-acquire path (via AcquireMutex) AND its bypass Default (operator/recovery/non-cadence roles, which skip the mutex entirely) BOTH converge -- so every execution passes through this gate exactly once, regardless of pipeline_role, never burning a spot launch on a mutex conflict -- and BEFORE CheckShellRun / any of the 14 consumer states (nothing may reference $.ec2_instance_id before this gate resolves it). alpha-engine-config-I8162 adds the SECOND branch: bypass the dispatch entirely when EVERY stage that SSM-invokes onto $.ec2_instance_id is skipped by this execution's input, landing straight on the same CheckShellRun convergence with no ec2_instance_id at all (nothing downstream dereferences it once all of those stages are gated off). Recovery is exactly when the skip set is largest, so the most often-unnecessary stage was the one that always ran: watch-rerun-2026-08-22-1 spent 4 of its 16 minutes in DispatchWeeklyFreshnessSpot -> WaitForWeeklyFreshnessSpotBootstrap. The conjunction is NOT hand-maintained here: it is DERIVED from scripts/weekly_sf_rerun.py's STAGES table by reachability over this definition (box_dispatch_flags) and pinned to this state by tests/test_weekly_sf_rerun.py::TestSpotDispatchOnlyWhenABoxStageSurvives. Edit it there, never here — the two drifting in the other direction denies a boot to a stage that then SSM-invokes onto a box it does not have, which FAILS a run rather than costing four minutes. alpha-engine-config-I8167 (operator decision (a), 2026-08-24): the deriver's 8th conjunct is now skip_saturday_health_check rather than skip_post_eval, because skip_post_eval could never be reached from a mechanical recovery's Director-only input without also silently disabling ReportCard/Director/ScannerLeaderboard — see CheckSkipSaturdayHealthCheck.",
       "Choices": [
         {
           "Variable": "$.ec2_instance_id",
@@ -7528,11 +7548,11 @@
             {
               "And": [
                 {
-                  "Variable": "$.skip_post_eval",
+                  "Variable": "$.skip_saturday_health_check",
                   "IsPresent": true
                 },
                 {
-                  "Variable": "$.skip_post_eval",
+                  "Variable": "$.skip_saturday_health_check",
                   "BooleanEquals": true
                 }
               ]

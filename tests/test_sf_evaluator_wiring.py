@@ -267,7 +267,11 @@ class TestHalfOrdering:
         success = next(c for c in chk["Choices"]
                        if c.get("StringEquals") == "Success")
         assert success["Next"] == "CheckSkipPostEval"
-        assert states["CheckSkipPostEval"]["Default"] == "SaturdayHealthCheck"
+        # alpha-engine-config-I8167: the tail gate now defaults one hop
+        # downstream, to the new health-check-only skip gate — which itself
+        # defaults to SaturdayHealthCheck on a normal run.
+        assert states["CheckSkipPostEval"]["Default"] == "CheckSkipSaturdayHealthCheck"
+        assert states["CheckSkipSaturdayHealthCheck"]["Default"] == "SaturdayHealthCheck"
 
 
 # ── Poll loop, per half ───────────────────────────────────────────────────
