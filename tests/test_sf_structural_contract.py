@@ -273,6 +273,14 @@ _DEGRADED_FLAG_JSONPATHS: dict[str, frozenset[str]] = {
             # leaf's own flag. Read LAST in CheckGateDegradedNotify, so a run
             # that also degraded something consequential still reports that.
             "$.scanner_leaderboard_degraded",
+            # alpha-engine-config-I7194: AggregateCosts moved out of
+            # ResearchPredictorParallel branch 0 onto the top-level tail (so it
+            # runs AFTER Director, whose director-plan rows it could never see
+            # from inside the Parallel). Its fail-open can no longer ride the
+            # branch-local $.research_degraded_local fold, so it gets its own
+            # family — also read LAST, folded into the generic combined
+            # notifier rather than given a per-combination Task of its own.
+            "$.aggregate_costs_degraded",
         }
     ),
     "step_function_daily.json": frozenset({"$.degraded_summary"}),
@@ -528,18 +536,10 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
         ),
         "ResearchPredictorParallel.Counterfactual": (
             "Same fold as Scanner (routes through MarkCounterfactualDegraded) "
-            "before continuing to CheckSkipAggregateCosts unchanged."
-        ),
-        "ResearchPredictorParallel.AggregateCosts": (
-            "FIXED (alpha-engine-config#6722): matched sf-pipeline-policy.md "
-            "§5's NAMED cost-aggregation carve-out verbatim ('Health-check "
-            "and cost-aggregation stages may fail-open ... They must still "
-            "set a degraded flag') without complying — Catch routed "
-            "straight to BranchAComplete with zero flag. Now routes through "
-            "MarkAggregateCostsDegraded (same branch-local fold as Scanner) "
-            "before continuing to BranchAComplete unchanged — the §5 "
-            "clause's flag requirement is now met, verified by "
-            "tests/test_sf_research_predictor_degraded_wiring.py."
+            "before continuing to BranchAComplete unchanged "
+            "(alpha-engine-config-I7194: was CheckSkipAggregateCosts until the "
+            "aggregator left this branch — Counterfactual is now Branch A's "
+            "last work state)."
         ),
         "ResearchPredictorParallel.ResolveZooSpecs": (
             "FIXED, not directly walker-visible (alpha-engine-config#6722, "

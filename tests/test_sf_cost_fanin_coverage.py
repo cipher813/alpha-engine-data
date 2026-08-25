@@ -63,21 +63,34 @@ def states(sf) -> dict:
 
 
 @pytest.fixture(scope="module")
-def branch_a(sf) -> dict:
-    """The branch AggregateCosts itself lives in.
+def scopes(sf) -> dict:
+    """Every scope in the definition, keyed by the top-level state that
+    contains it: the top level itself under ``None``, and each Parallel
+    branch under the Parallel's own state name.
 
-    Reachability is only meaningful inside one branch: a stage in a
-    sibling branch of the same Parallel, or at the top level after it,
-    has no ordering relationship with the aggregator that the aggregator
-    can rely on.
+    Reachability is only meaningful WITHIN one scope — ASL gives a state
+    in one Parallel branch no ordering relationship with a state in a
+    sibling branch. Between scopes the ordering that IS guaranteed is the
+    Parallel's own: a Parallel completes before its ``Next``, so every
+    state inside it precedes every state reachable after it.
     """
-    for st in sf["States"].values():
-        if st.get("Type") != "Parallel":
-            continue
-        for branch in st["Branches"]:
-            if "AggregateCosts" in branch["States"]:
-                return branch["States"]
-    raise AssertionError("AggregateCosts is not inside a Parallel branch")
+    out: dict = {None: sf["States"]}
+    for name, st in sf["States"].items():
+        if st.get("Type") == "Parallel":
+            for branch in st["Branches"]:
+                out.setdefault(name, {}).update(branch["States"])
+    return out
+
+
+def _enclosing(stage: str, scopes: dict) -> str | None:
+    """The top-level state that contains ``stage`` — ``None`` when the
+    stage IS a top-level state."""
+    if stage in scopes[None]:
+        return None
+    for parallel, states in scopes.items():
+        if parallel is not None and stage in states:
+            return parallel
+    raise AssertionError(f"{stage} is in no scope of the definition")
 
 
 @pytest.fixture(scope="module")
@@ -165,29 +178,79 @@ class TestDeclaredStagesAreReal:
 class TestDeclaredStagesCanActuallyBeSeen:
     """The ordering half — the failure that was live when this was written.
 
-    ``Director`` makes the pipeline's single most expensive call and runs
-    at the TOP LEVEL, after the Parallel that contains ``AggregateCosts``.
-    Its rows cannot be in the parquet the aggregator writes, so demanding
-    them would make the coverage check fail on every healthy run. It is
-    listed under ``allowed_producers`` instead, and moving the aggregator
-    is tracked separately. This test is what stops a later edit from
-    quietly promoting a post-aggregator stage into ``required_producers``.
+    ``Director`` makes the pipeline's single most expensive call
+    (``ultra`` group, callsite ``director-plan``) and runs at the TOP
+    LEVEL. ``AggregateCosts`` ran as the last state of
+    ``ResearchPredictorParallel`` branch 0, so the Director's rows landed
+    in ``_cost_raw`` AFTER the parquet for that date was written and
+    could never be in it — ``cost.parquet`` structurally excluded the
+    pipeline's largest cost, and ``AlphaEngine/Cost`` under-reported by
+    an unbounded margin in the reassuring direction. Fixed by
+    ``alpha-engine-config-I7194``: the aggregator moved to the top-level
+    tail, on the single edge every real-completion path takes into
+    ``CheckShellRunNotify``, and ``Director`` is required rather than
+    merely allowed.
+
+    The reachability rule below is stated over SCOPES rather than over
+    one hard-coded branch, so it keeps holding wherever the aggregator
+    sits — that generality is the whole point: the branch-local version
+    of this test could only ever have said "the aggregator cannot see
+    Director", never "it must".
     """
 
-    def test_every_required_stage_precedes_the_aggregator(self, coverage, branch_a):
+    def test_every_required_stage_precedes_the_aggregator(self, coverage, scopes):
+        agg_scope = _enclosing("AggregateCosts", scopes)
         for stage in coverage["required_producers"]:
-            assert stage in branch_a, (
-                f"{stage} is required to have emitted cost rows before "
-                f"AggregateCosts runs, but it is not in the aggregator's own "
-                f"Parallel branch — the aggregator cannot see its rows"
+            stage_scope = _enclosing(stage, scopes)
+            if stage_scope == agg_scope:
+                # Same scope — the ordinary intra-scope walk.
+                assert _reaches(stage, "AggregateCosts", scopes[agg_scope]), (
+                    f"{stage} cannot reach AggregateCosts, so its cost rows "
+                    f"are not guaranteed to exist when the aggregator reads "
+                    f"the prefix"
+                )
+                continue
+            # Different scopes. The only ordering ASL guarantees across a
+            # Parallel boundary is the Parallel's own: everything inside it
+            # finishes before its Next. So the stage's enclosing Parallel
+            # must reach the aggregator's scope at the top level, and the
+            # aggregator must not itself be inside a Parallel the stage is
+            # not in (a sibling branch has no ordering at all).
+            assert agg_scope is None, (
+                f"{stage} is in {stage_scope or 'the top level'} and "
+                f"AggregateCosts is inside {agg_scope} — a Parallel branch "
+                f"has no ordering relationship with anything outside it, so "
+                f"the aggregator cannot rely on seeing {stage}'s rows"
             )
-            assert _reaches(stage, "AggregateCosts", branch_a), (
-                f"{stage} cannot reach AggregateCosts, so its cost rows are "
-                f"not guaranteed to exist when the aggregator reads the prefix"
+            assert stage_scope is not None
+            assert _reaches(stage_scope, "AggregateCosts", scopes[None]), (
+                f"{stage} runs inside {stage_scope}, which does not reach "
+                f"AggregateCosts at the top level — its cost rows are not "
+                f"guaranteed to exist when the aggregator reads the prefix"
             )
 
     def test_the_aggregator_does_not_require_itself(self, coverage):
         assert "AggregateCosts" not in coverage["required_producers"]
+
+    def test_the_aggregator_runs_after_the_director(self, sf, scopes):
+        """The I7194 defect, stated as the property rather than as a
+        position. Anchored on Director's SKIP gate, not on Director or
+        DirectorComplete: DirectorComplete is entered only on Director's
+        success edge, so an aggregator anchored there would silently not
+        run under ``skip_director`` or after a ReportCard fail-open —
+        exactly the reruns — and the parquet would be missing entirely
+        rather than merely incomplete."""
+        assert _enclosing("AggregateCosts", scopes) is None, (
+            "AggregateCosts must be a top-level state: Director is one, and "
+            "a Parallel branch cannot be ordered after it"
+        )
+        top = scopes[None]
+        assert _reaches("Director", "AggregateCosts", top)
+        assert _reaches("CheckSkipDirector", "AggregateCosts", top)
+        assert not _reaches("AggregateCosts", "Director", top), (
+            "the aggregator must not be able to precede the Director on any "
+            "path — that is the whole defect"
+        )
 
 
 class TestKnownProducersStayDeclared:
@@ -220,6 +283,29 @@ class TestKnownProducersStayDeclared:
         detector that cries wolf is turned off."""
         assert coverage["conditional_producers"]["EvalJudgeProcess"] == [
             "evaljudge-sync"
+        ]
+
+    def test_director_plan_is_required(self, coverage):
+        """alpha-engine-config-I7194: the pipeline's most expensive call.
+        It was ``allowed`` — never required — only because the aggregator
+        ran before it, which is exactly the defect. Demoting it back to
+        ``allowed`` would restore a coverage check that passes when the
+        largest cost in the pipeline is missing."""
+        assert coverage["required_producers"]["Director"] == ["director-plan"]
+        assert "director-plan" not in coverage["allowed_producers"]
+
+    def test_director_retro_judge_is_conditional_not_required(self, coverage):
+        """The SAME Lambda invocation makes a second call —
+        ``crucible-evaluator`` ``director/retro.py::grade_prior_plan``,
+        callsite ``director-retro-judge`` — which genuinely does not fire
+        on every run: ``_run_retro_best_effort`` returns ``skipped`` on
+        the first cycle (no prior plan) and on an exhausted invocation
+        budget, and swallows its own failure because the plan is already
+        persisted. Requiring it would make the detector cry wolf; leaving
+        it undeclared would make the aggregator refuse it as a
+        present-but-undeclared producer the first time it does fire."""
+        assert coverage["conditional_producers"]["Director"] == [
+            "director-retro-judge"
         ]
 
     def test_thinktank_is_allowed_but_never_required(self, coverage):

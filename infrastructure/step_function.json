@@ -2494,7 +2494,7 @@
                       "BooleanEquals": true
                     }
                   ],
-                  "Next": "CheckSkipAggregateCosts"
+                  "Next": "BranchAComplete"
                 }
               ],
               "Default": "Counterfactual"
@@ -2535,97 +2535,11 @@
                 }
               ],
               "ResultPath": "$.counterfactual_result",
-              "Next": "CheckSkipAggregateCosts"
+              "Next": "BranchAComplete"
             },
             "MarkCounterfactualDegraded": {
               "Type": "Pass",
               "Comment": "alpha-engine-config#6722: threads $.research_degraded_local=true onto Counterfactual's fail-open path without changing its continuation (still CheckSkipAggregateCosts).",
-              "Result": true,
-              "ResultPath": "$.research_degraded_local",
-              "Next": "CheckSkipAggregateCosts"
-            },
-            "CheckSkipAggregateCosts": {
-              "Type": "Choice",
-              "Comment": "Skip-gate. {\"skip_aggregate_costs\": true} bypasses the daily cost-telemetry aggregation Lambda (used for ad-hoc reruns where the cost parquet for the date is already current, or when iterating on the aggregator script). Standalone invocation of the Lambda is always available via the deploy.sh aggregate_costs target. Independent of skip_rationale_clustering / skip_replay_concordance / skip_counterfactual \u2014 the four are independent observability paths.",
-              "Choices": [
-                {
-                  "And": [
-                    {
-                      "Variable": "$.skip_aggregate_costs",
-                      "IsPresent": true
-                    },
-                    {
-                      "Variable": "$.skip_aggregate_costs",
-                      "BooleanEquals": true
-                    }
-                  ],
-                  "Next": "BranchAComplete"
-                }
-              ],
-              "Default": "AggregateCosts"
-            },
-            "AggregateCosts": {
-              "Type": "Task",
-              "Comment": "Daily cost-telemetry aggregation Lambda. Reads decision_artifacts/_cost_raw/{run_date}/*.jsonl and writes the daily parquet at decision_artifacts/_cost/{run_date}/cost.parquet, emits per-agent CW metrics under AlphaEngine/Cost, and asserts FAN-IN COVERAGE (config-I7179): the set of distinct producers under _cost_raw must contain every producer the `coverage.required_producers` map below declares for the stages this execution actually entered, and must contain nothing outside the declared/conditional/allowed sets. A COUNT cannot see this defect \u2014 five Think Tank files look exactly like healthy coverage, which is what they were mistaken for until 2026-08-13. This Comment previously claimed 'all LLM-emitting upstream states have written their cost JSONL rows by the time the aggregator runs' and named rationale-clustering and counterfactual among them; both are measured to make ZERO LLM calls, and the pipeline's single most expensive call (Director, `ultra` group) runs at the TOP LEVEL after this Parallel and is therefore NOT in this parquet at all. Correcting the aggregator's position is tracked separately. Failure is non-blocking (Catch routes to MarkAggregateCostsDegraded) \u2014 cost telemetry is observability, NOT a primary deliverable; a coverage breach must be loud without regressing the alpha pipeline. Status contract OK / SKIPPED / ERROR mirrors data #295 + L3277 audit.",
-              "Resource": "arn:aws:states:::lambda:invoke",
-              "Parameters": {
-                "FunctionName": "alpha-engine-research-aggregate-costs:live",
-                "Payload": {
-                  "date.$": "$.run_date",
-                  "dry_run_llm.$": "$.research_dry",
-                  "coverage": {
-                    "execution_arn.$": "$$.Execution.Id",
-                    "required_producers": {
-                      "ChallengerShadow": [
-                        "single-agent-quant"
-                      ],
-                      "EvalJudgeProcess": [
-                        "evaljudge-batch"
-                      ],
-                      "ReplayConcordance": [
-                        "replay-concordance"
-                      ]
-                    },
-                    "conditional_producers": {
-                      "EvalJudgeProcess": [
-                        "evaljudge-sync"
-                      ]
-                    },
-                    "allowed_producers": [
-                      "thinktank-*",
-                      "director-plan"
-                    ]
-                  }
-                }
-              },
-              "TimeoutSeconds": 270,
-              "Retry": [
-                {
-                  "ErrorEquals": [
-                    "Lambda.ServiceException",
-                    "Lambda.TooManyRequestsException"
-                  ],
-                  "MaxAttempts": 1,
-                  "IntervalSeconds": 60,
-                  "BackoffRate": 1.0
-                }
-              ],
-              "Catch": [
-                {
-                  "ErrorEquals": [
-                    "States.ALL"
-                  ],
-                  "Comment": "Cost-telemetry aggregation is observability \u2014 failure must NOT halt the pipeline. The next Saturday SF will retry over a fresh _cost_raw partition; the prior week's parquet (or the manual-trigger fallback via scripts/aggregate_costs.py) remains available. alpha-engine-config#6722: this Catch matches sf-pipeline-policy.md \u00a75's NAMED cost-aggregation carve-out verbatim ('Health-check and cost-aggregation stages may fail-open ... They must still set a degraded flag') \u2014 previously routed straight to BranchAComplete with zero flag, a policy non-compliance on an explicit clause. Now routes through MarkAggregateCostsDegraded first.",
-                  "Next": "MarkAggregateCostsDegraded",
-                  "ResultPath": "$.aggregate_costs_error"
-                }
-              ],
-              "ResultPath": "$.aggregate_costs_result",
-              "Next": "BranchAComplete"
-            },
-            "MarkAggregateCostsDegraded": {
-              "Type": "Pass",
-              "Comment": "alpha-engine-config#6722: threads $.research_degraded_local=true onto AggregateCosts's fail-open path (the sf-pipeline-policy.md \u00a75 cost-aggregation carve-out's required flag) without changing its continuation (still BranchAComplete).",
               "Result": true,
               "ResultPath": "$.research_degraded_local",
               "Next": "BranchAComplete"
@@ -6126,7 +6040,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "CheckShellRunNotify"
+          "Next": "CheckSkipAggregateCosts"
         }
       ],
       "Default": "CheckSkipSaturdayHealthCheck"
@@ -6527,6 +6441,108 @@
       "ResultPath": "$.director_result",
       "Next": "DirectorComplete"
     },
+    "CheckSkipAggregateCosts": {
+      "Type": "Choice",
+      "Comment": "Skip-gate. {\"skip_aggregate_costs\": true} bypasses the daily cost-telemetry aggregation Lambda (used for ad-hoc reruns where the cost parquet for the date is already current, or when iterating on the aggregator script). Standalone invocation of the Lambda is always available via the deploy.sh aggregate_costs target. POSITION (alpha-engine-config-I7194, 2026-08-25): this gate and the states behind it were the LAST states of ResearchPredictorParallel branch 0 until now. They sit at the TOP LEVEL, on the single edge every real-completion path takes into CheckShellRunNotify \u2014 after Director, the pipeline's most expensive LLM call. The entry point is this gate rather than DirectorComplete deliberately: DirectorComplete is entered ONLY via Director's success edge, so anchoring there would silently skip cost aggregation on {\"skip_director\": true}, on {\"skip_post_eval\": true} and on the ReportCard fail-open \u2014 exactly the reruns. Independent of skip_rationale_clustering / skip_replay_concordance / skip_counterfactual / skip_report_card / skip_director / skip_scanner_leaderboard / skip_post_eval: cost telemetry is not part of the post-eval advisory tail, and none of those flags has ever bypassed it.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.skip_aggregate_costs",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_aggregate_costs",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckShellRunNotify"
+        }
+      ],
+      "Default": "AggregateCosts"
+    },
+    "AggregateCosts": {
+      "Type": "Task",
+      "Comment": "Daily cost-telemetry aggregation Lambda. Reads decision_artifacts/_cost_raw/{run_date}/*.jsonl and writes the daily parquet at decision_artifacts/_cost/{run_date}/cost.parquet, emits per-agent CW metrics under AlphaEngine/Cost, and asserts FAN-IN COVERAGE (config-I7179): the set of distinct producers under _cost_raw must contain every producer the `coverage.required_producers` map below declares for the stages this execution actually entered, and must contain nothing outside the declared/conditional/allowed sets. A COUNT cannot see this defect \u2014 five Think Tank files look exactly like healthy coverage, which is what they were mistaken for until 2026-08-13. POSITION (alpha-engine-config-I7194, 2026-08-25): this state ran as the last state of ResearchPredictorParallel branch 0 until now, which put it BEFORE Director \u2014 the single most expensive LLM call in the pipeline, `ultra` group, callsite director-plan \u2014 so cost.parquet structurally could not contain the pipeline's largest cost and AlphaEngine/Cost under-reported by an unbounded margin in the reassuring direction. It now runs at the top level on the single edge into CheckShellRunNotify, after Director AND after the ScannerLeaderboard leaf, so every state that can emit a cost row has emitted it before the prefix is read. Director is consequently promoted from allowed_producers to required_producers, and its SECOND callsite \u2014 director-retro-judge (crucible-evaluator director/retro.py, run best-effort by the SAME Lambda invocation and genuinely absent on the first cycle, when there is no prior plan, and when the invocation budget is exhausted) \u2014 is declared CONDITIONAL: undeclared, it would arrive as a present-but-undeclared producer the moment the Director's IAM grant lands (alpha-engine-config-I8152) and the aggregator would refuse it. Failure is non-blocking (Catch routes to MarkAggregateCostsDegraded) \u2014 cost telemetry is observability, NOT a primary deliverable; a coverage breach must be loud without regressing the alpha pipeline. Status contract OK / SKIPPED / ERROR mirrors data #295 + L3277 audit.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-research-aggregate-costs:live",
+        "Payload": {
+          "date.$": "$.run_date",
+          "dry_run_llm.$": "$.research_dry",
+          "coverage": {
+            "execution_arn.$": "$$.Execution.Id",
+            "required_producers": {
+              "ChallengerShadow": [
+                "single-agent-quant"
+              ],
+              "EvalJudgeProcess": [
+                "evaljudge-batch"
+              ],
+              "ReplayConcordance": [
+                "replay-concordance"
+              ],
+              "Director": [
+                "director-plan"
+              ]
+            },
+            "conditional_producers": {
+              "EvalJudgeProcess": [
+                "evaljudge-sync"
+              ],
+              "Director": [
+                "director-retro-judge"
+              ]
+            },
+            "allowed_producers": [
+              "thinktank-*"
+            ]
+          }
+        }
+      },
+      "TimeoutSeconds": 270,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 60,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Cost-telemetry aggregation is observability \u2014 failure must NOT halt the pipeline. The next Saturday SF will retry over a fresh _cost_raw partition; the prior week's parquet (or the manual-trigger fallback via scripts/aggregate_costs.py) remains available. alpha-engine-config#6722: this Catch matches sf-pipeline-policy.md \u00a75's NAMED cost-aggregation carve-out verbatim ('Health-check and cost-aggregation stages may fail-open ... They must still set a degraded flag'). alpha-engine-config-I7194: the flag it sets is now $.aggregate_costs_degraded, its own top-level family, because the branch-local $.research_degraded_local this path used to thread exists only inside the Parallel and is hoisted as branch_a_degraded \u2014 which would attribute a cost-aggregation failure to a Parallel that no longer contains the aggregator.",
+          "Next": "MarkAggregateCostsDegraded",
+          "ResultPath": "$.aggregate_costs_error"
+        }
+      ],
+      "ResultPath": "$.aggregate_costs_result",
+      "Next": "CheckShellRunNotify"
+    },
+    "MarkAggregateCostsDegraded": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I7194: the SF-controlled visible flag CheckGateDegradedNotify reads, set BEFORE the summary so the flag is on the execution record whatever happens downstream. Shape mirrors ScannerLeaderboardDegraded / ReportCardDegraded exactly. Replaces the branch-local $.research_degraded_local this Catch path set while the aggregator lived inside ResearchPredictorParallel branch 0.",
+      "Result": true,
+      "ResultPath": "$.aggregate_costs_degraded",
+      "Next": "SetAggregateCostsDegradedSummary"
+    },
+    "SetAggregateCostsDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I7194: mirrors SetScannerLeaderboardDegradedSummary. $.degraded_summary is what CheckDegradedOutcome reads to route to WriteCompletionMarkerDegraded \u2014 without it the run would end SUCCEEDED with no cost record for the cycle. Like every sibling Set*DegradedSummary in this definition it OVERWRITES an earlier stage's summary; the per-stage booleans survive independently. Deliberately carries NO stage_error: the sibling convention is uniform and a Choice path added later must not start throwing States.Runtime here (tests/test_degraded_terminal_derives_its_cause.py). Continuation is CheckShellRunNotify \u2014 the same edge the success and skip paths take, so a fail-open changes what the run SAYS, never where it goes.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_aggregate_costs_fail_open",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "CheckShellRunNotify"
+    },
     "CheckShellRunNotify": {
       "Type": "Choice",
       "Comment": "Consolidated Friday-PM shell-run result notify. Reuses the EXISTING NotifyComplete SNS-publish substrate (same alpha-engine-alerts topic, same arn:aws:states:::sns:publish Resource) with a shell_run-tagged Subject/Message so the operator can tell a Friday dry-pass result apart from a real Saturday SUCCESS in their inbox. shell_run absent/false \u2192 NotifyComplete (BYTE-IDENTICAL to pre-spine). shell_run=true \u2192 NotifyShellRunComplete. No new SNS topic / Lambda / infra \u2014 the consolidated per-state pass/fail report (ROADMAP design point 5) is a scoped follow-on; the spine delivers a single shell-run-tagged success signal by reusing NotifyComplete's pattern.",
@@ -6755,6 +6771,20 @@
           ],
           "Comment": "alpha-engine-config-I7813. LAST in the list on purpose: a run that also degraded a gate, a health check, the parity verdict, the report card or a Branch A fail-open matches one of the rules above and gets that (more consequential) notification, while the leaf's own PublishScannerLeaderboardDegraded alert has already named it. This rule exists so a run whose ONLY degradation is the observe-only board cannot reach NotifyComplete's \"All steps completed successfully\" while terminating in DegradedRun.",
           "Next": "NotifyCompleteScannerLeaderboardDegraded"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.aggregate_costs_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.aggregate_costs_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "alpha-engine-config-I7194. The sixth flag family, and the second one folded into the generic combined notifier rather than given a per-combination Task of its own \u2014 the generalization config#2276's comment predicted and config#6722 already applied to research_predictor_degraded. LAST in the list on purpose, for the same reason the scanner-leaderboard rule above it is: a run that also degraded a gate, a health check, the parity verdict, the report card, the leaf or a Branch A fail-open matches one of the rules above and gets that (more consequential) notification. This rule exists so a run whose ONLY degradation is the cost aggregation cannot reach NotifyComplete's \"All steps completed successfully\" while terminating in DegradedRun \u2014 which is what it would have done from the top level, where the branch-local $.research_degraded_local hoist that used to carry it does not reach.",
+          "Next": "NotifyCompleteMultipleDegraded"
         }
       ],
       "Default": "NotifyComplete"
@@ -6849,12 +6879,12 @@
     },
     "NotifyCompleteMultipleDegraded": {
       "Type": "Task",
-      "Comment": "config#6685 + alpha-engine-config-I6025 + alpha-engine-config#6722: SUCCESS notifier for a run where TWO OR MORE of the (now five) degraded-flag families fired together (pre-spend gates, tail health checks, report card advisory grading, parity verdict, ResearchPredictorParallel's internal fail-open routes) \u2014 OR research_predictor_degraded fired ALONE, which is deliberately folded here too rather than given its own single-flag notifier (it already covers 25+ distinct internal routes; a sixth per-combination axis would re-introduce the enumeration explosion this notifier exists to avoid). Folded (config#2276's own comment predicted a third flag family would need a data-driven notifier rather than a 7-way enumeration, and the same reasoning generalizes further): a single generic combined-degradation notifier, instead of enumerating every additional per-combination Task state. Deliberately does NOT assert which SPECIFIC families degraded in the constant Subject/Message (config#1819 forbids States.Format-ing the exact set into the text) \u2014 names all five categories generically and points at the execution record ($.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded / $.research_predictor_degraded) for the exact combination, which stays truthful regardless of which subset actually fired (including the single-family research_predictor_degraded-only case). Mirrors NotifyCompleteGatesDegraded's shape \u2014 constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819).",
+      "Comment": "config#6685 + alpha-engine-config-I6025 + alpha-engine-config#6722: SUCCESS notifier for a run where TWO OR MORE of the (now five) degraded-flag families fired together (pre-spend gates, tail health checks, report card advisory grading, parity verdict, ResearchPredictorParallel's internal fail-open routes) \u2014 OR research_predictor_degraded fired ALONE, which is deliberately folded here too rather than given its own single-flag notifier (it already covers 25+ distinct internal routes; a sixth per-combination axis would re-introduce the enumeration explosion this notifier exists to avoid). Folded (config#2276's own comment predicted a third flag family would need a data-driven notifier rather than a 7-way enumeration, and the same reasoning generalizes further): a single generic combined-degradation notifier, instead of enumerating every additional per-combination Task state. Deliberately does NOT assert which SPECIFIC families degraded in the constant Subject/Message (config#1819 forbids States.Format-ing the exact set into the text) \u2014 names all five categories generically and points at the execution record ($.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded / $.research_predictor_degraded) for the exact combination, which stays truthful regardless of which subset actually fired (including the single-family research_predictor_degraded-only case). Mirrors NotifyCompleteGatesDegraded's shape \u2014 constants-only Subject/Message, best-effort Catch to NotifyCompleteDegraded (config#1819). | alpha-engine-config-I7194: a SIXTH family, $.aggregate_costs_degraded, now folds here too \u2014 AggregateCosts left ResearchPredictorParallel branch 0 for the top level (so it runs AFTER Director, whose director-plan rows it could never see from inside the Parallel), and its fail-open flag can no longer ride $.research_degraded_local. Registered LAST in CheckGateDegradedNotify, so it selects this notifier only when nothing more consequential degraded.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Pipeline \u2014 DEGRADED: multiple (run terminates FAILED)",
-        "Message": "Every WORK stage completed, and the run still terminates FAILED (config-I6891, sf-pipeline-policy.md \u00a72.3 Option A) because one or more of the following degraded on this run: the pre-spend gates (LibPinDriftCheck/PipelineContractCheck/AcquireMutex), the tail health checks (SaturdayHealthCheck/WeeklySubstrateHealthCheck), the report card advisory grading (ReportCard Lambda), the Parity verdict (pit_parity/replay \u2014 absence of a verdict must NOT be read as a clean pass), and/or an internal ResearchPredictorParallel fail-open (Scanner/RegimeSubstrate/ChallengerShadow/ThinkTank/the eval-judge chain/cost aggregation/the model-zoo rotation). Exact combination is on the execution record: $.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded / $.research_predictor_degraded, with detail at $.report_card_error and (if set) $.health_check_error / $.substrate_check_error / $.parity_error / $.branch_outcomes. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
+        "Message": "Every WORK stage completed, and the run still terminates FAILED (config-I6891, sf-pipeline-policy.md \u00a72.3 Option A) because one or more of the following degraded on this run: the pre-spend gates (LibPinDriftCheck/PipelineContractCheck/AcquireMutex), the tail health checks (SaturdayHealthCheck/WeeklySubstrateHealthCheck), the report card advisory grading (ReportCard Lambda), the Parity verdict (pit_parity/replay \u2014 absence of a verdict must NOT be read as a clean pass), and/or an internal ResearchPredictorParallel fail-open (Scanner/RegimeSubstrate/ChallengerShadow/ThinkTank/the eval-judge chain/the model-zoo rotation), and/or the top-level cost aggregation (AggregateCosts, moved out of that Parallel by alpha-engine-config-I7194). Exact combination is on the execution record: $.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded / $.research_predictor_degraded / $.aggregate_costs_degraded, with detail at $.report_card_error and (if set) $.health_check_error / $.substrate_check_error / $.parity_error / $.branch_outcomes. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
@@ -7975,7 +8005,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "CheckShellRunNotify"
+          "Next": "CheckSkipAggregateCosts"
         }
       ],
       "Default": "ScannerLeaderboard"
@@ -8038,7 +8068,7 @@
     "ScannerLeaderboardComplete": {
       "Type": "Pass",
       "Comment": "alpha-engine-config-I7813: success-only witness for the rerun deriver (scripts/weekly_sf_rerun.py), exactly the DirectorComplete pattern and for the same reason \u2014 the success edge and every bypass path would otherwise converge on CheckShellRunNotify, leaving no state that uniquely witnesses 'the leaf actually completed' (the I6055 trap).",
-      "Next": "CheckShellRunNotify"
+      "Next": "CheckSkipAggregateCosts"
     },
     "ScannerLeaderboardDegraded": {
       "Type": "Pass",
@@ -8094,10 +8124,10 @@
           ],
           "Comment": "Best-effort alert \u2014 a publish failure must not block the non-fatal path this alert decorates. $.degraded_summary is already set, so the run still terminates DEGRADED.",
           "ResultPath": "$.scanner_leaderboard_degraded_notify_error",
-          "Next": "CheckShellRunNotify"
+          "Next": "CheckSkipAggregateCosts"
         }
       ],
-      "Next": "CheckShellRunNotify"
+      "Next": "CheckSkipAggregateCosts"
     },
     "NotifyCompleteScannerLeaderboardDegraded": {
       "Type": "Task",

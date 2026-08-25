@@ -126,8 +126,14 @@ _BRANCH_A_MARK_STATES = {
     "MarkEvalRollingMeanDegraded": "CheckSkipRationaleClustering",
     "MarkRationaleClusteringDegraded": "CheckSkipReplayConcordance",
     "MarkReplayConcordanceDegraded": "CheckSkipCounterfactual",
-    "MarkCounterfactualDegraded": "CheckSkipAggregateCosts",
-    "MarkAggregateCostsDegraded": "BranchAComplete",
+    # alpha-engine-config-I7194: Counterfactual is Branch A's last work state
+    # now that the aggregator runs at the top level, so this fold lands on the
+    # branch terminal directly. MarkAggregateCostsDegraded left this table with
+    # the aggregator — it no longer writes $.research_degraded_local, because
+    # the branch-local fold does not exist outside the Parallel; its top-level
+    # replacement writes $.aggregate_costs_degraded and is pinned by
+    # tests/test_sf_aggregate_costs_wiring.py.
+    "MarkCounterfactualDegraded": "BranchAComplete",
 }
 
 
@@ -155,7 +161,6 @@ def test_branch_a_mark_state_shape(branch_a, name, next_target):
         "RationaleClustering",
         "ReplayConcordance",
         "Counterfactual",
-        "AggregateCosts",
     ],
 )
 def test_branch_a_owner_catch_routes_through_a_mark_state(branch_a, owner):

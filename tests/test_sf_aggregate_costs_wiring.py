@@ -5,18 +5,32 @@ companion alpha-engine-research PR adds the
 ``alpha-engine-research-aggregate-costs:live`` Lambda; this test only
 asserts the SF wiring.
 
-Pin the chain end of Branch A:
+Pin the tail of the weekly definition:
 
-    ... Counterfactual → CheckSkipAggregateCosts → AggregateCosts
-                                                 → BranchAComplete
+    ... DirectorComplete ─┐
+        CheckSkipDirector ┤
+        Publish/Complete  ├→ CheckSkipAggregateCosts → AggregateCosts
+        of the leaf       ┘                          → CheckShellRunNotify
 
-The aggregator must sit AFTER the entire LLM chain (Research /
-eval-judge / rationale-clustering / replay-concordance / counterfactual)
-so every upstream LLM-emitting state has finished writing its
-``_cost_raw/{date}/*.jsonl`` rows by the time the aggregator runs.
-Catches regressions like: a future SF refactor that drops the new
-state, or reroutes Counterfactual back to BranchAComplete bypassing
-the aggregator.
+The aggregator must sit AFTER every LLM-emitting state so all of their
+``_cost_raw/{run_date}/*.jsonl`` rows exist by the time it reads the
+prefix. **alpha-engine-config-I7194 (2026-08-25)** moved it out of
+``ResearchPredictorParallel`` branch 0, where it ran BEFORE ``Director``
+— the pipeline's single most expensive call — so ``cost.parquet``
+structurally could not contain the pipeline's largest cost and
+``AlphaEngine/Cost`` under-reported by an unbounded margin in the
+reassuring direction.
+
+It is anchored on the SHARED edge into ``CheckShellRunNotify`` rather
+than on ``DirectorComplete``: that witness is entered only via
+``Director``'s success edge, so anchoring there would silently skip cost
+aggregation under ``skip_director``, under ``skip_post_eval`` and after
+a ``ReportCard`` fail-open — exactly the reruns — turning an incomplete
+parquet into a missing one.
+
+Catches regressions like: a future SF refactor that drops a state, that
+reroutes the tail past the aggregator, or that puts it back upstream of
+an LLM call.
 """
 
 from __future__ import annotations
@@ -97,13 +111,12 @@ class TestLambdaTarget:
 
 
 class TestFailureIsolation:
-    def test_catch_routes_to_branch_a_complete(self, states):
+    def test_catch_routes_through_the_degraded_flag(self, states):
         # Cost telemetry is observability — aggregator failure must NOT
-        # halt the pipeline. Mirrors the rationale-clustering Catch.
-        # alpha-engine-config#6722: this Catch matches sf-pipeline-policy.md
-        # §5's NAMED cost-aggregation carve-out, which REQUIRES a degraded
-        # flag — now routes through MarkAggregateCostsDegraded before
-        # converging on BranchAComplete exactly as before.
+        # halt the pipeline. alpha-engine-config#6722: this Catch matches
+        # sf-pipeline-policy.md §5's NAMED cost-aggregation carve-out,
+        # which REQUIRES a degraded flag, so it routes through
+        # MarkAggregateCostsDegraded rather than straight to the notify.
         catches = states["AggregateCosts"]["Catch"]
         assert len(catches) >= 1
         assert any(
@@ -111,7 +124,59 @@ class TestFailureIsolation:
             and "States.ALL" in c["ErrorEquals"]
             for c in catches
         )
-        assert states["MarkAggregateCostsDegraded"]["Next"] == "BranchAComplete"
+
+    def test_the_degraded_flag_is_its_own_top_level_family(self, states):
+        """alpha-engine-config-I7194. Inside the Parallel this path wrote
+        the branch-local ``$.research_degraded_local``, hoisted as
+        ``branch_a_degraded`` and folded into
+        ``$.research_predictor_degraded``. That fold does not exist at the
+        top level, and reusing the name would attribute a cost-aggregation
+        failure to a Parallel that no longer contains the aggregator — so
+        the flag is its own family, in the ReportCard / ScannerLeaderboard
+        shape: boolean first, then the summary the terminal reads."""
+        flag = states["MarkAggregateCostsDegraded"]
+        assert flag["Type"] == "Pass"
+        assert flag["Result"] is True
+        assert flag["ResultPath"] == "$.aggregate_costs_degraded"
+        assert flag["Next"] == "SetAggregateCostsDegradedSummary"
+
+        summary = states["SetAggregateCostsDegradedSummary"]
+        assert summary["Type"] == "Pass"
+        assert summary["ResultPath"] == "$.degraded_summary"
+        assert summary["Parameters"]["degraded"] is True
+        assert summary["Parameters"]["reason"]
+        # A Choice path added later must not throw on an absent error key.
+        assert "stage_error.$" not in summary["Parameters"]
+        # The fail-open changes what the run SAYS, never where it goes.
+        assert summary["Next"] == "CheckShellRunNotify"
+
+    def test_a_degraded_aggregation_can_never_report_a_clean_success(self, states):
+        """Without a rule of its own in CheckGateDegradedNotify a run whose
+        only degradation is the cost aggregation falls through to
+        NotifyComplete — "All steps completed successfully" — while
+        terminating in DegradedRun. Folded into the generic combined
+        notifier rather than given a per-combination Task, the
+        disposition config#6722 already applied to
+        ``$.research_predictor_degraded``; registered LAST, so anything
+        more consequential reports itself instead."""
+        gate = states["CheckGateDegradedNotify"]
+        matching = [
+            c
+            for c in gate["Choices"]
+            if any(
+                cond.get("Variable") == "$.aggregate_costs_degraded"
+                for cond in (c.get("And") or [c])
+            )
+        ]
+        assert len(matching) == 1
+        assert matching[0]["Next"] == "NotifyCompleteMultipleDegraded"
+        assert gate["Choices"][-1] is matching[0]
+        assert gate["Default"] == "NotifyComplete"
+        # The notifier's constant Message must name the flag it now covers —
+        # config#1819 forbids formatting the live set into the text, so the
+        # enumeration IS the contract with the operator reading it.
+        message = states["NotifyCompleteMultipleDegraded"]["Parameters"]["Message"]
+        assert "$.aggregate_costs_degraded" in message
 
     def test_retry_only_on_lambda_service_errors(self, states):
         # Same shape as rationale-clustering — service-level retries
@@ -130,57 +195,85 @@ class TestFailureIsolation:
 
 
 class TestEdges:
-    def test_counterfactual_routes_to_check_skip_aggregate_costs(self, states):
-        # Default path (success) — Counterfactual's Next must hit the
-        # new skip-gate, NOT BranchAComplete directly.
-        cf = states["Counterfactual"]
-        assert cf["Next"] == "CheckSkipAggregateCosts"
+    def test_the_aggregator_is_a_top_level_state(self, sf):
+        """alpha-engine-config-I7194. Not a stylistic point: ASL gives a
+        state in a Parallel branch no ordering relationship with anything
+        outside that Parallel, so an aggregator inside one can never be
+        ordered after Director."""
+        for name in (
+            "CheckSkipAggregateCosts",
+            "AggregateCosts",
+            "MarkAggregateCostsDegraded",
+            "SetAggregateCostsDegradedSummary",
+        ):
+            assert name in sf["States"], f"{name} is not a top-level state"
+        for st in sf["States"].values():
+            if st.get("Type") != "Parallel":
+                continue
+            for branch in st["Branches"]:
+                assert "AggregateCosts" not in branch["States"]
 
-    def test_counterfactual_catch_routes_to_check_skip_aggregate_costs(self, states):
-        # Counterfactual failure must STILL run the aggregator —
-        # upstream LLM cost rows are independent of counterfactual's
-        # success. (The aggregator's own Catch routes to
-        # BranchAComplete so a downstream failure-of-failure can't
-        # ladder back into the failed counterfactual error path.)
-        # alpha-engine-config#6722: routes through MarkCounterfactualDegraded
-        # before converging on CheckSkipAggregateCosts exactly as before.
-        cf = states["Counterfactual"]
-        catches = cf["Catch"]
-        assert any(
-            c["Next"] == "MarkCounterfactualDegraded"
-            for c in catches
+    def test_every_edge_into_the_notify_gate_passes_the_aggregator_first(self, sf):
+        """The load-bearing property. The aggregator is anchored on the
+        tail's single convergence point, so no completion path can reach
+        the terminal notify without it — which is what an anchor on
+        DirectorComplete (a success-ONLY witness) would have allowed
+        under skip_director, under skip_post_eval and after a ReportCard
+        fail-open."""
+        allowed = {
+            "CheckSkipAggregateCosts",  # the skip route
+            "AggregateCosts",           # the success route
+            "SetAggregateCostsDegradedSummary",  # the fail-open route
+        }
+        offenders = []
+        for name, st in sf["States"].items():
+            if name in allowed:
+                continue
+            targets = [st.get("Next"), st.get("Default")]
+            targets += [c.get("Next") for c in st.get("Choices", []) or []]
+            targets += [c.get("Next") for c in st.get("Catch", []) or []]
+            if "CheckShellRunNotify" in targets:
+                offenders.append(name)
+        assert not offenders, (
+            f"{offenders} reach CheckShellRunNotify without passing the "
+            f"cost-aggregation gate — their cost rows would never be "
+            f"aggregated (alpha-engine-config-I7194)"
         )
-        assert states["MarkCounterfactualDegraded"]["Next"] == "CheckSkipAggregateCosts"
 
-    def test_check_skip_counterfactual_default_unchanged(self, states):
-        # CheckSkipCounterfactual's Default → Counterfactual stays
-        # unchanged; only the SKIP branch is rerouted to the new
-        # CheckSkipAggregateCosts.
-        skip = states["CheckSkipCounterfactual"]
-        assert skip["Default"] == "Counterfactual"
+    def test_the_leaf_and_the_director_hand_off_to_the_gate(self, states):
+        assert states["ScannerLeaderboardComplete"]["Next"] == "CheckSkipAggregateCosts"
+        assert states["CheckSkipScannerLeaderboard"]["Choices"][0]["Next"] == (
+            "CheckSkipAggregateCosts"
+        )
+        assert states["PublishScannerLeaderboardDegraded"]["Next"] == (
+            "CheckSkipAggregateCosts"
+        )
+        # The coarse deprecated whole-tail alias too: skip_post_eval bypasses
+        # the advisories, and never bypassed cost telemetry.
+        assert states["CheckSkipPostEval"]["Choices"][0]["Next"] == (
+            "CheckSkipAggregateCosts"
+        )
 
-    def test_check_skip_counterfactual_skip_routes_to_aggregate_costs_gate(
-        self, states,
-    ):
-        # When operator skips counterfactual, the flow MUST still hit
-        # the aggregator gate (an operator skipping counterfactual is
-        # NOT also skipping cost-telemetry — those are independent
-        # skip flags per the comment on CheckSkipAggregateCosts).
-        skip = states["CheckSkipCounterfactual"]
-        skip_choices = skip["Choices"]
-        assert len(skip_choices) == 1
-        assert skip_choices[0]["Next"] == "CheckSkipAggregateCosts"
+    def test_branch_a_no_longer_routes_through_the_aggregator(self, states):
+        """Counterfactual is Branch A's last work state again. All three
+        of its exits land on the branch terminal."""
+        assert states["Counterfactual"]["Next"] == "BranchAComplete"
+        assert states["MarkCounterfactualDegraded"]["Next"] == "BranchAComplete"
+        assert states["CheckSkipCounterfactual"]["Default"] == "Counterfactual"
+        assert states["CheckSkipCounterfactual"]["Choices"][0]["Next"] == (
+            "BranchAComplete"
+        )
 
-    def test_aggregate_costs_success_routes_to_branch_a_complete(self, states):
-        assert states["AggregateCosts"]["Next"] == "BranchAComplete"
+    def test_aggregate_costs_success_routes_to_the_notify_gate(self, states):
+        assert states["AggregateCosts"]["Next"] == "CheckShellRunNotify"
 
-    def test_check_skip_aggregate_costs_skip_routes_to_branch_a_complete(
+    def test_check_skip_aggregate_costs_skip_routes_to_the_notify_gate(
         self, states,
     ):
         skip = states["CheckSkipAggregateCosts"]
         skip_choices = skip["Choices"]
         assert len(skip_choices) == 1
-        assert skip_choices[0]["Next"] == "BranchAComplete"
+        assert skip_choices[0]["Next"] == "CheckShellRunNotify"
 
     def test_check_skip_aggregate_costs_default_is_aggregate_costs(self, states):
         assert states["CheckSkipAggregateCosts"]["Default"] == "AggregateCosts"

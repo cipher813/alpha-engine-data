@@ -158,9 +158,14 @@ def test_a_leaf_failure_degrades_the_run_loudly_and_never_silently(states):
     assert alert["Resource"] == "arn:aws:states:::sns:publish"
     assert "ScannerLeaderboard" in alert["Parameters"]["Subject"]
     # Best-effort: the alert can fail without changing the outcome it reports.
-    assert alert["Next"] == "CheckShellRunNotify"
+    # alpha-engine-config-I7194: the tail's convergence point is now the
+    # cost-aggregation gate, which every real-completion path enters before
+    # CheckShellRunNotify — the aggregator runs AFTER Director so it can see
+    # the director-plan cost rows. The leaf's own routing is unchanged in
+    # meaning: one hop, best-effort, no fork.
+    assert alert["Next"] == "CheckSkipAggregateCosts"
     for catch in alert["Catch"]:
-        assert catch["Next"] == "CheckShellRunNotify"
+        assert catch["Next"] == "CheckSkipAggregateCosts"
 
     # $.degraded_summary is what CheckDegradedOutcome routes on.
     outcome = states["CheckDegradedOutcome"]
@@ -190,9 +195,16 @@ def test_the_terminal_notify_can_never_call_a_degraded_leaf_a_success(states):
     ]
     assert len(matching) == 1
     assert matching[0]["Next"] == "NotifyCompleteScannerLeaderboardDegraded"
-    # LAST before the clean default: a run that ALSO degraded something
-    # consequential must report that instead.
-    assert gate["Choices"][-1] is matching[0]
+    # Second-to-last before the clean default: a run that ALSO degraded
+    # something consequential must report that instead. alpha-engine-config-I7194
+    # appended one further rule after this one — $.aggregate_costs_degraded,
+    # the tail's sixth and least consequential family — so the property this
+    # pins is "after every more consequential family", not "physically last".
+    assert gate["Choices"].index(matching[0]) == len(gate["Choices"]) - 2
+    assert any(
+        cond.get("Variable") == "$.aggregate_costs_degraded"
+        for cond in (gate["Choices"][-1].get("And") or [gate["Choices"][-1]])
+    )
     assert gate["Default"] == "NotifyComplete"
     assert states["NotifyCompleteScannerLeaderboardDegraded"]["Next"] == "CheckDegradedOutcome"
 
@@ -200,14 +212,17 @@ def test_the_terminal_notify_can_never_call_a_degraded_leaf_a_success(states):
 def test_the_leaf_is_skippable_and_witnessed_for_rerun(states):
     """sf-pipeline-policy.md §2.5: recovery is one mechanical command, which
     needs (a) a skip flag the rerun deriver can emit and (b) a success-ONLY
-    witness. Witnessing on the shared CheckShellRunNotify would mark a bypassed
-    leaf complete and skip it on the rerun — the I6055 trap."""
+    witness. Witnessing on the shared tail convergence point would mark a
+    bypassed leaf complete and skip it on the rerun — the I6055 trap.
+    alpha-engine-config-I7194 moved that convergence point one state earlier,
+    to CheckSkipAggregateCosts; it is still shared by the skip and success
+    routes, so the witness still has to be the leaf's own Pass."""
     gate = states["CheckSkipScannerLeaderboard"]
     assert gate["Default"] == "ScannerLeaderboard"
-    assert {c["Next"] for c in gate["Choices"]} == {"CheckShellRunNotify"}
+    assert {c["Next"] for c in gate["Choices"]} == {"CheckSkipAggregateCosts"}
     assert states["ScannerLeaderboard"]["Next"] == "ScannerLeaderboardComplete"
     assert states["ScannerLeaderboardComplete"]["Type"] == "Pass"
-    assert states["ScannerLeaderboardComplete"]["Next"] == "CheckShellRunNotify"
+    assert states["ScannerLeaderboardComplete"]["Next"] == "CheckSkipAggregateCosts"
     # Only the leaf's success edge enters the witness.
     enterers = [
         name for name, body in states.items()

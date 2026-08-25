@@ -396,17 +396,12 @@ STAGES: tuple[Stage, ...] = (
     Stage(
         "counterfactual", "skip_counterfactual",
         "CheckSkipCounterfactual", "Counterfactual",
-        frozenset({"CheckSkipAggregateCosts"}),
-        degraded_witness=frozenset({"MarkCounterfactualDegraded"}),
-    ),
-    Stage(
-        "aggregate_costs", "skip_aggregate_costs",
-        "CheckSkipAggregateCosts", "AggregateCosts",
+        # alpha-engine-config-I7194: was CheckSkipAggregateCosts until the
+        # aggregator left this branch for the top level. Counterfactual is now
+        # the last work state of Branch A, so its success edge, its Catch fold
+        # and the skip route all land on BranchAComplete.
         frozenset({"BranchAComplete"}),
-        # alpha-engine-config#6722: matches sf-pipeline-policy.md §5's named
-        # cost-aggregation carve-out, which REQUIRES a degraded flag —
-        # MarkAggregateCostsDegraded now provides it.
-        degraded_witness=frozenset({"MarkAggregateCostsDegraded"}),
+        degraded_witness=frozenset({"MarkCounterfactualDegraded"}),
     ),
     # --- ResearchPredictorParallel branch B -------------------------------
     Stage(
@@ -601,7 +596,12 @@ STAGES: tuple[Stage, ...] = (
     Stage(
         "post_eval", "skip_post_eval",
         "CheckSkipPostEval", "SaturdayHealthCheck",
-        frozenset({"CheckShellRunNotify"}),
+        # alpha-engine-config-I7194: was CheckShellRunNotify. The whole-tail
+        # skip route now lands one state earlier, on the cost-aggregation
+        # gate — skip_post_eval bypasses the post-Evaluator ADVISORIES and
+        # has never bypassed cost telemetry, which carries its own
+        # skip_aggregate_costs flag.
+        frozenset({"CheckSkipAggregateCosts"}),
         emit_skip=False,
         # detect_failure=False (alpha-engine-config-I8167): shares its `work`
         # state with "saturday_health_check" above, which now owns
@@ -616,8 +616,9 @@ STAGES: tuple[Stage, ...] = (
             "config-I8167): the deriver emits skip_report_card / "
             "skip_director / skip_saturday_health_check instead. Kept in "
             "the DEFINITION only for in-flight inputs that still set it — "
-            "its meaning (bypass the entire post-Evaluator tail, including "
-            "ReportCard/Director/ScannerLeaderboard) is UNCHANGED. Remove "
+            "its meaning (bypass the entire post-Evaluator advisory tail, "
+            "including ReportCard/Director/ScannerLeaderboard, but NOT the "
+            "cost aggregation behind its own gate) is UNCHANGED. Remove "
             "the alias once a full cycle has passed on the split flags."
         ),
     ),
@@ -678,6 +679,28 @@ STAGES: tuple[Stage, ...] = (
             "SetScannerLeaderboardResourceKillSummary",
         }),
     ),
+    Stage(
+        "aggregate_costs", "skip_aggregate_costs",
+        "CheckSkipAggregateCosts", "AggregateCosts",
+        # alpha-engine-config-I7194: this row modeled a Branch A stage until
+        # the aggregator moved to the top level so it could see Director's
+        # director-plan cost rows. It is now the LAST gate before the terminal
+        # notify, and its success edge, its fail-open and its skip route all
+        # land on CheckShellRunNotify — the ordinary skip-lands-in-witness
+        # convention, exactly as the shared BranchAComplete witness worked
+        # before the move, NOT director's/scanner_leaderboard's inverted one.
+        frozenset({"CheckShellRunNotify"}),
+        # alpha-engine-config#6722: matches sf-pipeline-policy.md §5's named
+        # cost-aggregation carve-out, which REQUIRES a degraded flag. I7194
+        # splits that flag into its own top-level family, so the summary Pass
+        # is a second degraded witness (the ReportCard/ScannerLeaderboard
+        # shape) — the branch-local $.research_degraded_local fold it used
+        # does not exist outside the Parallel.
+        degraded_witness=frozenset({
+            "MarkAggregateCostsDegraded",
+            "SetAggregateCostsDegradedSummary",
+        }),
+    ),
 )
 
 STAGES_BY_NAME = {s.name: s for s in STAGES}
@@ -694,7 +717,10 @@ BRANCH_A_STAGES = frozenset({
     "scanner", "regime_substrate", "signals_envelope", "challenger_shadow",
     "rag_ingestion", "regime_retrospective_eval",
     "data_phase2", "eval_judge", "rationale_clustering",
-    "replay_concordance", "counterfactual", "aggregate_costs",
+    "replay_concordance", "counterfactual",
+    # alpha-engine-config-I7194: aggregate_costs left this set when the
+    # aggregator moved out of ResearchPredictorParallel branch 0 to the
+    # top-level tail — it is modeled with the other tail stages below.
 })
 # Stages whose gate is only reachable THROUGH CheckSkipBacktester's run path
 # (the skip route overshoots them — see Stage("backtester").note).
@@ -1135,7 +1161,13 @@ def _simulate_reachable_works(flags: dict, original_input: dict) -> set:
     # guard (which folds DEGRADED stages into must_rerun) can see
     # saturday_health_check — its health-check degraded_witness — as
     # reachable when a tail rerun re-runs the span.
-    run_linear(["evaluator", "saturday_health_check", "post_eval", "report_card", "director"])
+    # alpha-engine-config-I7194: aggregate_costs joins the tail — it now runs
+    # after Director, on the single edge every real-completion path takes
+    # into CheckShellRunNotify.
+    run_linear([
+        "evaluator", "saturday_health_check", "post_eval", "report_card",
+        "director", "aggregate_costs",
+    ])
     return ran
 
 

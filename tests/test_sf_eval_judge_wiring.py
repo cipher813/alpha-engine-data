@@ -744,7 +744,7 @@ class TestReplayConcordance:
 
 
 class TestSkipCounterfactual:
-    def test_skip_flag_bypasses_to_aggregate_costs_gate(self, states):
+    def test_skip_flag_bypasses_to_branch_terminal(self, states):
         """Skipping Counterfactual now lands on the AggregateCosts
         skip-gate (ROADMAP L1146 — SF-wired daily cost aggregator
         added 2026-05-25), not directly on BranchAComplete. The cost
@@ -755,9 +755,11 @@ class TestSkipCounterfactual:
         run. The four observability skip flags (skip_counterfactual /
         skip_rationale_clustering / skip_replay_concordance /
         skip_aggregate_costs) are independent. Pre-L1146 this assertion
-        pinned ``BranchAComplete``; the L1146 wire-up reroutes through
-        ``CheckSkipAggregateCosts`` which transitively reaches the
-        Branch-A terminal."""
+        pinned ``BranchAComplete``; the L1146 wire-up rerouted through
+        ``CheckSkipAggregateCosts``, and alpha-engine-config-I7194 moved
+        that gate to the TOP LEVEL — so the branch terminal is once again
+        the direct target, and cost aggregation now runs AFTER Director
+        instead of before it."""
         skip = states["CheckSkipCounterfactual"]
         choice = skip["Choices"][0]
         and_clauses = choice["And"]
@@ -766,7 +768,7 @@ class TestSkipCounterfactual:
             and c.get("BooleanEquals") is True
             for c in and_clauses
         )
-        assert choice["Next"] == "CheckSkipAggregateCosts"
+        assert choice["Next"] == "BranchAComplete"
 
     def test_default_runs_counterfactual(self, states):
         assert states["CheckSkipCounterfactual"]["Default"] == "Counterfactual"
@@ -794,17 +796,17 @@ class TestCounterfactual:
         # across 8 weeks of corpus).
         assert states["Counterfactual"]["TimeoutSeconds"] == 600
 
-    def test_success_exits_to_aggregate_costs_gate(self, states):
-        # Counterfactual is now the SECOND-to-last load-bearing state in
-        # Branch A — the L1146 wire-up (2026-05-25) inserted the
-        # AggregateCosts cost-telemetry aggregator after it. Success now
-        # exits to CheckSkipAggregateCosts, which transitively reaches
-        # BranchAComplete (End:true). Persisted S3 artifacts are still
-        # available to the downstream Evaluator, which runs AFTER the
-        # Parallel join. Pre-L1146: Counterfactual.Next == BranchAComplete.
-        assert states["Counterfactual"]["Next"] == "CheckSkipAggregateCosts"
+    def test_success_exits_to_branch_terminal(self, states):
+        # Counterfactual is Branch A's LAST load-bearing state again: the
+        # L1146 wire-up (2026-05-25) inserted AggregateCosts after it, and
+        # alpha-engine-config-I7194 moved that aggregator to the top level
+        # so it runs after Director (whose director-plan rows it could
+        # never see from inside this Parallel). Persisted S3 artifacts are
+        # still available to the downstream Evaluator, which runs AFTER
+        # the Parallel join.
+        assert states["Counterfactual"]["Next"] == "BranchAComplete"
 
-    def test_catch_routes_to_aggregate_costs_gate_not_failure(self, states):
+    def test_catch_routes_to_branch_terminal_not_failure(self, states):
         # Same Catch posture as the rest of the agent-justification
         # triple — Counterfactual is observability, not load-bearing, so
         # failures fall through to the next observability step (the cost
@@ -816,12 +818,13 @@ class TestCounterfactual:
         # observability layer with its own Catch routing to
         # BranchAComplete.
         # alpha-engine-config#6722: routes through MarkCounterfactualDegraded
-        # before converging on CheckSkipAggregateCosts exactly as before.
+        # first. alpha-engine-config-I7194: that fold now converges on
+        # BranchAComplete, the aggregator having moved to the top level.
         catch = states["Counterfactual"]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
         assert catch["Next"] == "MarkCounterfactualDegraded"
         assert catch["Next"] != "HandleFailure"
-        assert states["MarkCounterfactualDegraded"]["Next"] == "CheckSkipAggregateCosts"
+        assert states["MarkCounterfactualDegraded"]["Next"] == "BranchAComplete"
 
     def test_retries_on_transient_lambda_errors(self, states):
         retry = states["Counterfactual"]["Retry"][0]
@@ -877,35 +880,33 @@ class TestJudgeChainBeforePredictor:
             == "CheckSkipEvalJudge"
         )
 
-    def test_counterfactual_exits_to_aggregate_costs_gate(self, states):
+    def test_counterfactual_exits_to_branch_terminal(self, states):
         """Counterfactual's three exit edges (Next + Catch + the
-        skip-gate above it) all converge on the AggregateCosts skip-gate
-        added by ROADMAP L1146 (2026-05-25). The Evaluator-sees-judge-
+        skip-gate above it) all converge on BranchAComplete
+        (alpha-engine-config-I7194 moved the AggregateCosts skip-gate that
+        ROADMAP L1146 inserted here to the top-level tail). The Evaluator-sees-judge-
         artifacts ordering invariant is still satisfied because
         Evaluator runs AFTER the Parallel join, by which point Branch A
         (including the inserted cost-aggregator step) has completed and
         its S3 artifacts are landed. Edge target history:
         pre-2026-05-07 SaturdayHealthCheck → 2026-05-07→05-16
         CheckSkipPredictorTraining → 2026-05-16→05-25 BranchAComplete →
-        post-L1146 CheckSkipAggregateCosts. The transitive reach to
-        BranchAComplete is preserved (CheckSkipAggregateCosts.Default →
-        AggregateCosts.Next → BranchAComplete; CheckSkipAggregateCosts's
-        skip-branch → BranchAComplete directly)."""
-        # alpha-engine-config#6722: the Catch edge now detours through
-        # MarkCounterfactualDegraded, still transitively reaching
-        # CheckSkipAggregateCosts.
-        assert states["Counterfactual"]["Next"] == "CheckSkipAggregateCosts"
+        L1146 CheckSkipAggregateCosts → alpha-engine-config-I7194
+        (2026-08-25) BranchAComplete again."""
+        # alpha-engine-config#6722: the Catch edge detours through
+        # MarkCounterfactualDegraded, still reaching BranchAComplete.
+        assert states["Counterfactual"]["Next"] == "BranchAComplete"
         assert (
             states["Counterfactual"]["Catch"][0]["Next"]
             == "MarkCounterfactualDegraded"
         )
         assert (
             states["MarkCounterfactualDegraded"]["Next"]
-            == "CheckSkipAggregateCosts"
+            == "BranchAComplete"
         )
         assert (
             states["CheckSkipCounterfactual"]["Choices"][0]["Next"]
-            == "CheckSkipAggregateCosts"
+            == "BranchAComplete"
         )
 
     def test_evaluator_exits_directly_to_health_check(self, states):
