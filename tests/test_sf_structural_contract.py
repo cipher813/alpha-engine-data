@@ -140,6 +140,7 @@ _TIMEOUT_EXEMPT: dict[str, dict[str, str]] = {
         "NotifyCompleteMultipleDegraded": "sns:publish completion notifier — SDK call, not a wait (config#6685)",
         "NotifyCompleteParityDegraded": "sns:publish completion notifier — SDK call, not a wait (alpha-engine-config-I6025)",
         "PublishScannerLeaderboardDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait (alpha-engine-config-I7813)",
+        "PublishAggregateCostsDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait (alpha-engine-config-I8336)",
         "NotifyCompleteScannerLeaderboardDegraded": "sns:publish completion notifier — SDK call, not a wait (alpha-engine-config-I7813)",
         "NotifyShellRunComplete": "sns:publish completion notifier — SDK call, not a wait",
         "NotifyComplete": "sns:publish completion notifier — SDK call, not a wait",
