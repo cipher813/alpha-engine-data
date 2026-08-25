@@ -1,4 +1,23 @@
-# No third-party dependencies. boto3 is provided by the Lambda runtime, and the
-# derivation in run_scope.py is pure stdlib by design — it is the module that
-# decides what the Director may grade, so it carries no dependency that could
-# fail to import on a cold start and take the scope block down with it.
+# CORRECTED alpha-engine-config-I8373 (was: "No third-party dependencies").
+# That rationale weighed a cold-start import risk against nothing — no
+# dependency meant nothing could fail to import. It never weighed the
+# dependency against the alternative that shipped instead: writing
+# run_scope.json to the wrong S3 prefix on EVERY run, where its only consumer
+# (crucible-evaluator) could never read it. An artifact landing somewhere
+# unreadable is a total failure of this Lambda's one job; a boto3-runtime-class
+# import risk is not. So: krepis, for krepis.dates.resolve_trading_day — the
+# SAME shared primitive the consumer already normalizes through, rather than
+# hand-rolling a "previous weekday" calculation here and drifting on the next
+# NYSE holiday. 21 sibling lambdas already vendor krepis this way (see
+# freshness-monitor/requirements.txt + deploy.sh for the established pattern);
+# this mirrors it rather than inventing a parallel shortcut.
+#
+# Pinned, not floored — first-party/fast-moving deps are pinned, never
+# floored (alpha-engine-config-I7635, same convention as
+# crucible-evaluator/requirements.txt's `krepis[...]==` line). 0.59.38 is
+# krepis's released head at the time of this pin (verified: `git rev-parse
+# v0.59.38^{}` == `origin/main` on nousergon/krepis) and the exact version
+# this lambda's test_handler.py was run against (`pip install krepis==0.59.38`
+# into a clean venv, 28/28 passed) — not merely a floor assumed to resolve to
+# something tested.
+krepis==0.59.38
