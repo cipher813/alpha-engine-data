@@ -1355,6 +1355,49 @@ def derive_plan(
                 f"with its own skip flag set. Refusing (forbidden swallow)."
             )
 
+    # Director/ReportCard freshness coupling (alpha-engine-config-I8382,
+    # measured 2026-08-22 watch-rerun-2026-08-22-3). Director's input contract
+    # is a report_card.json produced by THIS execution — but report_card and
+    # director are independently-witnessed stages, and LATEST-ATTEMPT-WINS
+    # (resolve_chain, above) can legitimately witness report_card as
+    # "completed" from an EARLIER, possibly-failed chain link while director
+    # itself was never witnessed complete anywhere in the chain (its own
+    # failure is terminal — config#6408 — so DirectorComplete is never
+    # entered by a failing attempt, and the stage keeps re-running on every
+    # rerun until one succeeds). The two facts compose into a bug: a rerun
+    # skips ReportCard (reusing an old evaluator/{date}/report_card.json,
+    # possibly the very run whose Director hard-failed and whose upstream
+    # tiles were still degraded) while re-running Director fresh against that
+    # STALE card. Measured: watch-rerun-2026-08-22-3 graded a card written by
+    # the FAILED 02:00 execution (report_card.json at 07:04) with its freshly
+    # re-run Director (action_plan.json at 09:04) — a card with
+    # status:"partial", tiles_overall_status:"RED", degraded_attestation:true,
+    # scope_unknown:true, none of which reflect what the intervening reruns
+    # actually fixed upstream.
+    #
+    # Fix: whenever Director will actually RUN this rerun (skip_director is
+    # not True), ReportCard must run too — forcing a fresh card from THIS
+    # execution rather than letting Director grade one carried over from a
+    # different, earlier attempt. This is independent of the failed/degraded
+    # reachability guard above (report_card is neither failed nor degraded
+    # here — it is "completed", just stale relative to what Director is about
+    # to consume), so it is not covered by must_rerun / BACKTESTER_OVERSHADOWED
+    # and needs its own rule. The safe direction is to over-run (re-run a
+    # ReportCard that was actually still fine) rather than under-run (skip one
+    # that no longer reflects reality) — same reasoning _reachable_from uses
+    # for the spot-dispatch predicate.
+    director_will_run = not plan.skip_flags.get(STAGES_BY_NAME["director"].flag)
+    if director_will_run and plan.skip_flags.pop(STAGES_BY_NAME["report_card"].flag, None):
+        if "report_card" in plan.completed:
+            plan.completed.remove("report_card")
+        plan.notes.append(
+            "skip_report_card dropped: Director will run this rerun and its "
+            "input contract is a ReportCard produced by THIS execution — "
+            "skipping ReportCard would let Director grade a card written by "
+            "an earlier, possibly-stale attempt (alpha-engine-config-I8382, "
+            "measured 2026-08-22 watch-rerun-2026-08-22-3)."
+        )
+
     orig_role = original_input.get("pipeline_role")
     if orig_role != EMITTED_ROLE:
         plan.notes.append(

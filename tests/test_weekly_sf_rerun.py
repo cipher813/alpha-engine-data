@@ -1307,6 +1307,74 @@ class TestChainedRecoveryKeepsTheOriginalRunsProgress:
         assert "rationale_clustering" not in plan.completed
 
 
+class TestDirectorReportCardFreshnessCoupling:
+    """alpha-engine-config-I8382, measured 2026-08-22 watch-rerun-2026-08-22-3.
+
+    Director's input contract is a report_card.json produced by THIS
+    execution. report_card and director are independently-witnessed stages,
+    so a rerun can legitimately witness report_card as "completed" (it ran to
+    completion in this or an earlier chain link) while director itself never
+    completes (its failure is terminal — config#6408 — so it keeps re-running
+    across chain links until one succeeds). Left alone, that composes into a
+    rerun that SKIPS ReportCard while RE-RUNNING Director against the stale
+    card ReportCard last wrote — measured live: a card written by the FAILED
+    02:00 execution graded by a Director that ran nearly two hours later.
+    """
+
+    # ReportCard runs and completes (witness: CheckSkipDirector + Director
+    # entered), then Director itself runs and fails terminally (Director is
+    # entered as WORK — detect_failure — but DirectorComplete never is).
+    _REPORT_CARD_COMPLETED_DIRECTOR_FAILED = [
+        "InitializeInput", "CheckSkipBacktester", "Backtester",
+        "CheckSkipPredictorBacktest", "PredictorBacktest",
+        "CheckSkipPortfolioOptimizerBacktest", "PortfolioOptimizerBacktest",
+        "CheckSkipParity", "CheckSkipEvaluator", "EvaluatorDiagnostics",
+        "CheckSkipPostEval", "SaturdayHealthCheck", "CheckShellRunNotify",
+        "CheckSkipReportCard", "ReportCard",
+        "CheckSkipDirector", "Director",
+        # no DirectorComplete: Director hard-failed (terminal, config#6408)
+    ]
+
+    def test_director_will_run_forces_report_card_to_rerun(self, mod):
+        plan = mod.derive_plan(
+            _chain_history(self._REPORT_CARD_COMPLETED_DIRECTOR_FAILED)
+        )
+        assert "director" in plan.failed
+        assert "skip_director" not in plan.skip_flags
+        assert "skip_report_card" not in plan.skip_flags, (
+            "Director will run this rerun, so ReportCard must run too — "
+            "skipping it lets Director grade a card from a different, "
+            "possibly-stale attempt"
+        )
+        assert "report_card" not in plan.completed
+        assert any(
+            "skip_report_card dropped" in n and "I8382" in n
+            for n in plan.notes
+        )
+
+    def test_the_dropped_flag_is_actually_reachable(self, mod, sf_def):
+        """The emitted input must not just OMIT skip_report_card — ReportCard's
+        work state must be reachable under the rest of the derived flags, or
+        this is a paper fix."""
+        plan = mod.derive_plan(
+            _chain_history(self._REPORT_CARD_COMPLETED_DIRECTOR_FAILED)
+        )
+        reachable = mod._simulate_reachable_works(plan.skip_flags, {})
+        assert "report_card" in reachable
+
+    def test_report_card_still_skips_when_director_also_completed(self, mod):
+        """Regression: the ordinary case (both witnessed complete) is
+        unaffected — nothing here should force an unnecessary ReportCard
+        re-run when Director genuinely does not need to run."""
+        entered = self._REPORT_CARD_COMPLETED_DIRECTOR_FAILED[:-1] + [
+            "DirectorComplete",
+        ]
+        plan = mod.derive_plan(_chain_history(entered))
+        assert plan.skip_flags.get("skip_director") is True
+        assert plan.skip_flags.get("skip_report_card") is True
+        assert "report_card" in plan.completed
+
+
 class TestChainMembership:
     """Which executions the chain is built FROM — pure, so the membership rule
     is testable without AWS."""
