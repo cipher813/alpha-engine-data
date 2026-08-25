@@ -262,6 +262,77 @@ class CorporateActionRegistry:
         self._put_json(key, payload)
         return True
 
+    # ── candidate lookup shared by every discrepancy question ────────────
+    def _known_actions(self) -> dict:
+        """Persisted registry UNION this session's detections, by action_id.
+
+        Session detections win on id collision. A failed persisted load
+        degrades to session-only scope with a WARNING rather than raising —
+        the callers state the scope they actually evaluated, so a narrowed
+        scope never becomes a false "nothing explains this".
+        """
+        known: dict = {}
+        try:
+            known.update(self._ensure_loaded())
+        except Exception as exc:  # noqa: BLE001 - degrade to session-only scope
+            log.warning(
+                "corporate_actions registry: persisted-action load failed (%s) "
+                "— discrepancy classification degrades to session-detected scope",
+                exc,
+            )
+        known.update(self._session_actions)  # session wins on id collision
+        return known
+
+    def splits_near(
+        self,
+        ticker: str,
+        date,
+        *,
+        early_leniency_days: int = _EX_DATE_EARLY_LENIENCY_DAYS,
+        max_ahead_days: int = _EX_DATE_MAX_AHEAD_DAYS,
+    ) -> list:
+        """Registered SPLIT actions for ``ticker`` whose ``ex_date`` sits in the
+        plausibility window around ``date``, earliest ex_date first.
+
+        The ex-date half of :meth:`explains_discrepancy`, lifted out so a
+        caller that CANNOT use an exact-factor match can still ask the
+        registry the authoritative question "is there a registered split at
+        this boundary?". ``builders/daily_append._splice_basis_guard``'s
+        pure-append branch is that caller: the two closes it compares are on
+        DIFFERENT trading days, so the observed ratio is the split factor
+        multiplied by whatever the market did in between and can never equal
+        the exact factor (alpha-engine-config-I8374).
+
+        The window is a parameter, not a constant, because the answer differs
+        by question: the classifier's default look-ahead is generous, while a
+        caller asking "is this row AT the boundary" wants a tight one.
+        """
+        candidates = [
+            a
+            for a in self._known_actions().values()
+            if a.type == "split" and a.ticker == str(ticker)
+        ]
+        date_ts = pd.Timestamp(date).normalize()
+        out = []
+        for action in candidates:
+            try:
+                ex_ts = pd.Timestamp(action.ex_date).normalize()
+            except Exception:  # noqa: BLE001 - malformed ex_date, not a candidate
+                log.warning(
+                    "corporate_actions registry: action %s has an unparseable "
+                    "ex_date %r — excluded from splits_near(%s)",
+                    action.action_id, action.ex_date, ticker,
+                )
+                continue
+            if ex_ts < date_ts - timedelta(days=early_leniency_days):
+                continue
+            if ex_ts > date_ts + timedelta(days=max_ahead_days):
+                continue
+            out.append(action)
+        # Evaluate by ex_date ascending so the earliest plausible action wins.
+        out.sort(key=lambda a: a.ex_date)
+        return out
+
     # ── the authoritative discrepancy classifier ─────────────────────────
     def explains_discrepancy(self, ticker: str, date, prior: float, new: float):
         """Return the registered ``CorporateAction`` that explains an adjusted-
@@ -299,33 +370,9 @@ class CorporateActionRegistry:
         except Exception:
             return None
 
-        known: dict = {}
-        try:
-            known.update(self._ensure_loaded())
-        except Exception as exc:  # noqa: BLE001 - degrade to session-only scope
-            log.warning(
-                "corporate_actions registry: persisted-action load failed (%s) "
-                "— explains_discrepancy degrades to session-detected scope",
-                exc,
-            )
-        known.update(self._session_actions)  # session wins on id collision
-        candidates = [
-            a
-            for a in known.values()
-            if a.type == "split" and a.ticker == str(ticker)
-        ]
-        # Evaluate by ex_date ascending so the earliest plausible action wins.
-        candidates.sort(key=lambda a: a.ex_date)
-        for action in candidates:
-            try:
-                ex_ts = pd.Timestamp(action.ex_date).normalize()
-            except Exception:
-                continue
-            # ex_date plausibility window relative to the discrepancy date.
-            if ex_ts < date_ts - timedelta(days=_EX_DATE_EARLY_LENIENCY_DAYS):
-                continue
-            if ex_ts > date_ts + timedelta(days=_EX_DATE_MAX_AHEAD_DAYS):
-                continue
+        # ex_date plausibility window (``splits_near``) first, exact-factor
+        # match second — the two halves of a match, in that order.
+        for action in self.splits_near(ticker, date_ts):
             try:
                 expected = expected_factor(action)
             except (NotImplementedError, ValueError):

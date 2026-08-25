@@ -1099,6 +1099,42 @@ _SPLICE_GUARD_REL_TOL = 0.15
 _SPLICE_GUARD_ALLOW_ENV = "DAILY_APPEND_SPLICE_GUARD_ALLOW"
 # Price fields scaled by a split factor (volume scales inversely).
 _SPLICE_PRICE_FIELDS = ("Open", "High", "Low", "Close", "VWAP")
+# Ex-date plausibility window used by the PURE-APPEND branch when asking the
+# registry whether a registered split sits at this boundary. Deliberately
+# tighter than ``registry._EX_DATE_MAX_AHEAD_DAYS`` (60): the classifier's
+# generous look-ahead is safe because it also demands an EXACT factor match,
+# and this branch cannot (see the comment at the call site). A discontinuity
+# two months before an ex date is not explained by it.
+_SPLICE_GUARD_EX_DATE_EARLY_DAYS = 3
+_SPLICE_GUARD_EX_DATE_AHEAD_DAYS = 10
+
+
+def _splice_ratio_matches(observed: float, expected: float) -> bool:
+    """Whether ``observed`` sits within ``_SPLICE_GUARD_REL_TOL`` of ``expected``."""
+    if expected <= 0:
+        return False
+    return abs(observed - expected) <= _SPLICE_GUARD_REL_TOL * expected
+
+
+def _splice_restate_bar(bar, price_scale: float):
+    """Return a copy of ``bar`` with prices scaled by ``price_scale`` and
+    volume scaled inversely (a split restates the two in opposite directions).
+    """
+    restated = bar.copy()
+    for fld in _SPLICE_PRICE_FIELDS:
+        try:
+            val = float(restated[fld])
+        except Exception:  # noqa: BLE001 - absent/NaN field, skip
+            continue
+        if np.isfinite(val):
+            restated[fld] = val * price_scale
+    try:
+        vol = float(restated["Volume"])
+        if np.isfinite(vol):
+            restated["Volume"] = round(vol / price_scale)
+    except Exception:  # noqa: BLE001 - absent/NaN volume, prices still restated
+        pass
+    return restated
 
 
 def _splice_basis_guard(
@@ -1117,10 +1153,19 @@ def _splice_basis_guard(
     all REAL single-day moves that overlap the 2:1-split ratio zone, so
     magnitude alone cannot refuse):
 
-      * A registered split with ``ex_date > row_date`` already applied to the
-        store explains a ``1/factor`` gap exactly → the row arrived on the
-        pre-action basis (polygon restates its aggregates only once the ex
-        date lands — the CRWD 2026-06-30 case). Deterministic: restate it.
+      * A registered split with ``ex_date > row_date`` puts the row and the
+        store on different bases, in EITHER of two orientations, and the
+        observed ratio plus the store's applied-state says which:
+          - STORE-LEADS (gap ``1/factor``, action already applied to the
+            store): the row arrived on the pre-action basis because polygon
+            restates its aggregates only once the ex date lands — the CRWD
+            2026-06-30 case.
+          - FEED-LEADS (gap ``factor``, action NOT yet applied): the vendor
+            retro-adjusted its history AHEAD of the ex date while the store
+            is still pre-action — the IESC 2026-08-21 case.
+        Deterministic either way: restate the incoming row onto the STORE's
+        current basis (the registry restatement path owns migrating the whole
+        history), and say which orientation it was.
       * A split-like disagreement with an ALREADY-STORED row for the SAME
         date whose value coheres with its own neighbors is NEVER a market
         move (same date, same market — the HON 2026-06-26 case: incoming
@@ -1158,10 +1203,30 @@ def _splice_basis_guard(
     if 1.0 / _SPLICE_GUARD_SOFT_RATIO < ratio < _SPLICE_GUARD_SOFT_RATIO:
         return bar, "ok"
 
-    # A registered split whose ex_date is AFTER this row's date and which is
-    # already folded into the stored history explains the gap exactly: the
-    # incoming row is pre-action basis, the store is post-action basis, and
-    # the observed ratio is 1/factor. Restate the row by the action's factor.
+    # A registered split whose ex_date is AFTER this row's date puts the
+    # incoming row and the stored history on DIFFERENT adjusted bases — in
+    # one of TWO orientations, and production produces both:
+    #
+    #   STORE-LEADS / feed lags: the action is already folded into the stored
+    #     history, the vendor still serves pre-action aggregates, so the row
+    #     sits 1/factor ABOVE the store (CRWD 2026-06-30). Restate the row by
+    #     ``factor``.
+    #   FEED-LEADS / store lags: the vendor retro-adjusted its history AHEAD
+    #     of the ex date while the store is still pre-action, so the row sits
+    #     at ``factor``, BELOW the store (IESC 2026-08-21). Restate the row by
+    #     ``1/factor``.
+    #
+    # Either way the guard's job is the same: put the incoming row on the
+    # STORE's CURRENT basis so the series stays continuous. Migrating the
+    # whole history to the new basis is the registry restatement path's job,
+    # and it runs over the pre-ex rows once the action is applied.
+    #
+    # ``is_applied`` is the evidence for WHICH orientation, so it is asserted
+    # per-orientation rather than as a shared precondition: load-bearing and
+    # TRUE for store-leads, and necessarily FALSE for feed-leads — the split
+    # not yet being applied is exactly why the store is stale. Requiring it
+    # for both made feed-leads structurally unreachable, on top of the ratio
+    # test only ever accepting 1/factor (alpha-engine-config-I8374).
     for a in actions:
         if getattr(a, "type", None) != "split":
             continue
@@ -1172,34 +1237,37 @@ def _splice_basis_guard(
             continue
         if factor <= 0 or ex_ts <= today_ts:
             continue
-        if registry is not None and not registry.is_applied(
-            _ca.STORE_ARCTICDB_UNIVERSE, a.action_id
-        ):
-            continue
-        expected_gap = 1.0 / factor
-        if abs(ratio - expected_gap) <= _SPLICE_GUARD_REL_TOL * expected_gap:
-            restated_bar = bar.copy()
-            for fld in _SPLICE_PRICE_FIELDS:
-                try:
-                    val = float(restated_bar[fld])
-                except Exception:  # noqa: BLE001 - absent/NaN field, skip
-                    continue
-                if np.isfinite(val):
-                    restated_bar[fld] = val * factor
-            try:
-                vol = float(restated_bar["Volume"])
-                if np.isfinite(vol):
-                    restated_bar["Volume"] = round(vol / factor)
-            except Exception:  # noqa: BLE001 - absent/NaN volume, skip
-                pass
-            log.warning(
-                "daily_append splice basis-guard: %s @ %s row arrived on the "
-                "PRE-action basis (ratio %.4f vs stored history; registered "
-                "%s, ex %s, already applied to the store) — restated the "
-                "incoming row by factor %.6g before splice",
-                ticker, today_ts.date(), ratio, a.human(), a.ex_date, factor,
+        # None = no registry to ask; neither orientation is then excluded on
+        # applied-state and the ratio alone decides.
+        applied = None
+        if registry is not None:
+            applied = registry.is_applied(_ca.STORE_ARCTICDB_UNIVERSE, a.action_id)
+        if applied is not False and _splice_ratio_matches(ratio, 1.0 / factor):
+            orientation, price_scale = "store-leads", factor
+            detail = (
+                "row arrived on the PRE-action basis while the store is "
+                "already post-action (registered %s, ex %s, applied to the "
+                "store) — restated the incoming row by factor %.6g onto the "
+                "store's basis" % (a.human(), a.ex_date, price_scale)
             )
-            return restated_bar, "restated"
+        elif applied is not True and _splice_ratio_matches(ratio, factor):
+            orientation, price_scale = "feed-leads", 1.0 / factor
+            detail = (
+                "the FEED has already restated its history for a split that "
+                "is NOT yet applied to the store (registered %s, ex %s) — "
+                "restated the incoming row by %.6g back onto the store's "
+                "pre-action basis; the registry restatement path migrates the "
+                "whole series when the action is applied"
+                % (a.human(), a.ex_date, price_scale)
+            )
+        else:
+            continue
+        log.warning(
+            "daily_append splice basis-guard: %s @ %s basis mismatch "
+            "orientation=%s (ratio %.4f vs stored history): %s",
+            ticker, today_ts.date(), orientation, ratio, detail,
+        )
+        return _splice_restate_bar(bar, price_scale), "restated"
 
     allow = {
         entry.strip()
@@ -1252,15 +1320,85 @@ def _splice_basis_guard(
             )
             return bar, "refused"
 
-    # Pure append with an unexplained split-like ratio: can be a genuine
-    # crash/pop (CAR −48%, KD −55% verified real) — write it, page loudly.
+    # Pure append with a split-like ratio: can be a genuine crash/pop
+    # (CAR −48%, KD −55% verified real) — write it either way. Whether it
+    # pages depends on ASKING the registry first, which the message below
+    # used to assert without doing (alpha-engine-config-I8374).
+    #
+    # The test here is EX-DATE PROXIMITY plus the LOOSE ``_SPLICE_GUARD_REL_TOL``
+    # magnitude check. Do NOT re-tighten it to an exact-factor match
+    # (``registry._SPLIT_RATIO_TOL`` = 0.005): the two closes compared here are
+    # on DIFFERENT trading days, so the observed ratio is the split factor
+    # multiplied by whatever the market did in between. IESC 2026-08-24:
+    # 324.12 vs the 08-21 close 685.04 = 0.4731 = the 0.5 factor × a genuine
+    # 5.4% interday move. A cross-date ratio can never equal the exact factor
+    # whenever the market also moved — which is essentially always.
+    scope_actions: dict = {}
+    for a in actions:
+        if getattr(a, "type", None) != "split":
+            continue
+        try:
+            ex_ts = pd.Timestamp(a.ex_date).normalize()
+        except Exception:  # noqa: BLE001 - malformed ex_date cannot place the
+            # action at this boundary; excluded from the evaluated scope, and
+            # the WARNING is the recording surface so the ERROR below is not
+            # silently narrowed.
+            log.warning(
+                "daily_append splice basis-guard: %s session action %s has an "
+                "unparseable ex_date %r — excluded from the boundary check",
+                ticker, getattr(a, "action_id", "?"), getattr(a, "ex_date", None),
+            )
+            continue
+        delta_days = (ex_ts - today_ts).days
+        if -_SPLICE_GUARD_EX_DATE_EARLY_DAYS <= delta_days <= _SPLICE_GUARD_EX_DATE_AHEAD_DAYS:
+            scope_actions[getattr(a, "action_id", id(a))] = a
+    scope = "session-detected splits only (no registry available)"
+    if registry is not None:
+        scope = "persisted registry + session-detected splits"
+        for a in registry.splits_near(
+            ticker,
+            today_ts,
+            early_leniency_days=_SPLICE_GUARD_EX_DATE_EARLY_DAYS,
+            max_ahead_days=_SPLICE_GUARD_EX_DATE_AHEAD_DAYS,
+        ):
+            scope_actions[getattr(a, "action_id", id(a))] = a
+    explaining = None
+    for a in sorted(scope_actions.values(), key=lambda x: str(x.ex_date)):
+        try:
+            factor = _ca.expected_factor(a)
+        except Exception:  # noqa: BLE001 - malformed action, can't explain
+            continue
+        if factor <= 0:
+            continue
+        if _splice_ratio_matches(ratio, factor) or _splice_ratio_matches(
+            ratio, 1.0 / factor
+        ):
+            explaining = a
+            break
+
+    if explaining is not None:
+        log.warning(
+            "daily_append splice basis-guard: %s @ %s incoming close %.4f vs "
+            "prior stored close %.4f (ratio %.4f) sits at the boundary of a "
+            "REGISTERED corporate action (%s, ex %s, action_id=%s) — an "
+            "expected basis discontinuity at an ex date, not an anomaly. "
+            "Writing; the restatement path flattens the pre-ex history when "
+            "the action is applied to the store",
+            ticker, today_ts.date(), bar_close, prior_close, ratio,
+            explaining.human(), explaining.ex_date, explaining.action_id,
+        )
+        return bar, "ok"
+
     log.error(
         "daily_append splice basis-guard: %s @ %s incoming close %.4f vs "
         "prior stored close %.4f (ratio %.4f) is split-like and NO registered "
-        "corporate action explains it. Writing (a genuine move is possible), "
-        "but if a corporate-action record lands later the restatement path "
-        "must flatten this boundary — verify the split calendar",
+        "corporate action explains it (evaluated: %s for %s with ex_date in "
+        "[%s -%dd, +%dd]). Writing (a genuine move is possible), but if a "
+        "corporate-action record lands later the restatement path must "
+        "flatten this boundary — verify the split calendar",
         ticker, today_ts.date(), bar_close, prior_close, ratio,
+        scope, ticker, today_ts.date(),
+        _SPLICE_GUARD_EX_DATE_EARLY_DAYS, _SPLICE_GUARD_EX_DATE_AHEAD_DAYS,
     )
     return bar, "ok"
 
