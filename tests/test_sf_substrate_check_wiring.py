@@ -132,7 +132,11 @@ class TestChainOrdering:
         assert states["Director"]["Next"] == "DirectorComplete"
         assert states["DirectorComplete"]["Next"] == "CheckSkipScannerLeaderboard"
         assert states["CheckSkipScannerLeaderboard"]["Default"] == "ScannerLeaderboard"
-        assert states["ScannerLeaderboardComplete"]["Next"] == "CheckShellRunNotify"
+        # alpha-engine-config-I7194: the leaf now hands off to the
+        # cost-aggregation gate, the tail's last stage, which runs the
+        # aggregator AFTER Director and then enters the notify gate.
+        assert states["ScannerLeaderboardComplete"]["Next"] == "CheckSkipAggregateCosts"
+        assert states["AggregateCosts"]["Next"] == "CheckShellRunNotify"
         assert all(
             c["Next"] == "NormalizeFailureContext" for c in states["Director"]["Catch"]
         )

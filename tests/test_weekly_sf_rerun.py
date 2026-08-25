@@ -133,7 +133,16 @@ class TestDerivePlan:
             "skip_rationale_clustering",
             "skip_replay_concordance",
             "skip_counterfactual",
-            "skip_aggregate_costs",
+            # skip_aggregate_costs is NOT here (alpha-engine-config-I7194):
+            # the aggregator left Branch A for the top-level tail, where it
+            # runs AFTER Director — so a run that failed at Evaluator never
+            # reached it, and a stage the run never attempted must not be
+            # skipped on the rerun. The fixture was trimmed to match: it is a
+            # pre-move history, and the two events it carried for those
+            # states cannot occur under this topology. A REAL pre-move
+            # history replayed after this change derives aggregate_costs as
+            # failed rather than complete, which re-runs an idempotent
+            # Lambda — the safe direction, same as director's inversion.
             "skip_predictor_training",
             "skip_backtester_stage_only",
             "skip_predictor_backtest",
@@ -561,11 +570,14 @@ class TestStageTableLockstep:
                 # alpha-engine-config-I7813: same inverted convention as
                 # director, and for the same I6055 reason — the witness is the
                 # success-only ScannerLeaderboardComplete Pass, while the skip
-                # route lands on CheckShellRunNotify, which every bypass path
-                # also enters. An original run that skipped the leaf yields a
+                # route lands on the tail's shared convergence point, which
+                # every bypass path also enters. alpha-engine-config-I7194
+                # moved that point one state earlier — from CheckShellRunNotify
+                # to CheckSkipAggregateCosts — so the aggregator runs after
+                # Director. An original run that skipped the leaf yields a
                 # rerun that re-runs it: the safe direction for an observe-only
                 # board that costs one Lambda invocation.
-                assert skip_targets == {"CheckShellRunNotify"}
+                assert skip_targets == {"CheckSkipAggregateCosts"}
                 assert "ScannerLeaderboardComplete" not in skip_targets
                 continue
             if stage.name == "backtester_stage_only":

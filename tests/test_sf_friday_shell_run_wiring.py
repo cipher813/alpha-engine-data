@@ -1102,11 +1102,14 @@ class TestConsolidatedNotify:
         # Director → DirectorComplete (success-only rerun witness) →
         # CheckSkipScannerLeaderboard → ScannerLeaderboard →
         # ScannerLeaderboardComplete (success-only rerun witness) →
-        # CheckShellRunNotify. alpha-engine-config-I7813 inserted the last three:
-        # the observe-only scanner board is a leaf AFTER the advisories, and
-        # every path that previously reached CheckShellRunNotify from this tail
-        # — ReportCard's degraded route, Director's skip route, Director's
-        # success — now passes through its gate first.
+        # CheckSkipAggregateCosts → AggregateCosts → CheckShellRunNotify.
+        # alpha-engine-config-I7813 inserted the scanner-leaderboard trio;
+        # alpha-engine-config-I7194 then appended the cost-aggregation gate as
+        # the tail's LAST stage, so the aggregator runs after Director and its
+        # director-plan rows are in the parquet. Every path that previously
+        # reached CheckShellRunNotify from this tail — ReportCard's degraded
+        # route, Director's skip route, Director's success, the leaf's three
+        # routes — now passes through that gate first.
         assert substrate_success["Next"] == "RunScope"
         assert states["RunScope"]["Next"] == "CheckSkipReportCard"
         assert states["CheckSkipReportCard"]["Default"] == "ReportCard"
@@ -1127,7 +1130,7 @@ class TestConsolidatedNotify:
         assert states["CheckSkipScannerLeaderboard"]["Default"] == "ScannerLeaderboard"
         leaf = states["ScannerLeaderboard"]
         assert leaf["Next"] == "ScannerLeaderboardComplete"
-        assert states["ScannerLeaderboardComplete"]["Next"] == "CheckShellRunNotify"
+        assert states["ScannerLeaderboardComplete"]["Next"] == "CheckSkipAggregateCosts"
         # alpha-engine-config-I7812: a resource kill forks one state earlier so
         # the terminal cause can name it; both routes set the same
         # $.scanner_leaderboard_degraded flag and converge on the same alert.
@@ -1138,7 +1141,12 @@ class TestConsolidatedNotify:
         assert_degraded_continuation(
             states, "ScannerLeaderboardDegraded", "PublishScannerLeaderboardDegraded"
         )
-        assert states["PublishScannerLeaderboardDegraded"]["Next"] == "CheckShellRunNotify"
+        assert states["PublishScannerLeaderboardDegraded"]["Next"] == "CheckSkipAggregateCosts"
+        # alpha-engine-config-I7194: the cost-aggregation gate is the tail's
+        # last stage and the sole entry into the terminal notify.
+        assert states["CheckSkipAggregateCosts"]["Default"] == "AggregateCosts"
+        assert states["AggregateCosts"]["Next"] == "CheckShellRunNotify"
+        assert states["CheckSkipAggregateCosts"]["Choices"][0]["Next"] == "CheckShellRunNotify"
 
     def test_advisory_tail_runs_dry_on_preflight(self, states):
         """ROADMAP L4504: ReportCard + Director were added after the shell-run

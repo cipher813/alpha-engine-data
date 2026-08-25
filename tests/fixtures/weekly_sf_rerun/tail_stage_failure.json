@@ -693,24 +693,6 @@
       "timestamp": "2026-07-11T09:00:00Z"
     },
     {
-      "type": "ChoiceStateEntered",
-      "stateEnteredEventDetails": {
-        "name": "CheckSkipAggregateCosts",
-        "input": "{}"
-      },
-      "id": 74,
-      "timestamp": "2026-07-11T09:00:00Z"
-    },
-    {
-      "type": "TaskStateEntered",
-      "stateEnteredEventDetails": {
-        "name": "AggregateCosts",
-        "input": "{}"
-      },
-      "id": 75,
-      "timestamp": "2026-07-11T09:00:00Z"
-    },
-    {
       "type": "TaskStateExited",
       "stateExitedEventDetails": {
         "name": "AggregateCosts",
