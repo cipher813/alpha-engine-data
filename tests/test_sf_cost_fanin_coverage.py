@@ -308,6 +308,38 @@ class TestKnownProducersStayDeclared:
             "director-retro-judge"
         ]
 
+    def test_eval_judge_shadow_is_allowed_but_never_required(self, coverage):
+        """alpha-engine-config-I8335.
+
+        ``evaljudge-shadow`` is the OpenRouter shadow judge
+        (``crucible-research`` ``evals/judge.py::evaluate_artifact_openrouter``).
+        It reads as an ``EvalJudgeProcess`` sibling and is not one: no state
+        of this definition reaches it. Its only live invoker is
+        ``lambda/openrouter_shadow_handler.py``, fired by the standalone
+        EventBridge rule ``alpha-research-openrouter-shadow-weekly`` (Sunday
+        10:00 UTC) whose own setup script says verbatim that it is
+        "explicitly NOT a new state on the production Saturday ... chain".
+
+        So it can be neither required nor conditional. ``required`` would
+        demand a record from a producer nothing in the execution invokes;
+        ``conditional_producers["EvalJudgeProcess"]`` would key its admission
+        on a stage that does not produce it — admitting it only when eval-judge
+        happens to run, and refusing it on a run where eval-judge was skipped
+        and a manual shadow re-run landed in the same partition.
+
+        ``allowed`` is the same treatment ``thinktank-*`` gets for the same
+        reason: an out-of-band producer sharing the prefix.
+        """
+        assert "evaljudge-shadow" in coverage["allowed_producers"]
+        flat_required = {
+            cid for ids in coverage["required_producers"].values() for cid in ids
+        }
+        flat_conditional = {
+            cid for ids in coverage["conditional_producers"].values() for cid in ids
+        }
+        assert "evaljudge-shadow" not in flat_required
+        assert "evaljudge-shadow" not in flat_conditional
+
     def test_thinktank_is_allowed_but_never_required(self, coverage):
         """The Think Tank left this pipeline on 2026-08-10 and now runs on
         its own daily cadence, but still writes to the same prefix. It is
