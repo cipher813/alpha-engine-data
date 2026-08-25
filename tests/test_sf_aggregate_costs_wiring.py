@@ -147,8 +147,62 @@ class TestFailureIsolation:
         assert summary["Parameters"]["reason"]
         # A Choice path added later must not throw on an absent error key.
         assert "stage_error.$" not in summary["Parameters"]
-        # The fail-open changes what the run SAYS, never where it goes.
-        assert summary["Next"] == "CheckShellRunNotify"
+        # The fail-open changes what the run SAYS, never where it goes —
+        # one state longer since alpha-engine-config-I8336, which put the
+        # named publish on the path. Both edges out of that publish (success
+        # and its best-effort Catch) land on CheckShellRunNotify, so the
+        # continuation is unchanged in substance.
+        assert summary["Next"] == "PublishAggregateCostsDegraded"
+
+    def test_the_fail_open_pages_at_the_moment_it_fires(self, states):
+        """alpha-engine-config-I8336.
+
+        Before this, the path set ``$.aggregate_costs_degraded`` and walked
+        straight to ``CheckShellRunNotify``: the only signal was the terminal
+        email, and ``$.aggregate_costs_degraded`` folds into
+        ``NotifyCompleteMultipleDegraded``, which deliberately names no
+        specific family. So a cycle with no cost record reached the operator
+        as "two or more families degraded". Mirrors
+        ``PublishScannerLeaderboardDegraded`` exactly.
+        """
+        publish = states["PublishAggregateCostsDegraded"]
+        assert publish["Type"] == "Task"
+        assert publish["Resource"] == "arn:aws:states:::sns:publish"
+        assert publish["ResultPath"] == "$.aggregate_costs_degraded_notify"
+        assert publish["Next"] == "CheckShellRunNotify"
+
+        # config#1819: Subject and Message are CONSTANTS. A States.Format
+        # against an unbounded error string is how an SNS publish starts
+        # failing on the run it is meant to report.
+        params = publish["Parameters"]
+        assert set(params) == {
+            "TopicArn.$",
+            "Subject",
+            "Message",
+            "MessageAttributes",
+        }
+        assert "States.Format" not in params["Subject"]
+        assert "States.Format" not in params["Message"]
+
+        # The Catch is what keeps this best-effort: an SNS outage must not
+        # convert a deliberately-continued run into a failed one.
+        (catch,) = publish["Catch"]
+        assert "States.ALL" in catch["ErrorEquals"]
+        assert catch["Next"] == "CheckShellRunNotify"
+        assert catch["ResultPath"] == "$.aggregate_costs_degraded_notify_error"
+
+    def test_the_alert_does_not_name_a_cause_it_cannot_distinguish(self, states):
+        """This Catch is reached by a fan-in COVERAGE BREACH, by the coverage
+        check being unable to measure, by a capture-stream staleness raise and
+        by an ordinary Lambda failure. The state cannot tell them apart, so the
+        message must not claim to — an alert naming the wrong one of four
+        causes sends the operator to the wrong place three times in four."""
+        message = states["PublishAggregateCostsDegraded"]["Parameters"]["Message"]
+        assert "cost" in message.lower()
+        assert "$.aggregate_costs_error" in message, (
+            "the message must point at where the actual error lives, since it "
+            "deliberately does not name one"
+        )
 
     def test_a_degraded_aggregation_can_never_report_a_clean_success(self, states):
         """Without a rule of its own in CheckGateDegradedNotify a run whose
@@ -224,6 +278,12 @@ class TestEdges:
             "CheckSkipAggregateCosts",  # the skip route
             "AggregateCosts",           # the success route
             "SetAggregateCostsDegradedSummary",  # the fail-open route
+            # alpha-engine-config-I8336: the named alert the fail-open route
+            # now walks through. Both of its edges (success and its
+            # best-effort Catch) land here, and it is reachable ONLY from
+            # SetAggregateCostsDegradedSummary — which is already downstream
+            # of the aggregator, so it adds no path that bypasses it.
+            "PublishAggregateCostsDegraded",
         }
         offenders = []
         for name, st in sf["States"].items():
@@ -239,6 +299,19 @@ class TestEdges:
             f"cost-aggregation gate — their cost rows would never be "
             f"aggregated (alpha-engine-config-I7194)"
         )
+
+    def test_the_degraded_publish_is_reachable_only_from_the_fail_open(self, states):
+        """It is on the allowlist above, so it must not become a second way
+        into the notify gate. Its only predecessor is the fail-open summary,
+        which is itself downstream of the aggregator."""
+        predecessors = []
+        for name, st in states.items():
+            targets = [st.get("Next"), st.get("Default")]
+            targets += [c.get("Next") for c in st.get("Choices", []) or []]
+            targets += [c.get("Next") for c in st.get("Catch", []) or []]
+            if "PublishAggregateCostsDegraded" in targets:
+                predecessors.append(name)
+        assert predecessors == ["SetAggregateCostsDegradedSummary"]
 
     def test_the_leaf_and_the_director_hand_off_to_the_gate(self, states):
         assert states["ScannerLeaderboardComplete"]["Next"] == "CheckSkipAggregateCosts"

@@ -6542,6 +6542,29 @@
         "run_date.$": "$.run_date"
       },
       "ResultPath": "$.degraded_summary",
+      "Next": "PublishAggregateCostsDegraded"
+    },
+    "PublishAggregateCostsDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I8336: named alert on the cost-aggregation fail-open path, mirroring PublishScannerLeaderboardDegraded's shape exactly (config#1819 discipline: hardcoded Subject/Message constants, never States.Format against unbounded input; best-effort Catch so a publish failure cannot block the path it decorates). Before this state the fail-open set $.aggregate_costs_degraded and walked straight to CheckShellRunNotify, so the ONLY signal was the terminal completion email \u2014 and $.aggregate_costs_degraded is registered LAST in CheckGateDegradedNotify, folding into NotifyCompleteMultipleDegraded, which deliberately names no specific family. A run degraded here therefore reached the operator as 'two or more families degraded, check the execution record'. This is the named surface. The Message deliberately does NOT name a cause: this Catch is reached by a fan-in COVERAGE BREACH (CostCoverageError), by 'unable to measure' (CostCoverageUnmeasured), by a capture-stream staleness raise (CostCaptureStaleError) and by an ordinary Lambda failure, and the state cannot tell them apart \u2014 all four are truthfully reported as 'the cost record for this cycle was not written'.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline \u2014 AggregateCosts WARNING (cost record for this cycle not written)",
+        "Message": "AggregateCosts (the weekly cost-telemetry aggregation, decision_artifacts/_cost/{run_date}/cost.parquet) failed \u2014 see $.aggregate_costs_error on the execution record for detail. Reached by an ordinary Lambda failure, by a fan-in COVERAGE BREACH (a stage ran and emitted no cost record, or an undeclared producer appeared), by the coverage check being unable to measure, or by a stale capture stream; the alert does not try to tell them apart because the operator consequence is the same. NON-FATAL for trading: no research, prediction, backtest or execution artifact depends on this parquet, and the run's own work is unaffected. It is NOT nothing: this cycle has no LLM cost attribution, AlphaEngine/Cost is missing a week, and a coverage breach means spend was attributed to nothing at all. The run therefore terminates DEGRADED. View pipeline status: https://dashboard.nousergon.ai/pipeline-status",
+        "MessageAttributes": {}
+      },
+      "ResultPath": "$.aggregate_costs_degraded_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert \u2014 a publish failure must not block the non-fatal path this alert decorates. $.degraded_summary and $.aggregate_costs_degraded are already set, so the run still terminates DEGRADED.",
+          "ResultPath": "$.aggregate_costs_degraded_notify_error",
+          "Next": "CheckShellRunNotify"
+        }
+      ],
       "Next": "CheckShellRunNotify"
     },
     "CheckShellRunNotify": {

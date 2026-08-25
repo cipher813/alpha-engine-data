@@ -699,6 +699,12 @@ STAGES: tuple[Stage, ...] = (
         degraded_witness=frozenset({
             "MarkAggregateCostsDegraded",
             "SetAggregateCostsDegradedSummary",
+            # alpha-engine-config-I8336: the named WARNING publish now sits
+            # between the summary and CheckShellRunNotify, mirroring
+            # PublishScannerLeaderboardDegraded. Entering it means this stage
+            # fail-opened, so a mechanical rerun must re-run it rather than
+            # read the shared CheckShellRunNotify witness as completion.
+            "PublishAggregateCostsDegraded",
         }),
     ),
 )
