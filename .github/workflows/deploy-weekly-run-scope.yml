@@ -1,0 +1,92 @@
+name: Deploy weekly-run-scope
+
+# Auto-deploy the alpha-engine-weekly-run-scope Lambda on merge to main.
+#
+# Why this exists: every other SF-invoked Lambda in this repo has its own
+# deploy-*.yml (freshness-monitor, weekly-preflight, etc.) so a change under
+# the lambda's directory actually goes live. This Lambda (alpha-engine-config-
+# I7620) had none — it was operator-deployed only, which is exactly the
+# codified-but-not-live drift class deploy-infrastructure.yml (deploys the SF,
+# not the lambdas) was built to avoid. Added alongside alpha-engine-config-
+# I8373: that fix vendors a NEW runtime dependency (krepis) into a lambda
+# whose zip previously carried none, so a merge-triggered deploy is the only
+# way the fix actually reaches the Lambda instead of sitting correct-on-main
+# and unreachable, same as the freshness-monitor open_orders gap this pattern
+# was built to close.
+#
+# Separation of concerns: this deploys the function CODE (deploy.sh default
+# path = update-function-code). weekly-run-scope/deploy.sh has no
+# `--code-only` flag (unlike freshness-monitor's — there is no registry here
+# to skip), so the plain default path is used, same as deploy-weekly-
+# preflight.yml.
+#
+# IAM: the github-actions-lambda-deploy role's LambdaUpdate grant covers
+# arn:aws:lambda:...:function:alpha-engine-* (including this function,
+# alpha-engine-weekly-run-scope) so this job needs no policy change.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/lambdas/weekly-run-scope/**'
+      - '.github/workflows/deploy-weekly-run-scope.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-weekly-run-scope-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy weekly-run-scope Lambda
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: alpha-engine-data
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12 (match Lambda runtime)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Deploy weekly-run-scope
+        working-directory: alpha-engine-data
+        run: bash infrastructure/lambdas/weekly-run-scope/deploy.sh
+
+      - name: Report deployed version
+        working-directory: alpha-engine-data
+        run: |
+          echo "Deployed commit: ${{ github.sha }}"
+          aws lambda get-function \
+            --function-name alpha-engine-weekly-run-scope \
+            --query "Configuration.[LastModified,CodeSha256]" \
+            --output text
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@8a904b7a817901f2520dd87131ff307ed97fee02 # main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: deploy-weekly-run-scope.yml
+
+  # Alert (Telegram) on genuine post-merge failure on the default branch.
+  # Reusable workflow + transport in nousergon-lib. config#1128.
+  notify-main-failure:
+    needs: [deploy]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit

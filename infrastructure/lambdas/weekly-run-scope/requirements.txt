@@ -11,4 +11,13 @@
 # NYSE holiday. 21 sibling lambdas already vendor krepis this way (see
 # freshness-monitor/requirements.txt + deploy.sh for the established pattern);
 # this mirrors it rather than inventing a parallel shortcut.
-krepis>=0.59.26
+#
+# Pinned, not floored — first-party/fast-moving deps are pinned, never
+# floored (alpha-engine-config-I7635, same convention as
+# crucible-evaluator/requirements.txt's `krepis[...]==` line). 0.59.38 is
+# krepis's released head at the time of this pin (verified: `git rev-parse
+# v0.59.38^{}` == `origin/main` on nousergon/krepis) and the exact version
+# this lambda's test_handler.py was run against (`pip install krepis==0.59.38`
+# into a clean venv, 28/28 passed) — not merely a floor assumed to resolve to
+# something tested.
+krepis==0.59.38
