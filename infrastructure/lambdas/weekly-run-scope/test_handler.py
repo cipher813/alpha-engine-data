@@ -329,12 +329,19 @@ def _index(monkeypatch, *, definition=None, history=None, raises=None):
 def test_the_handler_writes_the_artifact_for_the_run_date(
     monkeypatch, definition, real_run_history
 ):
+    """``event['run_date']` is the SF's CALENDAR date — a Saturday for this
+    pipeline (`InitializeInput` sets it from `$$.Execution.StartTime`). The
+    written Key must land on the normalized TRADING day (Friday), the same
+    key the sole consumer (crucible-evaluator) reads — alpha-engine-config-
+    I8373: it previously landed on the raw Saturday, where nothing ever
+    read it.
+    """
     index, written = _index(
         monkeypatch, definition=definition, history=real_run_history
     )
     result = index.handler(
         {
-            "run_date": "2026-08-14",
+            "run_date": "2026-08-15",  # Saturday
             "execution_arn": "arn:x",
             "state_machine_arn": "arn:y",
             "execution_input": {"skip_parity": True, "sns_topic_arn": "arn:z"},
@@ -342,7 +349,60 @@ def test_the_handler_writes_the_artifact_for_the_run_date(
         None,
     )
     assert written["Key"] == "backtest/2026-08-14/run_scope.json"
+    assert result["run_date"] == "2026-08-14"
+    assert result["calendar_run_date"] == "2026-08-15"
     assert result["stages"]["Parity"]["disabled_by"] == "skip_parity"
+
+
+def test_a_saturday_run_date_normalizes_to_the_preceding_nyse_session(
+    monkeypatch, definition, all_skip_history
+):
+    """The real live case, alpha-engine-config-I8373: the 2026-08-22 weekly
+    execution wrote ``backtest/2026-08-22/run_scope.json`` while the cycle's
+    ~49 other artifacts were under ``backtest/2026-08-21/`` — the artifact
+    was written where its only consumer could never read it. 2026-08-22 is a
+    Saturday; 2026-08-21 is the preceding NYSE trading day (a Friday, no
+    intervening holiday).
+    """
+    index, written = _index(
+        monkeypatch, definition=definition, history=all_skip_history
+    )
+    result = index.handler(
+        {
+            "run_date": "2026-08-22",
+            "execution_arn": "arn:x",
+            "state_machine_arn": "arn:y",
+        },
+        None,
+    )
+    assert written["Key"] == "backtest/2026-08-21/run_scope.json"
+    assert result["run_date"] == "2026-08-21"
+    assert result["calendar_run_date"] == "2026-08-22"
+
+
+def test_an_empty_run_date_raises_rather_than_writing_a_double_slash_key(
+    monkeypatch, definition, all_skip_history
+):
+    """An empty ``run_date`` must never reach ``KEY_TEMPLATE.format`` — that
+    would silently write ``backtest//run_scope.json``, a key nothing reads
+    and every later listing of ``backtest/`` would misparse. The SF's own
+    Catch on the ``RunScope`` state routes any raised exception to
+    ``CheckSkipReportCard`` without failing the run (module docstring), so
+    raising here is free and turns a silently-misplaced artifact into an
+    honestly-absent one.
+    """
+    index, written = _index(
+        monkeypatch, definition=definition, history=all_skip_history
+    )
+    result = index.handler(
+        {"run_date": "", "execution_arn": "arn:x", "state_machine_arn": "arn:y"},
+        None,
+    )
+    assert result["degraded"] is True
+    assert "EmptyRunDateError" in result["degraded_reason"]
+    assert result["statement"].startswith("SCOPE UNAVAILABLE")
+    # Nothing was persisted — an absent artifact, not a misplaced one.
+    assert written == {}
 
 
 def test_only_skip_flags_are_carried_off_the_execution_input(

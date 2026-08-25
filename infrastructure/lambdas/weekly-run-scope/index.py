@@ -43,6 +43,7 @@ import logging
 import os
 
 import boto3
+from krepis.dates import resolve_trading_day
 
 from run_scope import build_run_scope
 
@@ -51,6 +52,22 @@ logger.setLevel(logging.INFO)
 
 BUCKET = os.environ.get("RESEARCH_BUCKET", "alpha-engine-research")
 KEY_TEMPLATE = "backtest/{run_date}/run_scope.json"
+
+
+class EmptyRunDateError(ValueError):
+    """Raised when the SF handed no ``run_date`` at all.
+
+    ``krepis.dates.resolve_trading_day`` is deliberately defensive — on a parse
+    failure it logs a WARNING and returns the input unchanged rather than
+    raising, which is right for its other callers but wrong here: an empty
+    string would sail through unchanged and produce ``backtest//run_scope.json``,
+    a key nothing has ever read from and nothing ever will. This module's own
+    ``handler`` already has a fail-open Catch (see the module docstring) that
+    routes any raised exception to a degraded, gradeless scope block — so
+    raising loudly here is free: it cannot fail the weekly run, and it turns a
+    silently-misplaced artifact into an honestly-absent one.
+    """
+
 
 #: Every ``skip_*`` key the SF understands is threaded in by the caller. Read
 #: only to EXPLAIN a NOT_REACHED row, never to decide a disposition — the
@@ -82,7 +99,7 @@ def _definition(client, state_machine_arn: str) -> dict:
 
 
 def handler(event, _context):
-    run_date = event.get("run_date") or ""
+    calendar_run_date = event.get("run_date") or ""
     execution_arn = event.get("execution_arn") or ""
     state_machine_arn = event.get("state_machine_arn") or ""
     dry_run = bool(event.get("dry_run"))
@@ -90,8 +107,29 @@ def handler(event, _context):
         key: value for key, value in (event.get("execution_input") or {}).items()
         if key.startswith(_FLAG_PREFIX)
     }
+    # Established before the try so the except branch always has a value to
+    # key the (possibly degraded) artifact by — even when the failure IS the
+    # resolution of `run_date` itself.
+    run_date = ""
 
     try:
+        # alpha-engine-config-I8373: `$.run_date` is the SF's CALENDAR date
+        # (`InitializeInput` sets it from `$$.Execution.StartTime` — a Saturday
+        # for this pipeline). Every artifact under `backtest/{key}/` is keyed by
+        # the TRADING day per DATE_CONVENTIONS, and the sole consumer
+        # (`crucible-evaluator/grading/handler.py::_resolve_run_date`) normalizes
+        # through this same shared primitive before reading. Writing under the
+        # raw calendar date put this artifact where nothing has ever looked —
+        # measured live, 2026-08-22: `backtest/2026-08-22/run_scope.json` sat
+        # alone while the cycle's ~49 other artifacts were under
+        # `backtest/2026-08-21/`.
+        if not calendar_run_date:
+            raise EmptyRunDateError(
+                "event['run_date'] was empty — refusing to write "
+                "backtest//run_scope.json"
+            )
+        run_date = resolve_trading_day(calendar_run_date)
+
         states = boto3.client("stepfunctions")
         definition = _definition(states, state_machine_arn)
         history = _history(states, execution_arn)
@@ -103,6 +141,11 @@ def handler(event, _context):
             state_machine_arn=state_machine_arn,
             input_flags=flags,
         )
+        # Both dates ride along: `run_date` stays the resolved trading day (the
+        # consumer's existing contract, unchanged), and the raw calendar date
+        # the execution actually started on is named explicitly so a reader can
+        # tell which execution produced this artifact without re-deriving it.
+        scope["calendar_run_date"] = calendar_run_date
     except Exception as exc:  # noqa: BLE001
         # Fail-open, and loudly. See the module docstring: the degraded block
         # grades NOTHING, so a consumer reading it cannot mistake this for a
@@ -115,6 +158,7 @@ def handler(event, _context):
         )
         scope["degraded"] = True
         scope["degraded_reason"] = f"{type(exc).__name__}: {exc}"
+        scope["calendar_run_date"] = calendar_run_date
         scope["statement"] = (
             "SCOPE UNAVAILABLE — the run's own scope could not be derived, so "
             "NOTHING on this cycle is established as having been dispatched. "
@@ -129,6 +173,21 @@ def handler(event, _context):
         # construction, the two API grants, the derivation) and writes nothing —
         # the same dry contract every advisory producer on this pipeline honours.
         scope["dry_run"] = True
+        return scope
+
+    if not run_date:
+        # `run_date` never resolved (the EmptyRunDateError path, or a parse
+        # failure so total that `resolve_trading_day` itself couldn't return
+        # anything usable). Writing here would produce
+        # `backtest//run_scope.json` — a key nothing reads and everything after
+        # it would silently misinterpret as a real prefix. The Catch on the SF
+        # `RunScope` state already routes any raised exception to
+        # `CheckSkipReportCard` without failing the run, so an absent artifact
+        # here is the honest outcome, not a gap.
+        logger.error(
+            "run_date never resolved — not writing an artifact for this "
+            "execution (calendar_run_date=%r)", calendar_run_date,
+        )
         return scope
 
     key = KEY_TEMPLATE.format(run_date=run_date)
