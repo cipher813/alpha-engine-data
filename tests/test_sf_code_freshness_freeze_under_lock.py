@@ -84,3 +84,34 @@ def test_freeze_names_the_race_in_what_the_operator_reads() -> None:
         "are different incidents with different fixes, and the operator reads "
         "only this line."
     )
+
+
+def _gate_commands() -> list[str]:
+    doc = json.loads(_SF_PATH.read_text())
+    return doc["States"]["CodeFreshnessGate"]["Parameters"]["Parameters"]["commands"]
+
+
+def test_fatal_gate_diagnostics_go_to_stderr() -> None:
+    """alpha-engine-config-I8685: the line naming WHY the gate failed must land
+    in StandardErrorContent, which is what reaches the operator.
+
+    ``HandleFailure`` publishes ``States.JsonToString($)`` to SNS, and ``$``
+    carries ``code_freshness_poll`` — whose ``detail`` is only "SSM command
+    <id> terminal status Failed (rc=1)" and whose ``StandardErrorContent`` on
+    2026-08-26 was the SSM agent's own "failed to run commands: exit status 1".
+    The sentence that actually explained the failure —
+    ``CODE-STALE-AFTER-HEAL alpha-engine branch=main head=20ca44aa
+    upstream=c5edc712`` — was on stdout, which nothing in the notification
+    path carries, so diagnosing a lost trading session began with pulling the
+    SSM invocation by hand.
+
+    sf-pipeline-policy.md §2.3: the terminal failure message must carry the
+    actual error.
+    """
+    fatal = [c for c in _gate_commands() if "CODE-STALE-AFTER-HEAL" in c]
+    assert len(fatal) == 1
+    assert ">&2" in fatal[0], (
+        "CODE-STALE-AFTER-HEAL is written to stdout, which the SNS failure "
+        "notification does not carry. Route it to stderr so it lands in "
+        "StandardErrorContent."
+    )
