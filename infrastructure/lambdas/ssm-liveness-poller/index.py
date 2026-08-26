@@ -89,6 +89,32 @@ _DELIVERY_FAILURE_DETAILS = {"Undeliverable", "Terminated", "DeliveryTimedOut"}
 
 _STDERR_TAIL_CHARS = 1500
 
+# alpha-engine-config-I8685. Stderr discipline is the contract; this is the
+# backstop for when it is not kept. A stage that writes its fatal diagnostic to
+# stdout leaves the failure notification carrying nothing but the exit code —
+# `detail` restates rc, and StandardErrorContent carries the SSM agent's own
+# generic "failed to run commands: exit status 1". Measured 2026-08-26: the
+# preopen lost a trading session and the sentence that explained it,
+# `CODE-STALE-AFTER-HEAL alpha-engine branch=main head=20ca44aa
+# upstream=c5edc712`, was on stdout — so the diagnosis began with
+# get-execution-history followed by ssm list-command-invocations --details.
+# Bounded, and it reaches the operator ONLY through `detail`. It must never be
+# mapped as its own ResultSelector field: SSM stdout runs ~24 KB per invocation
+# and HandleFailure serialises the whole of `$` via States.JsonToString, so a
+# `stdout_tail.$` / `StandardOutputContent.$` entry re-opens the
+# States.DataLimitExceeded class that killed the Saturday SF twice (2026-06-06
+# ResearchPredictorParallel, 2026-06-19 WaitForEvaluator) and was closed on the
+# weekday and EOD pipelines in config#1163. `detail` is written only on the
+# terminal COMMAND_FAILED branch, so the tail appears once per failed stage
+# rather than on every poll iteration. tests/test_sf_poll_resultselector.py and
+# tests/test_sf_ssm_diagnostics_reach_the_operator.py guard both halves.
+#
+# S3 is not the answer here either, though it is for the spot stages: those
+# sendCommand states set OutputS3BucketName and their full logs land under
+# s3://alpha-engine-research/_ssm_logs/. CodeFreshnessGate sets no S3 output at
+# all, which is why its stdout was simply gone (alpha-engine-config-I8705).
+_STDOUT_TAIL_CHARS = 2000
+
 
 def _get_command_status(command_id: str, instance_id: str) -> dict[str, Any]:
     """Return the invocation's status fields, or a registering sentinel.
@@ -109,6 +135,9 @@ def _get_command_status(command_id: str, instance_id: str) -> dict[str, Any]:
             "stderr_tail": (inv.get("StandardErrorContent") or "")[
                 -_STDERR_TAIL_CHARS:
             ],
+            "stdout_tail": (inv.get("StandardOutputContent") or "")[
+                -_STDOUT_TAIL_CHARS:
+            ],
             "registered": True,
         }
     except ClientError as exc:
@@ -118,6 +147,7 @@ def _get_command_status(command_id: str, instance_id: str) -> dict[str, Any]:
                 "response_code": -1,
                 "status_details": "InvocationDoesNotExist (registration window)",
                 "stderr_tail": "",
+                "stdout_tail": "",
                 "registered": False,
             }
         raise
@@ -140,6 +170,26 @@ def _get_ping_status(instance_id: str) -> str:
     return info[0].get("PingStatus", "Unknown")
 
 
+def _output_tails(cmd: dict[str, Any]) -> str:
+    """Append whatever the script actually said to the COMMAND_FAILED detail.
+
+    `detail` is the one field every consumer already carries: the ASL
+    ResultSelectors map it, and HandleFailure serialises the whole state into
+    the SNS body. Putting the tails here reaches both weekday pipelines and any
+    future stage without each one having to remember a ResultSelector entry —
+    which is the mistake this exists to survive in the first place.
+
+    Both tails are included, and their ABSENCE is stated rather than omitted.
+    A silently missing section is indistinguishable from a stage that printed
+    nothing, and those need different next steps (principles.md 2.7).
+    """
+    parts = []
+    for label, key in (("stderr", "stderr_tail"), ("stdout", "stdout_tail")):
+        tail = (cmd.get(key) or "").strip()
+        parts.append(f" | {label}: {tail}" if tail else f" | {label}: <empty>")
+    return "".join(parts)
+
+
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     instance_id = event["instance_id"]
     command_id = event["command_id"]
@@ -159,6 +209,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         "response_code": cmd["response_code"],
         "status_details": cmd["status_details"],
         "stderr_tail": cmd["stderr_tail"],
+        "stdout_tail": cmd["stdout_tail"],
         "ping_status": ping,
         "step": step,
         # Always present so the ASL ResultSelector's detail.$ path never
@@ -202,6 +253,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 f"[{step}] SSM command {command_id} terminal status "
                 f"{cmd['status']} (rc={cmd['response_code']}): "
                 f"{cmd['status_details']}"
+                + _output_tails(cmd)
             )
     else:
         # Still running (or registering). Liveness + budget accounting.
