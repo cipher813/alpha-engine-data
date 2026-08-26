@@ -1812,7 +1812,7 @@ def test_load_registry_with_recovery_parses_block(monkeypatch, fake_s3):
     artifact_id; artifacts without a block are absent from the map."""
     fake_s3._registry_body = _RECOVERY_REGISTRY
     import index
-    specs, recovery, critical_arms, _esc, _rem, _pt = index.load_registry_with_recovery(
+    specs, recovery, critical_arms, _esc, _rem, _pt, _do = index.load_registry_with_recovery(
         fake_s3, "b", "k")
     assert len(specs) == 2
     assert set(recovery) == {"closes_recoverable"}
@@ -1867,7 +1867,7 @@ def _keyed_get_object(fake_s3, extra: dict[str, bytes]) -> None:
 def test_load_registry_parses_critical_while_champion_arm(fake_s3):
     fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
     import index
-    _specs, _recovery, critical_arms, _esc, _rem, _pt = index.load_registry_with_recovery(
+    _specs, _recovery, critical_arms, _esc, _rem, _pt, _do = index.load_registry_with_recovery(
         fake_s3, "b", "k")
     assert critical_arms == {"champion_feed": ["scanner_predictor_direct"]}
 
@@ -1875,7 +1875,7 @@ def test_load_registry_parses_critical_while_champion_arm(fake_s3):
 def test_dynamic_severity_coerces_when_champion_arm_matches(fake_s3):
     fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
     import index
-    specs, _r, arms, _esc, _rem, _pt = index.load_registry_with_recovery(fake_s3, "b", "k")
+    specs, _r, arms, _esc, _rem, _pt, _do = index.load_registry_with_recovery(fake_s3, "b", "k")
     _keyed_get_object(fake_s3, {
         index.CHAMPION_POINTER_KEY:
             b'{"schema_version": 1, "champion": "scanner_predictor_direct"}',
@@ -1891,7 +1891,7 @@ def test_dynamic_severity_coerces_when_champion_arm_matches(fake_s3):
 def test_dynamic_severity_not_coerced_for_other_arm(fake_s3):
     fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
     import index
-    specs, _r, arms, _esc, _rem, _pt = index.load_registry_with_recovery(fake_s3, "b", "k")
+    specs, _r, arms, _esc, _rem, _pt, _do = index.load_registry_with_recovery(fake_s3, "b", "k")
     _keyed_get_object(fake_s3, {
         index.CHAMPION_POINTER_KEY: b'{"schema_version": 1, "champion": "think_tank"}',
     })
@@ -1906,7 +1906,7 @@ def test_dynamic_severity_pointer_read_failure_fails_toward_critical(fake_s3):
     fail toward paging, never toward silence."""
     fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
     import index
-    specs, _r, arms, _esc, _rem, _pt = index.load_registry_with_recovery(fake_s3, "b", "k")
+    specs, _r, arms, _esc, _rem, _pt, _do = index.load_registry_with_recovery(fake_s3, "b", "k")
     _keyed_get_object(fake_s3, {index.CHAMPION_POINTER_KEY: None})
     coerced_specs, coerced_ids = index.apply_dynamic_severity(
         fake_s3, specs, arms)
@@ -2054,7 +2054,7 @@ artifacts:
     created_at: 2025-01-01
 """
     import index
-    _specs, _recovery, _arms, escalate, _rem, _pt = index.load_registry_with_recovery(
+    _specs, _recovery, _arms, escalate, _rem, _pt, _do = index.load_registry_with_recovery(
         fake_s3, "b", "k")
     assert escalate == {"config_scoring_weights": True}
 
@@ -2397,7 +2397,7 @@ def test_load_registry_parses_remediation_map(monkeypatch, fake_s3):
     undeclared rows are simply absent."""
     import index
     fake_s3._registry_body = _DRAIN_REGISTRY
-    _s, _r, _a, _e, remediation, _pt = index.load_registry_with_recovery(
+    _s, _r, _a, _e, remediation, _pt, _do = index.load_registry_with_recovery(
         fake_s3, "b", "k"
     )
     assert remediation == {
@@ -2595,7 +2595,7 @@ def test_loader_parses_producer_trigger_and_drops_malformed(fake_s3):
     today's alerting behaviour instead of taking the registry down."""
     import index
     fake_s3._registry_body = _PRODUCER_REGISTRY
-    specs, _r, _a, _e, _rem, producer = index.load_registry_with_recovery(
+    specs, _r, _a, _e, _rem, producer, _do = index.load_registry_with_recovery(
         fake_s3, "b", "k"
     )
     assert {s.artifact_id for s in specs} == {
@@ -3875,7 +3875,7 @@ def test_partially_malformed_trigger_list_is_dropped_whole(fake_s3, caplog):
         b"      - scheduler:good\n"
         b"      - not-a-trigger\n"
     )
-    _s, _r, _a, _e, _rem, producer = index.load_registry_with_recovery(
+    _s, _r, _a, _e, _rem, producer, _do = index.load_registry_with_recovery(
         fake_s3, "b", "k"
     )
     assert producer == {}
@@ -4623,3 +4623,338 @@ def test_an_unsuppressed_paging_row_still_gets_its_lookup(
     spent = _lookup_calls(index, monkeypatch)
     index.handler({}, None)
     assert "probe_missing" in spent
+
+
+# ── Declared-off rows (alpha-engine-config-I8719) ───────────────────────────
+#
+# `backtest_pit_parity` CRITICAL-escalated every sweep for a stage that is off
+# by ruling, with `escalation_basis=owning_item_age` — the escalation fired
+# BECAUSE the deliberate disable was old. These pin the fix and, more
+# importantly, pin that the mechanism fails toward PAGING in every direction.
+
+_DO_BLOCK = {
+    "since": "2026-05-13",
+    "reason": "PitParityCompare is bypassed on every automatic weekly-SF "
+              "launch path by skip_parity. Brian ruling 2026-05-13.",
+    "owning_item": "alpha-engine-config-I7309",
+    "clears_when": {"milestone": "crucible_phase_3"},
+}
+
+
+def _resolution(index, now, *, status="pending", age_hours=1.0, artifact="champion_feed"):
+    resolved = (now - timedelta(hours=age_hours)).isoformat()
+    return {
+        "resolved_at": resolved,
+        "row_count": 1,
+        "rows": {artifact: {
+            "milestone": "crucible_phase_3",
+            "milestone_status": status,
+            "suppresses": status == "pending",
+        }},
+    }
+
+
+def _fresh_index(monkeypatch):
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    return index
+
+
+# ── parse_declared_off ──────────────────────────────────────────────────────
+
+
+def test_parse_declared_off_keeps_a_well_formed_block(monkeypatch):
+    index = _fresh_index(monkeypatch)
+    out = index.parse_declared_off(
+        {"artifacts": [{"artifact_id": "a", "declared_off": dict(_DO_BLOCK)}]}
+    )
+    assert out["a"]["owning_item"] == "alpha-engine-config-I7309"
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda b: b.pop("since"),
+    lambda b: b.pop("reason"),
+    lambda b: b.pop("owning_item"),
+    lambda b: b.pop("clears_when"),
+    lambda b: b.__setitem__("clears_when", {"date": "2026-09-30"}),
+    lambda b: b.__setitem__("clears_when", "crucible_phase_3"),
+])
+def test_a_malformed_declared_off_block_is_dropped_and_the_row_keeps_paging(
+        monkeypatch, mutate):
+    """Degrades to today's alerting, never to a registry that fails to load —
+    a suppression field must not be able to take every row's monitoring down
+    with it. The loud half is the PR-time validator in alpha-engine-config."""
+    index = _fresh_index(monkeypatch)
+    block = dict(_DO_BLOCK)
+    mutate(block)
+    out = index.parse_declared_off(
+        {"artifacts": [{"artifact_id": "a", "declared_off": block}]}
+    )
+    assert out == {}
+
+
+def test_a_non_mapping_declared_off_is_dropped(monkeypatch):
+    index = _fresh_index(monkeypatch)
+    assert index.parse_declared_off(
+        {"artifacts": [{"artifact_id": "a", "declared_off": "off"}]}
+    ) == {}
+
+
+# ── resolve_declared_off ────────────────────────────────────────────────────
+
+
+def test_a_pending_milestone_with_a_fresh_resolution_suppresses(
+        monkeypatch, fixed_now):
+    index = _fresh_index(monkeypatch)
+    out = index.resolve_declared_off(
+        {"champion_feed": dict(_DO_BLOCK)},
+        _resolution(index, fixed_now),
+        fixed_now,
+    )
+    assert out["champion_feed"]["suppressed"] is True
+    assert out["champion_feed"]["days_declared_off"] == 17
+    assert out["champion_feed"]["clears_when_milestone"] == "crucible_phase_3"
+
+
+def test_a_reached_milestone_does_not_suppress(monkeypatch, fixed_now):
+    """The designed clearing path: normal freshness resumes the moment the
+    milestone flips, with no second manual step and no separate expiry."""
+    index = _fresh_index(monkeypatch)
+    out = index.resolve_declared_off(
+        {"champion_feed": dict(_DO_BLOCK)},
+        _resolution(index, fixed_now, status="reached"),
+        fixed_now,
+    )
+    assert out["champion_feed"]["suppressed"] is False
+    assert out["champion_feed"]["milestone_status"] == "reached"
+
+
+def test_an_absent_resolution_does_not_suppress(monkeypatch, fixed_now):
+    index = _fresh_index(monkeypatch)
+    out = index.resolve_declared_off(
+        {"champion_feed": dict(_DO_BLOCK)}, None, fixed_now)
+    assert out["champion_feed"]["suppressed"] is False
+
+
+def test_a_resolution_for_a_different_artifact_does_not_suppress_this_one(
+        monkeypatch, fixed_now):
+    index = _fresh_index(monkeypatch)
+    out = index.resolve_declared_off(
+        {"champion_feed": dict(_DO_BLOCK)},
+        _resolution(index, fixed_now, artifact="some_other_row"),
+        fixed_now,
+    )
+    assert out["champion_feed"]["suppressed"] is False
+
+
+def test_a_stale_resolution_does_not_suppress(monkeypatch, fixed_now):
+    """The one failure this must not introduce is a resolution nothing
+    refreshes becoming a permanent blindfold. Past the ceiling, the row pages
+    and the page reads as 'this has been off for N days', which is the
+    decision the operator actually owes."""
+    index = _fresh_index(monkeypatch)
+    out = index.resolve_declared_off(
+        {"champion_feed": dict(_DO_BLOCK)},
+        _resolution(index, fixed_now,
+                    age_hours=index.DECLARED_OFF_RESOLUTION_MAX_AGE_HOURS + 1),
+        fixed_now,
+    )
+    assert out["champion_feed"]["suppressed"] is False
+    assert out["champion_feed"]["resolution_fresh"] is False
+
+
+def test_a_resolution_exactly_at_the_ceiling_still_suppresses(
+        monkeypatch, fixed_now):
+    index = _fresh_index(monkeypatch)
+    out = index.resolve_declared_off(
+        {"champion_feed": dict(_DO_BLOCK)},
+        _resolution(index, fixed_now,
+                    age_hours=index.DECLARED_OFF_RESOLUTION_MAX_AGE_HOURS),
+        fixed_now,
+    )
+    assert out["champion_feed"]["suppressed"] is True
+
+
+def test_an_unparseable_resolved_at_does_not_suppress(monkeypatch, fixed_now):
+    index = _fresh_index(monkeypatch)
+    res = _resolution(index, fixed_now)
+    res["resolved_at"] = "not-a-timestamp"
+    out = index.resolve_declared_off(
+        {"champion_feed": dict(_DO_BLOCK)}, res, fixed_now)
+    assert out["champion_feed"]["suppressed"] is False
+
+
+def test_an_unsuppressed_declared_off_row_is_still_returned(
+        monkeypatch, fixed_now):
+    """Dropping it would make 'declared off, suppression lapsed' and 'never
+    declared anything' indistinguishable to every consumer downstream."""
+    index = _fresh_index(monkeypatch)
+    out = index.resolve_declared_off(
+        {"champion_feed": dict(_DO_BLOCK)},
+        _resolution(index, fixed_now, status="reached"),
+        fixed_now,
+    )
+    assert "champion_feed" in out
+
+
+def test_no_declared_off_rows_resolves_to_an_empty_map(monkeypatch, fixed_now):
+    index = _fresh_index(monkeypatch)
+    assert index.resolve_declared_off({}, None, fixed_now) == {}
+
+
+# ── the escalation half: owning_item_age must not promote a declared-off row ─
+
+
+def test_owning_item_age_does_not_promote_a_declared_off_row(
+        monkeypatch, fixed_now):
+    """The defect in one test. `owning_item_age` escalates a warning row once
+    its owning item is old enough — and a declared-off row's owning item is
+    old PRECISELY BECAUSE the producer is deliberately off. Same inputs as
+    `test_owning_item_age_drives_escalation_not_the_miss_count`, which pages
+    CRITICAL; the only difference is the declaration."""
+    index = _fresh_index(monkeypatch)
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+    spec, result = _warning_spec_and_missing_result(index)
+
+    declared = index.resolve_declared_off(
+        {spec.artifact_id: dict(_DO_BLOCK)},
+        _resolution(index, fixed_now, artifact=spec.artifact_id),
+        fixed_now,
+    )[spec.artifact_id]
+
+    assert _page(index, spec, result, fixed_now, consecutive_miss_runs=3,
+                 owning=_owning(age_days=90.0, sla_days=3),
+                 declared_off=declared) is False
+    publish_mock.assert_not_called()
+
+
+def test_the_same_row_pages_when_its_declaration_is_not_suppressing(
+        monkeypatch, fixed_now):
+    """The control. Nothing about the escalation path was weakened — a row
+    whose declared-off state has lapsed escalates exactly as before."""
+    index = _fresh_index(monkeypatch)
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+    spec, result = _warning_spec_and_missing_result(index)
+
+    declared = index.resolve_declared_off(
+        {spec.artifact_id: dict(_DO_BLOCK)},
+        _resolution(index, fixed_now, status="reached", artifact=spec.artifact_id),
+        fixed_now,
+    )[spec.artifact_id]
+
+    assert _page(index, spec, result, fixed_now, consecutive_miss_runs=3,
+                 owning=_owning(age_days=90.0, sla_days=3),
+                 declared_off=declared) is True
+    assert publish_mock.call_args.kwargs["severity"] == "critical"
+
+
+def test_the_miss_count_ladder_also_cannot_escalate_a_declared_off_row(
+        monkeypatch, fixed_now):
+    index = _fresh_index(monkeypatch)
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+    spec, result = _warning_spec_and_missing_result(index)
+    declared = index.resolve_declared_off(
+        {spec.artifact_id: dict(_DO_BLOCK)},
+        _resolution(index, fixed_now, artifact=spec.artifact_id),
+        fixed_now,
+    )[spec.artifact_id]
+    assert _page(index, spec, result, fixed_now, consecutive_miss_runs=99,
+                 declared_off=declared) is False
+    publish_mock.assert_not_called()
+
+
+def test_a_probe_failure_on_a_declared_off_row_still_does_not_page(
+        monkeypatch, fixed_now):
+    """Deliberate. A probe failure means the MONITOR is broken, but a
+    declared-off row is one whose artifact is not expected to exist, so a
+    failed probe over it carries no information about the producer. It still
+    reaches check_results.json with state=probe_failed."""
+    from nousergon_lib.artifact_freshness import CheckResult
+    index = _fresh_index(monkeypatch)
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    monkeypatch.setattr(index, "publish", publish_mock)
+    spec, _ = _warning_spec_and_missing_result(index)
+    result = CheckResult(state="probe_failed", reason="denied",
+                         canonical_key=spec.s3_key_template,
+                         sla_violated_by_minutes=0)
+    declared = index.resolve_declared_off(
+        {spec.artifact_id: dict(_DO_BLOCK)},
+        _resolution(index, fixed_now, artifact=spec.artifact_id),
+        fixed_now,
+    )[spec.artifact_id]
+    assert _page(index, spec, result, fixed_now, declared_off=declared) is False
+
+
+# ── the console half: never silent ──────────────────────────────────────────
+
+
+def test_a_declared_off_row_renders_with_its_true_state_and_its_age(
+        monkeypatch, fixed_now):
+    """Removes a PAGE, never a FACT. observability-policy.md §8.3: DISABLED is
+    declared, and a declared state renders with its reason, its owner and its
+    age — never green and never an omission."""
+    index = _fresh_index(monkeypatch)
+    spec, result = _warning_spec_and_missing_result(index)
+    declared = index.resolve_declared_off(
+        {spec.artifact_id: dict(_DO_BLOCK)},
+        _resolution(index, fixed_now, artifact=spec.artifact_id),
+        fixed_now,
+    )
+    payload = index._serialize_check_results(
+        [(spec, result)], fixed_now, declared_off_by_id=declared)
+    row = payload["results"][0]
+    assert row["state"] == "missing"          # true state, unchanged
+    assert row["declared_off"] is True
+    assert row["declared_off_suppressed"] is True
+    assert row["console_state"] == "DISABLED"
+    assert row["days_declared_off"] == 17
+    assert row["declared_off_owning_item"] == "alpha-engine-config-I7309"
+    assert row["declared_off_clears_when_milestone"] == "crucible_phase_3"
+    assert row["declared_off_milestone_status"] == "pending"
+    assert row["alert_suppressed"] is True
+    # Distinct from producer-trigger suppression: no live probe found a
+    # disabled trigger, and conflating the two senses is how a check became
+    # unclearable once already.
+    assert row["producer_disabled"] is False
+    assert row["producer_trigger"] is None
+
+
+def test_a_lapsed_declared_off_row_is_not_rendered_DISABLED(
+        monkeypatch, fixed_now):
+    """`console_state` is a claim the monitor is currently acting on. A row
+    that is paging must not simultaneously render as deliberately off."""
+    index = _fresh_index(monkeypatch)
+    spec, result = _warning_spec_and_missing_result(index)
+    declared = index.resolve_declared_off(
+        {spec.artifact_id: dict(_DO_BLOCK)},
+        _resolution(index, fixed_now, status="reached", artifact=spec.artifact_id),
+        fixed_now,
+    )
+    row = index._serialize_check_results(
+        [(spec, result)], fixed_now, declared_off_by_id=declared)["results"][0]
+    assert row["declared_off"] is True          # the declaration still shows
+    assert row["declared_off_suppressed"] is False
+    assert row["console_state"] is None
+    assert row["alert_suppressed"] is False
+
+
+def test_a_row_with_no_declaration_carries_the_fields_as_false_and_none(
+        monkeypatch, fixed_now):
+    """Emit zero rather than nothing — an absent field and a false one are
+    not the same claim to a console."""
+    index = _fresh_index(monkeypatch)
+    spec, result = _warning_spec_and_missing_result(index)
+    row = index._serialize_check_results(
+        [(spec, result)], fixed_now)["results"][0]
+    assert row["declared_off"] is False
+    assert row["declared_off_suppressed"] is False
+    assert row["days_declared_off"] is None
+    assert row["console_state"] is None
