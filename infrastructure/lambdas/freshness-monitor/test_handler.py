@@ -3242,10 +3242,178 @@ def test_search_terms_cover_the_human_prose_variant():
     assert "director_retro" in terms
     assert "director-retro" in terms
     assert "director retro" in terms
-    assert "director" in terms
-    # A date-shaped first path segment is not a stable identifier.
+
+
+def test_search_terms_no_longer_emit_the_bare_path_prefix():
+    """config-I8680. The bare first path segment used to be a search term.
+
+    GitHub issue search is full-text, so one common word (`trades`,
+    `predictor`, `director`) returned twenty-to-thirty unrelated open
+    issues, and `_rank_key` scores no relevance — so ownership fell to
+    whichever of them was the oldest P0. It is now a relevance signal only,
+    never a query.
+    """
+    import index
+    assert "director" not in index._search_terms(
+        "director_retro", "director/2026-08-13/retro.json")
+    assert "trades" not in index._search_terms(
+        "open_orders_latest", "trades/open_orders/latest.json")
+    # And a date-shaped segment was never a stable identifier either.
     assert "2026-08-13" not in index._search_terms(
         "x_y", "2026-08-13/retro.json")
+
+
+# ── config-I8680: the relevance gate ───────────────────────────────────────
+#
+# The measured 2026-08-26 misattribution, verbatim from the CRITICAL page:
+#
+#   artifact_id=open_orders_latest ... escalated_from=warning
+#   escalation_basis=owning_item_age after_consecutive_miss_runs=1
+#   owning_item=#4500 owning_item_priority=P0 owning_item_age_days=30.02
+#   owning_item_sla_days=1 owning_item_members_total=20
+#   owning_item_title='Groom/alert-drain boxes run egress proxy v2.0.0
+#   without auto-redaction — hard-blocks where the laptop redacts'
+#
+# #4500's body matches neither `open_orders` nor `trades/` (verified live via
+# `gh issue view 4500 --json body`). It won ownership on priority and age
+# alone. Because `_alert_decision` swaps the miss-count ladder for the owning
+# item's AGE the moment an item resolves, `30.02 >= 1` made a warning row page
+# CRITICAL on its FIRST miss — and #4500 carries `gate:dependency`, so its age
+# only grows.
+
+_OPEN_ORDERS_KEY = "trades/open_orders/latest.json"
+
+_IRRELEVANT_OLD_P0 = {
+    "number": 4500,
+    "html_url": "https://x/4500",
+    "created_at": "2026-07-27T13:31:07Z",
+    "title": ("Groom/alert-drain boxes run egress proxy v2.0.0 without "
+              "auto-redaction — hard-blocks where the laptop redacts"),
+    "body": "the groom box's proxy build predates auto-redaction",
+    "labels": [{"name": "P0"}, {"name": "gate:dependency"}],
+}
+
+_RELEVANT_YOUNGER_P2 = {
+    "number": 8000,
+    "html_url": "https://x/8000",
+    "created_at": "2026-08-24T00:00:00Z",
+    "title": "executor daemon stopped writing open_orders_latest",
+    "body": "no write to trades/open_orders/latest.json since the restart",
+    "labels": [{"name": "P2"}],
+}
+
+
+def test_irrelevant_old_p0_can_never_own_a_row(monkeypatch):
+    """The live defect: #4500 is the ONLY search result, so a relevance
+    RANK would still crown it. The gate must discard it and leave the row
+    unowned, which puts the miss-count ladder back in force."""
+    import index
+    monkeypatch.setattr(index, "_cached_github_pat", lambda state: "pat")
+    monkeypatch.setattr(index, "_github_search_open_issues",
+                        lambda term, pat: [_IRRELEVANT_OLD_P0])
+    res = index._resolve_owning_item(
+        "open_orders_latest", _OPEN_ORDERS_KEY, {"open_orders_latest"},
+        datetime(2026, 8, 26, 14, 0, tzinfo=timezone.utc),
+        index._new_lookup_state(),
+    )
+    assert res["resolved"] is True
+    assert res["owning_item"] is None
+    assert res["members"] == []
+    assert res["n_candidates"] == 0
+    # Recorded as a number, not as an absence.
+    assert res["n_filtered_irrelevant"] >= 1
+
+
+def test_relevance_outranks_priority_and_age(monkeypatch):
+    """A P2 filed two days ago that NAMES the artifact owns the cause over a
+    P0 filed a month ago that does not. Priority and age order candidates;
+    they do not create them."""
+    import index
+    monkeypatch.setattr(index, "_cached_github_pat", lambda state: "pat")
+    monkeypatch.setattr(
+        index, "_github_search_open_issues",
+        lambda term, pat: [_IRRELEVANT_OLD_P0, _RELEVANT_YOUNGER_P2],
+    )
+    res = index._resolve_owning_item(
+        "open_orders_latest", _OPEN_ORDERS_KEY, {"open_orders_latest"},
+        datetime(2026, 8, 26, 14, 0, tzinfo=timezone.utc),
+        index._new_lookup_state(),
+    )
+    assert res["owning_item"]["number"] == 8000
+    assert [m["number"] for m in res["members"]] == []
+
+
+def test_relevance_accepts_the_dedated_s3_key(monkeypatch):
+    """An item that names the S3 path instead of the artifact_id is still
+    the owner — that recall is what the path prefix used to buy, kept here
+    without buying twenty irrelevant candidates alongside it."""
+    import index
+    by_key = {
+        "number": 8100,
+        "html_url": "https://x/8100",
+        "created_at": "2026-08-20T00:00:00Z",
+        "title": "predictor/self_test.json has not been rewritten",
+        "body": "the weekly training run did not emit it",
+        "labels": [{"name": "P1"}],
+    }
+    monkeypatch.setattr(index, "_cached_github_pat", lambda state: "pat")
+    monkeypatch.setattr(index, "_github_search_open_issues",
+                        lambda term, pat: [by_key])
+    res = index._resolve_owning_item(
+        "predictor_self_test", "predictor/2026-08-25/self_test.json",
+        {"predictor_self_test"},
+        datetime(2026, 8, 26, tzinfo=timezone.utc),
+        index._new_lookup_state(),
+    )
+    assert res["owning_item"]["number"] == 8100
+
+
+def test_relevance_match_is_case_insensitive(monkeypatch):
+    import index
+    shouty = dict(_RELEVANT_YOUNGER_P2,
+                  title="OPEN_ORDERS_LATEST is not being written",
+                  body="no detail")
+    monkeypatch.setattr(index, "_cached_github_pat", lambda state: "pat")
+    monkeypatch.setattr(index, "_github_search_open_issues",
+                        lambda term, pat: [shouty])
+    res = index._resolve_owning_item(
+        "open_orders_latest", _OPEN_ORDERS_KEY, {"open_orders_latest"},
+        datetime(2026, 8, 26, tzinfo=timezone.utc),
+        index._new_lookup_state(),
+    )
+    assert res["owning_item"]["number"] == 8000
+
+
+def test_zero_namer_sorts_last_not_at_ninety_nine():
+    """The `... if n else 99` inversion, corrected.
+
+    DEFENSIVE, and honestly so: the sentinel only changed an outcome when a
+    competing item named 100+ registry artifacts, which no real item does.
+    The relevance gate above is what actually fixes the live defect. This is
+    here because `99` was a count-shaped magic number sitting in a
+    count-valued slot, and the next person to read it would reasonably
+    assume a zero-namer ranks between a 98-namer and a 100-namer — which is
+    exactly backwards from the intent stated in the docstring.
+    """
+    import index
+    broad = {"priority": "P1", "n_artifacts_named": 100,
+             "created_at": "2026-08-20T00:00:00Z", "number": 2}
+    names_none = {"priority": "P1", "n_artifacts_named": 0,
+                  "created_at": "2026-01-01T00:00:00Z", "number": 1}
+    assert sorted([names_none, broad], key=index._rank_key) == [
+        broad, names_none,
+    ]
+    # And the ordinary case is unchanged: narrower still beats broader.
+    narrow = dict(broad, n_artifacts_named=1, number=3)
+    assert sorted([broad, narrow], key=index._rank_key) == [narrow, broad]
+
+
+def test_dedated_key_strips_only_date_segments():
+    import index
+    assert index._dedated_key("predictor/2026-08-25/self_test.json") == (
+        "predictor/self_test.json")
+    assert index._dedated_key(_OPEN_ORDERS_KEY) == _OPEN_ORDERS_KEY
+    assert index._dedated_key("") == ""
 
 
 def test_pat_read_failure_degrades_the_lookup_and_never_raises(monkeypatch):

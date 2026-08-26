@@ -2211,25 +2211,88 @@ def _github_search_open_issues(term: str, pat: str) -> list[dict]:
     return [i for i in items if isinstance(i, dict) and i.get("number")]
 
 
+def _artifact_id_variants(artifact_id: str) -> list[str]:
+    """The spellings a human or a machine might use for one artifact_id.
+
+    The verbatim id is what the registry row and a machine-filed item use.
+    The hyphen/space variants exist because a HUMAN writes the condition in
+    prose — #6562's title says `director-retro-judge`, which an exact
+    `director_retro` match misses entirely, and missing it is the measured
+    defect that motivated the variants.
+    """
+    out = [artifact_id]
+    for variant in (artifact_id.replace("_", "-"), artifact_id.replace("_", " ")):
+        if variant not in out:
+            out.append(variant)
+    return out
+
+
+def _dedated_key(canonical_key: str) -> str:
+    """``canonical_key`` with date-shaped path segments removed.
+
+    ``predictor/2026-08-25/self_test.json`` → ``predictor/self_test.json``.
+    Used as a RELEVANCE signal only (an item that names the S3 path instead
+    of the artifact_id), never as a search term — it costs a query and
+    almost never appears verbatim in a title.
+    """
+    segments = [
+        s for s in (canonical_key or "").split("/")
+        if s and not s[:1].isdigit()
+    ]
+    return "/".join(segments)
+
+
 def _search_terms(artifact_id: str, canonical_key: str) -> list[str]:
     """Search terms derived from the alert's own §7.2 signature.
 
-    The artifact_id verbatim is the exact key both the registry row and a
-    machine-filed item use. The hyphen/space variants exist because a HUMAN
-    writes the condition in prose — #6562's title says `director-retro-judge`,
-    which an exact `director_retro` match misses entirely, and missing it is
-    the whole measured defect. The canonical key's own directory prefix
-    catches items that name the S3 path instead of the artifact.
+    The artifact_id and its prose variants — and NOTHING ELSE.
+
+    config-I8680: this used to also emit the canonical key's bare first path
+    segment (`trades`, `predictor`, `backtest`). GitHub's issue search is
+    full-text, so a single common word returned twenty-to-thirty open issues
+    that had nothing to do with the artifact, and `_rank_key` — which scores
+    no relevance at all — then handed ownership to whichever of them was the
+    oldest P0. Measured 2026-08-26: `open_orders_latest` was reported as
+    owned by alpha-engine-config#4500, "Groom/alert-drain boxes run egress
+    proxy v2.0.0 without auto-redaction", whose body matches neither
+    `open_orders` nor `trades/`.
+
+    That is not merely a cosmetic misattribution. `_alert_decision` replaces
+    the miss-count ladder with the owning item's AGE whenever an item
+    resolves, so a wrongly-attributed 30-day-old P0 makes
+    `age_days >= sla_days` trivially true and the row pages CRITICAL on its
+    FIRST confirmed miss — with `WARNING_ESCALATION_RUNS` bypassed. #4500
+    also carries `gate:dependency`, so its age only grows: the misattribution
+    was a PERMANENT critical-on-first-miss pin.
+
+    The path prefix is not lost, only demoted: it survives as a relevance
+    signal via :func:`_dedated_key`, where it can confirm an already-matched
+    candidate but can never be the sole basis for one.
     """
-    terms = [artifact_id]
-    for variant in (artifact_id.replace("_", "-"), artifact_id.replace("_", " ")):
-        if variant not in terms:
-            terms.append(variant)
-    prefix = (canonical_key or "").split("/", 1)[0]
-    # A date-shaped or empty first segment is not a stable identifier.
-    if prefix and not prefix[:1].isdigit() and prefix not in terms:
-        terms.append(prefix)
-    return terms
+    return _artifact_id_variants(artifact_id)
+
+
+def _is_relevant(
+    issue: dict, artifact_id: str, canonical_key: str,
+) -> bool:
+    """Whether this issue may own ``artifact_id`` AT ALL (config-I8680).
+
+    The bar is deliberately concrete: the artifact_id — in one of its prose
+    variants — or the de-dated S3 key appears in the issue's title or body.
+    An item that merely came back from a full-text search is NOT a candidate.
+
+    This is a FILTER, not a rank term, because a relevance score that only
+    reorders still lets an irrelevant item own the cause whenever it is the
+    only result. When nothing passes, `_resolve_owning_item` returns
+    `owning_item=None` and the miss-count ladder stays in force — which is
+    the correct clock for a condition that is genuinely undiagnosed.
+    """
+    haystack = f"{issue.get('title') or ''}\n{issue.get('body') or ''}".lower()
+    for variant in _artifact_id_variants(artifact_id):
+        if variant.lower() in haystack:
+            return True
+    dedated = _dedated_key(canonical_key)
+    return bool(dedated) and dedated.lower() in haystack
 
 
 def _priority_of(issue: dict) -> str | None:
@@ -2274,6 +2337,13 @@ def _summarize_issue(
     }
 
 
+# Sentinel for "names no registry artifact at all" in `_rank_key`'s
+# specificity term. Any value above the largest plausible `n_artifacts_named`
+# works; it is named rather than inline so the intent (sort LAST) cannot be
+# misread as a count.
+_UNSPECIFIC_RANK = 10 ** 6
+
+
 def _rank_key(item: dict[str, Any]) -> tuple:
     """Deterministic cause-ownership order (§7.4a's many-items-one-cause
     rule): highest priority first, then the NARROWEST claim, then the
@@ -2282,7 +2352,14 @@ def _rank_key(item: dict[str, Any]) -> tuple:
     the owner."""
     return (
         _PRIORITY_RANK.get(item["priority"], 9),
-        item["n_artifacts_named"] if item["n_artifacts_named"] else 99,
+        # config-I8680: this was `... if n else 99`, which sorted an item
+        # naming ZERO registry artifacts — i.e. maximally irrelevant — into
+        # the same bucket as every other zero-namer, collapsing the whole
+        # sort to "oldest of the highest priority wins". Zero now sorts
+        # LAST, where it belongs. With `_is_relevant` filtering upstream a
+        # zero-namer can still appear (it may match on the de-dated S3 key
+        # rather than the artifact_id), so the branch is live, not dead.
+        item["n_artifacts_named"] or _UNSPECIFIC_RANK,
         item["created_at"] or "",
         item["number"],
     )
@@ -2319,6 +2396,7 @@ def _resolve_owning_item(
     by_number: dict[int, dict] = {}
     errors: list[str] = []
     ran_any = False
+    n_filtered = 0
     for term in _search_terms(artifact_id, canonical_key):
         if state["queries"] >= OWNING_ITEM_LOOKUP_MAX_QUERIES:
             errors.append("lookup_budget_exhausted")
@@ -2334,6 +2412,15 @@ def _resolve_owning_item(
         state["queries"] += 1
         try:
             for issue in _github_search_open_issues(term, pat):
+                # config-I8680 relevance gate. Full-text search is a
+                # RECALL mechanism; it decides what to look at, never what
+                # owns the cause. An item that does not name this artifact
+                # (or its de-dated S3 key) is discarded here rather than
+                # ranked, because a rank can still crown an irrelevant item
+                # when it is the only result.
+                if not _is_relevant(issue, artifact_id, canonical_key):
+                    n_filtered += 1
+                    continue
                 by_number.setdefault(int(issue["number"]), issue)
             ran_any = True
         except Exception as exc:  # noqa: BLE001 — a single failed query degrades that term only; recording surfaces: `errors` → degraded_reason on the page and in check_results.json, plus the OwningItemLookupDegraded CW metric
@@ -2348,6 +2435,13 @@ def _resolve_owning_item(
         (_summarize_issue(i, now, known_artifact_ids) for i in by_number.values()),
         key=_rank_key,
     )
+    if not ranked:
+        logger.info(
+            "owning-item lookup: %s matched %d open issue(s) by full-text "
+            "search, none of which name the artifact or its key — no owning "
+            "item; the miss-count ladder stays in force (config-I8680)",
+            artifact_id, n_filtered,
+        )
     resolution = {
         "resolved": True,
         # A PARTIAL search still resolved something, but the operator is
@@ -2357,6 +2451,10 @@ def _resolve_owning_item(
         "owning_item": ranked[0] if ranked else None,
         "members": ranked[1:],
         "n_candidates": len(ranked),
+        # How many full-text hits the relevance gate discarded. Recorded so
+        # a gate that is silently rejecting everything is visible as a
+        # number rather than as an absence (principles.md §2.7).
+        "n_filtered_irrelevant": n_filtered,
     }
     state["cache"][artifact_id] = resolution
     return resolution
