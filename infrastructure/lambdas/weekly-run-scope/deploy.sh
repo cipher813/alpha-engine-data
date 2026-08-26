@@ -46,14 +46,25 @@ source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 # ----- 0. Tests gate the deploy -------------------------------------------
 # The derivation runs against captured real executions and needs no AWS, so
 # there is no reason for a deploy to be the first thing that exercises it.
+# alpha-engine-config-I8373: index.py now does a REAL `import krepis.dates`,
+# so the gate needs the lambda's own requirements.txt installed alongside
+# pytest — the same `-r requirements.txt` shape freshness-monitor/deploy.sh
+# uses, not the old bare `boto3` list (which never covered a real
+# `import krepis`).
 source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
-run_handler_tests "${SCRIPT_DIR}" boto3
+run_handler_tests "${SCRIPT_DIR}" -r "${SCRIPT_DIR}/requirements.txt"
 
-# ----- 1. Package ----------------------------------------------------------
-# No pip install: requirements.txt is deliberately empty (boto3 comes from the
-# runtime), so the zip is index.py + run_scope.py and nothing else.
+# ----- 1. Package: pip install runtime deps into $PKG -----------------------
+# alpha-engine-config-I8373: requirements.txt now carries krepis (for
+# krepis.dates.resolve_trading_day), so the zip is built the same
+# Lambda-safe-Docker-pip way every other dependency-carrying lambda in this
+# tree is (see freshness-monitor/deploy.sh) — bare `cp` of the two source
+# files was correct only while requirements.txt was empty.
+LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PKG=$(mktemp -d)
 trap "rm -rf '$PKG'" EXIT
+echo "Installing runtime deps into ${PKG} (Lambda-safe Docker pip)..."
+bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
 cp "${SCRIPT_DIR}/index.py" "${SCRIPT_DIR}/run_scope.py" "${PKG}/"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
