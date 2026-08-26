@@ -95,6 +95,57 @@ class TestSpliceBasisGuard:
         assert float(out["Close"]) == pytest.approx(763.14 * 0.25)
         assert float(out["Volume"]) == pytest.approx(3_687_971 / 0.25, rel=1e-6)
 
+    def test_feed_leads_pre_adjusted_row_restated_onto_the_store_basis(self):
+        # IESC 2026-08-21 (alpha-engine-config-I8374): polygon retro-adjusted
+        # its history for the registered 1:2 (ex 2026-08-24) while ArcticDB was
+        # still on the pre-action basis. The incoming row then sits at
+        # ``factor`` BELOW the store — the MIRROR of the CRWD case — and
+        # ``is_applied`` is False BY DEFINITION, because the split not yet
+        # being applied is exactly why the store is stale. Both facts made this
+        # orientation structurally unreachable before I8374.
+        reg = CorporateActionRegistry(_FakeS3(), "b")
+        action = ca.CorporateAction.from_split("IESC", "2026-08-24", 1, 2)
+        reg.record_detected(action, run_id="r")  # detected, NOT applied
+
+        assert reg.is_applied(ca.STORE_ARCTICDB_UNIVERSE, action.action_id) is False
+
+        hist = _hist({"2026-08-19": 697.38, "2026-08-20": 683.27})
+        bar = _bar(342.52, volume=1_400_000)
+        out, verdict = _splice_basis_guard(
+            "IESC", bar, hist, pd.Timestamp("2026-08-21"), [action], reg
+        )
+        assert verdict == "restated"
+        # Restated ONTO THE STORE'S basis (×1/factor = ×2), not onto the feed's.
+        assert float(out["Close"]) == pytest.approx(342.52 * 2.0)
+        assert float(out["Volume"]) == pytest.approx(1_400_000 / 2.0, rel=1e-6)
+
+    def test_restatement_log_names_the_orientation(self, caplog):
+        reg = CorporateActionRegistry(_FakeS3(), "b")
+        action = ca.CorporateAction.from_split("IESC", "2026-08-24", 1, 2)
+        reg.record_detected(action, run_id="r")
+        hist = _hist({"2026-08-19": 697.38, "2026-08-20": 683.27})
+        with caplog.at_level(logging.WARNING):
+            _out, verdict = _splice_basis_guard(
+                "IESC", _bar(342.52), hist, pd.Timestamp("2026-08-21"),
+                [action], reg,
+            )
+        assert verdict == "restated"
+        assert any("orientation=feed-leads" in r.message for r in caplog.records)
+
+        caplog.clear()
+        reg2 = CorporateActionRegistry(_FakeS3(), "b")
+        crwd = ca.CorporateAction.from_split("CRWD", "2026-07-02", 1, 4)
+        reg2.record_detected(crwd, run_id="r")
+        reg2.mark_applied(crwd, ca.STORE_ARCTICDB_UNIVERSE, run_id="r")
+        hist2 = _hist({"2026-06-26": 175.27, "2026-06-29": 185.73})
+        with caplog.at_level(logging.WARNING):
+            _out, verdict = _splice_basis_guard(
+                "CRWD", _bar(763.14), hist2, pd.Timestamp("2026-06-30"),
+                [crwd], reg2,
+            )
+        assert verdict == "restated"
+        assert any("orientation=store-leads" in r.message for r in caplog.records)
+
     def test_unapplied_future_ex_action_does_not_restate(self):
         # The store is NOT yet on the post-action scale — a 1/factor gap is
         # then expected pre-basis continuity, not a mismatch to correct.
@@ -145,6 +196,58 @@ class TestSpliceBasisGuard:
         assert verdict == "ok"
         assert float(out["Close"]) == pytest.approx(10.59)
         assert any("NO registered corporate action" in r.message for r in caplog.records)
+
+    def test_pure_append_at_a_registered_ex_date_does_not_page(self, caplog):
+        # IESC 2026-08-24 (alpha-engine-config-I8374): the ex date itself. The
+        # compared closes are on DIFFERENT trading days (324.12 vs the 08-21
+        # close 685.04 = 0.4731 = the 0.5 factor × a genuine 5.4% interday
+        # move), so an EXACT-factor match cannot fire here — only ex-date
+        # proximity can. The old code asserted "NO registered corporate action
+        # explains it" while holding this very action.
+        reg = CorporateActionRegistry(_FakeS3(), "b")
+        action = ca.CorporateAction.from_split("IESC", "2026-08-24", 1, 2)
+        reg.record_detected(action, run_id="r")
+
+        hist = _hist({"2026-08-20": 683.27, "2026-08-21": 685.04})
+        with caplog.at_level(logging.WARNING):
+            out, verdict = _splice_basis_guard(
+                "IESC", _bar(324.12), hist, pd.Timestamp("2026-08-24"), [], reg
+            )
+        assert verdict == "ok"
+        assert float(out["Close"]) == pytest.approx(324.12)
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any(
+            "REGISTERED corporate action" in r.message
+            and action.action_id in r.message
+            for r in caplog.records
+        )
+
+    def test_pure_append_page_states_the_scope_it_evaluated(self, caplog):
+        # A genuinely unexplained split-like append must still page — and the
+        # message must name what it actually asked (MRNA 2026-08-19: the
+        # registry holds no MRNA action at all, so the claim was true there).
+        reg = CorporateActionRegistry(_FakeS3(), "b")
+        hist = _hist({"2026-08-18": 61.10, "2026-08-19": 62.96})
+        with caplog.at_level(logging.ERROR):
+            out, verdict = _splice_basis_guard(
+                "MRNA", _bar(174.38), hist, pd.Timestamp("2026-08-20"), [], reg
+            )
+        assert verdict == "ok"
+        assert float(out["Close"]) == pytest.approx(174.38)
+        errs = [r.message for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errs) == 1
+        assert "NO registered corporate action explains it" in errs[0]
+        assert "evaluated: persisted registry + session-detected splits" in errs[0]
+
+    def test_pure_append_page_admits_a_narrowed_scope_without_a_registry(self, caplog):
+        hist = _hist({"2026-02-05": 22.07, "2026-02-06": 23.49})
+        with caplog.at_level(logging.ERROR):
+            _out, verdict = _splice_basis_guard(
+                "KD", _bar(10.59), hist, pd.Timestamp("2026-02-09"), [], None
+            )
+        assert verdict == "ok"
+        errs = [r.message for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any("session-detected splits only (no registry available)" in m for m in errs)
 
     def test_missing_prior_close_fails_open(self):
         out, verdict = _splice_basis_guard(
