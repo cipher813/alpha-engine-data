@@ -346,7 +346,8 @@ def test_a_declaration_for_a_stage_the_definition_lost_is_a_finding(stages):
 def test_a_declaration_naming_a_producer_that_does_not_exist_is_a_finding(stages):
     bad = {"upstream_artifact_dependencies": [
         {"stage": "PredictorBacktest", "produced_by": "NoSuchStage",
-         "prefix": "backtest/{run_date}/", "reason": "r"}
+         "prefix": "backtest/{run_date}/", "reason": "r",
+         "date_normalization": "nyse_trading_day"}
     ]}
     findings = upstream_dependency_disagreement(stages, bad)
     assert findings and "not a stage in the definition" in findings[0]
