@@ -138,6 +138,10 @@
       "items": {
         "type": "object",
         "required": ["name", "description", "authorized_by", "added", "match", "remediation_steps", "success_predicate", "rollback", "max_consecutive_failures"],
+        "dependentRequired": {
+          "reauthorized_at": ["reauthorized_by"],
+          "reauthorized_by": ["reauthorized_at"]
+        },
         "additionalProperties": false,
         "properties": {
           "name": {
@@ -227,7 +231,17 @@
             "minimum": 1,
             "maximum": 10,
             "default": 2,
-            "description": "Number of consecutive predicate failures before automatic demotion to T2 + finding filed (overseer-policy.md §6)."
+            "description": "Number of consecutive FAILED outcomes before automatic demotion to T2 + finding filed (overseer-policy.md §6). config-I8686 (Brian ruling 2026-08-26): a run resolves to exactly one of verified / declined / failed, and ONLY `failed` — the automation could not EVALUATE its predicate (crash, timeout, unreadable input, malformed payload) — increments this counter. `declined` (the predicate was evaluated and is not satisfied) is the automation giving the CORRECT answer and is silent on the counter in both directions. Collapsing the two demotes an automation precisely when the fleet is broken, which is when its coverage is worth most."
+          },
+          "reauthorized_at": {
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "description": "config-I8686 — the date this automation was re-authorized after a demotion. The drain voids any demotion recorded in the carryover ledger with `demoted_at` earlier than this date, resetting the counter. Re-authorization is therefore a reviewed, merged registry diff rather than a hand-edit of ledger state in S3, which is what §6's 'a reviewed issue authorizing it' actually requires. Requires `reauthorized_by`."
+          },
+          "reauthorized_by": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]+-I[0-9]+$",
+            "description": "config-I8686 — the reviewed issue carrying the re-authorization ruling. Required whenever `reauthorized_at` is set."
           },
           "triggers": { "$ref": "#/$defs/triggers" }
         }

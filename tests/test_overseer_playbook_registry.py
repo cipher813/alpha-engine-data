@@ -528,3 +528,63 @@ def test_every_registry_bundling_lambda_redeploys_on_registry_change():
     assert checked >= 2, (
         f"expected >=2 registry-bundling lambdas (router + liveness probe), found {checked}"
     )
+
+
+# ── T1 outcome split + re-authorization (alpha-engine-config-I8686) ──────────
+
+
+def _t1(name):
+    return next(e for e in REGISTRY["t1_automations"] if e["name"] == name)
+
+
+def test_the_auto_verify_entry_distinguishes_declined_from_failed():
+    """Brian ruling 2026-08-26: a correct DECLINE is an outcome, not a
+    predicate failure. The steps are the executable spec for a
+    non-deterministic runner, so the distinction has to be IN them."""
+    steps = " ".join(_t1("freshness-critical-auto-verify")["remediation_steps"])
+    assert "`declined` — NOT `failed`" in steps
+    assert "Do not increment consecutive_failures" in steps
+    assert "could not be EVALUATED" in steps
+
+
+def test_a_decline_declares_the_incident():
+    """The half that turns a decline into work. Without it the T1 lane earns
+    its keep only on the resolved path, and the full-agent cost the demotion
+    notice names is never removed."""
+    steps = " ".join(_t1("freshness-critical-auto-verify")["remediation_steps"])
+    assert "DECLARE the incident" in steps
+    for fact in ("artifact_id", "last-modified", "SLA floor",
+                 "produced_by", "owning item"):
+        assert fact in steps, fact
+
+
+def test_the_auto_verify_entry_is_reauthorized_by_the_ruling_issue():
+    """Re-authorization is a merged registry diff, never a hand-edit of the
+    carryover ledger in S3 — that is what makes overseer-policy.md §6's
+    'a reviewed issue authorizing it' an actual mechanism."""
+    entry = _t1("freshness-critical-auto-verify")
+    assert entry["reauthorized_at"] == "2026-08-26"
+    assert entry["reauthorized_by"] == "alpha-engine-config-I8686"
+
+
+def test_reauthorized_at_and_reauthorized_by_are_required_together():
+    """A date with no authorizing issue would re-arm an automation with no
+    record of who decided to."""
+    dep = SCHEMA["properties"]["t1_automations"]["items"]["dependentRequired"]
+    assert dep["reauthorized_at"] == ["reauthorized_by"]
+    assert dep["reauthorized_by"] == ["reauthorized_at"]
+
+
+def test_max_consecutive_failures_is_documented_as_failed_only():
+    desc = (SCHEMA["properties"]["t1_automations"]["items"]
+            ["properties"]["max_consecutive_failures"]["description"])
+    assert "ONLY `failed`" in desc
+    assert "declined" in desc
+
+
+def test_the_auto_verify_entry_excludes_declared_off_rows():
+    """The coupling with alpha-engine-config-I8719, stated where the
+    population is defined — one contract, enforced at the producer."""
+    desc = _t1("freshness-critical-auto-verify")["description"]
+    assert "declared_off" in desc
+    assert "alpha-engine-config-I8719" in desc

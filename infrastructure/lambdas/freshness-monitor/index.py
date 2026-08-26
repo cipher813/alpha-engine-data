@@ -360,13 +360,18 @@ def load_registry(s3_client: Any, bucket: str, key: str) -> list[ArtifactSpec]:
 def load_registry_with_recovery(
     s3_client: Any, bucket: str, key: str
 ) -> tuple[list[ArtifactSpec], dict[str, dict], dict[str, list[str]],
-           dict[str, bool], dict[str, str], dict[str, str]]:
+           dict[str, bool], dict[str, str], dict[str, str],
+           dict[str, Any]]:
     """Like :func:`load_registry`, but also returns the per-artifact
     ``recovery:`` spec map (config#1240), the
     ``critical_while_champion_arm`` map (config-I3086), the
     ``escalate_to_issue`` map (config#2055 Gap 2), the
-    ``remediation:`` declared-response-lane map (config-I3282), and the
-    ``producer_trigger`` map (config-I6570), all keyed by ``artifact_id``.
+    ``remediation:`` declared-response-lane map (config-I3282), the
+    ``producer_trigger`` map (config-I6570) — all keyed by ``artifact_id`` —
+    and the ``declared_off`` input (config-I8719): the well-formed
+    ``declared_off:`` blocks plus the publisher's ``declared_off_resolution``
+    block, which :func:`resolve_declared_off` turns into a suppression map
+    once ``now`` is known.
 
     ``ArtifactSpec`` is a frozen lib dataclass without a ``recovery``
     field (the monitor's dispatch concern is not the substrate's
@@ -438,8 +443,17 @@ def load_registry_with_recovery(
                     "row on fewer producers than it declares",
                     spec.artifact_id, producer_trigger,
                 )
+    # config-I8719 — the declared-off input. Both halves come from THIS file:
+    # the per-row declarations and the publisher's resolution of their clearing
+    # milestones, so a declaration can never be read against a resolution from
+    # a different publish.
+    declared_off_input = {
+        "rows": parse_declared_off(data),
+        "resolution": data.get("declared_off_resolution"),
+    }
     return (specs, recovery_by_id, critical_arms_by_id,
-            escalate_to_issue_by_id, remediation_by_id, producer_trigger_by_id)
+            escalate_to_issue_by_id, remediation_by_id, producer_trigger_by_id,
+            declared_off_input)
 
 
 # ── Dynamic severity (config-I3086) ─────────────────────────────────────────
@@ -844,6 +858,215 @@ def _save_producer_disabled_since(s3_client: Any, mapping: dict[str, str]) -> No
             "ages from today on the next pass instead of from first observation",
             type(exc).__name__, exc,
         )
+
+
+# ── Declared-off rows (alpha-engine-config-I8719) ───────────────────────────
+#
+# `producer_trigger` above answers "is this artifact's producing SCHEDULE
+# switched off?" by asking live AWS or the GitHub workflow inventory. There is
+# a class it structurally cannot see: a producer switched off INSIDE a pipeline
+# that is itself still enabled.
+#
+# `backtest_pit_parity` is that class. The weekly SF's `SaturdayTrigger` rule
+# is ENABLED and fires every week; what is off is the `PitParityCompare` stage,
+# bypassed by `"skip_parity": true` on the trigger Input (Brian ruling
+# 2026-08-13, re-affirmed 2026-08-26, gated on the `crucible_phase_3`
+# milestone). No AWS object's state answers "does PitParityCompare run?", so
+# there is nothing to probe — and on 2026-08-26T12:00:17Z the row was CRITICAL
+# with `escalation_basis=owning_item_age`, i.e. the escalation fired precisely
+# BECAUSE the deliberate disable was old. The ladder was anti-correlated with
+# the thing it should measure.
+#
+# So this state is DECLARED, in the registry row, never inferred
+# (`observability-policy.md` §8.3: DISABLED, DEPRECATED and RETIRED are the
+# three declared states, and a disposition that exists only as an inference has
+# to be re-derived by hand every time anyone asks).
+#
+# THE SAME THREE PROPERTIES as producer-trigger suppression, and they are why
+# this is a sibling of that mechanism rather than a new one:
+#
+#   1. It FAILS TOWARD PAGING. A malformed block, an absent resolution, an
+#      unknown milestone, a milestone already `reached`, or a resolution older
+#      than DECLARED_OFF_RESOLUTION_MAX_AGE_HOURS all leave the row alerting
+#      exactly as today. Nothing about this path can be made to silence a row
+#      by breaking it.
+#   2. It is NEVER SILENT. A declared-off row still lands in
+#      check_results.json with its true state, `declared_off: true`,
+#      `console_state: "DISABLED"`, the ruling's date, its age in days, the
+#      owning item and the clearing milestone — so the console renders
+#      "declared off, N days" with the ruling attached, never green and never
+#      an omission. `principles.md` §2.7: no data is never green, and neither
+#      is deliberately-off.
+#   3. It EXPIRES BY ITS OWN PREDICATE, and by nothing else. There is
+#      deliberately NO day-count ceiling here, unlike
+#      PRODUCER_SUPPRESSION_MAX_DAYS. A pause nobody owns is a latch and going
+#      loud is the right end state; a declared-off row is the opposite case —
+#      it names its owning item and its clearing milestone up front, and a
+#      calendar expiry would page for a producer that is still deliberately
+#      off. It clears when MILESTONE_REGISTRY.yaml flips the named milestone to
+#      `reached`, which is the same predicate that clears the `gate:milestone`
+#      label on the owning item.
+#
+# WHERE THE MILESTONE COMES FROM. This Lambda holds no GitHub credential and
+# must not acquire one (same argument as GHA_WORKFLOW_STATE_KEY above). The
+# milestone is resolved at PUBLISH time by
+# `alpha-engine-config/scripts/resolve_declared_off.py` and appended to the
+# registry we already read as a top-level `declared_off_resolution` block. So
+# the declaration and its resolved predicate arrive together, in one file, over
+# the transport that already exists.
+#
+# THE STALENESS CEILING is on the RESOLUTION, not on the declaration.
+# `sync-artifact-registry.yml` republishes daily; if it stops — broken,
+# disabled, or switched off by GitHub for repo dormancy
+# (alpha-engine-config-I7370) — `resolved_at` ages past this ceiling inside
+# 36h and every declared-off row pages again. A resolution nothing refreshes is
+# a permanent blindfold, and that is the one failure this mechanism must not
+# introduce.
+DECLARED_OFF_RESOLUTION_MAX_AGE_HOURS = int(
+    os.environ.get("DECLARED_OFF_RESOLUTION_MAX_AGE_HOURS", "36")
+)
+#: Every key a `declared_off:` block must carry to be honoured. A block short
+#: of any of them is DROPPED (the row keeps paging) and logged — matching
+#: `producer_trigger`'s degrade-to-alerting posture, because a suppression
+#: field must never be able to take down a registry load.
+DECLARED_OFF_REQUIRED = ("since", "reason", "owning_item", "clears_when")
+
+
+def parse_declared_off(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Extract well-formed ``declared_off`` blocks from a parsed registry.
+
+    Returns ``{artifact_id: block}``. A malformed block is dropped with a
+    WARNING rather than raising: the field's whole job is to REMOVE a page, so
+    a typo must degrade to today's behaviour, not to a registry that fails to
+    load and takes every row's monitoring with it. The PR-time chokepoint is
+    ``alpha-engine-config/scripts/validate_artifact_registry.py``, which fails
+    loudly on exactly the shapes dropped here.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for entry in data.get("artifacts") or []:
+        if not isinstance(entry, dict):
+            continue
+        block = entry.get("declared_off")
+        if block is None:
+            continue
+        aid = str(entry.get("artifact_id"))
+        if not isinstance(block, dict):
+            logger.warning(
+                "registry row %s carries a declared_off that is not a mapping "
+                "(%s) — row keeps alerting", aid, type(block).__name__,
+            )
+            continue
+        missing = [k for k in DECLARED_OFF_REQUIRED if not block.get(k)]
+        milestone = (block.get("clears_when") or {}).get("milestone") \
+            if isinstance(block.get("clears_when"), dict) else None
+        if missing or not milestone:
+            logger.warning(
+                "registry row %s carries a malformed declared_off "
+                "(missing=%s, milestone=%r) — row keeps alerting. A "
+                "declared-off state without a clearing milestone could never "
+                "lapse, which is worse than the page it would have removed",
+                aid, missing, milestone,
+            )
+            continue
+        out[aid] = dict(block)
+    return out
+
+
+def resolve_declared_off(
+    declared_off_by_id: dict[str, dict[str, Any]],
+    resolution: Any,
+    now: datetime,
+) -> dict[str, dict[str, Any]]:
+    """Decide which declared-off rows are actually suppressed this sweep.
+
+    Returns ``{artifact_id: {...}}`` for EVERY row carrying a well-formed
+    block — including the ones that are NOT suppressed. That is deliberate:
+    the console has to render a declared-off row whose suppression has lapsed
+    differently from one that never declared anything, and dropping the
+    un-suppressed rows here would make those two indistinguishable downstream.
+
+    ``suppressed`` is True only when ALL of the following hold. Every other
+    combination leaves the row on the normal page path:
+
+      * the published registry carries a ``declared_off_resolution`` block;
+      * that block names this artifact;
+      * its ``milestone_status`` is ``pending`` (``reached`` means the ruling
+        has cleared and normal freshness resumes; ``unknown`` means the
+        publisher could not evaluate the predicate at all);
+      * its ``resolved_at`` parses and is within
+        :data:`DECLARED_OFF_RESOLUTION_MAX_AGE_HOURS`.
+    """
+    if not declared_off_by_id:
+        return {}
+    res = resolution if isinstance(resolution, dict) else {}
+    rows = res.get("rows") if isinstance(res.get("rows"), dict) else {}
+    resolved_at_raw = res.get("resolved_at")
+    resolution_age_hours: float | None = None
+    if isinstance(resolved_at_raw, str):
+        try:
+            parsed = datetime.fromisoformat(resolved_at_raw)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            resolution_age_hours = (now - parsed).total_seconds() / 3600.0
+        except ValueError:
+            resolution_age_hours = None
+    resolution_fresh = (
+        resolution_age_hours is not None
+        and resolution_age_hours <= DECLARED_OFF_RESOLUTION_MAX_AGE_HOURS
+    )
+    if declared_off_by_id and not resolution_fresh:
+        logger.warning(
+            "declared-off resolution is ABSENT or STALE (resolved_at=%r, "
+            "age_hours=%s, ceiling=%d) — %d declared-off row(s) keep alerting. "
+            "The publisher is alpha-engine-config's sync-artifact-registry.yml, "
+            "which runs daily; a resolution nothing refreshes is a permanent "
+            "blindfold, so this fails toward paging on purpose",
+            resolved_at_raw, resolution_age_hours,
+            DECLARED_OFF_RESOLUTION_MAX_AGE_HOURS, len(declared_off_by_id),
+        )
+
+    out: dict[str, dict[str, Any]] = {}
+    for aid, block in declared_off_by_id.items():
+        milestone = str((block.get("clears_when") or {}).get("milestone") or "")
+        row = rows.get(aid) if isinstance(rows.get(aid), dict) else {}
+        status = str(row.get("milestone_status") or "unresolved")
+        since = str(block.get("since") or "")
+        try:
+            days = (now.date() - date.fromisoformat(since)).days
+        except ValueError:
+            days = 0
+        suppressed = bool(resolution_fresh and status == "pending")
+        if not suppressed:
+            logger.warning(
+                "declared-off NOT suppressed for %s: milestone=%s status=%s "
+                "resolution_fresh=%s — the row pages exactly as it would "
+                "without the block",
+                aid, milestone, status, resolution_fresh,
+            )
+        else:
+            logger.info(
+                "declared-off (config-I8719): %s — %s (since %s, %d days, "
+                "owning_item=%s, clears when milestone %s is reached); "
+                "console-only, no SNS/Telegram, and NOT eligible for "
+                "owning_item_age escalation",
+                aid, block.get("reason"), since, days,
+                block.get("owning_item"), milestone,
+            )
+        out[aid] = {
+            "suppressed": suppressed,
+            "since": since,
+            "days_declared_off": days,
+            "reason": block.get("reason"),
+            "owning_item": block.get("owning_item"),
+            "clears_when_milestone": milestone,
+            "milestone_status": status,
+            "resolution_age_hours": (
+                round(resolution_age_hours, 2)
+                if resolution_age_hours is not None else None
+            ),
+            "resolution_fresh": resolution_fresh,
+        }
+    return out
 
 
 def _declared_triggers(value: Any) -> tuple[str, ...]:
@@ -1371,6 +1594,7 @@ def _serialize_check_results(
     coerced_ids: set[str] | None = None,
     issue_filed_by_id: dict[str, str | None] | None = None,
     suppression_by_id: dict[str, dict[str, Any]] | None = None,
+    declared_off_by_id: dict[str, dict[str, Any]] | None = None,
     owning_by_id: dict[str, dict[str, Any]] | None = None,
     execution_loop: dict[str, Any] | None = None,
     coverage: dict[str, Any] | None = None,
@@ -1396,10 +1620,12 @@ def _serialize_check_results(
     coerced_ids = coerced_ids or set()
     issue_filed_by_id = issue_filed_by_id or {}
     suppression_by_id = suppression_by_id or {}
+    declared_off_by_id = declared_off_by_id or {}
     owning_by_id = owning_by_id or {}
     rows = []
     for spec, result in pairs:
         suppression = suppression_by_id.get(spec.artifact_id)
+        declared_off = declared_off_by_id.get(spec.artifact_id)
         # §7.4a: the RECORD carries the full owning-item block for every
         # row that had one resolved — including rows whose page was
         # console-only or suppressed. Suppression is a delivery decision,
@@ -1428,7 +1654,55 @@ def _serialize_check_results(
                     suppression["disabled_since"] if suppression else None
                 ),
                 "alert_suppressed": bool(
-                    suppression and suppression["suppressed"]
+                    (suppression and suppression["suppressed"])
+                    or (declared_off and declared_off["suppressed"])
+                ),
+                # config-I8719 — the DECLARED-off half. Deliberately its own
+                # set of fields rather than reusing `producer_disabled`: that
+                # one means "a live probe found the producing trigger
+                # DISABLED", and a declared-off row has no such probe. Two
+                # senses of one word made a check unclearable once already
+                # (config-I8105); these stay distinct.
+                #
+                # `console_state` resolves the row to a member of
+                # observability-policy.md §8.3's closed vocabulary, so the
+                # console renders a declared decision rather than inferring one
+                # from an absent artifact. Only a SUPPRESSED row is DISABLED —
+                # a declared-off row whose resolution went stale or whose
+                # milestone was reached is back under normal freshness, and
+                # saying DISABLED there would be a claim the monitor is no
+                # longer acting on.
+                "declared_off": declared_off is not None,
+                "declared_off_suppressed": bool(
+                    declared_off and declared_off["suppressed"]
+                ),
+                "declared_off_since": (
+                    declared_off["since"] if declared_off else None
+                ),
+                "days_declared_off": (
+                    declared_off["days_declared_off"] if declared_off else None
+                ),
+                "declared_off_reason": (
+                    declared_off["reason"] if declared_off else None
+                ),
+                "declared_off_owning_item": (
+                    declared_off["owning_item"] if declared_off else None
+                ),
+                "declared_off_clears_when_milestone": (
+                    declared_off["clears_when_milestone"]
+                    if declared_off else None
+                ),
+                "declared_off_milestone_status": (
+                    declared_off["milestone_status"] if declared_off else None
+                ),
+                "declared_off_resolution_age_hours": (
+                    declared_off["resolution_age_hours"]
+                    if declared_off else None
+                ),
+                "console_state": (
+                    "DISABLED"
+                    if (declared_off and declared_off["suppressed"])
+                    else None
                 ),
                 # config-I7622 — True: no instance has EVER existed under this
                 # key, so the row is a producer-birth gap and does not page.
@@ -2535,7 +2809,8 @@ def _alert_decision(spec: ArtifactSpec, result: CheckResult, now: datetime,
                     consecutive_miss_runs: int = 0,
                     producer_suppression: dict[str, Any] | None = None,
                     owning: dict[str, Any] | None = None,
-                    never_written: bool | None = None) -> dict[str, Any] | None:
+                    never_written: bool | None = None,
+                    declared_off: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """Decide whether this probe result belongs on the operator page, and
     return the decision. Returns ``None`` when it does not.
 
@@ -2565,6 +2840,35 @@ def _alert_decision(spec: ArtifactSpec, result: CheckResult, now: datetime,
     how many 15min probes have already fired in this window.
     """
     if result.state not in _ALERTING_STATES:
+        return None
+
+    # config-I8719 — the producer is off BY A RECORDED RULING that no live
+    # probe can observe (a bypassed stage inside a still-enabled pipeline).
+    #
+    # Placed FIRST, above every other gate including the config-I3086 warning
+    # ladder and the §7.4a `owning_item_age` basis, and that position is the
+    # whole fix: `owning_item_age` promotes a warning row once its owning item
+    # is old enough, and a declared-off row's owning item is old PRECISELY
+    # BECAUSE the producer is deliberately off. The escalation got louder the
+    # longer the declared state held — anti-correlated with the thing it exists
+    # to measure. Returning here means an `owning_item_age` promotion is
+    # structurally unreachable for a declared-off row, rather than suppressed
+    # after the fact somewhere further down.
+    #
+    # This removes a PAGE, never a fact: the row still reaches
+    # check_results.json with its true state, `declared_off: true`,
+    # `console_state: "DISABLED"` and its age in days (see
+    # `_serialize_check_results`).
+    if declared_off and declared_off.get("suppressed"):
+        logger.info(
+            "declared-off (config-I8719): %s state=%s — %s (declared off %s, "
+            "%d days; owning_item=%s; clears when milestone %s is reached); "
+            "console-only, no SNS/Telegram, no escalation",
+            spec.artifact_id, result.state, declared_off.get("reason"),
+            declared_off.get("since"), declared_off.get("days_declared_off"),
+            declared_off.get("owning_item"),
+            declared_off.get("clears_when_milestone"),
+        )
         return None
 
     # config-I6570 — the producing trigger is live-confirmed DISABLED, so this
@@ -2707,7 +3011,8 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
                  consecutive_miss_runs: int = 0,
                  producer_suppression: dict[str, Any] | None = None,
                  owning: dict[str, Any] | None = None,
-                 never_written: bool | None = None) -> bool:
+                 never_written: bool | None = None,
+                 declared_off: dict[str, Any] | None = None) -> bool:
     """Whether this row belongs on the sweep's page.
 
     Retained as the boolean face of :func:`_alert_decision` — it is the gate
@@ -2722,6 +3027,7 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
         producer_suppression=producer_suppression,
         owning=owning,
         never_written=never_written,
+        declared_off=declared_off,
     ) is not None
 
 
@@ -3437,7 +3743,7 @@ def _handle_intraday(s3_client: Any, now: datetime, started_at: float) -> dict:
     )
 
     (specs, recovery_by_id, critical_arms_by_id, _escalate_to_issue_by_id,
-     remediation_by_id, producer_trigger_by_id) = (
+     remediation_by_id, producer_trigger_by_id, declared_off_input) = (
         load_registry_with_recovery(s3_client, REGISTRY_BUCKET, REGISTRY_KEY)
     )
     specs, _coerced = apply_dynamic_severity(s3_client, specs, critical_arms_by_id)
@@ -3458,12 +3764,25 @@ def _handle_intraday(s3_client: Any, now: datetime, started_at: float) -> dict:
     suppression_by_id = apply_producer_suppression(
         s3_client, intraday_triggers, now
     )
+    # config-I8719 — restricted to the intraday rows for the same reason the
+    # trigger suppression is: this path runs every 30min and must not do work
+    # for rows it will not probe. No AWS call either way — the declaration and
+    # its resolution both came from the registry object already read.
+    declared_off_by_id = {
+        aid: v for aid, v in resolve_declared_off(
+            declared_off_input.get("rows") or {},
+            declared_off_input.get("resolution"),
+            now,
+        ).items()
+        if aid in INTRADAY_ARTIFACT_IDS
+    }
 
     (pairs, alerted, dispatched, per_spec_exceptions, _miss_counts,
      _telemetry) = _run_probe_pass(
         s3_client, intraday_specs, recovery_by_id, now,
         remediation_by_id=remediation_by_id,
         suppression_by_id=suppression_by_id,
+        declared_off_by_id=declared_off_by_id,
     )
 
     duration_seconds = round(time.time() - started_at, 2)
@@ -3495,6 +3814,7 @@ def _run_probe_pass(
     prev_miss_counts: dict[str, int] | None = None,
     remediation_by_id: dict[str, str] | None = None,
     suppression_by_id: dict[str, dict[str, Any]] | None = None,
+    declared_off_by_id: dict[str, dict[str, Any]] | None = None,
     prev_issue_filed: dict[str, str] | None = None,
 ) -> tuple[
     list[tuple[ArtifactSpec, CheckResult]], int, int, int, dict[str, int],
@@ -3622,8 +3942,16 @@ def _run_probe_pass(
         # its true state; what it loses is an owning-item block on a page it was
         # never going to appear on.
         _suppressed = (suppression_by_id or {}).get(spec.artifact_id)
+        # config-I8719 — a declared-off row is the third shape that cannot
+        # page, and it is exactly `_alert_decision`'s first early return, so
+        # skipping the lookup for it cannot change any verdict. Including it
+        # here is not an optimisation: on 2026-08-19 the 24-query cap was spent
+        # on rows that could not page and the ONE row that DID page carried
+        # `lookup_budget_exhausted` onto Brian's Telegram.
+        _declared_off = (declared_off_by_id or {}).get(spec.artifact_id)
         _cannot_page = (
             (_suppressed and _suppressed.get("suppressed"))
+            or (_declared_off and _declared_off.get("suppressed"))
             or never_written_by_id.get(spec.artifact_id) is True
             or suppress_page
         )
@@ -3658,6 +3986,7 @@ def _run_probe_pass(
                     spec.artifact_id),
                 owning=owning,
                 never_written=never_written,
+                declared_off=(declared_off_by_id or {}).get(spec.artifact_id),
             )
         paged = decision is not None
         if paged:
@@ -3766,7 +4095,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     # Load registry. If THIS fails, we want the Lambda to error out
     # so the CW alarm fires — a broken registry must not be silent.
     (specs, recovery_by_id, critical_arms_by_id, escalate_to_issue_by_id,
-     remediation_by_id, producer_trigger_by_id) = (
+     remediation_by_id, producer_trigger_by_id, declared_off_input) = (
         load_registry_with_recovery(s3, REGISTRY_BUCKET, REGISTRY_KEY)
     )
     logger.info(
@@ -3784,6 +4113,28 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     prev_miss_counts = _load_prev_miss_counts(s3)
     # config-I6570: which producers are deliberately switched off right now.
     suppression_by_id = apply_producer_suppression(s3, producer_trigger_by_id, now)
+    # config-I8719 — the declared-off half. No AWS call: both the declarations
+    # and the publisher's resolution of their clearing milestones came from the
+    # registry object already read above.
+    declared_off_by_id = resolve_declared_off(
+        declared_off_input.get("rows") or {},
+        declared_off_input.get("resolution"),
+        now,
+    )
+    # Emit zero rather than nothing. A sweep with no declared-off rows says so,
+    # and a sweep whose declared-off rows are NOT suppressed says that too —
+    # otherwise "the mechanism found nothing" and "the mechanism did not run"
+    # are the same silence (observability-policy.md §3.1).
+    logger.info(
+        "declared-off rows: %d declared, %d suppressed this sweep (%s)",
+        len(declared_off_by_id),
+        len([v for v in declared_off_by_id.values() if v["suppressed"]]),
+        ", ".join(
+            f"{a}={'suppressed' if v['suppressed'] else 'PAGING'}"
+            f"/milestone={v['clears_when_milestone']}:{v['milestone_status']}"
+            for a, v in sorted(declared_off_by_id.items())
+        ) or "none",
+    )
     if suppression_by_id:
         logger.info(
             "producer-trigger suppression active for %d artifact(s): %s",
@@ -3815,6 +4166,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         s3, specs, recovery_by_id, now, prev_miss_counts,
         remediation_by_id=remediation_by_id,
         suppression_by_id=suppression_by_id,
+        declared_off_by_id=declared_off_by_id,
         prev_issue_filed=prev_issue_filed,
     )
     owning_by_id = pass_telemetry["owning_by_id"]
@@ -3868,6 +4220,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         pairs, now, miss_counts=miss_counts, coerced_ids=coerced_ids,
         issue_filed_by_id=issue_filed_by_id,
         suppression_by_id=suppression_by_id,
+        declared_off_by_id=declared_off_by_id,
         owning_by_id=owning_by_id,
         execution_loop=execution_loop,
         coverage=coverage,
