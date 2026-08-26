@@ -475,6 +475,14 @@ def map_binding_disagreement(required: set[str], manifest: dict) -> list[str]:
 
 _REQUIRED_UPSTREAM_FIELDS = ("stage", "produced_by", "prefix", "reason")
 
+#: How the probe date is resolved from the sweep's ``run_date`` binding. Closed
+#: vocabulary, mirrored in preflight_sweep.py. Every dependency must DECLARE
+#: one: a launcher that normalizes RUN_DATE (every crucible-backtester stage
+#: does, via spot_common_normalize_run_date) reads a different prefix than the
+#: sweep's raw calendar date names, and an undeclared default is exactly how a
+#: real weekend failure gets downgraded to "awaiting upstream".
+_DATE_NORMALIZATIONS = ("none", "nyse_trading_day")
+
 
 def upstream_dependencies(manifest: dict) -> dict[str, dict]:
     """The DECLARED same-day upstream artifact dependency of each stage.
@@ -552,6 +560,21 @@ def upstream_dependency_disagreement(stages: list[Stage], manifest: dict) -> lis
                 f"manifest declares an upstream dependency for stage {name!r}, but that "
                 f"stage is classified {NO_DRY_PATH!r} — it is never exercised at all, so "
                 "the declaration can never apply; drop it or give the stage a dry path"
+            )
+        normalization = entry.get("date_normalization")
+        if normalization is None:
+            findings.append(
+                f"upstream dependency for {name!r} declares no date_normalization — the "
+                "probe would use the sweep's raw calendar run_date while the launcher "
+                "normalizes RUN_DATE to the NYSE trading day, so on every non-trading day "
+                "a REAL failure would be downgraded to upstream_pending; declare one of "
+                f"{', '.join(_DATE_NORMALIZATIONS)}"
+            )
+        elif normalization not in _DATE_NORMALIZATIONS:
+            findings.append(
+                f"upstream dependency for {name!r} declares date_normalization="
+                f"{normalization!r}, which is not one of {', '.join(_DATE_NORMALIZATIONS)} "
+                "— the probe cannot be dated and the stage will report unmeasured"
             )
         producer = entry["produced_by"]
         if producer not in by_name:

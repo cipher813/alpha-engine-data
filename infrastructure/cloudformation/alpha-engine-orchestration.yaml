@@ -493,11 +493,23 @@ Resources:
       Name: alpha-engine-predictor-health-check
       Description: Weekday 13:40 UTC — daily predictor model health (IC, hit rate, calibration, retrain triggers), re-homed off the preopen SF (alpha-engine-config-I2722)
       ScheduleExpression: 'cron(40 13 ? * MON-FRI *)'
-      # PAUSED 2026-08-07 (Brian ruling — see infrastructure/automation_pause.json).
-      # State lives here, not only live in AWS: deploy-infrastructure.yml re-applies
-      # this stack on EVERY push to main, so a console-only disable comes back on the
-      # next merge. Flip to ENABLED and drop the manifest entry to un-pause.
-      State: DISABLED
+      # UN-PAUSED 2026-08-26 (Brian ruling, alpha-engine-config-I8704). Paused
+      # 2026-08-07 with the rest of the response plane (config-I6617); restored
+      # per-entry, the same shape as alpha-engine-pipeline-watchdog-daily
+      # (config-I6697) and the three freshness crons (config-I6792).
+      #
+      # Why this one comes back: it is the ONLY consumer of
+      # production_health.json::degradation_flag. That flag has been true since
+      # the 2026-08-22 weekly run (ic_ratio 0.11) and nothing could act on it —
+      # predictor/alerts/history.jsonl had been silent since 2026-06-25. The
+      # failure class it covers is the one the watchdog and the freshness
+      # monitors structurally cannot see: a pipeline that succeeds, writes its
+      # artifact on time, and reports a model that has stopped working.
+      #
+      # State lives here, not only live in AWS: deploy-infrastructure.yml
+      # re-applies this stack on EVERY push to main, so a console-only enable
+      # would be reverted on the next merge.
+      State: ENABLED
       Targets:
         - Id: predictor-health-check
           Arn: !Ref PredictorHealthCheckLambdaArn

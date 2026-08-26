@@ -196,6 +196,16 @@ class SweepReport:
     stages_unsweepable_coverage_defect: int = 0
     stages_unsweepable_upstream_pending: int = 0
     stages_no_dry_path: int = 0
+    # The subset of `stages_no_dry_path` with NO written acknowledgement in
+    # preflight_sweep_manifest.json. The distinction decides whether the run
+    # can ever be clean: a RATIFIED no-dry-path stage is a reviewed, permanent
+    # boundary of the sweep's denominator, so gating `clean` on it made
+    # `outcome: ok` structurally unreachable and `last_clean.json` unwritable
+    # for the sweep's whole life (13 of 13 runs, 2026-08-14..2026-08-26). An
+    # UNACKNOWLEDGED one is a real gap and still keeps the run out of clean --
+    # it also raises its own blocking manifest_disagreement finding, so the
+    # protection is not carried by this counter alone.
+    stages_no_dry_path_unacknowledged: int = 0
     stages_not_attempted: int = 0
     coverage_findings: list[dict[str, Any]] = field(default_factory=list)
     # A stage unsweepable on EVERY run for the declared streak threshold is its
@@ -408,6 +418,83 @@ def _finding(kind: str, detail: str, *, blocking: bool, stage: str | None = None
     return {"kind": kind, "stage": stage, "blocking": blocking, "finding": detail}
 
 
+# ── Probe-date normalization (closed vocabulary; add by PR) ──────────────────
+# The sweep binds `run_date` to its own UTC calendar date, exactly as the SF's
+# InitializeInput does. The LAUNCHERS do not use that value directly: every
+# crucible-backtester stage calls `spot_common_normalize_run_date`
+# (infrastructure/_spot_common.sh), which snaps RUN_DATE back to the NYSE
+# trading day before its stage preflight reads
+# `backtest/${RUN_DATE}/`. On any Saturday, Sunday or market holiday the stage
+# therefore probes a DIFFERENT prefix than the sweep does, and the manifest's
+# stated safety property — "a stage that fails while its upstream prefix IS
+# populated stays FAILED" — is void: the sweep would find the (always empty)
+# calendar-dated prefix and downgrade a REAL failure to upstream_pending, which
+# does not page. Measured on 2026-08-22 and 2026-08-23, where the stage read
+# the populated backtest/2026-08-21/ while the sweep's probe named an empty
+# backtest/2026-08-2{2,3}/.
+#
+# So the normalization is DECLARED per dependency and applied to the probe. It
+# is never guessed from the launcher, and it never falls back to the calendar
+# date when it cannot be computed — falling back is the bug.
+NORMALIZE_NONE = "none"
+NORMALIZE_NYSE_TRADING_DAY = "nyse_trading_day"
+DATE_NORMALIZATIONS = (NORMALIZE_NONE, NORMALIZE_NYSE_TRADING_DAY)
+
+
+class DateNormalizationUnavailable(Exception):
+    """The declared probe-date normalization could not be computed.
+
+    Raised rather than degraded to the calendar date: a probe naming a prefix
+    the stage never read is worse than no probe, because it silently reclassifies
+    real failures.
+    """
+
+
+def normalize_probe_date(run_date: str, mode: str) -> str:
+    """Resolve the date the STAGE will have used, from the sweep's binding.
+
+    ``none`` returns the binding unchanged. ``nyse_trading_day`` routes through
+    the same ``nousergon_lib.trading_calendar`` chokepoint
+    ``spot_common_normalize_run_date`` uses, so the sweep and the launcher can
+    never name different prefixes.
+    """
+    if mode == NORMALIZE_NONE:
+        return run_date
+    if mode != NORMALIZE_NYSE_TRADING_DAY:
+        raise DateNormalizationUnavailable(
+            f"unknown date_normalization {mode!r} — expected one of "
+            f"{', '.join(DATE_NORMALIZATIONS)}"
+        )
+    try:
+        from nousergon_lib import trading_calendar as tc  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        raise DateNormalizationUnavailable(
+            f"nousergon_lib.trading_calendar is not importable ({type(exc).__name__}: "
+            f"{exc}), so the NYSE trading day the launcher normalizes to cannot be "
+            "computed"
+        ) from exc
+    try:
+        day = dt.date.fromisoformat(run_date[:10])
+        return (day if tc.is_trading_day(day) else tc.previous_trading_day(day)).isoformat()
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        raise DateNormalizationUnavailable(
+            f"normalizing {run_date!r} to the NYSE trading day raised "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _probe_bindings(bindings: dict[str, Any], mode: str) -> dict[str, Any]:
+    """``bindings`` with ``run_date`` moved to the date the stage actually used."""
+    if mode == NORMALIZE_NONE:
+        return bindings
+    run_date = bindings.get("run_date")
+    if not run_date:
+        raise DateNormalizationUnavailable(
+            "the sweep has no run_date binding to normalize"
+        )
+    return {**bindings, "run_date": normalize_probe_date(str(run_date), mode)}
+
+
 def upstream_content(
     prefix: str, ignore_subprefixes: list[str], lister
 ) -> tuple[bool, dict[str, Any]]:
@@ -455,10 +542,27 @@ def classify_upstream(
       declaration;
     * upstream prefix is empty     -> ``unsweepable`` / ``upstream_pending``,
       naming the producing stage and the prefix. Not a failure, does not page;
-    * the probe itself could not run -> ``unmeasured``. The sweep cannot tell a
-      real failure from an unmet upstream, and saying either would be a guess.
+    * the probe itself could not run, or the declared probe-date normalization
+      could not be computed -> ``unmeasured``. The sweep cannot tell a real
+      failure from an unmet upstream, and saying either would be a guess.
+
+    The prefix is rendered from the date the STAGE used, not the sweep's own
+    calendar date — see ``normalize_probe_date``.
     """
     template = declaration["prefix"]
+    mode = declaration.get("date_normalization") or NORMALIZE_NONE
+    try:
+        bindings = _probe_bindings(bindings, mode)
+    except DateNormalizationUnavailable as exc:
+        result.verdict = UNMEASURED
+        result.reason = (
+            f"preflight exited rc={result.returncode}, and the declared upstream prefix "
+            f"{template!r} could not be dated: {exc}. The launcher normalizes RUN_DATE to "
+            "the NYSE trading day before reading this prefix, so probing the sweep's raw "
+            "calendar date would name a prefix the stage never read and could silently "
+            "downgrade a real failure — neither verdict is claimed."
+        )
+        return result
     try:
         prefix = template.format(**bindings)
     except (KeyError, IndexError, ValueError) as exc:
@@ -802,6 +906,12 @@ def sweep(
         for entry in (manifest.get("no_dry_path_stages") or [])
         if isinstance(entry, dict) and entry.get("stage")
     }
+    report.stages_no_dry_path_unacknowledged = sum(
+        1
+        for st in stages
+        if st.classification == NO_DRY_PATH
+        and not (acknowledgements.get(st.name) or {}).get("reason")
+    )
 
     results: list[StageResult] = []
     for stage in stages:
@@ -1014,16 +1124,32 @@ def sweep(
 
     blocking_findings = [f for f in report.coverage_findings if _is_blocking(f)]
     # A run is CLEAN only if every stage the sweep is accountable for passed.
-    # An acknowledged no-dry-path stage and a stage awaiting its upstream are
-    # not failures — and they are not passes either, so they keep the run out
-    # of OK and out of last_clean.json. Rendering "measured 14 of 19" as green
-    # is exactly the failure this component exists to avoid.
+    # A stage awaiting its upstream is not a failure and not a pass, so it
+    # keeps the run out of OK and out of last_clean.json — rendering
+    # "measured 14 of 19" as green is exactly the failure this component
+    # exists to avoid.
+    #
+    # A RATIFIED no-dry-path stage is deliberately NOT in this predicate. It is
+    # a permanent, reviewed boundary of the denominator, not a same-day
+    # measurement gap: five of them are declared, none will ever gain a dry
+    # path (three were ruled that way in alpha-engine-config#7329), so gating
+    # `clean` on the raw count made `ok` unreachable on every possible day and
+    # `_preflight_sweep/last_clean.json` — the pointer this module's own
+    # docstring calls the artifact a detector reads as proof, and which
+    # registry.d/ae-preflight-sweep.yaml declares this component PRODUCES —
+    # was never written once in the sweep's life. A status with one reachable
+    # value grades nothing (principles.md §2.7 read the other way round:
+    # a permanent amber is as uninformative as a permanent green). The gap is
+    # still named on every surface: each such stage carries its own no_dry_path
+    # verdict row and its own coverage finding, and an UNACKNOWLEDGED one both
+    # raises a blocking manifest_disagreement finding and is counted in
+    # stages_no_dry_path_unacknowledged above, so it still cannot be clean.
     clean = (
         report.stages_failed == 0
         and report.stages_unsweepable == 0
         and report.stages_unmeasured == 0
         and report.stages_not_attempted == 0
-        and report.stages_no_dry_path == 0
+        and report.stages_no_dry_path_unacknowledged == 0
         and not blocking_findings
     )
     if clean and report.stages_passed > 0:
