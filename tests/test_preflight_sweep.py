@@ -105,8 +105,17 @@ def _sweep_run_date() -> str:
     an empty upstream probe, which is exactly the state it asserts — so it
     passed for the wrong reason in that window and would have kept passing
     if the probe had stopped working entirely.
+
+    Second half, measured 2026-08-26: the probe is dated by the NYSE TRADING
+    DAY, not the calendar date, because that is what the launcher normalizes
+    RUN_DATE to before reading the prefix. A fixture keyed on the raw UTC date
+    would miss the probe on every Saturday, Sunday and market holiday — the
+    same passed-for-the-wrong-reason failure, one axis over.
     """
-    return dt.datetime.now(dt.timezone.utc).date().isoformat()
+    return ps.normalize_probe_date(
+        dt.datetime.now(dt.timezone.utc).date().isoformat(),
+        ps.NORMALIZE_NYSE_TRADING_DAY,
+    )
 
 
 def test_a_clean_preflight_is_a_pass(tmp_path):
@@ -903,3 +912,117 @@ def test_the_sweep_derives_run_date_from_utc_not_local_time():
         "sweep uses LOCAL today() for run_date — the fixtures, the SF's "
         "InitializeInput and the sweep must all agree on one clock"
     )
+
+
+# ── The probe is dated by the NYSE trading day the LAUNCHER uses ─────────────
+# Measured 2026-08-26. `spot_common_normalize_run_date` (crucible-backtester
+# infrastructure/_spot_common.sh) snaps RUN_DATE back to the previous trading
+# day before the stage preflight reads `backtest/${RUN_DATE}/`, so on every
+# non-trading day the sweep's raw calendar probe named a prefix the stage never
+# read — and an empty probe DOWNGRADES a real failure to upstream_pending,
+# which does not page.
+
+_WEEKEND_BINDINGS = {"run_date": "2026-08-23"}  # a Sunday
+_NORMALIZED_DECL = {**DECL, "date_normalization": "nyse_trading_day"}
+
+
+def test_the_probe_uses_the_trading_day_the_launcher_normalized_to():
+    seen: list[str] = []
+
+    def lister(prefix):
+        seen.append(prefix)
+        return []
+
+    ps.classify_upstream(_failed(), _NORMALIZED_DECL, _WEEKEND_BINDINGS, lister)
+    assert seen == ["backtest/2026-08-21/"], (
+        "the Sunday probe must name the Friday prefix the stage actually read"
+    )
+
+
+def test_a_real_weekend_failure_is_not_downgraded_when_the_traded_prefix_is_full():
+    """The regression this exists for: before the normalization, the probe named
+    the always-empty Sunday prefix and reclassified a REAL failure."""
+    listing = {"backtest/2026-08-21/": [
+        {"Key": "backtest/2026-08-21/results/backtest.parquet", "Size": 8123},
+    ]}
+    result = ps.classify_upstream(
+        _failed(), _NORMALIZED_DECL, _WEEKEND_BINDINGS,
+        lambda p: listing.get(p, []),
+    )
+    assert result.verdict == ps.FAILED
+    assert "IS populated" in result.reason
+
+
+def test_an_uncomputable_probe_date_is_unmeasured_never_the_calendar_date(monkeypatch):
+    """Falling back to the calendar date IS the defect, so it must never happen:
+    the sweep says it could not tell instead."""
+    def boom(_run_date, _mode):
+        raise ps.DateNormalizationUnavailable("no trading calendar on this box")
+
+    monkeypatch.setattr(ps, "normalize_probe_date", boom)
+    result = ps.classify_upstream(
+        _failed(), _NORMALIZED_DECL, _WEEKEND_BINDINGS, lambda _p: [])
+    assert result.verdict == ps.UNMEASURED
+    assert "no trading calendar on this box" in result.reason
+
+
+def test_every_declared_upstream_dependency_declares_its_probe_date_rule():
+    manifest = ps.load_manifest(MANIFEST_PATH)
+    decls = manifest["upstream_artifact_dependencies"]
+    assert decls
+    for entry in decls:
+        assert entry.get("date_normalization") in ("none", "nyse_trading_day"), entry
+
+
+# ── A ratified no-dry-path stage must not make `ok` unreachable ──────────────
+# 13 of 13 runs (2026-08-14..2026-08-26) were non-clean and
+# `_preflight_sweep/last_clean.json` was never written once, because `clean`
+# was gated on the raw no-dry-path count and five stages are permanently
+# ratified as having none. A status with one reachable value grades nothing.
+
+
+def test_a_run_whose_only_gap_is_ratified_no_dry_path_stages_is_ok(tmp_path):
+    root = _fake_checkout(tmp_path)
+    run_date = _sweep_run_date()
+    aws = FakeAws(listing={f"backtest/{run_date}/": [
+        {"Key": f"backtest/{run_date}/results/backtest.parquet", "Size": 8123},
+    ]})
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", aws=aws,
+                      runner=_completed(0))
+    assert report.stages_failed == 0
+    assert report.stages_no_dry_path > 0, "the ratified gaps are still counted"
+    assert report.stages_no_dry_path_unacknowledged == 0
+    assert report.outcome == ps.OUTCOME_OK
+    ps.emit(report, aws, "arn:sns")
+    assert f"{ps.REPORT_PREFIX}/last_clean.json" in aws.objects
+
+
+def test_an_unacknowledged_no_dry_path_stage_still_keeps_the_run_out_of_ok(tmp_path):
+    root = _fake_checkout(tmp_path)
+    manifest = json.loads(MANIFEST_PATH.read_text())
+    manifest["no_dry_path_stages"] = [
+        e for e in manifest["no_dry_path_stages"]
+        if e["stage"] != "SaturdayHealthCheck"
+    ]
+    stripped = tmp_path / "manifest.json"
+    stripped.write_text(json.dumps(manifest))
+    report = ps.sweep(SF_PATH, stripped, str(root), "t", runner=_completed(0))
+    assert report.stages_no_dry_path_unacknowledged == 1
+    assert report.outcome == ps.OUTCOME_FAILED
+
+
+def test_the_gaps_stay_named_on_every_surface_even_on_an_ok_run(tmp_path):
+    """Reachable OK must not be bought by hiding the coverage gap."""
+    root = _fake_checkout(tmp_path)
+    run_date = _sweep_run_date()
+    aws = FakeAws(listing={f"backtest/{run_date}/": [
+        {"Key": f"backtest/{run_date}/results/backtest.parquet", "Size": 8123},
+    ]})
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", aws=aws,
+                      runner=_completed(0))
+    assert report.outcome == ps.OUTCOME_OK
+    named = {f.get("stage") for f in report.coverage_findings
+             if f.get("kind") == ps.FINDING_NO_DRY_PATH}
+    rows = {r["stage"] for r in report.results
+            if r["verdict"] == ps.NO_DRY_PATH_VERDICT}
+    assert named == rows and len(rows) == report.stages_no_dry_path > 0
