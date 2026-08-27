@@ -1263,10 +1263,16 @@ def main(argv: list[str] | None = None) -> int:
         definition = json.loads(Path(args.definition).read_text())
         manifest = load_manifest(args.manifest)
         base = derive_shell_run_bindings(definition)
+        # run_date is bound BEFORE the map-binding scan, exactly as `sweep()`
+        # does it — the RUNNER supplies it, so it is not a Map-scoped variable
+        # the manifest must declare. Binding it afterwards made this rehearsal
+        # emit a BLOCKING map_binding_disagreement finding for `$.run_date`
+        # that the live path never emits: the zero-spend rehearsal disagreed
+        # with production about whether the pipeline was renderable at all.
+        base.setdefault("run_date", dt.datetime.now(dt.timezone.utc).date().isoformat())
         required_map = derive_required_map_bindings(definition, base)
         findings = map_binding_disagreement(required_map, manifest)
         bindings = apply_map_bindings(base, manifest)
-        bindings.setdefault("run_date", dt.date.today().isoformat())
         stages = derive_stages(
             definition,
             bindings,

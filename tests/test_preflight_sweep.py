@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import pathlib
 import subprocess
+import sys
 
 import pytest
 
@@ -1026,3 +1028,26 @@ def test_the_gaps_stay_named_on_every_surface_even_on_an_ok_run(tmp_path):
     rows = {r["stage"] for r in report.results
             if r["verdict"] == ps.NO_DRY_PATH_VERDICT}
     assert named == rows and len(rows) == report.stages_no_dry_path > 0
+
+
+# ── The zero-spend rehearsal must agree with the live path ──────────────────
+
+
+def test_the_derive_only_rehearsal_reports_no_blocking_finding_on_the_real_pipeline():
+    """`--derive-only` is the documented zero-spend rehearsal. It bound run_date
+    AFTER the map-binding scan, so it emitted a blocking
+    map_binding_disagreement for `$.run_date` that `sweep()` never emits — the
+    rehearsal said the pipeline could not be rendered while production rendered
+    all 21 stages. It also used LOCAL `date.today()` against the sweep's UTC,
+    the timezone-dependence class of alpha-engine-config#7390."""
+    proc = subprocess.run(
+        [sys.executable, str(REPO / "infrastructure/preflight_sweep.py"),
+         "--derive-only", "--checkout-root", "/nonexistent",
+         "--definition", str(SF_PATH), "--manifest", str(MANIFEST_PATH)],
+        capture_output=True, text=True, cwd=str(REPO),
+        env={**os.environ, "PYTHONPATH": str(REPO)},
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    out = json.loads(proc.stdout)
+    assert out["coverage_findings"] == []
+    assert len(out["stages"]) > 0
