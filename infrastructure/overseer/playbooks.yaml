@@ -1359,11 +1359,38 @@ alert_classes:
 # deterministic remediation with a machine-checkable success predicate, a
 # rollback path, and a reviewed issue authorizing it (listed in authorized_by).
 #
-# Demotion is automatic: ≥max_consecutive_failures consecutive predicate
-# failures → entry disabled (state=demoted) + finding filed. Consecutive-
-# failure count resets on any successful execution. Runtime state is tracked
-# in the drain carryover ledger (DRAIN_STATE_KEY t1_runtime block), NOT here
-# — this file is the static registry; the drain agent reads both.
+# Demotion is automatic: ≥max_consecutive_failures consecutive FAILED outcomes
+# → entry disabled (state=demoted) + finding filed. Consecutive-failure count
+# resets on any successful execution. Runtime state is tracked in the drain
+# carryover ledger (DRAIN_STATE_KEY t1_runtime block), NOT here — this file is
+# the static registry; the drain agent reads both.
+#
+# THREE OUTCOMES, ONE COUNTER (alpha-engine-config-I8686, Brian ruling
+# 2026-08-26). A run resolves to exactly one of:
+#
+#   verified  predicate evaluated and SATISFIED — condition auto-resolved
+#   declined  predicate evaluated and NOT satisfied — the automation gave the
+#             CORRECT answer to the question it was asked
+#   failed    the automation could not EVALUATE its predicate — crash, timeout,
+#             unreadable input, malformed payload, a step it could not complete
+#
+# Only `failed` increments max_consecutive_failures. The distinction is
+# EVALUABILITY, not the answer. `declined` and `failed` used to be collapsed,
+# and on 2026-08-26 `freshness-critical-auto-verify` was demoted after two runs
+# in which it worked perfectly: `trades/open_orders/latest.json` read
+# 2026-08-25T20:00:04Z at both the 12:01 and 14:30 runs because the executor
+# daemon was down (alpha-engine-config-I8682). The automation checked freshness,
+# found the artifact genuinely stale, and declined. Counting that as a failure
+# demotes the automation precisely when the fleet is broken — the moment its
+# coverage is worth most — and keeps it demoted through the outage that
+# triggered it. §6's ladder is right; what fed it was wrong.
+#
+# RE-AUTHORIZATION IS A REGISTRY EDIT. An entry may carry `reauthorized_at`
+# (with `reauthorized_by`); the drain voids any ledger demotion whose
+# `demoted_at` precedes that date and resets the counter. That makes §6's
+# "a reviewed issue authorizing it" the actual mechanism — a merged diff —
+# rather than an operator hand-editing JSON in S3 where nothing records who
+# did it or why.
 #
 # Schema: playbooks.schema.json §t1_automations (additive-only evolution —
 # new OPTIONAL fields are fine; renames/removals require a schema_version bump).
@@ -1383,6 +1410,10 @@ t1_automations:
       compare last-modified to the alert's SLA floor. If fresher, the producer
       ran between alert and drain — the incident is T0-resolved with zero
       diagnosis. This is the T2 agent's own first step, made deterministic.
+      A row carrying `declared_off:` in ARTIFACT_REGISTRY.yaml
+      (alpha-engine-config-I8719) emits no freshness CRITICAL at all and so
+      never enters this population — the exclusion is enforced at the
+      freshness monitor, not here, so there is one contract and not two.
     authorized_by: alpha-engine-config-I4483
     added: "2026-07-28"
     match:
@@ -1402,13 +1433,24 @@ t1_automations:
     remediation_steps:
       - "Read the artifact's `s3_key_template` from `alpha-engine-config/private-docs/ARTIFACT_REGISTRY.yaml` (trust the registry template, not the alert's spelling — some surfaces render `_` as `-`)."
       - "Run `aws s3 ls <artifact_key>` to get the last-modified timestamp."
-      - "Compare to the alert's SLA floor (the staleness threshold). If last-modified ≥ SLA floor, the incident is T0-resolved: record it with disposition `t1-resolved` and note the observed freshness timestamp. If still stale, the T1 automation declines — fall through to T2 diagnosis."
+      - "Compare to the alert's SLA floor (the staleness threshold). If last-modified >= SLA floor, the outcome is `verified`: record the incident with disposition `t1-resolved` and the observed freshness timestamp, and RESET consecutive_failures."
+      - "If still stale, the outcome is `declined` — NOT `failed`. The predicate was evaluated and answered correctly. Do not increment consecutive_failures (config-I8686)."
+      - "On `declined`, DECLARE the incident rather than only returning 'not fresh': record the artifact_id, its s3_key_template, the measured last-modified, the SLA floor it missed, the declared producer from ARTIFACT_REGISTRY.yaml (`produced_by`, or `producer_trigger` where the row carries one), and the owning item where the row or the alert names one. Walk the producer, not the artifact. Then fall through to T2."
+      - "The outcome is `failed` ONLY when the predicate could not be EVALUATED: the registry is unreadable, `aws s3 ls` errors rather than returning empty, the alert carries no resolvable SLA floor, or a step could not be completed at all. Increment consecutive_failures on this and on nothing else."
     success_predicate:
-      description: "Artifact last-modified timestamp is ≥ the alert's SLA floor"
-      check: "aws s3 ls <artifact_key> returns a timestamp ≥ SLA floor"
+      description: "Artifact last-modified timestamp is >= the alert's SLA floor. Evaluating this and getting `no` is a `declined` outcome, not a failure; only being unable to evaluate it at all is `failed` (config-I8686)."
+      check: "aws s3 ls <artifact_key> returns a timestamp >= SLA floor"
     rollback:
       description: "Read-only verification — no state to roll back. If the predicate check was wrong (artifact actually stale), the incident falls through to T2 and is properly diagnosed."
     max_consecutive_failures: 2
+    # config-I8686 — Brian ruled Option A (fix, then re-authorize) on
+    # 2026-08-26. The fix is the outcome split above plus the decline-declares
+    # step; this date is the re-authorization, and it lands in the SAME merge as
+    # the fix it is conditional on. The drain voids the 2026-08-26 demotion
+    # (whose two recorded "failures" were both correct declines) and re-enters
+    # the automation at consecutive_failures: 0 rather than at 2/2.
+    reauthorized_at: "2026-08-26"
+    reauthorized_by: alpha-engine-config-I8686
 
   # Second seed — groom lifecycle ONLINE notices ride the bus at info severity
   # with a dedup_key that is deterministic (mode + filter + model). They are

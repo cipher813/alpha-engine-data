@@ -38,7 +38,7 @@ def _event(**over):
 
 def _mock_ssm(status="InProgress", ping="Online", rc=-1, stderr="",
               invocation_exists=True, instance_registered=True,
-              status_details=None):
+              status_details=None, stdout=None):
     ssm = mock.Mock()
     if invocation_exists:
         ssm.get_command_invocation.return_value = {
@@ -49,6 +49,11 @@ def _mock_ssm(status="InProgress", ping="Online", rc=-1, stderr="",
             # non-delivery). Default to mirroring Status for the common case.
             "StatusDetails": status if status_details is None else status_details,
             "StandardErrorContent": stderr,
+            # Omitted entirely when stdout is None, deliberately: SSM's
+            # StandardOutputContent is optional in the API model, and the
+            # reader must tolerate its absence rather than KeyError on the
+            # path that is trying to explain a failure.
+            **({} if stdout is None else {"StandardOutputContent": stdout}),
         }
     else:
         ssm.get_command_invocation.side_effect = ClientError(
@@ -227,3 +232,70 @@ def test_success_ignores_stale_ping_state():
     ):
         out = index.handler(_event(ping_misses=2), None)
     assert out["verdict"] == "SUCCESS"
+
+
+# ── alpha-engine-config-I8685: what the script said must reach the alert ─────
+
+
+def test_stdout_tail_is_captured_alongside_stderr():
+    with mock.patch.object(
+        index, "_ssm",
+        _mock_ssm(status="Success", rc=0, stderr="warn", stdout="hello"),
+    ):
+        out = index.handler(_event(), None)
+    assert out["stdout_tail"] == "hello"
+    assert out["stderr_tail"] == "warn"
+
+
+def test_absent_stdout_field_does_not_raise():
+    """StandardOutputContent is optional in the SSM API model.
+
+    The reader must tolerate its absence: a KeyError here would kill the poll
+    on the exact path that exists to explain a failure.
+    """
+    with mock.patch.object(index, "_ssm", _mock_ssm(status="Success", rc=0)):
+        out = index.handler(_event(), None)
+    assert out["stdout_tail"] == ""
+
+
+def test_command_failed_detail_carries_the_stdout_the_script_printed():
+    """The 2026-08-26 regression, pinned.
+
+    CodeFreshnessGate wrote CODE-STALE-AFTER-HEAL to stdout and the SNS body
+    carried only the exit code, so diagnosing a lost trading session began with
+    ssm list-command-invocations --details.
+    """
+    with mock.patch.object(
+        index, "_ssm",
+        _mock_ssm(
+            status="Failed", rc=1, ping="Online",
+            stderr="failed to run commands: exit status 1",
+            stdout="CODE-STALE-AFTER-HEAL alpha-engine head=20ca44aa upstream=c5edc712",
+        ),
+    ):
+        out = index.handler(_event(), None)
+    assert out["verdict"] == "COMMAND_FAILED"
+    assert "CODE-STALE-AFTER-HEAL" in out["detail"], (
+        "the failure detail must carry what the script printed — it is the one "
+        "field every ResultSelector already maps and HandleFailure serialises."
+    )
+    assert "failed to run commands" in out["detail"]
+
+
+def test_empty_tails_are_stated_rather_than_omitted():
+    """An absent section and a silent stage need different next steps."""
+    with mock.patch.object(
+        index, "_ssm", _mock_ssm(status="Failed", rc=1, ping="Online"),
+    ):
+        out = index.handler(_event(), None)
+    assert "stderr: <empty>" in out["detail"]
+    assert "stdout: <empty>" in out["detail"]
+
+
+def test_tails_are_bounded():
+    with mock.patch.object(
+        index, "_ssm",
+        _mock_ssm(status="Failed", rc=1, ping="Online", stdout="x" * 50_000),
+    ):
+        out = index.handler(_event(), None)
+    assert len(out["stdout_tail"]) == index._STDOUT_TAIL_CHARS
