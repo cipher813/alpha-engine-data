@@ -66,13 +66,19 @@ def _manifest(paused: dict | None = None, kept: dict | None = None) -> dict:
 
 
 def _reconcile(mod, *, manifest, rows, triggers, targets=None, sf=None, ran=None,
-                alarm_actions_of=None):
+                alarm_actions_of=None, alarm_breaching_of=None):
     return mod.reconcile(
         manifest=manifest, rows=rows, triggers=triggers,
         targets_of=(lambda t: (targets or {}).get(t["name"], [])),
         sf_invoked=sf or set(),
         invocations_of=(lambda cid: (ran or {}).get(cid, 0)),
         alarm_actions_of=alarm_actions_of,
+        # alpha-engine-config-I8712: every alarm-direction test below predates
+        # the notBreaching distinction and asserts the `breaching` behaviour,
+        # so default it True here rather than touch each call site — a test
+        # exercising the notBreaching skip passes its own `alarm_breaching_of`.
+        alarm_breaching_of=alarm_breaching_of if alarm_breaching_of is not None
+        else (lambda name: True),
     )
 
 
@@ -324,6 +330,38 @@ def test_alarm_grading_is_silent_when_state_matches_justification(mod):
         alarm_actions_of=lambda name: False,
     )
     assert not [f for f in findings if f["surface"] == "cloudwatch"]
+
+
+def test_alarm_unexpectedly_enabled_does_not_fire_for_a_notbreaching_alarm(mod):
+    """alpha-engine-config-I8712, induced: the exact live shape that was red on
+    main — a `notBreaching` alarm, watched trigger paused (justified), live
+    ActionsEnabled=True. Only a `breaching` alarm can false-page from the
+    watched trigger's silence, so this is not drift: the live state was never
+    wrong, and grading it as `alarm-unexpectedly-enabled` was the bug.
+    """
+    m = _manifest_with_alarm(watches={"tick": "ruled off"}, alarm_watches=["tick"])
+    findings = _reconcile(
+        mod, manifest=m, rows={},
+        triggers=[{"surface": "events", "name": "tick", "state": "DISABLED"}],
+        alarm_actions_of=lambda name: True,
+        alarm_breaching_of=lambda name: False,
+    )
+    assert not [f for f in findings if f["surface"] == "cloudwatch"], findings
+
+
+def test_alarm_stale_disabled_does_not_fire_for_a_notbreaching_alarm(mod):
+    """The other direction of the same exemption: a notBreaching alarm left
+    ActionsEnabled=False after its watched trigger un-pauses is not drift
+    either — it never needed to be enabled to be correct, so it is not
+    required to be re-enabled to stay correct."""
+    m = _manifest_with_alarm(watches={}, alarm_watches=["tick"])  # tick no longer paused
+    findings = _reconcile(
+        mod, manifest=m, rows={},
+        triggers=[{"surface": "events", "name": "tick", "state": "ENABLED"}],
+        alarm_actions_of=lambda name: False,
+        alarm_breaching_of=lambda name: False,
+    )
+    assert not [f for f in findings if f["surface"] == "cloudwatch"], findings
 
 
 def test_alarm_missing_in_aws_fires_when_the_alarm_does_not_exist(mod):

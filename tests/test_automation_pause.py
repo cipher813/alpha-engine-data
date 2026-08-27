@@ -868,7 +868,13 @@ def test_check_flags_a_justified_alarm_left_armed(
         module, manifest, monkeypatch, classified_world):
     """The bug this issue fixes, induced: paused trigger, ActionsEnabled=true."""
     monkeypatch.setattr(module, "_live_state", lambda surface, name: "DISABLED")
-    monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: True)
+    # ActionsEnabled=true is graded here (alarm-unexpectedly-enabled) only for
+    # a BREACHING alarm (alpha-engine-config-I8712) — `classified_world`
+    # already marks every entry `breaching: True` by default, so setting
+    # `enabled: True` on the live dict it backs is what induces the finding.
+    declared = {e["name"] for e in module.alarm_entries(manifest)}
+    assert declared, "paused_alarms is empty — this test would prove nothing"
+    classified_world.update({name: True for name in declared})
     findings = module.check()
     kinds = {(f["trigger"], f["kind"]) for f in findings}
     # Read from the manifest's CURRENT paused_alarms, not a frozen name list.
@@ -876,8 +882,6 @@ def test_check_flags_a_justified_alarm_left_armed(
     # justified, so every one must be flagged — that is the property. Naming
     # three specific alarms made this fail the moment those three were
     # legitimately re-armed (alpha-engine-config-I8110).
-    declared = {e["name"] for e in module.alarm_entries(manifest)}
-    assert declared, "paused_alarms is empty — this test would prove nothing"
     for name in declared:
         assert (name, "alarm-unexpectedly-enabled") in kinds, findings
 
