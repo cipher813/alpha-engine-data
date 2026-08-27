@@ -68,6 +68,33 @@ re-invoking their paused probe — and were therefore never listed, and kept
 paging. A register built from symptoms is an incident log; ``armed_alarms`` is
 what makes this one an audit.
 
+**``paused_alarms`` may hold BOTH missing-data treatments; only ``breaching``
+entries are graded for silence (alpha-engine-config-I8712).** The block's
+membership is "an alarm watching a paused trigger", not "an alarm that must be
+silenced" — its siblings are commonly declared together (e.g. a component's
+``-dead``/breaching and ``-unreachable``/notBreaching probes watch the same
+schedule). But only a ``breaching`` alarm can latch ALARM purely from a paused
+trigger's silence, so only a ``breaching`` alarm has anything to be silenced
+FOR. A ``notBreaching`` alarm cannot false-page while its watched trigger is
+paused regardless of ``ActionsEnabled`` — CloudWatch treats the missing
+datapoints as within threshold either way — so ``alarm_findings()`` grades
+``alarm-unexpectedly-enabled``/``alarm-stale-disabled`` (and ``enforce()``
+flips actions) **only for entries whose LIVE ``TreatMissingData`` is
+``breaching``**; a ``notBreaching`` entry's ``ActionsEnabled`` state is never
+graded here and is left exactly as it is found; whether it is separately
+declared MUTED still falls to ``alarm_coverage_findings()``'s
+``alarm-undeclared-silence`` scan below, which covers every alarm regardless of
+missing-data treatment. Treating a ``notBreaching`` entry as if it needed
+silencing is the defect this fixes: ``alpha-engine-ssm-reachability-probe-
+unreachable`` (notBreaching, live ``ActionsEnabled=True``) was flagged
+``alarm-unexpectedly-enabled`` against a live state that was never wrong. Do
+**not** "fix" this by moving such an alarm into ``armed_alarms`` instead —
+that block's own scope (above) is explicitly the ``breaching`` population;
+widening it to notBreaching would just relocate the same category error
+(alpha-engine-config-I8180 family: a reader took one classification word to
+mean something narrower than its own scope statement, and made a true finding
+permanently unclearable).
+
 Usage:
   ./infrastructure/automation_pause.py --check     # verify; exit 1 on any finding
   ./infrastructure/automation_pause.py --enforce   # re-disable anything that came back,
@@ -451,13 +478,25 @@ def check() -> list[dict]:
 
 
 def alarm_findings() -> list[dict]:
-    """Every disagreement between ``paused_alarms`` and live CloudWatch state."""
+    """Every disagreement between ``paused_alarms`` and live CloudWatch state.
+
+    ``alarm-unexpectedly-enabled``/``alarm-stale-disabled`` grade whether
+    ``ActionsEnabled`` matches ``alarm_justified()`` — but that grading only
+    applies to a ``breaching`` alarm (alpha-engine-config-I8712, see the module
+    docstring): only a ``breaching`` alarm can false-page from a paused
+    trigger's silence, so only a ``breaching`` alarm has a silencing
+    requirement to be graded against. A live-fetched ``breaching`` flag decides
+    this per entry rather than trusting anything declared in the manifest,
+    because the manifest has no ``treat_missing_data`` field to trust — the
+    live value is the only source of truth for it.
+    """
     out: list[dict] = []
+    live_all = _live_alarm_actions()
     for entry in alarm_entries():
         name = entry["name"]
         justified = alarm_justified(entry)
-        live = _alarm_actions_enabled(name)
-        if live is None:
+        live_entry = live_all.get(name)
+        if live_entry is None:
             out.append({
                 "trigger": name, "surface": "cloudwatch", "kind": "alarm-missing-in-aws",
                 "detail": (
@@ -465,7 +504,16 @@ def alarm_findings() -> list[dict]:
                     "it was deleted or renamed. Remove or correct the entry."
                 ),
             })
-        elif justified and live:
+            continue
+        live = live_entry["enabled"]
+        if not live_entry["breaching"]:
+            # notBreaching: cannot latch ALARM from the watched trigger's
+            # silence, so its ActionsEnabled state is never graded here —
+            # continues to whatever `alarm_coverage_findings()` says about a
+            # DECLARED mute, but not to a "should be silenced" verdict this
+            # alarm class structurally cannot need.
+            continue
+        if justified and live:
             out.append({
                 "trigger": name, "surface": "cloudwatch", "kind": "alarm-unexpectedly-enabled",
                 "detail": (
@@ -713,12 +761,19 @@ def enforce(alarms_only: bool = False) -> list[str]:
                 _disable(surface, name)
                 acted.append(f"{surface}:{name}")
 
+    live_all = _live_alarm_actions()
     for entry in alarm_entries():
         name = entry["name"]
         justified = alarm_justified(entry)
-        live = _alarm_actions_enabled(name)
-        if live is None:
+        live_entry = live_all.get(name)
+        if live_entry is None:
             continue  # reported by alarm_findings(); nothing to act on
+        if not live_entry["breaching"]:
+            # notBreaching: see alarm_findings() / module docstring
+            # (alpha-engine-config-I8712) — nothing to enforce, it cannot
+            # false-page from the watched trigger's silence either way.
+            continue
+        live = live_entry["enabled"]
         if justified and live:
             _set_alarm_actions(name, enabled=False)
             acted.append(f"cloudwatch:{name}:disabled")

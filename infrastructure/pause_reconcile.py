@@ -396,6 +396,7 @@ def reconcile(
     sf_invoked: set[str] | None = None,
     invocations_of=None,
     alarm_actions_of=None,
+    alarm_breaching_of=None,
     is_ephemeral=None,
     noted: list[dict] | None = None,
 ) -> list[dict]:
@@ -407,6 +408,18 @@ def reconcile(
     `paused_alarms` direction (alpha-engine-config-I7174): a callable
     `alarm_name -> bool | None` (live `ActionsEnabled`, or `None` if the alarm
     does not exist), defaulting to `automation_pause._alarm_actions_enabled`.
+    `alarm_breaching_of` mirrors it for the alarm's LIVE ``TreatMissingData``
+    (alpha-engine-config-I8712): a callable `alarm_name -> bool`, `True` unless
+    live state says otherwise, so a caller that supplies neither keeps the
+    pre-I8712 behaviour of assuming every declared entry is `breaching`. Only a
+    `breaching` alarm can false-page from its watched trigger's silence, so
+    `alarm-unexpectedly-enabled`/`alarm-stale-disabled` below are graded only
+    for one — grading a `notBreaching` alarm's `ActionsEnabled` against the
+    silencing requirement was exactly the false positive I8712 fixed
+    (`alpha-engine-ssm-reachability-probe-unreachable`, notBreaching, live
+    `ActionsEnabled=True`, flagged `alarm-unexpectedly-enabled` against a live
+    state that was never wrong). Defaults to a single bulk
+    `automation_pause._live_alarm_actions()` read, not one call per alarm.
 
     `is_ephemeral` is `is_ephemeral_one_shot` and is called LAZILY — only for a
     Scheduler schedule about to be reported `undeclared-enabled`, so a clean run
@@ -424,6 +437,22 @@ def reconcile(
     since = window_start(m)
     invocations_of = invocations_of or (lambda cid: lambda_invocations(cid, since=since))
     alarm_actions_of = alarm_actions_of or ap._alarm_actions_enabled
+    if alarm_breaching_of is None:
+        # One bulk read, cached for every entry this call grades — not one
+        # `describe-alarms` per alarm. `.get(name)` is None for an alarm that
+        # no longer exists live; that case is already reported as
+        # `alarm-missing-in-aws` below via `alarm_actions_of`, so defaulting
+        # its breaching-ness to True here changes nothing observable.
+        _live_cache: dict[str, dict[str, bool]] | None = None
+
+        def _default_breaching_of(name: str) -> bool:
+            nonlocal _live_cache
+            if _live_cache is None:
+                _live_cache = ap._live_alarm_actions()
+            row = _live_cache.get(name)
+            return row["breaching"] if row is not None else True
+
+        alarm_breaching_of = _default_breaching_of
     is_ephemeral = is_ephemeral or is_ephemeral_one_shot
     noted = noted if noted is not None else []
 
@@ -600,6 +629,14 @@ def reconcile(
                     "declared in paused_alarms but no such CloudWatch alarm exists live."
                 ),
             })
+        elif not alarm_breaching_of(name):
+            # notBreaching (alpha-engine-config-I8712): cannot latch ALARM from
+            # the watched trigger's silence, so this direction's silencing
+            # requirement does not apply — ActionsEnabled is not graded here
+            # regardless of its live value. See the module-level note on
+            # `alarm_breaching_of` above and `automation_pause.py`'s matching
+            # fix in `alarm_findings()`.
+            continue
         elif justified and live:
             findings.append({
                 "kind": "alarm-unexpectedly-enabled", "trigger": name, "surface": "cloudwatch",
