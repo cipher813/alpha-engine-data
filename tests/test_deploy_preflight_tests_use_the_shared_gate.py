@@ -62,10 +62,10 @@ _DECLARED_CARVE_OUTS = {
 #     very `get-role >/dev/null 2>&1 || create-role` misclassification the
 #     shared applier was fixed for. Wiring only the test gate would leave the
 #     larger defect in place and imply it had been reviewed.
-#     Tracked: alpha-engine-config-I9075.
+#     Tracked: alpha-engine-config-I9114.
 #   weekly-freshness-spot-dispatcher — nousergon-data#1562 (draft) is editing
 #     this exact deploy.sh; a second concurrent edit to it would collide.
-#     Tracked: alpha-engine-config-I9076.
+#     Tracked: alpha-engine-config-I9115.
 _TRACKED_UNGATED = {
     "thinktank-spot-dispatcher",
     "weekly-freshness-spot-dispatcher",
