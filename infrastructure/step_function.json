@@ -2308,7 +2308,7 @@
             },
             "EvalRollingMean": {
               "Type": "Task",
-              "Comment": "Rolling-4-week-mean derived metric Lambda (PR 4b) \u2014 runs after both eval-judge branches converge. Reads AlphaEngine/Eval/agent_quality_score for the trailing 28 days, computes the mean per (judged_agent_id, criterion, judge_model) combo, and emits agent_quality_score_4w_mean which a CloudWatch alarm fires against (per ROADMAP \u00a71634). Runs every Saturday \u2014 even on weeks where eval-judge had infra failures, the mean across the prior 4 weeks of available data is still the most-current calibration signal.",
+              "Comment": "Rolling-4-week-mean derived metric Lambda (PR 4b) \u2014 runs after both eval-judge branches converge. Reads AlphaEngine/Eval/agent_quality_score for the trailing 28 days, computes the mean per (judged_agent_id, criterion, judge_model) combo, and emits agent_quality_score_4w_mean which a CloudWatch alarm fires against (per ROADMAP \u00a71634). Runs every Saturday \u2014 even on weeks where eval-judge had infra failures, the mean across the prior 4 weeks of available data is still the most-current calibration signal. | alpha-engine-config#9102 (2026-08-28): TimeoutSeconds 300 -> 240, deliberately BELOW the Lambda's own 300s ceiling so the SF timeout is the one that binds and the failure is attributable to this state rather than arriving as an opaque Lambda-side stop. Same convention as NormalizeRunDates. Found when this state burned the full 300s after 1.6s of handler work \u2014 an unbounded boto3 S3 client inside flow-doctor's notifier preflight (flow-doctor#93) \u2014 and fail-opened the whole research/predictor branch, so a run that did its work terminated DEGRADED. The ladder is not the fix for that; it is what makes the next one legible.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-eval-rolling-mean:live",
@@ -2316,7 +2316,7 @@
                   "end_time_iso.$": "$$.Execution.StartTime"
                 }
               },
-              "TimeoutSeconds": 300,
+              "TimeoutSeconds": 240,
               "Retry": [
                 {
                   "ErrorEquals": [
