@@ -94,7 +94,12 @@ _FUNCTION_TIMEOUTS_SEC: dict[str, int] = {
     "alpha-engine-research-eval-judge-poll": 60,
     "alpha-engine-research-eval-judge-process": 900,
     "alpha-engine-research-eval-judge-submit": 300,
-    "alpha-engine-research-eval-rolling-mean": 300,
+    # 300 -> 900 by crucible-research infrastructure/deploy.sh in the
+    # alpha-engine-config-I9102 arc (both create AND update paths — the sizing
+    # previously lived only on create, so no merge could ever re-size the live
+    # function). Pinned at the service maximum because the handler is now
+    # self-deadlining; see the guard-band entry below.
+    "alpha-engine-research-eval-rolling-mean": 900,
     "alpha-engine-research-rationale-clustering": 900,
     "alpha-engine-research-runner": 900,
     # 300 -> 450 by crucible-research-PR601 (p95 x 1.5). The Scanner states
@@ -123,14 +128,10 @@ _KNOWN_UNBOUND: frozenset[tuple[str, str]] = frozenset(
         ("step_function.json", "EvalJudgeSubmitFirstSaturday"),
         ("step_function.json", "EvalJudgeSubmitWeekly"),
         ("step_function.json", "EvalJudgePoll"),
-        # EvalRollingMean REMOVED 2026-08-28 (alpha-engine-config#9102): it now
-        # binds at 240s against the function's 300s. The reason the policy asks
-        # for was measured, not chosen — the state burned its full 300s budget
-        # after 1.6s of handler work, because an unbounded boto3 S3 client in
-        # flow-doctor's notifier preflight (flow-doctor#93, fixed in 0.16.2) held
-        # the invocation open. With SF and function both at 300 the stop arrived
-        # as an opaque Lambda-side timeout rather than an SF error attributable
-        # to this state, and it fail-opened the whole research/predictor branch.
+        # EvalRollingMean REMOVED 2026-08-28 (alpha-engine-config#9102). It is
+        # now a declared _SERVICE_MAX_GUARD_BAND entry below, not an unbound
+        # one: the function moves to Lambda's 900s maximum and its handler
+        # self-deadlines, which is the rule's second branch.
         ("step_function.json", "RationaleClustering"),
         ("step_function.json", "Counterfactual"),
         ("step_function.json", "ReportCard"),
@@ -171,6 +172,25 @@ _SERVICE_MAX_GUARD_BAND: dict[tuple[str, str], int] = {
     # regression cannot recreate the race. alpha-engine-config-I7181.
     ("step_function.json", "ReplayConcordance"): 960,
     ("step_function.json", "EvalJudgeProcess"): 960,
+    # alpha-engine-research-eval-rolling-mean joins that class in the
+    # alpha-engine-config-I9102 arc. MEASURED, from log stream
+    # 2026/08/28/[379]2195e7f6733c410eae3c42e205dc3e59: the stage emitted its
+    # rolling mean (the primary deliverable) 1.6s into the invocation, logged
+    # its control bands at 22:25:53.652, and then produced nothing for 298s
+    # until the 300s function wall — inside
+    # scripts.build_agent_quality -> evals.judge_outcome_ic.open_research_db,
+    # which downloads a 356 MB SQLite snapshot into a 512 MB function. The SF
+    # state raised States.Timeout, the research/predictor branch fail-opened,
+    # and the weekly run terminated FAILED for a stage that had succeeded.
+    #
+    # The fix is in the handler, not here: the four secondary aggregations
+    # bolted onto this stage now run under `invocation_budget.run_bounded`
+    # (crucible-research), so the stage returns its primary deliverable on its
+    # own budget and records an overrunning block as TIMEOUT. That makes it
+    # self-deadlining, and a self-deadlining function must not be pre-empted by
+    # the state that invoked it — same reasoning as the two entries above, and
+    # the same 60s band over a measured ~3.9s Init Duration.
+    ("step_function.json", "EvalRollingMean"): 960,
 }
 
 
