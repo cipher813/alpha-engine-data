@@ -24,6 +24,9 @@ on:
     branches: [main]
     paths:
       - 'infrastructure/lambdas/freshness-monitor/**'
+      - 'infrastructure/overseer/playbooks.yaml'
+      - 'infrastructure/overseer/trigger_descriptions.py'
+      - 'infrastructure/overseer/trigger_surface_drift.py'
       - '.github/workflows/deploy-freshness-monitor.yml'
   workflow_dispatch:
 
@@ -61,6 +64,25 @@ jobs:
       - name: Deploy freshness-monitor (code-only)
         working-directory: alpha-engine-data
         run: bash infrastructure/lambdas/freshness-monitor/deploy.sh --code-only
+
+      # alpha-engine-config-I9045. The linkage between a playbook and the AWS
+      # resources that wake it existed only as prose in playbooks.yaml. These
+      # two steps put it on the resources themselves and then assert it landed
+      # — the assertion is the half that matters: a description applied once by
+      # hand drifts the first time a wake leg is added, and is checked by
+      # nothing. Needs no new IAM: scheduler:{Create,Update}Schedule,
+      # events:PutRule and the matching reads are already on
+      # github-actions-lambda-deploy.
+      - name: Install the reconciler's one dependency
+        run: pip install --upgrade pyyaml
+
+      - name: Reconcile trigger descriptions from playbooks.yaml
+        working-directory: alpha-engine-data
+        run: bash infrastructure/lambdas/freshness-monitor/deploy.sh --reconcile-triggers
+
+      - name: Assert the live trigger surface matches playbooks.yaml
+        working-directory: alpha-engine-data
+        run: python3 infrastructure/overseer/trigger_surface_drift.py --source-file infrastructure/lambdas/freshness-monitor/deploy.sh
 
       - name: Report deployed version
         working-directory: alpha-engine-data

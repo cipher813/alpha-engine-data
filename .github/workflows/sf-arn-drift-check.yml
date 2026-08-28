@@ -198,3 +198,24 @@ jobs:
       # daily sweep rather than on every push of a branch.
       - name: schedule-manifest.json drift (fleet-wide, vs live AWS)
         run: python3 infrastructure/scheduler/check-manifest-drift.py --live
+
+      # alpha-engine-config-I9045. Does the AWS trigger surface still say what
+      # playbooks.yaml says? Measured 2026-08-28: alert-drain's four schedules
+      # were DISABLED with `Description: null` while the playbook ran daily off
+      # an EventBridge RULE nothing on AWS connected to it. Both deploy
+      # workflows now stamp that linkage and assert it in the same job; this is
+      # the out-of-band half — a description edited in the console, a resource
+      # created by hand, a wake leg added to the registry with no deploy behind
+      # it.
+      #
+      # `if: github.event_name != 'push'` is not an exemption, it is a RACE
+      # removal. On a merge, deploy-{alert-drain-dispatcher,freshness-monitor}
+      # .yml run concurrently with this workflow, so a push-triggered run here
+      # would grade the surface before the reconcile that fixes it had a chance
+      # to run, and report drift that nothing did wrong. The merge path is
+      # covered strictly better inside those workflows, where the assertion is
+      # the step immediately after the write. Every OTHER step here is on the
+      # push trigger deliberately (see this file's header) and stays there.
+      - name: Playbook trigger surface drift (playbooks.yaml vs live AWS)
+        if: github.event_name != 'push'
+        run: python3 infrastructure/overseer/trigger_surface_drift.py
