@@ -1,6 +1,20 @@
 [Unit]
 Description=Daily news collector — 04:00 PT (DST-aware), ahead of the 05:00 morning-signal run
-Requires=daily-news.service
+# NO Requires=daily-news.service here, deliberately (alpha-engine-config-I9000).
+# `Requires=` in a TIMER's [Unit] is a START dependency OF THE TIMER, not a
+# description of what the timer triggers: `systemctl enable --now
+# daily-news.timer` in install-daily-news.sh therefore enqueued a start job for
+# daily-news.service too — even with the timer already active and no calendar
+# point elapsed. The timer->service binding is the `Unit=` line below; it needs
+# no dependency edge at all.
+#
+# This unit is the one where an off-schedule start is most expensive. It fetches
+# from rate-limited news sources (GDELT + Polygon, each with a 1200s in-adapter
+# bail budget), it is the 04:00 PT feeder morning-signal.service declares
+# `Wants=`/`After=` on via its 10-after-news.conf drop-in, and the digest it
+# writes is read by a freshness guard that a mistimed run trips. On 2026-08-28 a
+# sibling installer's `enable --now` ran exactly this chain at 03:00 UTC off an
+# unrelated deploy, the units failed, and box-health paged critical.
 
 [Timer]
 Unit=daily-news.service
