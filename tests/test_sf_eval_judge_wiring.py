@@ -392,10 +392,32 @@ class TestEvalJudgePollChoice:
         )
         assert choice["Next"] == "EvalJudgePollWait"
 
-    def test_default_is_fail_soft_to_rolling_mean(self, states):
-        # Anything other than EMPTY/OK (ERROR, malformed) must NOT
-        # halt the pipeline.
-        assert states["EvalJudgePollChoice"]["Default"] == "EvalRollingMean"
+    def test_default_is_fail_soft_but_marks_degraded(self, states):
+        # Anything other than EMPTY/OK (ERROR, malformed) must NOT halt the
+        # pipeline — and must not be SILENT either.
+        #
+        # alpha-engine-config-I9058. This Default used to be EvalRollingMean.
+        # The four Catches on this chain (SubmitFirstSaturday, SubmitWeekly,
+        # Poll, Process) all route through MarkEvalJudgeDegraded, but a Catch
+        # only fires when the Lambda RAISED. A submit Lambda that SUCCEEDS
+        # while returning {"status": "ERROR"} in its payload is an in-band
+        # failure and lands here — so it bypassed the degraded marker entirely.
+        # Measured 2026-08-22 on ne-weekly-freshness-pipeline execution
+        # 1ed4d68f-...-c59654eb426d: EvalJudgeSubmitWeekly returned
+        # status=ERROR (Anthropic 400, credit balance too low), the run jumped
+        # Submit -> EvalRollingMean in 25s, decision_artifacts/_eval/latest.json
+        # was never rewritten, and NOTHING in the execution recorded a
+        # degradation. The condition first surfaced five days later as a
+        # freshness-monitor CRITICAL.
+        assert states["EvalJudgePollChoice"]["Default"] == "MarkEvalJudgeDegraded"
+        # Continuation is unchanged: the marker is a Pass that threads
+        # $.research_degraded_local and hands straight on to EvalRollingMean.
+        assert states["MarkEvalJudgeDegraded"]["Type"] == "Pass"
+        assert states["MarkEvalJudgeDegraded"]["Next"] == "EvalRollingMean"
+        assert (
+            states["MarkEvalJudgeDegraded"]["ResultPath"]
+            == "$.research_degraded_local"
+        )
 
 
 class TestEvalJudgePollLoop:
@@ -458,11 +480,63 @@ class TestEvalJudgePollLoop:
         )
         # Fail-soft — Anthropic retains batch results for 29 days, so
         # operator can re-run Process offline against the same batch_id.
-        assert max_wait_choice["Next"] == "EvalRollingMean"
+        # alpha-engine-config-I9058: fail-soft, via the degraded marker. A
+        # batch abandoned at the 6h cap produced no eval artifact; that is a
+        # degradation whether or not any Lambda raised.
+        assert max_wait_choice["Next"] == "MarkEvalJudgeDegraded"
 
     def test_poll_decision_default_loops_back_to_wait(self, states):
         # Continue polling until ended OR max_wait exceeded.
         assert states["EvalJudgePollDecision"]["Default"] == "EvalJudgePollWait"
+
+    def test_poll_decision_malformed_payload_marks_degraded(self, states):
+        """config#2275's malformed-payload branch is a fail-soft exit too.
+
+        alpha-engine-config-I9058 — same class as the max_wait branch: a poll
+        payload carrying neither ``processing_status`` nor
+        ``exceeded_max_wait`` means the chain gave up without producing an
+        eval artifact, so it must leave through the degraded marker rather
+        than land on EvalRollingMean looking like a clean run.
+        """
+        malformed = next(
+            c for c in states["EvalJudgePollDecision"]["Choices"]
+            if all("Not" in leaf for leaf in c.get("And", []))
+        )
+        assert malformed["Next"] == "MarkEvalJudgeDegraded"
+
+    def test_no_eval_judge_failure_path_reaches_rolling_mean_unmarked(
+        self, states
+    ):
+        """The invariant, stated once over the whole chain.
+
+        alpha-engine-config-I9058. Every way the eval-judge chain can end
+        WITHOUT writing ``decision_artifacts/_eval/latest.json`` must pass
+        through ``MarkEvalJudgeDegraded``. Only the success paths
+        (``OK`` -> poll loop, ``ended``/``ended_empty`` -> Process) and the
+        marker itself may name ``EvalRollingMean`` as a Next.
+
+        Written as a whole-chain sweep rather than three separate branch
+        assertions because the defect it pins is additive: the failure mode is
+        someone adding a FOURTH fail-soft exit later and wiring it straight to
+        EvalRollingMean, which no per-branch test would catch.
+        """
+        offenders = []
+        for name in ("EvalJudgePollChoice", "EvalJudgePollDecision"):
+            state = states[name]
+            targets = [
+                (name, "Default", state.get("Default"))
+            ] + [
+                (name, f"Choices[{i}]", c.get("Next"))
+                for i, c in enumerate(state.get("Choices", []))
+            ]
+            offenders += [t for t in targets if t[2] == "EvalRollingMean"]
+        assert offenders == [], (
+            "eval-judge Choice exits reach EvalRollingMean without passing "
+            f"through MarkEvalJudgeDegraded: {offenders}"
+        )
+        # And the marker is still the only door to EvalRollingMean from this
+        # chain — i.e. the fix routes, it does not orphan.
+        assert states["MarkEvalJudgeDegraded"]["Next"] == "EvalRollingMean"
 
 
 class TestEvalJudgeProcessContract:

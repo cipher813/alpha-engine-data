@@ -2127,7 +2127,7 @@
             },
             "EvalJudgePollChoice": {
               "Type": "Choice",
-              "Comment": "Branch on Submit's processing_status. EMPTY (no captures or all empty-input skipped client-side) \u2192 route directly to Process so the empty-batch case still emits a clean SF result + downstream metric inputs. OK \u2192 enter the Wait/Poll loop. Anything else (ERROR, missing fields) routes to EvalRollingMean as a fail-soft.",
+              "Comment": "Branch on Submit's processing_status. EMPTY (no captures, or all empty-input skipped client-side) -> route directly to Process so the empty-batch case still emits a clean SF result + downstream metric inputs. OK -> enter the Wait/Poll loop. Anything else (ERROR, missing fields) is fail-soft but NOT silent: it routes through MarkEvalJudgeDegraded, which threads $.research_degraded_local=true and then continues to EvalRollingMean exactly as before. alpha-engine-config-I9058: the Default used to jump straight to EvalRollingMean, so a submit Lambda that SUCCEEDED while returning status=ERROR in its payload bypassed the degraded marker every one of this chain's four Catches goes through. On 2026-08-22 EvalJudgeSubmitWeekly returned status=ERROR (Anthropic 400, credit balance too low), the chain skipped Poll and Process, decision_artifacts/_eval/latest.json was never rewritten, and nothing in the run recorded a degradation -- the only signal was the freshness row going stale five days later.",
               "Choices": [
                 {
                   "And": [
@@ -2157,7 +2157,7 @@
                   "Next": "EvalJudgePollWait"
                 }
               ],
-              "Default": "EvalRollingMean"
+              "Default": "MarkEvalJudgeDegraded"
             },
             "EvalJudgePollWait": {
               "Type": "Wait",
@@ -2205,7 +2205,7 @@
             },
             "EvalJudgePollDecision": {
               "Type": "Choice",
-              "Comment": "Branch on poll status. processing_status='ended' \u2192 run Process. exceeded_max_wait=true \u2192 fail-soft (batch results stay retrievable for 29 days; an operator can re-run the chain offline). Anything else \u2192 loop back to Wait. Includes the synthetic 'ended_empty' status (Submit short-circuited an empty plan) so the empty case still hits Process.",
+              "Comment": "Branch on poll status. processing_status='ended' -> run Process. exceeded_max_wait=true -> fail-soft, and a malformed payload (neither field present) likewise. Anything else -> loop back to Wait. Includes the synthetic 'ended_empty' status (Submit short-circuited an empty plan) so the empty case still hits Process. alpha-engine-config-I9058: both fail-soft exits now go through MarkEvalJudgeDegraded rather than straight to EvalRollingMean -- same continuation, but the run records that the judge produced nothing. A batch abandoned at the 6h cap and a batch that was never submitted are both degradations; only the Catch paths said so.",
               "Choices": [
                 {
                   "And": [
@@ -2239,7 +2239,7 @@
                       "BooleanEquals": true
                     }
                   ],
-                  "Next": "EvalRollingMean"
+                  "Next": "MarkEvalJudgeDegraded"
                 },
                 {
                   "And": [
@@ -2256,8 +2256,8 @@
                       }
                     }
                   ],
-                  "Comment": "config#2275: a poll payload carrying NEITHER processing_status NOR exceeded_max_wait is malformed \u2014 fail-soft to EvalRollingMean (eval is observability; mirrors this state's Catch posture) instead of States.Runtime, and instead of looping in Wait until the global ceiling.",
-                  "Next": "EvalRollingMean"
+                  "Comment": "config#2275: a poll payload carrying NEITHER processing_status NOR exceeded_max_wait is malformed \u2014 fail-soft via MarkEvalJudgeDegraded to EvalRollingMean (eval is observability; mirrors this state's Catch posture) instead of States.Runtime, and instead of looping in Wait until the global ceiling.",
+                  "Next": "MarkEvalJudgeDegraded"
                 }
               ],
               "Default": "EvalJudgePollWait"

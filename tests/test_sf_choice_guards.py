@@ -314,10 +314,16 @@ def _choice_target(definition: dict, choice_name: str, data) -> str:
          "LibPinGateDegradedFromProbe"),
         ("PipelineContractGate", {"pipeline_contract_result": {"Payload": {}}},
          "PipelineContractGateDegradedFromProbe"),
+        # alpha-engine-config-I9058: still fail-soft (eval is observability),
+        # but through MarkEvalJudgeDegraded — the same shape the LibPin and
+        # PipelineContract gates above already use. A degraded eval leg that
+        # routes straight to EvalRollingMean is indistinguishable from a clean
+        # one, which is how the 2026-08-22 weekly run skipped the judge and
+        # reported nothing.
         ("EvalJudgePollChoice", {"eval_judge_submit": {"Payload": {}}},
-         "EvalRollingMean"),  # eval is observability — fail-soft
+         "MarkEvalJudgeDegraded"),  # eval is observability — fail-soft, marked
         ("EvalJudgePollDecision", {"eval_judge_poll": {"Payload": {}}},
-         "EvalRollingMean"),  # malformed poll payload — fail-soft, no Wait loop
+         "MarkEvalJudgeDegraded"),  # malformed poll payload — no Wait loop
         # Healthy-path sanity: the guards must not change live semantics.
         ("WeeklyRunDayGateChoice",
          {"weekly_run_day_gate": {"Payload": {"is_weekly_run_day": False}}},
