@@ -896,12 +896,12 @@
         "Parameters": {
           "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('export EXECUTION_RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug data-weekly --log /var/log/data-weekly.log -- bash infrastructure/spot_data_phase1.sh{}',$$.Execution.Name,$.preflight_args))",
           "executionTimeout": [
-            "5400"
+            "6600"
           ]
         },
-        "TimeoutSeconds": 5400
+        "TimeoutSeconds": 6600
       },
-      "TimeoutSeconds": 5460,
+      "TimeoutSeconds": 6660,
       "Retry": [
         {
           "ErrorEquals": [
@@ -1011,7 +1011,7 @@
             },
             {
               "Variable": "$.data_phase1_polls",
-              "NumericLessThan": 216
+              "NumericLessThan": 240
             }
           ],
           "Next": "DataPhase1Wait"
