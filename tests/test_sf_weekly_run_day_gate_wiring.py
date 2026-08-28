@@ -62,9 +62,14 @@ class TestGateRouting:
     def test_gate_scoped_to_scheduled_weekly_role_only(self, states):
         choice = states["CheckWeeklyRunDayGate"]
         assert choice["Type"] == "Choice"
-        assert choice["Default"] == "CheckRunMode", (
+        # alpha-engine-config-I8809: NormalizeRunDates now sits between the run-day
+        # gate and CheckRunMode — the graph's ONE date normalization, on every path
+        # that does real work. Its own Next (via ApplyNormalizedRunDate) is CheckRunMode,
+        # so the chain below is unchanged past this hop.
+        assert choice["Default"] == "NormalizeRunDates", (
             "non-weekly roles (manual/recovery/watch/shell) must bypass the gate"
         )
+        assert states["ApplyNormalizedRunDate"]["Next"] == "CheckRunMode"
         (rule,) = choice["Choices"]
         conds = {
             (c["Variable"], next(k for k in c if k not in ("Variable",))): c
@@ -116,12 +121,17 @@ class TestGateOutcomes:
         assert states["WeeklyRunDayGateMalformed"]["Next"] == "WeeklyRunDayGateFailed"
 
     def test_run_day_proceeds_to_normal_head(self, states):
-        assert states["WeeklyRunDayGateChoice"]["Default"] == "CheckRunMode"
+        # alpha-engine-config-I8809: NormalizeRunDates now sits between the run-day
+        # gate and CheckRunMode — the graph's ONE date normalization, on every path
+        # that does real work. Its own Next (via ApplyNormalizedRunDate) is CheckRunMode,
+        # so the chain below is unchanged past this hop.
+        assert states["WeeklyRunDayGateChoice"]["Default"] == "NormalizeRunDates"
+        assert states["ApplyNormalizedRunDate"]["Next"] == "CheckRunMode"
 
     def test_gate_failure_is_fail_open_with_alert(self, states):
         failed = states["WeeklyRunDayGateFailed"]
         assert failed["Resource"] == "arn:aws:states:::sns:publish"
-        assert failed["Next"] == "CheckRunMode", "fail-open: proceed as run day"
+        assert failed["Next"] == "NormalizeRunDates", "fail-open: proceed as run day"
         # Notifier totality (config#1819): Subject constant + short; every
         # JSONPath in the message structurally guaranteed on this path.
         subject = failed["Parameters"]["Subject"]

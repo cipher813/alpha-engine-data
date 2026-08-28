@@ -207,6 +207,12 @@ TERMINAL_DEGRADED_FAMILY: frozenset[str] = frozenset({
     "CheckDegradedOutcome",
     "CheckShellRunDegradedOutcome",
     "WriteCompletionMarkerDegraded",
+    # alpha-engine-config-I8809: the legacy-partition COPY of the degraded
+    # envelope marker, written for the migration window only. Same terminal
+    # family as its canonical twin above and for the same reason — it records
+    # a run that already ended, and re-running a stage on the strength of it
+    # would re-run the whole pipeline. Deleted at the 2026-09-05 cutover.
+    "WriteCompletionMarkerDegradedCalendar",
     "DegradedRun",
 })
 

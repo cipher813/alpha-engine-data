@@ -452,7 +452,12 @@ class TestBranchBContents:
         # serialization before — a non-ISO value (HTTP-date/epoch) must
         # fail LOUD, not silently wrong-pass a lexicographic compare.
         assert conds["StringMatches"] == "20*-*-*"
-        assert conds["StringGreaterThanEqualsPath"] == "$.run_date"
+        # alpha-engine-config-I8809: the left side is an S3 LastModified — a
+        # wall-clock write time — so the reference is the execution's CALENDAR
+        # date. $.run_date became the cycle's TRADING day at NormalizeRunDates,
+        # and comparing against it would make this guard strictly WEAKER on
+        # every Saturday run.
+        assert conds["StringGreaterThanEqualsPath"] == "$.calendar_date"
         assert fresh["Next"] == "PredictorTrainingSkipped"
         assert c["Default"] == "PredictorSkipWeightsStale"
         # The stale Pass synthesizes $.error (a Choice.Default transition
@@ -462,7 +467,9 @@ class TestBranchBContents:
         assert stale["Type"] == "Pass"
         assert stale["ResultPath"] == "$.error"
         assert stale["Parameters"]["Error"] == "PredictorSkipWeightsStale"
-        assert "$.run_date" in stale["Parameters"]["Cause.$"]
+        # alpha-engine-config-I8809: the Cause prints the reference it actually
+        # compared against, which is now the CALENDAR date.
+        assert "$.calendar_date" in stale["Parameters"]["Cause.$"]
         assert stale["Next"] == "BranchBFailed"
 
     def test_skip_terminal_reads_as_succeeded_branch(self, branch_b):

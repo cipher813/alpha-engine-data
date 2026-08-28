@@ -157,7 +157,10 @@ def test_membership_intact_fail_opens_onto_scanners_own_convergence_point(branch
         "would let a bare lexicographic >= silently WRONG-PASS, which is the "
         "exact defect this gate exists to prevent"
     )
-    assert rule["And"][1]["StringGreaterThanEqualsPath"] == "$.run_date"
+    # alpha-engine-config-I8809: LastModified is a wall-clock write time, so
+    # the reference is $.calendar_date. Against the post-NormalizeRunDates
+    # trading day this fail-open would widen every Saturday.
+    assert rule["And"][1]["StringGreaterThanEqualsPath"] == "$.calendar_date"
     assert rule["Next"] == "ScannerResourceKillDegraded"
 
     degraded = branch_a["ScannerResourceKillDegraded"]

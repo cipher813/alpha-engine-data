@@ -174,7 +174,11 @@ def test_a_leaf_failure_degrades_the_run_loudly_and_never_silently(states):
         for choice in outcome["Choices"]
         for cond in (choice.get("And") or [choice])
     )
-    assert states["WriteCompletionMarkerDegraded"]["Next"] == "DegradedRun"
+    # alpha-engine-config-I8809: the legacy-partition copy of the degraded
+    # marker sits between it and DegradedRun for the migration window; it is
+    # fail-soft. Deleted at the 2026-09-05 cutover.
+    assert states["WriteCompletionMarkerDegraded"]["Next"] == "WriteCompletionMarkerDegradedCalendar"
+    assert states["WriteCompletionMarkerDegradedCalendar"]["Next"] == "DegradedRun"
     assert states["DegradedRun"]["Type"] == "Fail"
 
 

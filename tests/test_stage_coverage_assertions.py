@@ -353,10 +353,26 @@ def test_no_stage_coverage_sf_state_remains() -> None:
 
 
 def test_the_weekly_preflight_lambda_has_no_coverage_action_dispatch() -> None:
-    """The second `action` on alpha-engine-weekly-preflight is gone with it."""
+    """The second `action` on alpha-engine-weekly-preflight is gone with it.
+
+    NARROWED 2026-08-27 (alpha-engine-config-I8809). This previously asserted
+    that the handler dispatches on NO action at all. That is broader than the
+    rule it exists to hold: what the rescope removed is the STAGE-COVERAGE
+    action and the end-of-run sweep behind it, not the idea of a fast path.
+    The Lambda now carries `action == "resolve_run_dates"` — pure NYSE-calendar
+    arithmetic, no AWS call, returning before the preflight body — because the
+    weekly graph needs its ONE date normalization somewhere and
+    `InitializeInput` is a Pass with no calendar. A new function for it would
+    need an IAM role bootstrap, i.e. an operator step, i.e. a PR that is not
+    deployable by the merge button alone.
+
+    The assertion below still forbids exactly what was ruled out: any
+    stage-coverage action, under either of its names.
+    """
     body = (INFRA / "lambdas" / "weekly-preflight" / "index.py").read_text()
     assert "sf_stage_coverage" not in body
-    assert 'event.get("action")' not in body
+    assert '"assert_stage_coverage"' not in body
+    assert 'action") == "assert_stage_coverage"' not in body
 
 
 def test_the_end_of_run_module_is_gone() -> None:

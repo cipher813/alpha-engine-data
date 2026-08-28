@@ -1135,7 +1135,7 @@ def test_skip_coherence_fails_when_artifact_predates_run_date():
     with patch("boto3.client", return_value=_s3_with_last_modified("2026-08-15")):
         res = sfp.check_skip_flag_artifact_coherence(ctx)
     assert res.status == "fail"
-    assert "2026-08-15 < run_date 2026-08-16" in res.details["violations"][0]
+    assert "2026-08-15 < calendar_date 2026-08-16" in res.details["violations"][0]
     assert "CheckPredictorSkipWeightsFresh" in res.details["violations"][0]
 
 
@@ -1252,15 +1252,22 @@ def test_skip_predicate_matches_the_sf_definitions_own_guard():
         f"heads {sf_target!r} — the two have drifted"
     )
 
-    # ...and the comparison must still be >= run_date, not something else.
+    # ...and the comparison must still be >= the CALENDAR date, not something
+    # else. alpha-engine-config-I8809: this was `$.run_date` until 2026-08-27,
+    # when NormalizeRunDates made $.run_date the cycle's TRADING day. The left
+    # side is an S3 LastModified — a wall-clock write time — so against the
+    # trading day the guard becomes strictly WEAKER on every Saturday run: a
+    # manifest written on Friday would satisfy "a training run completed for
+    # this cycle". Both sides moved together; that is what this pin exists for.
     choice = states["CheckPredictorSkipWeightsFresh"]["Choices"][0]["And"]
     assert any(
-        c.get("StringGreaterThanEqualsPath") == "$.run_date" for c in choice
+        c.get("StringGreaterThanEqualsPath") == "$.calendar_date" for c in choice
     ), (
-        "CheckPredictorSkipWeightsFresh no longer compares >= $.run_date; "
-        "check_skip_flag_artifact_coherence's last_modified_gte_run_date "
+        "CheckPredictorSkipWeightsFresh no longer compares >= $.calendar_date; "
+        "check_skip_flag_artifact_coherence's last_modified_gte_calendar_date "
         "predicate is now wrong"
     )
+    assert pred.kind == "last_modified_gte_calendar_date"
 
 
 def test_weekly_preflight_receives_the_execution_input():

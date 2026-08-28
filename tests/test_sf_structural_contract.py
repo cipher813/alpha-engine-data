@@ -402,6 +402,33 @@ _NOTIFY_RESOURCE = "arn:aws:states:::sns:publish"
 #     needing its own tracker issue, not a leftover.
 _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
     "step_function.json": {
+        # ── alpha-engine-config-I8809 ──────────────────────────────────
+        "NormalizeRunDates": (
+            "the fail-open IS the flag. NormalizeRunDatesDegraded leaves "
+            "$.run_date_family='calendar_date' — the value InitializeInput "
+            "seeded — so every artifact and every stage-coverage verdict this "
+            "run writes carries the family it actually used. That is a wider "
+            "and more durable surface than a boolean the notifier reads once, "
+            "and it is present on BOTH polarities (sf-pipeline-policy §2.3a "
+            "rule 3): the clean path sets 'trading_day'. A degraded flag here "
+            "would additionally page for a condition with no consequence this "
+            "cycle — the coverage sweep unions both partitions until the "
+            "2026-09-05 cutover — which is how a real page gets ignored."
+        ),
+        "WriteCompletionMarkerCalendar": (
+            "the legacy-partition COPY of the envelope marker, written for the "
+            "migration window only. Its canonical twin has already landed on "
+            "S3 by the time this state runs and is deliberately UNCAUGHT; a "
+            "failure to write the convenience copy must never degrade a run "
+            "whose real completion signal is already durable. Deleted at the "
+            "2026-09-05 cutover."
+        ),
+        "WriteCompletionMarkerDegradedCalendar": (
+            "same as WriteCompletionMarkerCalendar, on the degraded path — and "
+            "that path has ALREADY set its degraded flag, which is what routed "
+            "it here. Deleted at the 2026-09-05 cutover."
+        ),
+
         # alpha-engine-config-I8214: the coverage sweep runs AFTER
         # WriteCompletionMarker — after the pipeline's real success terminal.
         # A degraded flag exists to make a fail-open visible in the RUN's own
