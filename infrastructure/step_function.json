@@ -3179,12 +3179,13 @@
             },
             "ModelZooTrainMap": {
               "Type": "Map",
-              "Comment": "config#1083 PARALLEL fan-out, step 2: train one challenger PER spec id, each on its OWN memory-isolated spot, concurrently. MaxConcurrency 4 bounds in-flight spots. PER-ITERATION ERROR ISOLATION (the key robustness property): each iteration ends in a branch-local Pass terminal (TrainSpecOK / TrainSpecFailed, both End:true) recording status as DATA so an iteration NEVER throws; a single challenger crashing (OOM / KeyError / spot interruption) does NOT abort its siblings; selection proceeds with the survivors. ToleratedFailurePercentage 100 is a defense-in-depth backstop (iterations already self-terminate as success). ItemSelector threads ec2_instance_id + preflight_args + the per-item spec id into each iteration.",
+              "Comment": "config#1083 PARALLEL fan-out, step 2: train one challenger PER spec id, each on its OWN memory-isolated spot, concurrently. MaxConcurrency 4 bounds in-flight spots. PER-ITERATION ERROR ISOLATION (the key robustness property): each iteration ends in a branch-local Pass terminal (TrainSpecOK / TrainSpecFailed, both End:true) recording status as DATA so an iteration NEVER throws; a single challenger crashing (OOM / KeyError / spot interruption) does NOT abort its siblings; selection proceeds with the survivors. ToleratedFailurePercentage 100 is a defense-in-depth backstop (iterations already self-terminate as success). ItemSelector threads ec2_instance_id + preflight_args + the per-item spec id into each iteration. alpha-engine-config-I8809: PARTITION FAMILY = trading_day. The run_date passed into each item becomes EXECUTION_RUN_DATE for spot_train_spec_dispatch.sh, which answers 'which CYCLE is this spec training for' -- the artifact-prefix question -- not 'when did this fire'. It must therefore be the normalized trading_day from NormalizeRunDates, never the calendar date the Map happened to execute on. alpha-engine-config-I9077: this key was ABSENT until 2026-08-28. A Map's ItemProcessor resolves $. against the ITEM payload, so TrainSpecDispatch's $.run_date reference could not resolve and the stage raised States.Runtime -- caught by the Friday rehearsal friday-shell-2026-08-28-eod-2026-08-28-1787947216, latent since #1510 introduced EXECUTION_RUN_DATE at 2026-08-22 10:49 PT, AFTER that morning's weekly run. Guarded by tests/test_sf_map_item_selector_completeness.py.",
               "ItemsPath": "$.parsed_zoo.zoo_specs",
               "MaxConcurrency": 4,
               "ToleratedFailurePercentage": 100,
               "ItemSelector": {
                 "spec_id.$": "$$.Map.Item.Value",
+                "run_date.$": "$.run_date",
                 "ec2_instance_id.$": "$.ec2_instance_id",
                 "preflight_args.$": "$.preflight_args"
               },
