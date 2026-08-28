@@ -639,11 +639,33 @@ class TestEvalRollingMean:
         payload = states["EvalRollingMean"]["Parameters"]["Payload"]
         assert payload["end_time_iso.$"] == "$$.Execution.StartTime"
 
-    def test_timeout_matches_lambda_cap(self, states):
-        # Rolling-mean Lambda is configured with timeout=300s
-        # (alpha-engine-research infrastructure/deploy.sh) — SF state
-        # TimeoutSeconds must equal that ceiling.
-        assert states["EvalRollingMean"]["TimeoutSeconds"] == 300
+    def test_timeout_binds_below_the_lambda_cap(self, states):
+        """The SF budget must be STRICTLY below the function's own ceiling.
+
+        Was `== 300`, equal to the Lambda's configured timeout
+        (crucible-research infrastructure/deploy.sh). Equal is the one value
+        that guarantees the SF cannot be the thing that stops the state:
+        whichever fires first is a coin toss, and on 2026-08-28 the Lambda won,
+        so `EvalRollingMean` burned its full 300s after 1.6s of handler work and
+        the stop arrived as an opaque Lambda-side timeout instead of an SF error
+        naming this state. It fail-opened the whole research/predictor branch,
+        and the run terminated DEGRADED having done its work
+        (alpha-engine-config#9102; the hang itself was an unbounded boto3 S3
+        client in flow-doctor's notifier preflight, flow-doctor#93).
+
+        240 is the budget; 300 is the function's ceiling. The ordering — not the
+        specific number — is what this asserts, so a later re-budgeting of the
+        stage does not have to edit this test, only stay under the cap.
+        `tests/test_sf_lambda_timeout_ordering.py` enforces the same rule
+        fleet-wide (alpha-engine-config#6897).
+        """
+        sf_budget = states["EvalRollingMean"]["TimeoutSeconds"]
+        lambda_cap = 300
+        assert sf_budget < lambda_cap, (
+            f"SF budget {sf_budget}s must bind below the function's {lambda_cap}s "
+            "ceiling, or the SF cannot be the thing that stops this state"
+        )
+        assert sf_budget == 240
 
     def test_success_continues_to_rationale_clustering_gate(self, states):
         # Rolling-mean converges to CheckSkipRationaleClustering (the

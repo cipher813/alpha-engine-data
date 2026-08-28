@@ -123,7 +123,14 @@ _KNOWN_UNBOUND: frozenset[tuple[str, str]] = frozenset(
         ("step_function.json", "EvalJudgeSubmitFirstSaturday"),
         ("step_function.json", "EvalJudgeSubmitWeekly"),
         ("step_function.json", "EvalJudgePoll"),
-        ("step_function.json", "EvalRollingMean"),
+        # EvalRollingMean REMOVED 2026-08-28 (alpha-engine-config#9102): it now
+        # binds at 240s against the function's 300s. The reason the policy asks
+        # for was measured, not chosen — the state burned its full 300s budget
+        # after 1.6s of handler work, because an unbounded boto3 S3 client in
+        # flow-doctor's notifier preflight (flow-doctor#93, fixed in 0.16.2) held
+        # the invocation open. With SF and function both at 300 the stop arrived
+        # as an opaque Lambda-side timeout rather than an SF error attributable
+        # to this state, and it fail-opened the whole research/predictor branch.
         ("step_function.json", "RationaleClustering"),
         ("step_function.json", "Counterfactual"),
         ("step_function.json", "ReportCard"),
