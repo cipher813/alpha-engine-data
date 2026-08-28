@@ -19,6 +19,7 @@ notify path is a no-op stub by default; alert-specific tests monkeypatch
 
 from __future__ import annotations
 
+import io
 import json
 import sys
 import types
@@ -856,6 +857,168 @@ class TestReconcileAws:
         assert row["actual_final"] == pytest.approx(12.34)
         assert row["accrued_mtd_final"] == 10.0
         assert row["delta_usd"] == pytest.approx(2.34)
+
+
+class _FakeHTTPResponse:
+    def __init__(self, body: bytes = b"{}"):
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class TestFundedDepthProbe:
+    """alpha-engine-config-I9049 (recurrence of I7448): 'funded depth is
+    watched by nothing' — these cover the live synthetic probe that closes
+    that gap, using the SAME 400 signature the real 2026-08-22
+    EvalJudgeSubmitWeekly failure and I7448's canary both hit."""
+
+    def test_ok_on_2xx(self, monkeypatch):
+        monkeypatch.setattr(index.urllib.request, "urlopen",
+                            lambda req, timeout: _FakeHTTPResponse())
+        result = index.probe_anthropic_funded_depth("sk-ant-fake")
+        assert result["status"] == "ok"
+        assert result["error"] is None
+
+    def test_credit_exhausted_on_matching_400(self, monkeypatch):
+        body = (b'{"type": "error", "error": {"type": "invalid_request_error", '
+               b'"message": "Your credit balance is too low to access the '
+               b'Anthropic API. Please go to Plans & Billing to upgrade or '
+               b'purchase credits."}}')
+
+        def _boom(req, timeout):
+            raise index.urllib.error.HTTPError(
+                "https://api.anthropic.com/v1/messages", 400, "Bad Request",
+                {}, io.BytesIO(body))
+
+        monkeypatch.setattr(index.urllib.request, "urlopen", _boom)
+        result = index.probe_anthropic_funded_depth("sk-ant-fake")
+        assert result["status"] == "credit_exhausted"
+        assert "credit balance is too low" in result["error"]
+
+    def test_unrelated_400_is_error_not_exhausted(self, monkeypatch):
+        """A 400 for a DIFFERENT reason (bad model id, malformed schema) must
+        not be conflated with credit exhaustion — only the exact marker
+        counts."""
+        body = b'{"error": {"message": "model: field required"}}'
+
+        def _boom(req, timeout):
+            raise index.urllib.error.HTTPError(
+                "https://api.anthropic.com/v1/messages", 400, "Bad Request",
+                {}, io.BytesIO(body))
+
+        monkeypatch.setattr(index.urllib.request, "urlopen", _boom)
+        result = index.probe_anthropic_funded_depth("sk-ant-fake")
+        assert result["status"] == "error"
+
+    def test_network_failure_is_error_not_exhausted(self, monkeypatch):
+        def _boom(req, timeout):
+            raise TimeoutError("connection timed out")
+
+        monkeypatch.setattr(index.urllib.request, "urlopen", _boom)
+        result = index.probe_anthropic_funded_depth("sk-ant-fake")
+        assert result["status"] == "error"
+
+    def test_collect_anthropic_sets_zero_balance_on_exhaustion(self, monkeypatch):
+        """Integration: a credit-exhausted probe must land on
+        `funded_balance_usd`/`days_to_zero` — the SAME fields
+        `run_balance_depletion_alerts` already watches for OpenRouter/
+        DeepSeek — so the existing critical alert path fires with no new
+        alert code."""
+        mw = index._month_window(NOW)
+        monkeypatch.setattr(index, "_http_json",
+                            lambda url, headers=None: {"data": [], "has_more": False})
+        monkeypatch.setattr(index, "probe_anthropic_funded_depth",
+                            lambda api_key: {"status": "credit_exhausted",
+                                             "latency_s": 0.17, "error": "..."})
+        row = index.collect_anthropic(
+            mw, {}, {index.SSM_ANTHROPIC_ADMIN: "admin-key",
+                    index.SSM_ANTHROPIC_API: "sk-ant-fake"}, None)
+        assert row["funded_balance_usd"] == 0.0
+        assert row["days_to_zero"] == 0.0
+        assert index._is_depleting(row) is True
+
+    def test_collect_anthropic_leaves_balance_unknown_when_funded(self, monkeypatch):
+        """A passing probe proves 'not exhausted right now', not a dollar
+        magnitude — `funded_balance_usd` must stay honestly None, not be
+        coerced into a fake healthy number."""
+        mw = index._month_window(NOW)
+        monkeypatch.setattr(index, "_http_json",
+                            lambda url, headers=None: {"data": [], "has_more": False})
+        monkeypatch.setattr(index, "probe_anthropic_funded_depth",
+                            lambda api_key: {"status": "ok", "latency_s": 0.4, "error": None})
+        row = index.collect_anthropic(
+            mw, {}, {index.SSM_ANTHROPIC_ADMIN: "admin-key",
+                    index.SSM_ANTHROPIC_API: "sk-ant-fake"}, None)
+        assert row["funded_balance_usd"] is None
+        assert index._is_depleting(row) is False
+
+    def test_skipped_when_ssm_key_missing(self, monkeypatch):
+        mw = index._month_window(NOW)
+        monkeypatch.setattr(index, "_http_json",
+                            lambda url, headers=None: {"data": [], "has_more": False})
+        called = MagicMock()
+        monkeypatch.setattr(index, "probe_anthropic_funded_depth", called)
+        row = index.collect_anthropic(
+            mw, {}, {index.SSM_ANTHROPIC_ADMIN: "admin-key"}, None)
+        called.assert_not_called()
+        assert row["detail"]["funded_depth_probe"]["status"] == "not_configured"
+
+    def test_skipped_during_reconciliation(self, monkeypatch):
+        """A live probe against a closed historical window is meaningless —
+        `end is not None` (reconciliation) must never invoke it."""
+        pmw = index._prior_month_window(NOW)
+        monkeypatch.setattr(index, "_http_json",
+                            lambda url, headers=None: {"data": [], "has_more": False})
+        called = MagicMock()
+        monkeypatch.setattr(index, "probe_anthropic_funded_depth", called)
+        index.collect_anthropic(
+            pmw, {}, {index.SSM_ANTHROPIC_ADMIN: "admin-key",
+                     index.SSM_ANTHROPIC_API: "sk-ant-fake"},
+            None, end=pmw["end"], last_day=30)
+        called.assert_not_called()
+
+    def test_probe_crash_does_not_blank_cost_row(self, monkeypatch):
+        """A bug in the probe itself must not take down the cost-report row
+        this function was already building (no-silent-fails: fenced, not
+        swallowed — recorded on the row, propagated nowhere)."""
+        mw = index._month_window(NOW)
+        monkeypatch.setattr(index, "_http_json",
+                            lambda url, headers=None: {"data": [{"results": [{"amount": "100"}]}],
+                                                       "has_more": False})
+
+        def _boom(api_key):
+            raise RuntimeError("unexpected probe bug")
+
+        monkeypatch.setattr(index, "probe_anthropic_funded_depth", _boom)
+        row = index.collect_anthropic(
+            mw, {}, {index.SSM_ANTHROPIC_ADMIN: "admin-key",
+                    index.SSM_ANTHROPIC_API: "sk-ant-fake"}, None)
+        assert row["mtd_cost_usd"] == pytest.approx(1.0)
+        assert row["detail"]["funded_depth_probe"]["status"] == "error"
+
+    def test_end_to_end_exhaustion_fires_critical_alert(self, monkeypatch):
+        """Full loop: a credit-exhausted probe on the anthropic_api row makes
+        it through `run_balance_depletion_alerts` to a Telegram send — closing
+        I9049's own closes-when ('fired at least one real alert in a
+        manufactured low-balance test')."""
+        s3 = FakeS3({})
+        notify = MagicMock(return_value=True)
+        monkeypatch.setattr(index, "notify_via_flow_doctor", notify)
+        row = _row_with_pace("anthropic_api", "under")
+        row["funded_balance_usd"] = 0.0
+        row["days_to_zero"] = 0.0
+        result = index.run_balance_depletion_alerts(s3, "2026-08", [row])
+        assert result["alerted"] == ["anthropic_api"]
+        notify.assert_called_once()
+        _, kwargs = notify.call_args
+        assert kwargs["severity"] == "critical"
 
 
 class TestReconcileAnthropic:

@@ -15,7 +15,21 @@ Providers collected per run (adapter registry, one row each):
                        (``decision_artifacts/_cost_raw/{date}/**.jsonl``,
                        producer: crucible-research ``graph/llm_cost_tracker.py``)
                        — fleet-only, excludes morning-signal et al (noted on the
-                       row).
+                       row). **Funded-depth probe** (alpha-engine-config-I9049,
+                       recurrence of I7448): the Admin API has no balance
+                       endpoint — ``cost_report`` succeeding proves nothing
+                       about remaining credit. Every ``collect`` run (twice
+                       daily; this schedule is the standing pause-manifest
+                       exception, config#6613) also fires one minimal live
+                       ``POST /v1/messages`` on ``/alpha-engine/ANTHROPIC_API_KEY``
+                       (the same credential the research fleet's direct-
+                       fallback path resolves). A matching "credit balance is
+                       too low" 400 sets ``funded_balance_usd=0.0`` on this
+                       row, which is the SAME field OpenRouter/DeepSeek's
+                       prepaid-balance rows already feed into
+                       ``run_balance_depletion_alerts`` — so exhaustion rides
+                       the existing critical-severity Telegram alert with no
+                       new alert path. See ``probe_anthropic_funded_depth``.
   - **openrouter**     ``/api/v1/credits`` lifetime-usage counter, diffed
                        against a first-run-of-month baseline
                        (``expenses/baselines/{YYYY-MM}.json``).
@@ -98,6 +112,7 @@ import calendar
 import json
 import logging
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -150,8 +165,19 @@ SSM_NEON_QUOTA_GB = "/alpha-engine/NEON_DATA_TRANSFER_QUOTA_GB"
 SSM_GITHUB_TOKEN = "/alpha-engine/GITHUB_TOKEN"
 SSM_GITHUB_USER_PAT = "/alpha-engine/expenses/GITHUB_USER_BILLING_PAT"
 SSM_ANTHROPIC_ADMIN = "/alpha-engine/expenses/ANTHROPIC_ADMIN_KEY"
+# alpha-engine-config-I9049 / I7448: the Admin API `cost_report` endpoint
+# (used by `collect_anthropic` below) reports SPEND, never remaining
+# balance — `funded_balance_usd` is unconditionally None for this provider
+# (see `_row`'s docstring comment). "Funded depth is watched by nothing"
+# because there is no Anthropic balance-query endpoint at all, admin or
+# otherwise. The only way to observe funded depth is a live synthetic call
+# on the SAME credential the research fleet's direct-fallback path resolves
+# (`krepis.secrets.get_secret("ANTHROPIC_API_KEY")`, `langchain_utils.py`),
+# which is what actually 400'd in both I7448 and I9049.
+SSM_ANTHROPIC_API = "/alpha-engine/ANTHROPIC_API_KEY"
 SSM_PARAMS = [SSM_OPENROUTER, SSM_DEEPSEEK, SSM_NEON, SSM_NEON_QUOTA_GB,
-              SSM_GITHUB_TOKEN, SSM_GITHUB_USER_PAT, SSM_ANTHROPIC_ADMIN]
+              SSM_GITHUB_TOKEN, SSM_GITHUB_USER_PAT, SSM_ANTHROPIC_ADMIN,
+              SSM_ANTHROPIC_API]
 
 GITHUB_ORG = "nousergon"
 GITHUB_USER = "cipher813"
@@ -181,6 +207,65 @@ def _http_json(url: str, headers: dict | None = None) -> dict:
     except urllib.error.HTTPError as exc:
         snippet = exc.read()[:300].decode("utf-8", "replace")
         raise RuntimeError(f"HTTP {exc.code} from {url}: {snippet}") from exc
+
+
+# alpha-engine-config-I9049 (recurrence of I7448) — the exact 400 signature
+# `EvalJudgeSubmitWeekly` and the canary-replay `validation_retry` probe both
+# hit. Matched on message substring, not status alone: a 400 can be many
+# things (bad model id, schema error) and only THIS one means "top up now".
+_CREDIT_EXHAUSTED_MARKER = "credit balance is too low"
+_ANTHROPIC_PROBE_MODEL = "claude-3-5-haiku-20241022"  # cheapest priced model
+# (list pricing) — this probe's whole cost budget is a handful of tokens,
+# twice a day; the model choice only has to be authenticatable, not capable.
+_ANTHROPIC_PROBE_MAX_TOKENS = 1
+
+
+def probe_anthropic_funded_depth(api_key: str) -> dict:
+    """One minimal live ``POST /v1/messages`` on the SAME credential the
+    research fleet's direct-fallback path resolves (I7448's diagnosis:
+    ``cost_report`` succeeding proves nothing about *remaining* balance —
+    only a real call against the billing-gated credential does). Mirrors
+    `crucible-research/agents/canary_replay.py::probe_validation_retry`'s
+    detection shape (a 400 at 0.17s = credential-layer failure) but is
+    deliberately NOT that probe: this needs to run daily+ on a credential
+    this Lambda already reads, not per-PR on a spot box (I9049 deliverable
+    #2 — extend the existing funded-depth machinery, not the PR-gated one).
+
+    Returns ``{"status": "ok"|"credit_exhausted"|"error", "latency_s": ...,
+    "error": str|None}``. Never raises — this is an ADDITIONAL read layered
+    onto the cost-report adapter; a probe bug must not blank the cost row.
+    """
+    t0 = time.monotonic()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=json.dumps({
+            "model": _ANTHROPIC_PROBE_MODEL,
+            "max_tokens": _ANTHROPIC_PROBE_MAX_TOKENS,
+            "messages": [{"role": "user", "content": "1"}],
+        }).encode(),
+        headers={
+            "User-Agent": "alpha-engine-expense-collector-funded-depth-probe",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            resp.read()
+        return {"status": "ok", "latency_s": round(time.monotonic() - t0, 3), "error": None}
+    except urllib.error.HTTPError as exc:
+        body = exc.read()[:500].decode("utf-8", "replace")
+        latency = round(time.monotonic() - t0, 3)
+        if exc.code == 400 and _CREDIT_EXHAUSTED_MARKER in body:
+            return {"status": "credit_exhausted", "latency_s": latency, "error": body[:300]}
+        # Any other 4xx/5xx (bad key, rate limit, transient outage) is NOT a
+        # funded-depth verdict either way — record it as unknown, don't
+        # conflate it with an actual credit-exhaustion signal.
+        return {"status": "error", "latency_s": latency, "error": f"HTTP {exc.code}: {body[:300]}"}
+    except Exception as exc:  # noqa: BLE001 — network/timeout; unknown, not exhausted
+        return {"status": "error", "latency_s": round(time.monotonic() - t0, 3), "error": str(exc)[:300]}
 
 
 def _month_window(now: datetime) -> dict:
@@ -601,6 +686,53 @@ def collect_aws(mw: dict, budgets: dict) -> dict:
     return _finish_usd_row(row, mw, _budget_usd(budgets, "aws"))
 
 
+def _apply_funded_depth_probe(row: dict, secrets: dict, *, end: datetime | None) -> None:
+    """Run :func:`probe_anthropic_funded_depth` and fold its verdict onto
+    *row* using the SAME fields (`funded_balance_usd`, `days_to_zero`) and
+    the SAME downstream machinery (`_is_depleting` /
+    `run_balance_depletion_alerts` / `_alert_balance_depletion`) already
+    built for OpenRouter/DeepSeek's prepaid-balance rows (config-I6613) —
+    per I9049's own instruction, this extends the existing funded-depth
+    mechanism rather than building a parallel one.
+
+    Anthropic has no balance-query endpoint (admin or otherwise), so this
+    cannot report a dollar figure — only a boolean "credit-exhausted right
+    now" verdict from a live call. On that verdict, `funded_balance_usd` is
+    set to the one number that verdict actually supports: **0.0** (a real
+    401/400-causing balance is, by definition, `<= 0`), which makes
+    `_is_depleting` and the existing critical-severity alert fire with zero
+    new alert code. A passing probe proves "not currently exhausted" but not
+    a magnitude, so the balance field stays `None` (still honestly unknown)
+    — this is a floor-detector, not a balance meter.
+
+    Never runs during reconciliation (`end is not None` = closed prior-month
+    re-query) — a live credential probe has no meaning against a historical
+    window, and would double-fire the alert machinery for the same event.
+    """
+    if end is not None:
+        return
+    api_key = secrets.get(SSM_ANTHROPIC_API)
+    if not api_key:
+        row["detail"]["funded_depth_probe"] = {
+            "status": "not_configured",
+            "note": f"SSM {SSM_ANTHROPIC_API} missing — funded-depth probe skipped",
+        }
+        return
+    try:
+        result = probe_anthropic_funded_depth(api_key)
+    except Exception as exc:  # noqa: BLE001 — probe is an ADDITIONAL read; a bug
+        # here must not blank the cost row this function was already building.
+        logger.exception("anthropic funded-depth probe crashed")
+        result = {"status": "error", "latency_s": None, "error": str(exc)[:300]}
+    result["checked_at"] = _now_utc().isoformat()
+    row["detail"]["funded_depth_probe"] = result
+    if result["status"] == "credit_exhausted":
+        row["funded_balance_usd"] = 0.0
+        row["days_to_zero"] = 0.0
+    elif result["status"] == "error":
+        logger.warning("anthropic funded-depth probe inconclusive: %s", result.get("error"))
+
+
 def collect_anthropic(mw: dict, budgets: dict, secrets: dict, s3, *,
                       end: datetime | None = None, last_day: int | None = None) -> dict:
     """``end``/``last_day`` default to the live current-month read (open-ended
@@ -634,6 +766,7 @@ def collect_anthropic(mw: dict, budgets: dict, secrets: dict, s3, *,
                 break
             page = doc.get("next_page")
         row.update(mtd_cost_usd=round(total, 2), source="admin_api")
+        _apply_funded_depth_probe(row, secrets, end=end)
         return _finish_usd_row(row, mw, _budget_usd(budgets, "anthropic_api"))
     # Fallback: research-fleet client telemetry (per-call JSONL, cost_usd per row).
     total, n_days = 0.0, 0
@@ -658,6 +791,7 @@ def collect_anthropic(mw: dict, budgets: dict, secrets: dict, s3, *,
               f"{SSM_ANTHROPIC_ADMIN} for authoritative org-wide Admin-API costs"),
         detail={"cost_raw_objects": n_days},
     )
+    _apply_funded_depth_probe(row, secrets, end=end)
     return _finish_usd_row(row, mw, _budget_usd(budgets, "anthropic_api"))
 
 
