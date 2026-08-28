@@ -665,11 +665,23 @@ Resources:
       AlarmActions:
         - !Ref AlertsTopic
 
+  # alpha-engine-config-I7996: this alarm is ALSO codified in
+  # nous-ergon-ops/infrastructure/cloudwatch/alarms/alpha-engine-predictor-inference-errors.json,
+  # which owns it going forward (I7339: a file is the only way an alarm comes
+  # into existence). This stack still deploys it on EVERY push to main
+  # (deploy-infrastructure.yml has no path filter), so a description edited
+  # only in nous-ergon-ops gets silently reverted here within the hour —
+  # exactly what happened to nous-ergon-ops-PR858's rewrite of this field on
+  # 2026-08-24, which stayed live for ~13 hours before this stack's next
+  # deploy put the old text back and pinned cloudwatch-alarm-drift.yml red
+  # for 26 straight graded runs. Keep this AlarmDescription byte-identical to
+  # the codified file until alpha-engine-config-I9009 removes this
+  # resource from the stack and leaves nous-ergon-ops as sole owner.
   PredictorInferenceErrors:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: alpha-engine-predictor-inference-errors
-      AlarmDescription: Predictor Lambda errors
+      AlarmDescription: "alpha-engine-predictor-inference reported >=1 invocation error in a 5-minute window. This function answers the FIRST state of both trading pipelines (MarketHoursGate) and DeployDriftCheck, so an error here is a safety gate that did not answer, not only a failed job — the pipelines degrade past an unanswered gate rather than halting. WHAT TO DO: check alpha-engine-predictor-inference-init-failure first. If that is also in ALARM the module did not IMPORT and every invocation is failing, which no retry fixes; if it is not, the failure is inside the handler and the action is named by the newest [ERROR] in the log group. This description was literally 'Predictor Lambda errors' until 2026-08-24, when the alarm fired for 16 minutes on an import crash, paged, self-cleared, and told nobody what had happened — while the Metadata below said to diagnose 'the condition named in AlarmDescription' (alpha-engine-config-I8298)."
       Namespace: AWS/Lambda
       MetricName: Errors
       Dimensions:
