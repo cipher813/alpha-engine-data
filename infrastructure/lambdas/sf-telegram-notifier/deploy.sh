@@ -80,15 +80,24 @@ echo "Installing deps into ${PKG} (Lambda-safe Docker pip)..."
 bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
 
 # ----- Preflight handler unit tests (shared gate — config#2381) -------------
-# Both test files stub nousergon_lib in sys.modules, so the shared gate only
-# provisions pytest; LAMBDAS_DIR is on PYTHONPATH for `import flow_doctor_
-# telegram`. This replaces a gate that relied on AMBIENT pytest (PYTHONPATH=$PKG
-# carried no pytest) — the same no-install drift class as config#2295. Runs on
-# Darwin too now: host pip fetches pure-python pytest, and the lib being stubbed
-# means no linux/amd64 wheel is imported, so the old Darwin skip is obsolete.
+# (corrected alpha-engine-config-I8993 — was: "Both test files stub
+# nousergon_lib in sys.modules, so the shared gate only provisions pytest".
+# That was true when written but the sibling-glob auto-discovery in
+# run_handler_tests.sh now also picks up test_terminal_delivery_guarantee.py
+# (I7573), which does a REAL `import flow_doctor_telegram` -> `from
+# nousergon_lib.telegram import send_message` with no sys.modules stub. On a
+# runner with no ambient nousergon_lib (every GHA runner; a laptop with it
+# pip-installed globally masks this) that is a bare ModuleNotFoundError at
+# collection, exit 2, deploy skipped — measured on `main` every push
+# 2026-08-25..08-28. So this lambda's tests are no longer uniformly
+# stub-only; passing this lambda's own requirements.txt (superset-source-
+# of-truth model, same as ci.yml's pre-merge glob step, config#1759) is the
+# minimal correct fix rather than widening the stub. LAMBDAS_DIR stays on
+# PYTHONPATH for the sibling-module imports (`flow_doctor_telegram`,
+# `eod_artifact_verification`) that are NOT satisfied by pip alone.
 source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
 HANDLER_TEST_PYTHONPATH="${LAMBDAS_DIR}" \
-  run_handler_tests "${SCRIPT_DIR}" boto3
+  run_handler_tests "${SCRIPT_DIR}" boto3 -r "${SCRIPT_DIR}/requirements.txt"
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
 cp "${SCRIPT_DIR}/execution_digest.py" "${PKG}/execution_digest.py"
