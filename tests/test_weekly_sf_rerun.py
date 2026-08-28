@@ -677,6 +677,15 @@ class TestStageTableLockstep:
             # downstream writer carries it: run_date_family stays
             # 'calendar_date', naming the family the run actually used.
             "NormalizeRunDatesDegraded",
+            # alpha-engine-config#5950: the floor for the optional degradation
+            # fields NotifyCompleteMultipleDegraded dereferences. Same kind as
+            # NormalizeRunDatesDegraded above — a Pass on the notify edge that
+            # dispatches nothing, writes no artifact and runs after all spend,
+            # matched here only by the "Degraded" substring in its name. It sits
+            # BETWEEN CheckGateDegradedNotify and the notifier, so entering it
+            # says a notification is being composed, never that a stage degraded;
+            # the granular Mark*/Set*Degraded states carry that and ARE mapped.
+            "NormalizeMultipleDegradedContext",
         }
         # alpha-engine-config-I6891: the predicate was `endswith("Degraded")`,
         # which the Set*DegradedSummary states this issue added would all have

@@ -83,7 +83,17 @@ def test_every_gated_phase_has_a_resume_target(states):
             leaf["StringEquals"] for leaf in leaves if "StringEquals" in leaf
         }
     assert phases <= covered, f"phases with no resume target: {sorted(phases - covered)}"
-    assert states[resume["Default"]]["Parameters"]["phase"] == (
+    # alpha-engine-config#5950: the Default is taken precisely when $.error.phase
+    # is ABSENT, and the terminal it leads to dereferences $.error — so the one
+    # path that exists to report an unrecognised phase could not run. A
+    # normalizer Pass now floors $.error on that edge. Walk through it rather
+    # than accepting either shape: the terminal must still be the loud one.
+    terminal = resume["Default"]
+    while states[terminal]["Type"] == "Pass" and "phase" not in (
+        states[terminal].get("Parameters") or {}
+    ):
+        terminal = states[terminal]["Next"]
+    assert states[terminal]["Parameters"]["phase"] == (
         "SubstrateRelaunch/UnknownResumePhase"
     ), "an unrecognised phase must fail loud, and say so"
 

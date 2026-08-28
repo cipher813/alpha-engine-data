@@ -544,6 +544,19 @@ class TestEODSFTopLevelFieldsClosed:
     # fields. Snapshot from step_function_eod.json on 2026-05-27.
     _EXPECTED_EOD_TOP_LEVEL_FIELDS: frozenset[str] = frozenset(
         {
+            # alpha-engine-config#5950 — NormalizeEODFailureContext's scratch
+            # key. HandleFailure formats States.JsonToString($.error), and three
+            # inbound edges never set it (MarketHoursGateChoice's Default, and
+            # PageCaptureSnapshotIrreversibleFailure's Next and Catch), so the
+            # EOD pipeline's own failure REPORTER raised States.Runtime on those
+            # paths and the run died carrying the reporting error instead of the
+            # real one. The floor uses the same JsonMerge-into-$.merged +
+            # OutputPath idiom as the weekly SF's NormalizeFailureContext, so
+            # $.merged is transient: it exists only INSIDE that one Pass and is
+            # re-rooted away before any successor sees it. Registered here
+            # because the closed-namespace scan reads the definition text, not
+            # the runtime payload.
+            "merged",
             # Intermediate ResultPath outputs
             # alpha-engine-config-I6891: WriteCompletionMarkerDegraded's
             # putObject result. It needs a ResultPath at all because the
