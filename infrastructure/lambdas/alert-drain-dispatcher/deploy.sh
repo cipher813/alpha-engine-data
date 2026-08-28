@@ -20,9 +20,10 @@
 # is code-only (GHA auto-deploy path); --bootstrap is operator-only.
 #
 # Usage:
-#   bash .../alert-drain-dispatcher/deploy.sh             # update code only
-#   bash .../alert-drain-dispatcher/deploy.sh --bootstrap # operator-only: role + Lambda + schedules
-#   bash .../alert-drain-dispatcher/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
+#   bash .../alert-drain-dispatcher/deploy.sh                     # update code only
+#   bash .../alert-drain-dispatcher/deploy.sh --bootstrap         # operator-only: role + Lambda + schedules
+#   bash .../alert-drain-dispatcher/deploy.sh --reconcile-triggers # upsert the four schedules ONLY (the CI path; no packaging)
+#   bash .../alert-drain-dispatcher/deploy.sh --apply-iam         # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
 #   bash .../alert-drain-dispatcher/deploy.sh --dry-run
 
 set -euo pipefail
@@ -35,6 +36,28 @@ POLICY_NAME="alpha-engine-alert-drain-dispatcher-policy"
 ROUTER_FUNCTION="alpha-engine-overseer-dispatcher"
 SCHED_ROLE_NAME="alpha-engine-overseer-scheduler-role"
 SCHED_POLICY_NAME="invoke-overseer-dispatcher"
+
+# alpha-engine-config-I6619: --state must come from the automation-pause
+# manifest, not from the API default. `scheduler update-schedule` is a FULL
+# REPLACE with no "leave the state alone" option, so every reconcile of a
+# paused schedule silently un-paused it until this was sourced here.
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
+
+# The FOUR live drain schedules, in the shape trigger_surface_drift.py scans
+# for (alpha-engine-config-I9045). Until this array existed, deploy.sh's
+# bootstrap loop wrote only the 1000/2200 slots while 0400 and 1600 also
+# existed live — created out of band, codified nowhere, covered by no drift
+# check. Measured 2026-08-28, the cost of that: config#2902's zero-retry fix
+# (MaximumRetryAttempts 185 -> 0, so a transient router error cannot
+# re-dispatch a drain for a day) reached 1000/2200 and NEVER reached
+# 0400/1600, which still carried the AWS default of 185 attempts / 86400s.
+RECONCILE_DESCRIPTION_TRIGGERS=(
+  "scheduler:alpha-engine-alert-drain-0400utc"
+  "scheduler:alpha-engine-alert-drain-1000utc"
+  "scheduler:alpha-engine-alert-drain-1600utc"
+  "scheduler:alpha-engine-alert-drain-2200utc"
+)
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 ROUTER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${ROUTER_FUNCTION}"
@@ -48,10 +71,12 @@ case "${DRY_RUN:-false}" in
 esac
 BOOTSTRAP=false
 APPLY_IAM=false
+RECONCILE_TRIGGERS=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
     --bootstrap) BOOTSTRAP=true ;;
+    --reconcile-triggers) RECONCILE_TRIGGERS=true ;;
     --apply-iam) APPLY_IAM=true ;;
     -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
   esac
@@ -59,6 +84,69 @@ done
 
 # shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
 source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
+
+# ----- Reconcile the drain schedules (shared by --bootstrap and the CI path) --
+#
+# alpha-engine-config-I9045. Every field below is written on EVERY run, because
+# `scheduler update-schedule` is a full replace: whatever this function does not
+# say, AWS resets. Three of those fields exist for a reason worth stating:
+#
+#   --state        from the pause manifest (I6619). Omitting it defaults to
+#                  ENABLED, which would silently lift Brian's 2026-08-07 pause
+#                  on the next merge that touched this Lambda.
+#   RetryPolicy    zero-retry (config#2902). AWS defaults to 185 attempts over
+#                  24h, which would re-dispatch a drain all day on a transient
+#                  router error.
+#   --description  prose + the machine-readable marker derived from
+#                  playbooks.yaml. This is the deliverable: the marker names the
+#                  event-time freshness leg that also wakes alert-drain, so
+#                  `aws scheduler get-schedule` alone answers "what runs this",
+#                  instead of a DISABLED state implying nothing does.
+reconcile_drain_schedules() {
+  local key surface sched_name slot hh input input_escaped desc verb
+  for key in "${RECONCILE_DESCRIPTION_TRIGGERS[@]}"; do
+    surface="${key%%:*}"
+    sched_name="${key#*:}"
+    slot="${sched_name#alpha-engine-alert-drain-}"
+    slot="${slot%utc}"
+    hh="${slot:0:2}"
+    input="{\"playbook\":\"alert-drain\",\"payload\":{\"trigger\":\"scheduled-${slot}utc\"}}"
+    # Input must be a JSON-ESCAPED string inside the target JSON.
+    input_escaped=$(printf '%s' "$input" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))")
+    # Fails the whole run if playbooks.yaml does not declare this schedule —
+    # a schedule created with no declaration behind it is the other half of
+    # the same defect, and it must not be creatable by this script.
+    desc=$(python3 "${SCRIPT_DIR}/../../overseer/trigger_descriptions.py" \
+      --trigger "${surface}:${sched_name}" \
+      --prose "Overseer alert-drain ${slot} UTC daily via the overseer-dispatcher router (alpha-engine-config-I2824)")
+    if aws scheduler get-schedule --name "${sched_name}" --region "${REGION}" >/dev/null 2>&1; then
+      verb=update-schedule
+    else
+      verb=create-schedule
+    fi
+    echo "  ${verb} ${sched_name} (state=$(pause_state "${sched_name}"))"
+    run aws scheduler "${verb}" \
+      --name "${sched_name}" \
+      --state "$(pause_state "${sched_name}")" \
+      --schedule-expression "cron(0 ${hh} * * ? *)" \
+      --flexible-time-window '{"Mode":"OFF"}' \
+      --description "${desc}" \
+      --target "{\"Arn\":\"${ROUTER_ARN}\",\"RoleArn\":\"arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}\",\"Input\":${input_escaped},\"RetryPolicy\":{\"MaximumRetryAttempts\":0,\"MaximumEventAgeInSeconds\":60}}" \
+      --region "${REGION}" > /dev/null
+  done
+}
+
+# ----- Schedules-only run (the CI path) --------------------------------------
+# Placed BEFORE packaging and EXITING, for the reason nous-ergon-ops-I520 made
+# expensive: "only" has to mean the whole run. Nothing below this point is
+# needed to write a description, and a schedules-only mode that fell through
+# into a code deploy would be a second deploy path nobody asked for.
+if $RECONCILE_TRIGGERS; then
+  echo "Reconciling alert-drain schedules (descriptions + state + retry policy)..."
+  reconcile_drain_schedules
+  echo "  ✓ schedules reconciled. Nothing else was touched — no code, no env, no IAM."
+  exit 0
+fi
 
 # ----- 0. Validate handler syntax + preflight unit tests ---------------------
 PKG=$(mktemp -d)
@@ -142,35 +230,11 @@ if $BOOTSTRAP; then
     --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"lambda:InvokeFunction\",\"Resource\":\"${ROUTER_ARN}\"}]}"
   if ! $DRY_RUN; then sleep 10; fi
 
-  # --- Twice-daily drain schedules -> ROUTER (playbook alert-drain) ----------
-  # 10:00 UTC (pre-market, after overnight alert accrual) + 22:00 UTC
-  # (post-close, after the daily pipelines) — both outside US market hours
-  # (13:30-20:00 UTC standard AND daylight time).
-  for slot in 1000 2200; do
-    HH="${slot:0:2}"
-    SCHED_NAME="alpha-engine-alert-drain-${slot}utc"
-    INPUT="{\"playbook\":\"alert-drain\",\"payload\":{\"trigger\":\"scheduled-${slot}utc\"}}"
-    if aws scheduler get-schedule --name "${SCHED_NAME}" --region "${REGION}" >/dev/null 2>&1; then
-      echo "  Schedule exists: ${SCHED_NAME} (updating)"
-      VERB=update-schedule
-    else
-      VERB=create-schedule
-    fi
-    # Input must be a JSON-ESCAPED string inside the target JSON.
-    INPUT_ESCAPED=$(printf '%s' "$INPUT" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))")
-    # config#2902: zero-retry on the router-targeting schedule — AWS Scheduler
-    # defaults to MaximumRetryAttempts=185, which would re-dispatch this
-    # payload for up to a day on any transient router error. The router's
-    # clean-JSON-never-raise contract + watch-plane Errors alarm are the
-    # intended failure surface, not scheduler-level retry.
-    run aws scheduler "${VERB}" \
-      --name "${SCHED_NAME}" \
-      --schedule-expression "cron(0 ${HH} * * ? *)" \
-      --flexible-time-window '{"Mode":"OFF"}' \
-      --description "Overseer alert-drain ${slot} UTC daily via the overseer-dispatcher router (alpha-engine-config-I2824)" \
-      --target "{\"Arn\":\"${ROUTER_ARN}\",\"RoleArn\":\"arn:aws:iam::${ACCOUNT_ID}:role/${SCHED_ROLE_NAME}\",\"Input\":${INPUT_ESCAPED},\"RetryPolicy\":{\"MaximumRetryAttempts\":0,\"MaximumEventAgeInSeconds\":60}}" \
-      --region "${REGION}" > /dev/null || echo "  WARN: ${VERB} ${SCHED_NAME} failed"
-  done
+  # --- The daily drain schedules -> ROUTER (playbook alert-drain) -----------
+  # One function, shared with --reconcile-triggers, so bootstrap and the CI
+  # path can never write different schedules (they did: this block used to
+  # loop over `1000 2200` while 0400 and 1600 existed live).
+  reconcile_drain_schedules
 fi
 
 # ----- 3. Update code (always) -----------------------------------------------

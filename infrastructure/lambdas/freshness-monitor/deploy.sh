@@ -30,6 +30,7 @@
 #   bash infrastructure/lambdas/freshness-monitor/deploy.sh             # update code + registry (operator; needs ae-config clone)
 #   bash infrastructure/lambdas/freshness-monitor/deploy.sh --code-only # update code ONLY (CI path; no registry, no ae-config clone)
 #   bash infrastructure/lambdas/freshness-monitor/deploy.sh --bootstrap # first-time create + wire EventBridge
+#   bash infrastructure/lambdas/freshness-monitor/deploy.sh --reconcile-triggers # upsert the three cron rules ONLY (the CI path; no packaging)
 #   bash infrastructure/lambdas/freshness-monitor/deploy.sh --apply-iam # re-apply iam-policy.json and EXIT — no code, no env, no registry (config#2825, config-I6661)
 #   bash infrastructure/lambdas/freshness-monitor/deploy.sh --dry-run   # show actions, do not apply
 #   bash infrastructure/lambdas/freshness-monitor/deploy.sh --smoke     # invoke once after deploy
@@ -49,6 +50,35 @@ POLICY_NAME="alpha-engine-freshness-monitor-policy"
 RULE_NAME="alpha-engine-freshness-monitor-cron"
 HISTORICAL_RULE_NAME="alpha-engine-freshness-monitor-historical-cron"
 INTRADAY_RULE_NAME="alpha-engine-freshness-monitor-intraday-cron"
+
+# alpha-engine-config-I9045. These three rules wake the freshness monitor, and
+# the daily one ALSO wakes the Overseer alert-drain playbook: on a freshness
+# CRITICAL with no declared operator/recovery lane the handler invokes
+# alpha-engine-overseer-dispatcher directly with {"playbook":"alert-drain"}
+# (config-I3282, gated by FRESHNESS_MONITOR_DRAIN_DISPATCH_ENABLED, verified
+# live true 2026-08-28). Measured the same day: that leg was running the drain
+# EVERY DAY while all four of alert-drain's own Scheduler schedules sat
+# DISABLED — and no tag, description or field on any AWS resource said so.
+# Listing the rules here opts them into the reconcile below and into
+# infrastructure/overseer/trigger_surface_drift.py's grading. Each cron and
+# state is written on every run: `events put-rule` is an upsert that DEFAULTS
+# TO ENABLED when --state is omitted (I6619) and drops the description when
+# --description is omitted.
+RECONCILE_DESCRIPTION_TRIGGERS=(
+  "events:alpha-engine-freshness-monitor-cron"
+  "events:alpha-engine-freshness-monitor-historical-cron"
+  "events:alpha-engine-freshness-monitor-intraday-cron"
+)
+RECONCILE_CRONS=(
+  "cron(0 12 * * ? *)"
+  "cron(0 4 * * ? *)"
+  "cron(0/30 14-21 ? * MON-FRI *)"
+)
+RECONCILE_PROSE=(
+  "Daily 12:00 UTC probe of the artifact freshness registry"
+  "Daily 04:00 UTC historical-cycle probe (mode=historical)"
+  "30-min weekday 14-21 UTC intraday probe (mode=intraday)"
+)
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 
@@ -74,10 +104,12 @@ BOOTSTRAP=false
 APPLY_IAM=false
 SMOKE=false
 CODE_ONLY=false
+RECONCILE_TRIGGERS=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
     --bootstrap) BOOTSTRAP=true ;;
+    --reconcile-triggers) RECONCILE_TRIGGERS=true ;;
     --apply-iam) APPLY_IAM=true ;;
     --smoke) SMOKE=true ;;
     --code-only) CODE_ONLY=true ;;
@@ -87,6 +119,40 @@ done
 
 # shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
 source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
+
+# ----- Reconcile the three cron rules' state + description ------------------
+# The description is prose + a marker derived from playbooks.yaml, so the
+# alert-drain dispatch leg is legible from `aws events describe-rule` alone.
+# Targets are NOT touched: `put-rule` with --schedule-expression leaves them in
+# place, and re-declaring them here would be a second copy of the bootstrap's
+# mode= Input JSON to keep in sync.
+reconcile_freshness_rules() {
+  local i key rule_name desc
+  for i in "${!RECONCILE_DESCRIPTION_TRIGGERS[@]}"; do
+    key="${RECONCILE_DESCRIPTION_TRIGGERS[$i]}"
+    rule_name="${key#*:}"
+    desc=$(python3 "${SCRIPT_DIR}/../../overseer/trigger_descriptions.py" \
+      --trigger "${key}" --prose "${RECONCILE_PROSE[$i]}")
+    echo "  put-rule ${rule_name} (state=$(pause_state "${rule_name}"))"
+    run aws events put-rule \
+      --name "${rule_name}" --state "$(pause_state "${rule_name}")" \
+      --schedule-expression "${RECONCILE_CRONS[$i]}" \
+      --description "${desc}" \
+      --region "${REGION}" \
+      --query 'RuleArn' --output text
+  done
+}
+
+# ----- Reconcile-triggers only, then EXIT ------------------------------------
+# Placed FIRST, alongside --apply-iam and for the same nous-ergon-ops-I520
+# reason: nothing below installs, tests or zips anything this mode needs, and a
+# mode that fell through would become a second, undeclared deploy path.
+if $RECONCILE_TRIGGERS; then
+  echo "Reconciling freshness-monitor EventBridge rules (state + description)..."
+  reconcile_freshness_rules
+  echo "  ✓ rules reconciled. Nothing else was touched — no code, no env, no registry."
+  exit 0
+fi
 
 # ----- Apply IAM only, then EXIT (config#2825, config-I6661) ---------------
 # Placed FIRST, before packaging, deliberately. "only" has to mean the whole
@@ -244,13 +310,12 @@ if $BOOTSTRAP; then
   # The genuinely-intraday artifacts (open_orders_latest,
   # freshness_monitor_heartbeat) are NOT blinded by this — they're also
   # covered by the separate 30-min mini-rule below.
-  echo "  Creating EventBridge cron: ${RULE_NAME}"
-  run aws events put-rule \
-    --name "${RULE_NAME}" --state "$(pause_state "${RULE_NAME}")" \
-    --schedule-expression "cron(0 12 * * ? *)" \
-    --description "Daily 12:00 UTC probe of the artifact freshness registry" \
-    --region "${REGION}" \
-    --query 'RuleArn' --output text
+  # All three rules are created by the SAME function the CI reconcile calls
+  # (alpha-engine-config-I9045). Bootstrap used to write its own put-rule per
+  # rule, with its own description literal — two writers of one field is how
+  # the marker would have gone missing on the next bootstrap.
+  echo "  Creating/updating the three EventBridge crons"
+  reconcile_freshness_rules
 
   FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
   run aws events put-targets \
@@ -273,14 +338,6 @@ if $BOOTSTRAP; then
   # cycles of each artifact and writes _freshness_monitor/history.json
   # (page 26 reads this for per-row history expanders + gap counts).
   # Lookback defaults: 12 saturday + 30 weekday/eod cycles.
-  echo "  Creating EventBridge historical cron: ${HISTORICAL_RULE_NAME}"
-  run aws events put-rule \
-    --name "${HISTORICAL_RULE_NAME}" --state "$(pause_state "${HISTORICAL_RULE_NAME}")" \
-    --schedule-expression "cron(0 4 * * ? *)" \
-    --description "Daily 04:00 UTC historical-cycle probe (mode=historical)" \
-    --region "${REGION}" \
-    --query 'RuleArn' --output text
-
   # JSON Input (`{"mode":"historical"}`) doesn't fit the put-targets
   # shorthand form (Id=,Arn=,Input= chokes on the embedded quotes +
   # comma). Write a temp JSON file + pass via file:// to dodge the
@@ -318,14 +375,6 @@ EOF
   # genuinely-intraday artifacts (open_orders_latest,
   # freshness_monitor_heartbeat) without touching the shared
   # check_results/heartbeat/cycle_verdict surfaces the daily sweep owns.
-  echo "  Creating EventBridge intraday cron: ${INTRADAY_RULE_NAME}"
-  run aws events put-rule \
-    --name "${INTRADAY_RULE_NAME}" --state "$(pause_state "${INTRADAY_RULE_NAME}")" \
-    --schedule-expression "cron(0/30 14-21 ? * MON-FRI *)" \
-    --description "30-min weekday 14-21 UTC intraday probe (mode=intraday)" \
-    --region "${REGION}" \
-    --query 'RuleArn' --output text
-
   # Same file:// dodge as the historical target above (embedded-quote JSON
   # doesn't survive the put-targets shorthand form).
   INTRADAY_TARGET_JSON=$(mktemp)

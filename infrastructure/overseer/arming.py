@@ -140,6 +140,49 @@ def _classify_trigger(trig: dict, paused: set[str], kept: set[str], live_state) 
     out = {"surface": surface, "name": trig.get("name") or trig.get("ref")}
 
     if surface not in JOINABLE_SURFACES:
+        # alpha-engine-config-I9045. A leg with no AWS resource of its own may
+        # still declare `depends_on`: the resources whose live state IS its
+        # arming. Resolving it is not a nicety — measured 2026-08-28,
+        # alert-drain's event-time leg was the ONLY thing running the drain
+        # (daily, all week) while its four schedules sat DISABLED, and this
+        # branch reported the one live leg as `unjoinable`. A blank standing
+        # where the answer was derivable is what §8.3 forbids.
+        deps = trig.get("depends_on") or []
+        if deps:
+            resolved = [
+                _classify_trigger(dict(d), paused, kept, live_state) for d in deps
+            ]
+            out["declared"] = trig.get("declared_by") or "derived-from-dependencies"
+            out["depends_on"] = resolved
+            dep_verdicts = [r["verdict"] for r in resolved]
+            out["live"] = ",".join(str(r.get("live", "-")) for r in resolved)
+            if "armed" in dep_verdicts:
+                # ANY armed dependency wakes this leg. Not `all` — the leg fires
+                # whenever any one of the rules it rides fires, and reading it
+                # as dark because a sibling is off is the false-negative that
+                # would hide a running playbook all over again.
+                out["verdict"] = "armed-via-dependency"
+            elif "trigger-absent" in dep_verdicts:
+                out["verdict"] = "trigger-absent"
+                out["detail"] = (
+                    f"event-time leg '{out['name']}' depends on a trigger that does not "
+                    "exist live, so this wake path is broken: "
+                    + "; ".join(
+                        r.get("detail", "") for r in resolved
+                        if r["verdict"] == "trigger-absent"
+                    )
+                )
+            elif all(v == "paused-declared" for v in dep_verdicts):
+                out["verdict"] = "paused-declared"
+            else:
+                out["verdict"] = "undeclared-dark"
+                out["detail"] = (
+                    f"event-time leg '{out['name']}' is dark: every trigger it depends on "
+                    "is DISABLED and at least one of them is in neither the paused nor "
+                    "the kept block of automation_pause.json."
+                )
+            return out
+
         out["verdict"] = "unjoinable"
         out["declared"] = trig.get("declared_by") or "out-of-band"
         out["detail"] = trig.get("reason") or (
@@ -186,7 +229,13 @@ def _unit_verdict(triggers: list[dict]) -> str:
     and `undeclared-dark` outranks everything because an undeclared dark
     trigger is the one condition that makes every other reading unsafe.
     """
-    v = [t["verdict"] for t in triggers]
+    # `armed-via-dependency` is an ARMED reading, not a weaker one: the leg has
+    # a live enabled AWS resource behind it, reached one hop away
+    # (alpha-engine-config-I9045). Folding it here is what makes a playbook
+    # running solely off its event-time leg read `partially-armed` rather than
+    # `paused-declared` — the false reading measured on 2026-08-12.
+    v = ["armed" if t["verdict"] == "armed-via-dependency" else t["verdict"]
+         for t in triggers]
     if not v:
         return "undeclared-no-triggers"
     if "undeclared-dark" in v:
