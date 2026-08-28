@@ -44,7 +44,7 @@ Reported but NOT red:
                           ``deploy.sh`` has opted into reconciling yet. Counted
                           and named on every run so the remaining coverage is a
                           number on a surface rather than an unstated backlog
-                          (``alpha-engine-config-I9068``). It becomes graded the
+                          (``alpha-engine-config-I9072``). It becomes graded the
                           moment its owning deploy script adds it to
                           ``RECONCILE_DESCRIPTION_TRIGGERS`` — coverage is
                           discovered by scanning the deploy scripts, so there is
@@ -263,7 +263,7 @@ def check(
                 "detail": (
                     f"{key} is implied by playbooks.yaml but no deploy.sh lists it in "
                     "RECONCILE_DESCRIPTION_TRIGGERS, so its AWS description is not "
-                    "reconciled and cannot be graded (alpha-engine-config-I9068)."
+                    "reconciled and cannot be graded (alpha-engine-config-I9072)."
                 ),
             })
             continue
