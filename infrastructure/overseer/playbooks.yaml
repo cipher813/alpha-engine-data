@@ -62,6 +62,17 @@ playbooks:
       - {surface: events, name: alpha-engine-saturday-sf-watch-failed}
       - {surface: events, name: alpha-engine-sf-watch-spot-interruption}
       - {surface: events, name: alpha-engine-sf-watch-instance-terminated}
+      # Found by trigger_surface_drift.py on its first live run
+      # (alpha-engine-config-I9045). This schedule dispatches
+      # {"playbook": "sf-watch", "payload": {"is_drill": "true", ...}} through
+      # the router — a real wake path for THIS playbook — and it was declared
+      # only under canary-replay, whose triggers list it because the drill is
+      # canary-replay's instrument. Both are true and both belong here: the
+      # ci-watch drill twin is already declared on both sides, which is what
+      # made the asymmetry visible. Being drill-only does not exempt it —
+      # `drill_isolation` governs how a drill run is graded, not whether the
+      # thing that starts it is a trigger.
+      - {surface: scheduler, name: alpha-engine-sf-watch-canary-drill-weekly}
     executor_function: alpha-engine-sf-watch-spot-dispatcher
     executor_lambda_dir: sf-watch-spot-dispatcher
     # Executor verdict `reason` values that are by-design declines — the
@@ -229,6 +240,21 @@ playbooks:
           invoke the router directly (config-I3282). Its arming is the arming of
           alpha-engine-freshness-monitor-{cron,historical-cron,intraday-cron},
           all three of which the pause manifest declares KEPT.
+        # alpha-engine-config-I9045. The sentence above was true, joinable by a
+        # human, and readable by nothing. Measured 2026-08-28: all four
+        # schedules above were live DISABLED and alert-drain ran EVERY DAY that
+        # week off this leg — and `arming.py` could only report the leg
+        # `unjoinable`, because "its arming is the arming of X" lived in prose.
+        # `depends_on` is that sentence in a form the code can follow: these are
+        # the AWS resources whose live state IS this leg's arming, so the leg
+        # resolves to armed/dark instead of a blank, and
+        # `trigger_descriptions.py` can stamp the linkage onto both ends of it
+        # (the rules gain `[wakes: alert-drain]`, the schedules gain a
+        # `[sibling-legs: ...]` naming the rule that is doing the work).
+        depends_on:
+          - {surface: events, name: alpha-engine-freshness-monitor-cron}
+          - {surface: events, name: alpha-engine-freshness-monitor-historical-cron}
+          - {surface: events, name: alpha-engine-freshness-monitor-intraday-cron}
     executor_function: alpha-engine-alert-drain-dispatcher
     executor_lambda_dir: alert-drain-dispatcher
     benign_reasons: [concurrent_skip, disabled]

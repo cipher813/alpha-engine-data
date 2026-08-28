@@ -272,3 +272,100 @@ def test_ci_runs_the_arming_report():
     """A checker nothing runs is a comment. Pin the wiring."""
     wf = (ROOT / ".github" / "workflows" / "sf-arn-drift-check.yml").read_text(encoding="utf-8")
     assert "infrastructure/overseer/arming.py" in wf
+
+
+# ── the event-time leg: a blank where the answer was derivable (I9045) ───────
+
+def _event_time_registry():
+    """alert-drain's real shape: four paused schedules plus an event-time leg
+    riding an EventBridge rule that is deliberately KEPT enabled."""
+    return {"playbooks": {"alert-drain": {"triggers": [
+        {"surface": "scheduler", "name": "drain-sched"},
+        {"surface": "event-time",
+         "ref": "freshness CRITICAL -> router",
+         "reason": "the freshness Lambda invokes the router in-process",
+         "depends_on": [{"surface": "events", "name": "freshness-rule"}]},
+    ]}}}
+
+
+def _paused_drain_manifest(manifest):
+    m = dict(manifest)
+    m["paused"] = {"events_rules": {}, "scheduler_schedules": {"drain-sched": "ruled off"}}
+    m["not_paused"] = {"freshness-rule": "kept — detection only"}
+    m["pending"] = {}
+    return m
+
+
+def test_an_event_time_leg_resolves_through_its_dependencies(arming, manifest):
+    """The measured 2026-08-28 condition, and the reading that was wrong.
+
+    Every schedule DISABLED, the drain running daily, and this leg reported
+    `unjoinable` — so the playbook rolled up to `paused-declared`, i.e. "off by
+    ruling", about a thing that ran every day of that week. With `depends_on`
+    the leg resolves off the live rule and the playbook reads `partially-armed`.
+    """
+    rec = arming.build_record(
+        _event_time_registry(), _paused_drain_manifest(manifest),
+        _states({("scheduler", "drain-sched"): "DISABLED",
+                 ("events", "freshness-rule"): "ENABLED"}))
+    legs = rec["units"][0]["triggers"]
+    assert legs[1]["verdict"] == "armed-via-dependency"
+    assert rec["units"][0]["arming"] == "partially-armed"
+
+
+def test_an_event_time_leg_whose_every_dependency_is_paused_reads_paused(arming, manifest):
+    """The other direction. A declared pause is not a finding — reporting a
+    deliberate operator disable as a defect is §8.3's collapse the other way."""
+    m = _paused_drain_manifest(manifest)
+    m["paused"]["events_rules"] = {"freshness-rule": "ruled off"}
+    m["not_paused"] = {}
+    rec = arming.build_record(
+        _event_time_registry(), m,
+        _states({("scheduler", "drain-sched"): "DISABLED",
+                 ("events", "freshness-rule"): "DISABLED"}))
+    assert rec["units"][0]["triggers"][1]["verdict"] == "paused-declared"
+    assert rec["units"][0]["arming"] == "paused-declared"
+    assert arming.findings(rec) == []
+
+
+def test_an_event_time_leg_dark_with_nobody_s_decision_is_a_finding(arming, manifest):
+    """`undeclared-dark` must survive the extra hop. A leg going dark because
+    the rule it rides was disabled out of band is exactly as invisible as the
+    direct case, and now exactly as loud."""
+    m = _paused_drain_manifest(manifest)
+    m["not_paused"] = {}
+    rec = arming.build_record(
+        _event_time_registry(), m,
+        _states({("scheduler", "drain-sched"): "DISABLED",
+                 ("events", "freshness-rule"): "DISABLED"}))
+    assert rec["units"][0]["arming"] == "undeclared-dark"
+    assert [f["kind"] for f in arming.findings(rec)] == ["undeclared-dark"]
+
+
+def test_an_event_time_leg_whose_dependency_vanished_is_a_finding(arming, manifest):
+    rec = arming.build_record(
+        _event_time_registry(), _paused_drain_manifest(manifest),
+        _states({("scheduler", "drain-sched"): "DISABLED"}))
+    assert rec["units"][0]["arming"] == "trigger-absent"
+
+
+def test_a_leg_with_no_dependencies_is_still_unjoinable(arming, manifest):
+    """`depends_on` is optional and additive. A github-actions leg has no AWS
+    state to read and must stay NAMED-with-a-reason, never assumed armed."""
+    reg = {"playbooks": {"p": {"triggers": [
+        {"surface": "github-actions", "ref": "owner/repo/.github/workflows/x.yml",
+         "reason": "GitHub Actions carries no AWS trigger state to read"}]}}}
+    rec = arming.build_record(reg, _paused_drain_manifest(manifest), _states({}))
+    assert rec["units"][0]["triggers"][0]["verdict"] == "unjoinable"
+
+
+def test_the_live_registry_declares_the_freshness_rules_as_the_drain_s_event_time_leg(
+    registry,
+):
+    """Pins the real declaration, not a fixture: the linkage the AWS surface was
+    missing must exist in the registry the reconcile derives descriptions from."""
+    triggers = registry["playbooks"]["alert-drain"]["triggers"]
+    event_time = [t for t in triggers if t["surface"] == "event-time"]
+    assert len(event_time) == 1
+    deps = {d["name"] for d in event_time[0]["depends_on"]}
+    assert "alpha-engine-freshness-monitor-cron" in deps
