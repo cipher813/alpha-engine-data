@@ -89,7 +89,9 @@ def test_the_run_day_gate_really_does_key_on_that_role(weekly):
     assert role_equals[0]["StringEquals"] == "weekly"
     # ...and anything that is not 'weekly' must fall through to the Default,
     # i.e. straight into the pipeline without the gate.
-    assert gate["Default"] == "CheckRunMode"
+    # alpha-engine-config-I8809: NormalizeRunDates sits between the gate and
+    # CheckRunMode — the graph's ONE date normalization. Chain unchanged past it.
+    assert gate["Default"] == "NormalizeRunDates"
 
 
 def test_launch_failure_alerts_and_never_fails_postclose(eod):

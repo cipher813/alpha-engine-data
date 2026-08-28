@@ -66,7 +66,12 @@ def test_marker_state_shape(weekly_states):
     # I8214: the marker hands off to the observe-only coverage sweep instead of
     # ending the execution. The sweep augments the object this state just wrote.
     assert "End" not in st
-    assert st["Next"] == "WeeklyCoverageSweep"
+    # alpha-engine-config-I8809: the legacy-partition COPY of the marker sits
+    # between the canonical write and the sweep for the migration window. It is
+    # fail-soft and its Next is the sweep, so the chain below is unchanged past
+    # this hop. Deleted at the 2026-09-05 cutover.
+    assert st["Next"] == "WriteCompletionMarkerCalendar"
+    assert weekly_states["WriteCompletionMarkerCalendar"]["Next"] == "WeeklyCoverageSweep"
     assert '"claim":"sf_execution_terminal"' in body, (
         "the marker must name what its write actually asserts — the SF execution "
         "reached its terminal — rather than implying the cycle completed"

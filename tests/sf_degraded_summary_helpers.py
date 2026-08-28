@@ -111,7 +111,11 @@ def assert_completion_notifier_chain(states: dict, notifier: str) -> None:
         "the degraded marker must carry the summary — a marker reader that can "
         "see DEGRADED but not WHY has to go back to execution history"
     )
-    assert degraded_marker["Next"] == "DegradedRun"
+    # alpha-engine-config-I8809: the legacy-partition COPY of the degraded
+    # marker sits between it and DegradedRun for the migration window; it is
+    # fail-soft and its Next is DegradedRun. Deleted at the 2026-09-05 cutover.
+    assert degraded_marker["Next"] == "WriteCompletionMarkerDegradedCalendar"
+    assert states["WriteCompletionMarkerDegradedCalendar"]["Next"] == "DegradedRun"
     assert states["DegradedRun"]["Type"] == "Fail"
     assert states["DegradedRun"]["Error"] == "DegradedRun", (
         "the error string is a consumer contract: sf-telegram-notifier keys its "
@@ -130,7 +134,12 @@ def assert_completion_notifier_chain(states: dict, notifier: str) -> None:
     # the line it replaced: an observe-only tail that could fail a completed run
     # would be the exact defect I8214's own comment forbids.
     assert "End" not in clean_marker
-    assert clean_marker["Next"] == "WeeklyCoverageSweep"
+    # alpha-engine-config-I8809: the legacy-partition COPY of the marker sits
+    # between the canonical write and the sweep for the migration window.
+    # Fail-soft, and its Next is the sweep, so the tail asserted below is
+    # unchanged past this hop. Deleted at the 2026-09-05 cutover.
+    assert clean_marker["Next"] == "WriteCompletionMarkerCalendar"
+    assert states["WriteCompletionMarkerCalendar"]["Next"] == "WeeklyCoverageSweep"
     assert_observe_only_tail(states, "WeeklyCoverageSweep")
 
 

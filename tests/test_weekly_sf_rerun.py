@@ -669,6 +669,14 @@ class TestStageTableLockstep:
             # so mapping them would make every run re-run the whole branch.
             "InitResearchDegradedFlag",
             "InitPredictorDegradedFlag",
+            # alpha-engine-config-I8809: the fail-open floor for the graph's
+            # date normalization. It is a routing Pass, not a stage — it
+            # dispatches nothing, writes no artifact, and runs BEFORE any spend,
+            # so there is nothing for a rerun to redo on the strength of it.
+            # What it does record lives on the state input instead, where every
+            # downstream writer carries it: run_date_family stays
+            # 'calendar_date', naming the family the run actually used.
+            "NormalizeRunDatesDegraded",
         }
         # alpha-engine-config-I6891: the predicate was `endswith("Degraded")`,
         # which the Set*DegradedSummary states this issue added would all have

@@ -1,0 +1,94 @@
+name: Deploy weekly-coverage-sweep
+
+# Auto-deploy the alpha-engine-weekly-coverage-sweep Lambda on merge to main.
+#
+# WHY THIS FILE DID NOT EXIST, and what that cost (alpha-engine-config-I8809):
+# `weekly-coverage-sweep` shipped with a `deploy.sh` and NO workflow calling
+# it. `deploy-infrastructure.yml` restamps the Step Functions definition on
+# every push to main, so an SF change goes live on merge — but it does not
+# touch Lambda code. Every edit to `infrastructure/lambdas/weekly-coverage-sweep/`
+# therefore merged INERT, with nothing anywhere reporting the drift: the
+# codified-but-not-live class `deploy-weekly-preflight.yml` was written to
+# close for its own sibling. The function whose whole job is to notice that a
+# stage recorded nothing was itself the thing nobody was deploying.
+#
+# Separation of concerns, same as the preflight sibling: this deploys the
+# function CODE (deploy.sh default path = update-function-code +
+# publish-version + `live` alias). First-time creation is
+# `deploy.sh --bootstrap --apply-iam`, which needs IAM role creation
+# (nous-ergon-ops owns IAM) — the function is already live, so that bootstrap
+# is not on this path.
+#
+# IAM: the github-actions-lambda-deploy role's LambdaUpdate grant covers
+# arn:aws:lambda:...:function:alpha-engine-* (including PublishVersion,
+# CreateAlias, UpdateAlias), so this job needs no policy change.
+
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/lambdas/weekly-coverage-sweep/**'
+      - 'infrastructure/lambdas/_shared/**'
+      - '.github/workflows/deploy-weekly-coverage-sweep.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-weekly-coverage-sweep-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy weekly-coverage-sweep Lambda
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: alpha-engine-data
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12 (match Lambda runtime)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Deploy weekly-coverage-sweep
+        working-directory: alpha-engine-data
+        run: bash infrastructure/lambdas/weekly-coverage-sweep/deploy.sh
+
+      - name: Report deployed version
+        working-directory: alpha-engine-data
+        run: |
+          echo "Deployed commit: ${{ github.sha }}"
+          aws lambda get-alias \
+            --function-name alpha-engine-weekly-coverage-sweep \
+            --name live \
+            --query 'FunctionVersion' \
+            --output text
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@8a904b7a817901f2520dd87131ff307ed97fee02 # main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: deploy-weekly-coverage-sweep.yml
+
+  # Alert (Telegram) on genuine post-merge failure on the default branch.
+  # Reusable workflow + transport in nousergon-lib. config#1128.
+  notify-main-failure:
+    needs: [deploy]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit

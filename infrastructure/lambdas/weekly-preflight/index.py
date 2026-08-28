@@ -42,6 +42,56 @@ _SF_DEFINITION_BUCKET = os.environ.get("SF_DEFINITION_BUCKET", "alpha-engine-res
 _WEEKLY_SF_NAME = os.environ.get("WEEKLY_SF_NAME", "ne-weekly-freshness-pipeline")
 
 
+def _resolve_run_dates(event: dict) -> dict:
+    """Calendar date in, trading day out. Pure NYSE arithmetic, no AWS calls.
+
+    ``alpha-engine-config-I8809``. One weekly cycle was written across TWO S3
+    date partitions because ``InitializeInput`` stamped the calendar date and
+    each consumer then decided for itself whether to normalize. Measured on
+    the 2026-08-22 cycle: 28 ``_stage_coverage`` verdicts under ``2026-08-21``
+    and 11 under ``2026-08-22``.
+
+    **``resolve_trading_day``, not ``now_dual()``** — and the difference is not
+    cosmetic. ``resolve_trading_day(d)`` is *the most recent NYSE trading day
+    on or before ``d``*; ``now_dual().trading_day`` is *the last session fully
+    CLOSED at this instant*. For a Friday-afternoon manual run those disagree
+    (Friday vs Thursday). Every downstream normalizer in the fleet —
+    ``crucible-backtester/infrastructure/_spot_common.sh``,
+    ``crucible-research``'s signals-envelope and ChallengerShadow handlers, the
+    evaluator, the Director — calls ``resolve_trading_day``, and it is
+    idempotent by contract. Matching it is what makes this a normalization
+    rather than a third partition.
+
+    **Raises rather than degrades on a missing input.** A silent fall-back to
+    "today" would key an entire cycle off the Lambda's own clock instead of the
+    execution's, which is the same class of defect as the split itself. The
+    state machine's Catch turns the raise into a NAMED fail-open
+    (``NormalizeRunDatesDegraded``) that keeps the calendar value AND says so
+    in ``run_date_family``.
+    """
+    calendar_date = str((event or {}).get("calendar_date") or "").strip()
+    if not calendar_date:
+        raise ValueError(
+            "resolve_run_dates: calendar_date is REQUIRED — it is the execution's own "
+            "date($$.Execution.StartTime), and defaulting it to this Lambda's clock "
+            "would key the cycle off the wrong machine (alpha-engine-config-I8809)"
+        )
+
+    from krepis.dates import resolve_trading_day
+
+    trading_day = resolve_trading_day(calendar_date)
+    return {
+        "calendar_date": calendar_date,
+        "trading_day": trading_day,
+        # Named on BOTH polarities (sf-pipeline-policy.md §2.3a rule 3): the
+        # state machine seeds run_date_family='calendar_date' and this is what
+        # upgrades it, so a run that never reached here is distinguishable from
+        # one that did.
+        "run_date_family": "trading_day",
+        "normalized": trading_day != calendar_date,
+    }
+
+
 def handler(event: dict, context) -> dict:
     """
     AWS Lambda handler for the weekly preflight.
@@ -53,6 +103,28 @@ def handler(event: dict, context) -> dict:
     Returns:
         dict with status, has_violation, and detailed results.
     """
+    # alpha-engine-config-I8809 — the weekly graph's ONE date normalization.
+    #
+    # `NormalizeRunDates` invokes this function with an explicit action, before
+    # any spend, to turn the execution's CALENDAR date into the cycle's TRADING
+    # day. It returns before the preflight's first AWS call: this path performs
+    # pure NYSE-calendar arithmetic and touches nothing.
+    #
+    # WHY HERE rather than in a new function: `InitializeInput` is a Pass and
+    # States intrinsics carry no NYSE calendar, so the normalization needs a
+    # Lambda. This one already exists, already pins nousergon-lib, is already
+    # invoked by this same state machine, and already auto-deploys on merge
+    # (`deploy-weekly-preflight.yml`). A NEW function would need an IAM role
+    # bootstrap — an operator step a PR cannot perform, and therefore a PR that
+    # is not deployable by the merge button alone.
+    #
+    # SAFE against the real gate: `WeeklyPreflight` passes no explicit Payload,
+    # so `event` there IS the whole state input, which carries no `action` key.
+    # `event.get("action")` is None on that path and the preflight below runs
+    # byte-identically to before.
+    if (event or {}).get("action") == "resolve_run_dates":
+        return _resolve_run_dates(event)
+
     # Captured at handler ENTRY: the stage-coverage window must predate any
     # write this invocation makes, or it would be trivially satisfied by it
     # (alpha-engine-config-I7214).
@@ -81,6 +153,10 @@ def handler(event: dict, context) -> dict:
     # a failure: this gate must not start halting the pipeline over a payload
     # shape it previously ignored.
     run_date = event.get("run_date")
+    # alpha-engine-config-I8809: $.run_date is the cycle's TRADING day past
+    # NormalizeRunDates; check_skip_flag_artifact_coherence compares an S3
+    # LastModified and needs the wall-clock day instead.
+    calendar_date = event.get("calendar_date")
     skip_flags = {k: v for k, v in event.items() if k.startswith("skip_")}
 
     try:

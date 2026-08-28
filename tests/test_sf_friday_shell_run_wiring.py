@@ -681,7 +681,11 @@ class TestStrictSuperset:
         # strict-superset property is preserved one gate further down.
         assert states["InitializeInput"]["Next"] == "CheckWeeklyRunDayGate"
         # config#1824: run-day gate precedes CheckRunMode; bypass Default keeps chain.
-        assert states["CheckWeeklyRunDayGate"]["Default"] == "CheckRunMode"
+        # alpha-engine-config-I8809: NormalizeRunDates (+ ApplyNormalizedRunDate)
+        # sit between the run-day gate and CheckRunMode — the graph's ONE date
+        # normalization, on every path that does real work.
+        assert states["CheckWeeklyRunDayGate"]["Default"] == "NormalizeRunDates"
+        assert states["ApplyNormalizedRunDate"]["Next"] == "CheckRunMode"
         assert states["CheckRunMode"]["Default"] == "CheckSkipLibPinDriftCheck"
         assert states["CheckMutexRole"]["Default"] == "CheckSpotDispatchNeeded", (
             "Mutex bypass path must route to CheckSpotDispatchNeeded so the "
@@ -1465,6 +1469,9 @@ class TestHappyPathTraversal:
         assert order[: order.index("CheckSkipMorningEnrich") + 4] == [
             "InitializeInput",
             "CheckWeeklyRunDayGate",
+            # alpha-engine-config-I8809: the graph's ONE date normalization.
+            "NormalizeRunDates",
+            "ApplyNormalizedRunDate",
             "CheckRunMode",
             "CheckSkipLibPinDriftCheck",
             "LibPinDriftCheck",

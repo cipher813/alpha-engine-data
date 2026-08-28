@@ -126,6 +126,15 @@ class PreflightContext:
     # the input has not observed a violation, it has observed nothing, and
     # the in-SF guards remain the authority either way.
     run_date: "str | None" = None
+    # alpha-engine-config-I8809: the execution's own CALENDAR date. $.run_date
+    # became the cycle's TRADING day at NormalizeRunDates, and this check
+    # compares an S3 LastModified — a wall-clock write time — so it must
+    # compare against the wall-clock day. Against the trading day the check is
+    # strictly WEAKER on every Saturday run: a manifest written on Friday would
+    # satisfy "a training run completed for this cycle". Falls back to run_date
+    # when absent (the CLI, and any caller predating the field), which is the
+    # pre-I8809 behaviour verbatim.
+    calendar_date: "str | None" = None
     skip_flags: dict = field(default_factory=dict)
     fresh_constituents: "set[str] | None" = None  # populated by check_constituents_fetch
     arctic_universe_symbols: "set[str] | None" = None  # populated by check_arctic_connectivity
@@ -1366,7 +1375,7 @@ class SkipArtifactPredicate:
     flag: str          # the execution-input key, e.g. "skip_predictor_training"
     stage: str         # human name for the message
     key: str           # S3 key, may contain "{run_date}"
-    kind: str          # "last_modified_gte_run_date" | "key_exists"
+    kind: str          # "last_modified_gte_calendar_date" | "key_exists"
     sf_guard: str      # the in-SF state that owns the authoritative check
     note: str = ""
 
@@ -1382,15 +1391,28 @@ SKIP_ARTIFACT_PREDICATES: "tuple[SkipArtifactPredicate, ...]" = (
         flag="skip_predictor_training",
         stage="PredictorTraining",
         key="predictor/weights/meta/manifest.json",
-        kind="last_modified_gte_run_date",
+        kind="last_modified_gte_calendar_date",
         sf_guard="CheckPredictorSkipWeightsFresh",
         note=(
-            "manifest LastModified date >= run_date proves a non-dry training "
-            "run completed FOR THIS run_date; an earlier date means the skip "
-            "would silently reuse the previous cycle's weights"
+            "manifest LastModified date >= calendar_date proves a non-dry "
+            "training run completed FOR THIS cycle; an earlier date means the "
+            "skip would silently reuse the previous cycle's weights "
+            "(alpha-engine-config-I8809: the reference is the CALENDAR date, "
+            "because LastModified is a wall-clock write time)"
         ),
     ),
 )
+
+
+def _coherence_reference(ctx: "PreflightContext") -> str:
+    """The date an S3 LastModified is compared against.
+
+    ``alpha-engine-config-I8809``: the execution's CALENDAR date, falling back
+    to ``run_date`` for callers that predate the field. Never silently: the two
+    are identical for every caller that has not been through
+    ``NormalizeRunDates``, so the fallback changes no existing answer.
+    """
+    return ctx.calendar_date or ctx.run_date or ""
 
 
 def check_skip_flag_artifact_coherence(ctx: PreflightContext) -> CheckResult:
@@ -1461,7 +1483,7 @@ def check_skip_flag_artifact_coherence(ctx: PreflightContext) -> CheckResult:
             verified.append(f"{pred.flag} (artifact present)")
             continue
 
-        # last_modified_gte_run_date — mirrors CheckPredictorSkipWeightsFresh:
+        # last_modified_gte_calendar_date — mirrors CheckPredictorSkipWeightsFresh:
         # the ISO date part, shape-guarded, compared lexicographically.
         last_modified = head.get("LastModified")
         lm_date = (
@@ -1477,19 +1499,20 @@ def check_skip_flag_artifact_coherence(ctx: PreflightContext) -> CheckResult:
             violations.append(
                 f"{pred.flag}=true but s3://{ctx.bucket}/{key} LastModified "
                 f"parsed as {lm_date!r}, which is not YYYY-MM-DD — cannot "
-                f"compare against run_date {ctx.run_date}"
+                f"compare against calendar_date {_coherence_reference(ctx)}"
             )
             continue
-        if lm_date < ctx.run_date:
+        reference = _coherence_reference(ctx)
+        if lm_date < reference:
             violations.append(
                 f"{pred.flag}=true but s3://{ctx.bucket}/{key} LastModified date "
-                f"{lm_date} < run_date {ctx.run_date} — no completed {pred.stage} "
-                f"for this run_date. Either re-run WITHOUT {pred.flag}, or pass "
+                f"{lm_date} < calendar_date {reference} — no completed {pred.stage} "
+                f"for this cycle. Either re-run WITHOUT {pred.flag}, or pass "
                 f"the ORIGINAL run_date if this is a cross-UTC-midnight recovery "
                 f"rerun (see {pred.sf_guard})"
             )
             continue
-        verified.append(f"{pred.flag} (artifact dated {lm_date} >= {ctx.run_date})")
+        verified.append(f"{pred.flag} (artifact dated {lm_date} >= {reference})")
 
     if violations:
         return CheckResult(

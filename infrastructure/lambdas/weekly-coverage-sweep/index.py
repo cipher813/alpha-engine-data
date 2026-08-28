@@ -68,6 +68,11 @@ OUTCOME_UNAVAILABLE = "unavailable"
 
 def handler(event, _context):
     run_date = (event or {}).get("run_date") or ""
+    # alpha-engine-config-I8809: the LEGACY partition. The sweep unions the
+    # trading-day family (run_date) with the calendar family until the
+    # 2026-09-05 cutover, so one cycle split across both reads as one cycle.
+    # Absent => a single-partition sweep, which is the post-cutover shape.
+    calendar_date = (event or {}).get("calendar_date") or ""
     state_machine_arn = (event or {}).get("state_machine_arn") or ""
     dry_run = bool((event or {}).get("dry_run"))
 
@@ -93,6 +98,7 @@ def handler(event, _context):
         sweep = read_coverage_sweep(
             pipeline=PIPELINE,
             run_date=run_date,
+            calendar_date=calendar_date or None,
             state_machine_arn=state_machine_arn or None,
             bucket=BUCKET,
             s3_client=s3_client,
@@ -130,6 +136,7 @@ def handler(event, _context):
             "outcome": OUTCOME_FINDINGS if sweep.should_alert else OUTCOME_CLEAN,
             "dry_run": True,
             "run_date": run_date,
+            "partitions_read": list(sweep.partitions_read),
             "explanation": explanation,
         }
 
@@ -147,7 +154,15 @@ def handler(event, _context):
         )
         published = True
         if sweep.cycle is not None:
-            augment_marker(sweep.cycle, s3_client=s3_client, bucket=BUCKET)
+            # Both partitions the state machine dual-wrote get the cycle
+            # verdict, or a consumer on the legacy family reads UNKNOWN beside
+            # a known verdict (alpha-engine-config-I8809).
+            augment_marker(
+                sweep.cycle,
+                s3_client=s3_client,
+                bucket=BUCKET,
+                also_dates=sweep.partitions_read,
+            )
             augmented = True
         else:
             logger.warning(
@@ -189,6 +204,8 @@ def handler(event, _context):
     return {
         "outcome": OUTCOME_FINDINGS if sweep.should_alert else OUTCOME_CLEAN,
         "run_date": run_date,
+        "partitions_read": list(sweep.partitions_read),
+        "legacy_partition_rows": sweep.legacy_partition_rows,
         "explanation": explanation,
         "published": published,
         "marker_augmented": augmented,

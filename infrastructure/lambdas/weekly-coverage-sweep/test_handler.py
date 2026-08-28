@@ -66,6 +66,9 @@ def _install_stubs(
     cm = types.ModuleType("nousergon_lib.pipeline_status.completion_marker")
 
     def _read(**kwargs):
+        # alpha-engine-config-I8809: recorded so a test can assert BOTH date
+        # families reach the reader — the whole point of the migration window.
+        calls["read_kwargs"] = kwargs
         if read_raises:
             raise read_raises
         return sweep
@@ -77,6 +80,7 @@ def _install_stubs(
 
     def _augment(*a, **k):
         calls["augmented"] = calls.get("augmented", 0) + 1
+        calls["augment_kwargs"] = k
         if augment_raises:
             raise augment_raises
 
@@ -95,9 +99,24 @@ def _install_stubs(
 
 
 class _Sweep:
-    def __init__(self, *, should_alert: bool, cycle=object()):
+    def __init__(
+        self,
+        *,
+        should_alert: bool,
+        cycle=object(),
+        partitions_read=("2026-08-21", "2026-08-22"),
+        legacy_partition_rows=0,
+    ):
         self.should_alert = should_alert
         self.cycle = cycle
+        # alpha-engine-config-I8809: the sweep now reports which date
+        # partitions it unioned. The handler threads both onto its result and
+        # into augment_marker, so a stub without them makes every outcome
+        # `unavailable` — which is exactly what the real handler does with a
+        # nousergon-lib pin predating the field, and why the pin floor is
+        # asserted in tests/test_weekly_partition_family_contract.py.
+        self.partitions_read = partitions_read
+        self.legacy_partition_rows = legacy_partition_rows
 
     def explain(self):
         return "sweep says so"
@@ -218,3 +237,46 @@ def test_the_handler_never_raises_on_any_stub_failure():
             index.OUTCOME_FINDINGS,
             index.OUTCOME_UNAVAILABLE,
         }
+
+
+# ── alpha-engine-config-I8809 ────────────────────────────────────────────────
+
+
+def test_the_legacy_partition_is_threaded_into_the_reader():
+    index, calls = _install_stubs(sweep=_Sweep(should_alert=False))
+    index.handler(
+        {"run_date": "2026-08-28", "calendar_date": "2026-08-29"}, None
+    )
+    assert calls["read_kwargs"]["run_date"] == "2026-08-28"
+    assert calls["read_kwargs"]["calendar_date"] == "2026-08-29"
+
+
+def test_no_calendar_date_is_a_single_partition_sweep_not_an_error():
+    """The post-cutover shape, and any caller that predates the field."""
+    index, calls = _install_stubs(sweep=_Sweep(should_alert=False))
+    out = index.handler({"run_date": "2026-08-28"}, None)
+    assert out["outcome"] == index.OUTCOME_CLEAN
+    assert calls["read_kwargs"]["calendar_date"] is None
+
+
+def test_the_result_says_which_partitions_it_unioned():
+    index, _ = _install_stubs(
+        sweep=_Sweep(
+            should_alert=False,
+            partitions_read=("2026-08-28", "2026-08-29"),
+            legacy_partition_rows=28,
+        )
+    )
+    out = index.handler(
+        {"run_date": "2026-08-28", "calendar_date": "2026-08-29"}, None
+    )
+    assert out["partitions_read"] == ["2026-08-28", "2026-08-29"]
+    assert out["legacy_partition_rows"] == 28
+
+
+def test_the_marker_is_augmented_in_every_partition_that_was_read():
+    index, calls = _install_stubs(
+        sweep=_Sweep(should_alert=False, partitions_read=("2026-08-28", "2026-08-29"))
+    )
+    index.handler({"run_date": "2026-08-28", "calendar_date": "2026-08-29"}, None)
+    assert calls["augment_kwargs"]["also_dates"] == ("2026-08-28", "2026-08-29")

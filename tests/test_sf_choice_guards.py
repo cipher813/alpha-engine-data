@@ -86,6 +86,13 @@ def _initialize_input_floors(definition: dict) -> set[str]:
     floors = set(json.loads(literal))
     if "run_date" in params:
         floors.add("run_date")
+    # alpha-engine-config-I8809: the same States.Format injection stamps two
+    # more fields on EVERY execution — the immutable calendar date and the
+    # family name saying which of the two $.run_date currently holds. Detected
+    # the same mechanical way as run_date, so this cannot drift from the state.
+    for injected in ("calendar_date", "run_date_family"):
+        if f'"{injected}"' in params:
+            floors.add(injected)
     assert "sns_topic_arn" in floors, "InitializeInput defaults parse failed"
     return floors
 

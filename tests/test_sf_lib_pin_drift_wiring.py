@@ -47,7 +47,12 @@ def test_runs_first_off_initialize_input(sf, states):
     assert sf["StartAt"] == "InitializeInput"
     assert states["InitializeInput"]["Next"] == "CheckWeeklyRunDayGate"
     # config#1824: run-day gate precedes CheckRunMode; bypass Default keeps chain.
-    assert states["CheckWeeklyRunDayGate"]["Default"] == "CheckRunMode"
+    # alpha-engine-config-I8809: NormalizeRunDates now sits between the run-day
+    # gate and CheckRunMode — the graph's ONE date normalization, on every path
+    # that does real work. Its own Next (via ApplyNormalizedRunDate) is CheckRunMode,
+    # so the chain below is unchanged past this hop.
+    assert states["CheckWeeklyRunDayGate"]["Default"] == "NormalizeRunDates"
+    assert states["ApplyNormalizedRunDate"]["Next"] == "CheckRunMode"
     assert states["CheckRunMode"]["Default"] == "CheckSkipLibPinDriftCheck"
 
 

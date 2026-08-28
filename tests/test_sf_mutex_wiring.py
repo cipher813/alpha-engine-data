@@ -286,7 +286,12 @@ class TestMutexWiring:
         # former-first-state, one gate further down.
         assert saturday_sf["States"]["InitializeInput"]["Next"] == "CheckWeeklyRunDayGate"
         # config#1824: run-day gate precedes CheckRunMode; bypass Default keeps chain.
-        assert saturday_sf["States"]["CheckWeeklyRunDayGate"]["Default"] == "CheckRunMode"
+        # alpha-engine-config-I8809: NormalizeRunDates now sits between the run-day
+        # gate and CheckRunMode — the graph's ONE date normalization, on every path
+        # that does real work. Its own Next (via ApplyNormalizedRunDate) is CheckRunMode,
+        # so the chain below is unchanged past this hop.
+        assert saturday_sf["States"]["CheckWeeklyRunDayGate"]["Default"] == "NormalizeRunDates"
+        assert saturday_sf["States"]["ApplyNormalizedRunDate"]["Next"] == "CheckRunMode"
         assert saturday_sf["States"]["CheckRunMode"]["Default"] == "CheckSkipLibPinDriftCheck"
         # config#693: the pipeline-contract preflight gate now sits between
         # LibPinDriftGate and CheckMutexRole (see

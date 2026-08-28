@@ -78,7 +78,18 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # CYCLE (every contributing execution for this run_date), not this one
     # execution — passing an execution arn would invite a handler that reads
     # only its own caller, which is the 1-of-16 reading I8186 is about.
-    "WeeklyCoverageSweep": frozenset({"run_date.$", "dry_run.$", "state_machine_arn.$"}),
+    # alpha-engine-config-I8809: calendar_date is the LEGACY partition. The
+    # sweep unions it with the trading-day family until the 2026-09-05 cutover,
+    # so one cycle split across both reads as one cycle instead of ~28 false
+    # absences. Removed with the fallback at the cutover.
+    "WeeklyCoverageSweep": frozenset(
+        {"run_date.$", "calendar_date.$", "dry_run.$", "state_machine_arn.$"}
+    ),
+    # alpha-engine-config-I8809: the weekly graph's ONE date normalization —
+    # calendar date in, cycle trading day out. Reuses alpha-engine-weekly-preflight
+    # rather than adding a function, because a new Lambda needs an IAM role
+    # bootstrap and that is an operator step a PR cannot perform.
+    "NormalizeRunDates": frozenset({"action", "calendar_date.$"}),
     # L4517: preventive cross-repo lib-pin drift gate (predictor-inference Lambda).
     # alpha-engine-config-I8155: +run_date.$ — the stage-coverage verdict this
     # Lambda writes is keyed on the execution's own run_date, and without it
