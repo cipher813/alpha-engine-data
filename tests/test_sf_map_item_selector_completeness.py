@@ -1,6 +1,6 @@
 """Every JsonPath a Map's ItemProcessor reads must be supplied by its ItemSelector.
 
-alpha-engine-config-I9074. A Map's ItemProcessor runs against the ITEM payload,
+alpha-engine-config-I9077. A Map's ItemProcessor runs against the ITEM payload,
 not the Map's own input, so `$.foo` inside the processor resolves against
 `ItemSelector` output alone. Referencing a field the selector does not pass is a
 `States.Runtime` error raised at execution time -- not at deploy, not in CI, and
