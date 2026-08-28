@@ -166,6 +166,28 @@ class TestImmediatePageOnFirstFailure:
         assert "\n" not in immediate_subject
 
 
+def _through_normalizers(states: dict, name: str) -> str:
+    """Resolve a transition target past any pure-Pass normalizer in front of it.
+
+    alpha-engine-config#5950 inserted floors that sit between an edge and its
+    real destination, flooring the optional fields the destination dereferences.
+    A Pass has no Choices, so it cannot change WHICH destination is reached —
+    walking through it keeps these guards asserting the destination rather than
+    widening them to accept any Pass, which is how a wrong destination would get
+    in behind one.
+    """
+    seen = set()
+    while (
+        name in states
+        and states[name].get("Type") == "Pass"
+        and "Next" in states[name]
+        and name not in seen
+    ):
+        seen.add(name)
+        name = states[name]["Next"]
+    return name
+
+
 class TestExhaustedRetryIsIrreversibleDeadline:
     """Deliverable #2 (terminal half): a SECOND consecutive CaptureSnapshot
     failure is the true irreversible-deadline moment and pages distinctly."""
@@ -188,7 +210,11 @@ class TestExhaustedRetryIsIrreversibleDeadline:
         assert st.get("Catch"), "must carry its own Catch — an SNS-side failure cannot block the hard-fail path"
         for c in st["Catch"]:
             assert c["ErrorEquals"] == ["States.ALL"]
-            assert c["Next"] == "HandleFailure"
+            # config#5950: this Catch sets no ResultPath, so it reached
+            # HandleFailure without the $.error that HandleFailure formats — the
+            # SNS-side failure path died in States.Runtime instead of reporting.
+            # It now passes through the floor; the destination is unchanged.
+            assert _through_normalizers(eod, c["Next"]) == "HandleFailure"
 
     def test_irreversible_message_marks_the_deadline(self, eod):
         subject = eod["PageCaptureSnapshotIrreversibleFailure"]["Parameters"]["Subject"]
@@ -199,10 +225,16 @@ class TestExhaustedRetryIsIrreversibleDeadline:
         assert "$.error" in msg
 
     def test_irreversible_page_reaches_handle_failure_not_fail_open(self, eod):
+        # config#5950: NormalizeEODFailureContext now floors $.error on this
+        # edge, because HandleFailure dereferences it and this edge's ResultPath
+        # writes $.capture_snapshot_irreversible_notify instead. The destination
+        # is unchanged; resolve through the Pass rather than accepting one.
         # UNLIKE the neighboring data-spot retry idiom (deliberately fail-open
         # to ExtractDataSpotError/CheckSkipCaptureSnapshot), CaptureSnapshot's
         # exhausted retry must still hard-fail into HandleFailure -> FailExecution.
-        assert eod["PageCaptureSnapshotIrreversibleFailure"]["Next"] == "HandleFailure"
+        assert _through_normalizers(
+            eod, eod["PageCaptureSnapshotIrreversibleFailure"]["Next"]
+        ) == "HandleFailure"
 
 
 class TestNoSilentFallbackPreserved:
@@ -232,8 +264,13 @@ class TestNoSilentFallbackPreserved:
                    "PageCaptureSnapshotFailureImmediate", "CaptureSnapshotRetryExhausted",
                    "PageCaptureSnapshotIrreversibleFailure", "HandleFailure"}
         for name in new_states:
-            for tgt in _all_targets(eod[name]):
-                assert tgt in allowed, f"{name} -> {tgt} escapes the retry/page machinery unexpectedly"
+            for raw in _all_targets(eod[name]):
+                tgt = _through_normalizers(eod, raw)
+                assert tgt in allowed, (
+                    f"{name} -> {raw}"
+                    + (f" (-> {tgt})" if tgt != raw else "")
+                    + " escapes the retry/page machinery unexpectedly"
+                )
 
 
 if __name__ == "__main__":
