@@ -1099,6 +1099,35 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+  - class: metron_deploy_drift
+    # alpha-engine-config-I8991: metron-deploy-drift.timer (hourly,
+    # metron/api/services/deploy_drift.py::report) correctly detected the box
+    # running code behind origin/main and paged, then nothing acted — the box
+    # stayed undeployed for five hours (2026-08-27) until a human intervened.
+    # This is overseer-policy.md invariant 4's third state (terminates in a
+    # page, carries neither operator_reason nor migration_issue), closed here
+    # by recording the migration_issue. NOT promoted to T1 (see
+    # t1_automations note below): only 2 occurrences with this root cause
+    # (2026-08-02→03, 2026-08-27) are known and §6 requires ≥3 before a
+    # deterministic remediation may be added — this row records the tracked
+    # path to autonomy, not the automation itself.
+    #
+    # KNOWN GAP, flagged rather than silently worked around: metron's
+    # api/services/alerting.py::send_alert hardcodes source="metron" for
+    # every metron in-app alert, so this row's `source` is IDENTICAL to
+    # metron_reconciliation's above — the two classes are indistinguishable
+    # by the wire source the cross-repo drift scanner matches on. This row
+    # exists so the class is nameable in this registry and carries its own
+    # migration_issue per the closes-when in alpha-engine-config-I8991; it
+    # does not fix the underlying source-collision, which needs a metron-side
+    # change (a distinct source string per metron alert type, e.g.
+    # "metron/deploy-drift") that is out of scope for this PR and is not a
+    # mechanical call — filed as alpha-engine-config-I8995 for a ruling.
+    source: "metron"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    migration_issue: alpha-engine-config-I8991
 
   # ── groom (alpha-engine-config emitter) ──
   - class: groom_lifecycle_bus_events
