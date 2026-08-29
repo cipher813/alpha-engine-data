@@ -191,7 +191,18 @@ def test_prices_refresh_uploads_to_both_prefixes(monkeypatch, tmp_path):
 
     recorded: list[tuple[str, str]] = []
 
+    class _NoSuchKey(Exception):
+        pass
+
     class _RecordingS3:
+        # alpha-engine-config-I9256: the refresh now reads the existing parquet
+        # before overwriting it with a short frame, so the double must model a
+        # missing key rather than lacking ``get_object`` entirely.
+        exceptions = type("E", (), {"NoSuchKey": _NoSuchKey})()
+
+        def get_object(self, Bucket, Key):
+            raise _NoSuchKey(Key)
+
         def upload_file(self, _local, bucket, key):
             recorded.append((bucket, key))
 

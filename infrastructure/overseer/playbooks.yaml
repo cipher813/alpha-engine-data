@@ -926,6 +926,39 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+  - class: research_spec_promotion_alerts
+    # alpha-engine-config-I9273 static-chokepoint registration. The scanner
+    # SPEC slot's promotion engine (crucible-research/scoring/spec_promotion.py
+    # ::run_spec_promotion, invoked from lambda/scanner_handler.py immediately
+    # after build_scanner_leaderboard) decides which registered arm of
+    # SCANNER_SPECS ranks the live candidate cut. Same FAIL-SOFT + LOUD shape
+    # as research_cut_promotion_alerts above and for the same reason: a
+    # promotion failure never downgrades the already-written candidates.json
+    # (the pointer keeps naming the standing champion), so this alert is the
+    # ONLY signal that no promote/demote/hold decision was recorded for the
+    # cycle. That matters more here than on the cut slot: before this engine
+    # existed the spec champion moved only by a hand-edit of LIVE_CHAMPION,
+    # which is how alpha-engine-config-I7808 produced four weeks of a
+    # leaderboard scoring an arm against itself. The call site publishes with
+    # explicit severity="ERROR".
+    source: "research:spec_promotion"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    # overseer-policy.md invariant 4 (alpha-engine-config-I8991): a pageable
+    # class is a CLOSED LOOP or a TRACKED GAP, and there is no third state.
+    # This is the tracked gap, deliberately, rather than an operator_reason.
+    # Declaring it page-only-by-design would be a RULING, and two things make
+    # that ruling premature: (1) the identically-shaped twin
+    # research_cut_promotion_alerts is still grandfathered awaiting its own
+    # disposition under I8996, so closing this one would make two rows
+    # disagree about a question they answer identically; (2) the dominant
+    # firing condition — board_defective, a scanner leaderboard reporting
+    # duplicate arm rows — is a characterised producer fault with a durable
+    # artifact to read (config/apply_audit/scanner_spec_champion/{date}.json
+    # is written BEFORE the engine raises), which is playbook-shaped work and
+    # not inherently human-only. I9316 rules both rows together.
+    migration_issue: alpha-engine-config-I9316
   - class: research_weekly_ledger_alerts
     # alpha-engine-config-I8264 static-chokepoint registration. Emitted by
     # crucible-research/lambda/scanner_handler.py after
@@ -970,6 +1003,22 @@ alert_classes:
     response: drain-queue
   - class: research_thinktank_daily_alerts
     source: "research:thinktank_daily"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  # alpha-engine-config-I9282 (crucible-research-PR762). The Think Tank
+  # challenger arm writes its leaderboard evidence
+  # (signals_shadow/thinktank_coverage/{date}/signals.json) ONLY when its
+  # declared coverage window is complete. That skip was reported at INFO and
+  # escalated nowhere, so the arm silently stopped contributing cohort dates on
+  # 2026-08-14 and nothing noticed for two weeks — on the producer leaderboard
+  # it read as a THIN arm rather than a DEAD one. This class carries the
+  # now-loud "arm produced no evidence this cycle" event
+  # (champion-challenger-policy.md §3: a no-output cycle is a MISS, not an
+  # omission). Deduped per trading_day at the call site, so a persistent
+  # outage pages once per cycle rather than once per run.
+  - class: research_thinktank_challenger_selection_alerts
+    source: "thinktank:challenger_selection"
     severities: [warning]
     intake: bus
     response: drain-queue

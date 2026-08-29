@@ -228,8 +228,17 @@ def test_backfill_wraps_macro_writes():
     single-source — and defends against a future writer that adds one.
     """
     assert "macro_lib.write(\"features\", to_arctic_safe(macro_df))" in _BACKFILL_SRC
-    assert "macro_lib.write(key, to_arctic_safe(macro_series_df))" in _BACKFILL_SRC
-    assert "macro_lib.write(key, to_arctic_safe(sector_df))" in _BACKFILL_SRC
+    # alpha-engine-config-I9256: the per-symbol raw-series writes now go through
+    # ``_write_macro_series_no_shrink``, which applies the same
+    # ``to_arctic_safe`` payload AND refuses a write that would truncate the
+    # symbol's history. The Categorical-strip chokepoint is unchanged — the
+    # wrapper is a guard in front of it, not a second write path.
+    assert "_write_macro_series_no_shrink(\n                        macro_lib, key, to_arctic_safe(macro_series_df)\n                    )" in _BACKFILL_SRC
+    assert "_write_macro_series_no_shrink(\n                        macro_lib, key, to_arctic_safe(sector_df)\n                    )" in _BACKFILL_SRC
+    assert "lib.write(symbol, df)" in _BACKFILL_SRC, (
+        "the no-shrink wrapper must still terminate in a single lib.write "
+        "boundary — no second, unguarded macro write path."
+    )
 
 
 # ── to_arctic_canonical chokepoint contract ──────────────────────────────────
