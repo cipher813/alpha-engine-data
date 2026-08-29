@@ -54,6 +54,22 @@ is passed. The import is lazy and best-effort: a missing/broken
 `nousergon_lib` degrades to a logged warning, never to a false "clean"
 exit — the non-zero exit code is always the authoritative signal.
 
+**Paging discipline (alpha-engine-config-I9036).** ``REPO_ROOT`` is derived
+from ``__file__``, so an out-of-band invocation inside a stale checkout
+compares THAT checkout's bytes against live and pages production with
+findings that are entirely local delta — measured 2026-08-29, six ERROR
+findings from a worktree 49 commits behind ``origin/main``, zero real drift.
+Two rules follow, and both are load-bearing:
+
+  * Every page carries the provenance of the "repo" side — ``REPO_ROOT``,
+    ``HEAD``, and the commits-behind count — and leads with the
+    ``stale_checkout_note`` when there is one. A drift page whose repo side
+    is unidentified is unactionable by construction.
+  * ``main()`` REFUSES to page from a checkout whose definition files differ
+    from the remote's DEFAULT branch. The findings still print and the exit
+    code is still 1 — only the page is withheld. Both legitimate callers
+    (deploy-infrastructure.yml, sf-arn-drift-check.yml) run on ``main``.
+
 Usage:
   ./infrastructure/step-functions/check-definition-drift.py               # every codified SF, alerts on drift
   ./infrastructure/step-functions/check-definition-drift.py --name NAME   # one (by SF name)
@@ -74,6 +90,7 @@ real AWS access in CI).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -93,6 +110,10 @@ DEFAULT_ACCOUNT_ID = "711398986525"
 # deploy-infrastructure.sh ($BUCKET) and the CFN DefinitionS3Location keys.
 S3_BUCKET = "alpha-engine-research"
 S3_PREFIX = "infrastructure/"
+
+# Last-resort ref for the staleness comparison when git cannot name the
+# remote's default branch. Never the tracked branch: see default_upstream().
+DEFAULT_UPSTREAM = "origin/main"
 
 # repo definition file -> live state machine name. Mirrors the ARN mapping in
 # deploy-infrastructure.sh step 3. A renamed/removed file or SF fails loud
@@ -220,7 +241,69 @@ def _git(*args: str) -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
-def stale_definition_files(entries) -> list[str]:
+def default_upstream() -> str:
+    """The remote's DEFAULT branch (e.g. ``origin/main``), never the branch
+    this checkout happens to track.
+
+    ``stale_definition_files`` originally resolved ``@{upstream}``, which on a
+    feature branch resolves to that feature branch's own remote ref — so a
+    checkout tens of commits behind ``main`` compares clean against itself and
+    the guard reports nothing. That is the exact configuration that produced a
+    false production page on 2026-08-29 from a worktree 49 commits behind
+    ``origin/main``. When this script is deciding whether it may PAGE, the only
+    meaningful reference is the branch the deployment is built from.
+
+    Falls back to ``DEFAULT_UPSTREAM`` when git cannot answer (a CI checkout
+    does not always carry ``refs/remotes/origin/HEAD``)."""
+    for args in (
+        ("rev-parse", "--abbrev-ref", "origin/HEAD"),
+        ("symbolic-ref", "--short", "refs/remotes/origin/HEAD"),
+    ):
+        ref = _git(*args)
+        if ref and "/" in ref:
+            return ref
+    return DEFAULT_UPSTREAM
+
+
+def repo_provenance(upstream: str | None = None) -> dict:
+    """WHICH bytes this run called "the repo".
+
+    A drift page whose repo side is unidentified is unactionable by
+    construction: the reader cannot tell a live hand-patch from an operator
+    running the checker inside a stale checkout. Every field is best-effort —
+    git may be absent — but an unknown is rendered as the literal string
+    ``unknown``, never omitted, so the page never reads as if the question was
+    not asked."""
+    upstream = upstream or default_upstream()
+    head = _git("rev-parse", "HEAD") or "unknown"
+    behind_raw = _git("rev-list", "--count", f"HEAD..{upstream}")
+    try:
+        behind = int(behind_raw) if behind_raw is not None else None
+    except ValueError:
+        behind = None
+    return {
+        "repo_root": str(REPO_ROOT.resolve()),
+        "head": head,
+        "upstream": upstream,
+        "behind": behind,
+    }
+
+
+def repo_provenance_note(provenance: dict) -> str:
+    """One line naming REPO_ROOT, HEAD and the behind-count. Pure / testable."""
+    behind = provenance.get("behind")
+    behind_txt = (
+        f"{behind} commits behind {provenance['upstream']}"
+        if behind is not None
+        else f"behind-count vs {provenance['upstream']} unknown"
+    )
+    return (
+        f"repo side: {provenance['repo_root']} @ HEAD {provenance['head']} "
+        f"({behind_txt})"
+    )
+
+
+def stale_definition_files(entries, upstream: str | None = None) -> list[str]:
     """Definition files whose WORKING-TREE bytes differ from ``origin/HEAD``'s.
 
     This script's entire premise is "the repo file is the intended truth" — so
@@ -238,14 +321,24 @@ def stale_definition_files(entries) -> list[str]:
     branch's definitions against live before merging is a legitimate use, and
     that case would trip this every time. It annotates instead.
 
+    ``upstream`` names the ref to compare against. ``None`` resolves the
+    tracked remote branch (the legacy annotate-only behaviour); ``main()``
+    always passes :func:`default_upstream` instead, because on a feature
+    branch the tracked ref IS the stale bytes and comparing against it can
+    never detect staleness (alpha-engine-config-I9036, deliverable 4).
+
     Returns repo-relative paths, sorted. Empty when git is unavailable — an
     unknown answer is reported as "no note", never as a false reassurance,
     because ``main()`` prints the note only when this is non-empty."""
     if _git("rev-parse", "--is-inside-work-tree") != "true":
         return []
-    # Resolve the tracked remote branch rather than assuming "origin/main".
-    upstream = (_git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
-                or "origin/main")
+    if upstream is None:
+        # Annotate-only callers keep the historical behaviour: prefer the
+        # tracked remote branch. main() NEVER relies on this — it passes
+        # default_upstream() explicitly, because a tracked feature branch is
+        # exactly the ref that makes a stale checkout look current.
+        upstream = (_git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+                    or DEFAULT_UPSTREAM)
     stale: list[str] = []
     for entry in SF_DEFINITIONS:
         rel = (INFRA_DIR / entry["definition_file"]).relative_to(REPO_ROOT)
@@ -328,7 +421,26 @@ def _check_sf(entry: dict) -> list[str]:
     return findings
 
 
-def _alert_on_drift(total_findings: list[str], *, severity: str = "error") -> None:
+def _dedup_key(total_findings: list[str]) -> str:
+    """Dedup key over the finding CONTENT, not its count.
+
+    ``sf_definition_drift_{len(findings)}`` collapsed every 6-finding
+    condition into one page: an unrelated drift arriving inside the dedup
+    window while a first one was open would have been silently dropped. The
+    count is a property of the alert, never an identity of the condition."""
+    digest = hashlib.sha256(
+        "\n".join(sorted(total_findings)).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"sf_definition_drift_{digest}"
+
+
+def _alert_on_drift(
+    total_findings: list[str],
+    *,
+    severity: str = "error",
+    provenance: dict | None = None,
+    stale_note: str = "",
+) -> None:
     """Best-effort SNS/Telegram page via nousergon_lib.alerts — same
     `alpha-engine-alerts` topic every other drift/preflight alert in this
     repo publishes to (see validators/constituents_drift_check.py). Import
@@ -344,8 +456,17 @@ def _alert_on_drift(total_findings: list[str], *, severity: str = "error") -> No
         )
         return
 
+    # The page must carry WHICH repo bytes produced the findings, and must
+    # lead with the stale-checkout warning when one exists — the guard being
+    # visible on stdout while stripped from the page is what let a stale
+    # worktree page production on 2026-08-29.
+    provenance = provenance if provenance is not None else repo_provenance()
+    header = "" if not stale_note else stale_note + "\n"
     message = (
-        f"SF definition drift detected ({len(total_findings)} finding(s)): "
+        header
+        + f"SF definition drift detected ({len(total_findings)} finding(s)) — "
+        + repo_provenance_note(provenance)
+        + ": "
         + "; ".join(total_findings)
     )
     try:
@@ -353,7 +474,7 @@ def _alert_on_drift(total_findings: list[str], *, severity: str = "error") -> No
             message,
             severity=severity,
             source="alpha-engine-data/infrastructure/step-functions/check-definition-drift.py",
-            dedup_key=f"sf_definition_drift_{len(total_findings)}",
+            dedup_key=_dedup_key(total_findings),
             dedup_window_min=60,
         )
         sys.stderr.write(
@@ -392,17 +513,47 @@ def main() -> int:
         total_findings.extend(_check_sf(entry))
 
     if total_findings:
+        # The paging decision compares against the remote's DEFAULT branch,
+        # never the tracked one — see default_upstream().
+        upstream = default_upstream()
+        provenance = repo_provenance(upstream)
         # Printed BEFORE the findings, so it cannot be missed by someone who
         # reads the first line and starts acting (which is exactly what
         # happened on 2026-07-27).
-        stale = stale_definition_files(entries)
-        if stale:
-            print(stale_checkout_note(stale))
+        stale = stale_definition_files(entries, upstream=upstream)
+        stale_note = stale_checkout_note(stale, upstream=upstream) if stale else ""
+        if stale_note:
+            print(stale_note)
+        print(repo_provenance_note(provenance))
         print(f"SF definition drift detected ({len(total_findings)} finding(s)):")
         for f in total_findings:
             print(f"  - {f}")
-        if not args.no_alert:
-            _alert_on_drift(total_findings)
+        if args.no_alert:
+            return 1
+        if stale:
+            # DELIBERATE NON-PAGE — a refusal, not a swallow. Nothing is
+            # discarded: the findings are on stdout above, the stale note
+            # leads them, and the exit code stays 1, so every caller's
+            # failure signal is intact. What is withheld is the PAGE, because
+            # findings derived from bytes that were never on the default
+            # branch cannot distinguish deployment drift from local staleness
+            # — §2.4's premise ("the repo is the only writer") does not hold
+            # for a checkout that is not the repo's default branch. Both
+            # legitimate callers run on main, so no true positive is lost.
+            # Recording surface: stdout + stderr below, and exit code 1.
+            sys.stderr.write(
+                "REFUSING TO PAGE: findings were produced from a stale "
+                f"checkout ({len(stale)} definition file(s) differ from "
+                f"{upstream}). {repo_provenance_note(provenance)}. "
+                "Exit code 1 stands; re-run from a checkout at "
+                f"{upstream} to page.\n"
+            )
+            print(
+                "REFUSING TO PAGE: stale checkout — see the warning above. "
+                "Exit code 1 stands."
+            )
+            return 1
+        _alert_on_drift(total_findings, provenance=provenance, stale_note=stale_note)
         return 1
 
     sf_names = ", ".join(e["sf_name"] for e in entries)
