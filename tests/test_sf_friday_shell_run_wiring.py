@@ -310,8 +310,13 @@ _DRY_LAMBDA_STATES = {
     # Skip-exception rewire — eval-judge chain + agent-justification triple.
     "EvalJudgeSubmitFirstSaturday": ("dry_run_llm.$", "$.research_dry"),
     "EvalJudgeSubmitWeekly": ("dry_run_llm.$", "$.research_dry"),
-    "EvalJudgePoll": ("dry_run_llm.$", "$.research_dry"),
-    "EvalJudgeProcess": ("dry_run_llm.$", "$.research_dry"),
+    # alpha-engine-config-I9329: EvalJudgePoll no longer exists, and
+    # EvalJudgeProcess is no longer a Lambda — it is an ssm:sendCommand whose
+    # dry path rides $.preflight_args (" --preflight-only") the way every
+    # other SPOT state's does, not a Payload flag. Pinned by
+    # test_eval_judge_process_takes_the_spot_dry_path below, which is the
+    # right guard for its new shape: a dry_run_llm entry here would assert a
+    # Payload key the state does not have.
     "RationaleClustering": ("dry_run_llm.$", "$.research_dry"),
     "ReplayConcordance": ("dry_run_llm.$", "$.research_dry"),
     "Counterfactual": ("dry_run_llm.$", "$.research_dry"),
@@ -1529,3 +1534,23 @@ class TestFridayCronRuleRetired:
         )
         assert "Name: alpha-engine-friday-shell-run" not in cfn_text
         assert "cron(45 20 ? * FRI *)" not in cfn_text
+
+
+def test_eval_judge_process_takes_the_spot_dry_path(sf):
+    """alpha-engine-config-I9329. EvalJudgeProcess moved off Lambda onto a
+    dedicated spot box, so its Friday dry path moved with it: the command
+    string ends in `$.preflight_args`, which InitializeInput seeds as "" and
+    ApplyShellRunDefaults overrides with " --preflight-only" (LEADING space,
+    no literal space in the template) — so the real Saturday command is
+    byte-identical to one with no dry path at all.
+
+    `evals/judge_spot_run.py --preflight-only` boots, imports for real and
+    does one read-only S3 probe, then exits 0. It grades nothing and writes
+    nothing. config#4497 is why that mode is non-optional: two of three split
+    launchers once treated --preflight-only as unrecognized and fell through
+    into real work.
+    """
+    branch_a = sf["States"]["ResearchPredictorParallel"]["Branches"][0]["States"]
+    cmd = branch_a["EvalJudgeProcess"]["Parameters"]["Parameters"]["commands.$"]
+    assert "--bucket alpha-engine-research{}" in cmd
+    assert "$.preflight_args" in cmd

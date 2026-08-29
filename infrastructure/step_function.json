@@ -2056,7 +2056,7 @@
             },
             "EvalJudgeSubmitFirstSaturday": {
               "Type": "Task",
-              "Comment": "Submit phase, monthly Sonnet sweep \u2014 force_sonnet_pass=true. Builds the (artifact \u00d7 judge_model) batch payload covering both Haiku and Sonnet for every mapped artifact, submits as one Anthropic Message Batches API call, and writes the plan manifest to S3 keyed by batch_id. ROADMAP P1 \u00a71642. 50% cost discount per Anthropic's batch contract; structurally bypasses the 15-min Lambda timeout class that nearly fired on the 2026-05-06 manual midweek SF run.",
+              "Comment": "Submit phase, monthly Sonnet sweep \u2014 force_sonnet_pass=true. Builds the (artifact x judge_model) plan covering both tiers for every mapped artifact and writes the plan manifest to S3 keyed by batch_id. ROADMAP P1 \u00a71642. STAYS A LAMBDA under alpha-engine-config-I9329: its work is an S3 listing and a manifest write \u2014 seconds, no LLM call, no ceiling risk \u2014 and it is where the transport rung is resolved and the degradation record written. Moving it to the spot box would buy nothing and cost the stage identity ARTIFACT_REGISTRY and the cost fan-in key off. It no longer submits an Anthropic Message Batches call: the direct Anthropic API is retired (alpha-engine-config-I9263, Brian 2026-08-29), so the plan is judged synchronously through the krepis router by EvalJudgeProcess.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-eval-judge-submit:live",
@@ -2090,11 +2090,11 @@
                 }
               ],
               "ResultPath": "$.eval_judge_submit",
-              "Next": "EvalJudgePollChoice"
+              "Next": "EvalJudgeSubmitOutcome"
             },
             "EvalJudgeSubmitWeekly": {
               "Type": "Task",
-              "Comment": "Submit phase, weekly Haiku-only batch + Sonnet escalation tail in Process. Submits Haiku entries for every mapped artifact in one batch; the Process Lambda runs Sonnet escalations synchronously after Haiku results arrive (typically 1-3 artifacts/run, well under Process's 15-min budget). Preserves the per-artifact <3 escalation gate so weekly cost stays bounded relative to the all-pairs first-Saturday batch.",
+              "Comment": "Submit phase, weekly cadence. Plans one cheap-tier entry per mapped artifact; the escalation tail runs inside EvalJudgeProcess. STAYS A LAMBDA for the reasons on EvalJudgeSubmitFirstSaturday (alpha-engine-config-I9329).",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-eval-judge-submit:live",
@@ -2128,12 +2128,25 @@
                 }
               ],
               "ResultPath": "$.eval_judge_submit",
-              "Next": "EvalJudgePollChoice"
+              "Next": "EvalJudgeSubmitOutcome"
             },
-            "EvalJudgePollChoice": {
+            "EvalJudgeSubmitOutcome": {
               "Type": "Choice",
-              "Comment": "Branch on Submit's processing_status. EMPTY (no captures, or all empty-input skipped client-side) -> route directly to Process so the empty-batch case still emits a clean SF result + downstream metric inputs. ended_sync -> route directly to Process (alpha-engine-config-I9263: the judge took the synchronous rung, so there is no provider batch to poll). OK -> enter the Wait/Poll loop. Anything else (ERROR, missing fields) is fail-soft but NOT silent: it routes through MarkEvalJudgeDegraded, which threads $.research_degraded_local=true and then continues to EvalRollingMean exactly as before. alpha-engine-config-I9058: the Default used to jump straight to EvalRollingMean, so a submit Lambda that SUCCEEDED while returning status=ERROR in its payload bypassed the degraded marker every one of this chain's four Catches goes through. On 2026-08-22 EvalJudgeSubmitWeekly returned status=ERROR (Anthropic 400, credit balance too low), the chain skipped Poll and Process, decision_artifacts/_eval/latest.json was never rewritten, and nothing in the run recorded a degradation -- the only signal was the freshness row going stale five days later.",
+              "Comment": "Branch on Submit's outcome. Replaces EvalJudgePollChoice, which was deleted with the rest of the poll chain (alpha-engine-config-I9329) \u2014 but NOT its fail-soft Default, which is load-bearing and was earned: alpha-engine-config-I9058 records 2026-08-22, when EvalJudgeSubmitWeekly SUCCEEDED while returning status=ERROR in its payload, the chain skipped straight past Process, decision_artifacts/_eval/latest.json was never rewritten, and NOTHING in the run recorded a degradation; the only signal was a freshness row going stale five days later. That Default is preserved verbatim in meaning here. | ORDER MATTERS. The dry branch is FIRST: on the Friday shell run $.research_dry is true and Submit returns the EMPTY sentinel, and we still want the box to boot, import and probe S3 under --preflight-only \u2014 that is the whole point of the keystone, and it is the only path that exercises the new substrate before Saturday. | A REAL EMPTY plan routes to EvalJudgeEmptyPlan instead of to the spot, which is a DELIBERATE deviation from I9329's issue body ('EMPTY continues to route straight to EvalJudgeProcess'): that instruction was written for a Lambda Process that could emit a clean empty result for free. On a spot box the same routing would launch an instance to grade zero artifacts, and judge_spot_run refuses to run without a plan (exit 2), so it would also FAIL the stage. The Pass state emits the identical result shape at no cost. | ended_sync (alpha-engine-config-I9263) and OK both mean 'there is a plan to judge' now that no provider batch exists to poll.",
               "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.research_dry",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.research_dry",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "PrepareEvalJudgeSpotDispatch"
+                },
                 {
                   "And": [
                     {
@@ -2145,7 +2158,7 @@
                       "StringEquals": "EMPTY"
                     }
                   ],
-                  "Next": "EvalJudgeProcess"
+                  "Next": "EvalJudgeEmptyPlan"
                 },
                 {
                   "And": [
@@ -2158,8 +2171,7 @@
                       "StringEquals": "ended_sync"
                     }
                   ],
-                  "Comment": "alpha-engine-config-I9263 (Brian ruling 2026-08-29: the direct Anthropic API is retired). Submit returns processing_status='ended_sync' when no batch-capable route resolved through the router and it took the SYNCHRONOUS judge rung instead. There is no provider-side batch to poll, so route straight to Process, which reads batch_id and plan_s3_key from $.eval_judge_submit.Payload (not from the poll result) and judges every plan entry through the router-addressed evaluate_artifact. Without this branch the run is still CORRECT -- status='OK' enters the Wait/Poll loop and poll_batch reports a 'sync-' id as already terminal -- but it burns a 60s Wait and a Poll invocation to learn something Submit already stated. A shortcut past dead work, never a change of outcome: a submit payload lacking processing_status still reaches the fail-soft Default.",
-                  "Next": "EvalJudgeProcess"
+                  "Next": "PrepareEvalJudgeSpotDispatch"
                 },
                 {
                   "And": [
@@ -2172,39 +2184,64 @@
                       "StringEquals": "OK"
                     }
                   ],
-                  "Comment": "config#2275: IsPresent-guarded so a submit payload WITHOUT status actually reaches the fail-soft Default this state's own comment promises ('missing fields routes to EvalRollingMean') instead of throwing States.Runtime.",
-                  "Next": "EvalJudgePollWait"
+                  "Next": "PrepareEvalJudgeSpotDispatch"
                 }
               ],
               "Default": "MarkEvalJudgeDegraded"
             },
-            "EvalJudgePollWait": {
-              "Type": "Wait",
-              "Comment": "60s pause between batch status polls. Anthropic's docs target sub-1h typical batch latency with 24h hard cap; 60s polls strike a balance between pickup latency and Lambda invocation cost over the typical wait.",
-              "Seconds": 60,
-              "Next": "EvalJudgePoll"
+            "EvalJudgeEmptyPlan": {
+              "Type": "Pass",
+              "Comment": "A plan with nothing in it is a legitimate, non-degraded outcome \u2014 no captures this cycle, or every capture skipped client-side. It is NOT a degradation, so it deliberately does not thread $.research_degraded_local: sf-pipeline-policy.md \u00a72.3a rule 3 wants both polarities SAID, and this says 'the judge ran and there was nothing to grade' rather than leaving the field absent. The result shape mirrors what the stage returns on the real path so EvalRollingMean and the Report Card read one contract.",
+              "Result": {
+                "status": "EMPTY",
+                "graded": 0,
+                "planned": 0,
+                "substrate": "none"
+              },
+              "ResultPath": "$.eval_judge_result",
+              "Next": "EvalRollingMean"
             },
-            "EvalJudgePoll": {
+            "PrepareEvalJudgeSpotDispatch": {
+              "Type": "Pass",
+              "Comment": "Seed the two fields the dispatch/relaunch loop reads, at their first-attempt identity values. Seeding rather than relying on absence is the alpha-engine-config-I7282 convention: $.eval_judge_spot_force_on_demand is referenced by DispatchEvalJudgeSpot's Payload with `.$`, which raises States.Runtime on any path that never set it \u2014 i.e. on exactly the runs that are WORKING \u2014 and a counter that appears only after a relaunch cannot be distinguished from a gate that never ran.",
+              "Parameters": {
+                "merged.$": "States.JsonMerge($,States.StringToJson('{\"eval_judge_spot_force_on_demand\":false,\"eval_judge_spot_relaunches\":0}'),false)"
+              },
+              "OutputPath": "$.merged",
+              "Next": "DispatchEvalJudgeSpot"
+            },
+            "DispatchEvalJudgeSpot": {
               "Type": "Task",
-              "Comment": "Poll phase. Retrieves the submitted batch's processing_status + request_counts + elapsed_seconds. alpha-engine-config-I9263 (2026-08-29): this state no longer calls anthropic.messages.batches.retrieve -- the eval-judge chain was migrated off the direct Anthropic SDK onto the krepis router, and the poll Lambda builds no provider client at all. The synthetic 'empty-' and 'sync-' batch ids are terminal by construction and need none; a real provider batch id would need a router-resolved batch client, which does not exist today (no registry member declares a reachable 'batches' capability). SF Choice that follows branches on processing_status: ended \u2192 Process; in_progress \u2192 loop back to Wait; exceeded_max_wait=true \u2192 fail-soft to EvalRollingMean.",
+              "Comment": "Launch the DEDICATED spot box EvalJudgeProcess runs on, and fire its async bootstrap (alpha-engine-config-I9329). Mirrors DispatchWeeklyFreshnessSpot exactly in shape \u2014 launch, return instance_id + command_id, let the SF poll the bootstrap to Success before any work is sent \u2014 because the Step Function must own the RUN: the judge's outcome is a coverage verdict, and the SSM ResponseCode the SF reads is the only signal that survives before anyone opens a log. | DEDICATED, not the shared launcher: this is NOT a sixth clone on weekly-freshness-spot-dispatcher. crucible-research is not on that box, its volume is sized for four shallow clones plus one venv, and a judge that filled that disk or OOM'd would take down the launcher every other stage in this pipeline addresses through $.ec2_instance_id. | FAIL-SOFT, like every state in this chain: eval is observability (ROADMAP \u00a71635) and must not halt the Saturday pipeline, so the Catch routes through MarkEvalJudgeDegraded. The Lambda itself is fail-LOUD and raises; the softness is here, once, where a reader can see it. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day; $.run_date is the cycle's trading day from NormalizeRunDates. It keys no artifact here \u2014 its only use is the box's `run-date` cost-attribution tag (config#5504) \u2014 but it must still be the trading day, because it is the SAME value EvalJudgeProcess passes to judge_spot_run as --date, and a launcher tagged with one date while the run it launched grades another puts the cycle's EC2 cost under a partition holding none of its evals.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
-                "FunctionName": "alpha-engine-research-eval-judge-poll:live",
+                "FunctionName": "alpha-engine-research-eval-judge-spot-dispatcher",
                 "Payload": {
-                  "batch_id.$": "$.eval_judge_submit.Payload.batch_id",
-                  "submit_iso.$": "$.eval_cadence.submit_iso",
-                  "max_wait_seconds": 21600,
-                  "dry_run_llm.$": "$.research_dry"
+                  "execution_id.$": "$$.Execution.Id",
+                  "run_date.$": "$.run_date",
+                  "pipeline_role": "weekly-eval-judge",
+                  "force_on_demand.$": "$.eval_judge_spot_force_on_demand"
                 }
               },
-              "TimeoutSeconds": 60,
+              "TimeoutSeconds": 540,
               "Retry": [
                 {
                   "ErrorEquals": [
                     "Lambda.ServiceException",
-                    "Lambda.TooManyRequestsException"
+                    "Lambda.TooManyRequestsException",
+                    "Lambda.SdkClientException"
                   ],
                   "MaxAttempts": 2,
+                  "IntervalSeconds": 15,
+                  "BackoffRate": 2.0
+                },
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed",
+                    "States.Timeout"
+                  ],
+                  "Comment": "The launch itself (spot capacity rotation, SSM-online wait) can transiently fail the way any other spot dispatch in this fleet does \u2014 one backed-off retry before the fail-soft Catch.",
+                  "MaxAttempts": 1,
                   "IntervalSeconds": 30,
                   "BackoffRate": 2.0
                 }
@@ -2214,95 +2251,62 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "A poll-level failure is recoverable \u2014 Anthropic retains batch results 29 days, so a transient poll Lambda failure can be re-run by a human if needed. Route through MarkEvalJudgeDegraded then EvalRollingMean so the rest of the pipeline isn't blocked. alpha-engine-config#6722.",
+                  "Comment": "alpha-engine-config#6722: routes through MarkEvalJudgeDegraded so the run RECORDS that the judge produced nothing, then continues to EvalRollingMean against historical data.",
                   "Next": "MarkEvalJudgeDegraded",
                   "ResultPath": "$.eval_judge_error"
                 }
               ],
-              "ResultPath": "$.eval_judge_poll",
-              "Next": "EvalJudgePollDecision"
-            },
-            "EvalJudgePollDecision": {
-              "Type": "Choice",
-              "Comment": "Branch on poll status. processing_status='ended' -> run Process. exceeded_max_wait=true -> fail-soft, and a malformed payload (neither field present) likewise. Anything else -> loop back to Wait. Includes the synthetic 'ended_empty' status (Submit short-circuited an empty plan) so the empty case still hits Process. alpha-engine-config-I9058: both fail-soft exits now go through MarkEvalJudgeDegraded rather than straight to EvalRollingMean -- same continuation, but the run records that the judge produced nothing. A batch abandoned at the 6h cap and a batch that was never submitted are both degradations; only the Catch paths said so.",
-              "Choices": [
-                {
-                  "And": [
-                    {
-                      "Variable": "$.eval_judge_poll.Payload.processing_status",
-                      "IsPresent": true
-                    },
-                    {
-                      "Or": [
-                        {
-                          "Variable": "$.eval_judge_poll.Payload.processing_status",
-                          "StringEquals": "ended"
-                        },
-                        {
-                          "Variable": "$.eval_judge_poll.Payload.processing_status",
-                          "StringEquals": "ended_empty"
-                        }
-                      ]
-                    }
-                  ],
-                  "Next": "EvalJudgeProcess"
-                },
-                {
-                  "And": [
-                    {
-                      "Variable": "$.eval_judge_poll.Payload.exceeded_max_wait",
-                      "IsPresent": true
-                    },
-                    {
-                      "Variable": "$.eval_judge_poll.Payload.exceeded_max_wait",
-                      "BooleanEquals": true
-                    }
-                  ],
-                  "Next": "MarkEvalJudgeDegraded"
-                },
-                {
-                  "And": [
-                    {
-                      "Not": {
-                        "Variable": "$.eval_judge_poll.Payload.processing_status",
-                        "IsPresent": true
-                      }
-                    },
-                    {
-                      "Not": {
-                        "Variable": "$.eval_judge_poll.Payload.exceeded_max_wait",
-                        "IsPresent": true
-                      }
-                    }
-                  ],
-                  "Comment": "config#2275: a poll payload carrying NEITHER processing_status NOR exceeded_max_wait is malformed \u2014 fail-soft via MarkEvalJudgeDegraded to EvalRollingMean (eval is observability; mirrors this state's Catch posture) instead of States.Runtime, and instead of looping in Wait until the global ceiling.",
-                  "Next": "MarkEvalJudgeDegraded"
-                }
-              ],
-              "Default": "EvalJudgePollWait"
-            },
-            "EvalJudgeProcess": {
-              "Type": "Task",
-              "Comment": "Process phase. Streams the completed batch's results, parses each via the existing RubricEvalLLMOutput schema, persists per-artifact eval JSONs to decision_artifacts/_eval/{date}/, emits CW metrics under AlphaEngine/Eval, and runs the small synchronous Sonnet-escalation tail for any Haiku result that flagged a borderline dimension. Returns OK/PARTIAL/ERROR mirroring the legacy single-Lambda contract \u2014 no consumer (RationaleClustering, EvalRollingMean, dashboard) changes.",
-              "Resource": "arn:aws:states:::lambda:invoke",
-              "Parameters": {
-                "FunctionName": "alpha-engine-research-eval-judge-process:live",
-                "Payload": {
-                  "batch_id.$": "$.eval_judge_submit.Payload.batch_id",
-                  "plan_s3_key.$": "$.eval_judge_submit.Payload.plan_s3_key",
-                  "dry_run_llm.$": "$.research_dry"
-                }
+              "ResultSelector": {
+                "instance_id.$": "$.Payload.instance_id",
+                "market.$": "$.Payload.market",
+                "command_id.$": "$.Payload.command_id",
+                "run_token.$": "$.Payload.run_token"
               },
-              "TimeoutSeconds": 960,
+              "ResultPath": "$.eval_judge_spot_result",
+              "Next": "MergeEvalJudgeSpotInstanceId"
+            },
+            "MergeEvalJudgeSpotInstanceId": {
+              "Type": "Pass",
+              "Comment": "Thread the launched instance into $.eval_judge_instance_id as a one-element ARRAY, because ssm:sendCommand's InstanceIds takes a list and getCommandInvocation's InstanceId takes a scalar \u2014 the same asymmetry $.ec2_instance_id carries. Deliberately a SEPARATE field from $.ec2_instance_id: that one is the shared weekly launcher, and writing over it here would silently repoint thirteen other stages at the judge box.",
+              "Parameters": {
+                "merged.$": "States.JsonMerge($, States.StringToJson(States.Format('\\{\"eval_judge_instance_id\":[\"{}\"]\\}', $.eval_judge_spot_result.instance_id)), false)"
+              },
+              "OutputPath": "$.merged",
+              "Next": "InitEvalJudgeSpotBootstrapPollCount"
+            },
+            "InitEvalJudgeSpotBootstrapPollCount": {
+              "Type": "Pass",
+              "Comment": "Poll-iteration budget seed. Cap=72 = ceil(1800s bootstrap executionTimeout / 30s wait) x 1.2 slack, matching the RAGIngestion/DataPhase2 precedent (alpha-engine-config-I5687).",
+              "Result": 0,
+              "ResultPath": "$.eval_judge_bootstrap_polls",
+              "Next": "WaitForEvalJudgeSpotBootstrap"
+            },
+            "WaitForEvalJudgeSpotBootstrap": {
+              "Type": "Task",
+              "Comment": "Poll the bootstrap SSM command until terminal. Nothing may be sent to the box before this reaches Success \u2014 the venv, the private prompts and the router env file do not exist until it does.",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+              "Parameters": {
+                "CommandId.$": "$.eval_judge_spot_result.command_id",
+                "InstanceId.$": "$.eval_judge_instance_id[0]"
+              },
               "Retry": [
                 {
                   "ErrorEquals": [
-                    "Lambda.ServiceException",
-                    "Lambda.TooManyRequestsException"
+                    "Ssm.InvocationDoesNotExistException",
+                    "Ssm.InvocationDoesNotExist"
                   ],
-                  "MaxAttempts": 1,
-                  "IntervalSeconds": 60,
-                  "BackoffRate": 1.0
+                  "MaxAttempts": 10,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 1.5
+                },
+                {
+                  "ErrorEquals": [
+                    "Ssm.SdkClientException",
+                    "States.Timeout"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 5,
+                  "BackoffRate": 1.5
                 }
               ],
               "Catch": [
@@ -2310,17 +2314,344 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Eval is observability \u2014 Process failures must NOT halt the pipeline. Routes through MarkEvalJudgeDegraded then EvalRollingMean, which still runs against historical data. alpha-engine-config#6722.",
                   "Next": "MarkEvalJudgeDegraded",
                   "ResultPath": "$.eval_judge_error"
                 }
               ],
-              "ResultPath": "$.eval_judge_result",
-              "Next": "EvalRollingMean"
+              "ResultSelector": {
+                "Status.$": "$.Status",
+                "ResponseCode.$": "$.ResponseCode",
+                "StatusDetails.$": "$.StatusDetails",
+                "StandardErrorContent.$": "$.StandardErrorContent"
+              },
+              "ResultPath": "$.eval_judge_bootstrap_poll",
+              "Next": "CheckEvalJudgeSpotBootstrapStatus"
+            },
+            "CheckEvalJudgeSpotBootstrapStatus": {
+              "Type": "Choice",
+              "Comment": "[poll budget cap=72 via $.eval_judge_bootstrap_polls; budget exhaustion falls through to the liveness-branched Default]",
+              "Choices": [
+                {
+                  "Variable": "$.eval_judge_bootstrap_poll.Status",
+                  "StringEquals": "Success",
+                  "Next": "EvalJudgeProcess"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.eval_judge_bootstrap_polls",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.eval_judge_bootstrap_poll.Status",
+                          "StringEquals": "InProgress"
+                        },
+                        {
+                          "Variable": "$.eval_judge_bootstrap_poll.Status",
+                          "StringEquals": "Pending"
+                        }
+                      ]
+                    },
+                    {
+                      "Variable": "$.eval_judge_bootstrap_polls",
+                      "NumericLessThan": 72
+                    }
+                  ],
+                  "Next": "EvalJudgeSpotBootstrapWait"
+                }
+              ],
+              "Default": "EvalJudgeSpotBootstrapLivenessGate"
+            },
+            "EvalJudgeSpotBootstrapWait": {
+              "Type": "Pass",
+              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget above actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
+              "Parameters": {
+                "polls.$": "States.MathAdd($.eval_judge_bootstrap_polls, 1)"
+              },
+              "ResultPath": "$.eval_judge_bootstrap_poll_count",
+              "Next": "EvalJudgeSpotBootstrapPollWait"
+            },
+            "EvalJudgeSpotBootstrapPollWait": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "MergeEvalJudgeSpotBootstrapPollCount"
+            },
+            "MergeEvalJudgeSpotBootstrapPollCount": {
+              "Type": "Pass",
+              "InputPath": "$.eval_judge_bootstrap_poll_count.polls",
+              "ResultPath": "$.eval_judge_bootstrap_polls",
+              "Next": "WaitForEvalJudgeSpotBootstrap"
+            },
+            "EvalJudgeSpotBootstrapLivenessGate": {
+              "Type": "Choice",
+              "Comment": "Liveness branch, mirroring RAGIngestionRetryGate (config#5688) with one inversion that matters. There the substrate is the SHARED launcher, so a relaunch would fix one symptom of a pipeline-wide loss and the gate fails fast. HERE the box is DEDICATED and EPHEMERAL, so a spot reclaim is a recoverable event with no blast radius outside this stage \u2014 and coverage is now a HARD failure (Brian, 2026-08-29), so losing the box must not lose the week's evals. SUBSTRATE LOST (StatusDetails Undeliverable/Terminated) with the relaunch unspent => launch a FRESH box. Anything else \u2014 a bootstrap that genuinely failed on a live instance, or an exhausted poll budget \u2014 is a provisioning defect that a second identical box would reproduce, so it goes to the degraded path rather than spending money twice to learn the same thing. | NAMED *LivenessGate, not *RetryGate, and the distinction is the contract not the spelling: a *RetryGate RE-ISSUES the same command to the SAME instance id, which config#5688 proved is a guaranteed no-op once the box is gone. This gate never re-issues. It either LAUNCHES A NEW BOX (the substrate was lost, and the box is dedicated and ephemeral, so a fresh one is the only thing that can help) or gives up. tests/test_sf_retrygate_liveness_branch.py enforces the re-issue contract on *RetryGate names and deliberately excludes this family.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.eval_judge_bootstrap_poll.StatusDetails",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.eval_judge_bootstrap_poll.StatusDetails",
+                          "StringEquals": "Undeliverable"
+                        },
+                        {
+                          "Variable": "$.eval_judge_bootstrap_poll.StatusDetails",
+                          "StringEquals": "Terminated"
+                        }
+                      ]
+                    },
+                    {
+                      "Variable": "$.eval_judge_spot_relaunches",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.eval_judge_spot_relaunches",
+                      "NumericLessThan": 1
+                    }
+                  ],
+                  "Next": "EvalJudgeSpotRelaunch"
+                }
+              ],
+              "Default": "ExtractEvalJudgeSpotBootstrapError"
+            },
+            "ExtractEvalJudgeSpotBootstrapError": {
+              "Type": "Pass",
+              "Comment": "Normalize a non-Success bootstrap poll into $.eval_judge_error. Mirrors ExtractRAGIngestionError: the soft-failure path out of a Choice Default does not populate an error field, only a Task Catch does, so without this the degraded notification would name no phase at all.",
+              "Parameters": {
+                "phase": "EvalJudgeSpotBootstrap",
+                "source": "CheckEvalJudgeSpotBootstrapStatus.Default",
+                "poll.$": "$.eval_judge_bootstrap_poll"
+              },
+              "ResultPath": "$.eval_judge_error",
+              "Next": "MarkEvalJudgeDegraded"
+            },
+            "EvalJudgeSpotRelaunch": {
+              "Type": "Pass",
+              "Comment": "Spend the ONE bounded relaunch and go back for a fresh box, ON DEMAND. force_on_demand=true because re-entering the pool that just reclaimed the box is how a recovery spends its single retry on the same failure (alpha-engine-config-I7119's reasoning, same shape). The judge is idempotent over the plan \u2014 every artifact is graded from the same manifest and persisted under the same key \u2014 so a relaunch re-grades rather than double-counts, and the coverage ledger is rebuilt from the plan on the new box.",
+              "Parameters": {
+                "merged.$": "States.JsonMerge($,States.StringToJson('{\"eval_judge_spot_force_on_demand\":true,\"eval_judge_spot_relaunches\":1}'),false)"
+              },
+              "OutputPath": "$.merged",
+              "Next": "DispatchEvalJudgeSpot"
+            },
+            "EvalJudgeProcess": {
+              "Type": "Task",
+              "Comment": "Process phase \u2014 the judge, run to completion on a dedicated EC2 spot box (alpha-engine-config-I9329, following -I9309). Brian, 2026-08-29: 'perhaps if the lambda times out then we need to put the judge on a spot instance', and 'ok lets keep 100% coverage and move to spot'. | WHAT WAS WRONG: this state ran as a Lambda under a 960s ceiling against a 900s function. At the measured 45-105s per synchronous judge call it covered roughly 8-15 of an ~83-artifact corpus, reported complete=False honestly, and returned SUCCESS \u2014 honest reporting on a successful stage, the anti-pattern Brian named on 2026-08-14 about the Director, because it makes a capacity regression survivable instead of visible. | THE NAME IS LOAD-BEARING and is why the substrate changed while the state did not: eval_artifact_latest.produced_by names EvalJudgeProcess, AggregateCosts.required_producers keys on it, and the stage-coverage registry has a row for it. All three statements stay true \u2014 the stage still produces exactly what they say it does. | COVERAGE IS A VERDICT: evals.judge_coverage.enforce_coverage compares planned against graded and raises on any gap; judge_spot_run exits 3, which fails the SSM command, which fails THIS STAGE. That is the intended and sufficient escalation \u2014 the STAGE fails, the RUN does not, because eval is observability (ROADMAP \u00a71635) and the Catch still converges on MarkEvalJudgeDegraded. | TIMEOUT ORDERING: executionTimeout (10800) must be STRICTLY BELOW TimeoutSeconds (10860) \u2014 the inverse of the lambda:invoke rule. Inverted, the state abandons a command SF cannot cancel, so the stage fails with a bare States.Timeout naming nothing while the spot keeps billing (alpha-engine-config-I6948, enforced by tests/test_sf_lambda_timeout_ordering.py). 10800s is budgeted from the MEASURED 83 artifacts x 45-105s = 60-145 min serial, with headroom for corpus growth; it is a budget, not an accommodation. | TEARDOWN: the EXIT trap arms a 120s systemd timer that powers the box off on EVERY exit path, success or failure. The delay is what lets SSM report the terminal status to this SF before the instance disappears \u2014 an immediate shutdown would race the ResponseCode this state reads. The dispatcher's watchdog and the fleet orphan-reaper remain the backstops; neither is on the happy path. | ROUTER: the box sources /home/ec2-user/eval-judge.env, written by the dispatcher, so KREPIS_EXEC_CONTEXT=ec2 and the ROUTER_CONSUMER_RESEARCH credential are present in THIS shell \u2014 a separate SSM command is a separate environment, and an export that lived only in the bootstrap would leave judge_exec_context() answering 'lambda' from a spot box. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day; $.run_date is the cycle's trading day from NormalizeRunDates, which is what every eval prefix and the stage-coverage verdict key off.",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+              "Parameters": {
+                "DocumentName": "AWS-RunShellScript",
+                "InstanceIds.$": "$.eval_judge_instance_id",
+                "Parameters": {
+                  "commands.$": "States.Array('set -eo pipefail','export HOME=/home/ec2-user','trap \"systemd-run --on-active=120 --unit=eval-judge-spot-teardown /sbin/shutdown -h now >/dev/null 2>&1 || true\" EXIT','set -a','. /home/ec2-user/eval-judge.env','set +a','cd /home/ec2-user/crucible-research',States.Format('/home/ec2-user/crucible-research/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug eval-judge --log /var/log/eval-judge.log -- /home/ec2-user/crucible-research/.venv/bin/python -m evals.judge_spot_run --date {} --batch-id {} --plan-s3-key {} --bucket alpha-engine-research{}',$$.Execution.Name,$.run_date,$.eval_judge_submit.Payload.batch_id,$.eval_judge_submit.Payload.plan_s3_key,$.preflight_args))",
+                  "executionTimeout": [
+                    "10800"
+                  ]
+                },
+                "TimeoutSeconds": 3600
+              },
+              "TimeoutSeconds": 10860,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed",
+                    "States.Timeout"
+                  ],
+                  "MaxAttempts": 4,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                },
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Eval is observability \u2014 a Process failure must NOT halt the pipeline. Routes through MarkEvalJudgeDegraded then EvalRollingMean, which still runs against historical data. alpha-engine-config#6722.",
+                  "Next": "MarkEvalJudgeDegraded",
+                  "ResultPath": "$.eval_judge_error"
+                }
+              ],
+              "ResultPath": "$.eval_judge_process_result",
+              "Next": "InitEvalJudgeProcessPollCount"
+            },
+            "InitEvalJudgeProcessPollCount": {
+              "Type": "Pass",
+              "Comment": "Poll-iteration budget seed. Cap=432 = ceil(10800s executionTimeout / 30s wait) x 1.2 slack, matching the RAGIngestion/DataPhase2 precedent (alpha-engine-config-I5687).",
+              "Result": 0,
+              "ResultPath": "$.eval_judge_process_polls",
+              "Next": "WaitForEvalJudgeProcess"
+            },
+            "WaitForEvalJudgeProcess": {
+              "Type": "Task",
+              "Comment": "Poll the judge's SSM command until terminal. ResponseCode 3 is judge_spot_run's coverage-shortfall exit, distinct from a crash \u2014 a crash is a defect in the judge, an under-covered sweep is capacity or an upstream producer, and they need different first moves.",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+              "Parameters": {
+                "CommandId.$": "$.eval_judge_process_result.Command.CommandId",
+                "InstanceId.$": "$.eval_judge_instance_id[0]"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Ssm.InvocationDoesNotExistException",
+                    "Ssm.InvocationDoesNotExist"
+                  ],
+                  "MaxAttempts": 10,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 1.5
+                },
+                {
+                  "ErrorEquals": [
+                    "Ssm.SdkClientException",
+                    "States.Timeout"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 5,
+                  "BackoffRate": 1.5
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "MarkEvalJudgeDegraded",
+                  "ResultPath": "$.eval_judge_error"
+                }
+              ],
+              "ResultSelector": {
+                "Status.$": "$.Status",
+                "ResponseCode.$": "$.ResponseCode",
+                "StatusDetails.$": "$.StatusDetails",
+                "StandardErrorContent.$": "$.StandardErrorContent"
+              },
+              "ResultPath": "$.eval_judge_process_poll",
+              "Next": "CheckEvalJudgeProcessStatus"
+            },
+            "CheckEvalJudgeProcessStatus": {
+              "Type": "Choice",
+              "Comment": "[poll budget cap=432 via $.eval_judge_process_polls; budget exhaustion falls through to the liveness-branched Default]",
+              "Choices": [
+                {
+                  "Variable": "$.eval_judge_process_poll.Status",
+                  "StringEquals": "Success",
+                  "Next": "EvalRollingMean"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.eval_judge_process_polls",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.eval_judge_process_poll.Status",
+                          "StringEquals": "InProgress"
+                        },
+                        {
+                          "Variable": "$.eval_judge_process_poll.Status",
+                          "StringEquals": "Pending"
+                        }
+                      ]
+                    },
+                    {
+                      "Variable": "$.eval_judge_process_polls",
+                      "NumericLessThan": 432
+                    }
+                  ],
+                  "Next": "EvalJudgeProcessWait"
+                }
+              ],
+              "Default": "EvalJudgeProcessLivenessGate"
+            },
+            "EvalJudgeProcessWait": {
+              "Type": "Pass",
+              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget above actually advances.",
+              "Parameters": {
+                "polls.$": "States.MathAdd($.eval_judge_process_polls, 1)"
+              },
+              "ResultPath": "$.eval_judge_process_poll_count",
+              "Next": "EvalJudgeProcessPollWait"
+            },
+            "EvalJudgeProcessPollWait": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "MergeEvalJudgeProcessPollCount"
+            },
+            "MergeEvalJudgeProcessPollCount": {
+              "Type": "Pass",
+              "InputPath": "$.eval_judge_process_poll_count.polls",
+              "ResultPath": "$.eval_judge_process_polls",
+              "Next": "WaitForEvalJudgeProcess"
+            },
+            "EvalJudgeProcessLivenessGate": {
+              "Type": "Choice",
+              "Comment": "The reclaim gate, and the reason interruptible compute is safe here. A spot reclaim mid-run is the failure mode this substrate is MOST exposed to \u2014 the run is 60-145 minutes long \u2014 and coverage is a HARD failure, so a silent loss of the box would be a silent loss of the week's evals. SUBSTRATE LOST (StatusDetails Undeliverable/Terminated) with the relaunch unspent => launch a FRESH box on demand and re-run the plan from the start. That is safe because the run is IDEMPOTENT over the plan manifest: every artifact is graded from the same manifest and persisted under the same key, and the coverage ledger is rebuilt from the plan rather than accumulated across attempts. | A WORKLOAD failure is deliberately NOT retried: a coverage shortfall (ResponseCode 3) is a real, actionable verdict, and re-grading the same corpus on a second box would spend money to reproduce it. | NAMED *LivenessGate, not *RetryGate, and the distinction is the contract not the spelling: a *RetryGate RE-ISSUES the same command to the SAME instance id, which config#5688 proved is a guaranteed no-op once the box is gone. This gate never re-issues. It either LAUNCHES A NEW BOX (the substrate was lost, and the box is dedicated and ephemeral, so a fresh one is the only thing that can help) or gives up. tests/test_sf_retrygate_liveness_branch.py enforces the re-issue contract on *RetryGate names and deliberately excludes this family.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.eval_judge_process_poll.StatusDetails",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.eval_judge_process_poll.StatusDetails",
+                          "StringEquals": "Undeliverable"
+                        },
+                        {
+                          "Variable": "$.eval_judge_process_poll.StatusDetails",
+                          "StringEquals": "Terminated"
+                        }
+                      ]
+                    },
+                    {
+                      "Variable": "$.eval_judge_spot_relaunches",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.eval_judge_spot_relaunches",
+                      "NumericLessThan": 1
+                    }
+                  ],
+                  "Next": "EvalJudgeSpotRelaunch"
+                }
+              ],
+              "Default": "ExtractEvalJudgeProcessError"
+            },
+            "ExtractEvalJudgeProcessError": {
+              "Type": "Pass",
+              "Comment": "Normalize a non-Success judge poll into $.eval_judge_error so the degraded notification names the phase and carries the SSM StatusDetails/StandardErrorContent. A Choice Default populates no error field on its own.",
+              "Parameters": {
+                "phase": "EvalJudgeProcess",
+                "source": "CheckEvalJudgeProcessStatus.Default",
+                "poll.$": "$.eval_judge_process_poll"
+              },
+              "ResultPath": "$.eval_judge_error",
+              "Next": "MarkEvalJudgeDegraded"
             },
             "MarkEvalJudgeDegraded": {
               "Type": "Pass",
-              "Comment": "alpha-engine-config#6722: shared convergence for the eval-judge chain's four fail-open Catches (EvalJudgeSubmitFirstSaturday/EvalJudgeSubmitWeekly/EvalJudgePoll/EvalJudgeProcess all previously converged directly on EvalRollingMean with no degraded flag). Threads $.research_degraded_local=true without changing the continuation.",
+              "Comment": "alpha-engine-config#6722: shared convergence for every fail-open exit of the eval-judge chain \u2014 the two Submit Catches, the EvalJudgeSubmitOutcome Default (alpha-engine-config-I9058), the spot dispatch/bootstrap/process Catches and the two liveness gates' Defaults. Threads $.research_degraded_local=true without changing the continuation. Under alpha-engine-config-I9329 the set of arrivals grew from four to eight and now includes SUBSTRATE loss, which is why each arrival first passes through an Extract* state that names its phase: 'the box was reclaimed' and 'the judge under-covered the corpus' are different incidents and must not reach the notifier as one.",
               "Result": true,
               "ResultPath": "$.research_degraded_local",
               "Next": "EvalRollingMean"
@@ -6498,7 +6829,7 @@
                 "single-agent-quant"
               ],
               "EvalJudgeProcess": [
-                "evaljudge-batch"
+                "evaljudge-sync"
               ],
               "ReplayConcordance": [
                 "replay-concordance"
@@ -6509,7 +6840,7 @@
             },
             "conditional_producers": {
               "EvalJudgeProcess": [
-                "evaljudge-sync"
+                "evaljudge-batch"
               ],
               "Director": [
                 "director-retro-judge"

@@ -643,7 +643,12 @@ def test_the_weekday_case_end_to_end_zero_failures_and_no_page(tmp_path):
     # alpha-engine-config-I7267: +2 (PitParityLookaheadResourceKillCheck,
     # PitParityWalkforwardResourceKillCheck), both acknowledged no-dry-path
     # stages in infrastructure/preflight_sweep_manifest.json.
-    assert len(report.results) == report.stages_declared == 21
+    # alpha-engine-config-I9329: +1 (ResearchPredictorParallel.EvalJudgeProcess)
+    # — the eval-judge cutover turned that state into an ssm:sendCommand stage
+    # that threads $.preflight_args, so the denominator GREW. This tripwire
+    # firing on a stage addition is the tripwire working: a new stage must be
+    # picked up automatically or fail, never counted silently.
+    assert len(report.results) == report.stages_declared == 22
     # It does not page and it does not claim a clean run.
     assert report.outcome == ps.OUTCOME_DEGRADED
     ps.emit(report, aws, "arn:sns")

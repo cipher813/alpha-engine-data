@@ -269,20 +269,35 @@ class TestKnownProducersStayDeclared:
             "single-agent-quant"
         ]
 
-    def test_eval_judge_batch_is_required(self, coverage):
-        """The Anthropic Batches carve-out (`model-router-policy` §4) means
-        this spend has no router client to emit at, so EvalJudgeProcess
-        emits it at batch decode. It is still required."""
+    def test_eval_judge_sync_is_required(self, coverage):
+        """alpha-engine-config-I9329 — a LIVE defect this cutover had to fix,
+        independently true of the substrate swap.
+
+        `evaljudge-batch` was declared REQUIRED, and the batch rung it names
+        was retired by alpha-engine-config-I9263 (Brian, 2026-08-29: "at this
+        point we shouldn't be using the anthropic api at all"). A producer
+        that can never be emitted, demanded on every run, fails the weekly
+        fan-in coverage check EVERY WEEK — turning the judge's success into a
+        pipeline degradation, which is the exact cry-wolf shape the
+        conditional/required split exists to prevent.
+
+        The two swap. Every judged artifact now goes through the router-
+        addressed synchronous rung, so `evaljudge-sync` is the producer whose
+        ABSENCE means the stage did not run.
+        """
         assert coverage["required_producers"]["EvalJudgeProcess"] == [
-            "evaljudge-batch"
+            "evaljudge-sync"
         ]
 
-    def test_eval_judge_sync_escalation_is_conditional_not_required(self, coverage):
-        """The parse-retry / Sonnet-escalation tail genuinely does not fire
-        on every run. Requiring it would make the detector cry wolf, and a
-        detector that cries wolf is turned off."""
+    def test_eval_judge_batch_is_allowed_but_never_required(self, coverage):
+        """Kept as CONDITIONAL rather than deleted, deliberately. Deleting it
+        would make a `evaljudge-batch` row arriving from a replay of an
+        archived plan read as a present-but-undeclared producer and fail the
+        check; conditional says "this may appear and that is fine", which is
+        the true statement about a retired rung whose historical artifacts
+        still exist."""
         assert coverage["conditional_producers"]["EvalJudgeProcess"] == [
-            "evaljudge-sync"
+            "evaljudge-batch"
         ]
 
     def test_director_plan_is_required(self, coverage):

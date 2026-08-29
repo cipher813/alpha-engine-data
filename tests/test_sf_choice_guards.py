@@ -320,10 +320,13 @@ def _choice_target(definition: dict, choice_name: str, data) -> str:
         # routes straight to EvalRollingMean is indistinguishable from a clean
         # one, which is how the 2026-08-22 weekly run skipped the judge and
         # reported nothing.
-        ("EvalJudgePollChoice", {"eval_judge_submit": {"Payload": {}}},
+        # alpha-engine-config-I9329 renamed this Choice EvalJudgeSubmitOutcome
+        # when the four EvalJudgePoll* states were deleted with the provider
+        # batch API they existed to drive. The Default is the part that
+        # mattered and it is unchanged: a submit payload with no status is
+        # still fail-soft THROUGH the degraded marker, not past it.
+        ("EvalJudgeSubmitOutcome", {"eval_judge_submit": {"Payload": {}}},
          "MarkEvalJudgeDegraded"),  # eval is observability — fail-soft, marked
-        ("EvalJudgePollDecision", {"eval_judge_poll": {"Payload": {}}},
-         "MarkEvalJudgeDegraded"),  # malformed poll payload — no Wait loop
         # Healthy-path sanity: the guards must not change live semantics.
         ("WeeklyRunDayGateChoice",
          {"weekly_run_day_gate": {"Payload": {"is_weekly_run_day": False}}},
@@ -331,9 +334,24 @@ def _choice_target(definition: dict, choice_name: str, data) -> str:
         ("LibPinDriftGate",
          {"libpin_drift_result": {"Payload": {"has_drift": True}}},
          "ExtractLibPinDriftError"),
-        ("EvalJudgePollDecision",
-         {"eval_judge_poll": {"Payload": {"processing_status": "polling"}}},
-         "EvalJudgePollWait"),
+        # Healthy-path sanity for the replacement Choice: a plan that exists
+        # reaches the spot dispatch, not the degraded marker.
+        ("EvalJudgeSubmitOutcome",
+         {"eval_judge_submit": {"Payload": {"status": "OK"}}},
+         "PrepareEvalJudgeSpotDispatch"),
+        # And the Friday shell run takes the dry branch FIRST, before the
+        # EMPTY sentinel its own submit returns can route it past the box —
+        # the preflight is the only path that exercises the new substrate
+        # before Saturday.
+        ("EvalJudgeSubmitOutcome",
+         {"research_dry": True,
+          "eval_judge_submit": {"Payload": {"status": "EMPTY"}}},
+         "PrepareEvalJudgeSpotDispatch"),
+        # A REAL empty plan (not the dry sentinel) never launches a box.
+        ("EvalJudgeSubmitOutcome",
+         {"research_dry": False,
+          "eval_judge_submit": {"Payload": {"status": "EMPTY"}}},
+         "EvalJudgeEmptyPlan"),
     ],
 )
 def test_partial_payload_routes_to_explicit_path(choice, partial_input, expected_route):

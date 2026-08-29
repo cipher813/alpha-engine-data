@@ -53,15 +53,27 @@ def test_weekly_definition_has_global_timeout():
 def test_global_timeout_clears_longest_legitimate_composition():
     definition = _definition()
     timeout = definition["TimeoutSeconds"]
-    # The single longest in-definition wait: the eval-judge Anthropic batch
-    # poll cap. The ceiling must clear it with real headroom for the spot
-    # stages around it (recorded full-run max 3.04h ≈ 11000s).
+    # The single longest in-definition wait. It used to be the eval-judge
+    # Anthropic batch poll's `max_wait_seconds` (21600s). alpha-engine-config-
+    # I9263 retired that provider batch API and -I9329 deleted the poll chain
+    # with it, so the floor is now derived from the largest SSM
+    # `executionTimeout` any stage declares — which is the same quantity in
+    # the same units, read from the shape the definition actually has.
+    #
+    # Derived rather than re-pinned: a hardcoded 21600 would have kept passing
+    # against a definition whose longest wait had moved, which is the exact
+    # class of stale-pin failure this file exists to prevent one level up.
     text = _WEEKLY.read_text()
-    max_waits = [int(m) for m in re.findall(r'"max_wait_seconds":\s*(\d+)', text)]
-    assert max_waits, "eval-judge max_wait_seconds cap not found — update this test"
-    assert timeout >= max(max_waits) + 4 * 3600, (
-        "global ceiling too tight: a legitimate slow Anthropic batch plus "
-        "normal stage time would TIMED_OUT a healthy run"
+    execution_timeouts = [
+        int(m) for m in re.findall(r'"executionTimeout":\s*\[\s*"(\d+)"', text)
+    ]
+    assert execution_timeouts, (
+        "no SSM executionTimeout found — the longest in-definition wait can no "
+        "longer be derived; update this test rather than leaving it vacuous"
+    )
+    assert timeout >= max(execution_timeouts) + 4 * 3600, (
+        "global ceiling too tight: the longest legitimate stage plus normal "
+        "stage time around it would TIMED_OUT a healthy run"
     )
     assert timeout <= 24 * 3600, (
         "global ceiling above 24h stops being a same-day hang signal"

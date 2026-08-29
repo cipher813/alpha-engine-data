@@ -74,11 +74,24 @@ class TestStatesPresent:
             # design, ROADMAP P1 §1642 closure 2026-05-07).
             "EvalJudgeSubmitFirstSaturday",
             "EvalJudgeSubmitWeekly",
-            "EvalJudgePollChoice",
-            "EvalJudgePollWait",
-            "EvalJudgePoll",
-            "EvalJudgePollDecision",
+            # alpha-engine-config-I9329: the four EvalJudgePoll* states are
+            # gone with the provider batch API they drove, and Process runs on
+            # a dedicated spot box reached over SSM.
+            "EvalJudgeSubmitOutcome",
+            "EvalJudgeEmptyPlan",
+            "PrepareEvalJudgeSpotDispatch",
+            "DispatchEvalJudgeSpot",
+            "MergeEvalJudgeSpotInstanceId",
+            "InitEvalJudgeSpotBootstrapPollCount",
+            "WaitForEvalJudgeSpotBootstrap",
+            "CheckEvalJudgeSpotBootstrapStatus",
+            "EvalJudgeSpotBootstrapLivenessGate",
+            "EvalJudgeSpotRelaunch",
             "EvalJudgeProcess",
+            "InitEvalJudgeProcessPollCount",
+            "WaitForEvalJudgeProcess",
+            "CheckEvalJudgeProcessStatus",
+            "EvalJudgeProcessLivenessGate",
             "EvalRollingMean",
             "CheckSkipRationaleClustering",
             "RationaleClustering",
@@ -88,6 +101,19 @@ class TestStatesPresent:
             "Counterfactual",
         ):
             assert name in states, f"missing SF state: {name}"
+
+    def test_the_poll_chain_is_gone(self, states):
+        """alpha-engine-config-I9329, verified RED against pre-fix code.
+
+        Submit -> Poll -> Process existed to drive an ASYNCHRONOUS provider
+        batch API. That API is retired (-I9263), and with no batch rung there
+        is nothing to poll: `poll_batch` returned terminal immediately for both
+        synthetic id prefixes, so the states could only ever fall straight
+        through. Pinned as an ABSENCE sweep rather than four named assertions
+        because the defect it guards is a redrive under the old names.
+        """
+        stale = sorted(n for n in states if n.startswith("EvalJudgePoll"))
+        assert not stale, f"EvalJudgePoll* states still present: {stale}"
 
     def test_legacy_single_lambda_states_removed(self, states):
         """The legacy single-Lambda Task states were replaced by the
@@ -346,10 +372,10 @@ class TestEvalJudgeSubmitContract:
         "state_name",
         ["EvalJudgeSubmitFirstSaturday", "EvalJudgeSubmitWeekly"],
     )
-    def test_submit_routes_to_poll_choice_on_success(
+    def test_submit_routes_to_the_outcome_choice_on_success(
         self, states, state_name,
     ):
-        assert states[state_name]["Next"] == "EvalJudgePollChoice"
+        assert states[state_name]["Next"] == "EvalJudgeSubmitOutcome"
 
     @pytest.mark.parametrize(
         "state_name",
@@ -366,52 +392,70 @@ class TestEvalJudgeSubmitContract:
         assert states["MarkEvalJudgeDegraded"]["Next"] == "EvalRollingMean"
 
 
-class TestEvalJudgePollChoice:
-    """EvalJudgePollChoice is the first Choice after Submit. EMPTY
-    short-circuits the poll loop; OK enters the loop; anything else
-    fail-softs to EvalRollingMean. Pinning these branches matters —
-    silently routing EMPTY through the loop would burn 60s + 1
-    Lambda invocation per poll cycle for hours."""
+class TestEvalJudgeSubmitOutcome:
+    """The Choice that replaced EvalJudgePollChoice (alpha-engine-config-I9329).
 
-    def test_empty_routes_directly_to_process(self, states):
-        # config#2275: rules are And:[{IsPresent}, {StringEquals}] guarded.
+    The poll states went; this Choice's FAIL-SOFT DEFAULT did not, and that is
+    the part worth pinning. alpha-engine-config-I9058 records what its absence
+    costs: on 2026-08-22 EvalJudgeSubmitWeekly SUCCEEDED while returning
+    ``{"status": "ERROR"}``, the chain jumped Submit -> EvalRollingMean in 25s,
+    ``decision_artifacts/_eval/latest.json`` was never rewritten, and NOTHING
+    in the execution recorded a degradation. It surfaced five days later as a
+    freshness-monitor CRITICAL.
+    """
+
+    def test_a_real_empty_plan_never_launches_a_box(self, states):
+        """DELIBERATE deviation from I9329's issue body, which said EMPTY
+        should keep routing to EvalJudgeProcess. That was written for a Lambda
+        Process that could emit a clean empty result for free. On a spot box
+        the same routing would launch an instance to grade zero artifacts, and
+        `judge_spot_run` refuses to run without a plan (exit 2) -- so it would
+        also FAIL the stage. The Pass emits the identical result shape at no
+        cost, and does NOT mark degraded: nothing to grade is an outcome, not a
+        failure.
+        """
         choice = next(
-            c for c in states["EvalJudgePollChoice"]["Choices"]
+            c for c in states["EvalJudgeSubmitOutcome"]["Choices"]
             if any(leaf.get("StringEquals") == "EMPTY" for leaf in c.get("And", []))
         )
-        assert choice["Next"] == "EvalJudgeProcess"
-        assert all(
-            leaf["Variable"] == "$.eval_judge_submit.Payload.status"
-            for leaf in choice["And"]
-        )
+        assert choice["Next"] == "EvalJudgeEmptyPlan"
+        assert states["EvalJudgeEmptyPlan"]["Next"] == "EvalRollingMean"
+        # Comment excluded: a state's PROSE may legitimately name the flag
+        # it deliberately does not set, and asserting over prose would make
+        # documenting the choice fail the test that checks the choice.
+        body = {k: v for k, v in states["EvalJudgeEmptyPlan"].items() if k != "Comment"}
+        assert "research_degraded_local" not in json.dumps(body)
 
-    def test_ok_routes_to_poll_wait(self, states):
+    def test_a_plan_that_exists_reaches_the_spot_dispatch(self, states):
         choice = next(
-            c for c in states["EvalJudgePollChoice"]["Choices"]
+            c for c in states["EvalJudgeSubmitOutcome"]["Choices"]
             if any(leaf.get("StringEquals") == "OK" for leaf in c.get("And", []))
         )
-        assert choice["Next"] == "EvalJudgePollWait"
+        assert choice["Next"] == "PrepareEvalJudgeSpotDispatch"
+        assert states["PrepareEvalJudgeSpotDispatch"]["Next"] == "DispatchEvalJudgeSpot"
+
+    def test_the_dry_branch_is_first_so_the_friday_preflight_boots_the_box(
+        self, states
+    ):
+        """Ordering is load-bearing. On the Friday shell run `$.research_dry`
+        is true AND Submit returns the EMPTY sentinel; if the EMPTY branch
+        matched first, the preflight would route past the spot entirely and
+        the ONLY path that exercises the new substrate before Saturday would
+        exercise nothing."""
+        choices = states["EvalJudgeSubmitOutcome"]["Choices"]
+        dry_index = next(
+            i for i, c in enumerate(choices)
+            if any(leaf.get("Variable") == "$.research_dry" for leaf in c.get("And", []))
+        )
+        empty_index = next(
+            i for i, c in enumerate(choices)
+            if any(leaf.get("StringEquals") == "EMPTY" for leaf in c.get("And", []))
+        )
+        assert dry_index < empty_index
+        assert choices[dry_index]["Next"] == "PrepareEvalJudgeSpotDispatch"
 
     def test_default_is_fail_soft_but_marks_degraded(self, states):
-        # Anything other than EMPTY/OK (ERROR, malformed) must NOT halt the
-        # pipeline — and must not be SILENT either.
-        #
-        # alpha-engine-config-I9058. This Default used to be EvalRollingMean.
-        # The four Catches on this chain (SubmitFirstSaturday, SubmitWeekly,
-        # Poll, Process) all route through MarkEvalJudgeDegraded, but a Catch
-        # only fires when the Lambda RAISED. A submit Lambda that SUCCEEDS
-        # while returning {"status": "ERROR"} in its payload is an in-band
-        # failure and lands here — so it bypassed the degraded marker entirely.
-        # Measured 2026-08-22 on ne-weekly-freshness-pipeline execution
-        # 1ed4d68f-...-c59654eb426d: EvalJudgeSubmitWeekly returned
-        # status=ERROR (Anthropic 400, credit balance too low), the run jumped
-        # Submit -> EvalRollingMean in 25s, decision_artifacts/_eval/latest.json
-        # was never rewritten, and NOTHING in the execution recorded a
-        # degradation. The condition first surfaced five days later as a
-        # freshness-monitor CRITICAL.
-        assert states["EvalJudgePollChoice"]["Default"] == "MarkEvalJudgeDegraded"
-        # Continuation is unchanged: the marker is a Pass that threads
-        # $.research_degraded_local and hands straight on to EvalRollingMean.
+        assert states["EvalJudgeSubmitOutcome"]["Default"] == "MarkEvalJudgeDegraded"
         assert states["MarkEvalJudgeDegraded"]["Type"] == "Pass"
         assert states["MarkEvalJudgeDegraded"]["Next"] == "EvalRollingMean"
         assert (
@@ -420,181 +464,274 @@ class TestEvalJudgePollChoice:
         )
 
 
-class TestEvalJudgePollLoop:
-    def test_poll_wait_60s(self, states):
-        # 60s polls strike a balance between pickup latency and Lambda
-        # invocation cost over Anthropic's typical sub-1h batch latency.
-        assert states["EvalJudgePollWait"]["Seconds"] == 60
-        assert states["EvalJudgePollWait"]["Next"] == "EvalJudgePoll"
+class TestEvalJudgeSpotSubstrate:
+    """The dispatch + two bounded poll loops that replaced the batch poll loop.
 
-    def test_poll_invokes_poll_lambda_live_alias(self, states):
-        params = states["EvalJudgePoll"]["Parameters"]
+    Shape is deliberately the RAGIngestion / DispatchWeeklyFreshnessSpot one,
+    not a new idiom: launch, poll the bootstrap to Success, send the work,
+    poll the work to Success.
+    """
+
+    def test_dispatch_invokes_the_dedicated_dispatcher(self, states):
+        params = states["DispatchEvalJudgeSpot"]["Parameters"]
+        assert params["FunctionName"] == (
+            "alpha-engine-research-eval-judge-spot-dispatcher"
+        )
+        # The name is chosen so the Step Functions role's existing
+        # `...function:alpha-engine-research-eval-judge*` invoke wildcard
+        # already covers it -- verified live 2026-08-29, which is why this
+        # cutover needs no SF-role invoke grant.
+        assert params["FunctionName"].startswith("alpha-engine-research-eval-judge")
+
+    def test_the_judge_box_is_its_own_and_never_the_shared_launcher(self, states):
+        """$.ec2_instance_id is the weekly launcher every other stage in this
+        pipeline addresses. Writing over it here -- or sending the judge to it
+        -- would couple an LLM workload's disk and memory to thirteen unrelated
+        stages, which is precisely why I9329 forbade a sixth clone on
+        weekly-freshness-spot-dispatcher."""
         assert (
-            params["FunctionName"]
-            == "alpha-engine-research-eval-judge-poll:live"
+            states["EvalJudgeProcess"]["Parameters"]["InstanceIds.$"]
+            == "$.eval_judge_instance_id"
         )
+        for name in (
+            "MergeEvalJudgeSpotInstanceId",
+            "WaitForEvalJudgeSpotBootstrap",
+            "WaitForEvalJudgeProcess",
+        ):
+            body = {k: v for k, v in states[name].items() if k != "Comment"}
+            assert "$.ec2_instance_id" not in json.dumps(body)
 
-    def test_poll_payload_passes_batch_id_and_submit_iso(self, states):
-        payload = states["EvalJudgePoll"]["Parameters"]["Payload"]
-        assert payload["batch_id.$"] == "$.eval_judge_submit.Payload.batch_id"
-        assert payload["submit_iso.$"] == "$.eval_cadence.submit_iso"
-        # 6-hour fail-soft cap matches the Poll Lambda default.
-        assert payload["max_wait_seconds"] == 21600
-
-    def test_poll_decision_ended_routes_to_process(self, states):
-        # config#2275: the rule is And:[{IsPresent}, {Or: [...]}] guarded.
-        def _or_clauses(rule):
-            for operand in rule.get("And", []):
-                if "Or" in operand:
-                    return operand["Or"]
-            return rule.get("Or", [])
-
-        ended_choice = next(
-            c for c in states["EvalJudgePollDecision"]["Choices"]
-            if any(
-                clause.get("StringEquals") == "ended"
-                for clause in _or_clauses(c)
-            )
+    def test_no_work_is_sent_before_the_bootstrap_reaches_success(self, states):
+        """The venv, the private prompts and the router env file do not exist
+        until the bootstrap command is Success. A sendCommand issued earlier
+        would fail on a box that is merely booting, and the SF cannot tell that
+        apart from a judge defect."""
+        check = states["CheckEvalJudgeSpotBootstrapStatus"]
+        success = next(
+            c for c in check["Choices"] if c.get("StringEquals") == "Success"
         )
-        assert ended_choice["Next"] == "EvalJudgeProcess"
-        # ended_empty (synthetic empty-batch sentinel) must converge
-        # to the same Process state — it's not a separate code path
-        # in Process.
-        assert any(
-            clause.get("StringEquals") == "ended_empty"
-            for clause in _or_clauses(ended_choice)
+        assert success["Next"] == "EvalJudgeProcess"
+
+    @pytest.mark.parametrize(
+        "check,var,cap,execution_timeout",
+        [
+            ("CheckEvalJudgeSpotBootstrapStatus", "$.eval_judge_bootstrap_polls", 72, 1800),
+            ("CheckEvalJudgeProcessStatus", "$.eval_judge_process_polls", 432, 10800),
+        ],
+    )
+    def test_each_poll_budget_is_derived_from_its_own_execution_timeout(
+        self, states, check, var, cap, execution_timeout
+    ):
+        """cap = ceil(executionTimeout / 30s wait) * 1.2, the
+        RAGIngestion/DataPhase2 precedent (alpha-engine-config-I5687). Derived
+        here rather than restated so a timeout change that leaves the cap
+        behind fails, instead of silently capping the loop below the work."""
+        import math
+
+        expected = int(math.ceil(execution_timeout / 30) * 1.2)
+        assert cap == expected
+        loop = next(
+            c for c in states[check]["Choices"]
+            if any(leaf.get("Variable") == var and "NumericLessThan" in leaf
+                   for leaf in c.get("And", []))
         )
-
-    def test_poll_decision_max_wait_routes_to_rolling_mean(self, states):
-        # config#2275: the rule is And:[{IsPresent}, {BooleanEquals}] guarded.
-        max_wait_choice = next(
-            c for c in states["EvalJudgePollDecision"]["Choices"]
-            if any(
-                leaf.get("Variable", "").endswith("exceeded_max_wait")
-                and "BooleanEquals" in leaf
-                for leaf in c.get("And", [])
-            )
+        bound = next(
+            leaf["NumericLessThan"] for leaf in loop["And"]
+            if leaf.get("Variable") == var and "NumericLessThan" in leaf
         )
-        assert any(
-            leaf.get("BooleanEquals") is True for leaf in max_wait_choice["And"]
-        )
-        # Fail-soft — Anthropic retains batch results for 29 days, so
-        # operator can re-run Process offline against the same batch_id.
-        # alpha-engine-config-I9058: fail-soft, via the degraded marker. A
-        # batch abandoned at the 6h cap produced no eval artifact; that is a
-        # degradation whether or not any Lambda raised.
-        assert max_wait_choice["Next"] == "MarkEvalJudgeDegraded"
+        assert bound == cap
 
-    def test_poll_decision_default_loops_back_to_wait(self, states):
-        # Continue polling until ended OR max_wait exceeded.
-        assert states["EvalJudgePollDecision"]["Default"] == "EvalJudgePollWait"
+    def test_the_bootstrap_execution_timeout_matches_the_dispatchers(self):
+        """One number, two owners: the dispatcher Lambda sets the SSM command's
+        own executionTimeout, and the poll cap above is derived from it. Read
+        the dispatcher rather than restating the literal, so a bump there
+        cannot leave this loop capped below the work it waits on."""
+        src = (
+            _SF_PATH.parent / "lambdas" / "eval-judge-spot-dispatcher" / "index.py"
+        ).read_text()
+        assert '"EVAL_JUDGE_SPOT_BOOTSTRAP_TIMEOUT_SECONDS", "1800"' in src
 
-    def test_poll_decision_malformed_payload_marks_degraded(self, states):
-        """config#2275's malformed-payload branch is a fail-soft exit too.
+    @pytest.mark.parametrize(
+        "gate,poll_var",
+        [
+            ("EvalJudgeSpotBootstrapLivenessGate", "$.eval_judge_bootstrap_poll"),
+            ("EvalJudgeProcessLivenessGate", "$.eval_judge_process_poll"),
+        ],
+    )
+    def test_a_reclaim_relaunches_once_and_a_workload_failure_does_not(
+        self, states, gate, poll_var
+    ):
+        """The reclaim design, stated where it is enforced.
 
-        alpha-engine-config-I9058 — same class as the max_wait branch: a poll
-        payload carrying neither ``processing_status`` nor
-        ``exceeded_max_wait`` means the chain gave up without producing an
-        eval artifact, so it must leave through the degraded marker rather
-        than land on EvalRollingMean looking like a clean run.
+        Spot is interruptible by default and the judge run is 60-145 minutes,
+        so a reclaim is the failure this substrate is most exposed to -- and
+        coverage is a HARD failure (Brian, 2026-08-29), so losing the box must
+        not silently lose the week's evals. SUBSTRATE LOST relaunches ONCE, on
+        demand. A WORKLOAD failure (a coverage shortfall, ResponseCode 3) does
+        NOT: it is a real verdict, and re-grading the same corpus on a second
+        box spends money to reproduce it.
         """
-        malformed = next(
-            c for c in states["EvalJudgePollDecision"]["Choices"]
-            if all("Not" in leaf for leaf in c.get("And", []))
+        rule = states[gate]["Choices"][0]
+        variables = {leaf.get("Variable") for leaf in rule["And"] if "Variable" in leaf}
+        assert f"{poll_var}.StatusDetails" in variables
+        details = next(op for op in rule["And"] if "Or" in op)["Or"]
+        assert {d["StringEquals"] for d in details} == {"Undeliverable", "Terminated"}
+        assert any(
+            leaf.get("Variable") == "$.eval_judge_spot_relaunches"
+            and leaf.get("NumericLessThan") == 1
+            for leaf in rule["And"]
         )
-        assert malformed["Next"] == "MarkEvalJudgeDegraded"
+        assert rule["Next"] == "EvalJudgeSpotRelaunch"
+        assert states[gate]["Default"].startswith("ExtractEvalJudge")
+
+    def test_the_relaunch_is_bounded_and_escalates_off_spot(self, states):
+        relaunch = states["EvalJudgeSpotRelaunch"]
+        blob = json.dumps(relaunch)
+        assert "eval_judge_spot_relaunches" in blob
+        assert "eval_judge_spot_force_on_demand" in blob
+        assert "true" in blob
+        assert relaunch["Next"] == "DispatchEvalJudgeSpot"
+
+    def test_the_counter_is_seeded_on_the_first_attempt(self, states):
+        """alpha-engine-config-I7282: a field written only by the relaunch path
+        would be ABSENT on every healthy run, and both gates dereference it."""
+        blob = json.dumps(states["PrepareEvalJudgeSpotDispatch"])
+        assert "eval_judge_spot_relaunches" in blob
+        assert "eval_judge_spot_force_on_demand" in blob
 
     def test_no_eval_judge_failure_path_reaches_rolling_mean_unmarked(
         self, states
     ):
-        """The invariant, stated once over the whole chain.
+        """The invariant, stated once over the whole chain
+        (alpha-engine-config-I9058, extended by -I9329).
 
-        alpha-engine-config-I9058. Every way the eval-judge chain can end
-        WITHOUT writing ``decision_artifacts/_eval/latest.json`` must pass
-        through ``MarkEvalJudgeDegraded``. Only the success paths
-        (``OK`` -> poll loop, ``ended``/``ended_empty`` -> Process) and the
-        marker itself may name ``EvalRollingMean`` as a Next.
+        Every way the eval-judge chain can end WITHOUT writing
+        ``decision_artifacts/_eval/latest.json`` must pass through
+        ``MarkEvalJudgeDegraded``. Written as a whole-chain sweep rather than
+        per-branch assertions because the defect is ADDITIVE: the failure mode
+        is someone adding another fail-soft exit later and wiring it straight
+        to EvalRollingMean. The cutover added four such exits, which is exactly
+        the growth this shape was written for.
 
-        Written as a whole-chain sweep rather than three separate branch
-        assertions because the defect it pins is additive: the failure mode is
-        someone adding a FOURTH fail-soft exit later and wiring it straight to
-        EvalRollingMean, which no per-branch test would catch.
+        EvalJudgeEmptyPlan is the one legitimate direct route, and it is not a
+        failure path: it says the judge ran and there was nothing to grade.
+        CheckEvalJudgeProcessStatus's Success branch is the write path itself.
         """
         offenders = []
-        for name in ("EvalJudgePollChoice", "EvalJudgePollDecision"):
-            state = states[name]
-            targets = [
-                (name, "Default", state.get("Default"))
-            ] + [
-                (name, f"Choices[{i}]", c.get("Next"))
-                for i, c in enumerate(state.get("Choices", []))
-            ]
+        for name, state in states.items():
+            if not name.startswith(("EvalJudge", "DispatchEvalJudge",
+                                    "CheckEvalJudge", "WaitForEvalJudge",
+                                    "ExtractEvalJudge", "PrepareEvalJudge",
+                                    "MergeEvalJudge", "InitEvalJudge")):
+                continue
+            if name in ("EvalJudgeEmptyPlan", "CheckEvalJudgeProcessStatus"):
+                continue
+            targets = [(name, "Default", state.get("Default")),
+                       (name, "Next", state.get("Next"))]
+            targets += [(name, f"Choices[{i}]", c.get("Next"))
+                        for i, c in enumerate(state.get("Choices", []))]
+            targets += [(name, f"Catch[{i}]", c.get("Next"))
+                        for i, c in enumerate(state.get("Catch", []))]
             offenders += [t for t in targets if t[2] == "EvalRollingMean"]
         assert offenders == [], (
-            "eval-judge Choice exits reach EvalRollingMean without passing "
-            f"through MarkEvalJudgeDegraded: {offenders}"
+            "eval-judge exits reach EvalRollingMean without passing through "
+            f"MarkEvalJudgeDegraded: {offenders}"
         )
-        # And the marker is still the only door to EvalRollingMean from this
-        # chain — i.e. the fix routes, it does not orphan.
         assert states["MarkEvalJudgeDegraded"]["Next"] == "EvalRollingMean"
 
 
 class TestEvalJudgeProcessContract:
-    def test_invokes_process_lambda_live_alias(self, states):
-        params = states["EvalJudgeProcess"]["Parameters"]
-        assert (
-            params["FunctionName"]
-            == "alpha-engine-research-eval-judge-process:live"
+    """EvalJudgeProcess keeps its NAME and changes its SUBSTRATE
+    (alpha-engine-config-I9329).
+
+    The name is load-bearing beyond aesthetics:
+    ``eval_artifact_latest.produced_by`` names EvalJudgeProcess,
+    ``AggregateCosts.required_producers`` keys on it, and the stage-coverage
+    registry has a row for it. All three statements stay true because the stage
+    still produces exactly what they say it does.
+    """
+
+    def test_it_is_a_send_command_stage(self, states):
+        assert states["EvalJudgeProcess"]["Resource"] == (
+            "arn:aws:states:::aws-sdk:ssm:sendCommand"
+        )
+        assert states["EvalJudgeProcess"]["Parameters"]["DocumentName"] == (
+            "AWS-RunShellScript"
         )
 
-    def test_payload_carries_batch_id_and_plan_key(self, states):
-        payload = states["EvalJudgeProcess"]["Parameters"]["Payload"]
-        assert payload["batch_id.$"] == "$.eval_judge_submit.Payload.batch_id"
-        assert (
-            payload["plan_s3_key.$"]
-            == "$.eval_judge_submit.Payload.plan_s3_key"
-        )
+    def test_execution_timeout_is_strictly_below_the_state_timeout(self, states):
+        """The INVERSE of the lambda:invoke rule, and the more dangerous
+        direction (alpha-engine-config-I6948). Inverted, the state abandons a
+        command Step Functions cannot cancel: the stage fails with a bare
+        States.Timeout naming nothing while the spot instance keeps billing.
 
-    def test_process_timeout_is_a_guard_band_above_the_lambda_cap(self, states):
-        """960, deliberately ABOVE the Lambda's own 900s (config-I7181).
-
-        This asserted `== 900` until 2026-08-13, on the reasoning quoted
-        below — that the escalation tail is "typically 1-3 calls x 5-8s
-        each, well inside the cap." Measured, it is not: the tail has NO
-        cap at all and its cardinality is data-dependent, and the
-        parse-retry tail's `_PARSE_RETRY_CAP = 40` was justified as
-        "40 x <=8s" against a measured 45-105s apiece. 9 of 28 real runs
-        were killed at the wall, all nine inside that tail.
-
-        `crucible-research-PR613` makes the loops self-deadlining: each
-        asks, before every item, whether one more fits, then stops and
-        returns a PARTIAL with the residue recorded. A self-deadlining
-        function's clock starts at INVOKE; the SF clock starts at
-        SCHEDULE, earlier by dispatch plus cold start. An equal ceiling
-        therefore guarantees the SF fires first and pre-empts the
-        graceful return -- the state killed at the wall precisely
-        because the function learned not to be.
-
-        Pinned in one place: tests/test_sf_lambda_timeout_ordering.py's
-        _SERVICE_MAX_GUARD_BAND, which asserts both that the function is
-        really at Lambda's 900s service maximum and that the band is
-        exactly this number.
+        10800s is budgeted from the MEASURED 83 artifacts x 45-105s = 60-145
+        minutes serial, with headroom for corpus growth. A budget, not an
+        accommodation (sf-pipeline-policy.md section 4).
         """
-        assert states["EvalJudgeProcess"]["TimeoutSeconds"] == 960
+        st = states["EvalJudgeProcess"]
+        execution_timeout = int(st["Parameters"]["Parameters"]["executionTimeout"][0])
+        assert execution_timeout == 10800
+        assert execution_timeout < st["TimeoutSeconds"]
 
-    def test_process_routes_to_rolling_mean_on_success(self, states):
-        assert states["EvalJudgeProcess"]["Next"] == "EvalRollingMean"
+    def test_the_command_reads_batch_id_and_plan_key_from_submit(self, states):
+        """The reason there is no poll stage left to starve. If the command
+        took either field from a poll result, deleting the poll chain would
+        have left it unresolvable."""
+        cmd = states["EvalJudgeProcess"]["Parameters"]["Parameters"]["commands.$"]
+        assert "$.eval_judge_submit.Payload.batch_id" in cmd
+        assert "$.eval_judge_submit.Payload.plan_s3_key" in cmd
+        assert "eval_judge_poll" not in cmd
+
+    def test_the_command_sources_the_router_environment_file(self, states):
+        """A separate SSM command is a SEPARATE shell. The dispatcher writes
+        the router addressing to a file on the box precisely because an export
+        made during bootstrap would be gone by now -- and
+        ``judge_exec_context()`` would then answer "lambda" from a spot box,
+        asking the router the wrong question with no error anywhere."""
+        cmd = states["EvalJudgeProcess"]["Parameters"]["Parameters"]["commands.$"]
+        assert "/home/ec2-user/eval-judge.env" in cmd
+
+    def test_the_command_never_names_a_model_provider_or_endpoint(self, states):
+        """principles.md section 2.8, and Brian's 2026-08-29 ruling that the
+        direct Anthropic API is retired. Addressed by registry GROUP through the
+        router, never by vendor identity."""
+        cmd = states["EvalJudgeProcess"]["Parameters"]["Parameters"]["commands.$"].lower()
+        for forbidden in ("anthropic", "openrouter", "claude-", "gpt-", "api_key"):
+            assert forbidden not in cmd
+
+    def test_the_box_tears_itself_down_on_every_exit_path(self, states):
+        """Cost-management: the box bills until something stops it, and the
+        watchdog is a 4.5h backstop, not a plan. The 120s delay is what lets
+        SSM report the terminal status to this Step Function before the
+        instance disappears -- an immediate shutdown would race the
+        ResponseCode this stage reads."""
+        cmd = states["EvalJudgeProcess"]["Parameters"]["Parameters"]["commands.$"]
+        assert "shutdown -h now" in cmd
+        assert "--on-active=120" in cmd
+        assert "EXIT" in cmd
+
+    def test_the_run_is_wrapped_in_the_shared_log_capture_cli(self, states):
+        """The institutional chokepoint, not a hand-rolled trap+tee: SSM's
+        StandardOutputContent is capped at 24KB, so a failure on a box that
+        then terminates is otherwise unrecoverable."""
+        cmd = states["EvalJudgeProcess"]["Parameters"]["Parameters"]["commands.$"]
+        assert "krepis.ssm_log_capture run --correlation-id" in cmd
+        assert "--slug eval-judge" in cmd
+
+    def test_process_routes_to_its_poll_loop_then_rolling_mean(self, states):
+        assert states["EvalJudgeProcess"]["Next"] == "InitEvalJudgeProcessPollCount"
+        success = next(
+            c for c in states["CheckEvalJudgeProcessStatus"]["Choices"]
+            if c.get("StringEquals") == "Success"
+        )
+        assert success["Next"] == "EvalRollingMean"
 
     def test_process_catch_routes_to_rolling_mean_not_failure(self, states):
-        # alpha-engine-config#6722: routes through the shared
-        # MarkEvalJudgeDegraded convergence before EvalRollingMean.
         catch = states["EvalJudgeProcess"]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
         assert catch["Next"] == "MarkEvalJudgeDegraded"
         assert states["MarkEvalJudgeDegraded"]["Next"] == "EvalRollingMean"
-
-
-# ── Non-blocking failure semantics — preserved across the chain ──────────
 
 
 class TestBatchChainNonBlocking:
@@ -608,7 +745,11 @@ class TestBatchChainNonBlocking:
         [
             "EvalJudgeSubmitFirstSaturday",
             "EvalJudgeSubmitWeekly",
-            "EvalJudgePoll",
+            # alpha-engine-config-I9329: EvalJudgePoll left this list with the
+            # rest of the poll chain; the spot dispatcher took its place as a
+            # fail-open owner, and it is the one that can now fail for an
+            # INFRASTRUCTURE reason (no spot capacity) rather than a domain one.
+            "DispatchEvalJudgeSpot",
             "EvalJudgeProcess",
         ],
     )
@@ -1063,7 +1204,7 @@ class TestSyncRungRouting:
         ``status='OK'``, so it entered the 60s Wait and burned a Poll
         invocation to learn what Submit had already stated.
         """
-        choices = states["EvalJudgePollChoice"]["Choices"]
+        choices = states["EvalJudgeSubmitOutcome"]["Choices"]
         sync = [
             c for c in choices
             if any(
@@ -1072,9 +1213,9 @@ class TestSyncRungRouting:
             )
         ]
         assert len(sync) == 1, (
-            "exactly one ended_sync branch expected in EvalJudgePollChoice"
+            "exactly one ended_sync branch expected in EvalJudgeSubmitOutcome"
         )
-        assert sync[0]["Next"] == "EvalJudgeProcess"
+        assert sync[0]["Next"] == "PrepareEvalJudgeSpotDispatch"
 
         # Ordering is load-bearing: SF evaluates Choices in order, and the
         # `status == "OK"` branch would otherwise match first and send a
@@ -1090,7 +1231,7 @@ class TestSyncRungRouting:
     def test_the_sync_branch_is_ispresent_guarded(self, states):
         """A submit payload with no processing_status must still reach the
         fail-soft Default, not throw States.Runtime (config#2275's rule)."""
-        choices = states["EvalJudgePollChoice"]["Choices"]
+        choices = states["EvalJudgeSubmitOutcome"]["Choices"]
         sync = next(
             c for c in choices
             if any(
@@ -1099,7 +1240,7 @@ class TestSyncRungRouting:
             )
         )
         assert any(cond.get("IsPresent") is True for cond in sync["And"])
-        assert states["EvalJudgePollChoice"]["Default"] == "MarkEvalJudgeDegraded"
+        assert states["EvalJudgeSubmitOutcome"]["Default"] == "MarkEvalJudgeDegraded"
 
     def test_process_reads_its_inputs_from_submit_not_from_poll(self, states):
         """The reason skipping Poll is safe at all.
@@ -1107,9 +1248,9 @@ class TestSyncRungRouting:
         If Process took batch_id or plan_s3_key from ``$.eval_judge_poll``, the
         ended_sync shortcut would starve it. Pinned so a future edit that moves
         either field to the poll payload fails here rather than in production."""
-        payload = states["EvalJudgeProcess"]["Parameters"]["Payload"]
-        assert payload["batch_id.$"] == "$.eval_judge_submit.Payload.batch_id"
-        assert payload["plan_s3_key.$"] == "$.eval_judge_submit.Payload.plan_s3_key"
+        cmd = states["EvalJudgeProcess"]["Parameters"]["Parameters"]["commands.$"]
+        assert "$.eval_judge_submit.Payload.batch_id" in cmd
+        assert "$.eval_judge_submit.Payload.plan_s3_key" in cmd
 
     def test_no_sf_comment_still_claims_the_poll_calls_anthropic(self, sf):
         """The chain no longer calls ``anthropic.messages.batches.retrieve``.

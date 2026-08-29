@@ -59,7 +59,7 @@ def test_data_venv_installs_that_repos_own_requirements():
 def test_data_venv_carries_the_released_krepis_stage_coverage_contract():
     """The box must not resolve a pre-I8155 fallback implementation."""
     src = _src()
-    assert ".venv/bin/pip install -q 'krepis==0.59.31'" in src, (
+    assert ".venv/bin/pip install -q 'krepis==0.59.41'" in src, (
         "the data venv must install the released I8155 contract explicitly; "
         "a floor can resolve a pre-I8155 verdict-key fallback and split a run"
     )

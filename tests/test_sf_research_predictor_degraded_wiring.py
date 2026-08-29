@@ -155,7 +155,11 @@ def test_branch_a_mark_state_shape(branch_a, name, next_target):
         "RegimeRetrospectiveEval",
         "EvalJudgeSubmitFirstSaturday",
         "EvalJudgeSubmitWeekly",
-        "EvalJudgePoll",
+        # alpha-engine-config-I9329: EvalJudgePoll is gone; the spot
+        # dispatcher took its place as a fail-open owner in this chain, and
+        # EvalJudgeProcess is now an ssm:sendCommand rather than a
+        # lambda:invoke — its Catch obligation is unchanged.
+        "DispatchEvalJudgeSpot",
         "EvalJudgeProcess",
         "EvalRollingMean",
         "RationaleClustering",

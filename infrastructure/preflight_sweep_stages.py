@@ -101,6 +101,16 @@ _BOX_ROOT = "/home/ec2-user/"
 _CD_RE = re.compile(r"^cd\s+" + re.escape(_BOX_ROOT) + r"([\w.-]+)\s*$")
 _GIT_C_RE = re.compile(r"git\s+-C\s+" + re.escape(_BOX_ROOT) + r"([\w.-]+)\b")
 _LAUNCHER_RE = re.compile(r"\bbash\s+((?:infrastructure|rag)/[\w./-]+\.sh)")
+# The second legitimate entry-point form: `python -m dotted.module`. A stage's
+# dry path is a property of its ENTRY POINT, not of the language it is written
+# in — EvalJudgeProcess is the first stage to use it (alpha-engine-config-I9329)
+# and AGENTS.md's "re-expressible as a Python CLI entry" makes it not the last.
+_MODULE_LAUNCHER_RE = re.compile(r"\bpython[\w.]*\s+-m\s+([A-Za-z_][\w.]*)")
+# Every stage wraps its real command in
+# `python -m krepis.ssm_log_capture run ... -- <real command>`, so the wrapper
+# itself matches _MODULE_LAUNCHER_RE. Its argv is stripped before the scan.
+_LOG_CAPTURE_MARKER = "ssm_log_capture"
+_ARGV_SEPARATOR = " -- "
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DEFINITION = REPO_ROOT / "infrastructure" / "step_function.json"
@@ -114,6 +124,11 @@ BOX_DIR_TO_REPO = {
     "alpha-engine-backtester": "nousergon/crucible-backtester",
     "alpha-engine-predictor": "nousergon/crucible-predictor",
     "alpha-engine-research": "nousergon/crucible-research",
+    # The DEDICATED eval-judge spot box clones under the repo's real name, not
+    # the legacy `alpha-engine-*` directory scheme the shared launcher box uses
+    # (alpha-engine-config-I9329). Two directory names, one repo: the mapping is
+    # dir -> repo and was never required to be injective.
+    "crucible-research": "nousergon/crucible-research",
     "alpha-engine-dashboard": "nousergon/crucible-dashboard",
     "alpha-engine-config": "nousergon/alpha-engine-config",
 }
@@ -177,11 +192,39 @@ def _box_dir(commands: list[str]) -> str | None:
     return None
 
 
+def _wrapped_payload(cmd: str) -> str:
+    """``cmd`` with ``krepis.ssm_log_capture``'s OWN argv stripped.
+
+    Load-bearing for the module form and only for it: the wrapper is itself a
+    ``python -m`` invocation, so an unstripped scan would name
+    ``krepis/ssm_log_capture.py`` as the launcher of every stage in the
+    pipeline. The shell form never had this problem — the wrapper is not
+    invoked with ``bash`` — which is why it is scanned against the raw command
+    and keeps its existing derivation exactly.
+    """
+    idx = cmd.find(_LOG_CAPTURE_MARKER)
+    if idx == -1:
+        return cmd
+    sep = cmd.find(_ARGV_SEPARATOR, idx)
+    return cmd[sep + len(_ARGV_SEPARATOR) :] if sep != -1 else cmd
+
+
 def _launcher(commands: list[str]) -> str | None:
+    """The repo-relative entry point the stage runs, in either legitimate form.
+
+    Both forms resolve to a repo-relative FILE, which is what lets the caller
+    apply the same two checks to each — present in the checkout, and implements
+    ``--preflight-only`` — with no branch on which form it was. The shell form
+    is tried first so no existing stage's derivation can change.
+    """
     for cmd in commands:
         m = _LAUNCHER_RE.search(cmd)
         if m:
             return m.group(1)
+    for cmd in commands:
+        m = _MODULE_LAUNCHER_RE.search(_wrapped_payload(cmd))
+        if m:
+            return m.group(1).replace(".", "/") + ".py"
     return None
 
 
