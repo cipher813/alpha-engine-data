@@ -148,6 +148,31 @@ STAGE_BUDGETS: dict[str, StageBudget] = {
         max_budget_seconds=21_600,  # config#2938 ruling 2: hard 6h cap
         pipeline_segment="branch_a",
     ),
+    # alpha-engine-config-I9329. EvalJudgeProcess became SSM-bearing on
+    # 2026-08-29 when the judge moved off a 900s Lambda onto a dedicated EC2
+    # spot: it covered 8-15 of an ~83-artifact corpus inside that ceiling,
+    # reported complete=False honestly, and returned SUCCESS.
+    #
+    # This stage does NOT scale with the ticker universe — it scales with the
+    # DECISION-ARTIFACT corpus, which is why per_ticker_cost_seconds is 0 and
+    # the whole budget sits in fixed_overhead_seconds. Recording it as a
+    # per-ticker cost would make the recommendation move with a number that
+    # has nothing to do with it.
+    #
+    # MEASURED (crucible-research-PR766, alpha-engine-config-I9309): 83
+    # artifacts at 45-105s per synchronous judge call = 60-145 minutes serial.
+    # 10800s (3h) is that worst case plus headroom for corpus growth. It is a
+    # budget, not an accommodation: coverage is a HARD failure by Brian's
+    # 2026-08-29 ruling, so a run that would exceed this must surface as a
+    # stage failure rather than be accommodated by a larger ceiling.
+    "EvalJudgeProcess": StageBudget(
+        name="EvalJudgeProcess",
+        current_timeout_seconds=10_800,
+        per_ticker_cost_seconds=0.0,
+        fixed_overhead_seconds=8_700,
+        max_budget_seconds=10_800,
+        pipeline_segment="branch_a",
+    ),
     "DataPhase2": StageBudget(
         name="DataPhase2",
         current_timeout_seconds=5_400,

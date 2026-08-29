@@ -177,6 +177,8 @@ _TIMEOUT_EXEMPT: dict[str, dict[str, str]] = {
         "WaitForSaturdayHealthCheck": "ssm:getCommandInvocation single poll — bounded by SaturdayHealthCheck's own executionTimeout",
         "WaitForWeeklySubstrateHealthCheck": "ssm:getCommandInvocation single poll — bounded by WeeklySubstrateHealthCheck's own executionTimeout",
         "WaitForWeeklyFreshnessSpotBootstrap": "ssm:getCommandInvocation single poll — bounded by DispatchWeeklyFreshnessSpot's own executionTimeout",
+        "ResearchPredictorParallel.WaitForEvalJudgeSpotBootstrap": "ssm:getCommandInvocation single poll — bounded by the eval-judge dispatcher's own 1800s bootstrap executionTimeout (alpha-engine-config-I9329)",
+        "ResearchPredictorParallel.WaitForEvalJudgeProcess": "ssm:getCommandInvocation single poll — bounded by EvalJudgeProcess' own 10800s executionTimeout (alpha-engine-config-I9329)",
         # s3:headObject / s3:putObject — single-object API call, sub-second.
         "ResearchPredictorParallel.ValidatePredictorSkipWeightsFresh": "s3:headObject freshness check — SDK call, not a wait",
         "WriteCompletionMarker": "s3:putObject completion marker — SDK call, not a wait (config#2857)",
@@ -538,7 +540,19 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
             "Same shared fold as EvalJudgeSubmitFirstSaturday (both route "
             "through MarkEvalJudgeDegraded)."
         ),
-        "ResearchPredictorParallel.EvalJudgePoll": (
+        # alpha-engine-config-I9329: EvalJudgePoll was deleted with the rest
+        # of the provider-batch poll chain; the three states below are the
+        # spot substrate that replaced it, and they fold through exactly the
+        # same shared marker.
+        "ResearchPredictorParallel.DispatchEvalJudgeSpot": (
+            "Same shared fold as EvalJudgeSubmitFirstSaturday (routes "
+            "through MarkEvalJudgeDegraded)."
+        ),
+        "ResearchPredictorParallel.WaitForEvalJudgeSpotBootstrap": (
+            "Same shared fold as EvalJudgeSubmitFirstSaturday (routes "
+            "through MarkEvalJudgeDegraded)."
+        ),
+        "ResearchPredictorParallel.WaitForEvalJudgeProcess": (
             "Same shared fold as EvalJudgeSubmitFirstSaturday (routes "
             "through MarkEvalJudgeDegraded)."
         ),

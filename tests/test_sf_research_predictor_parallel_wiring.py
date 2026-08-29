@@ -98,8 +98,22 @@ _BRANCH_A_STATES = {
     "CheckSkipDataPhase2", "DataPhase2", "CheckSkipEvalJudge",
     "ComputeEvalCadence", "CheckMonthlyCadence",
     "EvalJudgeSubmitFirstSaturday", "EvalJudgeSubmitWeekly",
-    "EvalJudgePollChoice", "EvalJudgePollWait", "EvalJudgePoll",
-    "EvalJudgePollDecision", "EvalJudgeProcess", "EvalRollingMean",
+    # alpha-engine-config-I9329: the four EvalJudgePoll* states were deleted
+    # with the provider batch API they existed to drive, and EvalJudgeProcess
+    # moved from lambda:invoke onto an ssm:sendCommand against a dedicated
+    # spot box. The dispatch + two poll loops below are what replaced them.
+    "EvalJudgeSubmitOutcome", "EvalJudgeEmptyPlan",
+    "PrepareEvalJudgeSpotDispatch", "DispatchEvalJudgeSpot",
+    "MergeEvalJudgeSpotInstanceId", "InitEvalJudgeSpotBootstrapPollCount",
+    "WaitForEvalJudgeSpotBootstrap", "CheckEvalJudgeSpotBootstrapStatus",
+    "EvalJudgeSpotBootstrapWait", "EvalJudgeSpotBootstrapPollWait",
+    "MergeEvalJudgeSpotBootstrapPollCount", "EvalJudgeSpotBootstrapLivenessGate",
+    "ExtractEvalJudgeSpotBootstrapError", "EvalJudgeSpotRelaunch",
+    "EvalJudgeProcess", "InitEvalJudgeProcessPollCount",
+    "WaitForEvalJudgeProcess", "CheckEvalJudgeProcessStatus",
+    "EvalJudgeProcessWait", "EvalJudgeProcessPollWait",
+    "MergeEvalJudgeProcessPollCount", "EvalJudgeProcessLivenessGate",
+    "ExtractEvalJudgeProcessError", "EvalRollingMean",
     "CheckSkipRationaleClustering", "RationaleClustering",
     "CheckSkipReplayConcordance", "ReplayConcordance",
     "CheckSkipCounterfactual", "Counterfactual", "ExtractSignalsEnvelopeError",
@@ -349,13 +363,38 @@ class TestBranchAContents:
         assert branch_a["SetDataPhase2ExhaustedError"]["ResultPath"] == "$.error"
         assert branch_a["SetDataPhase2ExhaustedError"]["Parameters"]["phase"] == "DataPhase2"
 
-    def test_eval_judge_quartet_preserved(self, branch_a):
-        assert branch_a["EvalJudgePollChoice"]["Type"] == "Choice"
-        assert branch_a["EvalJudgePollWait"]["Type"] == "Wait"
-        assert branch_a["EvalJudgePollWait"]["Next"] == "EvalJudgePoll"
-        assert (
-            branch_a["EvalJudgePoll"]["Next"] == "EvalJudgePollDecision"
-        )
+    def test_the_eval_judge_poll_chain_is_gone(self, branch_a):
+        """alpha-engine-config-I9329, verified RED against pre-fix code.
+
+        Submit -> Poll -> Process existed to drive an ASYNCHRONOUS provider
+        batch API. That API is retired (alpha-engine-config-I9263), and with no
+        batch rung there is nothing to poll: poll_batch returned terminal
+        immediately for both synthetic id prefixes, so the states could only
+        ever fall straight through — a reader's trap.
+        """
+        stale = sorted(n for n in branch_a if n.startswith("EvalJudgePoll"))
+        assert not stale, f"EvalJudgePoll* states still present: {stale}"
+
+    def test_eval_judge_process_is_a_send_command_stage_on_its_own_box(
+        self, branch_a
+    ):
+        """The stage KEEPS its name and changes its substrate. The name is
+        load-bearing: eval_artifact_latest.produced_by names EvalJudgeProcess,
+        AggregateCosts.required_producers keys on it, and the stage-coverage
+        registry has a row for it."""
+        st = branch_a["EvalJudgeProcess"]
+        assert st["Resource"] == "arn:aws:states:::aws-sdk:ssm:sendCommand"
+        # Its OWN box, never the shared weekly launcher: a judge that filled
+        # that disk or OOM'd would take down every other stage addressing
+        # $.ec2_instance_id.
+        assert st["Parameters"]["InstanceIds.$"] == "$.eval_judge_instance_id"
+        assert "$.ec2_instance_id" not in json.dumps(st)
+        # executionTimeout STRICTLY below TimeoutSeconds — the inverse of the
+        # lambda:invoke rule (alpha-engine-config-I6948). Inverted, the state
+        # abandons a command SF cannot cancel and the spot keeps billing.
+        assert int(st["Parameters"]["Parameters"]["executionTimeout"][0]) < st[
+            "TimeoutSeconds"
+        ]
 
 
 class TestBranchBContents:

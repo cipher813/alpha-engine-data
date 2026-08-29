@@ -62,9 +62,14 @@ def _gate_scopes():
                 # *LivenessGate states are deliberately excluded here: they add
                 # a substrate-loss branch WITHOUT a bounded re-issue (config#6938
                 # — the box those stages address is the shared launcher, so a
-                # re-issue could not help). The gate tests below are about the
-                # re-issue contract; the no-gate test further down covers both
-                # kinds.
+                # re-issue could not help). alpha-engine-config-I9329 added a
+                # THIRD member of that family with a stronger answer: the
+                # eval-judge gates address a DEDICATED ephemeral box, so on
+                # substrate loss they launch a NEW one rather than giving up —
+                # still never a re-issue to a dead id, which is the only thing
+                # the tests below assert. The gate tests here are about the
+                # re-issue contract; the no-gate test further down covers every
+                # kind.
                 yield name, state, scope
 
 

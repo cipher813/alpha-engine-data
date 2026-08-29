@@ -135,11 +135,15 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "EvalJudgeSubmitWeekly": frozenset(
         {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days"}
     ),
-    "EvalJudgePoll": frozenset(
-        {"batch_id.$", "dry_run_llm.$", "max_wait_seconds", "submit_iso.$"}
-    ),
-    "EvalJudgeProcess": frozenset(
-        {"batch_id.$", "dry_run_llm.$", "plan_s3_key.$"}
+    # alpha-engine-config-I9329: EvalJudgePoll and EvalJudgeProcess both left
+    # this registry, for different reasons. Poll was DELETED with the provider
+    # batch API it existed to drive (-I9263). Process still exists and keeps
+    # its name, but it is no longer a lambda:invoke at all — it is an
+    # ssm:sendCommand, so it has no Payload for this registry to close over;
+    # its command string is pinned by tests/test_sf_eval_judge_wiring.py
+    # instead. The dispatcher that launches its box is the new Lambda here.
+    "DispatchEvalJudgeSpot": frozenset(
+        {"execution_id.$", "run_date.$", "pipeline_role", "force_on_demand.$"}
     ),
     "EvalRollingMean": frozenset({"end_time_iso.$"}),
     "RationaleClustering": frozenset({"dry_run_llm.$", "end_time_iso.$"}),
