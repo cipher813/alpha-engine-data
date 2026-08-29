@@ -17,7 +17,7 @@
 # crucible-evaluator/requirements.txt's `krepis[...]==` line). 0.59.38 is
 # krepis's released head at the time of this pin (verified: `git rev-parse
 # v0.59.38^{}` == `origin/main` on nousergon/krepis) and the exact version
-# this lambda's test_handler.py was run against (`pip install krepis==0.59.38`
+# this lambda's test_handler.py was run against (`pip install krepis==0.59.41`
 # into a clean venv, 28/28 passed) — not merely a floor assumed to resolve to
 # something tested.
-krepis==0.59.38
+krepis==0.59.41

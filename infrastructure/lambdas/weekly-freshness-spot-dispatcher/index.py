@@ -419,7 +419,7 @@ python3.12 -m venv .venv || fail "data venv create failed"
 # Keep the dispatch box on the same released contract as its packaged Lambda.
 # A floor here would let a later bootstrap resolve a pre-I8155 stage-coverage
 # implementation even though the repository pin has already moved.
-.venv/bin/pip install -q 'krepis==0.59.31' || fail "data krepis install failed"
+.venv/bin/pip install -q 'krepis==0.59.41' || fail "data krepis install failed"
 chown -R ec2-user:ec2-user /home/ec2-user/alpha-engine-data/.venv || fail "data venv chown failed"
 trap - EXIT
 aws s3 cp {log} "{s3_log}" --region {REGION} --quiet || true
