@@ -57,7 +57,11 @@ source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 # lambda's tests stub boto3 in sys.modules, and the helper's contract is that
 # such a caller must NOT get boto3 installed alongside the stub.
 source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
-run_handler_tests "${SCRIPT_DIR}"
+# `boto3`: test_handler.py imports it at module scope. Not yet observed red
+# only because this workflow has not fired since the gate was wired; caught
+# by executing the gate on a bare interpreter rather than a laptop that
+# already has boto3 (alpha-engine-config-I9114 sweep).
+run_handler_tests "${SCRIPT_DIR}" boto3
 
 # ----- 0. Validate handler syntax -------------------------------------------
 

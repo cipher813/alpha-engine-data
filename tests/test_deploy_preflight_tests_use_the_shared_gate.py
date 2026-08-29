@@ -52,22 +52,22 @@ _DECLARED_CARVE_OUTS = {
     "changelog-cloudwatch-mirror",
 }
 
-# Two lambdas are KNOWN-UNGATED and deliberately not fixed in the change that
-# introduced this test. Each is tracked, each has a named reason, and this set
-# must shrink — it is a debt register, not a permanent exemption. An entry
-# whose issue is closed and whose gate is still missing is itself a finding.
+# A debt register, not a permanent exemption: each entry is tracked, each has a
+# named reason, and the set must shrink. An entry whose issue is closed and whose
+# gate is still missing is itself a finding.
 #
-#   thinktank-spot-dispatcher       — its deploy.sh is a separate dialect: it
-#     sources none of the _shared helpers and hand-rolls its own IAM with the
-#     very `get-role >/dev/null 2>&1 || create-role` misclassification the
-#     shared applier was fixed for. Wiring only the test gate would leave the
-#     larger defect in place and imply it had been reviewed.
-#     Tracked: alpha-engine-config-I9114.
+#   thinktank-spot-dispatcher — REMOVED 2026-08-28 (alpha-engine-config-I9114).
+#     Its deploy.sh was the one private dialect in this repo — bare `aws` calls,
+#     a host-arch `pip install --target`, no handler-test gate, and a hand-rolled
+#     `get-role >/dev/null 2>&1 || create-role` IAM block carrying the exact
+#     misclassification the shared applier had just been fixed for. It is now
+#     migrated onto deploy_run.sh / run_handler_tests.sh / apply_iam_policy.sh,
+#     and tests/test_thinktank_deploy_uses_shared_helpers.py EXECUTES the result
+#     against a fake `aws` to prove the code-only path reaches no IAM write.
 #   weekly-freshness-spot-dispatcher — nousergon-data#1562 (draft) is editing
 #     this exact deploy.sh; a second concurrent edit to it would collide.
 #     Tracked: alpha-engine-config-I9115.
 _TRACKED_UNGATED = {
-    "thinktank-spot-dispatcher",
     "weekly-freshness-spot-dispatcher",
 }
 
@@ -150,11 +150,11 @@ def test_a_lambda_with_handler_tests_actually_runs_them() -> None:
 
 
 def test_the_ungated_debt_register_does_not_grow_silently() -> None:
-    """`_TRACKED_UNGATED` is a debt register with two named, tracked entries.
+    """`_TRACKED_UNGATED` is a debt register of named, tracked entries.
     It must shrink, never grow — and an entry that has since been GATED must be
     removed from it, or the exemption outlives the debt and starts hiding a
     regression on the same lambda."""
-    assert len(_TRACKED_UNGATED) <= 2, (
+    assert len(_TRACKED_UNGATED) <= 1, (
         "the ungated-lambda exemption list grew. A new lambda shipping without "
         "its preflight gate is the defect this file exists to stop; add the "
         "gate rather than an exemption."
