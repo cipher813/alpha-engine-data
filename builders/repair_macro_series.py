@@ -46,6 +46,7 @@ from builders._price_cache_writeboth import (
     price_cache_read_prefixes,
     price_cache_write_prefixes,
 )
+from collectors.daily_closes import _FRED_INDEX_MAP
 from collectors.prices import _CARET_SYMBOLS
 from store.arctic_store import DEFAULT_BUCKET, get_macro_lib
 
@@ -62,8 +63,8 @@ def _yf_symbol(symbol: str) -> str:
     return f"^{symbol}" if symbol in _CARET_SYMBOLS else symbol
 
 
-def fetch_full_history(symbol: str, period: str = DEFAULT_FETCH_PERIOD) -> pd.DataFrame:
-    """Fetch ``period`` of daily OHLCV for ``symbol``. Raises on an empty answer."""
+def _fetch_yfinance(symbol: str, period: str = DEFAULT_FETCH_PERIOD) -> pd.DataFrame:
+    """Fetch ``period`` of daily OHLCV for ``symbol`` from yfinance."""
     import yfinance as yf
 
     from nousergon_lib.yfinance_quiet import yf_quiet
@@ -97,6 +98,79 @@ def fetch_full_history(symbol: str, period: str = DEFAULT_FETCH_PERIOD) -> pd.Da
     if out.empty:
         raise RuntimeError(f"Repair fetch for {symbol} produced an empty frame after cleaning")
     return out
+
+
+def _fetch_fred(symbol: str, period: str = DEFAULT_FETCH_PERIOD) -> pd.DataFrame:
+    """Fetch full history for an index ticker from FRED.
+
+    The four index tickers (``VIX``/``VIX3M``/``TNX``/``IRX``) already have a
+    declared FRED series in ``collectors/daily_closes.py::_FRED_INDEX_MAP`` —
+    that is how ``daily_closes`` gets their DAILY bar, since they are not on
+    polygon. FRED is therefore the canonical, non-yfinance source for exactly
+    these symbols, which matters here: measured 2026-08-29, yfinance answers a
+    ``^VIX3M`` 10y request with 2484 rows from a laptop and **1 row** from an
+    EC2 host in us-east-1 — and the weekly collector runs on EC2.
+    """
+    from collectors.fred_history import fetch_fred_history
+
+    series_id = _FRED_INDEX_MAP.get(symbol)
+    if series_id is None:
+        raise RuntimeError(f"No FRED series declared for {symbol} in _FRED_INDEX_MAP")
+    years = int(period.rstrip("y")) if period.endswith("y") and period[:-1].isdigit() else 10
+    fred_df = fetch_fred_history(series_id, period_years=years)
+    val = fred_df["value"].astype(float)
+    out = pd.DataFrame(
+        {"Open": val, "High": val, "Low": val, "Close": val, "Volume": 0},
+        index=pd.to_datetime(fred_df.index).normalize(),
+    )
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    out.index.name = "date"
+    if out.empty:
+        raise RuntimeError(f"FRED fetch for {symbol} ({series_id}) returned no rows")
+    return out
+
+
+def fetch_full_history(
+    symbol: str,
+    period: str = DEFAULT_FETCH_PERIOD,
+    source: str = "auto",
+) -> pd.DataFrame:
+    """Fetch full history for ``symbol``, taking the LONGEST answer available.
+
+    ``source="auto"`` (default) queries yfinance and, for symbols with a
+    declared FRED series, FRED as well, and keeps whichever returned more rows.
+    That is deliberate rather than a preference order: the failure this repairs
+    is a source silently answering short, so the repair must never depend on one
+    source being healthy. Every attempt that fails is reported; only ALL of them
+    failing raises.
+    """
+    attempts: list[tuple[str, pd.DataFrame]] = []
+    errors: list[str] = []
+
+    wanted = []
+    if source in ("auto", "yfinance"):
+        wanted.append(("yfinance", _fetch_yfinance))
+    if source in ("auto", "fred") and symbol in _FRED_INDEX_MAP:
+        wanted.append(("fred", _fetch_fred))
+    if not wanted:
+        raise RuntimeError(f"No usable source for {symbol} with source={source!r}")
+
+    for name, fn in wanted:
+        try:
+            df = fn(symbol, period)
+        except Exception as exc:  # noqa: BLE001 - every failure is reported below
+            errors.append(f"{name}: {exc}")
+            continue
+        log.info("%s: %s returned %d rows (%s -> %s)",
+                 symbol, name, len(df), df.index.min().date(), df.index.max().date())
+        attempts.append((name, df))
+
+    if not attempts:
+        raise RuntimeError(f"All sources failed for {symbol}: {'; '.join(errors)}")
+
+    best_name, best = max(attempts, key=lambda kv: len(kv[1]))
+    log.info("%s: using %s (%d rows)", symbol, best_name, len(best))
+    return best
 
 
 def union_no_shrink(existing: pd.DataFrame | None, fetched: pd.DataFrame, label: str) -> pd.DataFrame:
@@ -146,13 +220,14 @@ def repair_symbol(
     bucket: str = DEFAULT_BUCKET,
     s3_prefix: str = "predictor/price_cache/",
     period: str = DEFAULT_FETCH_PERIOD,
+    source: str = "auto",
     dry_run: bool = False,
 ) -> dict:
     """Repair one macro symbol end to end. Returns a per-symbol result dict."""
     s3 = boto3.client("s3")
     macro_lib = get_macro_lib(bucket)
 
-    fetched = fetch_full_history(symbol, period=period)
+    fetched = fetch_full_history(symbol, period=period, source=source)
 
     existing_pq = _read_parquet(s3, bucket, s3_prefix, symbol)
     pq_before = 0 if existing_pq is None else len(existing_pq)
@@ -214,6 +289,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bucket", default=DEFAULT_BUCKET)
     parser.add_argument("--s3-prefix", default="predictor/price_cache/")
     parser.add_argument("--period", default=DEFAULT_FETCH_PERIOD)
+    parser.add_argument("--source", default="auto", choices=["auto", "yfinance", "fred"],
+                        help="auto (default) takes the LONGEST of yfinance and FRED")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
@@ -226,6 +303,7 @@ def main(argv: list[str] | None = None) -> int:
             bucket=args.bucket,
             s3_prefix=args.s3_prefix,
             period=args.period,
+            source=args.source,
             dry_run=args.dry_run,
         )
         log.info("repair %s: %s", symbol, json.dumps(res, default=str))
