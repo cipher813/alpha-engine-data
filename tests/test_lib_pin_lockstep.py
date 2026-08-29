@@ -248,39 +248,60 @@ def test_lambda_pins_match_or_are_explicitly_exempted():
 
 
 # --------------------------------------------------------------------------- #
-# Tier→model conformance floor (groom-sweep-policy §2.3 / §5).
+# Tier→GROUP conformance floor (groom-sweep-policy §2.3 / §5; superseded by
+# alpha-engine-config-I9297 — see below).
 #
-# The groom dispatcher's launch decisions come from the *pinned lib*, not from
-# the Lambda's own code — `nousergon_lib.groom_eligibility.TIER_MODELS` is the
-# single owner of the tier→model assignment. So the policy's tier table is only
-# true in production if the pinned lib is new enough to contain it.
+# alpha-engine-config-I9297 (Brian ruling 2026-08-29: "the entire nous ergon
+# system should now be running through the krepis router"): the groom
+# dispatcher's launch decisions still come from the *pinned lib*, not from
+# the Lambda's own code, but `nousergon_lib.groom_eligibility.TIER_MODELS`
+# (a hardcoded tier -> VENDOR MODEL ID table, one of five hand-kept copies
+# fleet-wide) is RETIRED. `ge.SlotDecision` now carries `.model_group` — a
+# krepis registry GROUP name ("low"/"med"/"high"), resolved via
+# `krepis.router.group_for_tier` (the ONE tier->group mapping, fleet-wide) —
+# never a vendor model id. This Lambda's `index.py` reads `.model_group`
+# directly (AttributeError against any pin predating it), so the floor this
+# test enforces is no longer "does the pin know the DeepSeek migration" but
+# "does the pin carry the model_group contract this Lambda's own code now
+# requires unconditionally".
 # --------------------------------------------------------------------------- #
 
-#: First nousergon-lib release where TIER_MODELS["high"] == "deepseek-v4-pro"
-#: (nousergon-lib#252). Below this, live high-tier grooms dispatch claude-sonnet-5,
-#: violating groom-sweep-policy §5 (tier table) and §7 (no Claude for groom traffic).
-_TIER_MODEL_FLOOR = (0, 124, 16)
+#: First nousergon-lib release carrying `SlotDecision.model_group`
+#: (replacing `.model`) — alpha-engine-config-I9297. PREDICTED: main is at
+#: v0.124.97 as of this PR; the nousergon-lib PR implementing I9297 is not
+#: yet merged, so this assumes it is the NEXT release with no other merge
+#: landing first (mirrors the v0.124.36/PR#290 precedent above — re-verify
+#: against `git -C nousergon-lib tag --sort=-v:refname | head -1` once the
+#: nousergon-lib PR merges and correct this + every lockstep pin file if it
+#: drifted). Below this, `index.py`'s `d.model_group` reads raise
+#: AttributeError against the pinned lib — this is a hard runtime
+#: dependency, not a soft policy floor.
+_MODEL_GROUP_FLOOR = (0, 124, 98)
 
 
 def _version_tuple(pin: str) -> tuple[int, int, int]:
     return tuple(int(part) for part in pin.lstrip("v").split("."))
 
 
-def test_groom_dispatcher_pin_can_express_the_policy_tier_table():
-    """The dispatcher must bundle a lib new enough to know high == deepseek-v4-pro.
+def test_groom_dispatcher_pin_can_express_the_model_group_contract():
+    """The dispatcher must bundle a lib new enough to expose
+    `SlotDecision.model_group` (alpha-engine-config-I9297).
 
-    This is the check groom-sweep-policy §2.3 demands for the §5 tier table: it
-    fails if the pin regresses below the release that carries the assignment,
-    however that regression happens (manual edit, revived exemption, bad merge).
+    Re-expresses the retired TIER_MODELS/deepseek-v4-pro floor check above
+    against the new contract — the tier→model TABLE concept it verified is
+    gone (superseded by krepis.router.group_for_tier), but a floor here is
+    still meaningful: index.py's own code now depends on `.model_group`
+    existing, so a pin below this floor is a hard AttributeError at runtime,
+    not a policy violation.
     """
     pin = _read_pin(
         "infrastructure/lambdas/scheduled-groom-dispatcher/requirements.txt",
         _LAMBDA_PIN_RE,
     )
-    assert _version_tuple(pin) >= _TIER_MODEL_FLOOR, (
+    assert _version_tuple(pin) >= _MODEL_GROUP_FLOOR, (
         f"scheduled-groom-dispatcher pins nousergon-lib {pin}, which predates "
-        f"TIER_MODELS['high'] = 'deepseek-v4-pro'. Live complexity:high grooms "
-        f"would dispatch claude-sonnet-5, violating groom-sweep-policy §5 and §7."
+        f"SlotDecision.model_group (alpha-engine-config-I9297). index.py's "
+        f"d.model_group reads would AttributeError against this pin."
     )
 
 

@@ -24,12 +24,14 @@ from pathlib import Path
 
 import pytest
 
-# groom-sweep-policy §2.3: `nousergon_lib.groom_eligibility.TIER_MODELS` is the
-# SINGLE OWNER of the tier->model assignment. Derive expectations from it rather
-# than restating the model names here — a second hardcoded copy is exactly how
-# this Lambda came to dispatch claude-sonnet-5 for the high tier for days after
-# v0.124.16 moved it to deepseek-v4-pro (alpha-engine-config-I4796).
-from nousergon_lib.groom_eligibility import TIER_MODELS
+# alpha-engine-config-I9297 (Brian ruling 2026-08-29): the tier->model TABLE
+# this comment used to describe (`nousergon_lib.groom_eligibility.TIER_MODELS`)
+# is retired — a decided run now carries a krepis registry GROUP
+# (`SlotDecision.model_group`), resolved via `krepis.router.group_for_tier`,
+# the ONE tier->group mapping fleet-wide. Derive expectations from it rather
+# than restating group names here — a second hardcoded copy is exactly how
+# this Lambda drifted before (alpha-engine-config-I4796, pre-fix).
+from krepis.router import group_for_tier
 
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -964,18 +966,19 @@ def test_demand_gate_skips_light_queue_with_zero_launch(monkeypatch):
 
 def test_demand_gate_bundles_and_downgrades_model(monkeypatch):
     # high slot, no high issues, starving low+mid -> ONE box at the highest
-    # present tier's model (mid=deepseek-v4-flash in v0.124.15). decide_slot
-    # bundling logic unchanged; only TIER_MODELS changed.
+    # present tier's registry GROUP (mid's group). decide_slot bundling logic
+    # unchanged; only the tier->model TABLE was replaced by tier->group
+    # resolution (alpha-engine-config-I9297).
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     _stub_stats(monkeypatch, idx, {"low": 5, "mid": 6, "high": 0})
     out = idx.handler({"run_mode": "full", "model": "claude-sonnet-5",
                        "issue_filter": "high-only", "schedule": "0 1 * * *"}, None)
     g = out["groom"]
     assert g["launched"] and g["issue_filter"] == "mid+low"
-    assert g["model"] == "deepseek-v4-flash"
+    assert g["model"] == group_for_tier("mid")
     cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
     assert "export GROOM_ISSUE_FILTER=mid+low" in cmd
-    assert "export GROOM_MODEL=deepseek-v4-flash" in cmd
+    assert f"export GROOM_MODEL={group_for_tier('mid')}" in cmd
 
 
 def test_demand_gate_full_queues_run_own_tier(monkeypatch):
@@ -1057,11 +1060,12 @@ def test_symmetric_trigger_brians_8_9_10_launches_three_boxes(monkeypatch):
     g = out["groom"]
     assert g["trigger"] == "demand-all"
     launched = {(l["issue_filter"], l["model"]) for l in g["launches"]}
-    # Every tier launches independently at its OWN tier's model, read from the
-    # lib that owns the assignment (groom-sweep-policy §5 tier table).
-    assert launched == {("high-only", TIER_MODELS["high"]),
-                        ("mid-only", TIER_MODELS["mid"]),
-                        ("low-only", TIER_MODELS["low"])}
+    # Every tier launches independently at its OWN tier's registry group,
+    # resolved via krepis.router.group_for_tier (alpha-engine-config-I9297,
+    # the ONE tier->group mapping fleet-wide).
+    assert launched == {("high-only", group_for_tier("high")),
+                        ("mid-only", group_for_tier("mid")),
+                        ("low-only", group_for_tier("low"))}
     cmds = [c["Parameters"]["commands"][0] for c in idx._test_ssm.sent]
     assert len(cmds) == 3
     # config#2201: groom boxes are pure issue-coverage workers — the
@@ -1084,14 +1088,14 @@ def test_symmetric_trigger_all_tiers_launch_when_any_issues(monkeypatch):
     issue_filters = {l["issue_filter"] for l in launches}
     assert issue_filters == {"low-only", "mid-only", "high-only"}
     models = {l["model"] for l in launches}
-    assert models == {TIER_MODELS["low"], TIER_MODELS["mid"], TIER_MODELS["high"]}
+    assert models == {group_for_tier("low"), group_for_tier("mid"), group_for_tier("high")}
     assert len(idx._test_ssm.sent) == 3
 
 
 def test_symmetric_trigger_separate_boxes_no_bundling(monkeypatch):
     # groom-primary-deepseek (v0.124.15): no thin-tier bundling — low=5
-    # launches its own low-only box (deepseek-v4-flash), mid=6 launches its
-    # own mid-only box (deepseek-v4-flash). high=0 is skipped.
+    # launches its own low-only box (its own registry group), mid=6 launches
+    # its own mid-only box (its own registry group). high=0 is skipped.
     idx = _load(monkeypatch, env={"GROOM_DISPATCH_ENABLED": "true"})
     _stub_fresh_stats(monkeypatch, idx, {"low": 5, "mid": 6, "high": 0})
     out = idx.handler(_demand_event(), None)
@@ -1099,8 +1103,10 @@ def test_symmetric_trigger_separate_boxes_no_bundling(monkeypatch):
     assert len(ls) == 2
     issue_filters = {l["issue_filter"] for l in ls}
     assert issue_filters == {"low-only", "mid-only"}
-    for l in ls:
-        assert l["model"] == "deepseek-v4-flash"
+    by_filter = {l["issue_filter"]: l for l in ls}
+    assert by_filter["low-only"]["model"] == group_for_tier("low")
+    assert by_filter["mid-only"]["model"] == group_for_tier("mid")
+
 
 
 def test_symmetric_trigger_skips_on_enumeration_error(monkeypatch):
@@ -1178,7 +1184,7 @@ def test_decide_only_single_tier_returns_one_launch(monkeypatch):
                        "issue_filter": "mid-only", "schedule": "0 7 * * *",
                        "decide_only": True}, None)
     d = out["decide"]
-    assert d["launches"] == [{"model": "deepseek-v4-flash", "issue_filter": "mid-only"}]
+    assert d["launches"] == [{"model": group_for_tier("mid"), "issue_filter": "mid-only"}]
     assert idx._test_ssm.sent == []
 
 
@@ -2307,7 +2313,7 @@ def test_decide_only_single_tier_includes_backend_when_armed(monkeypatch):
                        "issue_filter": "mid-only", "schedule": "0 7 * * *",
                        "decide_only": True}, None)
     assert out["decide"]["launches"] == [
-        {"model": "deepseek-v4-flash", "issue_filter": "mid-only", "backend": "deepseek"}
+        {"model": group_for_tier("mid"), "issue_filter": "mid-only", "backend": "deepseek"}
     ]
     assert idx._test_ssm.sent == []
 
