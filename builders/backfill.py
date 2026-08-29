@@ -252,6 +252,122 @@ def _existing_last_date(lib, symbol: str) -> "pd.Timestamp | None":
     return last.normalize()
 
 
+# History-truncation tolerance for the macro/sector regression preflight.
+# A legitimate source restatement can drop a handful of rows (a vendor
+# correcting bad prints, a holiday reclassification). Losing more than this
+# many rows, or moving the series' FIRST date forward at all, is a producer
+# defect — see alpha-engine-config-I9256: ``VIX3M`` went 2509 rows ->
+# 16 rows across two consecutive Saturday backfills (2026-08-22 10:42 UTC
+# and 2026-08-29 10:48 UTC) because a 1-row ``reference/price_cache/
+# VIX3M.parquet`` was written wholesale over a 10y ArcticDB series. The
+# pre-existing preflight compared LAST DATE only, so a series that keeps
+# today's date while losing 2493 rows of history passed clean.
+_MACRO_HISTORY_SHRINK_TOLERANCE_ROWS = 5
+
+
+def _series_row_span(series_or_df) -> "tuple[int, pd.Timestamp | None]":
+    """``(n_rows, first_date)`` for a planned Series/DataFrame."""
+    if series_or_df is None:
+        return 0, None
+    idx = series_or_df.index
+    if idx is None or len(idx) == 0:
+        return 0, None
+    first = pd.Timestamp(idx[0])
+    if first.tzinfo is not None:
+        first = first.tz_convert("UTC").tz_localize(None)
+    return len(idx), first.normalize()
+
+
+def _existing_row_span(lib, symbol: str) -> "tuple[int, pd.Timestamp | None]":
+    """``(n_rows, first_date)`` for an existing ArcticDB symbol.
+
+    Returns ``(0, None)`` when the symbol does not exist yet — a first write
+    is never a regression. Any OTHER read failure RAISES: silently treating an
+    unreadable symbol as absent is exactly how a truncating write gets waved
+    through (fail-loud rule, AGENTS.md "no silent degrade on a producer").
+    """
+    try:
+        df = lib.read(symbol).data
+    except Exception as exc:
+        if _symbol_absent(lib, symbol):
+            return 0, None
+        raise RuntimeError(
+            f"Macro history guard: could not read existing ArcticDB symbol "
+            f"{symbol!r} to check for truncation: {exc}"
+        ) from exc
+    if df is None or df.empty:
+        return 0, None
+    first = pd.Timestamp(df.index[0])
+    if first.tzinfo is not None:
+        first = first.tz_convert("UTC").tz_localize(None)
+    return len(df), first.normalize()
+
+
+def _symbol_absent(lib, symbol: str) -> bool:
+    """True when ``symbol`` genuinely does not exist in ``lib``."""
+    try:
+        return not lib.has_symbol(symbol)
+    except Exception:
+        try:
+            return symbol not in set(lib.list_symbols())
+        except Exception:
+            return False
+
+
+def _history_regression(
+    label: str,
+    planned,
+    existing_rows: int,
+    existing_first: "pd.Timestamp | None",
+) -> "str | None":
+    """Return a human-readable regression string, or None when the write is safe."""
+    planned_rows, planned_first = _series_row_span(planned)
+    if existing_rows == 0:
+        return None
+    if planned_rows < existing_rows - _MACRO_HISTORY_SHRINK_TOLERANCE_ROWS:
+        return (
+            f"{label}: planned_rows={planned_rows} < existing_rows={existing_rows} "
+            f"(tolerance {_MACRO_HISTORY_SHRINK_TOLERANCE_ROWS})"
+        )
+    if (
+        planned_first is not None
+        and existing_first is not None
+        and planned_first > existing_first
+    ):
+        return (
+            f"{label}: planned_first={planned_first.date()} > "
+            f"existing_first={existing_first.date()} (history start moved forward)"
+        )
+    return None
+
+
+def _write_macro_series_no_shrink(lib, symbol: str, df: "pd.DataFrame") -> None:
+    """Write a full macro series, REFUSING any write that would truncate it.
+
+    The write boundary is the last line of defence: ``_assert_no_arctic_regression``
+    runs once per backfill over the planned frames, but the per-ticker
+    ``--rebuild-macro`` override and any future call site reach the library
+    directly. A wholesale ``lib.write()`` is destructive — ArcticDB keeps prior
+    versions, but every reader sees the truncated head immediately and the
+    predictor's ``dropna()`` turns one short optional column into a total loss
+    of the regime frame (alpha-engine-config-I9255 / I9256).
+
+    Raises RuntimeError rather than degrading: a producer that has lost its
+    own history must page, not publish.
+    """
+    existing_rows, existing_first = _existing_row_span(lib, symbol)
+    regression = _history_regression(f"macro.{symbol}", df, existing_rows, existing_first)
+    if regression is not None:
+        raise RuntimeError(
+            "Macro write refused — it would TRUNCATE an existing series. "
+            f"{regression}. Source is the price_cache parquet + daily_closes delta; "
+            "check reference/price_cache/"
+            f"{symbol}.parquet row count before re-running. "
+            "See alpha-engine-config-I9256."
+        )
+    lib.write(symbol, df)
+
+
 def _assert_no_arctic_regression(
     bucket: str,
     planned_macro: dict[str, "pd.Series"],
@@ -301,12 +417,18 @@ def _assert_no_arctic_regression(
     for key, series in planned_macro.items():
         planned_last = _planned_last_date(series)
         existing_last = _existing_last_date(macro_lib, key)
-        if planned_last is None or existing_last is None:
-            continue
-        if planned_last < existing_last:
+        if planned_last is not None and existing_last is not None and planned_last < existing_last:
             regressions.append(
                 f"macro.{key}: planned={planned_last.date()} < existing={existing_last.date()}"
             )
+        # HISTORY-length regression (alpha-engine-config-I9256). The last-date
+        # check above is blind to a series that still ends today but has lost
+        # every row before last month — which is exactly how VIX3M went from
+        # 2509 rows to 16 while passing this preflight clean twice.
+        existing_rows, existing_first = _existing_row_span(macro_lib, key)
+        hist = _history_regression(f"macro.{key}", series, existing_rows, existing_first)
+        if hist is not None:
+            regressions.append(hist)
 
     try:
         arctic_syms = set(universe_lib.list_symbols())
@@ -796,14 +918,18 @@ def backfill(
                 if series is not None:
                     macro_series_df = pd.DataFrame({"Close": series}, index=series.index)
                     macro_series_df.index.name = "date"
-                    macro_lib.write(key, to_arctic_safe(macro_series_df))
+                    _write_macro_series_no_shrink(
+                        macro_lib, key, to_arctic_safe(macro_series_df)
+                    )
 
             # Write sector ETFs
             for key in macro:
                 if key.startswith("XL"):
                     sector_df = pd.DataFrame({"Close": macro[key]}, index=macro[key].index)
                     sector_df.index.name = "date"
-                    macro_lib.write(key, to_arctic_safe(sector_df))
+                    _write_macro_series_no_shrink(
+                        macro_lib, key, to_arctic_safe(sector_df)
+                    )
 
     # ── 5b. Factor-momentum second pass (W2.3, L4469) ────────────────────────
     # ``factor_momentum_ratio`` is a cross-sectional-time-series feature: date
