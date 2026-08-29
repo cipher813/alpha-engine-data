@@ -108,6 +108,23 @@ ast.parse(src)
 print('index.py syntax OK')
 "
 
+# A syntax check is not a preflight: it proves index.py parses, not that the
+# handler still behaves. Through the SHARED helper so this gate cannot re-drift
+# into the naive no-install form (config#2381, after the config#2295 incident).
+# shellcheck source=infrastructure/lambdas/_shared/run_handler_tests.sh
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+# krepis ONLY, and it is the MEASURED set, not a reasoned one (bare interpreter,
+# 2026-08-29: 15/15 pass with krepis alone). test_handler.py stubs
+# nousergon_lib + nousergon_lib.spot_dispatch in sys.modules, but imports
+# krepis.spot_bootstrap FOR REAL because the rendered bootstrap is the thing
+# under test. Passing NOUSERGON_LIB_REQ too would re-pull the heavy git-only
+# dependency on every redeploy to satisfy a module the tests replace — the
+# minimal-set half of the helper's declared deploy.sh-vs-ci.yml contract. boto3
+# is deliberately absent: the helper never installs it implicitly, and index.py
+# reaches AWS only through the stubbed spot_dispatch chokepoint.
+KREPIS_REQ=$(grep -E '^krepis' "${SCRIPT_DIR}/requirements.txt" | head -1)
+run_handler_tests "${SCRIPT_DIR}" "${KREPIS_REQ}"
+
 # ----- 1. Package: pip install deps (Lambda-safe) + zip handler --------------
 
 LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -135,27 +152,16 @@ if $BOOTSTRAP; then
   echo "Bootstrapping ${FUNCTION_NAME}..."
 
   # --- 2a. Lambda execution role + inline policy ---
+  # Through the SHARED helper, never a hand-rolled
+  # `if ! aws iam get-role ... >/dev/null 2>&1` probe. That probe makes
+  # AccessDenied and NoSuchEntity the same observation, so a DENIED read is
+  # acted on as proof of absence -- alpha-engine-config-I9045, four workflows
+  # red on every run for a week. `apply_iam_policy` reaches create-role only
+  # via `probe_role_presence`, which classifies a denial as `unknown` and
+  # creates nothing. Enforced by tests/test_iam_role_creation_is_helper_gated.py.
   TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
-  if ! aws iam get-role --role-name "${ROLE_NAME}" --query 'Role.RoleName' --output text >/dev/null 2>&1; then
-    echo "  Creating IAM role: ${ROLE_NAME}"
-    # --description must be ASCII-only: IAM constrains it to
-    # [\u0009\u000A\u000D\u0020-\u007E\u00A1-\u00FF]. An em-dash (U+2014) is
-    # outside that range and CreateRole fails with ValidationError. Caught on
-    # the live 2026-07-27 bootstrap; use a plain hyphen, as siblings do.
-    run aws iam create-role \
-      --role-name "${ROLE_NAME}" \
-      --assume-role-policy-document "${TRUST_POLICY}" \
-      --description "Execution role for ${FUNCTION_NAME} - launch the weekly-freshness launcher spot + fire async SSM bootstrap (config#2248)" \
-      --query 'Role.RoleName' --output text
-  else
-    echo "  IAM role exists: ${ROLE_NAME}"
-  fi
-
-  echo "  Applying inline policy: ${POLICY_NAME}"
-  run aws iam put-role-policy \
-    --role-name "${ROLE_NAME}" \
-    --policy-name "${POLICY_NAME}" \
-    --policy-document "file://${SCRIPT_DIR}/iam-policy.json"
+  apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" \
+    "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
 
   if ! $DRY_RUN; then
     echo "  Waiting 10s for IAM role propagation..."
@@ -164,9 +170,12 @@ if $BOOTSTRAP; then
 
   # --- 2b. Lambda function ---
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
-  if ! aws lambda get-function --function-name "${FUNCTION_NAME}" --query 'Configuration.FunctionName' --output text >/dev/null 2>&1; then
-    echo "  Creating Lambda: ${FUNCTION_NAME}"
-    run aws lambda create-function \
+  echo "  Creating Lambda: ${FUNCTION_NAME} (idempotent)"
+  # `run_tolerating` rather than a get-function probe, for the same reason as
+  # the role above: the already-exists conflict is the ONE benign failure, and
+  # a probe would report that same reassuring line for AccessDenied.
+  run_tolerating "ResourceConflictException" \
+    aws lambda create-function \
       --function-name "${FUNCTION_NAME}" \
       --runtime python3.12 \
       --role "${ROLE_ARN}" \
@@ -177,9 +186,6 @@ if $BOOTSTRAP; then
       --environment "${PROD_ENV}" \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
-  else
-    echo "  Lambda exists, code will be updated in step 3"
-  fi
 fi
 
 # ----- 2c. Bootstrap preflight (the operator-gate detector) -------------------

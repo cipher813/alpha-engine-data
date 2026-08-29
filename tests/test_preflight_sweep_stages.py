@@ -22,6 +22,7 @@ import pathlib
 import pytest
 
 from infrastructure.preflight_sweep_stages import (
+    BOX_DIR_TO_REPO,
     NO_DRY_PATH,
     SWEEPABLE,
     UNSWEEPABLE,
@@ -131,8 +132,25 @@ def test_the_preflight_capable_stages_carry_a_launcher_and_a_working_directory(
     ]
     assert capable, "expected the live definition to declare preflight-capable stages"
     for stage in capable:
-        assert stage.launcher and stage.launcher.endswith(".sh")
-        assert stage.box_dir and stage.box_dir.startswith("alpha-engine-")
+        # Both LEGITIMATE entry-point forms, not just the shell one: a stage's
+        # dry path is a property of its entry point and not of the language it
+        # is written in (alpha-engine-config-I9329 — EvalJudgeProcess runs
+        # `python -m evals.judge_spot_run`). What the two checks downstream of
+        # this derivation need is a repo-relative FILE, which is what is
+        # asserted; the suffix set is closed so a third form has to be added
+        # here deliberately rather than arriving as a silently-None launcher.
+        assert stage.launcher and stage.launcher.endswith((".sh", ".py")), stage.name
+        assert not stage.launcher.startswith("/"), (
+            f"{stage.name}: launcher must be repo-relative, got {stage.launcher}"
+        )
+        # Membership, not a name prefix. The dedicated eval-judge box clones
+        # under the repo's real name rather than the legacy `alpha-engine-*`
+        # scheme, and what the sweep actually requires of a box_dir is that it
+        # RESOLVES to a repo — a prefix check would pass on a directory the
+        # attribution map has never heard of.
+        assert stage.box_dir in BOX_DIR_TO_REPO, (
+            f"{stage.name}: box_dir {stage.box_dir!r} is not in BOX_DIR_TO_REPO"
+        )
 
 
 def test_rendered_commands_carry_the_dry_flag_and_no_unresolved_placeholder(stages):

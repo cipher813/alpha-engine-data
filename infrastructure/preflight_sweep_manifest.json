@@ -64,6 +64,16 @@
       "value": "preflight-sweep-synthetic-spec",
       "reason": "ResearchPredictorParallel.ModelZooTrainMap.TrainSpecDispatch is Map-scoped: $.spec_id is supplied per iteration from the resolved zoo spec array and has no value outside an execution. The sweep exercises the stage's BOOTSTRAP-CLASS preconditions (clone, venv, lib pin, imports, dispatcher-side file checks), all of which spot_train_spec_dispatch.sh asserts before the spec id is ever read — its --preflight-only path exits 0 ahead of any spec-dependent work, so the value is a placeholder and never selects real work. If that ordering ever changes, the stage's preflight would fail loudly against a spec that does not exist, which is the correct outcome and not a silent pass.",
       "acknowledged": "2026-08-13"
+    },
+    "eval_judge_submit": {
+      "value": {
+        "Payload": {
+          "batch_id": "preflight-sweep-synthetic-batch",
+          "plan_s3_key": "decision_artifacts/_eval_batch_plans/preflight-sweep-synthetic/plan.json"
+        }
+      },
+      "reason": "alpha-engine-config-I9329. EvalJudgeProcess's command reads $.eval_judge_submit.Payload.{batch_id,plan_s3_key}, which EvalJudgeSubmit* returns at RUN TIME — there is no execution input for the sweep to derive them from, so they are declared here for the same reason spec_id is. Both are placeholders and neither can select real work: evals/judge_spot_run.py returns 0 from its --preflight-only block BEFORE either value is read (the block runs the imports and one read-only list_objects_v2 against the bucket, then returns), and the sweep threads $.preflight_args exactly as every other sendCommand stage does. Nested rather than flat because sf_commands._resolve walks the dotted path through the binding, so a flat string would raise UnresolvedReference and the stage would be dropped — which is the failure this declaration exists to prevent. If the ordering in judge_spot_run.main ever changes so the plan key is read before the preflight return, the stage's preflight fails loudly against a plan that does not exist — the correct outcome, and not a silent pass.",
+      "acknowledged": "2026-08-29"
     }
   }
 }
