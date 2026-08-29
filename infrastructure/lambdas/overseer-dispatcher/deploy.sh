@@ -177,16 +177,23 @@ run aws lambda put-function-event-invoke-config \
   --region "${REGION}" \
   --query 'MaximumRetryAttempts' --output text
 
-# ----- 5. Auto-apply IAM policy (idempotent — #4472) ------------------------
-# Merge that changes iam-policy.json applies it without a deferred operator
-# step. Gracefully fails when the caller lacks iam:PutRolePolicy (CI auto-
-# deploy role); the drift check backstops any missed apply.
-TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
-# No `||` here on purpose (alpha-engine-config-I7338): the ONE tolerated
-# failure — this caller lacks iam:PutRolePolicy — is classified inside
-# _shared/apply_iam_policy.sh. Every other cause, including this helper not
-# being sourced at all, aborts the deploy under `set -e`.
-apply_iam_policy_on_deploy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
+# ----- 5. Check IAM policy against live (READ-ONLY — I9045) ----------------
+# This path deploys CODE ONLY and mutates no IAM, which is what every
+# deploy-*.yml header has always claimed. It was not true until 2026-08-29: the
+# old call here issued `aws iam put-role-policy` on every merge and classified
+# the inevitable AccessDenied as expected, so each merge left a CloudTrail
+# AccessDenied on iam:PutRolePolicy from an identity that must never hold it
+# (single-writer rule; identity-access-policy.md §4 — the answer to a denied
+# write is not to grant it, and here it was not to make the call).
+#
+# What runs instead compares live IAM to iam-policy.json and, on drift, prints
+# the exact operator command. IAM writes live behind --bootstrap and
+# --apply-iam, where an operator states the intent with a flag.
+#
+# No `||` here on purpose (alpha-engine-config-I7338): a broken checker — this
+# helper not sourced at all, an unreadable iam-policy.json — aborts the deploy
+# under `set -e` rather than printing a reassurance.
+check_iam_policy_on_deploy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json"
 
 # ----- 6. Publish alert_classes projection to S3 (alpha-engine-config#5200) -----
 # The alert-drain box clones only alpha-engine-config, so the registry at
@@ -195,29 +202,71 @@ apply_iam_policy_on_deploy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-po
 # so the drain can mechanically verify every observed source against the
 # declared set. The drain charter points at this S3 URI.
 #
-# Best-effort: a publish failure must not block the Lambda deploy. The IAM
-# permission (s3:PutObject on alpha-engine-research/overseer/alert_classes.json)
-# is in github-actions-lambda-deploy-policy.json (nous-ergon-ops), not yet
-# granted — once added, this step becomes fail-loud (remove the || true).
+# TWO DEFECTS FIXED HERE 2026-08-29 (alpha-engine-config-I9045). The step was
+# the fatal one in run 33229043798 — exit 255, the whole workflow red — and
+# both halves are the same shape: a producer that swallowed, feeding a consumer
+# that exploded.
+#
+#   1. `import yaml` raised ModuleNotFoundError on the CI runner. PyYAML is in
+#      this lambda's requirements.txt but nothing put it on the DEPLOY host's
+#      interpreter, and actions/setup-python ships a bare 3.12. The extraction
+#      caught it, printed `WARN ... (non-fatal)`, and exited 0 WITHOUT writing
+#      alert_classes.json — then the `aws s3 cp` below died on a file that was
+#      never created. The producer's own failure was reported as benign and the
+#      consumer's cascade is what actually paged.
+#
+#      Fixed by pointing PYTHONPATH at ${PKG}: step 1 already installed this
+#      lambda's requirements.txt (pyyaml>=6.0 included) there via Docker. Zero
+#      new dependency, nothing to keep in sync — the deploy reads the same
+#      pyyaml it is about to ship. The linux/amd64 wheel is fine to import on an
+#      operator's macOS too: yaml.safe_load is pure Python and PyYAML guards its
+#      optional libyaml C extension itself.
+#
+#      And the swallow is gone. This repo is a PRODUCER (AGENTS.md): a writer
+#      that returns partial output is a silent corruption of every consumer, so
+#      an extraction failure is now fatal.
+#
+#   2. The `|| echo "...non-fatal..."` on the `aws s3 cp` was UNREACHABLE.
+#      `run()` calls `exit`, not `return` (alpha-engine-config-I8033), and `||`
+#      guards a RETURN. That is exactly the class I8125 closed with
+#      run_tolerating(), and this was the last `run ... ||` site left in any
+#      deploy.sh in this repo. Using run_tolerating() also narrows the
+#      tolerance from "any failure" to the one named cause.
+#
+# THE TOLERATED CAUSE, and why it is still tolerated: `github-actions-lambda-
+# deploy` holds s3:PutObject on alpha-engine-research/infrastructure/*,
+# /changelog/* and /ops/registry/* and NOT on /overseer/* (measured 2026-08-29
+# against the live inline policy). Widening the deploy identity is an operator
+# act under the single-writer rule, not something this deploy may do for
+# itself. Consequence, stated rather than hidden: the object does not exist in
+# S3 today and CI cannot create it. Tracked as alpha-engine-config-I9238; an
+# operator running this deploy.sh publishes it in the meantime.
 echo "Publishing alert_classes to S3..."
-python3 -c "
+PYTHONPATH="${PKG}" python3 -c "
 import json, sys
-try:
-    import yaml
-    path = '${SCRIPT_DIR}/../../overseer/playbooks.yaml'
-    with open(path) as f:
-        data = yaml.safe_load(f)
-    classes = data.get('alert_classes', [])
-    payload = json.dumps({'alert_classes': classes, 'schema_version': 1}, indent=2)
-    key = 'overseer/alert_classes.json'
-    bucket = 'alpha-engine-research'
-    with open('${PKG}/alert_classes.json', 'w') as f:
-        f.write(payload)
-    print(f'Extracted {len(classes)} alert classes from playbooks.yaml')
-except Exception as e:
-    print(f'WARN alert_classes extraction failed (non-fatal): {e}', file=sys.stderr)
-    sys.exit(0)  # best-effort — see comment above
-" 2>&1
-run aws s3 cp "${PKG}/alert_classes.json" "s3://alpha-engine-research/overseer/alert_classes.json" --content-type application/json || echo "WARN alert_classes S3 publish failed (non-fatal) — check IAM: s3:PutObject on alpha-engine-research/overseer/alert_classes.json"
+import yaml
+
+path = '${SCRIPT_DIR}/../../overseer/playbooks.yaml'
+with open(path) as f:
+    data = yaml.safe_load(f)
+classes = data.get('alert_classes', [])
+if not classes:
+    print('ERROR: playbooks.yaml declares no alert_classes — refusing to '
+          'publish an empty projection over the declared set.', file=sys.stderr)
+    raise SystemExit(1)
+payload = json.dumps({'alert_classes': classes, 'schema_version': 1}, indent=2)
+with open('${PKG}/alert_classes.json', 'w') as f:
+    f.write(payload)
+print(f'Extracted {len(classes)} alert classes from playbooks.yaml')
+"
+echo "NOTE: the CI auto-deploy identity holds no s3:PutObject on"
+echo "NOTE: alpha-engine-research/overseer/ — from CI this publish is EXPECTED to be"
+echo "NOTE: tolerated, and s3://alpha-engine-research/overseer/alert_classes.json"
+echo "NOTE: therefore does not exist yet (alpha-engine-config-I9238). Running this"
+echo "NOTE: deploy.sh as an operator publishes it."
+run_tolerating "AccessDenied" \
+  aws s3 cp "${PKG}/alert_classes.json" \
+  "s3://alpha-engine-research/overseer/alert_classes.json" \
+  --content-type application/json
 
 echo "Done."
