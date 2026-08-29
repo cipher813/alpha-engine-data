@@ -100,7 +100,20 @@ print('index.py syntax OK')
 # Delegates to the one _shared/run_handler_tests.sh so this gate can never
 # re-drift into the naive no-install `python3 -m pytest` form (config#2295).
 source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
-run_handler_tests "${SCRIPT_DIR}" boto3
+# alpha-engine-config-I9243: the handler imports `read_marker` from
+# nousergon_lib.pipeline_status.completion_marker (I8217), and its
+# test_handler.py imports that REAL module before installing its stubs
+# — deliberately, so the double-decode regression is pinned against the
+# fleet's canonical reader rather than a hand-rolled fake that could
+# silently diverge again. A test venv holding only pytest+boto3 therefore
+# fails COLLECTION, and the deploy dies after `index.py syntax OK` with
+# ModuleNotFoundError. Derive the two deps from this lambda's own
+# requirements.txt and hand them to the shared runner — the shape
+# saturday-sf-watch-dispatcher/deploy.sh already uses, so the test venv
+# matches what the function actually ships rather than a subset of it.
+NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
+KREPIS_REQ=$(grep -E '^krepis' "${SCRIPT_DIR}/requirements.txt" | head -1)
+run_handler_tests "${SCRIPT_DIR}" boto3 "${KREPIS_REQ}" "${NOUSERGON_LIB_REQ}"
 
 LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
