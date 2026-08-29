@@ -10,4 +10,4 @@ nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.102
 # hard-runtime timer, interpreter install and public clone. Same lockstep rule:
 # a floor 45 minors below what the handler imports is a pin that says nothing
 # and fails on nothing (alpha-engine-config-I7372).
-krepis==0.59.39
+krepis==0.59.41
