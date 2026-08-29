@@ -68,6 +68,7 @@ from builders._price_cache_writeboth import (
 )
 from builders._constituents_loader import load_constituents_for_run_date
 from builders.daily_append import _scan_universe_and_emit_freshness_receipt
+from collectors.prices import _SUB_SECTOR_ETFS
 
 log = logging.getLogger(__name__)
 
@@ -174,6 +175,24 @@ def _extract_macro_series(price_data: dict[str, pd.DataFrame]) -> dict[str, pd.S
         if stem.startswith("XL") and len(stem) <= 4 and "Close" in df.columns:
             macro[stem] = df["Close"].dropna()
 
+    # alpha-engine-config-I9289 — the 8 sub-sector benchmark ETFs
+    # (collectors/prices.py::_SUB_SECTOR_ETFS) were added to the price
+    # cache's ``_ALWAYS_DOWNLOAD`` list (config#934) but never added HERE,
+    # so ``_write_macro_series_no_shrink``'s raw-series loop below never
+    # wrote their full price-cache history to ArcticDB — only
+    # ``builders/daily_append.py``'s per-day incremental append touched
+    # them. Result: every one of the eight was stuck at exactly one row per
+    # weekday since their 2026-07-23 birth (26 rows measured 2026-08-29)
+    # while every sibling macro symbol carried ~2514 rows from 2016. Adding
+    # them here means the NEXT weekly backfill writes whatever the price
+    # cache actually holds — closing the loop once the parquet itself is
+    # repaired (``builders/repair_macro_series.py --symbols
+    # SMH,IGV,XBI,PPH,XOP,KRE,ITA,GDX``, run in-region per AGENTS.md).
+    for stem in _SUB_SECTOR_ETFS:
+        df = price_data.get(stem)
+        if df is not None and "Close" in df.columns:
+            macro[stem] = df["Close"].dropna()
+
     return macro
 
 
@@ -262,7 +281,39 @@ def _existing_last_date(lib, symbol: str) -> "pd.Timestamp | None":
 # VIX3M.parquet`` was written wholesale over a 10y ArcticDB series. The
 # pre-existing preflight compared LAST DATE only, so a series that keeps
 # today's date while losing 2493 rows of history passed clean.
+#
+# This row-floor-against-the-reference-series guard is also the producer-side
+# deliverable of alpha-engine-config-I9324: four champion predictor vintages
+# (2026-08-12/21/28) trained with all seven macro coefficients at exactly
+# zero because ``macro/VIX3M`` lost coverage intermittently between two
+# otherwise-healthy Saturday runs (08-07 healthy, 08-12 dead, 08-14 healthy).
+# The intermittency traces to yfinance answering ``^VIX3M`` with 1 row on the
+# EC2 host that runs the weekly collector some weeks and a full 2484-row
+# answer other weeks (alpha-engine-config-I9286 routes the four caret index
+# tickers through FRED instead). This guard is the backstop regardless of
+# which upstream call answers short on a given run.
 _MACRO_HISTORY_SHRINK_TOLERANCE_ROWS = 5
+
+# Max-date staleness tolerance for the macro write boundary, in NYSE trading
+# days behind the reference date (alpha-engine-config-I9287). A shrink/
+# first-date check is blind to a series that keeps writing NEW versions
+# without the PAYLOAD ever advancing: ``macro/HYOAS`` recorded continuous
+# weekly + daily ArcticDB versions right through 2026-08-29 while every
+# version's last row stayed 2026-05-07 — 3.5 months stale, 786 rows, never
+# shrinking, so the row-count and first-date guards both passed it clean.
+# 10 trading days (~2 calendar weeks) tolerates a FRED publication lag
+# without flagging routine latency; HYOAS was ~75 trading days stale.
+_MACRO_STALENESS_TOLERANCE_TRADING_DAYS = 10
+
+# Row-count floor (as a fraction of the largest established macro sibling)
+# below which a symbol's FIRST write is logged as a finding rather than
+# silently treated as a healthy new listing (alpha-engine-config-I9289: all
+# eight sub-sector benchmark ETFs were born 2026-07-23 at 26 rows next to
+# ~2514-row siblings, and nothing surfaced it for a month). This never
+# blocks the write — a genuinely short-lived listing (a recent IPO ETF) is
+# legitimate — it only makes the shortfall VISIBLE at birth via a loud log
+# line a health sweep can grep for, rather than a month later.
+_MACRO_FIRST_WRITE_SIBLING_FRACTION = 0.5
 
 
 def _series_row_span(series_or_df) -> "tuple[int, pd.Timestamp | None]":
@@ -341,19 +392,87 @@ def _history_regression(
     return None
 
 
-def _write_macro_series_no_shrink(lib, symbol: str, df: "pd.DataFrame") -> None:
-    """Write a full macro series, REFUSING any write that would truncate it.
+def _staleness_regression(
+    label: str,
+    planned,
+    reference_date: "str | pd.Timestamp | None",
+) -> "str | None":
+    """Return a staleness string when ``planned``'s last row lags ``reference_date``
+    by more than ``_MACRO_STALENESS_TOLERANCE_TRADING_DAYS`` NYSE trading days.
+
+    alpha-engine-config-I9287: catches a rewrite-with-stale-source that the
+    shrink/first-date checks in ``_history_regression`` cannot — a series
+    whose row count and start date never move because its writer keeps
+    re-deriving the same frozen upstream value. ``reference_date=None``
+    (no run_date available to the caller) skips the check rather than
+    guessing "today", since a caller with no reference has no way to know
+    what "stale" means here.
+    """
+    if reference_date is None:
+        return None
+    last = _planned_last_date(planned)
+    if last is None:
+        return None
+    from nousergon_lib.dates import trading_days_stale
+
+    ref = pd.Timestamp(reference_date).date()
+    lag = trading_days_stale(last.date(), ref)
+    if lag > _MACRO_STALENESS_TOLERANCE_TRADING_DAYS:
+        return (
+            f"{label}: last_date={last.date()} is {lag} trading days behind "
+            f"reference={ref} (tolerance {_MACRO_STALENESS_TOLERANCE_TRADING_DAYS}) "
+            "— writer is rewriting a FROZEN upstream value, not advancing it"
+        )
+    return None
+
+
+def _warn_if_short_first_write(lib, symbol: str, df: "pd.DataFrame") -> None:
+    """Log loudly when a symbol's FIRST write is short next to established siblings.
+
+    alpha-engine-config-I9289: a first write is never REFUSED (a genuinely
+    short-lived listing is legitimate), but it must be VISIBLE rather than
+    silently indistinguishable from a healthy new symbol — the sub-sector
+    ETFs sat at 26 rows for a month before anyone noticed. Best-effort: any
+    failure reading a reference sibling only skips the check, it never blocks
+    the write this function does not perform.
+    """
+    try:
+        reference_rows, _ = _existing_row_span(lib, "SPY")
+    except Exception:
+        return
+    if reference_rows <= 0:
+        return
+    planned_rows, _ = _series_row_span(df)
+    if planned_rows < reference_rows * _MACRO_FIRST_WRITE_SIBLING_FRACTION:
+        log.warning(
+            "MACRO_NEW_SYMBOL_SHORT_HISTORY macro.%s: first write carries %d rows "
+            "against SPY's %d (%.0f%% of the %.0f%%-of-siblings floor) — a new "
+            "macro symbol at birth, or a never-backfilled one. See "
+            "alpha-engine-config-I9289.",
+            symbol, planned_rows, reference_rows,
+            100 * planned_rows / reference_rows,
+            100 * _MACRO_FIRST_WRITE_SIBLING_FRACTION,
+        )
+
+
+def _write_macro_series_no_shrink(
+    lib, symbol: str, df: "pd.DataFrame", reference_date: "str | None" = None,
+) -> None:
+    """Write a full macro series, REFUSING any write that would truncate OR
+    silently re-freeze it.
 
     The write boundary is the last line of defence: ``_assert_no_arctic_regression``
     runs once per backfill over the planned frames, but the per-ticker
     ``--rebuild-macro`` override and any future call site reach the library
     directly. A wholesale ``lib.write()`` is destructive — ArcticDB keeps prior
-    versions, but every reader sees the truncated head immediately and the
-    predictor's ``dropna()`` turns one short optional column into a total loss
-    of the regime frame (alpha-engine-config-I9255 / I9256).
+    versions, but every reader sees the truncated (or stale) head immediately
+    and the predictor's ``dropna()`` turns one short optional column into a
+    total loss of the regime frame (alpha-engine-config-I9255 / I9256 / I9287).
 
     Raises RuntimeError rather than degrading: a producer that has lost its
-    own history must page, not publish.
+    own history, or is rewriting a frozen upstream value, must page, not
+    publish. ``reference_date=None`` skips the staleness half of the check
+    (no run_date known to the caller) but still enforces no-shrink.
     """
     existing_rows, existing_first = _existing_row_span(lib, symbol)
     regression = _history_regression(f"macro.{symbol}", df, existing_rows, existing_first)
@@ -365,6 +484,23 @@ def _write_macro_series_no_shrink(lib, symbol: str, df: "pd.DataFrame") -> None:
             f"{symbol}.parquet row count before re-running. "
             "See alpha-engine-config-I9256."
         )
+    # A first write (existing_rows == 0) is never a staleness regression —
+    # there is nothing established to lag behind, matching
+    # ``_history_regression``'s own first-write carve-out.
+    staleness = (
+        _staleness_regression(f"macro.{symbol}", df, reference_date)
+        if existing_rows > 0 else None
+    )
+    if staleness is not None:
+        raise RuntimeError(
+            "Macro write refused — it is a rewrite of a FROZEN source, not an "
+            f"advance. {staleness}. Check reference/price_cache/{symbol}.parquet's "
+            "LastModified and the collector that owns it "
+            "(collectors/fred_history.py for a FRED-only symbol). "
+            "See alpha-engine-config-I9287."
+        )
+    if existing_rows == 0:
+        _warn_if_short_first_write(lib, symbol, df)
     lib.write(symbol, df)
 
 
@@ -429,6 +565,18 @@ def _assert_no_arctic_regression(
         hist = _history_regression(f"macro.{key}", series, existing_rows, existing_first)
         if hist is not None:
             regressions.append(hist)
+        # STALENESS regression (alpha-engine-config-I9287). Neither check
+        # above catches a writer that keeps re-deriving the same frozen
+        # upstream value every run — row count and first date never move,
+        # only the ArcticDB *version* advances. Catch it here too so a
+        # ticker_filter/--rebuild-macro run that bypasses the per-write
+        # boundary still can't leave a symbol silently stuck.
+        stale = (
+            _staleness_regression(f"macro.{key}", series, run_date)
+            if existing_rows > 0 else None
+        )
+        if stale is not None:
+            regressions.append(stale)
 
     try:
         arctic_syms = set(universe_lib.list_symbols())
@@ -913,13 +1061,22 @@ def backfill(
         # VIX/TNX/etc. raw-series persistence so daily_append's read-back
         # loop (macro_lib.read("HYOAS")) resolves after this backfill runs.
         if not dry_run:
-            for key in ["SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO", "HYOAS"]:
+            # alpha-engine-config-I9289: the sub-sector benchmark ETFs join
+            # the raw-series write loop so a repaired price cache (full
+            # history via ``repair_macro_series.py``) actually reaches
+            # ArcticDB on the next Saturday run, rather than staying frozen
+            # at whatever ``daily_append`` alone could accumulate one row
+            # at a time.
+            for key in [
+                "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO", "HYOAS",
+                *_SUB_SECTOR_ETFS,
+            ]:
                 series = macro.get(key)
                 if series is not None:
                     macro_series_df = pd.DataFrame({"Close": series}, index=series.index)
                     macro_series_df.index.name = "date"
                     _write_macro_series_no_shrink(
-                        macro_lib, key, to_arctic_safe(macro_series_df)
+                        macro_lib, key, to_arctic_safe(macro_series_df), reference_date=today_str,
                     )
 
             # Write sector ETFs
@@ -928,7 +1085,7 @@ def backfill(
                     sector_df = pd.DataFrame({"Close": macro[key]}, index=macro[key].index)
                     sector_df.index.name = "date"
                     _write_macro_series_no_shrink(
-                        macro_lib, key, to_arctic_safe(sector_df)
+                        macro_lib, key, to_arctic_safe(sector_df), reference_date=today_str,
                     )
 
     # ── 5b. Factor-momentum second pass (W2.3, L4469) ────────────────────────

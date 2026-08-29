@@ -84,7 +84,7 @@ setup_logging(
     exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
 )
 
-from collectors import constituents, historical_constituents, prices, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest, metron_market_data, universe_classification
+from collectors import constituents, historical_constituents, prices, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest, metron_market_data, universe_classification, fred_history
 from builders._price_cache_writeboth import (
     price_cache_read_prefixes as _price_cache_read_prefixes,
     price_cache_write_prefixes as _price_cache_write_prefixes,
@@ -443,6 +443,31 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                     boto3.client("s3"), bucket,
                     writer="nousergon-data:weekly_collector.py",
                 )
+
+    # ── 2b. FRED-only macro history refresh (alpha-engine-config-I9287) ──────
+    # ``collectors/fred_history.py::backfill_to_s3`` was a one-shot operator
+    # step ("Run after Stage 2.5 ships") never wired to any schedule.
+    # Measured 2026-08-29: ``reference/price_cache/HYOAS.parquet`` last
+    # modified 2026-05-19 and never touched since — the weekly ``macro``
+    # rebuild (``builders/backfill.py``) faithfully rewrites
+    # ``macro/HYOAS`` from that frozen parquet every Saturday, so the ArcticDB
+    # symbol never advances even though the writer never stops. Explicit
+    # ``tickers=`` (not ``FRED_HISTORY_MAP`` default) so this call never grows
+    # to cover the caret index tickers (VIX/VIX3M/TNX/IRX) — those are
+    # ``collectors/prices.py``'s longest-of-yfinance-and-FRED job
+    # (alpha-engine-config-I9286); re-deriving them here from FRED alone
+    # would silently discard that fallback logic.
+    if only in (None, "prices", "fred_macro_history"):
+        results["collectors"]["fred_macro_history"] = _phase_collect(
+            reg, "fred_macro_history",
+            lambda: fred_history.backfill_to_s3(
+                bucket=bucket,
+                s3_prefix=price_cfg.get("s3_prefix", "predictor/price_cache/"),
+                tickers=["TWO", "HYOAS", "BAA10Y"],
+                dry_run=dry_run,
+            ),
+            supports_auto_skip=False,
+        )
 
     # ── 3. Slim cache — REMOVED (Wave-4) ─────────────────────────────────────
     # predictor/price_cache_slim/ deleted: every consumer (data macro-breadth
