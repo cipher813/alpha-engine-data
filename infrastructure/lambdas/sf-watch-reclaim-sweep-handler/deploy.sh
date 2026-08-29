@@ -1,8 +1,3 @@
-
-# alpha-engine-config-I6619: --state must come from the automation-pause
-# manifest, not from the API default (ENABLED). See infrastructure/lambdas/_shared/pause.sh.
-# shellcheck source=infrastructure/lambdas/_shared/pause.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
 #!/usr/bin/env bash
 # deploy.sh — Create or update the alpha-engine-sf-watch-reclaim-sweep-handler Lambda
 # and wire its EventBridge Scheduler rules.
@@ -64,6 +59,11 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
 #   bash .../sf-watch-reclaim-sweep-handler/deploy.sh --smoke     # invoke once (read-only check; pings only on a real problem)
 
 set -euo pipefail
+
+# alpha-engine-config-I6619: --state must come from the automation-pause
+# manifest, not from the API default (ENABLED). See infrastructure/lambdas/_shared/pause.sh.
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"

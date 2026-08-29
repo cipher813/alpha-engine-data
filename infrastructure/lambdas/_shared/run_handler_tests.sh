@@ -83,7 +83,12 @@ run_handler_tests() {
 
   local targets
   if [[ -n "${HANDLER_TEST_TARGETS+x}" ]]; then
-    # shellcheck disable=SC2206 — intentional word-split on the caller's list.
+    # A shellcheck directive's trailing prose must start with its own `#`.
+    # Written as `disable=SC2206 — intentional ...` this raised SC1125
+    # (error severity) on every run, which is why widening CI's shellcheck
+    # scope to _shared/*.sh could not land until it was fixed
+    # (alpha-engine-config-I9117).
+    # shellcheck disable=SC2206  # intentional word-split on the caller's list.
     targets=(${HANDLER_TEST_TARGETS})
   else
     targets=()

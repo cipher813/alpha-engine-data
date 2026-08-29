@@ -28,8 +28,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - name: shellcheck (infrastructure/*.sh, error severity)
-        run: shellcheck --severity=error infrastructure/*.sh
+      # Scope is DERIVED from git, not a literal glob list
+      # (alpha-engine-config-I9117). It used to be `infrastructure/*.sh` — the
+      # TOP-LEVEL directory only — so the 45 `infrastructure/lambdas/*/deploy.sh`
+      # and the `_shared/*.sh` helpers they source were analysed by NOTHING.
+      # Those are exactly the files that carried the week-long four-red-deploys
+      # outage (alpha-engine-config-I9045), and widening found four real
+      # error-severity defects: three deploy.sh had an automated `source` line
+      # prepended ABOVE their shebang, making the shebang inert (SC2148), and
+      # `_shared/run_handler_tests.sh` had an em-dash where a shellcheck
+      # directive's trailing prose needs its own `#` (SC1125).
+      #
+      # WHY DERIVED rather than the three globs that would have sufficed today:
+      # a hand-written scope leaves the next script uncovered on the day it
+      # lands, in a directory nobody remembered to add — which is the precise
+      # shape of the gap being closed here. `git ls-files` cannot go stale.
+      # Measured 2026-08-28: 79 tracked *.sh, clean at --severity=error.
+      # error-severity only, so a warning-noise cleanup never gates unrelated PRs.
+      - name: shellcheck (every tracked *.sh, error severity)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git ls-files -z '*.sh' | xargs -0 shellcheck --severity=error
 
   # config#4223: the 2026-07-25 weekly-SF kill was a krepis CLI contract
   # change deployed between SF phases — every ssm_log_capture caller in the
