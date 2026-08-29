@@ -83,4 +83,10 @@ boto3>=1.34.0
 # `flow-doctor` right: the sweep that fixed that symbol never looked for a
 # SECOND underscored extra, and scripts/lint_extras.py never opened this file
 # at all (it globbed the repo root only). Both are fixed in this PR.
-nousergon-lib[flow-doctor,github-app] @ git+https://github.com/nousergon/nousergon-lib@v0.124.98
+# v0.124.99 (nousergon-lib-PR373, merged 2026-08-29) is the first tag carrying
+# SlotDecision.model_group and the tier->GROUP resolution via krepis.router
+# (TIER_MODELS/FALLBACK_TIER_MODELS retired, alpha-engine-config-I9297). This
+# PR's own handler reads `decision.model_group` directly and WILL AttributeError
+# against v0.124.98 -- measured on run 33265618745, 18 test failures, all
+# `'SlotDecision' object has no attribute 'model_group'`. Lockstep with root.
+nousergon-lib[flow-doctor,github-app] @ git+https://github.com/nousergon/nousergon-lib@v0.124.99

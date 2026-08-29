@@ -124,7 +124,13 @@ arcticdb>=6.23.0
 # JSON landing ahead of the registry entry. VERIFIED 2026-08-25 against the tag
 # itself (contents API at ref=v0.124.88), not against the merge: a green publish
 # that serves old metadata has happened on this fleet before.
-nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.98
+# v0.124.99 (nousergon-lib-PR373, merged 2026-08-29) is the first tag carrying
+# SlotDecision.model_group and the tier->GROUP resolution via krepis.router
+# (TIER_MODELS/FALLBACK_TIER_MODELS retired, alpha-engine-config-I9297). This
+# PR's own handler reads `decision.model_group` directly and WILL AttributeError
+# against v0.124.98 -- measured on run 33265618745, 18 test failures, all
+# `'SlotDecision' object has no attribute 'model_group'`. Lockstep with root.
+nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.99
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,
