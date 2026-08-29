@@ -84,8 +84,7 @@ source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 # ----- 0. Scratch dirs + validate handler syntax -----------------------------
 
 PKG=$(mktemp -d)
-TEST_DEPS=$(mktemp -d)
-trap "rm -rf '$PKG' '$TEST_DEPS'" EXIT
+trap "rm -rf '$PKG'" EXIT
 
 python3 -c "
 import ast
@@ -96,12 +95,17 @@ print('index.py syntax OK')
 
 # ----- 0b. Preflight handler unit tests --------------------------------------
 
-if [[ -f "${SCRIPT_DIR}/test_handler.py" ]]; then
-  echo "Installing pytest into ${TEST_DEPS}..."
-  python3 -m pip install --quiet --target "${TEST_DEPS}" pytest
-  echo "Running handler unit tests..."
-  PYTHONPATH="${TEST_DEPS}" python3 -m pytest "${SCRIPT_DIR}/test_handler.py" -q
-fi
+# The shared gate (config#2381), not a hand-rolled copy. The copy this
+# replaced installed only `pytest`, ran ONLY test_handler.py, and put
+# nothing but the scratch dir on PYTHONPATH. Measured 2026-08-28,
+# preflight-sweep-dispatcher had failed 6 of 6 runs since the workflow
+# shipped on 2026-08-13 — `ModuleNotFoundError: No module named boto3`,
+# because its index.py imports boto3 at module scope and the hand-rolled
+# list did not. spot-interruption-recorder had already hit the identical
+# wall and patched its own copy in place rather than the shared helper,
+# which is what left the other three exposed.
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+run_handler_tests "${SCRIPT_DIR}"
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------
 
