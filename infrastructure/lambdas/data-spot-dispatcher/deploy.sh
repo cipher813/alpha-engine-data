@@ -98,7 +98,10 @@ source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 # lambda's tests stub boto3 in sys.modules, and the helper's contract is that
 # such a caller must NOT get boto3 installed alongside the stub.
 source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
-run_handler_tests "${SCRIPT_DIR}"
+# `krepis`: test_handler.py:34 imports krepis.spot_bootstrap for REAL (it is
+# not stubbed). Measured — deploy-data-spot-dispatcher failed on main
+# 2026-08-29T00:11 with ModuleNotFoundError: No module named 'krepis'.
+run_handler_tests "${SCRIPT_DIR}" krepis
 
 # ----- 0. Scratch dir + validate handler syntax ------------------------------
 

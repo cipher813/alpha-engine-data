@@ -108,7 +108,13 @@ fi
 # a caller must NOT get boto3 installed alongside the stub.
 # shellcheck source=infrastructure/lambdas/_shared/run_handler_tests.sh
 source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
-run_handler_tests "${SCRIPT_DIR}"
+# `-r requirements.txt` (the superset model ci.yml uses), not the empty dep
+# list alpha-engine-config-I9114 predicted. Measured on a bare interpreter
+# 2026-08-29: the tests do NOT stub nousergon_lib — 2 of 25 import it for
+# real and ModuleNotFound without it. A dep list that was reasoned about
+# rather than executed is how deploy-data-spot-dispatcher and
+# deploy-ssm-reachability-probe went red on main the same evening.
+run_handler_tests "${SCRIPT_DIR}" -r "${SCRIPT_DIR}/requirements.txt"
 
 echo "==> building package"
 BUILD_DIR="$(mktemp -d)"

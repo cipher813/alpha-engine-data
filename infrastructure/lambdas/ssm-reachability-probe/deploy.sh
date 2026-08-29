@@ -69,7 +69,10 @@ source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 # lambda's tests stub boto3 in sys.modules, and the helper's contract is that
 # such a caller must NOT get boto3 installed alongside the stub.
 source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
-run_handler_tests "${SCRIPT_DIR}"
+# `boto3`: index.py imports it at module scope. Measured —
+# deploy-ssm-reachability-probe failed on main 2026-08-29T00:11 with
+# ModuleNotFoundError: No module named 'boto3'.
+run_handler_tests "${SCRIPT_DIR}" boto3
 
 PKG="$(mktemp -d)"
 trap 'rm -rf "${PKG}"' EXIT
