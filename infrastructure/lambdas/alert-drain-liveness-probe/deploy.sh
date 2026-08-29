@@ -190,16 +190,23 @@ verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${ZIP}"
 
 echo "✓ Code deployed."
 
-# ----- 4. Auto-apply IAM policy (idempotent — #4472) ------------------------
-# Merge that changes iam-policy.json applies it without a deferred operator
-# step. Gracefully fails when the caller lacks iam:PutRolePolicy (CI auto-
-# deploy role); the drift check backstops any missed apply.
-TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
-# No `||` here on purpose (alpha-engine-config-I7338): the ONE tolerated
-# failure — this caller lacks iam:PutRolePolicy — is classified inside
-# _shared/apply_iam_policy.sh. Every other cause, including this helper not
-# being sourced at all, aborts the deploy under `set -e`.
-apply_iam_policy_on_deploy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
+# ----- 4. Check IAM policy against live (READ-ONLY — I9045) ----------------
+# This path deploys CODE ONLY and mutates no IAM, which is what every
+# deploy-*.yml header has always claimed. It was not true until 2026-08-29: the
+# old call here issued `aws iam put-role-policy` on every merge and classified
+# the inevitable AccessDenied as expected, so each merge left a CloudTrail
+# AccessDenied on iam:PutRolePolicy from an identity that must never hold it
+# (single-writer rule; identity-access-policy.md §4 — the answer to a denied
+# write is not to grant it, and here it was not to make the call).
+#
+# What runs instead compares live IAM to iam-policy.json and, on drift, prints
+# the exact operator command. IAM writes live behind --bootstrap and
+# --apply-iam, where an operator states the intent with a flag.
+#
+# No `||` here on purpose (alpha-engine-config-I7338): a broken checker — this
+# helper not sourced at all, an unreadable iam-policy.json — aborts the deploy
+# under `set -e` rather than printing a reassurance.
+check_iam_policy_on_deploy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json"
 
 # ----- 4b. Reconcile the reclaim rules from the repo (always, idempotent) ---
 # config-I7400. The rules' definition and ENABLED/DISABLED bit used to be
