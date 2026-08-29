@@ -926,6 +926,39 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+  - class: research_spec_promotion_alerts
+    # alpha-engine-config-I9273 static-chokepoint registration. The scanner
+    # SPEC slot's promotion engine (crucible-research/scoring/spec_promotion.py
+    # ::run_spec_promotion, invoked from lambda/scanner_handler.py immediately
+    # after build_scanner_leaderboard) decides which registered arm of
+    # SCANNER_SPECS ranks the live candidate cut. Same FAIL-SOFT + LOUD shape
+    # as research_cut_promotion_alerts above and for the same reason: a
+    # promotion failure never downgrades the already-written candidates.json
+    # (the pointer keeps naming the standing champion), so this alert is the
+    # ONLY signal that no promote/demote/hold decision was recorded for the
+    # cycle. That matters more here than on the cut slot: before this engine
+    # existed the spec champion moved only by a hand-edit of LIVE_CHAMPION,
+    # which is how alpha-engine-config-I7808 produced four weeks of a
+    # leaderboard scoring an arm against itself. The call site publishes with
+    # explicit severity="ERROR".
+    source: "research:spec_promotion"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    # overseer-policy.md invariant 4 (alpha-engine-config-I8991): a pageable
+    # class is a CLOSED LOOP or a TRACKED GAP, and there is no third state.
+    # This is the tracked gap, deliberately, rather than an operator_reason.
+    # Declaring it page-only-by-design would be a RULING, and two things make
+    # that ruling premature: (1) the identically-shaped twin
+    # research_cut_promotion_alerts is still grandfathered awaiting its own
+    # disposition under I8996, so closing this one would make two rows
+    # disagree about a question they answer identically; (2) the dominant
+    # firing condition — board_defective, a scanner leaderboard reporting
+    # duplicate arm rows — is a characterised producer fault with a durable
+    # artifact to read (config/apply_audit/scanner_spec_champion/{date}.json
+    # is written BEFORE the engine raises), which is playbook-shaped work and
+    # not inherently human-only. I9316 rules both rows together.
+    migration_issue: alpha-engine-config-I9316
   - class: research_weekly_ledger_alerts
     # alpha-engine-config-I8264 static-chokepoint registration. Emitted by
     # crucible-research/lambda/scanner_handler.py after

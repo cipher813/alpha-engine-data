@@ -2132,7 +2132,7 @@
             },
             "EvalJudgePollChoice": {
               "Type": "Choice",
-              "Comment": "Branch on Submit's processing_status. EMPTY (no captures, or all empty-input skipped client-side) -> route directly to Process so the empty-batch case still emits a clean SF result + downstream metric inputs. OK -> enter the Wait/Poll loop. Anything else (ERROR, missing fields) is fail-soft but NOT silent: it routes through MarkEvalJudgeDegraded, which threads $.research_degraded_local=true and then continues to EvalRollingMean exactly as before. alpha-engine-config-I9058: the Default used to jump straight to EvalRollingMean, so a submit Lambda that SUCCEEDED while returning status=ERROR in its payload bypassed the degraded marker every one of this chain's four Catches goes through. On 2026-08-22 EvalJudgeSubmitWeekly returned status=ERROR (Anthropic 400, credit balance too low), the chain skipped Poll and Process, decision_artifacts/_eval/latest.json was never rewritten, and nothing in the run recorded a degradation -- the only signal was the freshness row going stale five days later.",
+              "Comment": "Branch on Submit's processing_status. EMPTY (no captures, or all empty-input skipped client-side) -> route directly to Process so the empty-batch case still emits a clean SF result + downstream metric inputs. ended_sync -> route directly to Process (alpha-engine-config-I9263: the judge took the synchronous rung, so there is no provider batch to poll). OK -> enter the Wait/Poll loop. Anything else (ERROR, missing fields) is fail-soft but NOT silent: it routes through MarkEvalJudgeDegraded, which threads $.research_degraded_local=true and then continues to EvalRollingMean exactly as before. alpha-engine-config-I9058: the Default used to jump straight to EvalRollingMean, so a submit Lambda that SUCCEEDED while returning status=ERROR in its payload bypassed the degraded marker every one of this chain's four Catches goes through. On 2026-08-22 EvalJudgeSubmitWeekly returned status=ERROR (Anthropic 400, credit balance too low), the chain skipped Poll and Process, decision_artifacts/_eval/latest.json was never rewritten, and nothing in the run recorded a degradation -- the only signal was the freshness row going stale five days later.",
               "Choices": [
                 {
                   "And": [
@@ -2145,6 +2145,20 @@
                       "StringEquals": "EMPTY"
                     }
                   ],
+                  "Next": "EvalJudgeProcess"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.eval_judge_submit.Payload.processing_status",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.eval_judge_submit.Payload.processing_status",
+                      "StringEquals": "ended_sync"
+                    }
+                  ],
+                  "Comment": "alpha-engine-config-I9263 (Brian ruling 2026-08-29: the direct Anthropic API is retired). Submit returns processing_status='ended_sync' when no batch-capable route resolved through the router and it took the SYNCHRONOUS judge rung instead. There is no provider-side batch to poll, so route straight to Process, which reads batch_id and plan_s3_key from $.eval_judge_submit.Payload (not from the poll result) and judges every plan entry through the router-addressed evaluate_artifact. Without this branch the run is still CORRECT -- status='OK' enters the Wait/Poll loop and poll_batch reports a 'sync-' id as already terminal -- but it burns a 60s Wait and a Poll invocation to learn something Submit already stated. A shortcut past dead work, never a change of outcome: a submit payload lacking processing_status still reaches the fail-soft Default.",
                   "Next": "EvalJudgeProcess"
                 },
                 {
@@ -2172,7 +2186,7 @@
             },
             "EvalJudgePoll": {
               "Type": "Task",
-              "Comment": "Poll phase. Calls anthropic.messages.batches.retrieve(batch_id) and returns processing_status + request_counts + elapsed_seconds. SF Choice that follows branches on processing_status: ended \u2192 Process; in_progress \u2192 loop back to Wait; exceeded_max_wait=true \u2192 fail-soft to EvalRollingMean.",
+              "Comment": "Poll phase. Retrieves the submitted batch's processing_status + request_counts + elapsed_seconds. alpha-engine-config-I9263 (2026-08-29): this state no longer calls anthropic.messages.batches.retrieve -- the eval-judge chain was migrated off the direct Anthropic SDK onto the krepis router, and the poll Lambda builds no provider client at all. The synthetic 'empty-' and 'sync-' batch ids are terminal by construction and need none; a real provider batch id would need a router-resolved batch client, which does not exist today (no registry member declares a reachable 'batches' capability). SF Choice that follows branches on processing_status: ended \u2192 Process; in_progress \u2192 loop back to Wait; exceeded_max_wait=true \u2192 fail-soft to EvalRollingMean.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-eval-judge-poll:live",
