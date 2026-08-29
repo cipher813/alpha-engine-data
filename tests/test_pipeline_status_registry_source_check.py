@@ -61,7 +61,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # no hedge, "the Saturday SF has 1 substantive Task state NOT in the registry …
 # add each state to the registry in nousergon-lib". Measured 2026-08-28: the
 # venv held v0.124.88 (137 registry entries, no `NormalizeRunDates`) while
-# requirements.txt pinned v0.124.95 (138, with it). CI installs the pin and
+# requirements.txt pinned v0.124.96 (138, with it). CI installs the pin and
 # passes; the reader on the laptop is sent to nousergon-lib to add an entry that
 # already exists there.
 #
@@ -272,9 +272,9 @@ def test_pin_parser_reads_the_pin_and_not_the_comments_above_it() -> None:
         "# the floor. Superseded by nousergon-lib @ git+https://x/y@v0.124.78.\n"
         "some-other-pkg==1.2.3\n"
         "nousergon-lib[arcticdb,rag] @ git+https://github.com/nousergon/"
-        "nousergon-lib@v0.124.95\n"
+        "nousergon-lib@v0.124.96\n"
     )
-    assert _pinned_lib_version(text) == "v0.124.95"
+    assert _pinned_lib_version(text) == "v0.124.96"
 
 
 def test_pin_parser_reads_the_real_requirements_file() -> None:
@@ -291,16 +291,16 @@ def test_pin_parser_reads_the_real_requirements_file() -> None:
 
 def test_a_stale_install_is_named_first_in_the_failure_message() -> None:
     """THE case that made this a defect. On 2026-08-28 a laptop venv held
-    v0.124.88 against a v0.124.95 pin, and the message sent the reader to
+    v0.124.88 against a v0.124.96 pin, and the message sent the reader to
     nousergon-lib to add a `NormalizeRunDates` entry that already existed
     there."""
-    note = _provenance_note("v0.124.88", "v0.124.95")
+    note = _provenance_note("v0.124.88", "v0.124.96")
     assert note, "a version mismatch produced no qualifier at all"
     assert note.startswith("READ THIS FIRST"), (
         "the qualifier must LEAD. Appended below a 10-line accusation about the "
         "SF definition, it is not read."
     )
-    assert "v0.124.88" in note and "v0.124.95" in note, (
+    assert "v0.124.88" in note and "v0.124.96" in note, (
         f"the qualifier names neither version, so it cannot be acted on:\n{note}"
     )
     assert "pip install -r requirements.txt" in note, (
@@ -312,15 +312,15 @@ def test_matched_versions_produce_no_qualifier() -> None:
     """It is a qualifier, not a suppressor. With the clocks in lockstep the
     failure must read exactly as it did before — an accusation against the SF
     definition, which is then correct."""
-    assert _provenance_note("v0.124.95", "v0.124.95") == ""
+    assert _provenance_note("v0.124.96", "v0.124.96") == ""
 
 
 def test_unreadable_provenance_produces_no_qualifier() -> None:
     """An unreadable pin or a missing distribution must not invent a mismatch.
     Absence of evidence is not a version skew — the same conflation that made
     a denied `iam:GetRole` read as an absent role."""
-    assert _provenance_note(None, "v0.124.95") == ""
-    assert _provenance_note("v0.124.95", None) == ""
+    assert _provenance_note(None, "v0.124.96") == ""
+    assert _provenance_note("v0.124.96", None) == ""
 
 
 def test_real_drift_still_fails_loudly_when_versions_match(monkeypatch) -> None:
