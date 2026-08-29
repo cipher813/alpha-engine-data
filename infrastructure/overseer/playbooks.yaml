@@ -787,6 +787,19 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+  - class: backtester_producer_arena
+    # alpha-engine-config-I9318: the R-slot (selection-producer) arena cycle.
+    # Fires only when the cycle comes out `unmeasurable` or `unservable` — i.e.
+    # the slot could not decide the live config/producer_champion.json pointer
+    # on evidence. Distinct from backtester_champion_promotion above, which
+    # alerts when the weekly run RAISES: a cycle that completes and honestly
+    # reports "no arm is measurable" is not an exception, and collapsing the
+    # two would make the drain queue unable to tell a code defect from missing
+    # upstream evidence.
+    source: "alpha-engine-backtester/optimizer/producer_arena.py::run_arena_cycle"
+    severities: [error]
+    intake: bus
+    response: drain-queue
   - class: backtester_live_key_reconciliation
     source: "alpha-engine-backtester/optimizer/live_key_reconciliation.py"
     severities: [critical]
