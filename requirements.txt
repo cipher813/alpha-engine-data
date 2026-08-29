@@ -124,7 +124,7 @@ arcticdb>=6.23.0
 # JSON landing ahead of the registry entry. VERIFIED 2026-08-25 against the tag
 # itself (contents API at ref=v0.124.88), not against the merge: a green publish
 # that serves old metadata has happened on this fleet before.
-nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.95
+nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.97
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,
