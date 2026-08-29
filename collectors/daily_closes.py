@@ -150,31 +150,12 @@ def _fred_get_with_retry(params: dict) -> requests.Response:
 # TNX/IRX/TWO/HYOAS), so no conversion is needed before appending to
 # ArcticDB.
 #
-# TWO + HYOAS added 2026-05-10 (Stage 2.5 of regime-conditioning rebuild
-# — plan doc: alpha-engine-docs/private/regime-conditioning-260510.md).
-# Both are FRED-only (no yfinance proxy), so they only flow through the
-# FRED fallback path. Historical backfill is gated on a follow-up PR
-# adding a FRED history fetcher; this PR begins forward-only collection.
-_FRED_INDEX_MAP = {
-    "VIX": "VIXCLS",
-    "VIX3M": "VXVCLS",
-    "TNX": "DGS10",
-    "IRX": "DTB3",
-    # 2Y treasury — enables 10Y-2Y curve slope (recession-focused canonical)
-    # alongside the existing 10Y-3M (TNX-IRX cyclical).
-    "TWO": "DGS2",
-    # ICE BofA US High Yield Index Option-Adjusted Spread, percent.
-    # Major regime indicator that VIX misses — credit widens before vol
-    # spikes in many cycles, and stays wide during recoveries when vol
-    # has already calmed. Institutional risk-factor models include it.
-    "HYOAS": "BAMLH0A0HYM2",
-    # Moody's BAA Corporate Bond Yield Relative to 10Y Treasury, percent.
-    # Full 40y FRED history (1986+) — the credit-regime signal HYOAS can't
-    # provide across the full predictor training corpus (HYOAS is license-
-    # gated to 2023+ on FRED). BBB-rated spread vs HY's below-BBB; both
-    # belong in the institutional credit-regime feature set.
-    "BAA10Y": "BAA10Y",
-}
+# alpha-engine-config-I9286: this used to be a SEPARATE 7-entry literal that
+# had drifted from ``collectors/fred_history.py::FRED_HISTORY_MAP`` (which
+# only carried the 3 FRED-only symbols). Re-exported here as an alias so
+# there is exactly ONE declared ticker -> FRED series id map in the repo —
+# every existing caller of ``_FRED_INDEX_MAP`` in this module is unaffected.
+from collectors.fred_history import FRED_HISTORY_MAP as _FRED_INDEX_MAP
 
 
 def _coalesce_by_source_priority(
