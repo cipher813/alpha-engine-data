@@ -233,8 +233,18 @@ def test_backfill_wraps_macro_writes():
     # ``to_arctic_safe`` payload AND refuses a write that would truncate the
     # symbol's history. The Categorical-strip chokepoint is unchanged — the
     # wrapper is a guard in front of it, not a second write path.
-    assert "_write_macro_series_no_shrink(\n                        macro_lib, key, to_arctic_safe(macro_series_df)\n                    )" in _BACKFILL_SRC
-    assert "_write_macro_series_no_shrink(\n                        macro_lib, key, to_arctic_safe(sector_df)\n                    )" in _BACKFILL_SRC
+    assert (
+        "_write_macro_series_no_shrink(\n"
+        "                        macro_lib, key, to_arctic_safe(macro_series_df), "
+        "reference_date=today_str,\n"
+        "                    )"
+    ) in _BACKFILL_SRC
+    assert (
+        "_write_macro_series_no_shrink(\n"
+        "                        macro_lib, key, to_arctic_safe(sector_df), "
+        "reference_date=today_str,\n"
+        "                    )"
+    ) in _BACKFILL_SRC
     assert "lib.write(symbol, df)" in _BACKFILL_SRC, (
         "the no-shrink wrapper must still terminate in a single lib.write "
         "boundary — no second, unguarded macro write path."
