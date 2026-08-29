@@ -93,7 +93,20 @@ def test_sweep_detects_error_marker():
     assert "FileNotFoundError" in result["error_phases"][0]["error"]
 
 
-def test_sweep_unparseable_marker_skipped_not_fatal():
+def test_sweep_unparseable_marker_is_a_named_finding_not_fatal():
+    """An unparseable marker is reported by key — and is NOT scored `ok`.
+
+    Contract change, alpha-engine-config-I9262. This test previously
+    asserted `status == "ok"`: a corrupt marker was warned about and
+    dropped, and the sweep then reported a clean bill of health for a run
+    whose phase outcome it had just failed to read. That is `no data`
+    rendered as green (`principles.md` §2.7), on the one surface that
+    exists to say whether a non-fatal backtester phase errored.
+
+    Still not fatal in the sense the old name meant: the sweep completes,
+    reports every marker it COULD read, and exits 1 (a finding) rather
+    than 2 (a sweep-infra fault).
+    """
     from validators import phase_marker_sweep
 
     fake = _FakeS3({
@@ -102,8 +115,11 @@ def test_sweep_unparseable_marker_skipped_not_fatal():
     })
     with patch.object(phase_marker_sweep, "boto3", MagicMock(client=lambda *a, **k: fake)):
         result = phase_marker_sweep.sweep(run_date="2026-07-18", alert=False)
-    assert result["status"] == "ok"
+    assert result["status"] == "malformed_markers_detected"
     assert result["checked_count"] == 1
+    assert [m["s3_key"] for m in result["malformed_markers"]] == [
+        "backtest/2026-07-18/.phases/corrupt.json"
+    ]
 
 
 def test_sweep_s3_failure_returns_error():
@@ -208,3 +224,139 @@ def test_declared_long_options_still_parse_in_full():
     with patch("validators.phase_marker_sweep.boto3", MagicMock(client=lambda *a, **k: fake)):
         rc = main(["--run-date", "2026-07-18", "--no-alert", "--alert-severity", "warn"])
     assert rc == 0
+
+
+# ── alpha-engine-config-I9262 regressions ────────────────────────────────
+#
+# The 2026-08-29 weekly SF run terminated SubstrateHealthCheckDegraded on a
+# TypeError inside this sweep, not on a health finding. Two independent
+# defects, one test each. Both FAIL on the pre-fix implementation:
+# the first with `TypeError: list indices must be integers or slices, not
+# str`, the second the same way.
+
+
+class _DelimiterAwareS3:
+    """S3 fake that honours ``Delimiter`` the way the real API does.
+
+    With ``Delimiter="/"`` the real ``list_objects_v2`` returns only keys
+    with no further ``/`` after the prefix under ``Contents``; anything
+    deeper is collapsed into ``CommonPrefixes``. The pre-existing
+    ``_FakeS3`` in this module ignores ``Delimiter`` entirely, so it cannot
+    tell the fixed implementation from the broken one — hence this second
+    fake rather than a change to that one (other tests depend on it).
+    """
+
+    def __init__(self, keys_and_bodies: dict[str, bytes]):
+        self._bodies = keys_and_bodies
+
+    def get_paginator(self, name):
+        assert name == "list_objects_v2"
+        outer = self
+
+        class _P:
+            def paginate(self, **kwargs):
+                prefix = kwargs.get("Prefix", "")
+                delimiter = kwargs.get("Delimiter")
+                contents, common = [], set()
+                for k in outer._bodies:
+                    if not k.startswith(prefix):
+                        continue
+                    rest = k[len(prefix):]
+                    if delimiter and delimiter in rest:
+                        common.add(prefix + rest.split(delimiter, 1)[0] + delimiter)
+                    else:
+                        contents.append({"Key": k})
+                page = {}
+                if contents:
+                    page["Contents"] = contents
+                if common:
+                    page["CommonPrefixes"] = [{"Prefix": p} for p in sorted(common)]
+                return [page or {}]
+
+        return _P()
+
+    def get_object(self, Bucket, Key):
+        body = MagicMock()
+        body.read.return_value = self._bodies[Key]
+        return {"Body": body}
+
+
+def test_nested_phase_artifacts_are_not_read_as_markers(monkeypatch):
+    """A phase artifact under .phases/{phase}/ is not a marker.
+
+    Measured live on backtest/2026-08-28/.phases/: simulation_setup.json is
+    a well-formed marker, and simulation_setup/dates.json — declared in
+    that marker's own artifact_keys — is a JSON ARRAY. Without
+    Delimiter="/" the sweep read the array as a marker and died.
+    """
+    from validators import phase_marker_sweep
+
+    s3 = _DelimiterAwareS3({
+        "backtest/2026-08-28/.phases/simulation_setup.json": _marker(
+            "simulation_setup", "ok"
+        ),
+        "backtest/2026-08-28/.phases/simulation_setup/dates.json": json.dumps(
+            ["2026-03-05", "2026-03-06"]
+        ).encode(),
+    })
+    monkeypatch.setattr(
+        phase_marker_sweep, "boto3", MagicMock(client=lambda *a, **k: s3)
+    )
+
+    result = phase_marker_sweep.sweep(run_date="2026-08-28", alert=False)
+
+    assert result["status"] == "ok", result
+    assert result["checked_count"] == 1
+    assert result["error_phases"] == []
+    assert result["malformed_markers"] == []
+
+
+def test_non_dict_top_level_marker_is_a_named_finding_not_a_crash(monkeypatch):
+    """A top-level marker that parses to a non-object is reported, not fatal.
+
+    json.loads accepts an array, so the pre-fix
+    ``except (JSONDecodeError, ValueError)`` guard never saw it. Fail loud
+    with the key named — a marker the sweep cannot read must not be
+    indistinguishable from a healthy phase, and must not present as an
+    opaque stage=s3_list harness fault.
+    """
+    from validators import phase_marker_sweep
+
+    s3 = _DelimiterAwareS3({
+        "backtest/2026-08-28/.phases/good.json": _marker("good", "ok"),
+        "backtest/2026-08-28/.phases/bad.json": json.dumps([1, 2, 3]).encode(),
+    })
+    monkeypatch.setattr(
+        phase_marker_sweep, "boto3", MagicMock(client=lambda *a, **k: s3)
+    )
+
+    result = phase_marker_sweep.sweep(run_date="2026-08-28", alert=False)
+
+    assert result["status"] == "malformed_markers_detected", result
+    assert result["checked_count"] == 1
+    assert [m["s3_key"] for m in result["malformed_markers"]] == [
+        "backtest/2026-08-28/.phases/bad.json"
+    ]
+    assert "list" in result["malformed_markers"][0]["reason"]
+
+
+def test_malformed_marker_exits_1_not_2(monkeypatch):
+    """An unreadable marker is a finding (exit 1), not a sweep-infra fault (2).
+
+    substrate_health_check.sh treats this sweep as a gating check, so the
+    distinction is what separates "a phase marker is broken" from "the
+    sweep could not run" on the surface that reports it.
+    """
+    from validators import phase_marker_sweep
+
+    s3 = _DelimiterAwareS3({
+        "backtest/2026-08-28/.phases/bad.json": json.dumps([1]).encode(),
+    })
+    monkeypatch.setattr(
+        phase_marker_sweep, "boto3", MagicMock(client=lambda *a, **k: s3)
+    )
+
+    rc = phase_marker_sweep.main(
+        ["--run-date", "2026-08-28", "--no-alert"]
+    )
+    assert rc == 1

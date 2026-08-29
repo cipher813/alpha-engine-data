@@ -68,26 +68,64 @@ _PHASE_PREFIX_TEMPLATE = "backtest/{run_date}/.phases/"
 _ALERT_PREVIEW_LIMIT = 10
 
 
-def _list_phase_markers(bucket: str, run_date: str) -> list[dict]:
-    """List and parse every phase marker under backtest/{run_date}/.phases/."""
+def _list_phase_markers(bucket: str, run_date: str) -> tuple[list[dict], list[dict]]:
+    """Parse the phase markers directly under backtest/{run_date}/.phases/.
+
+    Returns ``(markers, malformed)`` — the well-formed markers, and one
+    ``{"s3_key", "reason"}`` entry per object under the marker prefix that
+    could not be read as a marker.
+
+    **``Delimiter="/"`` is load-bearing (alpha-engine-config-I9262).** A
+    phase marker declares its own outputs in ``artifact_keys``, and the
+    backtester writes those artifacts one level DOWN, under
+    ``.phases/{phase}/``. Listing the prefix without a delimiter walks that
+    whole subtree and hands this function objects that were never markers.
+    Measured 2026-08-29 on ``backtest/2026-08-28/.phases/``: 26 markers at
+    the top level and 10 nested ``*.json`` artifacts below it, one of which
+    (``simulation_setup/dates.json``) is a JSON **array**. ``json.loads``
+    accepts an array, so the old ``except (JSONDecodeError, ValueError)``
+    guard did not catch it, and ``marker["_s3_key"] = key`` then raised
+    ``TypeError: list indices must be integers or slices, not str``. The
+    caller's blanket ``except`` turned that code fault into
+    ``stage=s3_list``, the shell scored it as a gating failure, and the
+    weekly run terminated ``SubstrateHealthCheckDegraded`` having never
+    computed a phase verdict at all.
+
+    A non-dict body is therefore reported as a NAMED malformed marker
+    rather than crashing the sweep or being silently dropped: a marker this
+    sweep cannot read is exactly the condition it exists to surface, and a
+    skip would make it indistinguishable from a healthy phase.
+    """
     s3 = boto3.client("s3")
     prefix = _PHASE_PREFIX_TEMPLATE.format(run_date=run_date)
     markers: list[dict] = []
+    malformed: list[dict] = []
     paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/"):
+        for obj in page.get("Contents", []) or []:
             key = obj["Key"]
             if not key.endswith(".json"):
                 continue
             body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
             try:
                 marker = json.loads(body)
-            except (json.JSONDecodeError, ValueError):
-                logger.warning("Unparseable phase marker %s — skipping", key)
+            except (json.JSONDecodeError, ValueError) as exc:
+                logger.error("Unparseable phase marker %s: %s", key, exc)
+                malformed.append({"s3_key": key, "reason": f"unparseable: {exc}"})
+                continue
+            if not isinstance(marker, dict):
+                logger.error(
+                    "Phase marker %s parsed to %s, not an object — cannot be "
+                    "read as a marker", key, type(marker).__name__,
+                )
+                malformed.append({
+                    "s3_key": key,
+                    "reason": f"parsed to {type(marker).__name__}, expected object",
+                })
                 continue
             marker["_s3_key"] = key
             markers.append(marker)
-    return markers
+    return markers, malformed
 
 
 def sweep(
@@ -110,12 +148,13 @@ def sweep(
         alert_severity: severity tag for the published alert.
 
     Returns:
-        dict with keys: status (`ok` | `phase_errors_detected` | `error`),
-        run_date, checked_count, error_phases (list of
-        {phase, error, s3_key}).
+        dict with keys: status (`ok` | `phase_errors_detected` |
+        `malformed_markers_detected` | `error`), run_date,
+        checked_count, error_phases (list of {phase, error, s3_key}),
+        malformed_markers (list of {s3_key, reason}).
     """
     try:
-        markers = _list_phase_markers(bucket, run_date)
+        markers, malformed_markers = _list_phase_markers(bucket, run_date)
     except Exception as exc:
         logger.exception("Phase marker list/read failed")
         return {"status": "error", "error": str(exc), "stage": "s3_list"}
@@ -131,16 +170,34 @@ def sweep(
     ]
 
     logger.info(
-        "Phase marker sweep run_date=%s: checked=%d error=%d",
-        run_date, len(markers), len(error_phases),
+        "Phase marker sweep run_date=%s: checked=%d error=%d malformed=%d",
+        run_date, len(markers), len(error_phases), len(malformed_markers),
     )
 
+    if error_phases:
+        status = "phase_errors_detected"
+    elif malformed_markers:
+        # A marker that cannot be read is a finding with a name, not a pass
+        # and not a harness fault (alpha-engine-config-I9262).
+        status = "malformed_markers_detected"
+    else:
+        status = "ok"
+
     result = {
-        "status": "phase_errors_detected" if error_phases else "ok",
+        "status": status,
         "run_date": run_date,
         "checked_count": len(markers),
         "error_phases": error_phases,
+        "malformed_markers": malformed_markers,
     }
+
+    if malformed_markers:
+        logger.error(
+            "MALFORMED PHASE MARKERS: %d object(s) under backtest/%s/.phases/ "
+            "could not be read as markers: %s",
+            len(malformed_markers), run_date,
+            [m["s3_key"] for m in malformed_markers],
+        )
 
     if error_phases and alert:
         try:
@@ -228,6 +285,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         logger.error("Phase-marker sweep failed at stage=%s: %s",
                      result.get("stage"), result.get("error"))
         return 2
+
+    if result["status"] == "malformed_markers_detected":
+        logger.error(
+            "MALFORMED PHASE MARKERS: %d object(s) unreadable as markers on "
+            "run_date=%s: %s",
+            len(result["malformed_markers"]),
+            args.run_date,
+            [m["s3_key"] for m in result["malformed_markers"]],
+        )
+        return 1
 
     if result["status"] == "phase_errors_detected":
         logger.error(
