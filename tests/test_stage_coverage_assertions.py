@@ -567,3 +567,78 @@ def test_the_lambda_coverage_state_set_is_not_silently_smaller_than_reality() ->
         "world than its name implies."
     )
     assert discovered, "the lambda-state scan found nothing — it cannot pass vacuously"
+
+
+# ---------------------------------------------------------------------------
+# Every stage-coverage verdict producer is handed the execution that produced it
+# (alpha-engine-config-I9247)
+#
+# `_stage_coverage/` verdict records carried `execution_arn: None` on EVERY
+# object, so a deploy-time probe's verdict and a real execution's verdict were
+# indistinguishable in the artifact. `crucible-predictor-PR578` (merged
+# 2026-08-29) now persists `execution_arn` + `invocation_kind` onto those
+# records — but it populates `execution_arn` FROM THE EVENT, so a Task that does
+# not thread it writes the same None it always did and the fix is inert.
+#
+# Why it is load-bearing rather than cosmetic: `alpha-engine-config-I8155`'s
+# gate predicate is a raw object COUNT over
+# `s3://alpha-engine-research/_stage_coverage/{date}/`, which probe writes
+# inflate. The hardened predicate counts only records with a NON-NULL
+# `execution_arn` — and that predicate counts zero, and strands the gate, until
+# this threading lands (`alpha-engine-config-I9248`).
+# ---------------------------------------------------------------------------
+
+_EXECUTION_ARN_REQUIRED = (
+    "WeeklyRunDayGate",
+    "LibPinDriftCheck",
+    "PipelineContractCheck",
+    "RegimeSubstrate",
+    "RegimeRetrospectiveEval",
+)
+
+
+def _all_states(node, out=None):
+    """Every state in a definition, INCLUDING the ones nested inside a Parallel
+    branch or a Map's ItemProcessor.
+
+    A top-level `["States"]` walk is not sufficient here and quietly returns the
+    wrong answer: `RegimeSubstrate` and `RegimeRetrospectiveEval` live inside
+    `ResearchPredictorParallel`'s Branch 0 (config#885 relocated the
+    Scanner→RAG→Regime chain into it), so a flat scan reports them ABSENT
+    rather than unwired.
+    """
+    out = {} if out is None else out
+    if isinstance(node, dict):
+        states = node.get("States")
+        if isinstance(states, dict):
+            for name, body in states.items():
+                out[name] = body
+                _all_states(body, out)
+        for key in ("Branches", "ItemProcessor", "Iterator"):
+            value = node.get(key)
+            if isinstance(value, dict):
+                _all_states(value, out)
+            elif isinstance(value, list):
+                for branch in value:
+                    _all_states(branch, out)
+    return out
+
+
+def test_stage_coverage_producers_thread_the_execution_arn():
+    import json as _json
+    import pathlib as _pathlib
+
+    definition = _json.loads(
+        (_pathlib.Path(__file__).resolve().parents[1]
+         / "infrastructure" / "step_function.json").read_text()
+    )
+    states = _all_states(definition)
+    for name in _EXECUTION_ARN_REQUIRED:
+        assert name in states, f"{name} is not in the weekly definition at all"
+        payload = states[name].get("Parameters", {}).get("Payload", {})
+        assert payload.get("execution_arn.$") == "$$.Execution.Id", (
+            f"{name}'s Payload does not thread execution_arn — its stage-coverage "
+            "verdicts will keep writing execution_arn: None and stay "
+            "indistinguishable from a deploy-time probe's "
+            "(alpha-engine-config-I9247)"
+        )
