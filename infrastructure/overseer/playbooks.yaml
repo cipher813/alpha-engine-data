@@ -973,6 +973,22 @@ alert_classes:
     severities: [warning]
     intake: bus
     response: drain-queue
+  # alpha-engine-config-I9282 (crucible-research-PR762). The Think Tank
+  # challenger arm writes its leaderboard evidence
+  # (signals_shadow/thinktank_coverage/{date}/signals.json) ONLY when its
+  # declared coverage window is complete. That skip was reported at INFO and
+  # escalated nowhere, so the arm silently stopped contributing cohort dates on
+  # 2026-08-14 and nothing noticed for two weeks — on the producer leaderboard
+  # it read as a THIN arm rather than a DEAD one. This class carries the
+  # now-loud "arm produced no evidence this cycle" event
+  # (champion-challenger-policy.md §3: a no-output cycle is a MISS, not an
+  # omission). Deduped per trading_day at the call site, so a persistent
+  # outage pages once per cycle rather than once per run.
+  - class: research_thinktank_challenger_selection_alerts
+    source: "thinktank:challenger_selection"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
   - class: research_signals_envelope_rejected
     # NOTE: this class emits via ``alerts.publish`` with explicit
     # ``severity="error"`` (not ``publish_observe_alert``), so its
