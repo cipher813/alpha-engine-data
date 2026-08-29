@@ -183,7 +183,16 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
         "run_date.$", "dry_run.$", "execution_arn.$", "state_machine_arn.$",
         "execution_input.$",
     }),
-    "ReportCard": frozenset({"date.$", "dry_run.$", "snapshot", "gate_state"}),
+    # alpha-engine-config-I7392: `run_scope` is the run's OWN scope, threaded
+    # in-band from $.run_scope_result.Payload (the RunScope Task immediately
+    # upstream) and seeded at the InitializeInput floor. It was previously
+    # delivered ONLY as backtest/{date}/run_scope.json — the one delivery path a
+    # rehearsal is forbidden to write, since the RunScope Lambda skips its
+    # put_object on dry_run. Consumer: crucible-evaluator
+    # grading/artifacts.py::_read_run_scope (in-band first, S3 as the fallback).
+    "ReportCard": frozenset({
+        "date.$", "dry_run.$", "snapshot", "gate_state", "run_scope.$",
+    }),
     # Director (Layer C, Part II) — alpha-engine-evaluator-director:live. Final
     # advisory task; reads the fresh report card, writes director/{date}/
     # action_plan.json; flag-gated (DIRECTOR_ENABLED) + non-fatal (own Catch).
