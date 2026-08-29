@@ -1042,3 +1042,80 @@ class TestJudgeChainBeforePredictor:
         # defaults to SaturdayHealthCheck on a normal run.
         assert states["CheckSkipPostEval"]["Default"] == "CheckSkipSaturdayHealthCheck"
         assert states["CheckSkipSaturdayHealthCheck"]["Default"] == "SaturdayHealthCheck"
+
+
+class TestSyncRungRouting:
+    """alpha-engine-config-I9263 — Brian's ruling 2026-08-29, verbatim:
+    *"I will not fund the anthropic account, at this point we shouldn't be
+    using the anthropic api at all."*
+
+    ``crucible-research-PR759`` migrated the eval-judge chain off the direct
+    Anthropic SDK onto the krepis router. When no batch-capable route resolves,
+    Submit takes the synchronous judge rung and returns
+    ``processing_status='ended_sync'`` with a ``sync-{date}`` batch id. These
+    tests pin the SF's half of that contract.
+    """
+
+    def test_ended_sync_routes_straight_to_process(self, states):
+        """A sync-rung run must reach Process, and must not enter the Wait loop.
+
+        Pre-I9263 there was no such branch: an ``ended_sync`` payload carried
+        ``status='OK'``, so it entered the 60s Wait and burned a Poll
+        invocation to learn what Submit had already stated.
+        """
+        choices = states["EvalJudgePollChoice"]["Choices"]
+        sync = [
+            c for c in choices
+            if any(
+                cond.get("StringEquals") == "ended_sync"
+                for cond in c.get("And", [])
+            )
+        ]
+        assert len(sync) == 1, (
+            "exactly one ended_sync branch expected in EvalJudgePollChoice"
+        )
+        assert sync[0]["Next"] == "EvalJudgeProcess"
+
+        # Ordering is load-bearing: SF evaluates Choices in order, and the
+        # `status == "OK"` branch would otherwise match first and send a
+        # sync-rung run into the Wait loop.
+        ok_index = next(
+            i for i, c in enumerate(choices)
+            if any(
+                cond.get("StringEquals") == "OK" for cond in c.get("And", [])
+            )
+        )
+        assert choices.index(sync[0]) < ok_index
+
+    def test_the_sync_branch_is_ispresent_guarded(self, states):
+        """A submit payload with no processing_status must still reach the
+        fail-soft Default, not throw States.Runtime (config#2275's rule)."""
+        choices = states["EvalJudgePollChoice"]["Choices"]
+        sync = next(
+            c for c in choices
+            if any(
+                cond.get("StringEquals") == "ended_sync"
+                for cond in c.get("And", [])
+            )
+        )
+        assert any(cond.get("IsPresent") is True for cond in sync["And"])
+        assert states["EvalJudgePollChoice"]["Default"] == "MarkEvalJudgeDegraded"
+
+    def test_process_reads_its_inputs_from_submit_not_from_poll(self, states):
+        """The reason skipping Poll is safe at all.
+
+        If Process took batch_id or plan_s3_key from ``$.eval_judge_poll``, the
+        ended_sync shortcut would starve it. Pinned so a future edit that moves
+        either field to the poll payload fails here rather than in production."""
+        payload = states["EvalJudgeProcess"]["Parameters"]["Payload"]
+        assert payload["batch_id.$"] == "$.eval_judge_submit.Payload.batch_id"
+        assert payload["plan_s3_key.$"] == "$.eval_judge_submit.Payload.plan_s3_key"
+
+    def test_no_sf_comment_still_claims_the_poll_calls_anthropic(self, sf):
+        """The chain no longer calls ``anthropic.messages.batches.retrieve``.
+
+        `doc-maintenance-policy`: an instruction is load-bearing, not a
+        historical log. A comment asserting a call that no longer exists sends
+        the next reader to the wrong provider during an incident."""
+        raw = json.dumps(sf)
+        assert "Calls anthropic.messages.batches.retrieve" not in raw
