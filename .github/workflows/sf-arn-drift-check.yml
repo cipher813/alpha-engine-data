@@ -263,10 +263,14 @@ jobs:
       # deliberate `if: github.event_name != 'push'` race removal, and a step
       # excluded by its own `if:` has produced no verdict to fail on.
       #
-      # tests/test_sf_arn_drift_check_gate.py asserts that EVERY step running a
-      # checker here is both tolerated and named in this gate — a step added
-      # later without an id would otherwise be un-gated and its failure would
-      # silently pass the job, which is a worse defect than the one this fixes.
+      # tests/test_scheduled_workflow_reachability.py asserts that EVERY step
+      # running a checker here is both tolerated and named in this gate — a
+      # step added later without an id would otherwise be un-gated and its
+      # failure would silently pass the job, which is a worse defect than the
+      # one this fixes. (Corrected 2026-08-29, alpha-engine-config-I9073: this
+      # comment named a test file, test_sf_arn_drift_check_gate.py, that was
+      # never committed — the real guard landed under a different name in
+      # alpha-engine-config-I9121/nousergon-data-PR1572.)
       - name: Drift-check gate (fail the job on any failed check above)
         if: always()
         env:
