@@ -14,21 +14,32 @@
 #   --apply-iam   re-apply iam-policy.json only, no code/bootstrap side effects (config#2825)
 #   --smoke       fire ONE real run on a REAL spot box (the §47 validation gate)
 #   --cutover     repoint alpha-research-thinktank-daily at this dispatcher
+#   --dry-run     print every mutating call instead of making it
 #
 # See README.md for the full rollout order. crucible-research-PR544 must be
 # merged to main BEFORE --smoke: the SSM prelude execs
 # infrastructure/thinktank_spot_bootstrap.sh out of a shallow clone of main.
+#
+# WHY THIS SCRIPT NO LONGER HAND-ROLLS ANYTHING (alpha-engine-config-I9114).
+# Until 2026-08-28 this was the one deploy.sh in a private dialect: it made bare
+# `aws` calls instead of `run`, packaged with a host-arch `pip install --target`
+# instead of the shared Lambda-safe installer, never ran its own 25 handler
+# tests, and hand-rolled its IAM with the exact
+#
+#     aws iam get-role ... >/dev/null 2>&1 || { aws iam create-role ...; }
+#
+# misclassification that made four sibling workflows red for a week
+# (alpha-engine-config-I9045 / nousergon-data-PR1569 — `2>&1` to /dev/null makes
+# AccessDenied and NoSuchEntity the same observation, so a DENIED read was read
+# as "role absent"). Fixing `_shared/apply_iam_policy.sh` did not fix this copy,
+# which is the whole reason a private dialect is a defect and not a style. Every
+# mechanism below is now the shared one, so the next fix to it lands here too.
 
 set -euo pipefail
 
-# Alarm upserts RESET ActionsEnabled, so without this the next deploy re-arms any alarm the automation pause has silenced
-# (alpha-engine-config-I7023).
-# shellcheck source=infrastructure/lambdas/_shared/pause.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
-
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 REGION="${AWS_REGION:-us-east-1}"
-ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 FUNCTION_NAME="alpha-engine-thinktank-spot-dispatcher"
 ROLE_NAME="alpha-engine-thinktank-spot-dispatcher-role"
 # Authoritative inline-policy assignment — the consolidated drift checker
@@ -41,78 +52,108 @@ RULE_NAME="alpha-research-thinktank-daily"
 # Same topic the alarms this cutover replaces already publish to, so the
 # rotation does not silently change where a Think Tank page lands.
 SNS_TOPIC_ARN="${SNS_TOPIC_ARN:-arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
-source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
-BUILD_DIR="$(mktemp -d)"
-trap 'rm -rf "$BUILD_DIR"' EXIT
+TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 
-BOOTSTRAP=0; SMOKE=0; CUTOVER=0; APPLY_IAM=0
+# DRY_RUN honors an ambient env var (true/1/yes) as well as the --dry-run flag
+# below, matching every sibling deploy.sh (alpha-engine-config-I2752: an
+# operator assumed DRY_RUN=<env var> worked and triggered a real deploy). It
+# must be DEFINED whatever happens: `apply_iam_policy` reads a bare `$DRY_RUN`,
+# so leaving it unset would abort under this script's `set -u`.
+case "${DRY_RUN:-false}" in
+  true|1|yes|TRUE|YES) DRY_RUN=true ;;
+  *) DRY_RUN=false ;;
+esac
+
+BOOTSTRAP=false; SMOKE=false; CUTOVER=false; APPLY_IAM=false
 while [ $# -gt 0 ]; do
     case "$1" in
-        --bootstrap) BOOTSTRAP=1; shift ;;
-        --smoke) SMOKE=1; shift ;;
-        --cutover) CUTOVER=1; shift ;;
-        --apply-iam) APPLY_IAM=1; shift ;;
+        --bootstrap) BOOTSTRAP=true; shift ;;
+        --smoke) SMOKE=true; shift ;;
+        --cutover) CUTOVER=true; shift ;;
+        --apply-iam) APPLY_IAM=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
+# Alarm upserts RESET ActionsEnabled, so without this the next deploy re-arms any alarm the automation pause has silenced
+# (alpha-engine-config-I7023).
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "${SCRIPT_DIR}/../_shared/pause.sh"
+# shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
+source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
+# shellcheck source=infrastructure/lambdas/_shared/apply_iam_policy.sh
+source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
+
+ACCOUNT_ID="${ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text)}"
+
 # ----- Apply IAM only (config#2825, no bootstrap/code side effects) --------
-if [ "$APPLY_IAM" -eq 1 ]; then
+# Reached ONLY under --apply-iam, i.e. by an operator. apply_iam_policy's
+# default may_create_role=true is therefore correct here — and its
+# probe_role_presence means a DENIED get-role is reported as `unknown` and
+# creates nothing, rather than being misread as absence.
+if $APPLY_IAM; then
     echo "==> applying IAM (role=$ROLE_NAME, policy=$POLICY_NAME)"
-    aws iam get-role --role-name "$ROLE_NAME" --region "$REGION" >/dev/null 2>&1 || {
-        echo "  Creating IAM role: $ROLE_NAME"
-        aws iam create-role --role-name "$ROLE_NAME" \
-            --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}' \
-            --region "$REGION" >/dev/null
-        echo "  waiting for IAM propagation..."
-        sleep 10
-    }
-    aws iam put-role-policy --role-name "$ROLE_NAME" \
-        --policy-name "$POLICY_NAME" \
-        --policy-document "file://$SCRIPT_DIR/iam-policy.json" \
-        --region "$REGION"
-    echo "  ✓ IAM applied."
+    apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" \
+      "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
+    echo "  ✓ IAM applied. Nothing else was touched — no code, no alarms."
     echo "==> done"
     exit 0
 fi
 
-echo "==> building package"
-cp "$SCRIPT_DIR/index.py" "$BUILD_DIR/"
-python3.12 -m pip install --quiet --target "$BUILD_DIR" -r "$SCRIPT_DIR/requirements.txt"
-(cd "$BUILD_DIR" && zip -qr /tmp/thinktank-spot-dispatcher.zip .)
+# ----- Preflight handler unit tests (shared gate — config#2381) -------------
+# 25 tests sat beside index.py that this deploy.sh never ran, so the post-merge
+# gate was absent for this lambda entirely. No extra deps: they stub
+# nousergon_lib and boto3 in sys.modules, and the helper's contract is that such
+# a caller must NOT get boto3 installed alongside the stub.
+# shellcheck source=infrastructure/lambdas/_shared/run_handler_tests.sh
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+run_handler_tests "${SCRIPT_DIR}"
 
-if [ "$BOOTSTRAP" -eq 1 ]; then
-    echo "==> creating IAM role $ROLE_NAME (idempotent)"
-    aws iam create-role --role-name "$ROLE_NAME" \
-        --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}' \
-        --region "$REGION" >/dev/null 2>&1 || echo "    (role exists)"
-    aws iam put-role-policy --role-name "$ROLE_NAME" \
-        --policy-name "$POLICY_NAME" \
-        --policy-document "file://$SCRIPT_DIR/iam-policy.json" \
-        --region "$REGION"
-    echo "    waiting for IAM propagation..."
-    sleep 10
+echo "==> building package"
+BUILD_DIR="$(mktemp -d)"
+trap 'rm -rf "$BUILD_DIR"' EXIT
+# The shared Lambda-safe installer, not `pip install --target` (which this
+# script used until I9114). A bare host install on macOS bundles darwin/arm64
+# wheels that ImportError on the Lambda linux/amd64 runtime; the helper also
+# chowns the tree back so a Linux CI runner's non-root cleanup does not EPERM.
+bash "${SCRIPT_DIR}/../lambda_pip_install.sh" "$BUILD_DIR" "${SCRIPT_DIR}/requirements.txt"
+cp "$SCRIPT_DIR/index.py" "$BUILD_DIR/"
+# Inside BUILD_DIR, not a fixed /tmp path: the old /tmp/thinktank-spot-dispatcher.zip
+# was shared mutable state between concurrent runs and survived the trap.
+ZIP="$BUILD_DIR/function.zip"
+(cd "$BUILD_DIR" && zip -qr function.zip . -x "function.zip")
+
+if $BOOTSTRAP; then
+    echo "==> creating IAM role $ROLE_NAME + applying policy (idempotent)"
+    apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" \
+      "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
 
     echo "==> creating Lambda $FUNCTION_NAME (idempotent)"
-    aws lambda create-function --function-name "$FUNCTION_NAME" \
+    # `run_tolerating` rather than `|| echo "(function exists)"`: the old form
+    # reported that same reassuring line for AccessDenied, an invalid role ARN
+    # and a malformed zip, with the real message sent to /dev/null. The
+    # already-exists conflict is the ONE benign failure.
+    run_tolerating "ResourceConflictException" \
+      aws lambda create-function --function-name "$FUNCTION_NAME" \
         --runtime python3.12 --handler index.handler \
         --role "arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}" \
-        --zip-file fileb:///tmp/thinktank-spot-dispatcher.zip \
+        --zip-file "fileb://${ZIP}" \
         --timeout 300 --memory-size 512 \
-        --region "$REGION" >/dev/null 2>&1 || echo "    (function exists — updating code below)"
+        --region "$REGION" --query 'FunctionArn' --output text
 fi
 
 echo "==> updating function code"
-aws lambda update-function-code --function-name "$FUNCTION_NAME" \
-    --zip-file fileb:///tmp/thinktank-spot-dispatcher.zip \
-    --region "$REGION" --query 'LastModified' --output text
-aws lambda wait function-updated --function-name "$FUNCTION_NAME" --region "$REGION"
+run aws lambda update-function-code --function-name "$FUNCTION_NAME" \
+    --zip-file "fileb://${ZIP}" \
+    --region "$REGION" --query 'LastUpdateStatus' --output text
+if ! $DRY_RUN; then
+    aws lambda wait function-updated --function-name "$FUNCTION_NAME" --region "$REGION"
+fi
 
-verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "/tmp/thinktank-spot-dispatcher.zip"
+verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${ZIP}"
 
-if [ "$SMOKE" -eq 1 ]; then
+if $SMOKE; then
     echo "==> SMOKE: firing ONE real Think Tank run on a REAL spot box"
     echo "    (this spends a spot instance and a real LLM pass — ~25 min expected)"
     # shellcheck source=infrastructure/lambdas/_shared/smoke.sh
@@ -130,7 +171,7 @@ if [ "$SMOKE" -eq 1 ]; then
     echo "           thinktank/events/ written for the trading day, box self-terminated."
 fi
 
-if [ "$CUTOVER" -eq 1 ]; then
+if $CUTOVER; then
     echo "==> CUTOVER: repointing $RULE_NAME at $FUNCTION_NAME"
     TARGET_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
     # `|| echo "(permission exists)"` reported that same reassuring line for
@@ -143,7 +184,7 @@ if [ "$CUTOVER" -eq 1 ]; then
         --principal events.amazonaws.com \
         --source-arn "arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${RULE_NAME}" \
         --region "$REGION"
-    aws events put-targets --rule "$RULE_NAME" \
+    run aws events put-targets --rule "$RULE_NAME" \
         --targets "[{\"Id\":\"1\",\"Arn\":\"${TARGET_ARN}\"}]" --region "$REGION"
     echo "    $RULE_NAME now targets $FUNCTION_NAME."
 
@@ -171,7 +212,7 @@ if [ "$CUTOVER" -eq 1 ]; then
     echo "==> $DISPATCH_ALARM is applied from nous-ergon-ops, not here (alpha-engine-config-I7359)"
 
     echo "==> deleting the now-blind $OLD_FUNCTION alarms"
-    aws cloudwatch delete-alarms --alarm-names \
+    run aws cloudwatch delete-alarms --alarm-names \
         "alpha-engine-thinktank-daily-run-failed" \
         "alpha-engine-thinktank-daily-run-failed-timeout" \
         --region "$REGION"
