@@ -48,9 +48,23 @@ class TestFredHistoryMap:
 
     def test_no_unintended_entries(self):
         # Stage 2.5b shipped TWO + HYOAS; Stage 2.5c added BAA10Y.
-        # Lock so a future drive-by addition doesn't slip through
-        # unreviewed.
-        assert set(FRED_HISTORY_MAP.keys()) == {"TWO", "HYOAS", "BAA10Y"}
+        # alpha-engine-config-I9286 merged in the four caret index tickers
+        # (VIX/VIX3M/TNX/IRX) that used to live only in
+        # ``collectors/daily_closes.py::_FRED_INDEX_MAP`` — this dict is now
+        # the SINGLE declared ticker -> FRED series id map. Lock the full set
+        # so a future drive-by addition doesn't slip through unreviewed.
+        assert set(FRED_HISTORY_MAP.keys()) == {
+            "VIX", "VIX3M", "TNX", "IRX", "TWO", "HYOAS", "BAA10Y",
+        }
+
+    def test_caret_index_tickers_match_daily_closes_series_ids(self):
+        """The merge must not silently change what any existing caller
+        resolves — VIX/VIX3M/TNX/IRX must map to the exact series ids
+        ``daily_closes.py`` already used before the merge."""
+        assert FRED_HISTORY_MAP["VIX"] == "VIXCLS"
+        assert FRED_HISTORY_MAP["VIX3M"] == "VXVCLS"
+        assert FRED_HISTORY_MAP["TNX"] == "DGS10"
+        assert FRED_HISTORY_MAP["IRX"] == "DTB3"
 
 
 # ── fetch_fred_history ──────────────────────────────────────────────────
