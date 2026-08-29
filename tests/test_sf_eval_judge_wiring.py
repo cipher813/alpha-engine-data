@@ -639,11 +639,49 @@ class TestEvalRollingMean:
         payload = states["EvalRollingMean"]["Parameters"]["Payload"]
         assert payload["end_time_iso.$"] == "$$.Execution.StartTime"
 
-    def test_timeout_matches_lambda_cap(self, states):
-        # Rolling-mean Lambda is configured with timeout=300s
-        # (alpha-engine-research infrastructure/deploy.sh) — SF state
-        # TimeoutSeconds must equal that ceiling.
-        assert states["EvalRollingMean"]["TimeoutSeconds"] == 300
+    def test_timeout_is_the_declared_guard_band_over_a_self_deadlining_function(self, states):
+        """The SF budget sits deliberately ABOVE the function's 900s maximum.
+
+        Was `== 300`, exactly equal to the Lambda's configured timeout. Equal is
+        the one value that guarantees the SF cannot be the thing that stops the
+        state: whichever ceiling fires first is a coin toss, and on 2026-08-28
+        the Lambda won — `EvalRollingMean` burned its full 300s after 1.6s of
+        handler work, the stop arrived as `States.Timeout`, the
+        research/predictor branch fail-opened, and the run terminated FAILED
+        having done its work (alpha-engine-config#9102).
+
+        MEASURED cause, from that invocation's own log stream: the handler never
+        returned. It sat 298s inside
+        `scripts.build_agent_quality -> evals.judge_outcome_ic.open_research_db`,
+        which downloads a 356 MB SQLite snapshot into a 512 MB function.
+        Nothing held the runtime open AFTER the handler returned — on the
+        healthy 2026-08-21/-22 runs END lands 1.3-1.5s after the last handler
+        log line.
+
+        The repair is in the handler: its four secondary aggregations now run
+        under `invocation_budget.run_bounded`, so the stage returns its primary
+        deliverable on its own budget. That makes the function SELF-DEADLINING,
+        and the ordering rule inverts for that class — a self-deadlining
+        function is pinned at Lambda's 900s service maximum and the state
+        carries a guard band ABOVE it, so the FUNCTION's ceiling is the backstop
+        that fires and emits a REPORT line, instead of the state killing the
+        graceful return at the wall. `ReplayConcordance` and `EvalJudgeProcess`
+        carry the identical 960 for the identical reason
+        (alpha-engine-config-I7181); `tests/test_sf_lambda_timeout_ordering.py`
+        is where that rule is stated and enforced fleet-wide.
+        """
+        sf_budget = states["EvalRollingMean"]["TimeoutSeconds"]
+        lambda_cap = 900  # Lambda's service maximum; the function is pinned there.
+        assert sf_budget > lambda_cap, (
+            f"SF budget {sf_budget}s must sit ABOVE the self-deadlining function's "
+            f"{lambda_cap}s ceiling, or the state pre-empts the graceful partial "
+            "return the handler exists to make"
+        )
+        assert sf_budget == 960, (
+            "the guard band is a declared number, not a range — a drifting band "
+            "is back to being decorative (test_sf_lambda_timeout_ordering.py "
+            "pins the same value in _SERVICE_MAX_GUARD_BAND)"
+        )
 
     def test_success_continues_to_rationale_clustering_gate(self, states):
         # Rolling-mean converges to CheckSkipRationaleClustering (the

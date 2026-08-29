@@ -101,8 +101,14 @@ def test_preflight_fails_closed_on_lambda_error(states):
     is to stop before spending."""
     catch = states["WeeklyPreflight"]["Catch"][0]
     assert catch["ErrorEquals"] == ["States.ALL"]
-    assert catch["Next"] == "ExtractWeeklyPreflightError", (
-        "Lambda error must route to ExtractWeeklyPreflightError, "
+    # alpha-engine-config#5950: it used to route to ExtractWeeklyPreflightError,
+    # which dereferences $.weekly_preflight_result.Payload — a field the SUCCESS
+    # path writes. On the Catch path the invoke failed, so it was never written,
+    # and every preflight crash died in States.Runtime inside the state meant to
+    # report it. ExtractWeeklyPreflightCrash reads $.weekly_preflight_error,
+    # which is exactly what this Catch's own ResultPath writes.
+    assert catch["Next"] == "ExtractWeeklyPreflightCrash", (
+        "Lambda error must route to ExtractWeeklyPreflightCrash, "
         f"got {catch['Next']}"
     )
 
