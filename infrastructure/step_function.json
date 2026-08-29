@@ -44,7 +44,8 @@
         "FunctionName": "alpha-engine-predictor-inference:live",
         "Payload": {
           "action": "check_weekly_run_day",
-          "run_date.$": "$.run_date"
+          "run_date.$": "$.run_date",
+          "execution_arn.$": "$$.Execution.Id"
         }
       },
       "TimeoutSeconds": 60,
@@ -185,7 +186,8 @@
         "FunctionName": "alpha-engine-predictor-inference:live",
         "Payload": {
           "action": "check_lib_pin_drift",
-          "run_date.$": "$.run_date"
+          "run_date.$": "$.run_date",
+          "execution_arn.$": "$$.Execution.Id"
         }
       },
       "TimeoutSeconds": 60,
@@ -271,7 +273,8 @@
         "FunctionName": "alpha-engine-predictor-inference:live",
         "Payload": {
           "action": "check_pipeline_contract",
-          "run_date.$": "$.run_date"
+          "run_date.$": "$.run_date",
+          "execution_arn.$": "$$.Execution.Id"
         }
       },
       "TimeoutSeconds": 60,
@@ -1294,7 +1297,8 @@
                 "FunctionName": "alpha-engine-predictor-regime-substrate:live",
                 "Payload": {
                   "action.$": "$.regime_action",
-                  "run_date.$": "$.run_date"
+                  "run_date.$": "$.run_date",
+                  "execution_arn.$": "$$.Execution.Id"
                 }
               },
               "TimeoutSeconds": 270,
@@ -1719,7 +1723,8 @@
                 "FunctionName": "alpha-engine-predictor-regime-retrospective-eval:live",
                 "Payload": {
                   "action.$": "$.regime_action",
-                  "run_date.$": "$.run_date"
+                  "run_date.$": "$.run_date",
+                  "execution_arn.$": "$$.Execution.Id"
                 }
               },
               "TimeoutSeconds": 570,
