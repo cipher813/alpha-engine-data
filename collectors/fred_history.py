@@ -41,12 +41,32 @@ logger = logging.getLogger(__name__)
 _FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
 _FRED_TIMEOUT = 30  # longer than _fred_latest's 15s — date-range responses are bigger
 
-# FRED-only symbols that need historical backfill via this module. Map
-# our parquet/ArcticDB ticker key → FRED series id. Mirrors the
-# Stage 2.5 entries in ``collectors/daily_closes._FRED_INDEX_MAP`` for
-# the symbols not on yfinance. Kept separate so changes here don't
-# impact daily_closes' single-latest fetch behaviour.
+# Canonical ticker -> FRED series id map. Historically this module only
+# carried the three FRED-only symbols (TWO/HYOAS/BAA10Y) while
+# ``collectors/daily_closes.py::_FRED_INDEX_MAP`` separately carried the four
+# caret index tickers (VIX/VIX3M/TNX/IRX, for the daily single-latest FRED
+# fallback) PLUS its own copies of TWO/HYOAS/BAA10Y — two maps that had to be
+# kept in sync by hand and had already drifted (this dict was missing the
+# caret tickers daily_closes already knew about).
+#
+# alpha-engine-config-I9286: merged here as the SINGLE declared source.
+# ``daily_closes.py`` now imports this dict as ``_FRED_INDEX_MAP`` rather than
+# defining its own literal. Membership grew from 3 to 7 keys as part of that
+# merge — this is deliberate, not incidental (see the issue's "Merging them
+# is the point" gotcha).
 FRED_HISTORY_MAP: dict[str, str] = {
+    # Caret index tickers — yfinance's ``^``-prefixed indices. Added
+    # 2026-08-29 (I9286): yfinance answers ``^VIX3M`` with 1 row of history
+    # from the EC2 host that runs the weekly collector on some Saturdays
+    # (measured 2026-08-29: 1 row from EC2 vs 2484 from a laptop, in the
+    # same minutes) — the source ``collectors/prices.py`` trusted for these
+    # four tickers' 10y HISTORY fetch was already known-unreliable on the one
+    # host that matters, while the DAILY single-latest fetch in
+    # ``daily_closes.py`` already used FRED for exactly these tickers.
+    "VIX": "VIXCLS",
+    "VIX3M": "VXVCLS",
+    "TNX": "DGS10",
+    "IRX": "DTB3",
     "TWO": "DGS2",
     # ICE BofA US HY Index OAS — only 3y of FRED public history (2023+),
     # license-restricted. Forward observation grows; recent walk-forward
