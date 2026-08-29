@@ -176,6 +176,7 @@ from zoneinfo import ZoneInfo
 import boto3
 
 from nousergon_lib import alerts
+from nousergon_lib.pipeline_status.completion_marker import read_marker
 from nousergon_lib.trading_calendar import (
     is_trading_day,
     last_closed_trading_day,
@@ -1280,31 +1281,41 @@ def _completion_marker_status(
     failure modes here (S3 errors other than NoSuchKey, unparseable JSON,
     missing status field) all route to the caller's alert path plus a
     WARNING log, never to a silent pass.
+
+    alpha-engine-config-I8217: every object under ``_sf_completion/`` is
+    written by a Step Functions ``States.Format`` body, so the S3 object is
+    a JSON string LITERAL containing the JSON object — one ``json.loads``
+    yields a ``str``, not a ``dict``. This function used to do exactly that
+    single decode and then guard with ``isinstance(marker, dict)``, which
+    was therefore ALWAYS FALSE: every read fell through to "no usable status
+    field" (UNREADABLE) regardless of what the marker actually said, for
+    every pipeline, every date, since the guard was written. Delegates to
+    ``nousergon_lib.pipeline_status.completion_marker.read_marker``, the
+    fleet's canonical marker reader (alpha-engine-config-I8154/I8186),
+    which unwraps the double-encoding and classifies NoSuchKey as absence
+    rather than failure — closing this file's independent, broken
+    reimplementation of the same fix ``crucible-predictor/monitoring/
+    drift_detector.py::_load_json_maybe_wrapped`` already carried.
     """
     key = f"_sf_completion/{pipeline_name}/{target_date.isoformat()}.json"
     try:
-        resp = s3_client.get_object(Bucket=MARKER_BUCKET, Key=key)
-        marker = json.loads(resp["Body"].read())
-        status = marker.get("status") if isinstance(marker, dict) else None
-        if isinstance(status, str) and status:
-            return status
-        logger.warning(
-            "failed-day check: marker s3://%s/%s has no usable status field",
-            MARKER_BUCKET, key,
-        )
-        return "UNREADABLE"
+        marker = read_marker(s3_client, bucket=MARKER_BUCKET, key=key)
     except Exception as exc:  # classified below — never a silent pass
-        code = ""
-        response = getattr(exc, "response", None)
-        if isinstance(response, dict):
-            code = (response.get("Error") or {}).get("Code", "")
-        if code in ("NoSuchKey", "404"):
-            return "ABSENT"
         logger.warning(
             "failed-day check: marker s3://%s/%s unreadable (%s: %s)",
             MARKER_BUCKET, key, type(exc).__name__, exc,
         )
         return "UNREADABLE"
+    if marker is None:
+        return "ABSENT"
+    status = marker.get("status") if isinstance(marker, dict) else None
+    if isinstance(status, str) and status:
+        return status
+    logger.warning(
+        "failed-day check: marker s3://%s/%s has no usable status field",
+        MARKER_BUCKET, key,
+    )
+    return "UNREADABLE"
 
 
 def _last_due_weekly_day(now_utc: datetime) -> Optional[date]:
