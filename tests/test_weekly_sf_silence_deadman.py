@@ -194,16 +194,46 @@ class TestEvaluateSlot:
         assert result.matched_execution == "w1"
 
     def test_weekly_critical_when_only_the_run_day_gate_noop_exists(self, mod):
-        """A 2-second SUCCEEDED weekly-role execution is
-        WeeklyRunDayGateChoice's designed skip on a non-run day, not a real
-        run — counting it as 'ran' would hide a genuinely silent week."""
+        """A SUCCEEDED weekly-role execution whose output proves the gate
+        skipped it is WeeklyRunDayGateChoice's designed skip on a non-run
+        day, not a real run — counting it as 'ran' would hide a genuinely
+        silent week. `is_gate_out` is set from the output verdict, never
+        from duration (alpha-engine-config-I8057)."""
         slot = mod.ExpectedSlot(day=date(2026, 8, 8), role="weekly")
         start = _utc(date(2026, 8, 8), 9)
         execs = [mod.ExecutionRecord(name="noop", role="weekly", status="SUCCEEDED",
-                                      start=start, stop=start + timedelta(seconds=2))]
+                                      start=start, stop=start + timedelta(seconds=2),
+                                      is_gate_out=True)]
         result = mod.evaluate_slot(slot, execs)
         assert result.classification == "CRITICAL"
         assert "no-op" in result.detail
+
+
+    def test_weekly_ok_with_a_slow_real_run_despite_short_old_threshold(self, mod):
+        """alpha-engine-config-I8057's measured fact: the fleet's shortest
+        genuine weekly execution ran 12.6s — a duration heuristic would have
+        misclassified it. Without `is_gate_out` set, a short SUCCEEDED
+        execution is a real run regardless of how fast it finished."""
+        slot = mod.ExpectedSlot(day=date(2026, 8, 8), role="weekly")
+        start = _utc(date(2026, 8, 8), 9)
+        execs = [mod.ExecutionRecord(name="director-verify-0731-003355Z", role="weekly",
+                                      status="SUCCEEDED", start=start,
+                                      stop=start + timedelta(seconds=12.6))]
+        result = mod.evaluate_slot(slot, execs)
+        assert result.classification == "OK"
+
+
+    def test_weekly_critical_when_a_slow_gate_out_is_the_only_execution(self, mod):
+        """Mirror fact: a gate-out that happened to run long is still a
+        gate-out — `is_gate_out` is never re-derived from duration."""
+        slot = mod.ExpectedSlot(day=date(2026, 8, 22), role="weekly")
+        start = _utc(date(2026, 8, 22), 9)
+        execs = [mod.ExecutionRecord(name="watch-rerun-2026-08-22-3", role="weekly",
+                                      status="SUCCEEDED", start=start,
+                                      stop=start + timedelta(seconds=871.8),
+                                      is_gate_out=True)]
+        result = mod.evaluate_slot(slot, execs)
+        assert result.classification == "CRITICAL"
 
     def test_weekly_critical_when_nothing_at_all(self, mod):
         slot = mod.ExpectedSlot(day=date(2026, 8, 8), role="weekly")
@@ -469,6 +499,55 @@ def _record(mod, name, role, status, day, hours=1):
     start = _utc(day, 21)
     stop = start + timedelta(hours=hours)
     return mod.ExecutionRecord(name=name, role=role, status=status, start=start, stop=stop)
+
+
+class _FakeSFWithOutput:
+    """Minimal Step Functions fake carrying `output`, for the fetch-level
+    `is_gate_out` wiring test — `TestMainCLI`'s `_FakeSF` below never sets
+    `output` because no existing CLI test needed the gate axis."""
+
+    def __init__(self, executions, output_by_arn):
+        self._executions = executions
+        self._output_by_arn = output_by_arn
+
+    def list_executions(self, **kwargs):
+        return {"executions": self._executions, "nextToken": None}
+
+    def describe_execution(self, executionArn):
+        for e in self._executions:
+            if e["executionArn"] == executionArn:
+                resp = {"input": json.dumps({"pipeline_role": e["_role"]})}
+                if executionArn in self._output_by_arn:
+                    resp["output"] = json.dumps(self._output_by_arn[executionArn])
+                return resp
+        raise KeyError(executionArn)
+
+
+class TestFetchExecutionRecordsGateOut:
+    """alpha-engine-config-I8057: `is_gate_out` is read from the SAME
+    `describe_execution` call already made for role/run_date — no extra AWS
+    call, no clock."""
+
+    def test_gate_out_output_sets_is_gate_out(self, mod):
+        arn = "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:g1"
+        start = _utc(date(2026, 8, 21), 9)
+        ex = {"executionArn": arn, "name": "g1", "status": "SUCCEEDED",
+              "startDate": start, "stopDate": start + timedelta(seconds=5.7),
+              "_role": "weekly"}
+        sf = _FakeSFWithOutput([ex], {arn: {"weekly_run_day_gate": {"Payload": {
+            "is_weekly_run_day": False, "marker": "NOT_WEEKLY_RUN_DAY"}}}})
+        records = mod.fetch_execution_records(sf, window_days=5, today=date(2026, 8, 23))
+        assert records[0].is_gate_out is True
+
+    def test_real_run_output_leaves_is_gate_out_false(self, mod):
+        arn = "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:r1"
+        start = _utc(date(2026, 8, 3), 9)
+        ex = {"executionArn": arn, "name": "r1", "status": "SUCCEEDED",
+              "startDate": start, "stopDate": start + timedelta(seconds=12.6),
+              "_role": "weekly"}
+        sf = _FakeSFWithOutput([ex], {arn: {"some_other_stage": {"ok": True}}})
+        records = mod.fetch_execution_records(sf, window_days=5, today=date(2026, 8, 5))
+        assert records[0].is_gate_out is False
 
 
 # ---------------------------------------------------------------------------

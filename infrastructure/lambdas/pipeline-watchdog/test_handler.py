@@ -514,14 +514,37 @@ def _make_status_filtered_sfn_client(status_to_execs: dict) -> MagicMock:
     """SFN mock that honors ``statusFilter`` — unlike ``_make_sfn_client``
     (which returns the same rows for every status and can therefore never
     exercise a status-aware code path), each status only sees the rows
-    explicitly assigned to it."""
+    explicitly assigned to it.
+
+    ``describe_execution`` answers from each row's own ``_gate_out`` marker
+    (set by ``_row(gate_out=True)``): alpha-engine-config-I8057/I8224/I9233 — the
+    walk now reads the run-day gate's OWN verdict out of the execution
+    output, so a stand-in that returned no output could never exercise the
+    gate-skip path at all. Rows carrying no marker describe as a real run
+    (no ``weekly_run_day_gate`` key), which is exactly what live data looks
+    like for one.
+    """
     client = MagicMock()
+    outputs = {
+        row["executionArn"]: json.dumps(_GATE_OUT_OUTPUT)
+        for rows in status_to_execs.values()
+        for row in rows
+        if row.get("_gate_out")
+    }
 
     def _list_executions(**kwargs):
         status = kwargs.get("statusFilter")
         return {"executions": status_to_execs.get(status, []), "nextToken": None}
 
+    def _describe(**kwargs):
+        arn = kwargs.get("executionArn")
+        resp = {"input": "{}"}
+        if arn in outputs:
+            resp["output"] = outputs[arn]
+        return resp
+
     client.list_executions.side_effect = _list_executions
+    client.describe_execution.side_effect = _describe
     client.get_parameter.return_value = {"Parameter": {"Value": "daily"}}
     return client
 
@@ -1503,19 +1526,49 @@ _WEEKLY_EXEC_ARN_PREFIX = (
     "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:"
 )
 
+# The run-day gate's own verdict, trimmed from a REAL gate-out's output
+# (alpha-engine-config-I8057/I9242 — verified live 2026-08-29 against the
+# Fri 2026-08-28 02:00 PT scheduled execution
+# `c4cc646e-790b-6490-ab1e-b7a1515724d4_468f5b31-8ffc-1a8d-0f7c-b0e33cd01285`,
+# `AWS_PROFILE=ne-admin aws stepfunctions describe-execution --query output`).
+# Only `Payload.is_weekly_run_day`/`Payload.marker` are load-bearing to the
+# classifier (`weekly_sf_silence_deadman._is_weekly_gate_out`); the other
+# real fields (`check_date`, `day_name`, `reason`) are kept so this reads as
+# the production shape, not an invented minimal stub. The real response also
+# carries `ExecutedVersion`/`SdkHttpMetadata`/`SdkResponseMetadata` — omitted
+# here as pure AWS SDK noise the classifier never reads.
+_GATE_OUT_OUTPUT = {"weekly_run_day_gate": {"Payload": {
+    "check_date": "2026-08-28",
+    "day_name": "Friday",
+    "is_weekly_run_day": False,
+    "marker": "NOT_WEEKLY_RUN_DAY",
+    "reason": "2026-08-27 is not the week's last session (later session 2026-08-28)",
+}}}
+
 
 def _make_deadman_client(rows, cadence="daily"):
     """Stepfunctions+SSM stand-in for the silence deadman's live fetch.
 
-    ``rows`` — list of ``(day, role, status, duration_seconds)``. Each becomes
-    one weekly-SF execution whose ``pipeline_role`` is readable ONLY via
+    ``rows`` — list of ``(day, role, status, duration_seconds)`` or
+    ``(day, role, status, duration_seconds, gate_out)``. Each becomes one
+    weekly-SF execution whose ``pipeline_role`` is readable ONLY via
     ``describe_execution`` (exactly like production: neither launch path
     passes an explicit execution Name, so the role never appears on the
     list-executions summary).
+
+    ``gate_out`` (default ``False``) — alpha-engine-config-I8057/I9242: the
+    silence deadman no longer infers a run-day-gate skip from duration. A
+    row must say so explicitly by carrying the gate's own OUTPUT verdict
+    (``_GATE_OUT_OUTPUT``), exactly as `weekly_sf_silence_deadman.py` reads
+    it live. A short ``duration`` alone no longer means anything to the
+    classifier — see `test_silence_short_real_run_is_never_treated_as_a_gate_noop`.
     """
     execs = []
     inputs = {}
-    for i, (day, role, status, duration) in enumerate(rows):
+    outputs = {}
+    for i, row in enumerate(rows):
+        day, role, status, duration = row[:4]
+        gate_out = row[4] if len(row) > 4 else False
         arn = f"{_WEEKLY_EXEC_ARN_PREFIX}x{i}"
         start = datetime(day.year, day.month, day.day, 20, 30, tzinfo=timezone.utc)
         execs.append({
@@ -1526,14 +1579,20 @@ def _make_deadman_client(rows, cadence="daily"):
             "stopDate": start + timedelta(seconds=duration),
         })
         inputs[arn] = json.dumps({"pipeline_role": role} if role else {})
+        if gate_out:
+            outputs[arn] = json.dumps(_GATE_OUT_OUTPUT)
+
+    def _describe(executionArn):
+        resp = {"input": inputs.get(executionArn, "{}")}
+        if executionArn in outputs:
+            resp["output"] = outputs[executionArn]
+        return resp
 
     client = MagicMock()
     client.list_executions.side_effect = lambda **kw: {
         "executions": execs if kw.get("stateMachineArn") == SAT_ARN else []
     }
-    client.describe_execution.side_effect = lambda executionArn: {
-        "input": inputs.get(executionArn, "{}")
-    }
+    client.describe_execution.side_effect = _describe
     client.get_parameter.return_value = {"Parameter": {"Value": cadence}}
     return client
 
@@ -1643,12 +1702,15 @@ def test_silence_expects_the_weekly_run_the_day_after_the_last_session():
 
 
 def test_silence_treats_a_run_day_gate_noop_as_no_weekly_run():
-    """A SUCCEEDED weekly-role execution finishing in 2s is
-    WeeklyRunDayGateChoice's designed skip, not a run. Counting it would hide
-    a genuinely dead cron — the gotcha the CLI is built around, asserted here
-    through the Lambda entry point too."""
+    """A SUCCEEDED weekly-role execution whose OUTPUT carries the gate's
+    `is_weekly_run_day: false` verdict is WeeklyRunDayGateChoice's designed
+    skip, not a run. Counting it would hide a genuinely dead cron — the
+    gotcha the CLI is built around, asserted here through the Lambda entry
+    point too. Duration (2s) is incidental scenery, not the signal — see
+    `test_silence_short_real_run_is_never_treated_as_a_gate_noop` for the
+    mirror case (alpha-engine-config-I8057/I9242)."""
     now = datetime(2026, 8, 9, 14, 0, tzinfo=timezone.utc)
-    weekly_noop = (date(2026, 8, 8), "weekly", "SUCCEEDED", 2)
+    weekly_noop = (date(2026, 8, 8), "weekly", "SUCCEEDED", 2, True)
     exercises = [_exercise(date(2026, 8, d)) for d in (3, 4, 5, 6, 7)]
 
     noop_result = index._check_weekly_silence(
@@ -1671,6 +1733,28 @@ def test_silence_treats_a_run_day_gate_noop_as_no_weekly_run():
     )
     assert ok_result.critical == 0
     assert ok_result.ok == 6
+    _alerts_mod.publish.assert_not_called()
+
+
+def test_silence_short_real_run_is_never_treated_as_a_gate_noop():
+    """alpha-engine-config-I8057's measured fact: the fleet's shortest
+    genuine weekly execution ran 12.6s. Absence of the `weekly_run_day_gate`
+    key — exactly what a real run's `describe_execution` output looks like
+    — must never be read as evidence of a gate-out, however fast the
+    execution finished. `gate_out` defaults False in `_make_deadman_client`,
+    so this row carries no output at all, mirroring live data."""
+    now = datetime(2026, 8, 9, 14, 0, tzinfo=timezone.utc)
+    short_real_weekly = (date(2026, 8, 8), "weekly", "SUCCEEDED", 12.6)
+    exercises = [_exercise(date(2026, 8, d)) for d in (3, 4, 5, 6, 7)]
+
+    result = index._check_weekly_silence(
+        now_utc=now,
+        client=_make_deadman_client(exercises + [short_real_weekly]),
+        ssm_client=_make_deadman_client(exercises + [short_real_weekly]),
+    )
+    assert result.critical == 0
+    assert result.ok == 6
+    assert result.critical_slots == ()
     _alerts_mod.publish.assert_not_called()
 
 
@@ -1769,12 +1853,15 @@ def _make_weekly_cycle_client(rows):
     """Weekly-SF stand-in for the failed-cycle check's live fetch.
 
     ``rows`` — dicts with ``start`` (aware UTC datetime), ``role``,
-    ``status``, optional ``run_date`` and ``duration`` (seconds; default
-    well above GATE_NOOP_MAX_SECONDS so rows are real runs unless a test
-    says otherwise). Role and run_date are readable ONLY via
+    ``status``, optional ``run_date``, ``duration`` (seconds; a stand-alone
+    short duration no longer means anything to the classifier — see
+    ``gate_out`` below) and ``gate_out`` (bool, default ``False``:
+    alpha-engine-config-I8057/I9242 — a row is a run-day-gate skip only when
+    it says so via the gate's own OUTPUT verdict, ``_GATE_OUT_OUTPUT``,
+    never via ``duration`` alone). Role and run_date are readable ONLY via
     ``describe_execution``, exactly as in production.
     """
-    execs, inputs = [], {}
+    execs, inputs, outputs = [], {}, {}
     for i, row in enumerate(rows):
         arn = f"{_WEEKLY_EXEC_ARN_PREFIX}c{i}"
         start = row["start"]
@@ -1791,14 +1878,20 @@ def _make_weekly_cycle_client(rows):
         if row.get("run_date"):
             payload["run_date"] = row["run_date"]
         inputs[arn] = json.dumps(payload)
+        if row.get("gate_out"):
+            outputs[arn] = json.dumps(_GATE_OUT_OUTPUT)
+
+    def _describe(executionArn):
+        resp = {"input": inputs.get(executionArn, "{}")}
+        if executionArn in outputs:
+            resp["output"] = outputs[executionArn]
+        return resp
 
     client = MagicMock()
     client.list_executions.side_effect = lambda **kw: {
         "executions": execs if kw.get("stateMachineArn") == SAT_ARN else []
     }
-    client.describe_execution.side_effect = lambda executionArn: {
-        "input": inputs.get(executionArn, "{}")
-    }
+    client.describe_execution.side_effect = _describe
     return client
 
 
@@ -1878,7 +1971,9 @@ def test_weekly_cycle_without_run_date_falls_back_to_utc_start_date():
 def test_weekly_cycle_still_excludes_exercise_and_gate_noop_runs():
     """The widened role set must not start counting the two things this
     check has always been required to ignore: the daily chained exercise
-    run, and WeeklyRunDayGateChoice's ~2s designed skip."""
+    run, and WeeklyRunDayGateChoice's designed skip — signalled by the
+    gate's OUTPUT verdict, not by duration alone (alpha-engine-config-
+    I8057/I9242)."""
     exercise = {
         "start": datetime(2026, 8, 15, 20, 30, tzinfo=timezone.utc),
         "role": "exercise", "status": "SUCCEEDED", "run_date": "2026-08-15",
@@ -1886,10 +1981,25 @@ def test_weekly_cycle_still_excludes_exercise_and_gate_noop_runs():
     gate_noop = {
         "start": datetime(2026, 8, 15, 9, 0, tzinfo=timezone.utc),
         "role": "weekly", "status": "SUCCEEDED", "run_date": "2026-08-15",
-        "duration": 2,
+        "duration": 2, "gate_out": True,
     }
     client = _make_weekly_cycle_client([exercise, gate_noop])
     assert index._weekly_real_statuses_for_day(client, _CYCLE) == {}
+
+
+def test_weekly_cycle_short_real_run_is_never_treated_as_a_gate_noop():
+    """Mirror case: alpha-engine-config-I8057's measured fact is that the
+    fleet's shortest genuine weekly execution ran 12.6s. A short SUCCEEDED
+    weekly execution with NO gate-out output — exactly what a real run's
+    `describe_execution` output looks like — must be counted regardless of
+    duration."""
+    short_real = {
+        "start": datetime(2026, 8, 15, 9, 0, tzinfo=timezone.utc),
+        "role": "weekly", "status": "SUCCEEDED", "run_date": "2026-08-15",
+        "duration": 12.6,
+    }
+    client = _make_weekly_cycle_client([short_real])
+    assert index._weekly_real_statuses_for_day(client, _CYCLE) == {"SUCCEEDED": 1}
 
 
 def test_weekly_cycle_with_only_failures_still_pages():
@@ -2023,16 +2133,33 @@ _GATEOUT_0820 = 3.465   # measured
 _REAL_FAILED = 14003.967  # measured
 
 
-def _row(*, seconds_ago: float, duration: float, arn: str = "arn:aws:states:us-east-1:1:execution:sf:e"):
+def _row(
+    *,
+    seconds_ago: float,
+    duration: float,
+    arn: str = "arn:aws:states:us-east-1:1:execution:sf:e",
+    gate_out: bool = False,
+):
+    """One ListExecutions row. ``gate_out`` is what MAKES it a run-day-gate
+    skip (alpha-engine-config-I8057/I8224/I9233): ``_make_status_filtered_sfn_client``
+    turns the marker into the gate's own ``is_weekly_run_day: false`` output
+    on ``describe_execution``, which is the only thing the walk now reads.
+    ``duration`` is kept on every row because it is real measured data and
+    because the tests below assert it is NO LONGER load-bearing."""
     now = datetime.now(timezone.utc)
     start = now - timedelta(seconds=seconds_ago)
-    return {"startDate": start, "stopDate": start + timedelta(seconds=duration), "executionArn": arn}
+    return {
+        "startDate": start,
+        "stopDate": start + timedelta(seconds=duration),
+        "executionArn": arn,
+        "_gate_out": gate_out,
+    }
 
 
 def test_a_gate_noop_alone_no_longer_reads_as_a_watchdog_clear():
     """RED before I8045: this returned CLEAR off the 3.5s 08-20 gate-out."""
     client = _make_status_filtered_sfn_client(
-        {"SUCCEEDED": [_row(seconds_ago=3600, duration=_GATEOUT_0820)]}
+        {"SUCCEEDED": [_row(seconds_ago=3600, duration=_GATEOUT_0820, gate_out=True)]}
     )
     result = index._check_sf(
         sf_label="Saturday SF",
@@ -2055,8 +2182,8 @@ def test_a_gate_noop_no_longer_masks_a_real_failure_in_the_same_window():
     client = _make_status_filtered_sfn_client(
         {
             "SUCCEEDED": [
-                _row(seconds_ago=3600, duration=_GATEOUT_0821, arn="…:e21"),
-                _row(seconds_ago=90000, duration=_GATEOUT_0820, arn="…:e20"),
+                _row(seconds_ago=3600, duration=_GATEOUT_0821, arn="…:e21", gate_out=True),
+                _row(seconds_ago=90000, duration=_GATEOUT_0820, arn="…:e20", gate_out=True),
             ],
             "FAILED": [_row(seconds_ago=6 * 24 * 3600, duration=_REAL_FAILED, arn="…:e15")],
         }
@@ -2086,7 +2213,7 @@ def test_the_same_window_read_status_blind_still_clears_proving_the_defect():
     every call site did before I8045 — the identical window reports CLEAR."""
     client = _make_status_filtered_sfn_client(
         {
-            "SUCCEEDED": [_row(seconds_ago=3600, duration=_GATEOUT_0821)],
+            "SUCCEEDED": [_row(seconds_ago=3600, duration=_GATEOUT_0821, gate_out=True)],
             "FAILED": [_row(seconds_ago=6 * 24 * 3600, duration=_REAL_FAILED)],
         }
     )
@@ -2122,12 +2249,72 @@ def test_a_real_weekly_run_is_not_mistaken_for_a_gate_noop():
     assert result.alert_emitted is False
 
 
-def test_the_gate_noop_ceiling_is_the_deadmans_and_not_a_second_copy():
+def test_the_gate_noop_test_is_the_deadmans_and_not_a_second_copy():
     """Two checks in one Lambda disagreeing about what a no-op is was the
-    2026-08-16 defect; the constant is imported, never restated."""
-    assert index.GATE_NOOP_MAX_SECONDS is _deadman.GATE_NOOP_MAX_SECONDS
-    assert _GATEOUT_0821 < index.GATE_NOOP_MAX_SECONDS
-    assert _REAL_FAILED > index.GATE_NOOP_MAX_SECONDS
+    2026-08-16 defect. The protection is unchanged; the mechanism it guards
+    is not. Before alpha-engine-config-I8057 the shared thing was a 90s
+    duration CEILING; now it is the gate's own output verdict, and this
+    asserts the same one-implementation property against it: the predicate
+    is imported from `weekly_sf_silence_deadman`, never restated here."""
+    assert index._is_weekly_gate_out is _deadman._is_weekly_gate_out
+    assert index._is_gate_noop is _deadman._is_gate_noop
+    assert not hasattr(index, "GATE_NOOP_MAX_SECONDS"), (
+        "the duration ceiling is gone from both sides; a re-introduced copy "
+        "is how the two checks drift apart again"
+    )
+    assert not hasattr(_deadman, "GATE_NOOP_MAX_SECONDS")
+
+
+def test_the_measured_durations_no_longer_decide_anything():
+    """alpha-engine-config-I8057's measurement, asserted as a property of
+    the classifier rather than as a threshold: the longest genuine gate-out
+    (5.705s, 2026-08-21) and the shortest execution that really ran (12.6s,
+    2026-08-03) both sat inside the old 90s ceiling, so duration could
+    misread in EITHER direction. Here the 5.7s row is a gate-out and the
+    12.6s row is a real run purely because of what each one's output says —
+    and a 5.7s run with NO gate verdict is counted as real."""
+    fast_real = _make_status_filtered_sfn_client(
+        {"SUCCEEDED": [_row(seconds_ago=3600, duration=_GATEOUT_0821)]}
+    )
+    assert index._status_counts_in_window(
+        SAT_ARN, 7 * 24 * 3600, client=fast_real, gate_noop_aware=True
+    ) == {"SUCCEEDED": 1}
+
+    slow_gate_out = _make_status_filtered_sfn_client(
+        {"SUCCEEDED": [_row(seconds_ago=3600, duration=_REAL_FAILED, gate_out=True)]}
+    )
+    assert index._status_counts_in_window(
+        SAT_ARN, 7 * 24 * 3600, client=slow_gate_out, gate_noop_aware=True
+    ) == {index.GATE_SKIP: 1}
+
+
+def test_a_failed_execution_is_never_bucketed_as_a_gate_skip():
+    """The gate verdict is asked only of SUCCEEDED executions.
+    `WeeklyRunDaySkip` is a SUCCEEDED terminal, so a FAILED run carrying a
+    gate-shaped output — a run that gated out and then died on the way to
+    its terminal — is still a failure, and must still page."""
+    client = _make_status_filtered_sfn_client(
+        {"FAILED": [_row(seconds_ago=3600, duration=_GATEOUT_0821, gate_out=True)]}
+    )
+    assert index._status_counts_in_window(
+        SAT_ARN, 7 * 24 * 3600, client=client, gate_noop_aware=True
+    ) == {"FAILED": 1}
+
+
+def test_an_unparseable_execution_output_raises_rather_than_reads_as_real():
+    """Fail loud: an output that is present but not JSON means the SF's own
+    result contract is broken. Defaulting it to "not a gate-out" would
+    silently reclassify every skip as a real run and clear the check."""
+    client = _make_status_filtered_sfn_client(
+        {"SUCCEEDED": [_row(seconds_ago=3600, duration=_GATEOUT_0821)]}
+    )
+    client.describe_execution.side_effect = lambda **kw: {
+        "input": "{}", "output": "not json at all"
+    }
+    with pytest.raises(RuntimeError, match="not JSON"):
+        index._status_counts_in_window(
+            SAT_ARN, 7 * 24 * 3600, client=client, gate_noop_aware=True
+        )
 
 
 def test_the_other_two_pipelines_are_untouched_by_gate_bucketing():
