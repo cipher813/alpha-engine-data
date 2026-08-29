@@ -102,19 +102,6 @@ SNS_TOPIC_ARN = f"arn:aws:sns:{REGION}:{ACCOUNT_ID}:alpha-engine-alerts"
 ALLOWED_CADENCE = {"daily", "weekly-only", "off"}
 DEFAULT_WINDOW_DAYS = 5
 
-# DEPRECATED (alpha-engine-config-I8057) — kept ONLY because
-# infrastructure/lambdas/pipeline-watchdog/index.py imports this name
-# directly (`from weekly_sf_silence_deadman import GATE_NOOP_MAX_SECONDS`)
-# for its OWN separate, still-duration-based `_row_is_gate_noop` check.
-# `_is_gate_noop` below no longer reads this value — it reads
-# `ExecutionRecord.is_gate_out`, set from the execution's own output
-# verdict (`_is_weekly_gate_out`). Removing this constant would raise
-# ImportError at Lambda cold start. The Lambda's own duration check is a
-# separate, unfixed instance of the same class — filed as
-# alpha-engine-config-I<TBD> (out of this change's file ownership: Lane
-# A/B owns `infrastructure/lambdas/`).
-GATE_NOOP_MAX_SECONDS = 90
-
 
 def _is_weekly_gate_out(output_json: dict) -> bool:
     """True iff a SUCCEEDED weekly-role execution's own OUTPUT proves it did

@@ -171,7 +171,7 @@ class TestWeeklyFailedDayDegradedMarkerClears:
                 role="weekly",
                 status="FAILED",
                 start=_utc(TARGET_DATE, 9, 0),
-                duration_s=5400,  # 90 minutes — nowhere near GATE_NOOP_MAX_SECONDS
+                duration_s=5400,  # 90 minutes; it carries no gate-out verdict either
             ),
         ]
         sf_client = _FakeSFClient(executions)
@@ -232,8 +232,9 @@ class TestWeeklyFailedDayAbsentMarkerPages:
 
 class TestWeeklyFailedDayGateSkipIsNotACycle:
     def test_gate_skip_execution_is_not_counted_as_the_cycle(self, mod, _no_real_alerts):
-        # WeeklyRunDayGateChoice's designed no-op: SUCCEEDED, ~2s duration,
-        # well under GATE_NOOP_MAX_SECONDS (90s). Must not read as either a
+        # WeeklyRunDayGateChoice's designed no-op: SUCCEEDED, declared by the
+        # gate's OWN output verdict (`gate_out=True`), not by its ~2s duration
+        # (alpha-engine-config-I8057). Must not read as either a
         # real SUCCEEDED cycle (which would silently hide a genuine miss)
         # NOR as a "0 executions" never-fired case that some OTHER
         # non-weekly execution masks — this is the exact ambiguity I7036
