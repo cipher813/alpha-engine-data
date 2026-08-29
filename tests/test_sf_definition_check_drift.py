@@ -541,3 +541,245 @@ def test_git_helper_returns_none_on_nonzero_exit(cd, monkeypatch):
     monkeypatch.setattr(cd.subprocess, "run",
                         lambda *a, **k: MagicMock(returncode=1, stdout="x"))
     assert cd._git("rev-parse", "nope") is None
+
+
+# ── paging surface: provenance, refusal, dedup, default-branch resolution ───
+#
+# alpha-engine-config-I9036 (2026-08-29). A local invocation inside a worktree
+# 49 commits behind origin/main produced six ERROR findings across three state
+# machines and PAGED PRODUCTION. There was zero real drift: live, S3-staged and
+# origin/main definitions all matched. The stale-checkout guard above ALREADY
+# detected the condition and printed its warning — to stdout only, while
+# `_alert_on_drift` sent the findings alone. The guard was stripped from the
+# page: the local operator saw the warning, the pager did not.
+
+
+def _git_stub(*, head="a" * 40, behind="0", stale=False, origin_head="origin/main",
+              tracked="origin/feature"):
+    """A `_git` double covering every call the paging path makes."""
+
+    def fake_git(*args):
+        if args[0] == "rev-parse" and "--is-inside-work-tree" in args:
+            return "true"
+        if args[0] == "rev-parse" and args[1:] == ("--abbrev-ref", "origin/HEAD"):
+            return origin_head
+        if args[0] == "symbolic-ref":
+            return origin_head
+        if args[0] == "rev-parse" and "--abbrev-ref" in args and "@{upstream}" in args:
+            return tracked
+        if args[0] == "rev-parse" and args[1:] == ("HEAD",):
+            return head
+        if args[0] == "rev-list":
+            return behind
+        if args[0] == "hash-object":
+            return "local-blob"
+        if args[0] == "rev-parse":  # <upstream>:<path>
+            return "remote-blob" if stale else "local-blob"
+        return None
+
+    return fake_git
+
+
+# ── deliverable 1: the page carries REPO_ROOT + HEAD + behind-count ─────────
+
+
+def test_provenance_note_carries_repo_root_head_and_behind_count(cd):
+    note = cd.repo_provenance_note(
+        {"repo_root": "/Users/x/.worktrees/nousergon-data-i8155",
+         "head": "efd46785" + "0" * 32,
+         "upstream": "origin/main",
+         "behind": 49}
+    )
+    assert "/Users/x/.worktrees/nousergon-data-i8155" in note
+    assert "efd46785" in note
+    assert "49 commits behind origin/main" in note
+
+
+def test_provenance_note_renders_an_unknown_behind_count_explicitly(cd):
+    note = cd.repo_provenance_note(
+        {"repo_root": "/r", "head": "unknown", "upstream": "origin/main", "behind": None}
+    )
+    assert "unknown" in note
+    # The question must never look unasked.
+    assert "origin/main" in note
+
+
+def test_repo_provenance_reports_head_and_behind_count(cd, monkeypatch):
+    monkeypatch.setattr(cd, "_git", _git_stub(head="b" * 40, behind="49"))
+    prov = cd.repo_provenance()
+    assert prov["head"] == "b" * 40
+    assert prov["behind"] == 49
+    assert prov["upstream"] == "origin/main"
+    assert prov["repo_root"] == str(cd.REPO_ROOT.resolve())
+
+
+def test_repo_provenance_survives_git_being_unavailable(cd, monkeypatch):
+    monkeypatch.setattr(cd, "_git", lambda *a: None)
+    prov = cd.repo_provenance()
+    assert prov["head"] == "unknown"
+    assert prov["behind"] is None
+    cd.repo_provenance_note(prov)  # must not raise
+
+
+def test_alert_message_carries_repo_provenance(cd, fake_nousergon_lib_alerts, monkeypatch):
+    monkeypatch.setattr(cd, "_git", _git_stub(head="c" * 40, behind="49"))
+    cd._alert_on_drift(["ne-weekly-freshness-pipeline: definition drift (LIVE vs x)"])
+    message = fake_nousergon_lib_alerts[0]["message"]
+    assert str(cd.REPO_ROOT.resolve()) in message, "page must name WHICH repo it compared"
+    assert "c" * 40 in message, "page must name the HEAD it compared"
+    assert "49 commits behind origin/main" in message
+
+
+def test_alert_message_prepends_the_stale_checkout_note(cd, fake_nousergon_lib_alerts):
+    note = cd.stale_checkout_note(["infrastructure/step_function.json"])
+    cd._alert_on_drift(
+        ["fake-sf: drifted"],
+        provenance={"repo_root": "/r", "head": "d" * 40,
+                    "upstream": "origin/main", "behind": 3},
+        stale_note=note,
+    )
+    message = fake_nousergon_lib_alerts[0]["message"]
+    assert message.startswith(note), "the guard must LEAD the page, not be stripped from it"
+    assert "may be your checkout" in message
+
+
+# ── deliverable 2: a stale checkout must not page at all ────────────────────
+
+
+def _stale_main_env(cd, monkeypatch, *, stale, argv=None):
+    fake_entry = {"sf_name": "ne-weekly-freshness-pipeline",
+                  "definition_file": "step_function.json"}
+    monkeypatch.setattr(cd, "SF_DEFINITIONS", (fake_entry,))
+    monkeypatch.setattr(cd, "_check_sf", lambda entry: [f"{entry['sf_name']}: drifted"])
+    monkeypatch.setattr(cd, "_git", _git_stub(behind="49", stale=stale))
+    monkeypatch.setattr("sys.argv", argv or ["check-definition-drift.py"])
+
+
+def test_main_refuses_to_page_from_a_stale_checkout(cd, monkeypatch, capsys,
+                                                    fake_nousergon_lib_alerts):
+    """The 2026-08-29 false page, as a test."""
+    _stale_main_env(cd, monkeypatch, stale=True)
+    assert cd.main() == 1, "the operator signal (exit code) must be preserved"
+    assert fake_nousergon_lib_alerts == [], "a stale checkout must never page production"
+    captured = capsys.readouterr()
+    assert "REFUSING TO PAGE" in captured.out
+    assert "REFUSING TO PAGE" in captured.err, "the refusal must be loud, not silent"
+    assert "STALE" in captured.out
+
+
+def test_main_still_pages_from_a_clean_checkout(cd, monkeypatch, fake_nousergon_lib_alerts):
+    _stale_main_env(cd, monkeypatch, stale=False)
+    assert cd.main() == 1
+    assert len(fake_nousergon_lib_alerts) == 1, "real drift on main must still page"
+
+
+def test_main_prints_provenance_beside_the_findings(cd, monkeypatch, capsys,
+                                                    fake_nousergon_lib_alerts):
+    _stale_main_env(cd, monkeypatch, stale=False)
+    cd.main()
+    out = capsys.readouterr().out
+    assert str(cd.REPO_ROOT.resolve()) in out
+    assert "49 commits behind origin/main" in out
+
+
+# ── deliverable 3: dedup on content, not on the finding COUNT ───────────────
+
+
+def test_dedup_key_distinguishes_two_unrelated_conditions_of_equal_size(cd):
+    a = [f"sf-a: finding {i}" for i in range(6)]
+    b = [f"sf-b: finding {i}" for i in range(6)]
+    assert cd._dedup_key(a) != cd._dedup_key(b), (
+        "two unrelated 6-finding conditions must not collapse into one page"
+    )
+
+
+def test_dedup_key_is_stable_and_order_insensitive(cd):
+    a = ["x: one", "y: two"]
+    assert cd._dedup_key(a) == cd._dedup_key(list(reversed(a)))
+    assert cd._dedup_key(a) == cd._dedup_key(a)
+
+
+def test_alert_uses_the_content_dedup_key(cd, fake_nousergon_lib_alerts, monkeypatch):
+    monkeypatch.setattr(cd, "_git", _git_stub())
+    findings = ["sf-a: drifted", "sf-b: drifted"]
+    cd._alert_on_drift(findings)
+    key = fake_nousergon_lib_alerts[0]["dedup_key"]
+    assert key == cd._dedup_key(findings)
+    assert key != f"sf_definition_drift_{len(findings)}", (
+        "the key must not be the finding COUNT"
+    )
+
+
+# ── deliverable 4: the paging comparison uses the DEFAULT branch ────────────
+
+
+def test_default_upstream_resolves_the_remotes_default_branch(cd, monkeypatch):
+    monkeypatch.setattr(cd, "_git", _git_stub(origin_head="origin/trunk"))
+    assert cd.default_upstream() == "origin/trunk"
+
+
+def test_default_upstream_falls_back_when_git_cannot_answer(cd, monkeypatch):
+    monkeypatch.setattr(cd, "_git", lambda *a: None)
+    assert cd.default_upstream() == cd.DEFAULT_UPSTREAM == "origin/main"
+
+
+def test_stale_files_use_the_explicit_upstream_not_the_tracked_branch(cd, monkeypatch):
+    """A worktree tracking its own feature branch compares clean against
+    itself — which is precisely how a checkout 49 commits behind main passed
+    the guard."""
+    asked: list[str] = []
+
+    def fake_git(*args):
+        if args[0] == "rev-parse" and "--is-inside-work-tree" in args:
+            return "true"
+        if args[0] == "hash-object":
+            return "local-blob"
+        if args[0] == "rev-parse" and "--abbrev-ref" in args and "@{upstream}" in args:
+            return "origin/fix/i8155-execution-run-date"
+        if args[0] == "rev-parse":
+            asked.append(args[1])
+            # The feature branch's own ref matches; main does not.
+            return "local-blob" if args[1].startswith("origin/fix/") else "remote-blob"
+        return None
+
+    monkeypatch.setattr(cd, "_git", fake_git)
+    assert cd.stale_definition_files(cd.SF_DEFINITIONS) == [], (
+        "baseline: the tracked feature branch hides the staleness"
+    )
+    stale = cd.stale_definition_files(cd.SF_DEFINITIONS, upstream="origin/main")
+    assert stale, "comparing against the default branch must expose it"
+    assert all(ref.startswith("origin/main:") for ref in asked if ":" in ref
+               and not ref.startswith("origin/fix/"))
+
+
+def test_main_compares_against_the_default_branch_not_the_tracked_one(
+    cd, monkeypatch, fake_nousergon_lib_alerts
+):
+    """End-to-end: findings from a feature-branch worktree that is behind main
+    must NOT page, even though @{upstream} says the tree is clean."""
+    fake_entry = {"sf_name": "ne-weekly-freshness-pipeline",
+                  "definition_file": "step_function.json"}
+    monkeypatch.setattr(cd, "SF_DEFINITIONS", (fake_entry,))
+    monkeypatch.setattr(cd, "_check_sf", lambda entry: [f"{entry['sf_name']}: drifted"])
+    monkeypatch.setattr("sys.argv", ["check-definition-drift.py"])
+
+    def fake_git(*args):
+        if args[0] == "rev-parse" and "--is-inside-work-tree" in args:
+            return "true"
+        if args[0] == "rev-parse" and args[1:] == ("--abbrev-ref", "origin/HEAD"):
+            return "origin/main"
+        if args[0] == "rev-parse" and "--abbrev-ref" in args and "@{upstream}" in args:
+            return "origin/fix/i8155-execution-run-date"
+        if args[0] == "rev-parse" and args[1:] == ("HEAD",):
+            return "efd46785" + "0" * 32
+        if args[0] == "rev-list":
+            return "49"
+        if args[0] == "hash-object":
+            return "local-blob"
+        if args[0] == "rev-parse":
+            return "local-blob" if args[1].startswith("origin/fix/") else "remote-blob"
+        return None
+
+    monkeypatch.setattr(cd, "_git", fake_git)
+    assert cd.main() == 1
+    assert fake_nousergon_lib_alerts == []
