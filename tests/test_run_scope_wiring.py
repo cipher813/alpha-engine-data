@@ -121,3 +121,91 @@ def test_the_state_timeout_binds_before_the_lambda_timeout(states):
     tests/test_sf_lambda_timeout_ordering.py.
     """
     assert states["RunScope"]["TimeoutSeconds"] == 45
+
+
+# ---------------------------------------------------------------------------
+# In-band delivery to the Report Card (alpha-engine-config-I7392)
+#
+# The scope artifact was the ONLY delivery path, and it is the one path a
+# REHEARSAL cannot use: the Lambda derives the scope and skips its put_object
+# when dry_run is true. So on the 2026-08-29T00:47Z Friday shell run
+# (execution offcycle-shell-20260829-004717) RunScope derived the right answer
+# — Parity: DISABLED, CheckSkipParity took its skip branch — and the card could
+# not read it, resolved contamination to UNKNOWN rather than NOT_IN_SCOPE, and
+# paged ERROR at 01:44Z on a run in which nothing failed. The correct answer
+# existed in memory and was discarded on the way to its consumer.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def floor(states) -> dict:
+    """``InitializeInput``'s innermost defaults blob — the seeded floor every
+    ``.$`` reference in a Task Payload must resolve against on EVERY path that
+    reaches that Task. Same extraction as tests/test_sf_gate_state_wiring.py."""
+    merged = states["InitializeInput"]["Parameters"]["merged.$"]
+    start = merged.index("States.StringToJson('") + len("States.StringToJson('")
+    end = merged.index("')", start)
+    return json.loads(merged[start:end])
+
+
+def test_the_report_card_receives_the_scope_in_band(states):
+    """The run's own scope travels WITH the run, not via a side-channel
+    artifact a rehearsal is forbidden to write."""
+    payload = states["ReportCard"]["Parameters"]["Payload"]
+    assert payload["run_scope.$"] == "$.run_scope_result.Payload"
+
+
+def test_the_in_band_path_names_this_states_own_result_path(states):
+    """The two halves of the thread must agree, or the reference resolves to
+    the floor on every run and the fix is inert."""
+    assert states["RunScope"]["ResultPath"] == "$.run_scope_result"
+    assert states["ReportCard"]["Parameters"]["Payload"]["run_scope.$"].startswith(
+        states["RunScope"]["ResultPath"] + "."
+    )
+
+
+def test_the_reference_is_seeded_at_the_initialize_input_floor(floor):
+    """The hazard this class keeps producing (I7282, I7812, and the
+    ``TrainSpecDispatch`` States.Runtime on the 2026-08-28 EOD shell run): a
+    ``.$`` reference that is absent on a VALID path throws States.Runtime past
+    valid ASL and green CI.
+
+    Two valid paths reach ``CheckSkipReportCard`` without ``RunScope`` having
+    written its ``ResultPath``: ``RunScope``'s own ``Catch`` (which writes
+    ``$.run_scope_error`` instead) and ``SetSubstrateHealthCheckDegradedSummary``.
+    """
+    assert "run_scope_result" in floor
+    assert "Payload" in floor["run_scope_result"]
+
+
+def test_the_floor_grades_nothing(floor):
+    """BOTH POLARITIES, and the seed must be HONEST.
+
+    A floor that looked like a clean scope would let a run whose RunScope stage
+    never ran grade the full stage list — confidently wrong. The consumer
+    (``crucible-evaluator grading/run_scope.py::read_run_scope``) resolves a
+    ``degraded`` block, and an empty ``stages`` map, to ``UNKNOWN`` with an
+    empty graded set. Either alone is sufficient; both are asserted so a future
+    edit to one cannot silently make the floor read as a complete run.
+    """
+    seeded = floor["run_scope_result"]["Payload"]
+    assert seeded["degraded"] is True
+    assert seeded["degraded_reason"]
+    assert seeded["stages"] == {}
+
+
+def test_the_s3_artifact_remains_the_fallback_not_the_removal(states):
+    """In-band is PREFERRED, never exclusive.
+
+    The Lambda still writes ``backtest/{run_date}/run_scope.json`` on a real
+    run, which is what a manual/CLI card build or a snapshot rebuild — neither
+    of which has an SF payload behind it — reads. Pinned here because deleting
+    the write is the tempting simplification, and it would silently remove the
+    only scope a rebuilt card can see.
+    """
+    handler = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "infrastructure" / "lambdas" / "weekly-run-scope" / "index.py"
+    ).read_text()
+    assert "put_object" in handler
+    assert "KEY_TEMPLATE.format(run_date=run_date)" in handler
