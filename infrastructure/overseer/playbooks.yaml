@@ -945,6 +945,20 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    # overseer-policy.md invariant 4 (alpha-engine-config-I8991): a pageable
+    # class is a CLOSED LOOP or a TRACKED GAP, and there is no third state.
+    # This is the tracked gap, deliberately, rather than an operator_reason.
+    # Declaring it page-only-by-design would be a RULING, and two things make
+    # that ruling premature: (1) the identically-shaped twin
+    # research_cut_promotion_alerts is still grandfathered awaiting its own
+    # disposition under I8996, so closing this one would make two rows
+    # disagree about a question they answer identically; (2) the dominant
+    # firing condition — board_defective, a scanner leaderboard reporting
+    # duplicate arm rows — is a characterised producer fault with a durable
+    # artifact to read (config/apply_audit/scanner_spec_champion/{date}.json
+    # is written BEFORE the engine raises), which is playbook-shaped work and
+    # not inherently human-only. I9316 rules both rows together.
+    migration_issue: alpha-engine-config-I9316
   - class: research_weekly_ledger_alerts
     # alpha-engine-config-I8264 static-chokepoint registration. Emitted by
     # crucible-research/lambda/scanner_handler.py after
