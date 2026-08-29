@@ -58,11 +58,6 @@ def stub_flow_doctor_env(monkeypatch):
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100stub")
     monkeypatch.setenv("FLOW_DOCTOR_TELEGRAM_THREAD_CRITICAL", "1")
     monkeypatch.setenv("FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH", "2")
-    # 0.6.0rc2 soak: flow-doctor.yaml now enables Haiku diagnosis with
-    # api_key: ${ANTHROPIC_API_KEY}. flow-doctor fails loud on an unresolved
-    # ${VAR}, so the wiring tests must seed it (mirrors the runtime, where the
-    # box resolves it from SSM /alpha-engine/ANTHROPIC_API_KEY).
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "stub-anthropic-key")
 
 
 @pytest.fixture
