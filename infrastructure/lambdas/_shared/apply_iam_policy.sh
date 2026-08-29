@@ -29,23 +29,96 @@
 # Expects the caller to already define `run()` (the $DRY_RUN-aware command
 # wrapper) and `$DRY_RUN`, exactly as every deploy.sh already does.
 #
-# Usage: apply_iam_policy <role_name> <policy_name> <policy_file> <trust_policy_json>
+# probe_role_presence <role_name> -> prints "present" | "absent" | "unknown"
+#
+# WHY THIS EXISTS (the four-permanently-red-deploys defect, 2026-08-28).
+#
+# The old existence check was:
+#
+#   if ! aws iam get-role --role-name "$r" ... >/dev/null 2>&1; then  # CREATE
+#
+# `2>&1` to /dev/null makes AccessDenied and NoSuchEntity the same observation,
+# and the `!` branch reads BOTH as "the role does not exist". The CI auto-deploy
+# identity `github-actions-lambda-deploy` holds `iam:GetRole` on exactly two
+# roles (alpha-engine-eventbridge-sfn-role, alpha-engine-step-functions-role)
+# and on NO lambda execution role — by design, per the single-writer rule. So
+# every code-only deploy that reached this helper probed a role it may not read,
+# was denied, concluded "absent", printed `Creating IAM role: <name>` and called
+# `aws iam create-role` — a grant it also does not hold and must not hold.
+#
+# A denied READ is not evidence of absence. Distinguishing the two is the whole
+# job here, and it is why the stderr is captured instead of discarded.
+probe_role_presence() {
+  local role_name="${1:?probe_role_presence: role name required}"
+  local err rc=0
+  err="$(aws iam get-role --role-name "${role_name}" \
+           --query 'Role.RoleName' --output text 2>&1 >/dev/null)" || rc=$?
+  if [ "${rc}" -eq 0 ]; then
+    echo present
+    return 0
+  fi
+  # Only an explicit NoSuchEntity proves absence. Everything else — AccessDenied,
+  # an expired token, a throttle, a network failure — is `unknown`.
+  if printf '%s' "${err}" | grep -qiE 'NoSuchEntity|cannot be found|does not exist'; then
+    echo absent
+    return 0
+  fi
+  echo unknown
+  return 0
+}
+
+# Usage: apply_iam_policy <role_name> <policy_name> <policy_file> <trust_policy_json> [may_create_role]
+#
+# `may_create_role` (default "true") governs the ROLE-CREATION half only. The
+# policy apply below runs either way. See probe_role_presence and
+# apply_iam_policy_on_deploy for why the auto-apply path passes "false".
 apply_iam_policy() {
   local role_name="$1" policy_name="$2" policy_file="$3" trust_policy="$4"
+  local may_create_role="${5:-true}"
 
-  if ! aws iam get-role --role-name "${role_name}" --query 'Role.RoleName' --output text >/dev/null 2>&1; then
-    echo "  Creating IAM role: ${role_name}"
-    run aws iam create-role \
-      --role-name "${role_name}" \
-      --assume-role-policy-document "${trust_policy}" \
-      --query 'Role.RoleName' --output text
-    if ! $DRY_RUN; then
-      echo "  Waiting 10s for IAM role propagation..."
-      sleep 10
-    fi
-  else
-    echo "  IAM role exists: ${role_name}"
-  fi
+  local presence
+  presence="$(probe_role_presence "${role_name}")"
+  case "${presence}" in
+    present)
+      echo "  IAM role exists: ${role_name}"
+      ;;
+    absent)
+      if [ "${may_create_role}" != "true" ]; then
+        # alpha-engine-config-I9045 / the four-red-deploys defect. Creating a
+        # role is a BOOTSTRAP act, and the single-writer rule (infrastructure/
+        # iam/README.md) reserves it for an operator. The auto-apply-on-deploy
+        # path must never attempt it: it holds no iam:CreateRole by design, so
+        # the attempt can only ever fail, and failing here aborts a deploy
+        # whose CODE has already shipped.
+        echo "  IAM role ABSENT: ${role_name} — not creating it from this path." >&2
+        echo "  This is the code-only auto-apply path, which is deliberately not a" >&2
+        echo "  role creator (single-writer rule). Run this deploy.sh --bootstrap as" >&2
+        echo "  an operator to create it. Skipping the policy apply too: there is no" >&2
+        echo "  role to put it on." >&2
+        APPLY_IAM_POLICY_VERDICT="role-absent"
+        return 0
+      fi
+      echo "  Creating IAM role: ${role_name}"
+      run aws iam create-role \
+        --role-name "${role_name}" \
+        --assume-role-policy-document "${trust_policy}" \
+        --query 'Role.RoleName' --output text
+      if ! $DRY_RUN; then
+        echo "  Waiting 10s for IAM role propagation..."
+        sleep 10
+      fi
+      ;;
+    *)
+      # `unknown` — the probe was DENIED or failed for a reason that is not
+      # NoSuchEntity. It is NOT evidence of absence, and the old code treated
+      # it as exactly that (see probe_role_presence). Fall through to the
+      # policy apply, which is the call whose own success or AccessDenied is
+      # the real answer.
+      echo "  IAM role presence UNKNOWN for ${role_name} (the get-role probe was" >&2
+      echo "  denied or unreadable). Not creating anything on an unknown; the" >&2
+      echo "  policy apply below is the authoritative attempt." >&2
+      ;;
+  esac
 
   # Report whether this apply actually CHANGES anything
   # (alpha-engine-config-I7444).
@@ -161,8 +234,41 @@ apply_iam_policy_on_deploy() {
   local err_file rc=0 stderr_text
   err_file="$(mktemp)"
 
-  apply_iam_policy "${role_name}" "${policy_name}" "${policy_file}" "${trust_policy}" \
-    2>"${err_file}" || rc=$?
+  # THE SUBSHELL IS LOAD-BEARING (the four-permanently-red-deploys defect).
+  #
+  # `run()` in _shared/deploy_run.sh calls `exit`, not `return` — deliberate,
+  # and correct, per alpha-engine-config-I8033. But `exit` inside a function
+  # terminates the SHELL, and `|| rc=$?` guards a non-zero RETURN. There is no
+  # return to guard, so the moment run() started exiting (merged 2026-08-21),
+  # the classifier below became unreachable: a denied `aws iam create-role`
+  # killed the whole deploy at exit 254, the captured stderr in "${err_file}"
+  # was never replayed, and the CI log ended at `Creating IAM role: <name>`
+  # with no AWS error text at all. Four workflows went red on every run for a
+  # week and the log could not say why.
+  #
+  # This is the SAME class alpha-engine-config-I8125 fixed for `run ... || true`
+  # call sites with run_tolerating(). It fixed the call-site shape and missed
+  # this one — a FUNCTION-level tolerance wrapper. A subshell closes it
+  # generally: an `exit` inside `( ... )` sets the subshell's exit status, which
+  # `||` does catch, so run()'s fail-loud semantics are preserved everywhere and
+  # this one classifier still gets to run.
+  #
+  # Cost of the subshell: assignments inside it do not escape, so
+  # APPLY_IAM_POLICY_VERDICT is round-tripped on stdout's last line below
+  # rather than read from the variable.
+  local out_file
+  out_file="$(mktemp)"
+  (
+    apply_iam_policy "${role_name}" "${policy_name}" "${policy_file}" \
+      "${trust_policy}" "false"
+    printf 'APPLY_IAM_POLICY_VERDICT=%s\n' "${APPLY_IAM_POLICY_VERDICT:-unknown}"
+  ) >"${out_file}" 2>"${err_file}" || rc=$?
+
+  # Replay stdout minus the verdict marker, and lift the verdict out of the
+  # subshell.
+  APPLY_IAM_POLICY_VERDICT="$(sed -n 's/^APPLY_IAM_POLICY_VERDICT=//p' "${out_file}" | tail -1)"
+  grep -v '^APPLY_IAM_POLICY_VERDICT=' "${out_file}" || true
+  rm -f "${out_file}"
 
   stderr_text="$(cat "${err_file}" 2>/dev/null || true)"
   rm -f "${err_file}"
@@ -184,6 +290,15 @@ apply_iam_policy_on_deploy() {
     echo "WARN: role=${role_name} policy=${policy_name}. This is expected for the CI" >&2
     echo "WARN: auto-deploy OIDC role (single-writer rule). check-drift.py is the backstop;" >&2
     echo "WARN: an operator must run this deploy.sh --apply-iam to land the change." >&2
+    # Replay the AWS error VERBATIM even though this failure is tolerated. The
+    # header above has claimed since it was written that "captured stderr is
+    # replayed verbatim on both paths below" — it was not, on this path, and
+    # nothing noticed because the assertion lived only in a comment. A
+    # tolerated failure whose cause never prints is how a WRONG tolerance
+    # survives: `AccessDenied` matched on some OTHER operation than the one
+    # assumed reads exactly like the expected boundary.
+    printf 'WARN: --- captured stderr (tolerated) ---\n%s\nWARN: --- end stderr ---\n' \
+      "${stderr_text}" >&2
     return 0
   fi
 
