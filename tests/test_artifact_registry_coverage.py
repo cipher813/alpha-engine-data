@@ -76,6 +76,14 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # separate PR there — pinned here first so this repo's guard is honest
     # about the new PUT site either way.
     "scripts/fault_injection_run.py": 1,
+    # alpha-engine-config-I9256 — the macro-series repair CLI. Its single PUT
+    # site rewrites an EXISTING registered artifact,
+    # s3://alpha-engine-research/reference/price_cache/{symbol}.parquet, whose
+    # freshness is already watched via PRICE_CACHE_FRESHNESS_SENTINEL_KEY. No
+    # new artifact and no new registry row: this is an idempotent repair path
+    # for a symbol the weekly refresh already owns, so it is pinned here at its
+    # true count rather than registered or grandfathered.
+    "builders/repair_macro_series.py": 1,
     # alpha-engine-config-I7167 — the stage-output assertion's own verdict,
     # s3://alpha-engine-research/_stage_outputs/{pipeline}/{run_date}.json.
     # One PUT per weekly run, from the health-observe tail.
