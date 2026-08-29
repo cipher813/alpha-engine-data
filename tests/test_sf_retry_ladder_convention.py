@@ -66,6 +66,15 @@ SPOT_STAGE_SEND_STATES = {
     "PitParityWalkforwardResourceKillCheck",
     "EvaluatorDiagnostics",
     "EvaluatorOptimize",
+    # alpha-engine-config-I9329: EvalJudgeProcess moved from lambda:invoke to
+    # ssm:sendCommand against a dedicated spot box, so it joins this class on
+    # the same idempotency argument every sibling uses -- the SEND state can
+    # only fail pre-execution (a SendCommand API error), because the moment a
+    # command is delivered the WaitForEvalJudgeProcess poll loop owns it. A
+    # DELIVERED run that fails is never re-sent here: substrate loss goes to
+    # EvalJudgeProcessRetryGate, which launches a fresh box, and a coverage
+    # shortfall is a verdict that a retry cannot change.
+    "EvalJudgeProcess",
 }
 HEALTH_OBSERVE_SEND_STATES = {
     "SaturdayHealthCheck",

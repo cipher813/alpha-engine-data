@@ -41,6 +41,11 @@ _EXPECTED_LAUNCHERS = frozenset(
         # bootstrap command lands), plus a 2.5h watchdog sized above the SSM
         # execution timeout.
         "thinktank-spot-dispatcher",
+        # alpha-engine-config-I9329 — dedicated spot box for EvalJudgeProcess
+        # (bootstrap-only launcher; SF polls bootstrap then sends the run).
+        # Terminates on failure in the launch→bootstrap window plus a watchdog
+        # sized above the bootstrap SSM timeout.
+        "eval-judge-spot-dispatcher",
     }
 )
 

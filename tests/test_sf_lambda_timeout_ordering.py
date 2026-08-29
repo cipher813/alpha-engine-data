@@ -91,9 +91,22 @@ _FUNCTION_TIMEOUTS_SEC: dict[str, int] = {
     "alpha-engine-replay-concordance": 900,
     "alpha-engine-replay-counterfactual": 600,
     "alpha-engine-research-aggregate-costs": 300,
-    "alpha-engine-research-eval-judge-poll": 60,
-    "alpha-engine-research-eval-judge-process": 900,
+    # alpha-engine-research-eval-judge-poll and -process were RETIRED by
+    # alpha-engine-config-I9329: the poll states existed to drive a provider
+    # batch API that no longer exists (-I9263), and Process moved onto a
+    # dedicated EC2 spot box because the judge covered 8-15 of ~83 artifacts
+    # inside a 900s function. Their rows are removed rather than left behind —
+    # an entry naming a function no SF invokes is an unchecked claim, and
+    # test_the_codified_function_timeouts_match_live would then assert against
+    # a function whose only remaining property is that it is dead.
     "alpha-engine-research-eval-judge-submit": 300,
+    # The dispatcher that replaces them. 600s covers the handler's worst case:
+    # a spot launch with capacity rotation and an on-demand fallback, plus the
+    # full 300s SSM-online wait, before the async detached send-command. It
+    # does NOT wait for the bootstrap — the SF's own poll loop does that.
+    # Matches --bootstrap's FN_TIMEOUT in
+    # infrastructure/lambdas/eval-judge-spot-dispatcher/deploy.sh.
+    "alpha-engine-research-eval-judge-spot-dispatcher": 600,
     # 300 -> 900 by crucible-research infrastructure/deploy.sh in the
     # alpha-engine-config-I9102 arc (both create AND update paths — the sizing
     # previously lived only on create, so no merge could ever re-size the live
@@ -127,7 +140,6 @@ _KNOWN_UNBOUND: frozenset[tuple[str, str]] = frozenset(
         ("step_function.json", "ChallengerShadow"),
         ("step_function.json", "EvalJudgeSubmitFirstSaturday"),
         ("step_function.json", "EvalJudgeSubmitWeekly"),
-        ("step_function.json", "EvalJudgePoll"),
         # EvalRollingMean REMOVED 2026-08-28 (alpha-engine-config#9102). It is
         # now a declared _SERVICE_MAX_GUARD_BAND entry below, not an unbound
         # one: the function moves to Lambda's 900s maximum and its handler
@@ -171,7 +183,13 @@ _SERVICE_MAX_GUARD_BAND: dict[tuple[str, str], int] = {
     # 2.0-3.0s Init Duration, rounded an order of magnitude so a cold-start
     # regression cannot recreate the race. alpha-engine-config-I7181.
     ("step_function.json", "ReplayConcordance"): 960,
-    ("step_function.json", "EvalJudgeProcess"): 960,
+    # EvalJudgeProcess LEFT this table on 2026-08-29 (alpha-engine-config-I9329)
+    # and did not move to _KNOWN_UNBOUND: it is no longer a lambda:invoke at
+    # all. As an ssm:sendCommand it is governed by the INVERSE rule — its
+    # executionTimeout must sit strictly BELOW its TimeoutSeconds — which the
+    # sendCommand section at the bottom of this file enforces. A guard band
+    # entry surviving here would have exempted a state that no longer exists
+    # in this walk, i.e. exempted nothing while reading as coverage.
     # alpha-engine-research-eval-rolling-mean joins that class in the
     # alpha-engine-config-I9102 arc. MEASURED, from log stream
     # 2026/08/28/[379]2195e7f6733c410eae3c42e205dc3e59: the stage emitted its

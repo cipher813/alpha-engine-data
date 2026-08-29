@@ -1,0 +1,91 @@
+name: Deploy eval-judge-spot-dispatcher
+
+# Auto-deploy the alpha-engine-research-eval-judge-spot-dispatcher Lambda CODE
+# on merge to main (alpha-engine-config-I9329). Mirrors
+# deploy-weekly-freshness-spot-dispatcher.yml — same gap, same fix: a merged
+# code change must not sit inert until someone remembers to run deploy.sh by
+# hand.
+#
+# Separation of concerns: this deploys CODE only (deploy.sh with NO flag).
+# `--bootstrap` is what ADDS execution-role and function CREATION, and stays
+# operator-only: the github-actions-lambda-deploy OIDC role deliberately holds
+# no iam:CreateRole / iam:PutRolePolicy (fleet-wide after four IAM-clobber
+# incidents in two months — nous-ergon-ops/infrastructure/iam/README.md).
+#
+# THIS WORKFLOW IS HALF OF THE OPERATOR GATE. pull-request-policy.md §4.2 admits
+# an operator-gated post-merge step only when the merge EMITS the exact command
+# AND a detector stays red until it runs. deploy.sh's flagless preflight prints
+# the exact `--bootstrap` invocation and exits non-zero when the function does
+# not exist, so this job is that detector; the second, independent one is
+# infrastructure/step-functions/check-lambda-existence.py via
+# sf-arn-drift-check.yml (push-to-main + daily), which fails on any SF
+# lambda:invoke naming a function absent from the live account.
+#
+# IAM: no new grant needed — LambdaUpdate already covers
+# arn:...:function:alpha-engine-* (nous-ergon-ops/infrastructure/iam/
+# github-actions-lambda-deploy.json), which includes this function.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/lambdas/eval-judge-spot-dispatcher/**'
+      - '.github/workflows/deploy-eval-judge-spot-dispatcher.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-eval-judge-spot-dispatcher-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy eval-judge-spot-dispatcher Lambda (code-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: alpha-engine-data
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12 (match Lambda runtime)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Deploy eval-judge-spot-dispatcher (code-only — no --bootstrap)
+        working-directory: alpha-engine-data
+        run: bash infrastructure/lambdas/eval-judge-spot-dispatcher/deploy.sh
+
+      - name: Report deployed version
+        working-directory: alpha-engine-data
+        run: |
+          echo "Deployed commit: ${{ github.sha }}"
+          aws lambda get-function \
+            --function-name alpha-engine-research-eval-judge-spot-dispatcher \
+            --query "Configuration.[LastModified,CodeSha256]" \
+            --output text
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@8a904b7a817901f2520dd87131ff307ed97fee02 # main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: deploy-eval-judge-spot-dispatcher.yml
+
+  notify-main-failure:
+    needs: [deploy]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@8c40481c0e80790bda54b30af63b4a341bebcccb # main
+    secrets: inherit

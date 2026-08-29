@@ -55,8 +55,17 @@ replacement box for that tier running the DeepSeek backend
 (`GROOM_BACKEND=deepseek`) instead of retrying Claude — see
 `_handle_fallback_dispatch`. Reuses `_launch_groom_spot` verbatim (same
 concurrency guard, daily ceiling, spot/on-demand + SSM mechanics); the
-DeepSeek tier->model mapping (`nousergon_lib.groom_eligibility.
-FALLBACK_TIER_MODELS`) is consumed on-box, not by this Lambda.
+tier->model resolution itself is consumed on-box (`groom_spot_bootstrap.sh`/
+`groom_driver.py`, alpha-engine-config), never by this Lambda —
+alpha-engine-config-I9297 (Brian ruling 2026-08-29): the tier->VENDOR-MODEL
+tables this docstring used to name (`nousergon_lib.groom_eligibility.
+TIER_MODELS`/`FALLBACK_TIER_MODELS`) are RETIRED. `ge.decide_slot`/
+`decide_trigger` now resolve a tier to a krepis registry GROUP
+(`SlotDecision.model_group`, via `krepis.router.group_for_tier` — the ONE
+tier->group mapping fleet-wide), never a model id — this Lambda runs in the
+`lambda` execution context, where the router's loopback address does not
+resolve (model-router-policy R28/R29), so the group is resolved to an
+actual model on the box, where the router IS reachable, not here.
 
 DeepSeek PRIMARY-mode backend selection (alpha-engine-config-I3479, Brian
 ruling 2026-07-22): distinct from the quota-FALLBACK leg above — that one is
@@ -77,11 +86,12 @@ additive `backend` key when present — through to the launch_decided
 invocation WHOLESALE, so no ASL change was needed). Sweep-mode and the
 quota-fallback `mode=fallback` leg are UNCHANGED by this feature. Reuses the
 SAME `GROOM_BACKEND=deepseek` on-box contract the fallback leg already
-established: alpha-engine-config-PR3487's bootstrap OVERRIDES `GROOM_MODEL`
-from its own `FALLBACK_TIER_MODELS` mirror (deepest tier of the bundle) when
-`GROOM_BACKEND=deepseek` — this Lambda's `model`/`GROOM_MODEL` stays a
-Claude-side default/pass-through in the PRIMARY case too, never a DeepSeek
-model id this Lambda selects itself.
+established: alpha-engine-config-PR3487's bootstrap resolves the actual
+model from `GROOM_MODEL` on-box when `GROOM_BACKEND=deepseek` —
+alpha-engine-config-I9297: `GROOM_MODEL` now carries a krepis registry GROUP
+name (e.g. "med"/"high"), not a vendor model id, in every code path that
+sources it from `ge.SlotDecision.model_group` (demand-gate, demand-all,
+decide_only); this Lambda never resolves a model itself.
 
 Managed OUTSIDE CloudFormation (same as before): operator-deployed via
 `deploy.sh --bootstrap`. Merging the PR has ZERO live effect until the new code +
@@ -416,10 +426,11 @@ _MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 # it can never intercept a real cron/SF-driven invocation.
 # `GROOM_BACKEND=deepseek` is threaded through the SAME `_launch_groom_spot`
 # call every other path uses (no duplicated launch/SSM code) so the box runs
-# the DeepSeek fallback provider. The tier -> DeepSeek-model mapping
-# (`nousergon_lib.groom_eligibility.FALLBACK_TIER_MODELS`, a sibling PR) is
-# consumed on-box by alpha-engine-config's groom_spot_bootstrap.sh /
-# groom_driver.py — this Lambda does not import or reference that dict.
+# the DeepSeek fallback provider. The tier -> model resolution itself
+# (alpha-engine-config-I9297: via krepis.router, not a hardcoded
+# nousergon-lib table — `FALLBACK_TIER_MODELS` is retired) is consumed
+# on-box by alpha-engine-config's groom_spot_bootstrap.sh / groom_driver.py
+# — this Lambda does not resolve a model itself, on this path either.
 _VALID_FALLBACK_TIERS = set(ge.TIERS)  # {"low", "mid", "high"}
 GROOM_BACKEND_DEEPSEEK = "deepseek"
 
@@ -3232,7 +3243,7 @@ def _write_queue_manifests(schedule_label: str, launches: list,
         key = f"groom/queues/{now:%Y-%m-%d}/trigger-{now:%H%M}-{d.issue_filter}.json"
         body = json.dumps({
             "schema_version": 1, "schedule": schedule_label,
-            "issue_filter": d.issue_filter, "model": d.model,
+            "issue_filter": d.issue_filter, "model": d.model_group,
             "tiers": list(d.tiers), "decided_at": now.isoformat(),
             "issue_count": len(issues), "issues": issues,
         })
@@ -3390,9 +3401,10 @@ def _write_fallback_decision_record(schedule_label: str, tier: str, backend: str
 
 def _handle_fallback_dispatch(event: dict) -> dict:
     """Direct ``lambda:InvokeFunction`` quota-fallback path (3-repo feature;
-    this Lambda is one leg — see ``nousergon_lib``'s new
-    ``FALLBACK_TIER_MODELS`` dict and ``alpha-engine-config``'s
-    ``groom_driver.py`` quota classifier for the other two).
+    this Lambda is one leg — see ``alpha-engine-config``'s
+    ``groom_driver.py`` quota classifier and its krepis-based tier->model
+    resolution (alpha-engine-config-I9297; ``FALLBACK_TIER_MODELS`` retired)
+    for the other two).
 
     A groom box that hits mid-run Claude-quota exhaustion winds down cleanly
     (existing config#1803 behavior, UNCHANGED by this change) and then
@@ -3412,11 +3424,12 @@ def _handle_fallback_dispatch(event: dict) -> dict:
     the config#1979 concurrency guard, the config#3173 daily ceiling, and the
     spot/on-demand + SSM-send-command mechanics for free, with
     ``GROOM_BACKEND_DEEPSEEK`` threaded through so the box runs the DeepSeek
-    fallback provider. The tier -> DeepSeek-model mapping itself
-    (``FALLBACK_TIER_MODELS``) is consumed on-box by alpha-engine-config's
-    groom_spot_bootstrap.sh/groom_driver.py — this Lambda does not import or
-    reference that dict; ``GROOM_MODEL`` here is only the (inert-for-
-    deepseek) Claude-side default so the bootstrap command shape stays
+    fallback provider. The tier -> model resolution itself (alpha-engine-
+    config-I9297: via krepis.router on-box, not a hardcoded nousergon-lib
+    table) is consumed by alpha-engine-config's groom_spot_bootstrap.sh/
+    groom_driver.py — this Lambda does not resolve a model itself;
+    ``GROOM_MODEL`` here is only the (inert-for-deepseek) event-supplied
+    default so the bootstrap command shape stays
     unchanged for the field.
 
     Fails LOUD (raises ``ValueError``) on a missing/invalid tier rather than
@@ -3699,13 +3712,13 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                     _notify_demand_skip(d, counts, schedule_label)
                     continue
                 logger.info("demand trigger LAUNCH — %s (filter=%s model=%s backend=%s)",
-                            d.reason, d.issue_filter, d.model, backend or "claude")
+                            d.reason, d.issue_filter, d.model_group, backend or "claude")
                 # config#2201: SlotDecision no longer carries partition_index/
                 # partition_count at all — those fields were fully removed
                 # from nousergon-lib's SlotDecision (confirmed on the lib's
                 # current default branch, pin >= v0.109.0). The end-of-SF
                 # sweep box replaced per-box partitioned sweeps.
-                entry = {"model": d.model, "issue_filter": d.issue_filter}
+                entry = {"model": d.model_group, "issue_filter": d.issue_filter}
                 if pr_budget is not None and "high" in d.tiers:
                     entry["pr_budget"] = pr_budget
                 if backend:
@@ -3759,7 +3772,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             # schedule's model is only the slot default; high never runs
             # below its own tier's model, and a bundle without high never pays for it.
             issue_filter = decision.issue_filter
-            model = decision.model
+            model = decision.model_group
             backend = decided_backend
             logger.info("demand gate LAUNCH — %s (filter=%s model=%s backend=%s)",
                         decision.reason, issue_filter, model, backend or "claude")

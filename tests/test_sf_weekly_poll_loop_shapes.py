@@ -61,6 +61,12 @@ ALL_CHECK_STATUS_STATES = [
     "CheckBacktesterStatus",
     "CheckDataPhase1Status",
     "CheckDataPhase2Status",
+    # alpha-engine-config-I9329: EvalJudgeProcess moved off Lambda onto a
+    # dedicated spot box, so the eval-judge chain acquired the same two
+    # bounded poll loops every other spot stage has — one over the box's
+    # bootstrap command, one over the judge run itself.
+    "CheckEvalJudgeProcessStatus",
+    "CheckEvalJudgeSpotBootstrapStatus",
     "CheckEvaluatorDiagnosticsStatus",
     "CheckEvaluatorOptimizeStatus",
     "CheckModelZooStatus",
