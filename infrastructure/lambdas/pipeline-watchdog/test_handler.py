@@ -9,6 +9,7 @@ dedup wiring, fail-loud) per the ``feedback_no_silent_fails`` discipline.
 
 from __future__ import annotations
 
+import importlib
 import json
 import sys
 import types
@@ -18,6 +19,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+
+# alpha-engine-config-I8217: import the REAL nousergon_lib.pipeline_status.
+# completion_marker before the blanket nousergon_lib stub below replaces the
+# top-level package — this is the fleet's canonical, tested double-decode
+# fix (I8154/I8186), and the whole point of the regression tests further
+# down is to exercise that real implementation, not a hand-rolled fake that
+# could silently diverge from it again. Once imported, it stays reachable
+# via sys.modules regardless of what the stub does to the parent package.
+importlib.import_module("nousergon_lib.pipeline_status.completion_marker")
 
 # Stub `nousergon_lib.trading_calendar` + `nousergon_lib.alerts` BEFORE
 # importing the handler so test envs without the lib installed still pass.
@@ -1309,12 +1319,21 @@ def _make_status_aware_sfn_client(rows_by_status: dict) -> MagicMock:
 
 
 def _make_s3_marker_client(*, marker: dict | None = None, error: Exception | None = None) -> MagicMock:
+    """alpha-engine-config-I8217: production ``_sf_completion/`` objects are
+    written by a Step Functions ``States.Format`` body, so the S3 object is
+    a JSON string LITERAL containing the JSON object (double-encoded) — NOT
+    a single ``json.dumps(marker)``. This fixture used to write the single-
+    encoded form, which is why every test built on it kept passing against
+    the (until this issue) permanently-broken ``_completion_marker_status``:
+    the fixture never exercised the double-decode the real object needs.
+    Encoding it the way the SF actually does turns every test below into a
+    real regression test for that bug, not a fixture-shaped pass."""
     s3 = MagicMock()
     if error is not None:
         s3.get_object.side_effect = error
     else:
         body = MagicMock()
-        body.read.return_value = _json.dumps(marker).encode()
+        body.read.return_value = _json.dumps(_json.dumps(marker)).encode()
         s3.get_object.return_value = {"Body": body}
     return s3
 
@@ -1396,6 +1415,32 @@ def test_failed_day_unreadable_marker_pages_unknown_is_not_pass():
     assert result.alert_emitted is True
     assert result.marker_status == "UNREADABLE"
     assert _alerts_mod.publish.call_args.kwargs["severity"] == "error"
+
+
+def test_completion_marker_status_decodes_real_double_encoded_object():
+    """alpha-engine-config-I8217 regression: this is the ACTUAL object body
+    read from s3://alpha-engine-research/_sf_completion/ne-weekly-freshness-pipeline/2026-08-22.json
+    (fetched read-only 2026-08-29), a real ``watch-rerun`` recovery marker
+    for the weekly cycle whose scheduled cron run FAILED at Director after
+    5h15m with APITimeoutError. Before the fix this always returned
+    UNREADABLE regardless of content; it must resolve the real ``status``."""
+    real_body = (
+        '"{\\"sf\\":\\"ne-weekly-freshness-pipeline\\",\\"execution_arn\\":'
+        '\\"arn:aws:states:us-east-1:711398986525:execution:'
+        'ne-weekly-freshness-pipeline:watch-rerun-2026-08-22-3\\",'
+        '\\"status\\":\\"SUCCEEDED\\",\\"started_at\\":'
+        '\\"2026-08-22T15:53:30.910Z\\",\\"completed_at\\":'
+        '\\"2026-08-22T16:08:02.407Z\\",\\"cycle_key\\":\\"2026-08-22\\",'
+        '\\"substrate_relaunches\\":0}"'
+    )
+    s3 = MagicMock()
+    body = MagicMock()
+    body.read.return_value = real_body.encode()
+    s3.get_object.return_value = {"Body": body}
+    status = index._completion_marker_status(
+        s3, "ne-weekly-freshness-pipeline", date(2026, 8, 22),
+    )
+    assert status == "SUCCEEDED"
 
 
 def test_failed_day_non_degraded_marker_status_still_pages():
