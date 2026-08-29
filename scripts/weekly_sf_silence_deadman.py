@@ -32,10 +32,15 @@ dimension needed.
 
 **Gotchas this script is built around (measured, not theoretical):**
 
-  * A SUCCEEDED ``pipeline_role=weekly`` execution that completes in under
-    ``GATE_NOOP_MAX_SECONDS`` is ``WeeklyRunDayGateChoice``'s designed 2-second
-    no-op skip on a non-run day (2 of every 3 THU-SAT cron firings), NOT a
-    real weekly run. Counting it as "ran" would hide a genuinely silent week.
+  * A SUCCEEDED ``pipeline_role=weekly`` execution whose OUTPUT carries
+    ``weekly_run_day_gate.Payload.is_weekly_run_day is False`` is
+    ``WeeklyRunDayGateChoice``'s designed no-op skip on a non-run day (2 of
+    every 3 THU-SAT cron firings), NOT a real weekly run. Counting it as
+    "ran" would hide a genuinely silent week. Read directly from the
+    execution's output, never inferred from duration — corrected
+    2026-08-29 (alpha-engine-config-I8057) after a
+    ``duration < 90s`` heuristic misclassified real data in both
+    directions.
   * Neither launch path passes an explicit Step Functions ``Name`` — every
     execution gets an AWS-generated UUID name. ``pipeline_role`` is read from
     each execution's OWN INPUT via ``describe_execution``, never inferred
@@ -96,7 +101,38 @@ SNS_TOPIC_ARN = f"arn:aws:sns:{REGION}:{ACCOUNT_ID}:alpha-engine-alerts"
 
 ALLOWED_CADENCE = {"daily", "weekly-only", "off"}
 DEFAULT_WINDOW_DAYS = 5
+
+# DEPRECATED (alpha-engine-config-I8057) — kept ONLY because
+# infrastructure/lambdas/pipeline-watchdog/index.py imports this name
+# directly (`from weekly_sf_silence_deadman import GATE_NOOP_MAX_SECONDS`)
+# for its OWN separate, still-duration-based `_row_is_gate_noop` check.
+# `_is_gate_noop` below no longer reads this value — it reads
+# `ExecutionRecord.is_gate_out`, set from the execution's own output
+# verdict (`_is_weekly_gate_out`). Removing this constant would raise
+# ImportError at Lambda cold start. The Lambda's own duration check is a
+# separate, unfixed instance of the same class — filed as
+# alpha-engine-config-I<TBD> (out of this change's file ownership: Lane
+# A/B owns `infrastructure/lambdas/`).
 GATE_NOOP_MAX_SECONDS = 90
+
+
+def _is_weekly_gate_out(output_json: dict) -> bool:
+    """True iff a SUCCEEDED weekly-role execution's own OUTPUT proves it did
+    no work (alpha-engine-config-I8057, mirrors
+    ``gate_sf_run_sweep.py::_is_weekly_gate_out`` from
+    alpha-engine-config-PR8055 — the reference implementation for this
+    class, also mirrored in ``weekly_sf_recovery_metric.py``). Positive test
+    only: excludes on ``weekly_run_day_gate.Payload.is_weekly_run_day is
+    False``, never on the key's absence — a real run does not carry it at
+    all.
+    """
+    gate = output_json.get("weekly_run_day_gate")
+    if not isinstance(gate, dict):
+        return False
+    inner = gate.get("Payload")
+    if not isinstance(inner, dict):
+        return False
+    return inner.get("is_weekly_run_day") is False
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +364,12 @@ class ExecutionRecord:
     # zone (alpha-engine-config-I7440). ``None`` when the input carried no
     # usable run_date; consumers fall back to ``start`` and say so.
     run_date: date | None = None
+    # True iff this SUCCEEDED weekly-role execution's own OUTPUT proves it
+    # gated out (``weekly_run_day_gate.Payload.is_weekly_run_day is False``)
+    # — never inferred from duration (alpha-engine-config-I8057). ``False``
+    # by default and for every non-weekly role, since only the weekly
+    # pipeline carries a run-day gate.
+    is_gate_out: bool = False
 
 
 # The weekly SF's pipeline_role vocabulary, as emitted by its launch paths:
@@ -386,9 +428,21 @@ class SlotResult:
 
 
 def _is_gate_noop(e: ExecutionRecord) -> bool:
-    if e.status != "SUCCEEDED" or e.stop is None:
+    """True iff this SUCCEEDED weekly-role execution's own OUTPUT proves it
+    did no work — never a duration heuristic (corrected 2026-08-29,
+    alpha-engine-config-I8057, same class fixed in
+    ``gate_sf_run_sweep.py::_is_weekly_gate_out`` /
+    alpha-engine-config-PR8055). The prior ``duration < GATE_NOOP_MAX_SECONDS``
+    (90s) test was wrong in both directions: measured 2026-08-22,
+    ``watch-rerun-2026-08-22-3`` ran 871.8s and entered 1 of 16 stages — long,
+    and vacuous — while the fleet's shortest genuine weekly run is 12.6s,
+    well inside a 90s window. ``is_gate_out`` is computed once in
+    ``fetch_execution_records`` from the same ``describe_execution`` call
+    already made for ``role``/``run_date`` — no extra AWS call, no clock.
+    """
+    if e.status != "SUCCEEDED":
         return False
-    return (e.stop - e.start).total_seconds() < GATE_NOOP_MAX_SECONDS
+    return e.is_gate_out
 
 
 def evaluate_slot(slot: ExpectedSlot, executions: list[ExecutionRecord]) -> SlotResult:
@@ -477,11 +531,17 @@ def fetch_execution_records(
             continue
         role = None
         run_date = None
+        is_gate_out = False
         try:
             desc = sf_client.describe_execution(executionArn=ex["executionArn"])
             inp = json.loads(desc.get("input") or "{}")
             role = normalize_role(inp.get("pipeline_role"))
             run_date = _parse_run_date(inp.get("run_date"))
+            if role == "weekly" and ex["status"] == "SUCCEEDED":
+                # Same describe_execution call already made above — no extra
+                # AWS call. Never duration-based (alpha-engine-config-I8057).
+                output_json = json.loads(desc.get("output") or "{}")
+                is_gate_out = _is_weekly_gate_out(output_json)
         except Exception as exc:  # noqa: BLE001 — best-effort per-execution; unrecognized role is a safe fallback, not a hidden failure (surfaced below)
             print(f"WARN: could not read input of {ex['executionArn']}: {exc}", file=sys.stderr)
         records.append(ExecutionRecord(
@@ -491,6 +551,7 @@ def fetch_execution_records(
             start=start,
             stop=ex.get("stopDate"),
             run_date=run_date,
+            is_gate_out=is_gate_out,
         ))
     return records
 

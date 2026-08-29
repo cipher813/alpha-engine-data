@@ -92,12 +92,24 @@ class _FakeSFClient:
     def describe_execution(self, *, executionArn: str):
         for ex in self._executions:
             if ex["executionArn"] == executionArn:
-                return {"input": json.dumps(ex["_input"])}
+                resp = {"input": json.dumps(ex["_input"])}
+                if ex.get("_output") is not None:
+                    resp["output"] = json.dumps(ex["_output"])
+                return resp
         raise AssertionError(f"no fixture execution for {executionArn}")  # pragma: no cover
 
 
+# The run-day gate's own verdict, exactly as it appears in a real gate-skip
+# execution's output (alpha-engine-config-I8057 — the gate-noop axis is
+# read from this, never from duration).
+_GATE_OUT_OUTPUT = {"weekly_run_day_gate": {"Payload": {
+    "is_weekly_run_day": False, "marker": "NOT_WEEKLY_RUN_DAY",
+}}}
+
+
 def _execution(
-    *, name: str, role: str | None, status: str, start: datetime, duration_s: float
+    *, name: str, role: str | None, status: str, start: datetime, duration_s: float,
+    gate_out: bool = False,
 ) -> dict:
     return {
         "executionArn": f"arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:{name}",
@@ -106,6 +118,7 @@ def _execution(
         "startDate": start,
         "stopDate": start + timedelta(seconds=duration_s) if status != "RUNNING" else None,
         "_input": {"pipeline_role": role} if role is not None else {},
+        "_output": _GATE_OUT_OUTPUT if gate_out else None,
     }
 
 
@@ -234,6 +247,7 @@ class TestWeeklyFailedDayGateSkipIsNotACycle:
                 status="SUCCEEDED",
                 start=_utc(TARGET_DATE, 9, 0),
                 duration_s=2,
+                gate_out=True,
             ),
             _execution(
                 name="same-day-exercise-noise",

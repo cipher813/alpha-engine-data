@@ -14,8 +14,7 @@ result alongside the run's other artifacts, and alerts when the count
 exceeds the policy's target.
 
 REUSE, NOT DUPLICATION: the execution-history parsing primitives
-(``entered_states``, ``execution_input``, ``fetch_history``,
-``list_all_executions``) are imported directly from
+(``execution_input``, ``list_all_executions``) are imported directly from
 ``scripts/weekly_sf_rerun.py`` — this module owns none of that parsing
 logic itself.
 
@@ -30,14 +29,29 @@ Every execution of the state machine within the scan window is one of:
   runs belong to the separate weekly-exercise rehearsal chain, never the
   production recovery count for a real ``run_date``.
 - **excluded_gate_skip** — a ``pipeline_role="weekly"`` execution that
-  SUCCEEDED in well under a minute on a non-run day: ``CheckWeeklyRunDayGate``
-  self-selecting the correct day (config#1824) means the THU-SAT cron fires
-  3x and 2 of those 3 firings Succeed-skip at ``WeeklyRunDaySkip`` before any
-  real work state is entered. That is the run-day gate doing its job, not a
-  pipeline attempt, and must never inflate the recovery count. Detected by
-  duration (cheap, first) and CONFIRMED by execution history (only for the
-  short-duration candidates) so the classification never rests on a fragile
-  timing heuristic alone.
+  SUCCEEDED because ``CheckWeeklyRunDayGate`` self-selected a non-run day
+  (config#1824): the THU-SAT cron fires 3x and 2 of those 3 firings
+  Succeed-skip at ``WeeklyRunDaySkip`` before any real work state is
+  entered. That is the run-day gate doing its job, not a pipeline attempt,
+  and must never inflate the recovery count.
+
+  **NOT a duration heuristic** (corrected 2026-08-29 — alpha-engine-
+  config-I8057, same class fixed in alpha-engine-config-PR8055's
+  ``_is_weekly_gate_out``). The prior implementation used
+  ``duration < GATE_SKIP_MAX_SECONDS`` (60s) as a pre-filter before
+  confirming via a ``GetExecutionHistory`` walk — safe against a real run
+  finishing fast (history confirmation caught it), but blind to a
+  gate-out that happened to run slower than the threshold, and it paid an
+  extra API call either way. The gate publishes its own verdict directly
+  in the execution OUTPUT — ``weekly_run_day_gate.Payload.is_weekly_run_day
+  is False`` — readable from the same ``describe_execution`` call already
+  made to resolve ``role``/``run_date``, so this needs no extra AWS call
+  and no clock. Verified live 2026-08-21/08-22 against both real
+  gate-outs (3.5s, 5.7s) and the fleet's shortest genuine run (12.6s,
+  ``director-verify-0731-003355Z``): the shortest real run carries no
+  ``weekly_run_day_gate`` key at all, so it is never at risk of being
+  misread — the test is POSITIVE (excludes only on ``is False``, never on
+  absence).
 
 Correlation to a target ``run_date``:
 
@@ -89,9 +103,7 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from scripts.weekly_sf_rerun import (  # noqa: E402
-    entered_states,
     execution_input,
-    fetch_history,
     list_all_executions,
 )
 
@@ -118,11 +130,23 @@ NAME_RUN_DATE_RE = re.compile(r"^(?:watch-)?rerun-(\d{4}-\d{2}-\d{2})-\d+$")
 # never a real run_date attempt.
 EXERCISE_ROLES = frozenset({"exercise", "weekly-exercise"})
 
-# A weekly-role SUCCEEDED execution finishing this fast never reached a real
-# work state — it is CheckWeeklyRunDayGate self-selecting the correct day
-# (config#1824), confirmed below via entered_states before being excluded.
-GATE_SKIP_MAX_SECONDS = 60
-GATE_SKIP_WITNESS = "WeeklyRunDaySkip"
+def _is_weekly_gate_out(output_json: dict) -> bool:
+    """True iff a SUCCEEDED weekly-role execution's OWN OUTPUT proves it did
+    no work (alpha-engine-config-I8057, mirrors
+    ``gate_sf_run_sweep.py::_is_weekly_gate_out`` from
+    alpha-engine-config-PR8055 — the reference implementation for this
+    class). Positive test only: excludes on
+    ``weekly_run_day_gate.Payload.is_weekly_run_day is False``, never on the
+    key's absence — a real run does not carry it at all, so an absent-key-
+    as-gate-out reading would strand every real weekly execution.
+    """
+    gate = output_json.get("weekly_run_day_gate")
+    if not isinstance(gate, dict):
+        return False
+    inner = gate.get("Payload")
+    if not isinstance(inner, dict):
+        return False
+    return inner.get("is_weekly_run_day") is False
 
 
 @dataclass(frozen=True)
@@ -137,17 +161,11 @@ class ExecutionRecord:
     classification: str  # "counted" | "excluded_exercise" | "excluded_gate_skip"
 
 
-def _duration_seconds(start: datetime, stop: datetime | None) -> float | None:
-    if stop is None:
-        return None
-    return (stop - start).total_seconds()
-
-
 def classify_execution(sf, ex: dict) -> ExecutionRecord:
     """Classify one `list_executions` summary. Fetches `describe_execution`
-    only for executions whose name doesn't already carry the run_date, and
-    `get_execution_history` only for the (rare) short-duration weekly-role
-    SUCCEEDED candidates that need confirmation as a gate-skip."""
+    only for executions whose name doesn't already carry the run_date — that
+    same call's `output` field (already in hand, no second AWS call) also
+    carries the gate-out verdict for weekly-role SUCCEEDED candidates."""
     name = ex["name"]
     status = ex["status"]
     start = ex["startDate"]
@@ -186,11 +204,12 @@ def classify_execution(sf, ex: dict) -> ExecutionRecord:
     if role in EXERCISE_ROLES:
         classification = "excluded_exercise"
     elif role == "weekly" and status == "SUCCEEDED":
-        dur = _duration_seconds(start, stop)
-        if dur is not None and dur < GATE_SKIP_MAX_SECONDS:
-            events = fetch_history(sf, ex["executionArn"])
-            if GATE_SKIP_WITNESS in entered_states(events):
-                classification = "excluded_gate_skip"
+        try:
+            output_json = json.loads(desc.get("output") or "{}")
+        except json.JSONDecodeError:
+            output_json = {}
+        if _is_weekly_gate_out(output_json):
+            classification = "excluded_gate_skip"
 
     return ExecutionRecord(
         arn=ex["executionArn"], name=name, status=status, start=start,
