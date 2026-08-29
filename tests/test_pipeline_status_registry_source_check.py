@@ -37,7 +37,9 @@ files (Saturday/Weekday/EOD) ARE asserted on hard, per this issue's scope.
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -49,6 +51,75 @@ from nousergon_lib.pipeline_status.registry import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# ── Installed-versus-pinned provenance (alpha-engine-config-I9116) ───────────
+#
+# This test reads the SF JSONs from the working tree and the registry from the
+# INSTALLED `nousergon_lib`. Those are two different clocks. When the installed
+# lib is behind `requirements.txt`, the invariant fails for a reason that has
+# nothing to do with the SF definition — and the message below used to say, with
+# no hedge, "the Saturday SF has 1 substantive Task state NOT in the registry …
+# add each state to the registry in nousergon-lib". Measured 2026-08-28: the
+# venv held v0.124.88 (137 registry entries, no `NormalizeRunDates`) while
+# requirements.txt pinned v0.124.95 (138, with it). CI installs the pin and
+# passes; the reader on the laptop is sent to nousergon-lib to add an entry that
+# already exists there.
+#
+# A test whose failure text sends the reader to the wrong place is a defect in
+# its own right, so the provenance is now part of the verdict. It is a
+# QUALIFIER, never a suppressor: a version mismatch still fails, it just fails
+# saying which of the two things to go fix. The environment half is tracked
+# separately as alpha-engine-config-I9070; nothing here tries to repair it.
+_PIN_RE = re.compile(r"nousergon-lib(?:\[[^\]]*\])?\s*@\s*\S+@(v[0-9][^\s#]*)")
+
+
+def _pinned_lib_version(requirements: str) -> str | None:
+    """The `nousergon-lib@vX.Y.Z` tag from requirements.txt text.
+
+    FULL-LINE comments are stripped first, and that is load-bearing, not
+    tidiness: this repo's requirements.txt carries at least four comment lines
+    naming superseded tags (`v0.124.53`, `v0.124.78`, …) directly above the real
+    pin, explaining why each was bumped. A matcher that reads those would report
+    a mismatch against a version nobody installed — the same shape as the
+    scheduled-identity scan that matched a role name inside a YAML comment and
+    went red on main. Only whole comment lines are removed: a `#` mid-line is
+    left alone, because a pin may legitimately carry a trailing note.
+    """
+    code = "\n".join(
+        line for line in requirements.splitlines() if not line.lstrip().startswith("#")
+    )
+    match = _PIN_RE.search(code)
+    return match.group(1) if match else None
+
+
+def _installed_lib_version() -> str | None:
+    try:
+        return "v" + importlib.metadata.version("nousergon-lib")
+    except importlib.metadata.PackageNotFoundError:  # pragma: no cover - env-only
+        return None
+
+
+def _provenance_note(installed: str | None, pinned: str | None) -> str:
+    """The paragraph prepended to a drift failure when the two clocks disagree.
+
+    Empty string when they agree or when either is unreadable — in which case
+    the failure is the SF-definition drift the assertion was written for.
+    """
+    if installed is None or pinned is None or installed == pinned:
+        return ""
+    return (
+        f"READ THIS FIRST — your installed nousergon-lib does NOT match the pin.\n"
+        f"  installed: {installed}\n"
+        f"  pinned in requirements.txt: {pinned}\n"
+        f"This check reads the SF JSONs from the working tree but the registry "
+        f"from the INSTALLED lib, so a stale install produces exactly the "
+        f"failure below WITHOUT any drift existing. Reinstall the pin first and "
+        f"re-run:\n"
+        f"    python3 -m pip install -r requirements.txt\n"
+        f"Only if it still fails afterwards is the SF-definition drift described "
+        f"below real. (alpha-engine-config-I9116; the environment drift itself is "
+        f"tracked as alpha-engine-config-I9070.)\n\n"
+    )
 
 _SF_JSON_FILES = [
     ("Saturday", REPO_ROOT / "infrastructure" / "step_function.json"),
@@ -106,7 +177,9 @@ def test_every_substantive_state_has_registry_entry(label, json_path):
     substantive -= set(WAIT_GROUPING.keys())
     missing = substantive - set(STATE_TO_ARCHIVE_PAGE.keys())
 
-    assert not missing, (
+    assert not missing, _provenance_note(
+        _installed_lib_version(), _pinned_lib_version((REPO_ROOT / "requirements.txt").read_text())
+    ) + (
         f"{label} SF ({json_path.relative_to(REPO_ROOT)}) has {len(missing)} "
         f"substantive Task state(s) NOT in "
         f"nousergon_lib.pipeline_status.registry.STATE_TO_ARCHIVE_PAGE: "
@@ -148,7 +221,9 @@ def test_wait_companions_in_json_are_in_wait_grouping(label, json_path):
     wait_states = _collect_wait_states(sf.get("States", {}), set())
     missing = wait_states - set(WAIT_GROUPING.keys())
 
-    assert not missing, (
+    assert not missing, _provenance_note(
+        _installed_lib_version(), _pinned_lib_version((REPO_ROOT / "requirements.txt").read_text())
+    ) + (
         f"{label} SF has {len(missing)} ``WaitFor*`` state(s) NOT in "
         f"nousergon_lib.pipeline_status.registry.WAIT_GROUPING: "
         f"{sorted(missing)}. Each must map to its parent Task state name; "
@@ -179,3 +254,166 @@ def test_groom_sf_registry_coverage_visibility():
             f"(dashboard test never covered groom either). See this test "
             f"file's module docstring."
         )
+
+
+# ── The provenance qualifier's own tests (alpha-engine-config-I9116) ─────────
+#
+# Both halves, or the change is worse than what it replaced: the corrected
+# message must appear under a stale-lib condition, AND a genuine drift with the
+# versions in lockstep must still fail loudly and still name the states.
+
+
+def test_pin_parser_reads_the_pin_and_not_the_comments_above_it() -> None:
+    """The comment trap. requirements.txt names superseded tags in prose
+    directly above the live pin; a matcher that harvested those would report a
+    mismatch against a version nobody installed."""
+    text = (
+        "# nousergon-lib-PR311 adds all five and MUST merge first; v0.124.53 was\n"
+        "# the floor. Superseded by nousergon-lib @ git+https://x/y@v0.124.78.\n"
+        "some-other-pkg==1.2.3\n"
+        "nousergon-lib[arcticdb,rag] @ git+https://github.com/nousergon/"
+        "nousergon-lib@v0.124.95\n"
+    )
+    assert _pinned_lib_version(text) == "v0.124.95"
+
+
+def test_pin_parser_reads_the_real_requirements_file() -> None:
+    """A parser proven only on a fixture is a parser nobody ran on the real
+    input. The live file must yield a pin, or the qualifier silently degrades to
+    'unreadable' and never fires."""
+    pinned = _pinned_lib_version((REPO_ROOT / "requirements.txt").read_text())
+    assert pinned is not None and pinned.startswith("v"), (
+        "requirements.txt no longer yields a nousergon-lib pin this parser can "
+        "read. Fix _PIN_RE — a silently unparseable pin turns the provenance "
+        "qualifier off without failing anything."
+    )
+
+
+def test_a_stale_install_is_named_first_in_the_failure_message() -> None:
+    """THE case that made this a defect. On 2026-08-28 a laptop venv held
+    v0.124.88 against a v0.124.95 pin, and the message sent the reader to
+    nousergon-lib to add a `NormalizeRunDates` entry that already existed
+    there."""
+    note = _provenance_note("v0.124.88", "v0.124.95")
+    assert note, "a version mismatch produced no qualifier at all"
+    assert note.startswith("READ THIS FIRST"), (
+        "the qualifier must LEAD. Appended below a 10-line accusation about the "
+        "SF definition, it is not read."
+    )
+    assert "v0.124.88" in note and "v0.124.95" in note, (
+        f"the qualifier names neither version, so it cannot be acted on:\n{note}"
+    )
+    assert "pip install -r requirements.txt" in note, (
+        f"the qualifier does not say what to actually do:\n{note}"
+    )
+
+
+def test_matched_versions_produce_no_qualifier() -> None:
+    """It is a qualifier, not a suppressor. With the clocks in lockstep the
+    failure must read exactly as it did before — an accusation against the SF
+    definition, which is then correct."""
+    assert _provenance_note("v0.124.95", "v0.124.95") == ""
+
+
+def test_unreadable_provenance_produces_no_qualifier() -> None:
+    """An unreadable pin or a missing distribution must not invent a mismatch.
+    Absence of evidence is not a version skew — the same conflation that made
+    a denied `iam:GetRole` read as an absent role."""
+    assert _provenance_note(None, "v0.124.95") == ""
+    assert _provenance_note("v0.124.95", None) == ""
+
+
+def test_real_drift_still_fails_loudly_when_versions_match(monkeypatch) -> None:
+    """The other half. Inject a substantive Task state that no registry entry
+    covers, with installed == pinned, and assert the check still fails AND still
+    names the offending state. Without this, the change could have turned a real
+    invariant into a version-mismatch reporter."""
+    real_pin = _pinned_lib_version((REPO_ROOT / "requirements.txt").read_text())
+    monkeypatch.setattr(
+        "tests.test_pipeline_status_registry_source_check._installed_lib_version",
+        lambda: real_pin,
+        raising=False,
+    )
+    resource = next(iter(SUBSTANTIVE_RESOURCES))
+    invented = "AStateNoRegistryEverHeardOf"
+    assert invented not in STATE_TO_ARCHIVE_PAGE
+    states = {invented: {"Type": "Task", "Resource": resource}}
+    found = _walk_substantive_task_states(states, set())
+    assert found == {invented}, (
+        "the walker no longer recognises a plain substantive Task state, so the "
+        "invariant would pass vacuously on real drift"
+    )
+    missing = found - set(STATE_TO_ARCHIVE_PAGE.keys()) - set(WAIT_GROUPING.keys())
+    note = _provenance_note(real_pin, real_pin)
+    message = note + f"has {len(missing)} substantive Task state(s): {sorted(missing)}"
+    assert note == "", "versions match, so no qualifier should precede the drift text"
+    assert invented in message, (
+        "a genuine drift failure no longer names the offending state"
+    )
+
+
+def test_the_real_assertion_renders_the_qualifier_under_a_stale_install(
+    monkeypatch,
+) -> None:
+    """End-to-end, through the REAL assertion — not the helper in isolation.
+
+    Reproduces the measured 2026-08-28 condition: the working tree's Saturday SF
+    is unchanged and correct, but the installed lib is behind the pin and its
+    registry is missing a state the SF has. The rendered AssertionError must LEAD
+    with the version skew, because that is where the reader has to go.
+    """
+    label, json_path = _SF_JSON_FILES[0]
+    substantive = _all_substantive_states(json_path) - set(WAIT_GROUPING.keys())
+    assert substantive, "the Saturday SF walked to zero substantive states"
+    dropped = sorted(substantive)[0]
+
+    stale_registry = {k: v for k, v in STATE_TO_ARCHIVE_PAGE.items() if k != dropped}
+    monkeypatch.setattr(
+        "tests.test_pipeline_status_registry_source_check.STATE_TO_ARCHIVE_PAGE",
+        stale_registry,
+    )
+    monkeypatch.setattr(
+        "tests.test_pipeline_status_registry_source_check._installed_lib_version",
+        lambda: "v0.124.88",
+    )
+
+    with pytest.raises(AssertionError) as excinfo:
+        test_every_substantive_state_has_registry_entry(label, json_path)
+
+    rendered = str(excinfo.value)
+    assert rendered.startswith("READ THIS FIRST"), (
+        "under a stale install the failure still opens by accusing the SF "
+        f"definition:\n{rendered}"
+    )
+    assert "v0.124.88" in rendered, rendered
+    assert dropped in rendered, (
+        "the qualifier swallowed the underlying finding — it must ADD context, "
+        f"never replace it:\n{rendered}"
+    )
+
+
+def test_the_real_assertion_accuses_the_sf_when_versions_match(monkeypatch) -> None:
+    """And the inverse: with the clocks in lockstep, a genuine gap must produce
+    the original, correct accusation with no hedge in front of it."""
+    label, json_path = _SF_JSON_FILES[0]
+    substantive = _all_substantive_states(json_path) - set(WAIT_GROUPING.keys())
+    dropped = sorted(substantive)[0]
+
+    monkeypatch.setattr(
+        "tests.test_pipeline_status_registry_source_check.STATE_TO_ARCHIVE_PAGE",
+        {k: v for k, v in STATE_TO_ARCHIVE_PAGE.items() if k != dropped},
+    )
+    pinned = _pinned_lib_version((REPO_ROOT / "requirements.txt").read_text())
+    monkeypatch.setattr(
+        "tests.test_pipeline_status_registry_source_check._installed_lib_version",
+        lambda: pinned,
+    )
+
+    with pytest.raises(AssertionError) as excinfo:
+        test_every_substantive_state_has_registry_entry(label, json_path)
+
+    rendered = str(excinfo.value)
+    assert "READ THIS FIRST" not in rendered, (
+        f"a version qualifier appeared with the versions in lockstep:\n{rendered}"
+    )
+    assert dropped in rendered and "STATE_TO_ARCHIVE_PAGE" in rendered, rendered
