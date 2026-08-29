@@ -87,183 +87,49 @@ Two gaps this cannot see, named rather than left implicit:
     backstop for that is `crucible-dashboard`'s box-side
     `install_start_dependency_scan`, which reads merged systemd state on the box
     and is blind to no repo.
+
+WHERE THE PARSER LIVES
+----------------------
+`nousergon_lib.systemd_install_guard`, since 2026-08-28. This file was the
+SECOND of three copies cut the same day, and the second-adoption trigger had
+already fired when it was written; `alpha-engine-config-I9099` is the lift. The
+shell-noise and `reenable` fixes this copy carried are in the lifted version,
+along with one more of the same class none of the three had: a trailing
+`# comment` after a `systemctl` invocation had its words harvested as unit
+names.
+
+What stays HERE is what must not become a library allowlist: the paths, the
+presence assertions, this narrative, and the failure message that names this
+repo's fix.
 """
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import pytest
+from nousergon_lib.systemd_install_guard import (
+    load_units,
+    may_start,
+    scheduled_workloads,
+    start_closure,
+    started_units,
+    violations,
+)
 
 INFRA = Path(__file__).resolve().parents[1] / "infrastructure"
 SYSTEMD = INFRA / "systemd"
 
-# systemctl verbs that cause a unit to be ACTIVATED. `enable` alone and
-# `daemon-reload` do not, which is why they are absent.
-_START_RE = re.compile(
-    r"systemctl\s+(?P<flags>(?:--\S+\s+)*)"
-    r"(?P<verb>start|restart|enable|reenable|reload-or-restart|try-restart)\s+"
-    r"(?P<rest>[^\n;|&)]*)"
-)
-_DEP_KEYS = ("Requires", "Requisite", "BindsTo", "Wants")
-
-# `reenable` rewrites symlinks and does NOT activate; it is matched above only so
-# that a following `start` on the same unit is not the sole signal, and dropped
-# here.
-_INERT_VERBS = {"reenable"}
-
-
-def _sections(text: str) -> dict[str, list[str]]:
-    """Split a unit file into {section: [lines]}, ignoring comments."""
-    out: dict[str, list[str]] = {}
-    current = ""
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith(("#", ";")):
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            current = line[1:-1]
-            out.setdefault(current, [])
-            continue
-        out.setdefault(current, []).append(line)
-    return out
-
-
-def _directive(lines: list[str], key: str) -> list[str]:
-    vals: list[str] = []
-    for line in lines:
-        k, _, v = line.partition("=")
-        if k.strip() == key:
-            vals.extend(v.split())
-    return vals
-
-
-def _load_units() -> dict[str, dict[str, list[str]]]:
-    """Every unit this repo installs, with its drop-ins merged in."""
-    units: dict[str, dict[str, list[str]]] = {}
-    for path in sorted(SYSTEMD.glob("*")):
-        if path.is_dir() or path.suffix not in (".service", ".timer"):
-            continue
-        units[path.name] = _sections(path.read_text())
-    for dropin_dir in sorted(SYSTEMD.glob("*.service.d")):
-        target = units.setdefault(dropin_dir.name[: -len(".d")], {})
-        for conf in sorted(dropin_dir.glob("*.conf")):
-            for section, lines in _sections(conf.read_text()).items():
-                target.setdefault(section, []).extend(lines)
-    return units
-
-
-UNITS = _load_units()
-
-
-def _triggered_service(timer: str, sections: dict[str, list[str]]) -> str:
-    explicit = _directive(sections.get("Timer", []), "Unit")
-    if explicit:
-        return explicit[-1]
-    return timer[: -len(".timer")] + ".service"
-
-
-def _scheduled_workloads() -> set[str]:
-    """Type=oneshot services that a timer in this repo exists to trigger."""
-    out = set()
-    for name, sections in UNITS.items():
-        if not name.endswith(".timer"):
-            continue
-        target = _triggered_service(name, sections)
-        target_sections = UNITS.get(target)
-        if target_sections is None:
-            continue
-        if "oneshot" in _directive(target_sections.get("Service", []), "Type"):
-            out.add(target)
-    return out
-
-
-# Shell noise that is not a unit name. `>/dev/null` and the `2>` left behind when
-# `_START_RE` stops at the `&` of `2>&1` both survive a naive split, and
-# `crucible-dashboard` PR792's copy of this parser reports them as units named
-# `>/dev/null.service` and `2>.service`. They can never match a real unit, so
-# they change no verdict — but a guard whose output contains obvious garbage is
-# a guard nobody trusts the day it fires for real.
-_NOT_A_UNIT_NAME = set("<>&(){}[]!\\`")
-
-
-def _normalise(token: str) -> str | None:
-    token = token.strip().strip("\"'")
-    if not token or token.startswith("-") or "$" in token or "*" in token:
-        return None
-    if _NOT_A_UNIT_NAME & set(token):
-        return None
-    if "." not in token.rsplit("/", 1)[-1]:
-        return token + ".service"
-    return token
-
-
-# A `systemctl` inside an `echo`/`printf`/`log` is operator guidance printed by
-# an installer ("Run now: sudo systemctl start x.service"), not something the
-# script does. Reading those as executions is how a guard cries wolf until it is
-# deleted — the same class as the 2026-08-27 scan that matched `ne-admin` inside
-# a YAML comment. Full-line comments are stripped in `_started_units`; only
-# FULL-line, because truncating at any `#` turns a false positive into a false
-# negative (`systemctl start x  # why` would stop being seen).
-_QUOTED_RE = re.compile(r"\b(echo|printf|log|say|cat)\b")
-
-
-def _started_units(script: Path) -> set[str]:
-    """Units the script activates, by source text."""
-    started: set[str] = set()
-    for line in script.read_text().splitlines():
-        if line.lstrip().startswith("#"):
-            continue
-        for match in _START_RE.finditer(line):
-            prefix = line[: match.start()]
-            if _QUOTED_RE.search(prefix):
-                continue
-            verb = match.group("verb")
-            if verb in _INERT_VERBS:
-                continue
-            flags = match.group("flags") or ""
-            rest = match.group("rest")
-            if verb == "enable" and "--now" not in flags and "--now" not in rest:
-                continue
-            for token in rest.split():
-                unit = _normalise(token)
-                if unit:
-                    started.add(unit)
-    return started
-
-
-def _start_closure(unit: str) -> set[str]:
-    """`unit` plus everything starting it pulls in, per this repo's units."""
-    seen: set[str] = set()
-    stack = [unit]
-    while stack:
-        current = stack.pop()
-        if current in seen:
-            continue
-        seen.add(current)
-        sections = UNITS.get(current)
-        if sections is None:
-            continue
-        for key in _DEP_KEYS:
-            for dep in _directive(sections.get("Unit", []), key):
-                if dep.endswith((".service", ".timer")) and dep not in seen:
-                    stack.append(dep)
-    return seen
+UNITS = load_units(SYSTEMD)
 
 
 def _install_paths() -> list[Path]:
     return sorted(INFRA.glob("install-*.sh"))
 
 
-def _may_start(unit: str) -> bool:
-    sections = UNITS.get(unit, {})
-    return "yes" in _directive(sections.get("Unit", []), "X-InstallMayStart")
-
-
 def test_the_repo_still_has_scheduled_workloads_to_protect():
     """Guard against the guard silently covering nothing."""
-    workloads = _scheduled_workloads()
+    workloads = scheduled_workloads(UNITS)
     assert "daily-news.service" in workloads, workloads
     assert "systemd-unit-drift-check.service" in workloads, workloads
     assert len(workloads) >= 3, workloads
@@ -274,8 +140,8 @@ def test_install_paths_are_parsed_at_all():
     paths = _install_paths()
     assert len(paths) >= 2, paths
     installer = INFRA / "install-daily-news.sh"
-    assert "daily-news.timer" in _started_units(installer)
-    assert "systemd-unit-drift-check.timer" in _started_units(installer)
+    assert "daily-news.timer" in started_units(installer)
+    assert "systemd-unit-drift-check.timer" in started_units(installer)
 
 
 def test_a_commented_out_systemctl_is_not_read_as_an_execution():
@@ -285,7 +151,7 @@ def test_a_commented_out_systemctl_is_not_read_as_an_execution():
     and `systemctl enable --now` without ever ..." in a full-line comment. A
     scanner that reads it as an execution path reports a unit named `without`.
     """
-    started = _started_units(INFRA / "install-metron-intraday.sh")
+    started = started_units(INFRA / "install-metron-intraday.sh")
     assert "without.service" not in started, started
     assert started == {
         "metron-intraday.timer",
@@ -295,13 +161,7 @@ def test_a_commented_out_systemctl_is_not_read_as_an_execution():
 
 @pytest.mark.parametrize("script", _install_paths(), ids=lambda p: p.name)
 def test_no_install_path_starts_a_scheduled_workload(script: Path):
-    workloads = _scheduled_workloads()
-    offenders: dict[str, set[str]] = {}
-    for unit in _started_units(script):
-        pulled = _start_closure(unit) & workloads
-        pulled = {u for u in pulled if not _may_start(u)}
-        if pulled:
-            offenders[unit] = pulled
+    offenders = violations(script, UNITS)
     assert not offenders, (
         f"{script.name} activates a scheduled workload off-schedule: "
         + "; ".join(
@@ -325,11 +185,11 @@ def test_every_install_may_start_declaration_is_still_exercised():
     than by allowlisting the start. The assertion exists so the FIRST
     declaration is held to the same bar `crucible-dashboard`'s three are.
     """
-    declared = {u for u in UNITS if _may_start(u)}
+    declared = {u for u in UNITS if may_start(u, UNITS)}
     started: set[str] = set()
     for script in _install_paths():
-        for unit in _started_units(script):
-            started |= _start_closure(unit)
+        for unit in started_units(script):
+            started |= start_closure(unit, UNITS)
     unused = declared - started
     assert not unused, (
         f"X-InstallMayStart=yes declared on {sorted(unused)} but no install path "
