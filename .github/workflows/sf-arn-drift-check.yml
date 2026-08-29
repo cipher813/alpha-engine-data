@@ -115,6 +115,8 @@ jobs:
       # Read-only; needs nothing beyond the events:DescribeRule +
       # scheduler:GetSchedule this role already holds.
       - name: Scheduled-automation pause still holds (live)
+        id: pause_check
+        continue-on-error: true
         run: python3 infrastructure/automation_pause.py --check
 
       # alpha-engine-config-I7056. The step above asks "is the pause intact".
@@ -138,6 +140,8 @@ jobs:
       # Read-only; needs nothing beyond the events:DescribeRule +
       # scheduler:GetSchedule this role already holds.
       - name: Overseer playbook arming (declared pause vs live, live)
+        id: arming_check
+        continue-on-error: true
         run: python3 infrastructure/overseer/arming.py --check
 
       # The record itself, on every run, so the verdict for all nine is
@@ -156,15 +160,23 @@ jobs:
       # operator-gated apply. (This step carried the first `if:` excluding the
       # PR path; the whole workflow now excludes it, so the guard is gone.)
       - name: Weekly exercise-cadence drift (manifest vs live SSM)
+        id: cadence_drift
+        continue-on-error: true
         run: python3 infrastructure/weekly_cadence_drift.py --check
 
       - name: EventBridge SF-ARN drift (codified vs live)
+        id: eventbridge_arn_drift
+        continue-on-error: true
         run: python3 infrastructure/eventbridge/check-drift.py
 
       - name: SF LoggingConfiguration drift (codified vs live)
+        id: sf_logging_drift
+        continue-on-error: true
         run: python3 infrastructure/step-functions/check-drift.py
 
       - name: SF lambda:invoke Lambda-existence check (codified vs live)
+        id: sf_lambda_existence
+        continue-on-error: true
         run: python3 infrastructure/step-functions/check-lambda-existence.py
 
       # The invariant here is "deployed truth == repo source", which only
@@ -176,6 +188,8 @@ jobs:
       # the PR path (alpha-engine-config-I6591). Fleet-wide runs also happen
       # on every merge via deploy-infrastructure.yml, right after the deploy.
       - name: SF definition drift (codified vs live vs S3-staged)
+        id: sf_definition_drift
+        continue-on-error: true
         run: python3 infrastructure/step-functions/check-definition-drift.py
 
       # alpha-engine-config-I5805. The out-of-band half of schedule coverage.
@@ -188,6 +202,8 @@ jobs:
       # --ignore-kind missing-in-aws) is deleted with the PR trigger: every
       # rule it covered is covered here unscoped, on merge and daily.
       - name: EventBridge Scheduler rule drift (fleet-wide, codified vs live)
+        id: scheduler_rule_drift
+        continue-on-error: true
         run: python3 infrastructure/scheduler/check-schedule-drift.py
 
       # alpha-engine-config-I6461: the manifest-vs-live leg check-schedule-
@@ -197,6 +213,8 @@ jobs:
       # call per manifest entry, which is why it belongs on merge and the
       # daily sweep rather than on every push of a branch.
       - name: schedule-manifest.json drift (fleet-wide, vs live AWS)
+        id: schedule_manifest_drift
+        continue-on-error: true
         run: python3 infrastructure/scheduler/check-manifest-drift.py --live
 
       # alpha-engine-config-I9045. Does the AWS trigger surface still say what
@@ -217,5 +235,84 @@ jobs:
       # the step immediately after the write. Every OTHER step here is on the
       # push trigger deliberately (see this file's header) and stays there.
       - name: Playbook trigger surface drift (playbooks.yaml vs live AWS)
+        id: trigger_surface_drift
+        continue-on-error: true
         if: github.event_name != 'push'
         run: python3 infrastructure/overseer/trigger_surface_drift.py
+
+      # ── THE GATE ────────────────────────────────────────────────────────────
+      # alpha-engine-config-I9121. Every check above is INDEPENDENT — a
+      # different codified source against a different live AWS surface — but
+      # they shared one job's fail-fast, so the FIRST failure skipped all the
+      # rest. Measured 2026-08-28 on run 33217483446: `--check` reported five
+      # stale alarm classifications and steps 6 and 8-15 never executed,
+      # including the unscoped `trigger_surface_drift.py` sweep that
+      # nousergon-data-PR1563 had wired in an hour earlier. That sweep has four
+      # real `marker-missing` findings live right now, and no run of this
+      # workflow has ever reported them: a workflow that is already red hides
+      # every finding behind the first one, and the reader cannot tell one
+      # failing check from ten.
+      #
+      # So each check now carries `continue-on-error: true` and an `id`, and
+      # this step is the single place the job's verdict is computed. The
+      # workflow stays exactly as red as before — no finding is downgraded —
+      # but every check runs on every trigger and the summary names all of
+      # them.
+      #
+      # `skipped` is NOT a failure: `Playbook trigger surface drift` carries a
+      # deliberate `if: github.event_name != 'push'` race removal, and a step
+      # excluded by its own `if:` has produced no verdict to fail on.
+      #
+      # tests/test_sf_arn_drift_check_gate.py asserts that EVERY step running a
+      # checker here is both tolerated and named in this gate — a step added
+      # later without an id would otherwise be un-gated and its failure would
+      # silently pass the job, which is a worse defect than the one this fixes.
+      - name: Drift-check gate (fail the job on any failed check above)
+        if: always()
+        env:
+          OUTCOMES: |
+            pause_check=${{ steps.pause_check.outcome }}
+            arming_check=${{ steps.arming_check.outcome }}
+            cadence_drift=${{ steps.cadence_drift.outcome }}
+            eventbridge_arn_drift=${{ steps.eventbridge_arn_drift.outcome }}
+            sf_logging_drift=${{ steps.sf_logging_drift.outcome }}
+            sf_lambda_existence=${{ steps.sf_lambda_existence.outcome }}
+            sf_definition_drift=${{ steps.sf_definition_drift.outcome }}
+            scheduler_rule_drift=${{ steps.scheduler_rule_drift.outcome }}
+            schedule_manifest_drift=${{ steps.schedule_manifest_drift.outcome }}
+            trigger_surface_drift=${{ steps.trigger_surface_drift.outcome }}
+        run: |
+          failed=0
+          echo "### Drift-check outcomes" >> "$GITHUB_STEP_SUMMARY"
+          while IFS='=' read -r name outcome; do
+            [ -n "$name" ] || continue
+            case "$outcome" in
+              success) mark='✓' ;;
+              skipped) mark='·' ;;
+              *)       mark='✗'; failed=1 ;;
+            esac
+            echo "  $mark $name = $outcome"
+            echo "- \`$mark\` \`$name\` = \`$outcome\`" >> "$GITHUB_STEP_SUMMARY"
+          done <<< "$OUTCOMES"
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::One or more drift checks failed — see the marks above. Every check ran; this job is red because at least one found drift."
+            exit 1
+          fi
+          echo "every drift check passed or was deliberately skipped"
+
+  # ── FAILURE ALERTING (alpha-engine-config-I9121) ─────────────────────────
+  # A failing SCHEDULED workflow posts no PR check, calls no reusable notifier
+  # and dispatches no agent, so it is indistinguishable from one that ran
+  # clean. Measured 2026-08-28: NONE of this repo's five scheduled workflows
+  # wired an alert path, and `pause-check-alert.yml` — a workflow whose entire
+  # purpose is to page on pause drift — had failed 33 of 33 runs with nothing
+  # anywhere saying so. The reusable notifier 31 other workflows in this repo
+  # already use is the fleet's answer (config#1128, deduped through Fleet CI
+  # Watch per config#2855); it is not called on a PR because the ref guard
+  # below only passes on the default branch, which is where a scheduled run
+  # always sits.
+  notify-main-failure:
+    needs: [drift-check]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit
