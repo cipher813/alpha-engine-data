@@ -37,6 +37,16 @@
 #   bash infrastructure/lambdas/weekly-freshness-spot-dispatcher/deploy.sh --bootstrap # operator-only: create/update the execution role + create the Lambda
 #   bash infrastructure/lambdas/weekly-freshness-spot-dispatcher/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
 #   bash infrastructure/lambdas/weekly-freshness-spot-dispatcher/deploy.sh --dry-run   # show actions, do not apply
+#
+# alpha-engine-config-I9048: iam-policy.json gained WriteStageCoverageVerdicts
+# (s3:PutObject on _stage_coverage/*) and PutStageCoverageMetric
+# (cloudwatch:PutMetricData, namespace-conditioned) in the same PR as this
+# comment. Deliberately NOT applied in-session before merge (the repo's usual
+# preference) because the issue's own timing constraint forbids this grant
+# landing on the live role before 2026-08-29 09:00 UTC (the Saturday weekly SF
+# run this role is invoked by). Run `--apply-iam` (AWS_PROFILE=ne-admin) once
+# that window has passed to make the grant live — the flagless CI auto-deploy
+# path above is code-only and will NOT apply it.
 
 set -euo pipefail
 

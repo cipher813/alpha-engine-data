@@ -89,6 +89,23 @@
       "Effect": "Allow",
       "Action": "sns:Publish",
       "Resource": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts"
+    },
+    {
+      "Sid": "WriteStageCoverageVerdicts",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/_stage_coverage/*"
+    },
+    {
+      "Sid": "PutStageCoverageMetric",
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": {
+        "StringLike": {
+          "cloudwatch:namespace": "AlphaEngine"
+        }
+      }
     }
   ]
 }
