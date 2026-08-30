@@ -88,6 +88,18 @@ entries:
       excluded by the doc-extension carve-out because the file is .json.
     expires: "2026-11-27"
     tracking: alpha-engine-config-I9295
+  - path: infrastructure/lambdas/eval-judge-spot-dispatcher/test_handler.py
+    pattern: "anthropic:base_url"
+    reason: >-
+      test_never_names_a_model_a_provider_or_a_direct_endpoint asserts the
+      spot-box bootstrap command NEVER contains "api.anthropic.com" (nor
+      anthropic_api_key, openrouter, claude-, gpt-, litellm_master_key) —
+      a regression test for the literal's ABSENCE that enforces the very
+      rule this guard enforces. Same negative-assertion shape as the
+      tests/test_no_secret_environ_reads.py entry below. Landed in #1593,
+      which raced #1587's allowlist and so was not in its finding set.
+    expires: "2027-02-27"
+    tracking: alpha-engine-config-I9295
   - path: tests/test_no_secret_environ_reads.py
     pattern: "anthropic:env_key"
     reason: >-
