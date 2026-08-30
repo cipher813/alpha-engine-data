@@ -136,6 +136,8 @@ class TestBootstrapCommand:
             "KREPIS_ROUTER_CREDENTIAL_SECRET=ROUTER_CONSUMER_RESEARCH",
             "KREPIS_APPCONFIG_APPLICATION=yq405wh",
             "KREPIS_APPCONFIG_CONFIG_PROFILE=llm-model-registry",
+            "KREPIS_COST_SINK_BUCKET=alpha-engine-research",
+            "KREPIS_COST_SINK_PREFIX=decision_artifacts/_cost_raw",
         ):
             assert line in cmd, f"missing from the env file heredoc: {line}"
 
