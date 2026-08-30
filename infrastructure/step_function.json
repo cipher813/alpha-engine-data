@@ -7319,6 +7319,7 @@
           "Comment": "Transient S3 fault coverage \u2014 mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
         }
       ],
+      "ResultPath": "$.completion_marker_result",
       "Next": "WriteCompletionMarkerCalendar"
     },
     "NotifyShellRunComplete": {

@@ -84,6 +84,11 @@ def test_marker_state_shape(weekly_states):
     # that genuinely cannot be written should surface as a real failure,
     # not be silently swallowed the way a non-fatal notify is.
     assert "Catch" not in st
+    assert st["ResultPath"] == "$.completion_marker_result", (
+        "WriteCompletionMarker must preserve state for WriteCompletionMarkerCalendar "
+        "(alpha-engine-config-I8809); without ResultPath the putObject output "
+        "replaces the input and $.calendar_date cannot resolve"
+    )
     (retry,) = st["Retry"]
     assert retry["ErrorEquals"] == ["States.ALL"]
     assert retry["MaxAttempts"] >= 2
