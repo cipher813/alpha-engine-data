@@ -110,6 +110,7 @@ from pathlib import Path
 # spec_from_file_location the way tests/test_weekly_sf_rerun.py does.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sf_rerun_common import (  # noqa: E402 — see sys.path insertion above
+    derive_calendar_date,
     derive_run_date,
     effective_run_date_of,
     entered_states,
@@ -1030,6 +1031,8 @@ class RerunPlan:
     run_date: str
     run_date_provenance: str
     original_input: dict
+    calendar_date: str = ""
+    calendar_date_provenance: str = ""
     completed: list = field(default_factory=list)   # stage names
     degraded: list = field(default_factory=list)    # stage names (re-run!)
     failed: list = field(default_factory=list)      # stage names
@@ -1110,6 +1113,8 @@ class RerunPlan:
             and k not in declared
         )
         out["run_date"] = self.run_date
+        if self.calendar_date:
+            out["calendar_date"] = self.calendar_date
         out["pipeline_role"] = EMITTED_ROLE
         out.update(declared)
         out.update(self.skip_flags)
@@ -1267,8 +1272,14 @@ def derive_plan(
     entered = entered_states(events)
     original_input = execution_input(events)
     run_date, provenance = derive_run_date(events, start_time)
-    plan = RerunPlan(run_date=run_date, run_date_provenance=provenance,
-                     original_input=original_input)
+    calendar_date, cal_provenance = derive_calendar_date(events, start_time)
+    plan = RerunPlan(
+        run_date=run_date,
+        run_date_provenance=provenance,
+        original_input=original_input,
+        calendar_date=calendar_date,
+        calendar_date_provenance=cal_provenance,
+    )
 
     links = [(label, entered_states(evs)) for label, evs in (prior_histories or [])]
     links.append((source_label, entered))
@@ -1683,10 +1694,49 @@ def refuse_fallback_run_date_without_acceptance(plan: "RerunPlan", accept: bool)
     )
 
 
-def check_predictor_skip_freshness(s3, run_date: str, skip_flags: dict) -> None:
+def _predictor_manifest_date(s3) -> str:
+    """HeadObject the live weights manifest; return LastModified DATE."""
+    try:
+        head = s3.head_object(Bucket=PREDICTOR_MANIFEST_BUCKET, Key=PREDICTOR_MANIFEST_KEY)
+    except Exception as exc:  # noqa: BLE001 — cannot PROVE freshness on any S3 error; fail loud, mirrors the SF's own Catch
+        raise SkipCoherenceError(
+            f"skip_predictor_training=true but HeadObject on "
+            f"s3://{PREDICTOR_MANIFEST_BUCKET}/{PREDICTOR_MANIFEST_KEY} "
+            f"failed ({exc!r}) — cannot verify weights freshness. Refusing "
+            "to emit a plan the SF's own ValidatePredictorSkipWeightsFresh "
+            "would also reject. Re-run WITHOUT skip_predictor_training, or "
+            "investigate the manifest."
+        ) from exc
+    last_modified = head["LastModified"]
+    if hasattr(last_modified, "astimezone"):
+        return last_modified.astimezone(timezone.utc).date().isoformat()
+    return str(last_modified).split("T", 1)[0]
+
+
+def coerce_calendar_date_for_predictor_skip(
+    s3, calendar_date: str, skip_flags: dict
+) -> tuple[str, str | None]:
+    """When skip_predictor_training, clamp calendar_date to manifest
+    LastModified if the derived execution day is later — the SF predicate
+    is manifest DATE >= calendar_date, and a recovery launched on a later
+    wall-clock day must not re-stamp a calendar_date the weights cannot satisfy."""
+    if not skip_flags.get("skip_predictor_training"):
+        return calendar_date, None
+    manifest_date = _predictor_manifest_date(s3)
+    if manifest_date < calendar_date:
+        return manifest_date, (
+            f"calendar_date clamped {calendar_date} -> {manifest_date} for "
+            f"skip_predictor_training (manifest LastModified is the latest "
+            f"provable weights date; SF CheckPredictorSkipWeightsFresh compares "
+            f"against calendar_date, not run_date — alpha-engine-config-I8809)"
+        )
+    return calendar_date, None
+
+
+def check_predictor_skip_freshness(s3, calendar_date: str, skip_flags: dict) -> None:
     """Mirror ValidatePredictorSkipWeightsFresh: if skip_predictor_training
     is set, HeadObject the live weights manifest and require its
-    LastModified DATE >= run_date (lexicographic YYYY-MM-DD compare, same as
+    LastModified DATE >= calendar_date (lexicographic YYYY-MM-DD compare, same as
     the SF's CheckPredictorSkipWeightsFresh Choice state). Raises
     SkipCoherenceError rather than emitting an input the SF will only reject
     after a dispatch is already spent.
@@ -1697,34 +1747,20 @@ def check_predictor_skip_freshness(s3, run_date: str, skip_flags: dict) -> None:
     """
     if not skip_flags.get("skip_predictor_training"):
         return
-    try:
-        head = s3.head_object(Bucket=PREDICTOR_MANIFEST_BUCKET, Key=PREDICTOR_MANIFEST_KEY)
-    except Exception as exc:  # noqa: BLE001 — cannot PROVE freshness on any S3 error; fail loud, mirrors the SF's own Catch
-        raise SkipCoherenceError(
-            f"skip_predictor_training=true but HeadObject on "
-            f"s3://{PREDICTOR_MANIFEST_BUCKET}/{PREDICTOR_MANIFEST_KEY} "
-            f"failed ({exc!r}) — cannot verify weights freshness for "
-            f"run_date {run_date}. Refusing to emit a plan the SF's own "
-            "ValidatePredictorSkipWeightsFresh would also reject. Re-run "
-            "WITHOUT skip_predictor_training, or investigate the manifest."
-        ) from exc
-    last_modified = head["LastModified"]
-    if hasattr(last_modified, "astimezone"):
-        manifest_date = last_modified.astimezone(timezone.utc).date().isoformat()
-    else:
-        manifest_date = str(last_modified).split("T", 1)[0]
-    if manifest_date < run_date:
+    manifest_date = _predictor_manifest_date(s3)
+    if manifest_date < calendar_date:
         raise SkipCoherenceError(
             f"skip_predictor_training=true but "
             f"s3://{PREDICTOR_MANIFEST_BUCKET}/{PREDICTOR_MANIFEST_KEY} "
-            f"LastModified date {manifest_date} < run_date {run_date} — no "
-            "completed predictor training for this run_date; refusing to "
+            f"LastModified date {manifest_date} < calendar_date {calendar_date} — no "
+            "completed predictor training for this cycle; refusing to "
             "launch onto stale weights (same predicate as the SF's own "
             "ValidatePredictorSkipWeightsFresh / PredictorSkipWeightsStale — "
             "checked here BEFORE a dispatch, not after one; "
             "alpha-engine-config-I7443). Either re-run WITHOUT "
-            "skip_predictor_training, or pass the ORIGINAL run_date "
-            "explicitly if this is a cross-UTC-midnight recovery rerun."
+            "skip_predictor_training, or pass an explicit calendar_date "
+            "at or before the manifest date if this is a cross-UTC-midnight "
+            "recovery rerun."
         )
 
 
@@ -1735,6 +1771,8 @@ def check_predictor_skip_freshness(s3, run_date: str, skip_flags: dict) -> None:
 def _print_plan(plan: RerunPlan, source_arn: str, source_status: str, name: str, sm_arn: str) -> None:
     print(f"source execution : {source_arn} ({source_status})")
     print(f"run_date         : {plan.run_date}  [{plan.run_date_provenance}]")
+    if plan.calendar_date:
+        print(f"calendar_date    : {plan.calendar_date}  [{plan.calendar_date_provenance}]")
     # alpha-engine-config-I8161: the chain, and which link witnessed what. A
     # derived skip set whose evidence cannot be named is indistinguishable from
     # an inherited flag, and auditability is the property that makes this
@@ -1861,7 +1899,12 @@ def main(argv: list | None = None) -> int:
     # sf-pipeline-policy §2.5. Checked ahead of the mutex inspection below so
     # a doomed plan never touches DynamoDB or prints a false "OK" mutex line.
     try:
-        check_predictor_skip_freshness(s3, plan.run_date, plan.skip_flags)
+        plan.calendar_date, clamp_note = coerce_calendar_date_for_predictor_skip(
+            s3, plan.calendar_date, plan.skip_flags
+        )
+        if clamp_note:
+            plan.notes.append(clamp_note)
+        check_predictor_skip_freshness(s3, plan.calendar_date, plan.skip_flags)
     except SkipCoherenceError as exc:
         _print_plan(plan, source_arn, source_status, name, args.state_machine_arn)
         raise SystemExit(f"\nFATAL (skip-coherence, alpha-engine-config-I7443): {exc}")

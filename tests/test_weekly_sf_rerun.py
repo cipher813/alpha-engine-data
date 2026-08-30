@@ -1025,6 +1025,20 @@ class TestRunDateCarriedAcrossUTCMidnight:
         assert run_date == "2026-08-28"
         assert "ApplyNormalizedRunDate" in provenance
 
+    def test_calendar_date_carried_from_initialize_input(self, mod):
+        events = _history(init_run_date="2026-08-29", normalized_run_date="2026-08-28")
+        late_start = datetime(2026, 8, 30, 10, 0, 0, tzinfo=timezone.utc)
+        calendar_date, provenance = mod.derive_calendar_date(events, late_start)
+        assert calendar_date == "2026-08-29"
+        assert "InitializeInput" in provenance or "ApplyNormalizedRunDate" in provenance
+
+    def test_rerun_input_emits_calendar_date(self, mod):
+        events = _history(init_run_date="2026-08-29", normalized_run_date="2026-08-28")
+        plan = mod.derive_plan(events, start_time=datetime(2026, 8, 30, 10, 0, 0, tzinfo=timezone.utc))
+        emitted = plan.rerun_input()
+        assert emitted["run_date"] == "2026-08-28"
+        assert emitted["calendar_date"] == "2026-08-29"
+
     def test_only_a_genuine_pre_workload_failure_falls_back_to_start_time(self, mod):
         """No explicit run_date, no InitializeInput output at all (the
         source never reached it) — the ONLY case where start_time is used,
@@ -1071,7 +1085,7 @@ class TestPredictorSkipFreshness:
     """check_predictor_skip_freshness mirrors the SF's own
     ValidatePredictorSkipWeightsFresh / CheckPredictorSkipWeightsFresh
     predicate (infrastructure/step_function.json): HeadObject the live
-    weights manifest and require LastModified's DATE >= run_date. Checked
+    weights manifest and require LastModified's DATE >= calendar_date. Checked
     here BEFORE any dispatch — alpha-engine-config-I7443."""
 
     class _FakeS3:
@@ -1099,9 +1113,9 @@ class TestPredictorSkipFreshness:
             s3, "2026-08-16", {"skip_predictor_training": True}
         )  # does not raise
 
-    def test_manifest_older_than_run_date_is_rejected(self, mod):
+    def test_manifest_older_than_calendar_date_is_rejected(self, mod):
         """The real 2026-08-15/16 incident shape: manifest last written
-        2026-08-15, skip claimed for run_date 2026-08-16."""
+        2026-08-15, skip claimed for calendar_date 2026-08-16."""
         s3 = self._FakeS3(
             last_modified=datetime(2026, 8, 15, 20, 0, 0, tzinfo=timezone.utc)
         )
@@ -1118,6 +1132,19 @@ class TestPredictorSkipFreshness:
             mod.check_predictor_skip_freshness(
                 s3, "2026-08-16", {"skip_predictor_training": True}
             )
+
+    def test_coerce_clamps_calendar_date_to_manifest(self, mod):
+        s3 = self._FakeS3(
+            last_modified=datetime(2026, 8, 28, 17, 46, 15, tzinfo=timezone.utc)
+        )
+        cal, note = mod.coerce_calendar_date_for_predictor_skip(
+            s3, "2026-08-29", {"skip_predictor_training": True}
+        )
+        assert cal == "2026-08-28"
+        assert note is not None
+        mod.check_predictor_skip_freshness(
+            s3, cal, {"skip_predictor_training": True}
+        )  # does not raise
 
 
 class TestCadenceDeclaredSkipsAreCarried:

@@ -107,6 +107,48 @@ def derive_run_date(events: list[dict], start_time: datetime | None) -> tuple[st
     )
 
 
+def derive_calendar_date(events: list[dict], start_time: datetime | None) -> tuple[str, str]:
+    """Return (calendar_date, provenance). Precedence: explicit input
+    calendar_date > ApplyNormalizedRunDate's preserved calendar_date >
+    InitializeInput's calendar_date (or its pre-normalizer run_date stamp) >
+    date(Execution start time).
+
+    The weekly SF's ``CheckPredictorSkipWeightsFresh`` compares the weights
+    manifest against ``$.calendar_date``, not ``$.run_date`` — a recovery
+    rerun must emit this field or ``InitializeInput`` re-stamps it from the
+    NEW execution's wall clock (alpha-engine-config-I8809).
+    """
+    orig = execution_input(events)
+    if isinstance(orig.get("calendar_date"), str) and orig["calendar_date"]:
+        return orig["calendar_date"], "explicit calendar_date in the failed execution's input"
+    normalized = apply_normalized_run_date_output(events)
+    if isinstance(normalized, dict) and isinstance(normalized.get("calendar_date"), str) and normalized["calendar_date"]:
+        return normalized["calendar_date"], "ApplyNormalizedRunDate merged output (immutable execution day)"
+    init = initialize_input_output(events)
+    if isinstance(init, dict):
+        if isinstance(init.get("calendar_date"), str) and init["calendar_date"]:
+            return init["calendar_date"], "InitializeInput merged output calendar_date"
+        if isinstance(init.get("run_date"), str) and init["run_date"]:
+            return init["run_date"], "InitializeInput merged output run_date (pre-normalizer calendar day)"
+    if isinstance(orig.get("run_date"), str) and orig["run_date"]:
+        return orig["run_date"], (
+            "explicit run_date in the failed execution's input"
+            " (calendar day when InitializeInput never exited)"
+        )
+    if start_time is not None:
+        cd = start_time.astimezone(timezone.utc).date().isoformat()
+        return cd, (
+            "FALLBACK: UTC date of the failed execution's start time"
+            " (InitializeInput never exited, or this SF has no"
+            " InitializeInput state — pre-workload failure)"
+        )
+    raise SystemExit(
+        "FATAL: cannot derive calendar_date — no explicit input calendar_date, "
+        "no ApplyNormalizedRunDate output, no InitializeInput output in history, "
+        "and no execution start time was supplied."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Role-gating verification against a live SF definition
 # ---------------------------------------------------------------------------
