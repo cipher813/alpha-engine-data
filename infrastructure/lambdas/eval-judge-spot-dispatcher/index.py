@@ -253,6 +253,20 @@ KREPIS_APPCONFIG_ENVIRONMENT = os.environ.get(
     "EVAL_JUDGE_SPOT_APPCONFIG_ENVIRONMENT", "production"
 )
 
+# ── Cost-sink addressing (config-I7179) ─────────────────────────────────────
+# krepis>=0.57.0 resolves the process-default sink from these two variables.
+# Lambdas get them from crucible-research/infrastructure/deploy.sh; the spot
+# box gets them through ENV_FILE because the judge run is a separate SSM shell.
+# Without them, `default_sink_from_env()` returns None, every judge call is
+# unpriced, and AggregateCosts names EvalJudgeProcess for a missing
+# `evaljudge-sync` producer (measured watch-rerun-2026-08-28-8/9, 2026-08-30).
+KREPIS_COST_SINK_BUCKET = os.environ.get(
+    "EVAL_JUDGE_SPOT_COST_SINK_BUCKET", "alpha-engine-research"
+)
+KREPIS_COST_SINK_PREFIX = os.environ.get(
+    "EVAL_JUDGE_SPOT_COST_SINK_PREFIX", "decision_artifacts/_cost_raw"
+)
+
 INSTANCE_TAG_NAME = "alpha-engine-eval-judge-spot"
 
 
@@ -324,6 +338,8 @@ KREPIS_ROUTER_CREDENTIAL_SECRET={KREPIS_ROUTER_CREDENTIAL_SECRET}
 KREPIS_APPCONFIG_APPLICATION={KREPIS_APPCONFIG_APPLICATION}
 KREPIS_APPCONFIG_CONFIG_PROFILE={KREPIS_APPCONFIG_CONFIG_PROFILE}
 KREPIS_APPCONFIG_ENVIRONMENT={KREPIS_APPCONFIG_ENVIRONMENT}
+KREPIS_COST_SINK_BUCKET={KREPIS_COST_SINK_BUCKET}
+KREPIS_COST_SINK_PREFIX={KREPIS_COST_SINK_PREFIX}
 AWS_REGION={REGION}
 AWS_DEFAULT_REGION={REGION}
 EVAL_JUDGE_ENV
