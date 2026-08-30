@@ -61,6 +61,19 @@ done
 # shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
 source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 
+# ----- Preflight handler unit tests (shared gate — config#2381) -------------
+# These tests existed beside index.py and this deploy.sh never ran them, so
+# the post-merge gate was absent for this lambda entirely (the config#2295
+# shape: ci.yml's own glob runner keeps it green PRE-merge, which is exactly
+# what makes the missing POST-merge gate invisible). No extra deps: this
+# lambda's tests stub boto3 in sys.modules, and the helper's contract is that
+# such a caller must NOT get boto3 installed alongside the stub.
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+# `boto3`: index.py imports it at module scope. Measured —
+# deploy-ssm-reachability-probe failed on main 2026-08-29T00:11 with
+# ModuleNotFoundError: No module named 'boto3'.
+run_handler_tests "${SCRIPT_DIR}" boto3
+
 PKG="$(mktemp -d)"
 trap 'rm -rf "${PKG}"' EXIT
 

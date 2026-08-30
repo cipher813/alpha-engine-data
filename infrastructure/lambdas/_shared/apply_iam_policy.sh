@@ -29,23 +29,160 @@
 # Expects the caller to already define `run()` (the $DRY_RUN-aware command
 # wrapper) and `$DRY_RUN`, exactly as every deploy.sh already does.
 #
-# Usage: apply_iam_policy <role_name> <policy_name> <policy_file> <trust_policy_json>
+# probe_role_presence <role_name> -> prints "present" | "absent" | "unknown"
+#
+# WHY THIS EXISTS (the four-permanently-red-deploys defect, 2026-08-28).
+#
+# The old existence check was:
+#
+#   if ! aws iam get-role --role-name "$r" ... >/dev/null 2>&1; then  # CREATE
+#
+# `2>&1` to /dev/null makes AccessDenied and NoSuchEntity the same observation,
+# and the `!` branch reads BOTH as "the role does not exist". The CI auto-deploy
+# identity `github-actions-lambda-deploy` holds `iam:GetRole` on exactly two
+# roles (alpha-engine-eventbridge-sfn-role, alpha-engine-step-functions-role)
+# and on NO lambda execution role — by design, per the single-writer rule. So
+# every code-only deploy that reached this helper probed a role it may not read,
+# was denied, concluded "absent", printed `Creating IAM role: <name>` and called
+# `aws iam create-role` — a grant it also does not hold and must not hold.
+#
+# A denied READ is not evidence of absence. Distinguishing the two is the whole
+# job here, and it is why the stderr is captured instead of discarded.
+probe_role_presence() {
+  local role_name="${1:?probe_role_presence: role name required}"
+  local err rc=0
+  err="$(aws iam get-role --role-name "${role_name}" \
+           --query 'Role.RoleName' --output text 2>&1 >/dev/null)" || rc=$?
+  if [ "${rc}" -eq 0 ]; then
+    echo present
+    return 0
+  fi
+  # Only an explicit NoSuchEntity proves absence. Everything else — AccessDenied,
+  # an expired token, a throttle, a network failure — is `unknown`.
+  if printf '%s' "${err}" | grep -qiE 'NoSuchEntity|cannot be found|does not exist'; then
+    echo absent
+    return 0
+  fi
+  echo unknown
+  return 0
+}
+
+# probe_role_policy_state <role_name> <policy_name> <policy_file>
+#   -> prints "same" | "different" | "absent" | "unknown"
+#
+# WHY THIS EXISTS (the SECOND instance of the I9045 conflation, measured in
+# nousergon-data run 33229043798 on 2026-08-29).
+#
+# PR1569 fixed `aws iam get-role`'s AccessDenied/NoSuchEntity conflation and
+# left the IDENTICAL conflation one screen below it, on `get-role-policy`:
+#
+#   if live_doc="$(aws iam get-role-policy ... 2>/dev/null)"; then ...
+#   else verdict="absent"   # <- a DENIED read, called "no policy yet"
+#
+# The CI identity cannot read a lambda execution role's inline policy either,
+# so every code-only deploy printed
+#
+#   no inline policy alpha-engine-overseer-dispatcher-policy on the role yet
+#   — first apply.
+#
+# about a policy that has existed since 2026-07-22. A read the identity is not
+# allowed to make is not evidence about the thing being read. Same rule as
+# probe_role_presence: only an explicit NoSuchEntity proves absence.
+probe_role_policy_state() {
+  local role_name="${1:?probe_role_policy_state: role name required}"
+  local policy_name="${2:?probe_role_policy_state: policy name required}"
+  local policy_file="${3:?probe_role_policy_state: policy file required}"
+  local live_doc err err_file rc=0
+  err_file="$(mktemp)"
+
+  live_doc="$(aws iam get-role-policy \
+      --role-name "${role_name}" \
+      --policy-name "${policy_name}" \
+      --query 'PolicyDocument' --output json 2>"${err_file}")" || rc=$?
+  err="$(cat "${err_file}" 2>/dev/null || true)"
+  rm -f "${err_file}"
+
+  if [ "${rc}" -ne 0 ]; then
+    if printf '%s' "${err}" | grep -qiE 'NoSuchEntity|cannot be found|does not exist'; then
+      echo absent
+    else
+      echo unknown
+    fi
+    return 0
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo unknown
+    return 0
+  fi
+  python3 -c '
+import json, sys
+try:
+    live = json.loads(sys.argv[1])
+    disk = json.load(open(sys.argv[2]))
+except Exception:
+    print("unknown"); raise SystemExit(0)
+# Key-order- and whitespace-insensitive: only the semantic document matters.
+print("same" if json.dumps(live, sort_keys=True) == json.dumps(disk, sort_keys=True)
+      else "different")
+' "${live_doc}" "${policy_file}" 2>/dev/null || echo unknown
+}
+
+# Usage: apply_iam_policy <role_name> <policy_name> <policy_file> <trust_policy_json> [may_create_role]
+#
+# `may_create_role` (default "true") governs the ROLE-CREATION half only. The
+# policy apply below runs either way. This is the OPERATOR path (--bootstrap /
+# --apply-iam); the code-only deploy path uses check_iam_policy_on_deploy and
+# never reaches this function. See probe_role_presence and
+# the may_create_role rail, which the 45 scripts queued onto this helper by
+# alpha-engine-config-I9207 will need as they migrate.
 apply_iam_policy() {
   local role_name="$1" policy_name="$2" policy_file="$3" trust_policy="$4"
+  local may_create_role="${5:-true}"
 
-  if ! aws iam get-role --role-name "${role_name}" --query 'Role.RoleName' --output text >/dev/null 2>&1; then
-    echo "  Creating IAM role: ${role_name}"
-    run aws iam create-role \
-      --role-name "${role_name}" \
-      --assume-role-policy-document "${trust_policy}" \
-      --query 'Role.RoleName' --output text
-    if ! $DRY_RUN; then
-      echo "  Waiting 10s for IAM role propagation..."
-      sleep 10
-    fi
-  else
-    echo "  IAM role exists: ${role_name}"
-  fi
+  local presence
+  presence="$(probe_role_presence "${role_name}")"
+  case "${presence}" in
+    present)
+      echo "  IAM role exists: ${role_name}"
+      ;;
+    absent)
+      if [ "${may_create_role}" != "true" ]; then
+        # alpha-engine-config-I9045 / the four-red-deploys defect. Creating a
+        # role is a BOOTSTRAP act, and the single-writer rule (infrastructure/
+        # iam/README.md) reserves it for an operator. The auto-apply-on-deploy
+        # path must never attempt it: it holds no iam:CreateRole by design, so
+        # the attempt can only ever fail, and failing here aborts a deploy
+        # whose CODE has already shipped.
+        echo "  IAM role ABSENT: ${role_name} — not creating it from this path." >&2
+        echo "  This is the code-only auto-apply path, which is deliberately not a" >&2
+        echo "  role creator (single-writer rule). Run this deploy.sh --bootstrap as" >&2
+        echo "  an operator to create it. Skipping the policy apply too: there is no" >&2
+        echo "  role to put it on." >&2
+        APPLY_IAM_POLICY_VERDICT="role-absent"
+        return 0
+      fi
+      echo "  Creating IAM role: ${role_name}"
+      run aws iam create-role \
+        --role-name "${role_name}" \
+        --assume-role-policy-document "${trust_policy}" \
+        --query 'Role.RoleName' --output text
+      if ! $DRY_RUN; then
+        echo "  Waiting 10s for IAM role propagation..."
+        sleep 10
+      fi
+      ;;
+    *)
+      # `unknown` — the probe was DENIED or failed for a reason that is not
+      # NoSuchEntity. It is NOT evidence of absence, and the old code treated
+      # it as exactly that (see probe_role_presence). Fall through to the
+      # policy apply, which is the call whose own success or AccessDenied is
+      # the real answer.
+      echo "  IAM role presence UNKNOWN for ${role_name} (the get-role probe was" >&2
+      echo "  denied or unreadable). Not creating anything on an unknown; the" >&2
+      echo "  policy apply below is the authoritative attempt." >&2
+      ;;
+  esac
 
   # Report whether this apply actually CHANGES anything
   # (alpha-engine-config-I7444).
@@ -64,28 +201,8 @@ apply_iam_policy() {
   # unfalsifiable "applied" into a statement with content. Best-effort by
   # design: if the read or the comparison cannot be done, say so and apply
   # anyway — a diagnostic must never be able to block the apply itself.
-  local live_doc="" verdict="unknown"
-  if live_doc="$(aws iam get-role-policy \
-        --role-name "${role_name}" \
-        --policy-name "${policy_name}" \
-        --query 'PolicyDocument' --output json 2>/dev/null)"; then
-    if command -v python3 >/dev/null 2>&1; then
-      verdict="$(python3 -c '
-import json, sys
-try:
-    live = json.loads(sys.argv[1])
-    disk = json.load(open(sys.argv[2]))
-except Exception:
-    print("unknown"); raise SystemExit(0)
-# Key-order- and whitespace-insensitive: only the semantic document matters.
-print("same" if json.dumps(live, sort_keys=True) == json.dumps(disk, sort_keys=True)
-      else "different")
-' "${live_doc}" "${policy_file}" 2>/dev/null || echo unknown)"
-    fi
-  else
-    # No inline policy of that name yet — a first apply is by definition a change.
-    verdict="absent"
-  fi
+  local verdict
+  verdict="$(probe_role_policy_state "${role_name}" "${policy_name}" "${policy_file}")"
 
   echo "  Applying inline policy: ${policy_name}"
   case "${verdict}" in
@@ -97,8 +214,8 @@ print("same" if json.dumps(live, sort_keys=True) == json.dumps(disk, sort_keys=T
       echo "  NOTE: THAT BRANCH (alpha-engine-config-I7444)." >&2
       ;;
     different) echo "  live policy DIFFERS from ${policy_file} — applying the change." ;;
-    absent)    echo "  no inline policy ${policy_name} on the role yet — first apply." ;;
-    *)         echo "  (could not compare live policy against ${policy_file}; applying anyway)" >&2 ;;
+    absent)    echo "  no inline policy ${policy_name} on the role yet (an explicit\n  NoSuchEntity, not a denied read) — first apply." ;;
+    *)         echo "  (live policy could not be READ from this identity; the comparison is\n  unknown, not absent. Applying anyway.)" >&2 ;;
   esac
 
   run aws iam put-role-policy \
@@ -109,95 +226,93 @@ print("same" if json.dumps(live, sort_keys=True) == json.dumps(disk, sort_keys=T
   APPLY_IAM_POLICY_VERDICT="${verdict}"
 }
 
-# apply_iam_policy_on_deploy — the "#4472 auto-apply on merge" call site.
+# check_iam_policy_on_deploy — the code-only deploy path's IAM surface.
 #
-# Same arguments as apply_iam_policy. Tolerates EXACTLY ONE failure: the
-# caller is an identity without iam:PutRolePolicy / iam:CreateRole. That is
-# the CI auto-deploy role by design (see the single-writer note above), and
-# check-drift.py is its backstop. EVERY OTHER failure is a broken applier and
-# exits non-zero, which aborts the deploy under the callers' `set -euo
-# pipefail`.
+# READ-ONLY BY CONSTRUCTION. It reports whether live IAM matches
+# iam-policy.json and names the operator command that fixes a mismatch. It
+# issues no IAM write of any kind, and the guard in
+# tests/test_iam_auto_apply_code_only_path.py executes it against a fake `aws`
+# that fails loudly on every IAM-mutating verb.
 #
-# WHY this exists (alpha-engine-config-I7338). The four #4472 call sites each
-# wrote their own tolerance inline:
+# WHY IT REPLACED apply_iam_policy_on_deploy (alpha-engine-config-I9045,
+# measured in run 33229043798 on 2026-08-29).
 #
-#   apply_iam_policy ... || echo "WARN: IAM auto-apply failed (expected in CI
-#                                 — role lacks iam:PutRolePolicy)"
+# The old function called `aws iam put-role-policy` on every merge-triggered
+# deploy and then classified the resulting AccessDenied as expected. That is
+# backwards. `github-actions-lambda-deploy` does not hold iam:PutRolePolicy and
+# must not — the single-writer rule (infrastructure/iam/README.md), adopted
+# after 4 IAM-clobber incidents in 2 months. Per identity-access-policy.md §4
+# the answer to a denied write is never to grant the permission; here it was
+# also not to keep making the call. So every merge emitted a CloudTrail
+# AccessDenied on iam:PutRolePolicy, and the log line that "explained" it was
+# indistinguishable from the same error raised for a different reason.
 #
-# That `||` swallowed every cause and asserted one. On 2026-08-14, running as
-# `ne-admin` — an identity that DOES hold iam:PutRolePolicy —
-# alert-drain-liveness-probe/deploy.sh printed:
+# It also mislabelled the state it reported: `get-role-policy` is denied to the
+# same identity, and the old code read that denial as "no inline policy on the
+# role yet — first apply", about a policy live since 2026-07-22. See
+# probe_role_policy_state.
 #
-#   deploy.sh: line 188: apply_iam_policy: command not found
-#   WARN: IAM auto-apply failed (expected in CI — role lacks iam:PutRolePolicy)
+# THE SEPARATION THIS RESTORES. `deploy.sh` flagless is CODE ONLY — the claim
+# every deploy-*.yml already makes in its own header. IAM mutation happens on
+# exactly two paths, both requiring an operator to state the intent with a
+# flag: `--bootstrap` (create) and `--apply-iam` (re-apply). A flag IS the
+# declaration of intent; an identity check would not be.
 #
-# It had never sourced this file. The WARN named a cause that could not have
-# been true, read as benign, and the auto-apply feature had therefore never
-# executed on that lambda since #4472 shipped — which is the content-drift
-# half of alpha-engine-config-I6299.
+# WHAT IS TRADED. #4472's auto-apply-on-merge is gone for a privileged operator
+# running deploy.sh flagless: they now get a loud DRIFT line plus the exact
+# command instead of a silent apply. Principle 3 (Automation) would prefer the
+# apply; principle 5 (Human authority) and the single-writer rule outrank it,
+# and check-drift.py — every PR and daily — remains the standing detector.
 #
-# Two properties close that class, and both depend on the tolerance living
-# HERE rather than at the call site:
-#
-#   1. A `command not found` (rc 127) reaches the classifier as an unmatched
-#      stderr string and is reported LOUDLY, not as a permission note.
-#   2. If a deploy.sh forgets to source this file at all, the call site has no
-#      `||` of its own, so `apply_iam_policy_on_deploy: command not found`
-#      aborts the deploy under `set -e` instead of printing a reassurance.
-#
-# tests/test_deploy_shell_functions_are_defined.py is the derived guard for
-# the sourcing itself, so a 35th deploy.sh cannot repeat this.
-apply_iam_policy_on_deploy() {
-  local role_name="${1:?apply_iam_policy_on_deploy: role name required}"
-  local policy_name="${2:?apply_iam_policy_on_deploy: policy name required}"
-  local policy_file="${3:?apply_iam_policy_on_deploy: policy file required}"
-  local trust_policy="${4:?apply_iam_policy_on_deploy: trust policy required}"
+# Usage: check_iam_policy_on_deploy <role_name> <policy_name> <policy_file>
+check_iam_policy_on_deploy() {
+  local role_name="${1:?check_iam_policy_on_deploy: role name required}"
+  local policy_name="${2:?check_iam_policy_on_deploy: policy name required}"
+  local policy_file="${3:?check_iam_policy_on_deploy: policy file required}"
 
-  # stderr is captured to a file rather than streamed through a process
-  # substitution: `tee` in a `>(...)` is not reaped by the `||`, so the
-  # classifier can race the flush and read an EMPTY stderr for a genuine
-  # AccessDenied. Captured stderr is replayed verbatim on both paths below,
-  # so nothing is hidden — only deferred to the end of the command.
-  local err_file rc=0 stderr_text
-  err_file="$(mktemp)"
+  # A missing iam-policy.json is a broken checkout, not a drift verdict. Fail
+  # loud: the callers run under `set -euo pipefail`.
+  if [ ! -r "${policy_file}" ]; then
+    echo "ERROR: check_iam_policy_on_deploy: policy file not readable: ${policy_file}" >&2
+    return 1
+  fi
 
-  apply_iam_policy "${role_name}" "${policy_name}" "${policy_file}" "${trust_policy}" \
-    2>"${err_file}" || rc=$?
-
-  stderr_text="$(cat "${err_file}" 2>/dev/null || true)"
-  rm -f "${err_file}"
-
-  if [ "${rc}" -eq 0 ]; then
-    if [ -n "${stderr_text}" ]; then
-      printf '%s\n' "${stderr_text}" >&2
-    fi
+  local presence state
+  presence="$(probe_role_presence "${role_name}")"
+  if [ "${presence}" = "absent" ]; then
+    # An explicit NoSuchEntity — the one observation that proves absence.
+    echo "IAM DRIFT: role ${role_name} does not exist." >&2
+    echo "IAM DRIFT: creating it is an operator act (single-writer rule). Run:" >&2
+    echo "IAM DRIFT:   bash ${0} --bootstrap" >&2
+    IAM_POLICY_CHECK_VERDICT="role-absent"
     return 0
   fi
 
-  # The ONLY tolerated cause. Matched against what the AWS CLI actually
-  # emits for a denied IAM write: an explicit `AccessDenied`/
-  # `AccessDeniedException` error code, the `is not authorized to perform`
-  # sentence, or an SCP/boundary explicit deny.
-  if printf '%s' "${stderr_text}" | grep -qiE \
-      'AccessDenied|is not authorized to perform|explicit deny|ExpiredToken|InvalidClientTokenId|UnrecognizedClientException'; then
-    echo "WARN: IAM auto-apply skipped — this caller lacks iam:PutRolePolicy/iam:CreateRole." >&2
-    echo "WARN: role=${role_name} policy=${policy_name}. This is expected for the CI" >&2
-    echo "WARN: auto-deploy OIDC role (single-writer rule). check-drift.py is the backstop;" >&2
-    echo "WARN: an operator must run this deploy.sh --apply-iam to land the change." >&2
-    return 0
-  fi
+  state="$(probe_role_policy_state "${role_name}" "${policy_name}" "${policy_file}")"
+  case "${state}" in
+    same)
+      echo "  IAM: live ${policy_name} matches ${policy_file} — no drift."
+      ;;
+    different)
+      echo "IAM DRIFT: live ${policy_name} DIFFERS from ${policy_file}." >&2
+      echo "IAM DRIFT: this deploy shipped CODE ONLY and did not change IAM. Run:" >&2
+      echo "IAM DRIFT:   bash ${0} --apply-iam" >&2
+      ;;
+    absent)
+      echo "IAM DRIFT: role ${role_name} carries no inline policy ${policy_name}" >&2
+      echo "IAM DRIFT: (an explicit NoSuchEntity, not a denied read). Run:" >&2
+      echo "IAM DRIFT:   bash ${0} --apply-iam" >&2
+      ;;
+    *)
+      # `unknown` — the read was denied. This is the CI identity's normal
+      # state and is NOT a claim that the policy is absent or in drift.
+      echo "  IAM: cannot verify ${policy_name} on ${role_name} from this identity" >&2
+      echo "  (the get-role-policy read was denied). Expected for the CI auto-deploy" >&2
+      echo "  OIDC role, which holds no IAM read or write on lambda execution roles" >&2
+      echo "  by design. check-drift.py (every PR + daily) is the standing detector." >&2
+      ;;
+  esac
 
-  # Anything else is a BROKEN APPLIER, not a permission boundary. Loud, and
-  # non-zero so `set -e` aborts the deploy rather than shipping code whose
-  # IAM policy silently did not move.
-  echo "ERROR: IAM auto-apply FAILED for role=${role_name} policy=${policy_name} (exit ${rc})." >&2
-  echo "ERROR: This is NOT the known CI permission boundary — the stderr below carries no" >&2
-  echo "ERROR: AccessDenied. The apply mechanism itself is broken; live IAM is now unknown" >&2
-  echo "ERROR: relative to ${policy_file}." >&2
-  if [ -n "${stderr_text}" ]; then
-    printf 'ERROR: --- captured stderr ---\n%s\nERROR: --- end stderr ---\n' "${stderr_text}" >&2
-  else
-    echo "ERROR: (the failing command produced no stderr — exit ${rc} alone)" >&2
-  fi
-  return "${rc}"
+  IAM_POLICY_CHECK_VERDICT="${state}"
+  return 0
 }

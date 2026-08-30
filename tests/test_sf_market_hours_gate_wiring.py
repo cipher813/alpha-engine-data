@@ -227,6 +227,28 @@ class TestGateTask:
 # ---------------------------------------------------------------------------
 
 
+def _through_normalizers(states: dict, name: str) -> str:
+    """Resolve a transition target past any pure-Pass normalizer in front of it.
+
+    alpha-engine-config#5950 inserted floors that sit between an edge and its
+    real destination, flooring the optional fields the destination dereferences.
+    A Pass has no Choices, so it cannot change WHICH destination is reached —
+    walking through it keeps these guards asserting the destination rather than
+    widening them to accept any Pass, which is how a wrong destination would get
+    in behind one.
+    """
+    seen = set()
+    while (
+        name in states
+        and states[name].get("Type") == "Pass"
+        and "Next" in states[name]
+        and name not in seen
+    ):
+        seen.add(name)
+        name = states[name]["Next"]
+    return name
+
+
 class TestChoiceRouting:
     @pytest.mark.parametrize("name", _BOTH)
     def test_a_closed_market_proceeds(self, defs, name):
@@ -357,9 +379,16 @@ class TestChoiceRouting:
 
     @pytest.mark.parametrize("name", _BOTH)
     def test_an_unrecognised_verdict_fails_closed(self, defs, name):
-        choice = defs[name]["States"]["MarketHoursGateChoice"]
+        # config#5950: on the EOD pipeline the Default now passes through
+        # NormalizeEODFailureContext, which floors $.error for HandleFailure —
+        # that Default was one of three edges reaching the failure reporter
+        # without setting the field it formats. Fails closed exactly as before.
+        states = defs[name]["States"]
+        choice = states["MarketHoursGateChoice"]
         for junk in ("proceed", "PROCEED ", "OK", "", "MAYBE"):
-            assert evaluate(choice, _payload(junk)) == "HandleFailure", junk
+            assert _through_normalizers(
+                states, evaluate(choice, _payload(junk))
+            ) == "HandleFailure", junk
 
     @pytest.mark.parametrize("name", _BOTH)
     def test_every_verdict_the_lambda_can_emit_is_routed(self, defs, name):

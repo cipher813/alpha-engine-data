@@ -110,6 +110,28 @@ class TestLambdaTarget:
 # ── Failure isolation ─────────────────────────────────────────────────────
 
 
+def _through_normalizers(states: dict, name: str) -> str:
+    """Resolve a transition target past any pure-Pass normalizer in front of it.
+
+    alpha-engine-config#5950 inserted floors that sit between an edge and its
+    real destination, flooring the optional fields the destination dereferences.
+    A Pass has no Choices, so it cannot change WHICH destination is reached —
+    walking through it keeps these guards asserting the destination rather than
+    widening them to accept any Pass, which is how a wrong destination would get
+    in behind one.
+    """
+    seen = set()
+    while (
+        name in states
+        and states[name].get("Type") == "Pass"
+        and "Next" in states[name]
+        and name not in seen
+    ):
+        seen.add(name)
+        name = states[name]["Next"]
+    return name
+
+
 class TestFailureIsolation:
     def test_catch_routes_through_the_degraded_flag(self, states):
         # Cost telemetry is observability — aggregator failure must NOT
@@ -223,7 +245,13 @@ class TestFailureIsolation:
             )
         ]
         assert len(matching) == 1
-        assert matching[0]["Next"] == "NotifyCompleteMultipleDegraded"
+        # config#5950: NormalizeMultipleDegradedContext floors the three
+        # presence-tested degradation fields the notifier dereferences — they
+        # could not go in InitializeInput without moving this very gate. Resolve
+        # through it so this still asserts the notifier, not merely a Pass.
+        assert _through_normalizers(
+            states, matching[0]["Next"]
+        ) == "NotifyCompleteMultipleDegraded"
         assert gate["Choices"][-1] is matching[0]
         assert gate["Default"] == "NotifyComplete"
         # The notifier's constant Message must name the flag it now covers —

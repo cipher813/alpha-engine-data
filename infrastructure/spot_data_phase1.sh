@@ -25,7 +25,30 @@ source "$SCRIPT_DIR/_spot_common.sh"
 _SPOT_NAME="${_SPOT_NAME:-data-phase1}"
 _SSM_SLUG="${_SSM_SLUG:-spot-data-phase1}"
 _PROCESS_NAME="${_PROCESS_NAME:-data-phase1}"
-MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-5400}"
+# alpha-engine-config-I7176 / -I9201 (2026-08-28): 5400 -> 6600, DERIVED from
+# the two most recent cold runs rather than estimated. Measured span from the
+# DataPhase1 StateEntered event to the last CheckDataPhase1Status entry, one
+# dispatch attempt each, no reissues:
+#
+#   2026-08-01  2388s (44%)   2026-08-15  4926s (91%)
+#   2026-08-08  2418s (45%)   2026-08-22  5018s (93%)
+#
+# The step is NOT growth. Until 2026-08-13 a daily "exercise cadence" ran the
+# whole weekly pipeline every weekday; its Friday pass wrote the same
+# data/{date}/.phases/*.json markers PhaseRegistry auto-skips on, so Saturday
+# skipped 7 of 10 phases (`PHASE_SKIP ... reason=auto_skip_marker_ok` in
+# _ssm_logs/data-weekly/2026-08-08/). Retiring that cadence (4159239d, Brian
+# ruling 2026-08-13) removed the incidental pre-warm, and 4926/5018s is
+# DataPhase1's true cold cost — `fundamentals` (~1020s), `universe_classification`
+# (~508s) and `short_interest` (~505s) are sequential per-ticker API loops over
+# 903 tickers and account for ~1900s of it.
+#
+# 6600 = 5018 x 1.31, inside the 10800s max_budget_seconds already declared in
+# infrastructure/sf_budgets.py. This buys margin against a known, stable cost;
+# it is NOT a threshold widened until a stale value passes. The real fix is to
+# batch those three loops against their providers' rate limits —
+# alpha-engine-config-I9201 — and this ceiling comes back down when it lands.
+MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-6600}"
 
 # ── Parse flags ──────────────────────────────────────────────────────────────
 MODE="run"

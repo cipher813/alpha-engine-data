@@ -176,6 +176,7 @@ from zoneinfo import ZoneInfo
 import boto3
 
 from nousergon_lib import alerts
+from nousergon_lib.pipeline_status.completion_marker import read_marker
 from nousergon_lib.trading_calendar import (
     is_trading_day,
     last_closed_trading_day,
@@ -195,8 +196,8 @@ from nousergon_lib.flow_doctor_fleet import PIPELINE_OBSERVER_TELEGRAM_TOPICS
 # ``main``), so this costs the Lambda no cold-start weight beyond the file.
 try:  # deployed layout: flat next to index.py in /var/task
     from weekly_sf_silence_deadman import (  # noqa: E402
-        GATE_NOOP_MAX_SECONDS,
         _is_gate_noop,
+        _is_weekly_gate_out,
         compute_expected_slots,
         evaluate,
         fetch_execution_records,
@@ -208,8 +209,8 @@ except ModuleNotFoundError:  # in-repo layout (pytest, ci.yml glob runner)
         0, str(Path(__file__).resolve().parents[3] / "scripts")
     )
     from weekly_sf_silence_deadman import (  # noqa: E402
-        GATE_NOOP_MAX_SECONDS,
         _is_gate_noop,
+        _is_weekly_gate_out,
         compute_expected_slots,
         evaluate,
         fetch_execution_records,
@@ -468,69 +469,94 @@ def _role_clause(role_filter: Optional[frozenset]) -> str:
     )
 
 
-def _pipeline_role(client: object, execution_arn: str) -> Optional[str]:
-    """``input.pipeline_role`` for one execution, or None when absent.
+@dataclass(frozen=True)
+class _ExecutionFacts:
+    """Everything a status walk needs to classify ONE execution, read from a
+    SINGLE ``DescribeExecution``: its declared ``pipeline_role`` (input) and
+    whether the run-day gate itself declared the run a no-op (output).
 
-    ``ListExecutions`` does not return the execution input, so reading the
-    role costs one ``DescribeExecution`` per candidate. A malformed input
-    JSON yields None (the execution then does not count toward a
-    role-filtered check) — never a swallow: the caller's alert path is what
-    surfaces it, and a cadence run that lost its role IS the outage this
-    watchdog exists to catch.
+    One call, both facts — the same device
+    ``weekly_sf_silence_deadman.fetch_execution_records`` uses. Splitting
+    them would double this Lambda's DescribeExecution fan-out for no gain.
+    """
+
+    role: Optional[str]
+    is_gate_out: bool
+
+
+def _execution_facts(client: object, execution_arn: str) -> _ExecutionFacts:
+    """``input.pipeline_role`` and the run-day gate's own verdict for one
+    execution, off one ``DescribeExecution``.
+
+    ``ListExecutions`` returns neither the input nor the output, so both
+    facts cost one describe per candidate — the same one the role filter
+    already paid before alpha-engine-config-I8057/I8224/I9233.
+
+    **Role.** A malformed input JSON yields ``role=None`` (the execution then
+    does not count toward a role-filtered check) — never a swallow: the
+    caller's alert path is what surfaces it, and a cadence run that lost its
+    role IS the outage this watchdog exists to catch.
+
+    **Gate verdict.** ``is_gate_out`` is ``_is_weekly_gate_out`` applied to
+    the execution's own OUTPUT — imported from ``weekly_sf_silence_deadman``,
+    never restated here, so the two gate classifications in this one Lambda
+    cannot disagree about what a no-op is (the I6991/2026-08-16 failure
+    mode). It is a POSITIVE test only: it fires on
+    ``weekly_run_day_gate.Payload.is_weekly_run_day is False`` and never on
+    the key's absence, because a real run does not carry that key at all.
+
+    An output that is PRESENT but not parseable as JSON raises: that is the
+    state machine's own result contract broken, and a detector that shrugs
+    at it would silently reclassify every execution as a real run.
     """
     resp = client.describe_execution(executionArn=execution_arn)
-    raw = resp.get("input")
-    if not raw:
-        return None
-    try:
-        parsed = json.loads(raw)
-    except (TypeError, ValueError):
-        logger.warning(
-            "watchdog: unparseable execution input, role=None: %s", execution_arn
-        )
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    role = parsed.get("pipeline_role")
-    return role if isinstance(role, str) and role else None
+
+    role: Optional[str] = None
+    raw_input = resp.get("input")
+    if raw_input:
+        try:
+            parsed = json.loads(raw_input)
+        except (TypeError, ValueError):
+            logger.warning(
+                "watchdog: unparseable execution input, role=None: %s", execution_arn
+            )
+            parsed = None
+        if isinstance(parsed, dict):
+            candidate = parsed.get("pipeline_role")
+            role = candidate if isinstance(candidate, str) and candidate else None
+
+    is_gate_out = False
+    raw_output = resp.get("output")
+    if raw_output:
+        try:
+            output_json = json.loads(raw_output)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"pipeline-watchdog: {execution_arn} returned an output that is "
+                f"not JSON ({exc}) — the weekly SF's result contract is broken "
+                f"and the run-day-gate verdict cannot be read; this walk's "
+                f"counts are not trustworthy"
+            ) from exc
+        if isinstance(output_json, dict):
+            is_gate_out = _is_weekly_gate_out(output_json)
+
+    return _ExecutionFacts(role=role, is_gate_out=is_gate_out)
 
 
 # Pseudo-status for a SUCCEEDED execution that deliberately did no work.
 # It is NOT "SUCCEEDED" and it is NOT a failure — a third bucket, so no
 # caller can accidentally sum it into either (alpha-engine-config-I8045).
+#
+# ``ne-weekly-freshness-pipeline``'s cron fires THU-SAT and the gate
+# self-selects the single correct day; on the other two days the execution
+# terminates SUCCEEDED at ``WeeklyRunDaySkip`` having entered five states
+# and dispatched nothing. Which day that was is read from the gate's own
+# output verdict (``_execution_facts``), NOT from how long the execution
+# took: alpha-engine-config-I8057 measured the longest genuine gate-out at
+# 5.7s and the shortest execution that really ran at 12.6s, both inside the
+# 90s ceiling the previous ``_row_is_gate_noop`` duration heuristic used, so
+# that test could misread either direction and had no confirmation step.
 GATE_SKIP = "GATE_SKIP"
-
-
-def _row_is_gate_noop(exec_row: "dict", status_filter: str) -> bool:
-    """Is this ListExecutions row a run-day-gate no-op?
-
-    ``ne-weekly-freshness-pipeline``'s cron fires THU-SAT and the gate
-    self-selects the single correct day; on the other two days the execution
-    terminates SUCCEEDED in 2.7-5.7s at ``WeeklyRunDaySkip`` having entered
-    five states and dispatched nothing. Measured live 2026-08-21 across the
-    trailing 30 executions: EVERY scheduled SUCCEEDED run in that window was
-    one of these, and the liveness check below read them as a clear.
-
-    Uses ``GATE_NOOP_MAX_SECONDS`` — the SAME ceiling
-    ``weekly_sf_silence_deadman._is_gate_noop`` applies, imported rather than
-    restated, so the two checks in this one Lambda can never disagree about
-    what a no-op is (the I6991/2026-08-16 failure mode).
-
-    Costs no extra API call: ``ListExecutions`` already returns startDate and
-    stopDate. The stronger predicate — the DECLARED terminal state, which
-    also catches a SUCCEEDED-but-dispatched-nothing run of any duration — is
-    `nousergon_lib.pipeline_status.classify_work` (nousergon-lib-PR347); this
-    Lambda adopts it when it can take the pin.
-    """
-    if status_filter != "SUCCEEDED":
-        return False
-    start = exec_row.get("startDate")
-    stop = exec_row.get("stopDate")
-    if start is None or stop is None:
-        return False
-    if not hasattr(start, "astimezone") or not hasattr(stop, "astimezone"):
-        return False
-    return (stop - start).total_seconds() < GATE_NOOP_MAX_SECONDS
 
 
 def _status_counts_in_window(
@@ -612,27 +638,35 @@ def _status_counts_in_window(
                 )
                 if start_utc >= cutoff_utc:
                     bucket = status_filter
-                    if gate_noop_aware and _row_is_gate_noop(exec_row, status_filter):
-                        bucket = GATE_SKIP
-                    if role_filter is None:
-                        counts[bucket] = counts.get(bucket, 0) + 1
-                        continue
-                    described += 1
-                    if described > _MAX_ROLE_DESCRIBES:
-                        # Never silently truncate a coverage check: a
-                        # truncated walk that found nothing is
-                        # indistinguishable from a dead cron.
-                        raise RuntimeError(
-                            f"pipeline-watchdog: role-filtered walk for {sf_arn} "
-                            f"exceeded {_MAX_ROLE_DESCRIBES} DescribeExecution "
-                            f"calls in a {window_seconds}s window — the count "
-                            f"cannot be trusted; widen the cap or narrow the "
-                            f"window before this check is believed"
+                    # Both the role filter and the gate-out verdict live
+                    # inside the execution, not on the ListExecutions row —
+                    # so either one costs a describe, and ONE describe pays
+                    # for both (``_execution_facts``). The gate verdict is
+                    # asked only of SUCCEEDED executions: WeeklyRunDaySkip is
+                    # a SUCCEEDED terminal, and a FAILED/ABORTED run is never
+                    # a designed skip whatever its output says.
+                    wants_gate_verdict = gate_noop_aware and status_filter == "SUCCEEDED"
+                    if role_filter is not None or wants_gate_verdict:
+                        described += 1
+                        if described > _MAX_ROLE_DESCRIBES:
+                            # Never silently truncate a coverage check: a
+                            # truncated walk that found nothing is
+                            # indistinguishable from a dead cron.
+                            raise RuntimeError(
+                                f"pipeline-watchdog: describe-backed walk for {sf_arn} "
+                                f"exceeded {_MAX_ROLE_DESCRIBES} DescribeExecution "
+                                f"calls in a {window_seconds}s window — the count "
+                                f"cannot be trusted; widen the cap or narrow the "
+                                f"window before this check is believed"
+                            )
+                        facts = _execution_facts(
+                            client, exec_row.get("executionArn")
                         )
-                    if _pipeline_role(client, exec_row.get("executionArn")) in (
-                        role_filter
-                    ):
-                        counts[bucket] = counts.get(bucket, 0) + 1
+                        if wants_gate_verdict and facts.is_gate_out:
+                            bucket = GATE_SKIP
+                        if role_filter is not None and facts.role not in role_filter:
+                            continue
+                    counts[bucket] = counts.get(bucket, 0) + 1
                 else:
                     # Executions are returned newest-first; once we see one
                     # older than the cutoff we can stop paging this status.
@@ -776,11 +810,12 @@ def _check_sf(
         # one per detector that noticed it. Recorded loudly and carried on the
         # CheckResult so the absence is visible rather than inferred.
         logger.warning(
-            "watchdog: sf=%s saw %d execution(s) in the last %dh and EVERY one was "
-            "a run-day-gate no-op (<%ds, dispatched nothing). Not a clear: no real "
-            "run succeeded. The weekly-SF silence deadman owns the page for this "
-            "condition; this check reports ONLY_GATE_SKIPS.",
-            sf_label, seen, window_hours, GATE_NOOP_MAX_SECONDS,
+            "watchdog: sf=%s saw %d execution(s) in the last %dh and EVERY one "
+            "declared itself a run-day-gate no-op (is_weekly_run_day=false, "
+            "dispatched nothing). Not a clear: no real run succeeded. The "
+            "weekly-SF silence deadman owns the page for this condition; this "
+            "check reports ONLY_GATE_SKIPS.",
+            sf_label, seen, window_hours,
         )
         return CheckResult(
             sf_label=sf_label,
@@ -1280,31 +1315,41 @@ def _completion_marker_status(
     failure modes here (S3 errors other than NoSuchKey, unparseable JSON,
     missing status field) all route to the caller's alert path plus a
     WARNING log, never to a silent pass.
+
+    alpha-engine-config-I8217: every object under ``_sf_completion/`` is
+    written by a Step Functions ``States.Format`` body, so the S3 object is
+    a JSON string LITERAL containing the JSON object — one ``json.loads``
+    yields a ``str``, not a ``dict``. This function used to do exactly that
+    single decode and then guard with ``isinstance(marker, dict)``, which
+    was therefore ALWAYS FALSE: every read fell through to "no usable status
+    field" (UNREADABLE) regardless of what the marker actually said, for
+    every pipeline, every date, since the guard was written. Delegates to
+    ``nousergon_lib.pipeline_status.completion_marker.read_marker``, the
+    fleet's canonical marker reader (alpha-engine-config-I8154/I8186),
+    which unwraps the double-encoding and classifies NoSuchKey as absence
+    rather than failure — closing this file's independent, broken
+    reimplementation of the same fix ``crucible-predictor/monitoring/
+    drift_detector.py::_load_json_maybe_wrapped`` already carried.
     """
     key = f"_sf_completion/{pipeline_name}/{target_date.isoformat()}.json"
     try:
-        resp = s3_client.get_object(Bucket=MARKER_BUCKET, Key=key)
-        marker = json.loads(resp["Body"].read())
-        status = marker.get("status") if isinstance(marker, dict) else None
-        if isinstance(status, str) and status:
-            return status
-        logger.warning(
-            "failed-day check: marker s3://%s/%s has no usable status field",
-            MARKER_BUCKET, key,
-        )
-        return "UNREADABLE"
+        marker = read_marker(s3_client, bucket=MARKER_BUCKET, key=key)
     except Exception as exc:  # classified below — never a silent pass
-        code = ""
-        response = getattr(exc, "response", None)
-        if isinstance(response, dict):
-            code = (response.get("Error") or {}).get("Code", "")
-        if code in ("NoSuchKey", "404"):
-            return "ABSENT"
         logger.warning(
             "failed-day check: marker s3://%s/%s unreadable (%s: %s)",
             MARKER_BUCKET, key, type(exc).__name__, exc,
         )
         return "UNREADABLE"
+    if marker is None:
+        return "ABSENT"
+    status = marker.get("status") if isinstance(marker, dict) else None
+    if isinstance(status, str) and status:
+        return status
+    logger.warning(
+        "failed-day check: marker s3://%s/%s has no usable status field",
+        MARKER_BUCKET, key,
+    )
+    return "UNREADABLE"
 
 
 def _last_due_weekly_day(now_utc: datetime) -> Optional[date]:
@@ -1339,9 +1384,11 @@ def _weekly_real_statuses_for_day(client: object, target_date: date) -> "dict[st
     Reuses ``weekly_sf_silence_deadman.fetch_execution_records`` (role and
     run_date read from each execution's own input, never inferred from name —
     no launch path passes an explicit SF ``Name``) and ``_is_gate_noop``
-    (excludes a SUCCEEDED execution that finished in under
-    ``GATE_NOOP_MAX_SECONDS`` — ``WeeklyRunDayGateChoice``'s designed ~2s skip
-    on a THU/FRI cron firing that isn't the real cycle day). window_days=12
+    (excludes a SUCCEEDED execution whose own OUTPUT carries the gate's
+    ``is_weekly_run_day: false`` verdict — ``WeeklyRunDayGateChoice``'s
+    designed skip on a THU/FRI cron firing that isn't the real cycle day.
+    Never a duration test: alpha-engine-config-I8057 measured a 5.7s gate-out
+    and a 12.6s real run). window_days=12
     covers ``target_date`` even on the longest holiday-shortened weeks, plus
     the multi-day recovery tail below, while capping the
     ``describe_execution`` fan-out this makes.

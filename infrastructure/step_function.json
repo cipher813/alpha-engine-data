@@ -7,7 +7,7 @@
       "Type": "Pass",
       "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + ec2_instance_id explicitly; manual runs for partial-execution testing often omit sns_topic_arn, which previously caused HandleFailure/NotifyComplete to error on missing JSONPath. States.JsonMerge with user-input as the second arg lets explicit values win. | 2026-05-17: also stamps run_date = date($$.Execution.StartTime) so every spot stage of one execution keys backtest/{date}/ off ONE date (fixes the Backtester=05-17 vs Evaluator=05-18 UTC-midnight split). User-passed run_date still wins. | 2026-05-18 (shell-run keystone): also seeds the dry-path control vars at their NON-DRY identity values \u2014 preflight_args=\"\" (empty spot-command suffix), research_dry=false, data_phase2_dry=false, regime_action=\"produce\". These exist on EVERY run so the spot States.Format / Lambda Payload .$ references always resolve; on the real Saturday run (no shell_run) they hold these identity values, making every spot command string byte-identical to pre-keystone and every Lambda Payload behaviourally identical (handlers default dry_run_llm/dry_run to false; regime action 'produce' is the pre-keystone hardcoded value). ApplyShellRunDefaults (shell_run=true only) overrides them with the dry values. innermost defaults blob is merged UNDER run_date which is merged UNDER sns_topic_arn which is merged UNDER the user input, so user/ApplyShellRunDefaults values always win. PROVENANCE (config#2281): the sns_topic_arn default in the JsonMerge floor hand-carries the account/region literal (arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts) as a FLOOR ONLY \u2014 $$.Execution.Input wins the merge, so the authoritative source is the CALLER: the EventBridge schedule's Input (CFN alpha-engine-orchestration.yaml should pass sns_topic_arn via !Sub/!Ref so account/region live in ONE place \u2014 that Input change rides the CFN file in alpha-engine-config, not this repo) or an operator StartExecution payload. The floor is retained DELIBERATELY: a bare manual console start with no input must still alert instead of dying in HandleFailure on a missing $.sns_topic_arn. tests/test_sf_sns_arn_single_source.py pins that no publish state hardcodes a TopicArn and no NEW copy of the literal can ship outside the two declared floors (here + NormalizeFailureContext). | 2026-08-13 (alpha-engine-config-I7282, sf-pipeline-policy.md \u00a72.3a rule 3): the floor also seeds the four degraded-flag FAMILIES (gate_degraded / health_check_degraded / parity_degraded / research_predictor_degraded) at false, and both pre-spend gate probe results at {\"Payload\":{\"status\":\"UNKNOWN\"}}. Two reasons, and the second is the load-bearing one. (a) HAZARD: each family is written ONLY by its own degraded Pass state, so on the clean path it is ABSENT, not false \u2014 a bare $.gate_degraded reference in the ReportCard/Director Payload would raise States.Runtime on exactly the runs that are WORKING. Seeding is the same guarded-read convention SetLibPinGateDegradedSummary's Comment documents for stage_error, applied at the floor instead of by omission. (b) BOTH POLARITIES: \u00a72.3a requires the surface to state the verdict on a clean run too \u2014 a field that appears only on the bad path cannot be distinguished from a producer that broke. SAFE against the notifier: every Choice reading a family is And(IsPresent, BooleanEquals:true), so present-and-false selects exactly what absent selected (tests/test_sf_gate_state_wiring.py::test_seeding_does_not_change_the_degraded_notifier_selection pins that). The probe seeds carry status=UNKNOWN and deliberately NO has_drift/has_violation key \u2014 a gate that has not run is not a gate that found nothing (config-I7048/I7277); they are overwritten by the Task's own ResultPath the moment the gate actually runs, and survive only on the skip path and the Catch path, which is precisely when UNKNOWN is the true answer. | 2026-08-20 (alpha-engine-config-I7812): the floor also seeds scanner_resource_kill=false, for the same two reasons the I7282 degraded families are seeded here. (a) HAZARD: BranchAComplete/BranchAFailed hoist it via Parameters.$, which throws States.Runtime on any path that never set it \u2014 and it is set only by ScannerResourceKill, i.e. only on a Scanner resource kill. (b) BOTH POLARITIES (sf-pipeline-policy.md \u00a72.3a rule 3): a field that appears only on the bad path cannot be distinguished from a producer that broke. SAFE against the notifier: the one Choice that reads it (CheckScannerResourceKillReason) is And(IsPresent, BooleanEquals:true), so present-and-false selects exactly what absent selected. | 2026-08-27 (alpha-engine-config-I8809, Brian ruling: dual-write): the floor now stamps THREE date fields, not one. $.calendar_date is date($$.Execution.StartTime) and NEVER changes - it is the execution's own wall-clock day, the right key for anything asking 'when did this fire' (the run-day gate, the mutex slot, an artifact-LastModified freshness comparison). $.run_date starts EQUAL to it and is OVERWRITTEN by NormalizeRunDates with the cycle's TRADING day; it is the right key for anything asking 'which cycle is this' (every artifact prefix, every stage-coverage verdict). $.run_date_family names which of the two $.run_date currently holds, seeded 'calendar_date' here and set to 'trading_day' by NormalizeRunDates - BOTH POLARITIES (sf-pipeline-policy.md 2.3a rule 3): a field that appears only on the normalized path cannot be distinguished from a normalizer that broke. WHY: one weekly cycle was written across TWO S3 partitions - MEASURED on 2026-08-22, 28 _stage_coverage verdicts under 2026-08-21 and 11 under 2026-08-22, same cycle - because this state stamped the CALENDAR date and each consumer then decided for itself whether to normalize. crucible-backtester/infrastructure/_spot_common.sh normalizes; the nousergon-data launchers thread the un-normalized EXECUTION_RUN_DATE (config-I8155). weekly-coverage-sweep reads ONE partition, so its first production firing (2026-08-29) would have reported 28 stages absent.",
       "Parameters": {
-        "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"substrate_relaunch_attempts\":0,\"preflight_args\":\"\",\"skip_weekly_run_day_gate\":false,\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\",\"gate_degraded\":false,\"health_check_degraded\":false,\"parity_degraded\":false,\"research_predictor_degraded\":false,\"scanner_resource_kill\":false,\"libpin_drift_result\":{\"Payload\":{\"status\":\"UNKNOWN\",\"reason\":\"gate_did_not_run\"}},\"pipeline_contract_result\":{\"Payload\":{\"status\":\"UNKNOWN\",\"reason\":\"gate_did_not_run\"}}}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\",\"calendar_date\":\"{}\",\"run_date_family\":\"calendar_date\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0),States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
+        "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"substrate_relaunch_attempts\":0,\"preflight_args\":\"\",\"skip_weekly_run_day_gate\":false,\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\",\"gate_degraded\":false,\"health_check_degraded\":false,\"parity_degraded\":false,\"research_predictor_degraded\":false,\"scanner_resource_kill\":false,\"libpin_drift_result\":{\"Payload\":{\"status\":\"UNKNOWN\",\"reason\":\"gate_did_not_run\"}},\"pipeline_contract_result\":{\"Payload\":{\"status\":\"UNKNOWN\",\"reason\":\"gate_did_not_run\"}},\"mutex_ttl_epoch\":0,\"health_check_error\":{\"status\":\"not_set\"},\"health_check_poll\":{\"status\":\"not_set\"},\"substrate_check_error\":{\"status\":\"not_set\"},\"substrate_check_poll\":{\"status\":\"not_set\"},\"parity_error\":{\"status\":\"not_set\"},\"parity_poll\":{\"status\":\"not_set\"},\"parity_branch_outcomes\":{\"status\":\"not_set\"},\"parity_replay_poll\":{\"status\":\"not_set\"},\"pit_parity_lookahead_poll\":{\"status\":\"not_set\"},\"pit_parity_walkforward_poll\":{\"status\":\"not_set\"},\"pit_parity_compare_error\":{\"status\":\"not_set\"},\"pit_parity_compare_poll\":{\"status\":\"not_set\"},\"run_scope_result\":{\"Payload\":{\"degraded\":true,\"degraded_reason\":\"the RunScope stage did not run on this execution path\",\"stages\":{}}},\"report_card_error\":{\"status\":\"not_set\"},\"scanner_leaderboard_error\":{\"status\":\"not_set\"}}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\",\"calendar_date\":\"{}\",\"run_date_family\":\"calendar_date\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0),States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
       },
       "OutputPath": "$.merged",
       "Next": "CheckWeeklyRunDayGate"
@@ -44,7 +44,8 @@
         "FunctionName": "alpha-engine-predictor-inference:live",
         "Payload": {
           "action": "check_weekly_run_day",
-          "run_date.$": "$.run_date"
+          "run_date.$": "$.run_date",
+          "execution_arn.$": "$$.Execution.Id"
         }
       },
       "TimeoutSeconds": 60,
@@ -185,7 +186,8 @@
         "FunctionName": "alpha-engine-predictor-inference:live",
         "Payload": {
           "action": "check_lib_pin_drift",
-          "run_date.$": "$.run_date"
+          "run_date.$": "$.run_date",
+          "execution_arn.$": "$$.Execution.Id"
         }
       },
       "TimeoutSeconds": 60,
@@ -271,7 +273,8 @@
         "FunctionName": "alpha-engine-predictor-inference:live",
         "Payload": {
           "action": "check_pipeline_contract",
-          "run_date.$": "$.run_date"
+          "run_date.$": "$.run_date",
+          "execution_arn.$": "$$.Execution.Id"
         }
       },
       "TimeoutSeconds": 60,
@@ -437,7 +440,7 @@
           ],
           "Comment": "A Lambda-side crash means we cannot determine pass/fail. Fail-closed: a preflight that cannot check must NOT silently proceed (contrast the advisory gates that fail-open). Route through the normalizer so the failure names the error.",
           "ResultPath": "$.weekly_preflight_error",
-          "Next": "ExtractWeeklyPreflightError"
+          "Next": "ExtractWeeklyPreflightCrash"
         }
       ],
       "ResultPath": "$.weekly_preflight_result",
@@ -896,12 +899,12 @@
         "Parameters": {
           "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('export EXECUTION_RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug data-weekly --log /var/log/data-weekly.log -- bash infrastructure/spot_data_phase1.sh{}',$$.Execution.Name,$.preflight_args))",
           "executionTimeout": [
-            "5400"
+            "6600"
           ]
         },
-        "TimeoutSeconds": 5400
+        "TimeoutSeconds": 6600
       },
-      "TimeoutSeconds": 5460,
+      "TimeoutSeconds": 6660,
       "Retry": [
         {
           "ErrorEquals": [
@@ -1011,7 +1014,7 @@
             },
             {
               "Variable": "$.data_phase1_polls",
-              "NumericLessThan": 216
+              "NumericLessThan": 240
             }
           ],
           "Next": "DataPhase1Wait"
@@ -1294,7 +1297,8 @@
                 "FunctionName": "alpha-engine-predictor-regime-substrate:live",
                 "Payload": {
                   "action.$": "$.regime_action",
-                  "run_date.$": "$.run_date"
+                  "run_date.$": "$.run_date",
+                  "execution_arn.$": "$$.Execution.Id"
                 }
               },
               "TimeoutSeconds": 270,
@@ -1719,7 +1723,8 @@
                 "FunctionName": "alpha-engine-predictor-regime-retrospective-eval:live",
                 "Payload": {
                   "action.$": "$.regime_action",
-                  "run_date.$": "$.run_date"
+                  "run_date.$": "$.run_date",
+                  "execution_arn.$": "$$.Execution.Id"
                 }
               },
               "TimeoutSeconds": 570,
@@ -2051,7 +2056,7 @@
             },
             "EvalJudgeSubmitFirstSaturday": {
               "Type": "Task",
-              "Comment": "Submit phase, monthly Sonnet sweep \u2014 force_sonnet_pass=true. Builds the (artifact \u00d7 judge_model) batch payload covering both Haiku and Sonnet for every mapped artifact, submits as one Anthropic Message Batches API call, and writes the plan manifest to S3 keyed by batch_id. ROADMAP P1 \u00a71642. 50% cost discount per Anthropic's batch contract; structurally bypasses the 15-min Lambda timeout class that nearly fired on the 2026-05-06 manual midweek SF run.",
+              "Comment": "Submit phase, monthly Sonnet sweep \u2014 force_sonnet_pass=true. Builds the (artifact x judge_model) plan covering both tiers for every mapped artifact and writes the plan manifest to S3 keyed by batch_id. ROADMAP P1 \u00a71642. STAYS A LAMBDA under alpha-engine-config-I9329: its work is an S3 listing and a manifest write \u2014 seconds, no LLM call, no ceiling risk \u2014 and it is where the transport rung is resolved and the degradation record written. Moving it to the spot box would buy nothing and cost the stage identity ARTIFACT_REGISTRY and the cost fan-in key off. It no longer submits an Anthropic Message Batches call: the direct Anthropic API is retired (alpha-engine-config-I9263, Brian 2026-08-29), so the plan is judged synchronously through the krepis router by EvalJudgeProcess.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-eval-judge-submit:live",
@@ -2085,11 +2090,11 @@
                 }
               ],
               "ResultPath": "$.eval_judge_submit",
-              "Next": "EvalJudgePollChoice"
+              "Next": "EvalJudgeSubmitOutcome"
             },
             "EvalJudgeSubmitWeekly": {
               "Type": "Task",
-              "Comment": "Submit phase, weekly Haiku-only batch + Sonnet escalation tail in Process. Submits Haiku entries for every mapped artifact in one batch; the Process Lambda runs Sonnet escalations synchronously after Haiku results arrive (typically 1-3 artifacts/run, well under Process's 15-min budget). Preserves the per-artifact <3 escalation gate so weekly cost stays bounded relative to the all-pairs first-Saturday batch.",
+              "Comment": "Submit phase, weekly cadence. Plans one cheap-tier entry per mapped artifact; the escalation tail runs inside EvalJudgeProcess. STAYS A LAMBDA for the reasons on EvalJudgeSubmitFirstSaturday (alpha-engine-config-I9329).",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-eval-judge-submit:live",
@@ -2123,12 +2128,25 @@
                 }
               ],
               "ResultPath": "$.eval_judge_submit",
-              "Next": "EvalJudgePollChoice"
+              "Next": "EvalJudgeSubmitOutcome"
             },
-            "EvalJudgePollChoice": {
+            "EvalJudgeSubmitOutcome": {
               "Type": "Choice",
-              "Comment": "Branch on Submit's processing_status. EMPTY (no captures or all empty-input skipped client-side) \u2192 route directly to Process so the empty-batch case still emits a clean SF result + downstream metric inputs. OK \u2192 enter the Wait/Poll loop. Anything else (ERROR, missing fields) routes to EvalRollingMean as a fail-soft.",
+              "Comment": "Branch on Submit's outcome. Replaces EvalJudgePollChoice, which was deleted with the rest of the poll chain (alpha-engine-config-I9329) \u2014 but NOT its fail-soft Default, which is load-bearing and was earned: alpha-engine-config-I9058 records 2026-08-22, when EvalJudgeSubmitWeekly SUCCEEDED while returning status=ERROR in its payload, the chain skipped straight past Process, decision_artifacts/_eval/latest.json was never rewritten, and NOTHING in the run recorded a degradation; the only signal was a freshness row going stale five days later. That Default is preserved verbatim in meaning here. | ORDER MATTERS. The dry branch is FIRST: on the Friday shell run $.research_dry is true and Submit returns the EMPTY sentinel, and we still want the box to boot, import and probe S3 under --preflight-only \u2014 that is the whole point of the keystone, and it is the only path that exercises the new substrate before Saturday. | A REAL EMPTY plan routes to EvalJudgeEmptyPlan instead of to the spot, which is a DELIBERATE deviation from I9329's issue body ('EMPTY continues to route straight to EvalJudgeProcess'): that instruction was written for a Lambda Process that could emit a clean empty result for free. On a spot box the same routing would launch an instance to grade zero artifacts, and judge_spot_run refuses to run without a plan (exit 2), so it would also FAIL the stage. The Pass state emits the identical result shape at no cost. | ended_sync (alpha-engine-config-I9263) and OK both mean 'there is a plan to judge' now that no provider batch exists to poll.",
               "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.research_dry",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.research_dry",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "PrepareEvalJudgeSpotDispatch"
+                },
                 {
                   "And": [
                     {
@@ -2140,7 +2158,20 @@
                       "StringEquals": "EMPTY"
                     }
                   ],
-                  "Next": "EvalJudgeProcess"
+                  "Next": "EvalJudgeEmptyPlan"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.eval_judge_submit.Payload.processing_status",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.eval_judge_submit.Payload.processing_status",
+                      "StringEquals": "ended_sync"
+                    }
+                  ],
+                  "Next": "PrepareEvalJudgeSpotDispatch"
                 },
                 {
                   "And": [
@@ -2153,39 +2184,64 @@
                       "StringEquals": "OK"
                     }
                   ],
-                  "Comment": "config#2275: IsPresent-guarded so a submit payload WITHOUT status actually reaches the fail-soft Default this state's own comment promises ('missing fields routes to EvalRollingMean') instead of throwing States.Runtime.",
-                  "Next": "EvalJudgePollWait"
+                  "Next": "PrepareEvalJudgeSpotDispatch"
                 }
               ],
-              "Default": "EvalRollingMean"
+              "Default": "MarkEvalJudgeDegraded"
             },
-            "EvalJudgePollWait": {
-              "Type": "Wait",
-              "Comment": "60s pause between batch status polls. Anthropic's docs target sub-1h typical batch latency with 24h hard cap; 60s polls strike a balance between pickup latency and Lambda invocation cost over the typical wait.",
-              "Seconds": 60,
-              "Next": "EvalJudgePoll"
+            "EvalJudgeEmptyPlan": {
+              "Type": "Pass",
+              "Comment": "A plan with nothing in it is a legitimate, non-degraded outcome \u2014 no captures this cycle, or every capture skipped client-side. It is NOT a degradation, so it deliberately does not thread $.research_degraded_local: sf-pipeline-policy.md \u00a72.3a rule 3 wants both polarities SAID, and this says 'the judge ran and there was nothing to grade' rather than leaving the field absent. The result shape mirrors what the stage returns on the real path so EvalRollingMean and the Report Card read one contract.",
+              "Result": {
+                "status": "EMPTY",
+                "graded": 0,
+                "planned": 0,
+                "substrate": "none"
+              },
+              "ResultPath": "$.eval_judge_result",
+              "Next": "EvalRollingMean"
             },
-            "EvalJudgePoll": {
+            "PrepareEvalJudgeSpotDispatch": {
+              "Type": "Pass",
+              "Comment": "Seed the two fields the dispatch/relaunch loop reads, at their first-attempt identity values. Seeding rather than relying on absence is the alpha-engine-config-I7282 convention: $.eval_judge_spot_force_on_demand is referenced by DispatchEvalJudgeSpot's Payload with `.$`, which raises States.Runtime on any path that never set it \u2014 i.e. on exactly the runs that are WORKING \u2014 and a counter that appears only after a relaunch cannot be distinguished from a gate that never ran.",
+              "Parameters": {
+                "merged.$": "States.JsonMerge($,States.StringToJson('{\"eval_judge_spot_force_on_demand\":false,\"eval_judge_spot_relaunches\":0}'),false)"
+              },
+              "OutputPath": "$.merged",
+              "Next": "DispatchEvalJudgeSpot"
+            },
+            "DispatchEvalJudgeSpot": {
               "Type": "Task",
-              "Comment": "Poll phase. Calls anthropic.messages.batches.retrieve(batch_id) and returns processing_status + request_counts + elapsed_seconds. SF Choice that follows branches on processing_status: ended \u2192 Process; in_progress \u2192 loop back to Wait; exceeded_max_wait=true \u2192 fail-soft to EvalRollingMean.",
+              "Comment": "Launch the DEDICATED spot box EvalJudgeProcess runs on, and fire its async bootstrap (alpha-engine-config-I9329). Mirrors DispatchWeeklyFreshnessSpot exactly in shape \u2014 launch, return instance_id + command_id, let the SF poll the bootstrap to Success before any work is sent \u2014 because the Step Function must own the RUN: the judge's outcome is a coverage verdict, and the SSM ResponseCode the SF reads is the only signal that survives before anyone opens a log. | DEDICATED, not the shared launcher: this is NOT a sixth clone on weekly-freshness-spot-dispatcher. crucible-research is not on that box, its volume is sized for four shallow clones plus one venv, and a judge that filled that disk or OOM'd would take down the launcher every other stage in this pipeline addresses through $.ec2_instance_id. | FAIL-SOFT, like every state in this chain: eval is observability (ROADMAP \u00a71635) and must not halt the Saturday pipeline, so the Catch routes through MarkEvalJudgeDegraded. The Lambda itself is fail-LOUD and raises; the softness is here, once, where a reader can see it. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day; $.run_date is the cycle's trading day from NormalizeRunDates. It keys no artifact here \u2014 its only use is the box's `run-date` cost-attribution tag (config#5504) \u2014 but it must still be the trading day, because it is the SAME value EvalJudgeProcess passes to judge_spot_run as --date, and a launcher tagged with one date while the run it launched grades another puts the cycle's EC2 cost under a partition holding none of its evals.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
-                "FunctionName": "alpha-engine-research-eval-judge-poll:live",
+                "FunctionName": "alpha-engine-research-eval-judge-spot-dispatcher",
                 "Payload": {
-                  "batch_id.$": "$.eval_judge_submit.Payload.batch_id",
-                  "submit_iso.$": "$.eval_cadence.submit_iso",
-                  "max_wait_seconds": 21600,
-                  "dry_run_llm.$": "$.research_dry"
+                  "execution_id.$": "$$.Execution.Id",
+                  "run_date.$": "$.run_date",
+                  "pipeline_role": "weekly-eval-judge",
+                  "force_on_demand.$": "$.eval_judge_spot_force_on_demand"
                 }
               },
-              "TimeoutSeconds": 60,
+              "TimeoutSeconds": 540,
               "Retry": [
                 {
                   "ErrorEquals": [
                     "Lambda.ServiceException",
-                    "Lambda.TooManyRequestsException"
+                    "Lambda.TooManyRequestsException",
+                    "Lambda.SdkClientException"
                   ],
                   "MaxAttempts": 2,
+                  "IntervalSeconds": 15,
+                  "BackoffRate": 2.0
+                },
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed",
+                    "States.Timeout"
+                  ],
+                  "Comment": "The launch itself (spot capacity rotation, SSM-online wait) can transiently fail the way any other spot dispatch in this fleet does \u2014 one backed-off retry before the fail-soft Catch.",
+                  "MaxAttempts": 1,
                   "IntervalSeconds": 30,
                   "BackoffRate": 2.0
                 }
@@ -2195,95 +2251,62 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "A poll-level failure is recoverable \u2014 Anthropic retains batch results 29 days, so a transient poll Lambda failure can be re-run by a human if needed. Route through MarkEvalJudgeDegraded then EvalRollingMean so the rest of the pipeline isn't blocked. alpha-engine-config#6722.",
+                  "Comment": "alpha-engine-config#6722: routes through MarkEvalJudgeDegraded so the run RECORDS that the judge produced nothing, then continues to EvalRollingMean against historical data.",
                   "Next": "MarkEvalJudgeDegraded",
                   "ResultPath": "$.eval_judge_error"
                 }
               ],
-              "ResultPath": "$.eval_judge_poll",
-              "Next": "EvalJudgePollDecision"
-            },
-            "EvalJudgePollDecision": {
-              "Type": "Choice",
-              "Comment": "Branch on poll status. processing_status='ended' \u2192 run Process. exceeded_max_wait=true \u2192 fail-soft (batch results stay retrievable for 29 days; an operator can re-run the chain offline). Anything else \u2192 loop back to Wait. Includes the synthetic 'ended_empty' status (Submit short-circuited an empty plan) so the empty case still hits Process.",
-              "Choices": [
-                {
-                  "And": [
-                    {
-                      "Variable": "$.eval_judge_poll.Payload.processing_status",
-                      "IsPresent": true
-                    },
-                    {
-                      "Or": [
-                        {
-                          "Variable": "$.eval_judge_poll.Payload.processing_status",
-                          "StringEquals": "ended"
-                        },
-                        {
-                          "Variable": "$.eval_judge_poll.Payload.processing_status",
-                          "StringEquals": "ended_empty"
-                        }
-                      ]
-                    }
-                  ],
-                  "Next": "EvalJudgeProcess"
-                },
-                {
-                  "And": [
-                    {
-                      "Variable": "$.eval_judge_poll.Payload.exceeded_max_wait",
-                      "IsPresent": true
-                    },
-                    {
-                      "Variable": "$.eval_judge_poll.Payload.exceeded_max_wait",
-                      "BooleanEquals": true
-                    }
-                  ],
-                  "Next": "EvalRollingMean"
-                },
-                {
-                  "And": [
-                    {
-                      "Not": {
-                        "Variable": "$.eval_judge_poll.Payload.processing_status",
-                        "IsPresent": true
-                      }
-                    },
-                    {
-                      "Not": {
-                        "Variable": "$.eval_judge_poll.Payload.exceeded_max_wait",
-                        "IsPresent": true
-                      }
-                    }
-                  ],
-                  "Comment": "config#2275: a poll payload carrying NEITHER processing_status NOR exceeded_max_wait is malformed \u2014 fail-soft to EvalRollingMean (eval is observability; mirrors this state's Catch posture) instead of States.Runtime, and instead of looping in Wait until the global ceiling.",
-                  "Next": "EvalRollingMean"
-                }
-              ],
-              "Default": "EvalJudgePollWait"
-            },
-            "EvalJudgeProcess": {
-              "Type": "Task",
-              "Comment": "Process phase. Streams the completed batch's results, parses each via the existing RubricEvalLLMOutput schema, persists per-artifact eval JSONs to decision_artifacts/_eval/{date}/, emits CW metrics under AlphaEngine/Eval, and runs the small synchronous Sonnet-escalation tail for any Haiku result that flagged a borderline dimension. Returns OK/PARTIAL/ERROR mirroring the legacy single-Lambda contract \u2014 no consumer (RationaleClustering, EvalRollingMean, dashboard) changes.",
-              "Resource": "arn:aws:states:::lambda:invoke",
-              "Parameters": {
-                "FunctionName": "alpha-engine-research-eval-judge-process:live",
-                "Payload": {
-                  "batch_id.$": "$.eval_judge_submit.Payload.batch_id",
-                  "plan_s3_key.$": "$.eval_judge_submit.Payload.plan_s3_key",
-                  "dry_run_llm.$": "$.research_dry"
-                }
+              "ResultSelector": {
+                "instance_id.$": "$.Payload.instance_id",
+                "market.$": "$.Payload.market",
+                "command_id.$": "$.Payload.command_id",
+                "run_token.$": "$.Payload.run_token"
               },
-              "TimeoutSeconds": 960,
+              "ResultPath": "$.eval_judge_spot_result",
+              "Next": "MergeEvalJudgeSpotInstanceId"
+            },
+            "MergeEvalJudgeSpotInstanceId": {
+              "Type": "Pass",
+              "Comment": "Thread the launched instance into $.eval_judge_instance_id as a one-element ARRAY, because ssm:sendCommand's InstanceIds takes a list and getCommandInvocation's InstanceId takes a scalar \u2014 the same asymmetry $.ec2_instance_id carries. Deliberately a SEPARATE field from $.ec2_instance_id: that one is the shared weekly launcher, and writing over it here would silently repoint thirteen other stages at the judge box.",
+              "Parameters": {
+                "merged.$": "States.JsonMerge($, States.StringToJson(States.Format('\\{\"eval_judge_instance_id\":[\"{}\"]\\}', $.eval_judge_spot_result.instance_id)), false)"
+              },
+              "OutputPath": "$.merged",
+              "Next": "InitEvalJudgeSpotBootstrapPollCount"
+            },
+            "InitEvalJudgeSpotBootstrapPollCount": {
+              "Type": "Pass",
+              "Comment": "Poll-iteration budget seed. Cap=72 = ceil(1800s bootstrap executionTimeout / 30s wait) x 1.2 slack, matching the RAGIngestion/DataPhase2 precedent (alpha-engine-config-I5687).",
+              "Result": 0,
+              "ResultPath": "$.eval_judge_bootstrap_polls",
+              "Next": "WaitForEvalJudgeSpotBootstrap"
+            },
+            "WaitForEvalJudgeSpotBootstrap": {
+              "Type": "Task",
+              "Comment": "Poll the bootstrap SSM command until terminal. Nothing may be sent to the box before this reaches Success \u2014 the venv, the private prompts and the router env file do not exist until it does.",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+              "Parameters": {
+                "CommandId.$": "$.eval_judge_spot_result.command_id",
+                "InstanceId.$": "$.eval_judge_instance_id[0]"
+              },
               "Retry": [
                 {
                   "ErrorEquals": [
-                    "Lambda.ServiceException",
-                    "Lambda.TooManyRequestsException"
+                    "Ssm.InvocationDoesNotExistException",
+                    "Ssm.InvocationDoesNotExist"
                   ],
-                  "MaxAttempts": 1,
-                  "IntervalSeconds": 60,
-                  "BackoffRate": 1.0
+                  "MaxAttempts": 10,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 1.5
+                },
+                {
+                  "ErrorEquals": [
+                    "Ssm.SdkClientException",
+                    "States.Timeout"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 5,
+                  "BackoffRate": 1.5
                 }
               ],
               "Catch": [
@@ -2291,24 +2314,351 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Eval is observability \u2014 Process failures must NOT halt the pipeline. Routes through MarkEvalJudgeDegraded then EvalRollingMean, which still runs against historical data. alpha-engine-config#6722.",
                   "Next": "MarkEvalJudgeDegraded",
                   "ResultPath": "$.eval_judge_error"
                 }
               ],
-              "ResultPath": "$.eval_judge_result",
-              "Next": "EvalRollingMean"
+              "ResultSelector": {
+                "Status.$": "$.Status",
+                "ResponseCode.$": "$.ResponseCode",
+                "StatusDetails.$": "$.StatusDetails",
+                "StandardErrorContent.$": "$.StandardErrorContent"
+              },
+              "ResultPath": "$.eval_judge_bootstrap_poll",
+              "Next": "CheckEvalJudgeSpotBootstrapStatus"
+            },
+            "CheckEvalJudgeSpotBootstrapStatus": {
+              "Type": "Choice",
+              "Comment": "[poll budget cap=72 via $.eval_judge_bootstrap_polls; budget exhaustion falls through to the liveness-branched Default]",
+              "Choices": [
+                {
+                  "Variable": "$.eval_judge_bootstrap_poll.Status",
+                  "StringEquals": "Success",
+                  "Next": "EvalJudgeProcess"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.eval_judge_bootstrap_polls",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.eval_judge_bootstrap_poll.Status",
+                          "StringEquals": "InProgress"
+                        },
+                        {
+                          "Variable": "$.eval_judge_bootstrap_poll.Status",
+                          "StringEquals": "Pending"
+                        }
+                      ]
+                    },
+                    {
+                      "Variable": "$.eval_judge_bootstrap_polls",
+                      "NumericLessThan": 72
+                    }
+                  ],
+                  "Next": "EvalJudgeSpotBootstrapWait"
+                }
+              ],
+              "Default": "EvalJudgeSpotBootstrapLivenessGate"
+            },
+            "EvalJudgeSpotBootstrapWait": {
+              "Type": "Pass",
+              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget above actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
+              "Parameters": {
+                "polls.$": "States.MathAdd($.eval_judge_bootstrap_polls, 1)"
+              },
+              "ResultPath": "$.eval_judge_bootstrap_poll_count",
+              "Next": "EvalJudgeSpotBootstrapPollWait"
+            },
+            "EvalJudgeSpotBootstrapPollWait": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "MergeEvalJudgeSpotBootstrapPollCount"
+            },
+            "MergeEvalJudgeSpotBootstrapPollCount": {
+              "Type": "Pass",
+              "InputPath": "$.eval_judge_bootstrap_poll_count.polls",
+              "ResultPath": "$.eval_judge_bootstrap_polls",
+              "Next": "WaitForEvalJudgeSpotBootstrap"
+            },
+            "EvalJudgeSpotBootstrapLivenessGate": {
+              "Type": "Choice",
+              "Comment": "Liveness branch, mirroring RAGIngestionRetryGate (config#5688) with one inversion that matters. There the substrate is the SHARED launcher, so a relaunch would fix one symptom of a pipeline-wide loss and the gate fails fast. HERE the box is DEDICATED and EPHEMERAL, so a spot reclaim is a recoverable event with no blast radius outside this stage \u2014 and coverage is now a HARD failure (Brian, 2026-08-29), so losing the box must not lose the week's evals. SUBSTRATE LOST (StatusDetails Undeliverable/Terminated) with the relaunch unspent => launch a FRESH box. Anything else \u2014 a bootstrap that genuinely failed on a live instance, or an exhausted poll budget \u2014 is a provisioning defect that a second identical box would reproduce, so it goes to the degraded path rather than spending money twice to learn the same thing. | NAMED *LivenessGate, not *RetryGate, and the distinction is the contract not the spelling: a *RetryGate RE-ISSUES the same command to the SAME instance id, which config#5688 proved is a guaranteed no-op once the box is gone. This gate never re-issues. It either LAUNCHES A NEW BOX (the substrate was lost, and the box is dedicated and ephemeral, so a fresh one is the only thing that can help) or gives up. tests/test_sf_retrygate_liveness_branch.py enforces the re-issue contract on *RetryGate names and deliberately excludes this family.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.eval_judge_bootstrap_poll.StatusDetails",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.eval_judge_bootstrap_poll.StatusDetails",
+                          "StringEquals": "Undeliverable"
+                        },
+                        {
+                          "Variable": "$.eval_judge_bootstrap_poll.StatusDetails",
+                          "StringEquals": "Terminated"
+                        }
+                      ]
+                    },
+                    {
+                      "Variable": "$.eval_judge_spot_relaunches",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.eval_judge_spot_relaunches",
+                      "NumericLessThan": 1
+                    }
+                  ],
+                  "Next": "EvalJudgeSpotRelaunch"
+                }
+              ],
+              "Default": "ExtractEvalJudgeSpotBootstrapError"
+            },
+            "ExtractEvalJudgeSpotBootstrapError": {
+              "Type": "Pass",
+              "Comment": "Normalize a non-Success bootstrap poll into $.eval_judge_error. Mirrors ExtractRAGIngestionError: the soft-failure path out of a Choice Default does not populate an error field, only a Task Catch does, so without this the degraded notification would name no phase at all.",
+              "Parameters": {
+                "phase": "EvalJudgeSpotBootstrap",
+                "source": "CheckEvalJudgeSpotBootstrapStatus.Default",
+                "poll.$": "$.eval_judge_bootstrap_poll"
+              },
+              "ResultPath": "$.eval_judge_error",
+              "Next": "MarkEvalJudgeDegraded"
+            },
+            "EvalJudgeSpotRelaunch": {
+              "Type": "Pass",
+              "Comment": "Spend the ONE bounded relaunch and go back for a fresh box, ON DEMAND. force_on_demand=true because re-entering the pool that just reclaimed the box is how a recovery spends its single retry on the same failure (alpha-engine-config-I7119's reasoning, same shape). The judge is idempotent over the plan \u2014 every artifact is graded from the same manifest and persisted under the same key \u2014 so a relaunch re-grades rather than double-counts, and the coverage ledger is rebuilt from the plan on the new box.",
+              "Parameters": {
+                "merged.$": "States.JsonMerge($,States.StringToJson('{\"eval_judge_spot_force_on_demand\":true,\"eval_judge_spot_relaunches\":1}'),false)"
+              },
+              "OutputPath": "$.merged",
+              "Next": "DispatchEvalJudgeSpot"
+            },
+            "EvalJudgeProcess": {
+              "Type": "Task",
+              "Comment": "Process phase \u2014 the judge, run to completion on a dedicated EC2 spot box (alpha-engine-config-I9329, following -I9309). Brian, 2026-08-29: 'perhaps if the lambda times out then we need to put the judge on a spot instance', and 'ok lets keep 100% coverage and move to spot'. | WHAT WAS WRONG: this state ran as a Lambda under a 960s ceiling against a 900s function. At the measured 45-105s per synchronous judge call it covered roughly 8-15 of an ~83-artifact corpus, reported complete=False honestly, and returned SUCCESS \u2014 honest reporting on a successful stage, the anti-pattern Brian named on 2026-08-14 about the Director, because it makes a capacity regression survivable instead of visible. | THE NAME IS LOAD-BEARING and is why the substrate changed while the state did not: eval_artifact_latest.produced_by names EvalJudgeProcess, AggregateCosts.required_producers keys on it, and the stage-coverage registry has a row for it. All three statements stay true \u2014 the stage still produces exactly what they say it does. | COVERAGE IS A VERDICT: evals.judge_coverage.enforce_coverage compares planned against graded and raises on any gap; judge_spot_run exits 3, which fails the SSM command, which fails THIS STAGE. That is the intended and sufficient escalation \u2014 the STAGE fails, the RUN does not, because eval is observability (ROADMAP \u00a71635) and the Catch still converges on MarkEvalJudgeDegraded. | TIMEOUT ORDERING: executionTimeout (10800) must be STRICTLY BELOW TimeoutSeconds (10860) \u2014 the inverse of the lambda:invoke rule. Inverted, the state abandons a command SF cannot cancel, so the stage fails with a bare States.Timeout naming nothing while the spot keeps billing (alpha-engine-config-I6948, enforced by tests/test_sf_lambda_timeout_ordering.py). 10800s is budgeted from the MEASURED 83 artifacts x 45-105s = 60-145 min serial, with headroom for corpus growth; it is a budget, not an accommodation. | TEARDOWN: the EXIT trap arms a 120s systemd timer that powers the box off on EVERY exit path, success or failure. The delay is what lets SSM report the terminal status to this SF before the instance disappears \u2014 an immediate shutdown would race the ResponseCode this state reads. The dispatcher's watchdog and the fleet orphan-reaper remain the backstops; neither is on the happy path. | ROUTER: the box sources /home/ec2-user/eval-judge.env, written by the dispatcher, so KREPIS_EXEC_CONTEXT=ec2 and the ROUTER_CONSUMER_RESEARCH credential are present in THIS shell \u2014 a separate SSM command is a separate environment, and an export that lived only in the bootstrap would leave judge_exec_context() answering 'lambda' from a spot box. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day; $.run_date is the cycle's trading day from NormalizeRunDates, which is what every eval prefix and the stage-coverage verdict key off.",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+              "Parameters": {
+                "DocumentName": "AWS-RunShellScript",
+                "InstanceIds.$": "$.eval_judge_instance_id",
+                "Parameters": {
+                  "commands.$": "States.Array('set -eo pipefail','export HOME=/home/ec2-user','trap \"systemd-run --on-active=120 --unit=eval-judge-spot-teardown /sbin/shutdown -h now >/dev/null 2>&1 || true\" EXIT','set -a','. /home/ec2-user/eval-judge.env','set +a','cd /home/ec2-user/crucible-research',States.Format('/home/ec2-user/crucible-research/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug eval-judge --log /var/log/eval-judge.log -- /home/ec2-user/crucible-research/.venv/bin/python -m evals.judge_spot_run --date {} --batch-id {} --plan-s3-key {} --bucket alpha-engine-research{}',$$.Execution.Name,$.run_date,$.eval_judge_submit.Payload.batch_id,$.eval_judge_submit.Payload.plan_s3_key,$.preflight_args))",
+                  "executionTimeout": [
+                    "10800"
+                  ]
+                },
+                "TimeoutSeconds": 3600
+              },
+              "TimeoutSeconds": 10860,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed",
+                    "States.Timeout"
+                  ],
+                  "MaxAttempts": 4,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                },
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 2.0,
+                  "MaxDelaySeconds": 300,
+                  "JitterStrategy": "FULL"
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Eval is observability \u2014 a Process failure must NOT halt the pipeline. Routes through MarkEvalJudgeDegraded then EvalRollingMean, which still runs against historical data. alpha-engine-config#6722.",
+                  "Next": "MarkEvalJudgeDegraded",
+                  "ResultPath": "$.eval_judge_error"
+                }
+              ],
+              "ResultPath": "$.eval_judge_process_result",
+              "Next": "InitEvalJudgeProcessPollCount"
+            },
+            "InitEvalJudgeProcessPollCount": {
+              "Type": "Pass",
+              "Comment": "Poll-iteration budget seed. Cap=432 = ceil(10800s executionTimeout / 30s wait) x 1.2 slack, matching the RAGIngestion/DataPhase2 precedent (alpha-engine-config-I5687).",
+              "Result": 0,
+              "ResultPath": "$.eval_judge_process_polls",
+              "Next": "WaitForEvalJudgeProcess"
+            },
+            "WaitForEvalJudgeProcess": {
+              "Type": "Task",
+              "Comment": "Poll the judge's SSM command until terminal. ResponseCode 3 is judge_spot_run's coverage-shortfall exit, distinct from a crash \u2014 a crash is a defect in the judge, an under-covered sweep is capacity or an upstream producer, and they need different first moves.",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+              "Parameters": {
+                "CommandId.$": "$.eval_judge_process_result.Command.CommandId",
+                "InstanceId.$": "$.eval_judge_instance_id[0]"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Ssm.InvocationDoesNotExistException",
+                    "Ssm.InvocationDoesNotExist"
+                  ],
+                  "MaxAttempts": 10,
+                  "IntervalSeconds": 30,
+                  "BackoffRate": 1.5
+                },
+                {
+                  "ErrorEquals": [
+                    "Ssm.SdkClientException",
+                    "States.Timeout"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 5,
+                  "BackoffRate": 1.5
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "MarkEvalJudgeDegraded",
+                  "ResultPath": "$.eval_judge_error"
+                }
+              ],
+              "ResultSelector": {
+                "Status.$": "$.Status",
+                "ResponseCode.$": "$.ResponseCode",
+                "StatusDetails.$": "$.StatusDetails",
+                "StandardErrorContent.$": "$.StandardErrorContent"
+              },
+              "ResultPath": "$.eval_judge_process_poll",
+              "Next": "CheckEvalJudgeProcessStatus"
+            },
+            "CheckEvalJudgeProcessStatus": {
+              "Type": "Choice",
+              "Comment": "[poll budget cap=432 via $.eval_judge_process_polls; budget exhaustion falls through to the liveness-branched Default]",
+              "Choices": [
+                {
+                  "Variable": "$.eval_judge_process_poll.Status",
+                  "StringEquals": "Success",
+                  "Next": "EvalRollingMean"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.eval_judge_process_polls",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.eval_judge_process_poll.Status",
+                          "StringEquals": "InProgress"
+                        },
+                        {
+                          "Variable": "$.eval_judge_process_poll.Status",
+                          "StringEquals": "Pending"
+                        }
+                      ]
+                    },
+                    {
+                      "Variable": "$.eval_judge_process_polls",
+                      "NumericLessThan": 432
+                    }
+                  ],
+                  "Next": "EvalJudgeProcessWait"
+                }
+              ],
+              "Default": "EvalJudgeProcessLivenessGate"
+            },
+            "EvalJudgeProcessWait": {
+              "Type": "Pass",
+              "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget above actually advances.",
+              "Parameters": {
+                "polls.$": "States.MathAdd($.eval_judge_process_polls, 1)"
+              },
+              "ResultPath": "$.eval_judge_process_poll_count",
+              "Next": "EvalJudgeProcessPollWait"
+            },
+            "EvalJudgeProcessPollWait": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "MergeEvalJudgeProcessPollCount"
+            },
+            "MergeEvalJudgeProcessPollCount": {
+              "Type": "Pass",
+              "InputPath": "$.eval_judge_process_poll_count.polls",
+              "ResultPath": "$.eval_judge_process_polls",
+              "Next": "WaitForEvalJudgeProcess"
+            },
+            "EvalJudgeProcessLivenessGate": {
+              "Type": "Choice",
+              "Comment": "The reclaim gate, and the reason interruptible compute is safe here. A spot reclaim mid-run is the failure mode this substrate is MOST exposed to \u2014 the run is 60-145 minutes long \u2014 and coverage is a HARD failure, so a silent loss of the box would be a silent loss of the week's evals. SUBSTRATE LOST (StatusDetails Undeliverable/Terminated) with the relaunch unspent => launch a FRESH box on demand and re-run the plan from the start. That is safe because the run is IDEMPOTENT over the plan manifest: every artifact is graded from the same manifest and persisted under the same key, and the coverage ledger is rebuilt from the plan rather than accumulated across attempts. | A WORKLOAD failure is deliberately NOT retried: a coverage shortfall (ResponseCode 3) is a real, actionable verdict, and re-grading the same corpus on a second box would spend money to reproduce it. | NAMED *LivenessGate, not *RetryGate, and the distinction is the contract not the spelling: a *RetryGate RE-ISSUES the same command to the SAME instance id, which config#5688 proved is a guaranteed no-op once the box is gone. This gate never re-issues. It either LAUNCHES A NEW BOX (the substrate was lost, and the box is dedicated and ephemeral, so a fresh one is the only thing that can help) or gives up. tests/test_sf_retrygate_liveness_branch.py enforces the re-issue contract on *RetryGate names and deliberately excludes this family.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.eval_judge_process_poll.StatusDetails",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.eval_judge_process_poll.StatusDetails",
+                          "StringEquals": "Undeliverable"
+                        },
+                        {
+                          "Variable": "$.eval_judge_process_poll.StatusDetails",
+                          "StringEquals": "Terminated"
+                        }
+                      ]
+                    },
+                    {
+                      "Variable": "$.eval_judge_spot_relaunches",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.eval_judge_spot_relaunches",
+                      "NumericLessThan": 1
+                    }
+                  ],
+                  "Next": "EvalJudgeSpotRelaunch"
+                }
+              ],
+              "Default": "ExtractEvalJudgeProcessError"
+            },
+            "ExtractEvalJudgeProcessError": {
+              "Type": "Pass",
+              "Comment": "Normalize a non-Success judge poll into $.eval_judge_error so the degraded notification names the phase and carries the SSM StatusDetails/StandardErrorContent. A Choice Default populates no error field on its own.",
+              "Parameters": {
+                "phase": "EvalJudgeProcess",
+                "source": "CheckEvalJudgeProcessStatus.Default",
+                "poll.$": "$.eval_judge_process_poll"
+              },
+              "ResultPath": "$.eval_judge_error",
+              "Next": "MarkEvalJudgeDegraded"
             },
             "MarkEvalJudgeDegraded": {
               "Type": "Pass",
-              "Comment": "alpha-engine-config#6722: shared convergence for the eval-judge chain's four fail-open Catches (EvalJudgeSubmitFirstSaturday/EvalJudgeSubmitWeekly/EvalJudgePoll/EvalJudgeProcess all previously converged directly on EvalRollingMean with no degraded flag). Threads $.research_degraded_local=true without changing the continuation.",
+              "Comment": "alpha-engine-config#6722: shared convergence for every fail-open exit of the eval-judge chain \u2014 the two Submit Catches, the EvalJudgeSubmitOutcome Default (alpha-engine-config-I9058), the spot dispatch/bootstrap/process Catches and the two liveness gates' Defaults. Threads $.research_degraded_local=true without changing the continuation. Under alpha-engine-config-I9329 the set of arrivals grew from four to eight and now includes SUBSTRATE loss, which is why each arrival first passes through an Extract* state that names its phase: 'the box was reclaimed' and 'the judge under-covered the corpus' are different incidents and must not reach the notifier as one.",
               "Result": true,
               "ResultPath": "$.research_degraded_local",
               "Next": "EvalRollingMean"
             },
             "EvalRollingMean": {
               "Type": "Task",
-              "Comment": "Rolling-4-week-mean derived metric Lambda (PR 4b) \u2014 runs after both eval-judge branches converge. Reads AlphaEngine/Eval/agent_quality_score for the trailing 28 days, computes the mean per (judged_agent_id, criterion, judge_model) combo, and emits agent_quality_score_4w_mean which a CloudWatch alarm fires against (per ROADMAP \u00a71634). Runs every Saturday \u2014 even on weeks where eval-judge had infra failures, the mean across the prior 4 weeks of available data is still the most-current calibration signal.",
+              "Comment": "Rolling-4-week-mean derived metric Lambda (PR 4b) \u2014 runs after both eval-judge branches converge. Reads AlphaEngine/Eval/agent_quality_score for the trailing 28 days, computes the mean per (judged_agent_id, criterion, judge_model) combo, and emits agent_quality_score_4w_mean which a CloudWatch alarm fires against (per ROADMAP \u00a71634). Runs every Saturday \u2014 even on weeks where eval-judge had infra failures, the mean across the prior 4 weeks of available data is still the most-current calibration signal. | alpha-engine-config#9102 (2026-08-28): TimeoutSeconds 300 -> 960, a deliberate guard band ABOVE the function's own ceiling \u2014 the SECOND branch of the ordering rule, not an exception to it (see tests/test_sf_lambda_timeout_ordering.py::_SERVICE_MAX_GUARD_BAND and the identical posture on ReplayConcordance and EvalJudgeProcess, alpha-engine-config-I7181). alpha-engine-research-eval-rolling-mean moves to Lambda's 900s SERVICE MAXIMUM in the same arc (crucible-research infrastructure/deploy.sh) and its handler becomes SELF-DEADLINING: every secondary aggregation now runs under invocation_budget.run_bounded, so the stage returns its primary deliverable on its own budget whatever they do. A self-deadlining function's clock starts at INVOKE while the SF clock starts at SCHEDULE, earlier by dispatch plus a measured ~3.9s Init Duration, so an SF ceiling at or below the function's would pre-empt precisely the graceful return the handler learned to make. MEASURED root cause of the 2026-08-28 failure, from log stream 2026/08/28/[379]2195e7f6733c410eae3c42e205dc3e59: the handler emitted its rolling mean at 22:25:52.248 and logged control bands at 22:25:53.652, then produced nothing for 298s until the 300s wall. The next statement it reaches is scripts.build_agent_quality -> evals.judge_outcome_ic.open_research_db, which downloads the 356 MB s3://alpha-engine-research/research.db snapshot into a 512 MB function. The handler never returned; nothing held it open after it returned. An earlier revision of this comment blamed flow-doctor's notifier preflight \u2014 disproven by the same log group: on the healthy 2026-08-21 and 2026-08-22 runs END lands 1.3-1.5s after the last handler log line, not 20-35s, and flow-doctor initialises during the INIT phase (22:25:51.886, before START at 22:25:51.890).",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-eval-rolling-mean:live",
@@ -2316,7 +2666,7 @@
                   "end_time_iso.$": "$$.Execution.StartTime"
                 }
               },
-              "TimeoutSeconds": 300,
+              "TimeoutSeconds": 960,
               "Retry": [
                 {
                   "ErrorEquals": [
@@ -3179,12 +3529,13 @@
             },
             "ModelZooTrainMap": {
               "Type": "Map",
-              "Comment": "config#1083 PARALLEL fan-out, step 2: train one challenger PER spec id, each on its OWN memory-isolated spot, concurrently. MaxConcurrency 4 bounds in-flight spots. PER-ITERATION ERROR ISOLATION (the key robustness property): each iteration ends in a branch-local Pass terminal (TrainSpecOK / TrainSpecFailed, both End:true) recording status as DATA so an iteration NEVER throws; a single challenger crashing (OOM / KeyError / spot interruption) does NOT abort its siblings; selection proceeds with the survivors. ToleratedFailurePercentage 100 is a defense-in-depth backstop (iterations already self-terminate as success). ItemSelector threads ec2_instance_id + preflight_args + the per-item spec id into each iteration.",
+              "Comment": "config#1083 PARALLEL fan-out, step 2: train one challenger PER spec id, each on its OWN memory-isolated spot, concurrently. MaxConcurrency 4 bounds in-flight spots. PER-ITERATION ERROR ISOLATION (the key robustness property): each iteration ends in a branch-local Pass terminal (TrainSpecOK / TrainSpecFailed, both End:true) recording status as DATA so an iteration NEVER throws; a single challenger crashing (OOM / KeyError / spot interruption) does NOT abort its siblings; selection proceeds with the survivors. ToleratedFailurePercentage 100 is a defense-in-depth backstop (iterations already self-terminate as success). ItemSelector threads ec2_instance_id + preflight_args + the per-item spec id into each iteration. alpha-engine-config-I8809: PARTITION FAMILY = trading_day. The run_date passed into each item becomes EXECUTION_RUN_DATE for spot_train_spec_dispatch.sh, which answers 'which CYCLE is this spec training for' -- the artifact-prefix question -- not 'when did this fire'. It must therefore be the normalized trading_day from NormalizeRunDates, never the calendar date the Map happened to execute on. alpha-engine-config-I9077: this key was ABSENT until 2026-08-28. A Map's ItemProcessor resolves $. against the ITEM payload, so TrainSpecDispatch's $.run_date reference could not resolve and the stage raised States.Runtime -- caught by the Friday rehearsal friday-shell-2026-08-28-eod-2026-08-28-1787947216, latent since #1510 introduced EXECUTION_RUN_DATE at 2026-08-22 10:49 PT, AFTER that morning's weekly run. Guarded by tests/test_sf_map_item_selector_completeness.py.",
               "ItemsPath": "$.parsed_zoo.zoo_specs",
               "MaxConcurrency": 4,
               "ToleratedFailurePercentage": 100,
               "ItemSelector": {
                 "spec_id.$": "$$.Map.Item.Value",
+                "run_date.$": "$.run_date",
                 "ec2_instance_id.$": "$.ec2_instance_id",
                 "preflight_args.$": "$.preflight_args"
               },
@@ -6323,7 +6674,7 @@
     },
     "ReportCard": {
       "Type": "Task",
-      "Comment": "Evaluator Report Card v2 (Layer B, Option B) \u2014 builds s3://alpha-engine-research/evaluator/{date}/report_card.json from the persisted per-module artifacts (the 7-tile MetricRecord substrate the Director will consume). Runs here, after the Evaluator + substrate health checks, so it reads fresh grades. NON-FATAL: its own Catch routes to CheckShellRunNotify so an advisory grading failure never breaks the run that produced the real trading artifacts. PREFLIGHT-AWARE (ROADMAP L4504): dry_run.$=$.research_dry (the canonical shell-run-dry signal \u2014 false on the real Saturday run, true on the Friday-PM Preflight Pipeline). On the preflight the handler still exercises the full read+compute path (container boot, lib/numpy/pandas imports, S3-read IAM/transport, the tile compute) but does NOT persist the degenerate, mostly-N/A preflight card \u2014 mirrors how the other advisory Lambdas (eval-judge / rationale-clustering / replay-concordance / counterfactual) run dry rather than skip, per the shell-run keystone's 'dry-execute, don't skip' principle. | alpha-engine-config-I7282 (sf-pipeline-policy.md \u00a72.3a rule 3): the Payload now carries `gate_state` \u2014 the run's correctness-gate verdicts. Pre-fix this state received {date, dry_run(, snapshot)} and nothing else, so it rendered the week's numbers identically whether the pre-spend gates passed, failed, or never ran; \u00a72.3a rule 3 is explicit that a surface presenting the run's results without the verdict state is asserting a guarantee nobody established. It is not hypothetical: PipelineContractGate reads private-docs/PIPELINE_CONTRACT.yaml from raw.githubusercontent.com UNAUTHENTICATED and alpha-engine-config is PRIVATE, so the URL 404s and that gate has never measured anything on any run (config-I7281), while LibPinDriftCheck has been unmeasured since crucible-predictor#422 (config-I7171). Every field referenced here is seeded in InitializeInput's floor \u2014 see that state's Comment for the absent-on-the-clean-path hazard and why seeding is not optional. Contract: infrastructure/contracts/sf_gate_state.v1.schema.json (byte-identical copy at crucible-evaluator grading/contracts/, both pinned by sha256). Consumer: crucible-evaluator grading/pipeline_gates.py::read_gate_state. Wiring asserted by tests/test_sf_gate_state_wiring.py. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day - $.run_date is the cycle's trading day from NormalizeRunDates, and every artifact prefix and stage-coverage verdict this state produces keys off it. Downstream normalization with krepis.dates.resolve_trading_day is idempotent, so this is a no-op for consumers that already normalized and a convergence for those that did not.",
+      "Comment": "Evaluator Report Card v2 (Layer B, Option B) \u2014 builds s3://alpha-engine-research/evaluator/{date}/report_card.json from the persisted per-module artifacts (the 7-tile MetricRecord substrate the Director will consume). Runs here, after the Evaluator + substrate health checks, so it reads fresh grades. NON-FATAL: its own Catch routes to CheckShellRunNotify so an advisory grading failure never breaks the run that produced the real trading artifacts. PREFLIGHT-AWARE (ROADMAP L4504): dry_run.$=$.research_dry (the canonical shell-run-dry signal \u2014 false on the real Saturday run, true on the Friday-PM Preflight Pipeline). On the preflight the handler still exercises the full read+compute path (container boot, lib/numpy/pandas imports, S3-read IAM/transport, the tile compute) but does NOT persist the degenerate, mostly-N/A preflight card \u2014 mirrors how the other advisory Lambdas (eval-judge / rationale-clustering / replay-concordance / counterfactual) run dry rather than skip, per the shell-run keystone's 'dry-execute, don't skip' principle. | alpha-engine-config-I7282 (sf-pipeline-policy.md \u00a72.3a rule 3): the Payload now carries `gate_state` \u2014 the run's correctness-gate verdicts. Pre-fix this state received {date, dry_run(, snapshot)} and nothing else, so it rendered the week's numbers identically whether the pre-spend gates passed, failed, or never ran; \u00a72.3a rule 3 is explicit that a surface presenting the run's results without the verdict state is asserting a guarantee nobody established. It is not hypothetical: PipelineContractGate reads private-docs/PIPELINE_CONTRACT.yaml from raw.githubusercontent.com UNAUTHENTICATED and alpha-engine-config is PRIVATE, so the URL 404s and that gate has never measured anything on any run (config-I7281), while LibPinDriftCheck has been unmeasured since crucible-predictor#422 (config-I7171). Every field referenced here is seeded in InitializeInput's floor \u2014 see that state's Comment for the absent-on-the-clean-path hazard and why seeding is not optional. Contract: infrastructure/contracts/sf_gate_state.v1.schema.json (byte-identical copy at crucible-evaluator grading/contracts/, both pinned by sha256). Consumer: crucible-evaluator grading/pipeline_gates.py::read_gate_state. Wiring asserted by tests/test_sf_gate_state_wiring.py. | alpha-engine-config-I7392 (sf-pipeline-policy.md \u00a72.3a rules 2\u20133): the Payload also carries `run_scope`, the run's own scope from the RunScope Task immediately upstream, threaded from $.run_scope_result.Payload and seeded at the InitializeInput floor for the same absent-on-a-valid-path hazard the gate_state fields carry. Consumer: crucible-evaluator grading/artifacts.py::_read_run_scope (in-band first, backtest/{date}/run_scope.json as the S3 fallback). See the RunScope state's Comment for the rehearsal instance that made the artifact-only path a defect. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day - $.run_date is the cycle's trading day from NormalizeRunDates, and every artifact prefix and stage-coverage verdict this state produces keys off it. Downstream normalization with krepis.dates.resolve_trading_day is idempotent, so this is a no-op for consumers that already normalized and a convergence for those that did not.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-evaluator:live",
@@ -6331,6 +6682,7 @@
           "date.$": "$.run_date",
           "dry_run.$": "$.research_dry",
           "snapshot": true,
+          "run_scope.$": "$.run_scope_result.Payload",
           "gate_state": {
             "schema_version": 1,
             "gate_degraded.$": "$.gate_degraded",
@@ -6477,7 +6829,7 @@
                 "single-agent-quant"
               ],
               "EvalJudgeProcess": [
-                "evaljudge-batch"
+                "evaljudge-sync"
               ],
               "ReplayConcordance": [
                 "replay-concordance"
@@ -6488,7 +6840,7 @@
             },
             "conditional_producers": {
               "EvalJudgeProcess": [
-                "evaljudge-sync"
+                "evaljudge-batch"
               ],
               "Director": [
                 "director-retro-judge"
@@ -6602,7 +6954,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "NotifyCompleteMultipleDegraded"
+          "Next": "NormalizeMultipleDegradedContext"
         },
         {
           "And": [
@@ -6623,7 +6975,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "NotifyCompleteMultipleDegraded"
+          "Next": "NormalizeMultipleDegradedContext"
         },
         {
           "And": [
@@ -6644,7 +6996,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "NotifyCompleteMultipleDegraded"
+          "Next": "NormalizeMultipleDegradedContext"
         },
         {
           "And": [
@@ -6665,7 +7017,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "NotifyCompleteMultipleDegraded"
+          "Next": "NormalizeMultipleDegradedContext"
         },
         {
           "And": [
@@ -6686,7 +7038,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "NotifyCompleteMultipleDegraded"
+          "Next": "NormalizeMultipleDegradedContext"
         },
         {
           "And": [
@@ -6707,7 +7059,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "NotifyCompleteMultipleDegraded"
+          "Next": "NormalizeMultipleDegradedContext"
         },
         {
           "And": [
@@ -6808,7 +7160,7 @@
             }
           ],
           "Comment": "alpha-engine-config-I7194. The sixth flag family, and the second one folded into the generic combined notifier rather than given a per-combination Task of its own \u2014 the generalization config#2276's comment predicted and config#6722 already applied to research_predictor_degraded. LAST in the list on purpose, for the same reason the scanner-leaderboard rule above it is: a run that also degraded a gate, a health check, the parity verdict, the report card, the leaf or a Branch A fail-open matches one of the rules above and gets that (more consequential) notification. This rule exists so a run whose ONLY degradation is the cost aggregation cannot reach NotifyComplete's \"All steps completed successfully\" while terminating in DegradedRun \u2014 which is what it would have done from the top level, where the branch-local $.research_degraded_local hoist that used to carry it does not reach.",
-          "Next": "NotifyCompleteMultipleDegraded"
+          "Next": "NormalizeMultipleDegradedContext"
         }
       ],
       "Default": "NotifyComplete"
@@ -8928,7 +9280,7 @@
           "Next": "CheckShellRun"
         }
       ],
-      "Default": "SetSubstrateResumeUnknownPhaseError"
+      "Default": "NormalizeSubstrateResumeContext"
     },
     "SetSubstrateResumeUnknownPhaseError": {
       "Type": "Pass",
@@ -9023,7 +9375,7 @@
       "Next": "EvaluatorDirectorGateDegraded"
     },
     "RunScope": {
-      "Comment": "RunScope (alpha-engine-config-I7620) \u2014 derives THIS execution's own scope and writes backtest/{run_date}/run_scope.json: one row per gated stage, each DISABLED / ENABLED_COMPLETED / ENABLED_FAILED / NOT_REACHED, with the skip_* flag that decided it. WHY IT EXISTS: which stages a run actually dispatched has never been recorded anywhere a consumer could read, so the Director grades the week without knowing which producers were switched off. On 2026-08-14 it reported the DELIBERATE absence of pit_parity (skip_parity:true on the Saturday EventBridge target since 2026-08-13, a recorded ruling) as 'contamination UNKNOWN \u2014 the producer never ran this cycle' and withheld issue_filing + loop_verification on the strength of it. WHY DERIVED, NOT A REGISTRY: private-docs/ already carries thirteen registries; a fourteenth listing enabled stages would be a hand-kept COPY of a fact whose two authorities are this definition and this execution's history, and it would drift the first time a stage is added. One flag flip in the CFN preset therefore changes the pipeline, the artifact and the Director's purview together. PLACEMENT: immediately before CheckSkipReportCard, so every work stage is already in the history it reads; the three states after it (itself, ReportCard, Director) resolve from the execution input instead, and every row records which source decided it. NON-FATAL: its Catch routes to CheckSkipReportCard \u2014 an advisory scope artifact must never kill a run that produced real trading artifacts, and the handler's own fail-open path emits a scope whose every stage is NOT_REACHED, which grades NOTHING and so cannot be mistaken for a narrow-but-clean run. PREFLIGHT-AWARE: dry_run.$=$.research_dry \u2014 the Friday-PM shell run exercises the full describe+history+derive path and writes nothing. CONSUMER: crucible-evaluator reads the S3 artifact (not this Payload), so the two sides are not coupled through the SF payload shape. TIMEOUT: 45s, deliberately BELOW the Lambda's own 60s so the SF timeout is the one that binds (tests/test_sf_lambda_timeout_ordering.py) \u2014 a state whose ceiling never binds cannot be reasoned about from the definition. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day - $.run_date is the cycle's trading day from NormalizeRunDates, and every artifact prefix and stage-coverage verdict this state produces keys off it. Downstream normalization with krepis.dates.resolve_trading_day is idempotent, so this is a no-op for consumers that already normalized and a convergence for those that did not.",
+      "Comment": "RunScope (alpha-engine-config-I7620) \u2014 derives THIS execution's own scope and writes backtest/{run_date}/run_scope.json: one row per gated stage, each DISABLED / ENABLED_COMPLETED / ENABLED_FAILED / NOT_REACHED, with the skip_* flag that decided it. WHY IT EXISTS: which stages a run actually dispatched has never been recorded anywhere a consumer could read, so the Director grades the week without knowing which producers were switched off. On 2026-08-14 it reported the DELIBERATE absence of pit_parity (skip_parity:true on the Saturday EventBridge target since 2026-08-13, a recorded ruling) as 'contamination UNKNOWN \u2014 the producer never ran this cycle' and withheld issue_filing + loop_verification on the strength of it. WHY DERIVED, NOT A REGISTRY: private-docs/ already carries thirteen registries; a fourteenth listing enabled stages would be a hand-kept COPY of a fact whose two authorities are this definition and this execution's history, and it would drift the first time a stage is added. One flag flip in the CFN preset therefore changes the pipeline, the artifact and the Director's purview together. PLACEMENT: immediately before CheckSkipReportCard, so every work stage is already in the history it reads; the three states after it (itself, ReportCard, Director) resolve from the execution input instead, and every row records which source decided it. NON-FATAL: its Catch routes to CheckSkipReportCard \u2014 an advisory scope artifact must never kill a run that produced real trading artifacts, and the handler's own fail-open path emits a scope whose every stage is NOT_REACHED, which grades NOTHING and so cannot be mistaken for a narrow-but-clean run. PREFLIGHT-AWARE: dry_run.$=$.research_dry \u2014 the Friday-PM shell run exercises the full describe+history+derive path and writes nothing. CONSUMER: crucible-evaluator reads this state's OUTPUT IN-BAND \u2014 the ReportCard Task's Payload carries run_scope.$=$.run_scope_result.Payload \u2014 and falls back to the S3 artifact (alpha-engine-config-I7392, corrected 2026-08-29; it previously read the artifact ONLY). WHY THE ORDER WAS INVERTED: the artifact is the one delivery path a REHEARSAL is forbidden to use. This Lambda returns the derived scope and skips its put_object when dry_run is true, so on every Friday shell run the correct answer (Parity: DISABLED, CheckSkipParity took its skip branch) was derived, returned, and discarded on the way to its only consumer, and the card's contamination half resolved to UNKNOWN instead of NOT_IN_SCOPE. MEASURED: execution offcycle-shell-20260829-004717 (SUCCEEDED 2026-08-29T00:47:18Z\u201301:45:00Z) paged ERROR at 01:44Z with backtester=UNKNOWN, evaluator_stage=UNKNOWN, contamination=UNKNOWN \u2014 a rehearsal grading itself against artifacts it guarantees do not exist. The whole NOT_IN_SCOPE mechanism built for exactly this case (config-I7620) was defeated by the DELIVERY PATH, not by the logic. The two sides stay uncoupled on SHAPE: the payload key is the artifact body verbatim, and crucible-evaluator grading/artifacts.py::_read_run_scope accepts either source. SEEDED: $.run_scope_result carries a floor in InitializeInput (degraded=true, stages={}) \u2014 SetSubstrateHealthCheckDegradedSummary and this state's own Catch both reach CheckSkipReportCard WITHOUT this state's ResultPath being written, and an unseeded Payload.$ reference throws States.Runtime on exactly those paths. Wiring asserted by tests/test_run_scope_wiring.py. TIMEOUT: 45s, deliberately BELOW the Lambda's own 60s so the SF timeout is the one that binds (tests/test_sf_lambda_timeout_ordering.py) \u2014 a state whose ceiling never binds cannot be reasoned about from the definition. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day - $.run_date is the cycle's trading day from NormalizeRunDates, and every artifact prefix and stage-coverage verdict this state produces keys off it. Downstream normalization with krepis.dates.resolve_trading_day is idempotent, so this is a no-op for consumers that already normalized and a convergence for those that did not.",
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
@@ -9205,6 +9557,35 @@
           "ResultPath": "$.completion_marker_calendar_error"
         }
       ]
+    },
+    "ExtractWeeklyPreflightCrash": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config#5950. WeeklyPreflight's Catch fires when the INVOKE failed, so $.weekly_preflight_result was never written -- and the old Catch target, ExtractWeeklyPreflightError, dereferences $.weekly_preflight_result.Payload. Every crash of the preflight Lambda therefore died in States.Runtime inside the state meant to REPORT it, masking the real error. This terminal reads $.weekly_preflight_error, which is exactly what the Catch's own ResultPath writes.",
+      "Parameters": {
+        "phase": "WeeklyPreflight",
+        "source": "WeeklyPreflight.Catch",
+        "violation.$": "$.weekly_preflight_error"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "NormalizeMultipleDegradedContext": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config#5950. NotifyCompleteMultipleDegraded is reachable on seven CheckGateDegradedNotify edges, each set by a DIFFERENT degradation, while its Message dereferences every degradation's field at once. Any run degrading on one axis raised States.Runtime here instead of alerting. These three cannot be floored in InitializeInput -- CheckGateDegradedNotify and CheckResearchPredictorDegraded test them with IsPresent, so a default would move a gate. Flooring them AFTER the gate has decided cannot.",
+      "Parameters": {
+        "merged.$": "States.JsonMerge(States.StringToJson('{\"aggregate_costs_degraded\":false,\"branch_outcomes\":{\"status\":\"not_set\"},\"report_card_degraded\":false}'),$,false)"
+      },
+      "OutputPath": "$.merged",
+      "Next": "NotifyCompleteMultipleDegraded"
+    },
+    "NormalizeSubstrateResumeContext": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config#5950. ResumeAfterSubstrateRelaunch's Default is taken precisely when $.error.phase is ABSENT, and its target then dereferences $.error -- so the one path that exists to report an unrecognised resume phase could not run. $.error is presence-tested by this very Choice, so the floor goes on the Default edge, after the routing decision.",
+      "Parameters": {
+        "merged.$": "States.JsonMerge(States.StringToJson('{\"error\":{\"phase\":\"Unknown\",\"source\":\"ResumeAfterSubstrateRelaunch.Default\",\"detail\":\"no $.error was set on the path into the relaunch resume\"}}'),$,false)"
+      },
+      "OutputPath": "$.merged",
+      "Next": "SetSubstrateResumeUnknownPhaseError"
     }
   }
 }

@@ -49,6 +49,20 @@ done
 # shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
 source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 
+# ----- Preflight handler unit tests (shared gate — config#2381) -------------
+# These tests existed beside index.py and this deploy.sh never ran them, so
+# the post-merge gate was absent for this lambda entirely (the config#2295
+# shape: ci.yml's own glob runner keeps it green PRE-merge, which is exactly
+# what makes the missing POST-merge gate invisible). No extra deps: this
+# lambda's tests stub boto3 in sys.modules, and the helper's contract is that
+# such a caller must NOT get boto3 installed alongside the stub.
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+# `boto3`: test_handler.py imports it at module scope. Not yet observed red
+# only because this workflow has not fired since the gate was wired; caught
+# by executing the gate on a bare interpreter rather than a laptop that
+# already has boto3 (alpha-engine-config-I9114 sweep).
+run_handler_tests "${SCRIPT_DIR}" boto3
+
 # ----- 0. Validate handler syntax -------------------------------------------
 
 python3 -c "

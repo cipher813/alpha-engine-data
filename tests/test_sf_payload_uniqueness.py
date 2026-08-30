@@ -96,10 +96,10 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # in the Payload the handler substituted datetime.now(), which matches
     # $.run_date only while the stage runs on the same UTC day the execution
     # started.
-    "LibPinDriftCheck": frozenset({"action", "run_date.$"}),
+    "LibPinDriftCheck": frozenset({"action", "run_date.$", "execution_arn.$"}),  # +execution_arn.$ (I9247)
     # config#693 (L4595): pre-spend pipeline-contract preflight gate, wired
     # directly after LibPinDriftGate's pass-through (predictor-inference Lambda).
-    "PipelineContractCheck": frozenset({"action", "run_date.$"}),  # +run_date.$ (I8155)
+    "PipelineContractCheck": frozenset({"action", "run_date.$", "execution_arn.$"}),  # +run_date.$ (I8155), +execution_arn.$ (I9247)
     # config#2348: pre-spend evaluator Lambda-SHA drift gate pair, wired
     # directly after PipelineContractGate's pass-through. Two separate Lambda
     # invokes (grading, then director) — each checks its OWN :live alias's
@@ -107,15 +107,15 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "EvaluatorDeployDriftCheck": frozenset({"action"}),
     "EvaluatorDirectorDeployDriftCheck": frozenset({"action"}),
     # config#1824 weekly run-day gate (pure calendar; mirrors LibPinDriftCheck shape).
-    "WeeklyRunDayGate": frozenset({"action", "run_date.$"}),  # +run_date.$ (I8155)
+    "WeeklyRunDayGate": frozenset({"action", "run_date.$", "execution_arn.$"}),  # +run_date.$ (I8155), +execution_arn.$ (I9247)
     "Scanner": frozenset({"dry_run_llm.$", "run_date.$"}),
     # alpha-engine-config-I7813: the same scanner Lambda, invoked as a
     # post-Director leaf with an explicit `mode` so it builds ONLY the
     # observe-only scanner/leaderboard board. The literal `mode` is what
     # keeps this payload distinct from Scanner's above.
     "ScannerLeaderboard": frozenset({"dry_run_llm.$", "run_date.$", "mode"}),
-    "RegimeSubstrate": frozenset({"action.$", "run_date.$"}),  # +run_date.$ (I8155)
-    "RegimeRetrospectiveEval": frozenset({"action.$", "run_date.$"}),  # +run_date.$ (I8155)
+    "RegimeSubstrate": frozenset({"action.$", "run_date.$", "execution_arn.$"}),  # +run_date.$ (I8155), +execution_arn.$ (I9247)
+    "RegimeRetrospectiveEval": frozenset({"action.$", "run_date.$", "execution_arn.$"}),  # +run_date.$ (I8155), +execution_arn.$ (I9247)
     # alpha-engine-config-I2515 Phase B: replaces the removed multi-agent
     # Research state as the signals.json producer.
     # config-I2916: preflight.$=$.research_dry threads the Friday-PM shell-run
@@ -135,11 +135,15 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "EvalJudgeSubmitWeekly": frozenset(
         {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days"}
     ),
-    "EvalJudgePoll": frozenset(
-        {"batch_id.$", "dry_run_llm.$", "max_wait_seconds", "submit_iso.$"}
-    ),
-    "EvalJudgeProcess": frozenset(
-        {"batch_id.$", "dry_run_llm.$", "plan_s3_key.$"}
+    # alpha-engine-config-I9329: EvalJudgePoll and EvalJudgeProcess both left
+    # this registry, for different reasons. Poll was DELETED with the provider
+    # batch API it existed to drive (-I9263). Process still exists and keeps
+    # its name, but it is no longer a lambda:invoke at all — it is an
+    # ssm:sendCommand, so it has no Payload for this registry to close over;
+    # its command string is pinned by tests/test_sf_eval_judge_wiring.py
+    # instead. The dispatcher that launches its box is the new Lambda here.
+    "DispatchEvalJudgeSpot": frozenset(
+        {"execution_id.$", "run_date.$", "pipeline_role", "force_on_demand.$"}
     ),
     "EvalRollingMean": frozenset({"end_time_iso.$"}),
     "RationaleClustering": frozenset({"dry_run_llm.$", "end_time_iso.$"}),
@@ -183,7 +187,16 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
         "run_date.$", "dry_run.$", "execution_arn.$", "state_machine_arn.$",
         "execution_input.$",
     }),
-    "ReportCard": frozenset({"date.$", "dry_run.$", "snapshot", "gate_state"}),
+    # alpha-engine-config-I7392: `run_scope` is the run's OWN scope, threaded
+    # in-band from $.run_scope_result.Payload (the RunScope Task immediately
+    # upstream) and seeded at the InitializeInput floor. It was previously
+    # delivered ONLY as backtest/{date}/run_scope.json — the one delivery path a
+    # rehearsal is forbidden to write, since the RunScope Lambda skips its
+    # put_object on dry_run. Consumer: crucible-evaluator
+    # grading/artifacts.py::_read_run_scope (in-band first, S3 as the fallback).
+    "ReportCard": frozenset({
+        "date.$", "dry_run.$", "snapshot", "gate_state", "run_scope.$",
+    }),
     # Director (Layer C, Part II) — alpha-engine-evaluator-director:live. Final
     # advisory task; reads the fresh report card, writes director/{date}/
     # action_plan.json; flag-gated (DIRECTOR_ENABLED) + non-fatal (own Catch).
@@ -544,6 +557,19 @@ class TestEODSFTopLevelFieldsClosed:
     # fields. Snapshot from step_function_eod.json on 2026-05-27.
     _EXPECTED_EOD_TOP_LEVEL_FIELDS: frozenset[str] = frozenset(
         {
+            # alpha-engine-config#5950 — NormalizeEODFailureContext's scratch
+            # key. HandleFailure formats States.JsonToString($.error), and three
+            # inbound edges never set it (MarketHoursGateChoice's Default, and
+            # PageCaptureSnapshotIrreversibleFailure's Next and Catch), so the
+            # EOD pipeline's own failure REPORTER raised States.Runtime on those
+            # paths and the run died carrying the reporting error instead of the
+            # real one. The floor uses the same JsonMerge-into-$.merged +
+            # OutputPath idiom as the weekly SF's NormalizeFailureContext, so
+            # $.merged is transient: it exists only INSIDE that one Pass and is
+            # re-rooted away before any successor sees it. Registered here
+            # because the closed-namespace scan reads the definition text, not
+            # the runtime payload.
+            "merged",
             # Intermediate ResultPath outputs
             # alpha-engine-config-I6891: WriteCompletionMarkerDegraded's
             # putObject result. It needs a ResultPath at all because the

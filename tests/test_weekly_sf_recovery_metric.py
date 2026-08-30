@@ -2,8 +2,10 @@
 
 Covers:
   - classify_execution's three-way split (counted / excluded_exercise /
-    excluded_gate_skip), including the gate-skip duration+history double
-    check (config#1824's CheckWeeklyRunDayGate self-selection).
+    excluded_gate_skip), including the gate-skip output-verdict check
+    (config#1824's CheckWeeklyRunDayGate self-selection, alpha-engine-
+    config-I8057: NOT duration-based — read directly from the execution's
+    own `output`, positive-test-only, never absence-as-gate-out).
   - build_metric's derived fields against the two documented real shapes:
     a clean single-run day (0 reruns) and the 2026-08-01 shape (1 FAILED
     weekly + 6 watch-reruns, mixed FAILED-then-SUCCEEDED -> 6).
@@ -17,7 +19,7 @@ Covers:
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -33,22 +35,18 @@ def _dt(y, mo, d, h, mi, s=0):
 
 
 class _FakeSF:
-    """Minimal Step Functions client fake: single-page list_executions,
-    describe_execution and get_execution_history keyed by executionArn."""
+    """Minimal Step Functions client fake: single-page list_executions and
+    describe_execution keyed by executionArn."""
 
-    def __init__(self, executions, describe_by_arn=None, history_by_arn=None):
+    def __init__(self, executions, describe_by_arn=None):
         self._executions = executions
         self._describe = describe_by_arn or {}
-        self._history = history_by_arn or {}
 
     def list_executions(self, stateMachineArn, maxResults=200, nextToken=None, statusFilter=None):
         return {"executions": self._executions}
 
     def describe_execution(self, executionArn):
         return self._describe[executionArn]
-
-    def get_execution_history(self, executionArn, maxResults=1000, nextToken=None):
-        return {"events": self._history.get(executionArn, [])}
 
 
 class _FakeS3:
@@ -65,27 +63,27 @@ class _FakeS3:
         return {}
 
 
-def _weekly_exec(arn, name, status, start, stop, role="weekly", explicit_run_date=None):
+def _weekly_exec(arn, name, status, start, stop, role="weekly", explicit_run_date=None,
+                  output=None):
     inp = {"pipeline_role": role}
     if explicit_run_date:
         inp["run_date"] = explicit_run_date
+    desc = {"status": status, "startDate": start, "stopDate": stop, "input": json.dumps(inp)}
+    if output is not None:
+        desc["output"] = json.dumps(output)
     return (
         {"executionArn": arn, "name": name, "status": status, "startDate": start, "stopDate": stop},
-        {"status": status, "startDate": start, "stopDate": stop, "input": json.dumps(inp)},
+        desc,
     )
 
 
-def _gate_skip_history():
-    return [
-        {"type": "PassStateExited", "stateExitedEventDetails": {
-            "name": "InitializeInput",
-            "output": json.dumps({"pipeline_role": "weekly", "run_date": "2026-08-06"}),
-        }},
-        {"type": "ChoiceStateEntered", "stateEnteredEventDetails": {"name": "CheckWeeklyRunDayGate"}},
-        {"type": "TaskStateEntered", "stateEnteredEventDetails": {"name": "WeeklyRunDayGate"}},
-        {"type": "ChoiceStateEntered", "stateEnteredEventDetails": {"name": "WeeklyRunDayGateChoice"}},
-        {"type": "SucceedStateEntered", "stateEnteredEventDetails": {"name": "WeeklyRunDaySkip"}},
-    ]
+def _gate_out_output():
+    """The gate's own verdict, as it appears in a real gate-skip execution's
+    output (verified live 2026-08-21/08-22 against the 3.5s and 5.7s
+    gate-outs — alpha-engine-config-I8057)."""
+    return {"weekly_run_day_gate": {"Payload": {
+        "is_weekly_run_day": False, "marker": "NOT_WEEKLY_RUN_DAY",
+    }}}
 
 
 # ── classify_execution ───────────────────────────────────────────────────
@@ -136,51 +134,61 @@ def test_classify_weekly_exercise_role_variant_excluded():
     assert rec.classification == "excluded_exercise"
 
 
-def test_classify_gate_skip_confirmed_via_history():
-    """A fast (2s) SUCCEEDED weekly-role execution on a non-run day
-    (Thursday self-select miss) must be excluded, not counted as a clean
-    healthy run — the false positive this metric exists to prevent."""
+def test_classify_gate_skip_confirmed_via_output():
+    """A fast (2s) SUCCEEDED weekly-role execution whose OUTPUT carries the
+    gate's `is_weekly_run_day: false` verdict must be excluded, not counted
+    as a clean healthy run — the false positive this metric exists to
+    prevent."""
     start = _dt(2026, 8, 6, 9, 0, 0)
     stop = _dt(2026, 8, 6, 9, 0, 2)
-    ex, desc = _weekly_exec("arn:gate", "uuid-gate", "SUCCEEDED", start, stop)
-    sf = _FakeSF(
-        executions=[ex],
-        describe_by_arn={"arn:gate": desc},
-        history_by_arn={"arn:gate": _gate_skip_history()},
-    )
+    ex, desc = _weekly_exec("arn:gate", "uuid-gate", "SUCCEEDED", start, stop,
+                            output=_gate_out_output())
+    sf = _FakeSF(executions=[ex], describe_by_arn={"arn:gate": desc})
     rec = m.classify_execution(sf, ex)
     assert rec.classification == "excluded_gate_skip"
     assert rec.run_date == "2026-08-06"
 
 
-def test_classify_short_but_real_completion_not_mistaken_for_gate_skip():
-    """A short-duration weekly SUCCEEDED execution whose history does NOT
-    show WeeklyRunDaySkip must stay counted — duration alone never
-    excludes; history confirmation is required."""
+def test_classify_short_real_run_not_mistaken_for_gate_skip():
+    """alpha-engine-config-I8057's measured fact: the fleet's shortest
+    genuine weekly execution ran 12.6s (`director-verify-0731-003355Z`,
+    2026-08-03) — a duration threshold would have misclassified it. A short
+    SUCCEEDED weekly execution with no `weekly_run_day_gate` key in its
+    output — exactly what a real run's output looks like — must stay
+    counted regardless of how fast it finished."""
     start = _dt(2026, 8, 8, 9, 0, 0)
-    stop = _dt(2026, 8, 8, 9, 0, 5)
-    ex, desc = _weekly_exec("arn:short", "uuid-short", "SUCCEEDED", start, stop)
-    sf = _FakeSF(
-        executions=[ex],
-        describe_by_arn={"arn:short": desc},
-        history_by_arn={"arn:short": [
-            {"type": "PassStateExited", "stateExitedEventDetails": {
-                "name": "InitializeInput", "output": "{}"}},
-        ]},
-    )
+    stop = start + timedelta(seconds=12.6)
+    ex, desc = _weekly_exec("arn:short", "uuid-short", "SUCCEEDED", start, stop,
+                            output={"some_other_stage": {"ok": True}})
+    sf = _FakeSF(executions=[ex], describe_by_arn={"arn:short": desc})
     rec = m.classify_execution(sf, ex)
     assert rec.classification == "counted"
 
 
-def test_classify_failed_weekly_never_history_checked_for_gate_skip():
+def test_classify_slow_gate_out_still_excluded():
+    """Mirror fact: a gate-out is never assumed fast. Even if the terminal
+    state took longer than any duration threshold would have allowed, the
+    output verdict alone decides — no clock involved."""
+    start = _dt(2026, 8, 20, 9, 0, 0)
+    stop = _dt(2026, 8, 20, 9, 2, 0)  # 120s — would have missed a 60s ceiling
+    ex, desc = _weekly_exec("arn:slowgate", "uuid-slowgate", "SUCCEEDED", start, stop,
+                            output=_gate_out_output())
+    sf = _FakeSF(executions=[ex], describe_by_arn={"arn:slowgate": desc})
+    rec = m.classify_execution(sf, ex)
+    assert rec.classification == "excluded_gate_skip"
+
+
+def test_classify_failed_weekly_never_gate_checked():
     """status != SUCCEEDED short-circuits the gate-skip check entirely —
-    describe-only, get_execution_history must never be called."""
+    a FAILED execution's `output` field does not exist on real AWS
+    responses either, so this also pins that absence never raises."""
     ex, desc = _weekly_exec(
         "arn:failed", "uuid-failed", "FAILED",
         _dt(2026, 8, 1, 9, 0), _dt(2026, 8, 1, 9, 0, 2),
     )
-    sf = _FakeSF(executions=[ex], describe_by_arn={"arn:failed": desc})  # no history configured
-    rec = m.classify_execution(sf, ex)  # would KeyError/blow up if history were fetched
+    assert "output" not in desc
+    sf = _FakeSF(executions=[ex], describe_by_arn={"arn:failed": desc})
+    rec = m.classify_execution(sf, ex)
     assert rec.classification == "counted"
 
 
@@ -275,11 +283,9 @@ def test_gate_skip_only_day_is_no_data_not_a_false_clean_run():
     surface as zero *counted* executions, never as a false healthy run."""
     start = _dt(2026, 8, 6, 9, 0, 0)
     stop = _dt(2026, 8, 6, 9, 0, 2)
-    ex, desc = _weekly_exec("arn:gate2", "uuid-gate2", "SUCCEEDED", start, stop)
-    sf = _FakeSF(
-        executions=[ex], describe_by_arn={"arn:gate2": desc},
-        history_by_arn={"arn:gate2": _gate_skip_history()},
-    )
+    ex, desc = _weekly_exec("arn:gate2", "uuid-gate2", "SUCCEEDED", start, stop,
+                            output=_gate_out_output())
+    sf = _FakeSF(executions=[ex], describe_by_arn={"arn:gate2": desc})
     records = m.gather_records(sf, m.DEFAULT_STATE_MACHINE_ARN, "2026-08-06")
     counted = [r for r in records if r.classification == "counted"]
     assert counted == []

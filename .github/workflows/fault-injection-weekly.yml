@@ -89,3 +89,20 @@ jobs:
             exit 1
           fi
           python scripts/fault_injection_run.py
+
+  # ── FAILURE ALERTING (alpha-engine-config-I9121) ─────────────────────────
+  # A failing SCHEDULED workflow posts no PR check, calls no reusable notifier
+  # and dispatches no agent, so it is indistinguishable from one that ran
+  # clean. Measured 2026-08-28: NONE of this repo's five scheduled workflows
+  # wired an alert path, and `pause-check-alert.yml` — a workflow whose entire
+  # purpose is to page on pause drift — had failed 33 of 33 runs with nothing
+  # anywhere saying so. The reusable notifier 31 other workflows in this repo
+  # already use is the fleet's answer (config#1128, deduped through Fleet CI
+  # Watch per config#2855); it is not called on a PR because the ref guard
+  # below only passes on the default branch, which is where a scheduled run
+  # always sits.
+  notify-main-failure:
+    needs: [inject]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit

@@ -1,0 +1,85 @@
+{
+  "_comment": [
+    "Entry contract per state-machine definition: the fields EVERY declared caller",
+    "supplies in its StartExecution input, i.e. the INTERSECTION over callers - not",
+    "the union. A field only one caller passes is not guaranteed and must not be",
+    "listed, or the reachability analysis in infrastructure/sf_reachability.py will",
+    "declare a reference safe that a different trigger makes fatal.",
+    "",
+    "tests/test_sf_entry_contract_matches_callers.py pins every IN-REPO caller",
+    "against this file. Callers living in another repo are named under",
+    "external_callers and are pinned by a consumer-contract test THERE - see",
+    "alpha-engine-config-I9096."
+  ],
+  "step_function.json": {
+    "fields": [
+      "sns_topic_arn",
+      "pipeline_role",
+      "skip_parity"
+    ],
+    "callers": [
+      "infrastructure/cloudformation/alpha-engine-orchestration.yaml :: SaturdayTrigger Input",
+      "infrastructure/lambdas/eod-success-friday-shell-trigger/index.py :: _build_shell_run_input",
+      "infrastructure/run_weekly_offcycle.sh :: shell + full inputs",
+      "infrastructure/lambdas/saturday-sf-watch-dispatcher/index.py :: fast-path rerun (PASS-THROUGH: replays describe_resp['input'] verbatim, so it can never weaken the contract)"
+    ],
+    "notes": [
+      "ec2_instance_id is DELIBERATELY absent (alpha-engine-config#2248): the cadence",
+      "trigger omits it so CheckSpotDispatchNeeded always engages the fresh-spot",
+      "dispatch path instead of pinning the always-on dashboard box. It is produced",
+      "inside the graph by MergeWeeklyFreshnessSpotInstanceId, not supplied at entry.",
+      "shell_run is passed only by the Friday trigger, so it is NOT in the contract.",
+      "Measured 2026-08-28: the weekly graph also analyses clean with an EMPTY entry contract, because InitializeInput's JsonMerge floor supplies every field it reads. These three are still declared because they are what the callers actually guarantee, and a future reference to one of them must not silently become the first thing an operator start can break."
+    ]
+  },
+  "step_function_daily.json": {
+    "fields": [
+      "ec2_instance_id",
+      "trading_instance_id",
+      "sns_topic_arn",
+      "pipeline_role"
+    ],
+    "callers": [
+      "infrastructure/cloudformation/alpha-engine-orchestration.yaml :: WeekdayPipelineSchedule Input"
+    ],
+    "notes": [
+      "run_date is NOT supplied at entry - InitializeInput stamps it from",
+      "$$.Execution.StartTime, which is why this pipeline needs no caller to pass it."
+    ]
+  },
+  "step_function_eod.json": {
+    "fields": [
+      "trading_instance_id",
+      "ec2_instance_id",
+      "sns_topic_arn",
+      "run_date",
+      "triggered_by",
+      "pipeline_role"
+    ],
+    "callers": [
+      "infrastructure/lambdas/eod-backstop/index.py :: _start_eod"
+    ],
+    "external_callers": [
+      "crucible-executor/executor/daemon.py :: _trigger_eod_pipeline (triggered_by=daemon_shutdown)"
+    ],
+    "notes": [
+      "This pipeline has NO InitializeInput defaults floor, so every field here is",
+      "load-bearing at entry: 15 states read $.run_date directly and a caller that",
+      "omits it raises States.Runtime before any Catch can see it. Verified against",
+      "live execution eod-2026-08-28-1787947216, whose input carries all six fields.",
+      "This is the ONLY definition whose contract is load-bearing: with an empty contract the EOD graph reports run_date unreachable at 15 states. Giving it an InitializeInput floor like the other two would have to stamp a trading day, not a calendar date (see NormalizeRunDates, alpha-engine-config#8809), so the floor is deliberately NOT copied here - tracked at alpha-engine-config-I9097."
+    ]
+  },
+  "step_function_groom.json": {
+    "fields": [],
+    "callers": [
+      "infrastructure/cloudformation/alpha-engine-orchestration.yaml :: groom schedule Input"
+    ],
+    "notes": [
+      "EMPTY BY MEASUREMENT, not by omission: the groom graph analyses clean with no",
+      "entry contract at all, because every field it reads is produced inside it. The",
+      "earlier seed of schedInput/decideMarker was an artefact of the analysis before",
+      "it modelled OutputPath and JsonMerge - neither name appears in any caller."
+    ]
+  }
+}

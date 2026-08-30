@@ -118,6 +118,17 @@ KNOWN_UNGUARDED_SITES: dict[tuple[str, str], str] = {
         "step_function_daily.json",
         "/home/ec2-user/alpha-engine/.venv/bin/python",
     ): "alpha-engine-config-I7365",
+    # alpha-engine-config-I9329. EvalJudgeProcess runs on a DEDICATED
+    # ephemeral spot (tag alpha-engine-eval-judge-spot) whose only interpreter
+    # is the one crucible-research's own bootstrap builds -- the ops-owned
+    # guard is not installed there any more than it is on the weekly launcher
+    # above, and for the identical reason. Same SOTA close, same tracking
+    # issue: install the guard as part of the spot bootstrap
+    # (alpha-engine-config-I7383). Remove this entry with the one above.
+    (
+        "step_function.json",
+        "/home/ec2-user/crucible-research/.venv/bin/python",
+    ): "alpha-engine-config-I7383",
 }
 
 #: Definitions whose krepis commands run on an ephemeral spot rather than on
@@ -241,6 +252,37 @@ def test_every_krepis_module_invocation_resolves_the_guard():
         )
 
 
+def _ephemeral_spot_instance_fields(data: dict) -> set[str]:
+    """The JSONPaths this definition PROVES hold a per-execution spot id.
+
+    Derived, never listed: a field qualifies only if some Pass state in the
+    same definition builds it from a dispatcher Task's own
+    ``*.instance_id`` result. That is what makes it ephemeral -- the id was
+    minted by a launch on THIS execution -- and it is exactly the property the
+    carve-out below depends on.
+
+    A hardcoded field list would have re-created the hole this test exists to
+    close, one name later: alpha-engine-config-I9329 added a SECOND ephemeral
+    spot ($.eval_judge_instance_id, its own dedicated box) and a list would
+    have had to be edited by the same person adding the state.
+    """
+    fields: set[str] = set()
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(value, str) and ".instance_id" in value:
+                    for match in re.finditer(r'\\?"([a-z0-9_]*instance_id)\\?"', value):
+                        fields.add(f"$.{match.group(1)}")
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(data)
+    return fields
+
+
 def test_spot_definitions_really_target_a_spot():
     """The carve-out above is only legitimate for commands that run somewhere
     the guard is not installed. Re-derive that from the JSON instead of
@@ -258,16 +300,25 @@ def test_spot_definitions_really_target_a_spot():
         if path.name not in SPOT_HOSTED_DEFINITIONS:
             continue
         data = json.loads(path.read_text())
+        ephemeral = _ephemeral_spot_instance_fields(data)
+        assert ephemeral, (
+            f"{path.name}: no ephemeral-spot instance field could be derived — "
+            "the derivation below would then vacuously reject every state. "
+            "Either no dispatcher writes an instance id here (in which case "
+            "this definition does not belong in SPOT_HOSTED_DEFINITIONS) or "
+            "`_ephemeral_spot_instance_fields` no longer matches the JSON."
+        )
         offenders = []
         for state_name, params in _krepis_command_states(data):
             target = params.get("InstanceIds.$")
-            if target != "$.ec2_instance_id":
+            if target not in ephemeral:
                 offenders.append((state_name, target or params.get("InstanceIds")))
         assert not offenders, (
             f"{path.name} is listed in SPOT_HOSTED_DEFINITIONS, so its krepis "
             "commands are exempted from the guard on the grounds that they run "
             "on an ephemeral spot that does not have it. These states do not "
-            f"target $.ec2_instance_id: {offenders}. Either they run on the "
+            f"target a per-execution spot id ({sorted(ephemeral)}): {offenders}. "
+            "Either they run on the "
             "dashboard box — in which case they must resolve the guard and the "
             "exemption does not apply to them — or this definition no longer "
             "belongs in SPOT_HOSTED_DEFINITIONS."

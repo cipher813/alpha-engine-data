@@ -92,12 +92,24 @@ class _FakeSFClient:
     def describe_execution(self, *, executionArn: str):
         for ex in self._executions:
             if ex["executionArn"] == executionArn:
-                return {"input": json.dumps(ex["_input"])}
+                resp = {"input": json.dumps(ex["_input"])}
+                if ex.get("_output") is not None:
+                    resp["output"] = json.dumps(ex["_output"])
+                return resp
         raise AssertionError(f"no fixture execution for {executionArn}")  # pragma: no cover
 
 
+# The run-day gate's own verdict, exactly as it appears in a real gate-skip
+# execution's output (alpha-engine-config-I8057 — the gate-noop axis is
+# read from this, never from duration).
+_GATE_OUT_OUTPUT = {"weekly_run_day_gate": {"Payload": {
+    "is_weekly_run_day": False, "marker": "NOT_WEEKLY_RUN_DAY",
+}}}
+
+
 def _execution(
-    *, name: str, role: str | None, status: str, start: datetime, duration_s: float
+    *, name: str, role: str | None, status: str, start: datetime, duration_s: float,
+    gate_out: bool = False,
 ) -> dict:
     return {
         "executionArn": f"arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:{name}",
@@ -106,6 +118,7 @@ def _execution(
         "startDate": start,
         "stopDate": start + timedelta(seconds=duration_s) if status != "RUNNING" else None,
         "_input": {"pipeline_role": role} if role is not None else {},
+        "_output": _GATE_OUT_OUTPUT if gate_out else None,
     }
 
 
@@ -158,7 +171,7 @@ class TestWeeklyFailedDayDegradedMarkerClears:
                 role="weekly",
                 status="FAILED",
                 start=_utc(TARGET_DATE, 9, 0),
-                duration_s=5400,  # 90 minutes — nowhere near GATE_NOOP_MAX_SECONDS
+                duration_s=5400,  # 90 minutes; it carries no gate-out verdict either
             ),
         ]
         sf_client = _FakeSFClient(executions)
@@ -219,8 +232,9 @@ class TestWeeklyFailedDayAbsentMarkerPages:
 
 class TestWeeklyFailedDayGateSkipIsNotACycle:
     def test_gate_skip_execution_is_not_counted_as_the_cycle(self, mod, _no_real_alerts):
-        # WeeklyRunDayGateChoice's designed no-op: SUCCEEDED, ~2s duration,
-        # well under GATE_NOOP_MAX_SECONDS (90s). Must not read as either a
+        # WeeklyRunDayGateChoice's designed no-op: SUCCEEDED, declared by the
+        # gate's OWN output verdict (`gate_out=True`), not by its ~2s duration
+        # (alpha-engine-config-I8057). Must not read as either a
         # real SUCCEEDED cycle (which would silently hide a genuine miss)
         # NOR as a "0 executions" never-fired case that some OTHER
         # non-weekly execution masks — this is the exact ambiguity I7036
@@ -234,6 +248,7 @@ class TestWeeklyFailedDayGateSkipIsNotACycle:
                 status="SUCCEEDED",
                 start=_utc(TARGET_DATE, 9, 0),
                 duration_s=2,
+                gate_out=True,
             ),
             _execution(
                 name="same-day-exercise-noise",

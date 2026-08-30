@@ -117,9 +117,18 @@ STAGE_BUDGETS: dict[str, StageBudget] = {
         max_budget_seconds=10_800,
         pipeline_segment="sequential",
     ),
+    # alpha-engine-config-I7176 / -I9201 (2026-08-28): 5_400 -> 6_600. Measured
+    # DataPhase1 wall clock on the four most recent real scheduled runs —
+    # 2026-08-01 2388s, 08-08 2418s, 08-15 4926s, 08-22 5018s. The step between
+    # 08-08 and 08-15 is the retirement of the daily exercise cadence
+    # (4159239d, Brian ruling 2026-08-13), whose Friday pass had been writing
+    # the .phases/ markers Saturday auto-skipped on; 4926/5018s is the true
+    # cold cost, not growth. 6_600 = 5018 x 1.31, well inside max_budget_seconds.
+    # Mirrored in infrastructure/spot_data_phase1.sh (MAX_RUNTIME_SECONDS) and
+    # step_function.json (executionTimeout / TimeoutSeconds / poll cap 240).
     "DataPhase1": StageBudget(
         name="DataPhase1",
-        current_timeout_seconds=5_400,
+        current_timeout_seconds=6_600,
         per_ticker_cost_seconds=2.2,  # estimated (same dispatch pattern)
         fixed_overhead_seconds=3_300,
         max_budget_seconds=10_800,
@@ -137,6 +146,31 @@ STAGE_BUDGETS: dict[str, StageBudget] = {
         per_ticker_cost_seconds=8.5,
         fixed_overhead_seconds=5_500,
         max_budget_seconds=21_600,  # config#2938 ruling 2: hard 6h cap
+        pipeline_segment="branch_a",
+    ),
+    # alpha-engine-config-I9329. EvalJudgeProcess became SSM-bearing on
+    # 2026-08-29 when the judge moved off a 900s Lambda onto a dedicated EC2
+    # spot: it covered 8-15 of an ~83-artifact corpus inside that ceiling,
+    # reported complete=False honestly, and returned SUCCESS.
+    #
+    # This stage does NOT scale with the ticker universe — it scales with the
+    # DECISION-ARTIFACT corpus, which is why per_ticker_cost_seconds is 0 and
+    # the whole budget sits in fixed_overhead_seconds. Recording it as a
+    # per-ticker cost would make the recommendation move with a number that
+    # has nothing to do with it.
+    #
+    # MEASURED (crucible-research-PR766, alpha-engine-config-I9309): 83
+    # artifacts at 45-105s per synchronous judge call = 60-145 minutes serial.
+    # 10800s (3h) is that worst case plus headroom for corpus growth. It is a
+    # budget, not an accommodation: coverage is a HARD failure by Brian's
+    # 2026-08-29 ruling, so a run that would exceed this must surface as a
+    # stage failure rather than be accommodated by a larger ceiling.
+    "EvalJudgeProcess": StageBudget(
+        name="EvalJudgeProcess",
+        current_timeout_seconds=10_800,
+        per_ticker_cost_seconds=0.0,
+        fixed_overhead_seconds=8_700,
+        max_budget_seconds=10_800,
         pipeline_segment="branch_a",
     ),
     "DataPhase2": StageBudget(

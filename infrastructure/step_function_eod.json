@@ -79,7 +79,7 @@
           "Next": "NotifyMarketHoursOverrideMalformed"
         }
       ],
-      "Default": "HandleFailure"
+      "Default": "NormalizeEODFailureContext"
     },
     "StampMarketHoursVerdictMissing": {
       "Type": "Pass",
@@ -636,10 +636,10 @@
             "States.ALL"
           ],
           "ResultPath": null,
-          "Next": "HandleFailure"
+          "Next": "NormalizeEODFailureContext"
         }
       ],
-      "Next": "HandleFailure"
+      "Next": "NormalizeEODFailureContext"
     },
     "SnapshotWait": {
       "Type": "Wait",
@@ -2516,6 +2516,15 @@
         }
       ],
       "Next": "StartTradingInstance"
+    },
+    "NormalizeEODFailureContext": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config#5950. HandleFailure formats States.JsonToString($.error), and three inbound edges never set it: MarketHoursGateChoice's Default, and PageCaptureSnapshotIrreversibleFailure's Next (ResultPath $.capture_snapshot_irreversible_notify) and Catch (no ResultPath). On those paths the EOD pipeline's own failure REPORTER raised States.Runtime, which no Catch can see, so the run died with the reporting error in place of the real one. The weekly SF closed this exact shape with NormalizeFailureContext (alpha-engine-config#2281); this mirrors that pattern rather than inventing a second one, per the shared-code rule. Edges that DO set $.error are left pointing straight at HandleFailure -- the JsonMerge puts the real error above this floor anyway, but not re-routing them keeps the diff to the broken paths.",
+      "Parameters": {
+        "merged.$": "States.JsonMerge(States.StringToJson('{\"error\":{\"phase\":\"Unknown\",\"source\":\"NormalizeEODFailureContext\",\"detail\":\"no error was set by the upstream Catch or Choice edge\"}}'),$,false)"
+      },
+      "OutputPath": "$.merged",
+      "Next": "HandleFailure"
     }
   }
 }

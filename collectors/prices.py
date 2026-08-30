@@ -38,7 +38,10 @@ import boto3
 import pandas as pd
 import yfinance as yf
 
-from builders._price_cache_writeboth import price_cache_write_prefixes
+from builders._price_cache_writeboth import (
+    price_cache_read_prefixes,
+    price_cache_write_prefixes,
+)
 from nousergon_lib.yfinance_quiet import log_yf_coverage, yf_quiet
 
 logger = logging.getLogger(__name__)
@@ -193,6 +196,109 @@ def _find_stale_fast(
     return stale
 
 
+# Row count below which a "full period" yfinance refresh is treated as
+# SUSPECT and checked against what the price cache already holds.
+# ~400 trading days is ~18 months — far under the 10y (~2500 row) fetch every
+# maintained ticker returns, and comfortably over a genuinely new listing that
+# has no existing parquet to regress. Only frames under this threshold pay the
+# extra S3 GET, so the guard is free on the ~900-ticker happy path.
+_SHORT_FETCH_ROW_THRESHOLD = 400
+
+
+def _is_missing_object(s3, exc: Exception) -> bool:
+    """True when ``exc`` means "this S3 key does not exist" (and nothing else).
+
+    Deliberately narrow: every other failure (throttle, 403, transient network)
+    must NOT be read as "no existing parquet", or a short fetch would overwrite
+    a full history on a blip. Matches both the botocore ``ClientError`` code and
+    the modelled ``s3.exceptions.NoSuchKey`` class name so it holds for real
+    clients and for test doubles alike.
+    """
+    code = getattr(exc, "response", {}).get("Error", {}).get("Code") if hasattr(exc, "response") else None
+    if code in {"NoSuchKey", "NoSuchBucket", "404"}:
+        return True
+    modelled = getattr(getattr(s3, "exceptions", None), "NoSuchKey", None)
+    if isinstance(modelled, type) and isinstance(exc, modelled):
+        return True
+    return type(exc).__name__.lstrip("_") in {"NoSuchKey", "NoSuchBucketError"}
+
+
+def _existing_parquet_rows(s3, bucket: str, s3_prefix: str, ticker: str) -> int | None:
+    """Row count of the ticker's current price-cache parquet, or None if absent.
+
+    Any read failure other than "the object does not exist" RAISES — treating an
+    unreadable parquet as absent would let a short fetch overwrite a full history
+    on a transient S3 error, which is the same silent-degrade this guard exists
+    to stop.
+    """
+    import io as _io
+
+    last_exc: Exception | None = None
+    for prefix in price_cache_read_prefixes(s3_prefix):
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=f"{prefix}{ticker}.parquet")
+        except Exception as exc:  # noqa: BLE001 - classified below, never swallowed
+            if _is_missing_object(s3, exc):
+                continue
+            last_exc = exc
+            continue
+        return len(pd.read_parquet(_io.BytesIO(obj["Body"].read())))
+    if last_exc is not None:
+        raise RuntimeError(
+            f"Short-fetch guard: could not read the existing price-cache parquet "
+            f"for {ticker} to check for truncation: {last_exc}"
+        ) from last_exc
+    return None
+
+
+def _longest_of(candidates: list[tuple[str, pd.DataFrame]]) -> tuple[str, pd.DataFrame]:
+    """Pick the longest of several candidate history frames, by row count.
+
+    Deliberate rather than a preference order (mirrors
+    ``builders/repair_macro_series.py::fetch_full_history``): the failure this
+    guards against is a SOURCE answering short, so the selection can't assume
+    any one source is healthy. Raises if every candidate is empty/None.
+    """
+    named = [(name, df) for name, df in candidates if df is not None and not df.empty]
+    if not named:
+        raise RuntimeError("_longest_of: no usable candidate frames")
+    return max(named, key=lambda kv: len(kv[1]))
+
+
+def _fred_ohlcv_for_caret_symbol(ticker: str, period: str) -> "pd.DataFrame | None":
+    """Fetch ``ticker``'s FRED-sourced history, reshaped to the yfinance OHLCV
+    column set. Returns ``None`` (never raises) on any failure — the caller
+    falls back to whatever yfinance answered, since FRED being unavailable
+    must degrade to yfinance rather than to nothing (alpha-engine-config-I9286
+    deliverable 2).
+    """
+    from collectors.fred_history import FRED_HISTORY_MAP, fetch_fred_history, fred_history_to_ohlcv
+
+    series_id = FRED_HISTORY_MAP.get(ticker)
+    if series_id is None:
+        return None
+    years = int(period.rstrip("y")) if period.endswith("y") and period[:-1].isdigit() else 10
+    try:
+        fred_df = fetch_fred_history(series_id, period_years=years)
+        out = fred_history_to_ohlcv(fred_df)
+    except Exception as exc:
+        logger.warning(
+            "FRED history fetch failed for %s (%s): %s — falling back to yfinance",
+            ticker, series_id, exc,
+        )
+        return None
+    idx = pd.to_datetime(out.index)
+    if idx.tz is not None:
+        idx = idx.tz_convert("UTC").tz_localize(None)
+    out.index = idx.normalize()
+    # Match yfinance's minimal OHLCV column set — the FRED shape carries
+    # Adj_Close/VWAP/source too, and letting those vary week-to-week on the
+    # SAME ticker's parquet (yfinance-shaped one week, FRED-shaped the next)
+    # is schema churn the parquet contract doesn't need here.
+    keep = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in out.columns]
+    return out[keep]
+
+
 @yf_quiet
 def _refresh_stale(
     s3,
@@ -263,6 +369,60 @@ def _refresh_stale(
                         idx = idx.tz_convert("UTC").tz_localize(None)
                     new_df.index = idx
                     new_df = new_df.sort_index()
+
+                    # ── FRED longest-of selection for caret index tickers ───
+                    # (alpha-engine-config-I9286). yfinance answers ``^VIX3M``
+                    # with 1 row of history from the EC2 host that runs the
+                    # weekly collector on SOME Saturdays and a full answer on
+                    # others (measured 2026-08-29) — the intermittency behind
+                    # alpha-engine-config-I9324's dead-then-healthy champion
+                    # vintages. FRED already serves these four reliably (it's
+                    # what daily_closes.py's single-latest fallback uses), but
+                    # a hard cutover would make a FRED outage total instead of
+                    # degrading to yfinance — so take whichever answers longer,
+                    # every run, and log which source won.
+                    if ticker in _CARET_SYMBOLS:
+                        fred_df = _fred_ohlcv_for_caret_symbol(ticker, fetch_period)
+                        if fred_df is not None:
+                            source, new_df = _longest_of(
+                                [("yfinance", new_df), ("fred", fred_df)]
+                            )
+                            logger.info(
+                                "%s: source selection -> %s (%d rows)",
+                                ticker, source, len(new_df),
+                            )
+                        else:
+                            logger.info(
+                                "%s: FRED unavailable this run, using yfinance (%d rows)",
+                                ticker, len(new_df),
+                            )
+
+                    # ── Short-fetch guard (alpha-engine-config-I9256) ───────
+                    # yfinance intermittently answers a full-period request with
+                    # a handful of rows (measured 2026-08-29: a 1-row
+                    # ``reference/price_cache/VIX3M.parquet`` written at
+                    # 02:44:23 UTC in the same batch that wrote a full 2515-row
+                    # VIX.parquet). Uploading that wholesale destroys the 10y
+                    # cache, and the Saturday backfill then rewrites ArcticDB
+                    # ``macro/VIX3M`` from it — 2509 rows -> 16, undetected for
+                    # two weeks. A refresh that would SHRINK the cache is a
+                    # failed refresh, not a new truth: skip the upload, count the
+                    # ticker as failed so ``status`` degrades to "partial", and
+                    # leave the good parquet in place.
+                    if len(new_df) < _SHORT_FETCH_ROW_THRESHOLD:
+                        existing_rows = _existing_parquet_rows(
+                            s3, bucket, s3_prefix, ticker
+                        )
+                        if existing_rows is not None and len(new_df) < existing_rows:
+                            logger.error(
+                                "Short-fetch REFUSED for %s: yfinance returned %d rows "
+                                "for period=%s but the existing price-cache parquet has "
+                                "%d — not uploading (existing history preserved). "
+                                "See alpha-engine-config-I9256.",
+                                ticker, len(new_df), fetch_period, existing_rows,
+                            )
+                            failed_tickers.append(ticker)
+                            continue
 
                     # Write locally and upload (Wave 3 PR1: write-both to legacy
                     # ``predictor/price_cache/`` + new ``reference/price_cache/``;

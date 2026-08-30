@@ -155,7 +155,11 @@ def test_branch_a_mark_state_shape(branch_a, name, next_target):
         "RegimeRetrospectiveEval",
         "EvalJudgeSubmitFirstSaturday",
         "EvalJudgeSubmitWeekly",
-        "EvalJudgePoll",
+        # alpha-engine-config-I9329: EvalJudgePoll is gone; the spot
+        # dispatcher took its place as a fail-open owner in this chain, and
+        # EvalJudgeProcess is now an ssm:sendCommand rather than a
+        # lambda:invoke — its Catch obligation is unchanged.
+        "DispatchEvalJudgeSpot",
         "EvalJudgeProcess",
         "EvalRollingMean",
         "RationaleClustering",
@@ -364,7 +368,16 @@ def _notify_target(states, data: dict) -> str:
         return data[var] == rule["BooleanEquals"]
 
     cur = "CheckShellRunNotify"
-    while states[cur]["Type"] == "Choice":
+    while states[cur]["Type"] in ("Choice", "Pass"):
+        if states[cur]["Type"] == "Pass":
+            # alpha-engine-config#5950: a normalizer Pass may sit between the
+            # gate and its notifier, flooring the optional diagnostic fields the
+            # notifier dereferences. It has no Choices, so it cannot change WHICH
+            # notifier is reached — walk through it rather than widening the
+            # allowed-target list, which would let a future Pass hide a wrong
+            # destination from this test.
+            cur = states[cur]["Next"]
+            continue
         for rule in states[cur]["Choices"]:
             if eval_rule(rule):
                 cur = rule["Next"]

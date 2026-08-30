@@ -1,6 +1,17 @@
 [Unit]
 Description=Daily installed-vs-repo systemd unit drift check — once a day (config#2352)
-Requires=systemd-unit-drift-check.service
+# NO Requires=systemd-unit-drift-check.service here, deliberately
+# (alpha-engine-config-I9000). `Requires=` in a TIMER's [Unit] is a START
+# dependency OF THE TIMER, so `systemctl enable --now
+# systemd-unit-drift-check.timer` — which BOTH install-daily-news.sh and
+# install-metron-intraday.sh run, on two different boxes — also enqueued a start
+# job for the service. The binding is the `Unit=` line below.
+#
+# And no install-time run is wanted here even though the check is read-only: the
+# installer has just copied these unit files, so a drift comparison taken in the
+# same second answers a question nobody asked, while emitting a CloudWatch
+# datapoint dated to the deploy rather than to the daily cadence this check's
+# freshness is judged on.
 
 [Timer]
 Unit=systemd-unit-drift-check.service

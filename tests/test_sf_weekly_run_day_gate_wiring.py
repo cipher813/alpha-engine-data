@@ -90,6 +90,14 @@ class TestGateRouting:
             # on datetime.now() — which agrees with it only while the stage
             # runs on the same UTC day the execution started.
             "run_date.$": "$.run_date",
+            # alpha-engine-config-I9247: the execution that produced the
+            # verdict. crucible-predictor-PR578 persists `execution_arn` onto
+            # the `_stage_coverage/` record FROM THE EVENT, so a Task that does
+            # not thread it keeps writing the None that made a deploy-time
+            # probe's verdict indistinguishable from a real execution's — and
+            # I8155's hardened gate predicate, which counts only records with a
+            # non-null execution_arn, would count zero.
+            "execution_arn.$": "$$.Execution.Id",
         }
         assert gate["Next"] == "WeeklyRunDayGateChoice"
         (catch,) = gate["Catch"]

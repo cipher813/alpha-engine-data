@@ -62,6 +62,17 @@ playbooks:
       - {surface: events, name: alpha-engine-saturday-sf-watch-failed}
       - {surface: events, name: alpha-engine-sf-watch-spot-interruption}
       - {surface: events, name: alpha-engine-sf-watch-instance-terminated}
+      # Found by trigger_surface_drift.py on its first live run
+      # (alpha-engine-config-I9045). This schedule dispatches
+      # {"playbook": "sf-watch", "payload": {"is_drill": "true", ...}} through
+      # the router — a real wake path for THIS playbook — and it was declared
+      # only under canary-replay, whose triggers list it because the drill is
+      # canary-replay's instrument. Both are true and both belong here: the
+      # ci-watch drill twin is already declared on both sides, which is what
+      # made the asymmetry visible. Being drill-only does not exempt it —
+      # `drill_isolation` governs how a drill run is graded, not whether the
+      # thing that starts it is a trigger.
+      - {surface: scheduler, name: alpha-engine-sf-watch-canary-drill-weekly}
     executor_function: alpha-engine-sf-watch-spot-dispatcher
     executor_lambda_dir: sf-watch-spot-dispatcher
     # Executor verdict `reason` values that are by-design declines — the
@@ -229,6 +240,21 @@ playbooks:
           invoke the router directly (config-I3282). Its arming is the arming of
           alpha-engine-freshness-monitor-{cron,historical-cron,intraday-cron},
           all three of which the pause manifest declares KEPT.
+        # alpha-engine-config-I9045. The sentence above was true, joinable by a
+        # human, and readable by nothing. Measured 2026-08-28: all four
+        # schedules above were live DISABLED and alert-drain ran EVERY DAY that
+        # week off this leg — and `arming.py` could only report the leg
+        # `unjoinable`, because "its arming is the arming of X" lived in prose.
+        # `depends_on` is that sentence in a form the code can follow: these are
+        # the AWS resources whose live state IS this leg's arming, so the leg
+        # resolves to armed/dark instead of a blank, and
+        # `trigger_descriptions.py` can stamp the linkage onto both ends of it
+        # (the rules gain `[wakes: alert-drain]`, the schedules gain a
+        # `[sibling-legs: ...]` naming the rule that is doing the work).
+        depends_on:
+          - {surface: events, name: alpha-engine-freshness-monitor-cron}
+          - {surface: events, name: alpha-engine-freshness-monitor-historical-cron}
+          - {surface: events, name: alpha-engine-freshness-monitor-intraday-cron}
     executor_function: alpha-engine-alert-drain-dispatcher
     executor_lambda_dir: alert-drain-dispatcher
     benign_reasons: [concurrent_skip, disabled]
@@ -761,6 +787,24 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+  - class: backtester_producer_arena
+    # alpha-engine-config-I9318: the R-slot (selection-producer) arena cycle.
+    # Fires only when the cycle comes out `unmeasurable` or `unservable` — i.e.
+    # the slot could not decide the live config/producer_champion.json pointer
+    # on evidence. Distinct from backtester_champion_promotion above, which
+    # alerts when the weekly run RAISES: a cycle that completes and honestly
+    # reports "no arm is measurable" is not an exception, and collapsing the
+    # two would make the drain queue unable to tell a code defect from missing
+    # upstream evidence.
+    source: "alpha-engine-backtester/optimizer/producer_arena.py::run_arena_cycle"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    operator_reason: >-
+      The R-slot arena could not promote or defend the live producer_champion
+      pointer on evidence (unmeasurable or unservable). drain-queue is the
+      closed loop: T0-T3 triage distinguishes code defects from upstream
+      evidence gaps tracked as alpha-engine-config-I9405.
   - class: backtester_live_key_reconciliation
     source: "alpha-engine-backtester/optimizer/live_key_reconciliation.py"
     severities: [critical]
@@ -900,6 +944,39 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+  - class: research_spec_promotion_alerts
+    # alpha-engine-config-I9273 static-chokepoint registration. The scanner
+    # SPEC slot's promotion engine (crucible-research/scoring/spec_promotion.py
+    # ::run_spec_promotion, invoked from lambda/scanner_handler.py immediately
+    # after build_scanner_leaderboard) decides which registered arm of
+    # SCANNER_SPECS ranks the live candidate cut. Same FAIL-SOFT + LOUD shape
+    # as research_cut_promotion_alerts above and for the same reason: a
+    # promotion failure never downgrades the already-written candidates.json
+    # (the pointer keeps naming the standing champion), so this alert is the
+    # ONLY signal that no promote/demote/hold decision was recorded for the
+    # cycle. That matters more here than on the cut slot: before this engine
+    # existed the spec champion moved only by a hand-edit of LIVE_CHAMPION,
+    # which is how alpha-engine-config-I7808 produced four weeks of a
+    # leaderboard scoring an arm against itself. The call site publishes with
+    # explicit severity="ERROR".
+    source: "research:spec_promotion"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    # overseer-policy.md invariant 4 (alpha-engine-config-I8991): a pageable
+    # class is a CLOSED LOOP or a TRACKED GAP, and there is no third state.
+    # This is the tracked gap, deliberately, rather than an operator_reason.
+    # Declaring it page-only-by-design would be a RULING, and two things make
+    # that ruling premature: (1) the identically-shaped twin
+    # research_cut_promotion_alerts is still grandfathered awaiting its own
+    # disposition under I8996, so closing this one would make two rows
+    # disagree about a question they answer identically; (2) the dominant
+    # firing condition — board_defective, a scanner leaderboard reporting
+    # duplicate arm rows — is a characterised producer fault with a durable
+    # artifact to read (config/apply_audit/scanner_spec_champion/{date}.json
+    # is written BEFORE the engine raises), which is playbook-shaped work and
+    # not inherently human-only. I9316 rules both rows together.
+    migration_issue: alpha-engine-config-I9316
   - class: research_weekly_ledger_alerts
     # alpha-engine-config-I8264 static-chokepoint registration. Emitted by
     # crucible-research/lambda/scanner_handler.py after
@@ -944,6 +1021,22 @@ alert_classes:
     response: drain-queue
   - class: research_thinktank_daily_alerts
     source: "research:thinktank_daily"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+  # alpha-engine-config-I9282 (crucible-research-PR762). The Think Tank
+  # challenger arm writes its leaderboard evidence
+  # (signals_shadow/thinktank_coverage/{date}/signals.json) ONLY when its
+  # declared coverage window is complete. That skip was reported at INFO and
+  # escalated nowhere, so the arm silently stopped contributing cohort dates on
+  # 2026-08-14 and nothing noticed for two weeks — on the producer leaderboard
+  # it read as a THIN arm rather than a DEAD one. This class carries the
+  # now-loud "arm produced no evidence this cycle" event
+  # (champion-challenger-policy.md §3: a no-output cycle is a MISS, not an
+  # omission). Deduped per trading_day at the call site, so a persistent
+  # outage pages once per cycle rather than once per run.
+  - class: research_thinktank_challenger_selection_alerts
+    source: "thinktank:challenger_selection"
     severities: [warning]
     intake: bus
     response: drain-queue
