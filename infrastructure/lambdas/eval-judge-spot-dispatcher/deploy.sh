@@ -64,7 +64,7 @@ ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 # In particular EVAL_JUDGE_SPOT_WATCHDOG_SECONDS is NOT set here: the handler
 # refuses to launch when it does not exceed bootstrap + judge budget, and an
 # env override is exactly how that inequality would be broken out of band.
-PROD_ENV='Variables={LOG_LEVEL=INFO,EVAL_JUDGE_SPOT_DISPATCH_ENABLED=true}'
+PROD_ENV='Variables={LOG_LEVEL=INFO,EVAL_JUDGE_SPOT_DISPATCH_ENABLED=true,EVAL_JUDGE_SPOT_APPCONFIG_APPLICATION=yq405wh}'
 
 # Timeout must cover the handler's worst case: launch a spot (RunInstances +
 # state poll; longer on the on-demand fallback after capacity retries) PLUS
