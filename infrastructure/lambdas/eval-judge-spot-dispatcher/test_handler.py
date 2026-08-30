@@ -134,6 +134,7 @@ class TestBootstrapCommand:
             "KREPIS_EXEC_CONTEXT=ec2",
             "KREPIS_LITELLM_PROXY_URL=https://router.nousergon.ai:8443",
             "KREPIS_ROUTER_CREDENTIAL_SECRET=ROUTER_CONSUMER_RESEARCH",
+            "KREPIS_APPCONFIG_APPLICATION=yq405wh",
             "KREPIS_APPCONFIG_CONFIG_PROFILE=llm-model-registry",
         ):
             assert line in cmd, f"missing from the env file heredoc: {line}"

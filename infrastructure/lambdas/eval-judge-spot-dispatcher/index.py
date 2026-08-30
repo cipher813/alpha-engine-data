@@ -242,7 +242,9 @@ KREPIS_ROUTER_CREDENTIAL_SECRET = os.environ.get(
     "EVAL_JUDGE_SPOT_ROUTER_CREDENTIAL_SECRET", "ROUTER_CONSUMER_RESEARCH"
 )
 KREPIS_APPCONFIG_APPLICATION = os.environ.get(
-    "EVAL_JUDGE_SPOT_APPCONFIG_APPLICATION", "alpha-engine"
+    # IAM-scoped AppConfig application for the live registry (yq405wh), not the
+    # legacy alpha-engine id — same fix as crucible-research#778 on submit.
+    "EVAL_JUDGE_SPOT_APPCONFIG_APPLICATION", "yq405wh"
 )
 KREPIS_APPCONFIG_CONFIG_PROFILE = os.environ.get(
     "EVAL_JUDGE_SPOT_APPCONFIG_CONFIG_PROFILE", "llm-model-registry"
