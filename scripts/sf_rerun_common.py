@@ -63,12 +63,33 @@ def initialize_input_output(events: list[dict]) -> dict | None:
     return None
 
 
+def apply_normalized_run_date_output(events: list[dict]) -> dict | None:
+    """The merged object ``ApplyNormalizedRunDate`` emitted after
+    ``NormalizeRunDates`` — the cycle's TRADING day on ``$.run_date``
+    (alpha-engine-config-I8809). This is the key every artifact prefix and
+    skip-coherence predicate actually use; ``InitializeInput`` only stamps the
+    calendar date before normalization."""
+    for e in events:
+        d = e.get("stateExitedEventDetails")
+        if d is not None and d.get("name") == "ApplyNormalizedRunDate":
+            try:
+                return json.loads(d.get("output") or "null")
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
 def derive_run_date(events: list[dict], start_time: datetime | None) -> tuple[str, str]:
     """Return (run_date, provenance). Precedence: explicit input run_date >
-    InitializeInput's merged output > date(Execution start time)."""
+    ApplyNormalizedRunDate's merged output (trading day) >
+    InitializeInput's merged output (calendar day, pre-normalizer) >
+    date(Execution start time)."""
     orig = execution_input(events)
     if isinstance(orig.get("run_date"), str) and orig["run_date"]:
         return orig["run_date"], "explicit run_date in the failed execution's input"
+    normalized = apply_normalized_run_date_output(events)
+    if isinstance(normalized, dict) and isinstance(normalized.get("run_date"), str) and normalized["run_date"]:
+        return normalized["run_date"], "ApplyNormalizedRunDate merged output of the failed execution (trading day)"
     init = initialize_input_output(events)
     if isinstance(init, dict) and isinstance(init.get("run_date"), str) and init["run_date"]:
         return init["run_date"], "InitializeInput merged output of the failed execution"
@@ -81,8 +102,8 @@ def derive_run_date(events: list[dict], start_time: datetime | None) -> tuple[st
         )
     raise SystemExit(
         "FATAL: cannot derive run_date — no explicit input run_date, no "
-        "InitializeInput output in history, and no execution start time "
-        "was supplied."
+        "ApplyNormalizedRunDate output, no InitializeInput output in history, "
+        "and no execution start time was supplied."
     )
 
 

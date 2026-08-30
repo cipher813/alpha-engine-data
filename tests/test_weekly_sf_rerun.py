@@ -948,7 +948,7 @@ class TestHistoricalWorkStateNames:
 # dispatch is spent (sf-pipeline-policy §2.5).
 # ---------------------------------------------------------------------------
 
-def _history(*, explicit_run_date=None, init_run_date=None, extra_input=None):
+def _history(*, explicit_run_date=None, init_run_date=None, normalized_run_date=None, extra_input=None):
     """Build a minimal synthetic execution-history events list."""
     inp = {"pipeline_role": "watch-rerun"}
     if extra_input:
@@ -962,11 +962,25 @@ def _history(*, explicit_run_date=None, init_run_date=None, extra_input=None):
     if init_run_date is not None:
         out = dict(inp)
         out["run_date"] = init_run_date
+        out["calendar_date"] = init_run_date
         events.append({
             "type": "PassStateExited",
             "stateExitedEventDetails": {
                 "name": "InitializeInput",
                 "output": json.dumps(out),
+            },
+        })
+    if normalized_run_date is not None:
+        base = dict(inp)
+        if init_run_date is not None:
+            base["calendar_date"] = init_run_date
+        base["run_date"] = normalized_run_date
+        base["run_date_family"] = "trading_day"
+        events.append({
+            "type": "PassStateExited",
+            "stateExitedEventDetails": {
+                "name": "ApplyNormalizedRunDate",
+                "output": json.dumps(base),
             },
         })
     return events
@@ -1000,6 +1014,16 @@ class TestRunDateCarriedAcrossUTCMidnight:
         run_date, provenance = mod.derive_run_date(events, late_start)
         assert run_date == "2026-08-15"
         assert "InitializeInput" in provenance
+
+    def test_normalized_trading_day_wins_over_initialize_calendar_day(self, mod):
+        """alpha-engine-config-I8809: Saturday 2026-08-29 run keyed cycle
+        2026-08-28; rerun must carry the trading day or skip-coherence on
+        predictor weights rejects a valid recovery plan."""
+        events = _history(init_run_date="2026-08-29", normalized_run_date="2026-08-28")
+        late_start = datetime(2026, 8, 29, 9, 0, 49, tzinfo=timezone.utc)
+        run_date, provenance = mod.derive_run_date(events, late_start)
+        assert run_date == "2026-08-28"
+        assert "ApplyNormalizedRunDate" in provenance
 
     def test_only_a_genuine_pre_workload_failure_falls_back_to_start_time(self, mod):
         """No explicit run_date, no InitializeInput output at all (the
