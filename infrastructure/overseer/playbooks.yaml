@@ -800,6 +800,11 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      The R-slot arena could not promote or defend the live producer_champion
+      pointer on evidence (unmeasurable or unservable). drain-queue is the
+      closed loop: T0-T3 triage distinguishes code defects from upstream
+      evidence gaps tracked as alpha-engine-config-I9405.
   - class: backtester_live_key_reconciliation
     source: "alpha-engine-backtester/optimizer/live_key_reconciliation.py"
     severities: [critical]
