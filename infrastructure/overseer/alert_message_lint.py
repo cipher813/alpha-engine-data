@@ -895,7 +895,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"\npre-existing findings NOT gated by this PR ({len(carried)}): "
             + ", ".join(sorted({f"{f.rule}@{f.relpath}" for f in carried}))
-            + "\n  (alpha-engine-config-I9449's register owns those — this lint only "
+            + "\n  (alpha-engine-config-I9491's register owns those — this lint only "
               "reports what THIS diff introduced)"
         )
 
