@@ -452,3 +452,73 @@ def test_the_lint_and_the_scanner_do_not_grade_themselves():
     assert "infrastructure/overseer/alert_message_lint.py" not in graded
     assert "infrastructure/overseer/alert_class_registry_drift.py" not in graded
     assert "infrastructure/overseer/alert_class_pr_guard.py" not in graded
+
+
+# ── false positives found by calibration, pinned so they stay fixed ─────────
+#
+# Every case below flagged on a real fleet call site and was WRONG. A lint's
+# expensive failure is not the defect it misses — it is the correct call site
+# it flags, because that is what gets the whole rule switched off.
+
+
+def test_a_decision_queue_item_is_the_remedy_not_the_defect():
+    """`**Options:** ... B) Acknowledge as expected ...` — from freshness-monitor.
+
+    ALERT001's own remedy text says a genuine human decision belongs on the
+    Decision Queue with state. A queue item therefore has exactly what the rule
+    says is missing: a channel, state, and a consequence of never answering.
+    """
+    src = (
+        'publish_ops_alert(\n'
+        '    "**Ask:** Investigate why `x` has stopped updating, and either fix the '
+        'producer or acknowledge the staleness is expected right now.",\n'
+        '    source="freshness-monitor")\n'
+    )
+    assert _rules(src) == []
+
+
+def test_an_arrow_joined_vocabulary_is_not_an_instruction():
+    """saturday-sf-watch-dispatcher describes the AGENT's own workflow."""
+    src = (
+        'publish_ops_alert("_autonomous fix LAUNCHING — resilience agent dispatched; '
+        'outcome reported on box completion (diagnose->fix->merge->rerun)_", source="s")'
+    )
+    assert "ALERT002" not in _rules(src)
+
+
+def test_a_shell_script_that_publishes_nothing_is_an_operator_script():
+    """`pipeline-watchdog/deploy.sh` echoes "Confirm before proceeding".
+
+    That is an interactive prompt to the person who ran the script, who can
+    answer it or Ctrl-C — a channel with state. It was in scope only because
+    `watchdog` appears in its PATH.
+    """
+    src = 'echo "WARNING: --smoke will publish a real alert."\necho "Confirm before proceeding or omit --smoke."\n'
+    assert lint._in_scope("infrastructure/lambdas/pipeline-watchdog/deploy.sh", src) is False
+    publishing = src + 'python3 -m krepis.alerts publish --source x --message y\n'
+    assert lint._in_scope("infrastructure/lambdas/pipeline-watchdog/deploy.sh", publishing) is True
+
+
+def test_a_flow_doctor_emitter_is_in_scope():
+    """`notify_via_flow_doctor` reaches an operator; the class scanner misses it.
+
+    `saturday-sf-watch-dispatcher/index.py` and `scheduled-groom-dispatcher/index.py`
+    were out of scope entirely until this shape was added — 4 dedup keys and 6
+    unactionable messages that no guard had ever looked at
+    (``alpha-engine-config-I9490``).
+    """
+    src = 'notify_via_flow_doctor(text, dedup_key=f"w:{execution_arn}", flow_name="x")'
+    assert lint._in_scope("infrastructure/lambdas/saturday-sf-watch-dispatcher/index.py", src)
+    assert "ALERT003" in _rules(src, "infrastructure/lambdas/saturday-sf-watch-dispatcher/index.py")
+
+
+def test_a_clock_truncated_to_a_day_is_graded_calendar_not_execution():
+    """`pipeline-watchdog` keys on `datetime.now(timezone.utc).date().isoformat()`.
+
+    Still run-keyed, but it re-pages daily rather than per-run, and the tier is
+    what sets the remediation priority in the register.
+    """
+    assert lint.classify_dedup_expression(
+        "f'pipeline-watchdog-{sf_label}-{datetime.now(timezone.utc).date().isoformat()}'"
+    ) == ("calendar", "now")
+    assert lint.classify_dedup_expression("f'canary-replay:{run_token}'")[0] == "execution"

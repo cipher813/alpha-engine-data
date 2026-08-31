@@ -232,6 +232,10 @@ _RUNKEY_CALENDAR = re.compile(
 #: (``crucible-research-PR780``).
 _RUNKEY_EXEMPT = re.compile(r"as_?of", re.IGNORECASE)
 
+#: A clock reading truncated to a calendar day: `now.date()`, `date.today()`,
+#: `strftime("%Y-%m-%d")` with no time part.
+_DATE_TRUNCATION = re.compile(r"\.date\s*\(\s*\)|\btoday\s*\(\s*\)")
+
 #: Sub-day strftime directives inside a key literal: ``{now:%Y-%m-%dT%H:%M}``
 #: mints a new key every minute however the variable is named.
 _SUBDAY_STRFTIME = re.compile(r"%[HIMSfjs]")
@@ -271,6 +275,20 @@ def _is_sequence_token(text_lower: str, start: int, end: int) -> bool:
         _SEQUENCE_JOINER.match(text_lower[end:end + 3])
         or _SEQUENCE_JOINER_BEFORE.search(text_lower[max(0, start - 3):start])
     )
+
+
+#: A message carrying the Decision Queue's own field shape IS the remedy this
+#: lint recommends, not the defect it names. `engagement-protocol-policy.md`
+#: 6.4b requires an escalation to carry `**Ask:**` / `**Recommendation:**` /
+#: `**SOTA:**` / `**Delta:**`, and a queue item has exactly what ALERT001 says
+#: is missing: a channel, state, and a consequence of never being answered.
+#: Live false positive: `freshness-monitor/index.py` composes a queue item
+#: reading "**Options:** ... B) Acknowledge as expected ...", flagged for
+#: `acknowledge` — the one place in the fleet where asking for an
+#: acknowledgement is correct.
+_DECISION_QUEUE_SHAPE = re.compile(
+    r"\*\*(?:ask|options?|recommendation|sota|delta)\s*:?\*\*", re.IGNORECASE
+)
 
 
 def _is_instruction(text_lower: str, start: int) -> bool:
@@ -596,7 +614,12 @@ def classify_dedup_expression(expr: str) -> tuple[str, str] | None:
         return ("execution", _SUBDAY_STRFTIME.search(scrubbed).group(0))
     hit = _RUNKEY_EXECUTION.search(scrubbed)
     if hit:
-        return ("execution", hit.group(0).strip("_."))
+        # `now.date().isoformat()` reads a clock and then TRUNCATES it to a
+        # day, so it re-pages daily, not per-run. Still run-keyed, but the tier
+        # drives the remediation priority in the register, and calling a
+        # date-granular key "per-execution" overstates it.
+        tier = "calendar" if _DATE_TRUNCATION.search(scrubbed) else "execution"
+        return (tier, hit.group(0).strip("_."))
     hit = _RUNKEY_CALENDAR.search(scrubbed)
     if hit:
         return ("calendar", hit.group(0).strip("_."))
@@ -614,6 +637,8 @@ def lint_text(text: str, relpath: str) -> tuple[list[Finding], list[Waiver]]:
     strings = _python_message_strings(text) if is_python else _shell_message_strings(text)
     for lineno, value in strings:
         if len(value) < _MIN_MESSAGE_CHARS or " " not in value:
+            continue
+        if _DECISION_QUEUE_SHAPE.search(value):
             continue
         low = value.lower()
         for pattern, why in _ALERT001_TELLS:
@@ -712,12 +737,24 @@ def _in_scope(relpath: str, text: str) -> bool:
     parts = Path(relpath).parts[:-1]
     if any(seg in _UI_PATH_SEGMENTS for seg in parts):
         return False
-    if (
+    publishes = bool(
         scan._PUBLISH_CALL_PATTERN.search(text)
         or scan._CLI_CALL_PATTERN.search(text)
         or _EXTRA_PUBLISH_SHAPES.search(text)
-    ):
+    )
+    if publishes:
         return True
+    # A SHELL script that publishes nothing is talking to the terminal of the
+    # person who ran it, and that person can answer, or Ctrl-C. Live false
+    # positive: `pipeline-watchdog/deploy.sh` echoes "Confirm before proceeding
+    # or omit --smoke" -- an interactive prompt, admitted only because
+    # `watchdog` appears in its PATH. The name heuristic exists for the Python
+    # module that COMPOSES a message another module publishes; a shell script
+    # that composes without publishing is an operator script, not an emitter.
+    # Measured: of the six shell files this lint flags, that one is the only
+    # one with zero publish invocations.
+    if relpath.endswith(".sh"):
+        return False
     # Matched against the whole relative path, not just the basename. Every
     # Lambda in `nousergon-data` is `index.py`; the emitter identity lives in
     # its DIRECTORY (`lambdas/freshness-monitor/`, `lambdas/pipeline-watchdog/`).
