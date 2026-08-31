@@ -27,12 +27,15 @@ them. A synthetic fixture would have agreed with all four.
 """
 from __future__ import annotations
 
+import io
 import json
+import logging
 import pathlib
 
 import pytest
 
 from run_scope import (
+    AUTHORITY,
     DISABLED,
     DISPOSITIONS,
     ENABLED_COMPLETED,
@@ -44,6 +47,7 @@ from run_scope import (
     entered_sequence,
     gate_decisions,
     graded_stage_names,
+    merge_run_scopes,
     work_entry,
 )
 
@@ -294,12 +298,58 @@ def test_graded_stage_names_withholds_an_unknown_disposition():
 # ---------------------------------------------------------------------------
 
 
-def _index(monkeypatch, *, definition=None, history=None, raises=None):
+class _S3Error(Exception):
+    """A botocore-shaped error. ``index._error_code`` is duck-typed against the
+    ``response`` envelope precisely so these branches can be driven without
+    botocore in the test path."""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.response = {"Error": {"Code": code}}
+
+
+class _FakeS3:
+    """An S3 double with the ONE behaviour this fix depends on: conditional
+    writes.
+
+    ``IfNoneMatch: "*"`` (create-only) and ``IfMatch: <etag>`` (compare-and-swap)
+    are enforced here rather than assumed, because they are the mechanism that
+    makes the guard hold when the Lambda cannot read the incumbent at all.
+    """
+
+    def __init__(self, store=None, *, read_error=None):
+        self.store = dict(store or {})
+        self.etags = {k: f'"etag-{i}"' for i, k in enumerate(self.store)}
+        self.read_error = read_error
+        self.writes = []
+
+    def get_object(self, *, Bucket, Key):  # noqa: N803
+        if self.read_error:
+            raise _S3Error(self.read_error)
+        if Key not in self.store:
+            raise _S3Error("NoSuchKey")
+        body = json.dumps(self.store[Key]).encode()
+        return {"Body": io.BytesIO(body), "ETag": self.etags[Key]}
+
+    def put_object(self, **kwargs):
+        key = kwargs["Key"]
+        if kwargs.get("IfNoneMatch") == "*" and key in self.store:
+            raise _S3Error("PreconditionFailed")
+        if "IfMatch" in kwargs and self.etags.get(key) != kwargs["IfMatch"]:
+            raise _S3Error("PreconditionFailed")
+        self.store[key] = json.loads(kwargs["Body"].decode())
+        self.etags[key] = f'"etag-{len(self.writes)}"'
+        self.writes.append(kwargs)
+        return {}
+
+
+def _index(monkeypatch, *, definition=None, history=None, raises=None, s3=None):
     """Import the handler with boto3 replaced by a recording double."""
     import sys
     import types
 
     written = {}
+    s3 = s3 if s3 is not None else _FakeS3()
 
     class _States:
         def describe_state_machine(self, **_kw):
@@ -313,16 +363,26 @@ def _index(monkeypatch, *, definition=None, history=None, raises=None):
                     return [{"events": history or []}]
             return _P()
 
-    class _S3:
-        def put_object(self, **kwargs):
-            written.update(kwargs)
+    class _RecordingS3:
+        def __getattr__(self, name):
+            attr = getattr(s3, name)
+            if name != "put_object":
+                return attr
+
+            def _put(**kwargs):
+                result = attr(**kwargs)
+                written.clear()
+                written.update(kwargs)
+                return result
+            return _put
 
     fake = types.SimpleNamespace(
-        client=lambda name: _States() if name == "stepfunctions" else _S3()
+        client=lambda name: _States() if name == "stepfunctions" else _RecordingS3()
     )
     monkeypatch.setitem(sys.modules, "boto3", fake)
     sys.modules.pop("index", None)
     import index  # noqa: PLC0415
+    index.fake_s3 = s3
     return index, written
 
 
@@ -468,3 +528,391 @@ def test_a_failed_derivation_grades_nothing_rather_than_failing_the_run(
     # Still persisted: an absent artifact and an unmeasured one must not look
     # the same to the consumer.
     assert written["Key"] == "backtest/2026-08-14/run_scope.json"
+
+
+# ---------------------------------------------------------------------------
+# The clobber guard — one key per cycle, several executions writing it
+# (alpha-engine-config-I8811)
+# ---------------------------------------------------------------------------
+
+_KEY = "backtest/2026-08-14/run_scope.json"
+
+
+def _scheduled_then_rerun(monkeypatch, definition, first_history, second_history):
+    """Write a cycle's scope from one execution, then attempt it from another.
+
+    Both bodies are derived from REAL captured executions, and the second write
+    goes through the same conditional-write path production uses — the store is
+    not hand-assembled between the two.
+    """
+    s3 = _FakeS3()
+    index, _ = _index(monkeypatch, definition=definition, history=first_history, s3=s3)
+    scheduled = index.handler(
+        {"run_date": "2026-08-15", "execution_arn": "arn:scheduled",
+         "state_machine_arn": "arn:y",
+         "execution_input": {"skip_parity": True}},
+        None,
+    )
+    index2, written = _index(
+        monkeypatch, definition=definition, history=second_history, s3=s3
+    )
+    rerun = index2.handler(
+        {"run_date": "2026-08-15", "execution_arn": "arn:watch-rerun-2026-08-28-13",
+         "state_machine_arn": "arn:y",
+         "execution_input": {"skip_backtester": True, "skip_parity": True}},
+        None,
+    )
+    return s3, scheduled, rerun, written
+
+
+def test_a_skip_flagged_rerun_cannot_demote_a_scheduled_runs_scope(
+    monkeypatch, definition, real_run_history, all_skip_history, caplog
+):
+    """THE regression, in the exact 2026-08-28 shape.
+
+    A scheduled run writes the cycle's scope; a later skip-flagged recovery
+    rerun runs ``RunScope`` over the same ``run_date`` and derives a scope in
+    which almost nothing ran. Pre-fix, the rerun's body simply replaced the
+    scheduled run's — which is how both artifacts on S3 on 2026-08-31 came to
+    claim ``Backtester: DISABLED`` for cycles whose backtester artifacts exist,
+    and how ``Parity`` came to read ``NOT_REACHED`` on a cycle where it was
+    deliberately ``DISABLED`` by ``skip_parity``.
+
+    Both halves of that matter for clause 5: ``NOT_REACHED`` does not arm
+    ``NOT_IN_SCOPE`` in ``crucible-evaluator``'s
+    ``attestation._mark_scope_out_of_scope`` and ``DISABLED`` does, so the
+    demotion alone is enough to hold ``contamination_verdict`` at UNKNOWN over a
+    clean week.
+    """
+    with caplog.at_level(logging.ERROR):
+        s3, scheduled, rerun, _ = _scheduled_then_rerun(
+            monkeypatch, definition, real_run_history, all_skip_history
+        )
+
+    stored = s3.store[_KEY]
+    # The scheduled run established these; the rerun claimed weaker ones.
+    assert scheduled["stages"]["Parity"]["disposition"] == DISABLED
+    assert scheduled["stages"]["Evaluator"]["disposition"] == ENABLED_COMPLETED
+    assert stored["stages"]["Parity"]["disposition"] == DISABLED
+    assert stored["stages"]["Parity"]["disabled_by"] == "skip_parity"
+    assert stored["stages"]["Evaluator"]["disposition"] == ENABLED_COMPLETED
+    assert stored["stages"]["Parity"]["recorded_by_execution_arn"] == "arn:scheduled"
+
+    # The refusal is DURABLE (in the artifact) and LOUD (an ERROR line naming
+    # both sides) — a guard whose refusal leaves no trace is indistinguishable
+    # from the silent overwrite it replaced.
+    refused = {r["stage"]: r for r in stored["scope_merge"]["rejected"]}
+    assert refused["Parity"]["kept"] == DISABLED
+    assert refused["Parity"]["refused"] == NOT_REACHED
+    assert refused["Evaluator"]["refused"] == DISABLED
+    assert refused["Parity"]["kept_from"] == "arn:scheduled"
+    assert any("write REFUSED for stage Parity" in r.message for r in caplog.records)
+    # The returned block is the merged truth, not this execution's derivation.
+    assert rerun["stages"]["Parity"]["disposition"] == DISABLED
+
+
+def test_the_guard_fails_when_removed(
+    monkeypatch, definition, real_run_history, all_skip_history
+):
+    """Prove the guard is load-bearing: with the merge neutralised, the same
+    two executions reproduce the live defect.
+
+    A guard not verified to fail is not a guard. Neutralising is done by
+    replacing ``merge_run_scopes`` with the pre-fix behaviour — last writer
+    wins — rather than by editing the assertion, so what is demonstrated is the
+    mechanism and not the test.
+    """
+    import index as _probe  # noqa: PLC0415,F401
+
+    s3 = _FakeS3()
+    index, _ = _index(monkeypatch, definition=definition, history=real_run_history, s3=s3)
+    index.handler(
+        {"run_date": "2026-08-15", "execution_arn": "arn:scheduled",
+         "state_machine_arn": "arn:y", "execution_input": {"skip_parity": True}},
+        None,
+    )
+    index2, _ = _index(monkeypatch, definition=definition, history=all_skip_history, s3=s3)
+    monkeypatch.setattr(
+        index2, "merge_run_scopes",
+        lambda _incumbent, incoming: (incoming, {"merged": False, "accepted": [],
+                                                 "rejected": []}),
+    )
+    index2.handler(
+        {"run_date": "2026-08-15", "execution_arn": "arn:rerun",
+         "state_machine_arn": "arn:y", "execution_input": {"skip_backtester": True}},
+        None,
+    )
+    # Pre-fix behaviour, reproduced exactly: the scheduled run's deliberate
+    # DISABLED becomes NOT_REACHED, which is what denies clause 5.
+    assert s3.store[_KEY]["stages"]["Parity"]["disposition"] == NOT_REACHED
+    assert s3.store[_KEY]["stages"]["Evaluator"]["disposition"] == DISABLED
+
+
+def test_a_rerun_that_genuinely_re_runs_a_stage_still_records_it(
+    monkeypatch, definition, all_skip_history, real_run_history
+):
+    """The other half of the requirement, and the reason immutability was
+    rejected.
+
+    Reversed order: the skip-flagged shell run writes first, then an execution
+    that really dispatched the stages writes. Every stronger claim lands —
+    otherwise the fix would have traded a fail-open for a fail-stuck, and a
+    genuine recovery could never record what it re-ran.
+    """
+    s3, first, second, _ = _scheduled_then_rerun(
+        monkeypatch, definition, all_skip_history, real_run_history
+    )
+    stored = s3.store[_KEY]
+    assert first["stages"]["Evaluator"]["disposition"] == DISABLED
+    assert stored["stages"]["Evaluator"]["disposition"] == ENABLED_COMPLETED
+    accepted = {a["stage"] for a in stored["scope_merge"]["accepted"]}
+    assert "Evaluator" in accepted
+    assert stored["stages"]["Evaluator"]["recorded_by_execution_arn"] \
+        == "arn:watch-rerun-2026-08-28-13"
+    # Both executions are named on the artifact, per row and in aggregate.
+    assert len(stored["contributing_executions"]) == 2
+
+
+def test_a_failed_derivation_never_erases_an_established_scope(
+    monkeypatch, definition, real_run_history
+):
+    """The fail-open path is itself a clobber vector, and was one.
+
+    A later execution whose derivation raises publishes a block with
+    ``degraded: True`` and zero rows — and the consumer reads ``degraded`` as
+    SCOPE UNKNOWN. Writing that over a good scope would take a measured cycle
+    to unmeasured, which is the same destruction in a different costume.
+    """
+    s3 = _FakeS3()
+    index, _ = _index(monkeypatch, definition=definition, history=real_run_history, s3=s3)
+    index.handler(
+        {"run_date": "2026-08-15", "execution_arn": "arn:scheduled",
+         "state_machine_arn": "arn:y", "execution_input": {"skip_parity": True}},
+        None,
+    )
+    index2, _ = _index(monkeypatch, raises=RuntimeError("no such execution"), s3=s3)
+    result = index2.handler(
+        {"run_date": "2026-08-15", "execution_arn": "arn:broken",
+         "state_machine_arn": "arn:y"},
+        None,
+    )
+    stored = s3.store[_KEY]
+    assert "degraded" not in stored
+    assert stored["stages"]["Evaluator"]["disposition"] == ENABLED_COMPLETED
+    assert "RuntimeError" in stored["scope_merge"]["incoming_degraded_reason"]
+    assert result["scope_merge"]["incoming_degraded"] is True
+
+
+def test_an_unreadable_incumbent_is_declined_not_overwritten(
+    monkeypatch, definition, real_run_history, all_skip_history, caplog
+):
+    """The posture while the ``s3:GetObject`` grant lags the code deploy.
+
+    ``deploy-weekly-run-scope.yml`` ships CODE ONLY — its OIDC role has no
+    ``iam:PutRolePolicy`` by design — so the new grant in ``iam-policy.json``
+    reaches the role on a later operator ``--apply-iam``. In between, the
+    Lambda cannot read the incumbent. It must therefore not be able to destroy
+    it either: the write degrades to create-only (``IfNoneMatch: "*"``), S3
+    itself refuses it, and the handler declines at ERROR. The fix is safe from
+    the moment the code lands, not from the moment the grant does.
+    """
+    s3 = _FakeS3()
+    index, _ = _index(monkeypatch, definition=definition, history=real_run_history, s3=s3)
+    index.handler(
+        {"run_date": "2026-08-15", "execution_arn": "arn:scheduled",
+         "state_machine_arn": "arn:y", "execution_input": {"skip_parity": True}},
+        None,
+    )
+    established = json.loads(json.dumps(s3.store[_KEY]))
+
+    s3.read_error = "AccessDenied"
+    index2, _ = _index(monkeypatch, definition=definition, history=all_skip_history, s3=s3)
+    with caplog.at_level(logging.ERROR):
+        result = index2.handler(
+            {"run_date": "2026-08-15", "execution_arn": "arn:rerun",
+             "state_machine_arn": "arn:y"},
+            None,
+        )
+    assert s3.store[_KEY] == established          # untouched
+    assert result["write_declined"]["key"] == _KEY
+    assert "AccessDenied" in result["write_declined"]["reason"]
+    assert any("write DECLINED" in r.message for r in caplog.records)
+
+
+def test_the_first_write_of_a_cycle_is_create_only(
+    monkeypatch, definition, real_run_history
+):
+    """No incumbent -> ``IfNoneMatch: "*"``. A concurrent execution that wrote
+    between our read and our write loses the race instead of being silently
+    replaced."""
+    index, written = _index(
+        monkeypatch, definition=definition, history=real_run_history
+    )
+    index.handler(
+        {"run_date": "2026-08-15", "execution_arn": "arn:scheduled",
+         "state_machine_arn": "arn:y"},
+        None,
+    )
+    assert written["IfNoneMatch"] == "*"
+    assert "IfMatch" not in written
+
+
+def test_a_merge_write_is_compare_and_swap(
+    monkeypatch, definition, real_run_history, all_skip_history
+):
+    """Incumbent read -> ``IfMatch`` its ETag. Read-merge-write without a
+    condition is a race with a longer window, not a fix."""
+    s3, _, _, written = _scheduled_then_rerun(
+        monkeypatch, definition, real_run_history, all_skip_history
+    )
+    assert written["IfMatch"].startswith('"etag-')
+    assert "IfNoneMatch" not in written
+
+
+def test_a_lost_race_is_retried_against_the_new_incumbent(
+    monkeypatch, definition, real_run_history, all_skip_history
+):
+    """A 412 on a MERGE write means somebody else wrote between our read and
+    our put. That is a retry, not a refusal — the merge is simply recomputed
+    against what is now there."""
+    s3 = _FakeS3()
+    index, _ = _index(monkeypatch, definition=definition, history=real_run_history, s3=s3)
+    index.handler(
+        {"run_date": "2026-08-15", "execution_arn": "arn:scheduled",
+         "state_machine_arn": "arn:y", "execution_input": {"skip_parity": True}},
+        None,
+    )
+    real_put = s3.put_object
+    calls = {"n": 0}
+
+    def _flaky(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            s3.etags[_KEY] = '"etag-moved"'   # somebody else wrote first
+            raise _S3Error("PreconditionFailed")
+        return real_put(**kwargs)
+
+    s3.put_object = _flaky
+    index2, _ = _index(monkeypatch, definition=definition, history=all_skip_history, s3=s3)
+    index2.handler(
+        {"run_date": "2026-08-15", "execution_arn": "arn:rerun",
+         "state_machine_arn": "arn:y"},
+        None,
+    )
+    assert calls["n"] == 2
+    assert s3.store[_KEY]["stages"]["Parity"]["disposition"] == DISABLED
+
+
+def test_a_permanent_race_raises_rather_than_forcing_the_write(
+    monkeypatch, definition, real_run_history, all_skip_history
+):
+    """Exhausting the attempts raises. The SF's Catch on ``RunScope`` routes it
+    to ``CheckSkipReportCard`` without failing the weekly run, and the cycle
+    keeps the scope already on S3 — never a forced overwrite."""
+    s3 = _FakeS3()
+    index, _ = _index(monkeypatch, definition=definition, history=real_run_history, s3=s3)
+    index.handler(
+        {"run_date": "2026-08-15", "execution_arn": "arn:scheduled",
+         "state_machine_arn": "arn:y"},
+        None,
+    )
+
+    def _always_conflict(**_kwargs):
+        raise _S3Error("PreconditionFailed")
+
+    s3.put_object = _always_conflict
+    index2, _ = _index(monkeypatch, definition=definition, history=all_skip_history, s3=s3)
+    with pytest.raises(index2.ScopeWriteConflictError):
+        index2.handler(
+            {"run_date": "2026-08-15", "execution_arn": "arn:rerun",
+             "state_machine_arn": "arn:y"},
+            None,
+        )
+
+
+def test_the_dry_run_exercises_the_incumbent_read_and_writes_nothing(
+    monkeypatch, definition, real_run_history
+):
+    """The Friday rehearsal is where a missing grant must surface — a rehearsal
+    that skipped the new read would leave it to be discovered by the Saturday
+    run it exists to protect."""
+    s3 = _FakeS3(read_error="AccessDenied")
+    index, written = _index(
+        monkeypatch, definition=definition, history=real_run_history, s3=s3
+    )
+    result = index.handler(
+        {"run_date": "2026-08-14", "execution_arn": "a", "state_machine_arn": "b",
+         "dry_run": True},
+        None,
+    )
+    assert result["dry_run"] is True
+    assert result["incumbent_read"]["ok"] is False
+    assert "AccessDenied" in result["incumbent_read"]["note"]
+    assert written == {}
+    assert s3.store == {}
+
+
+# ---------------------------------------------------------------------------
+# The merge rule itself
+# ---------------------------------------------------------------------------
+
+
+def test_authority_ranks_dispatch_above_a_later_skip():
+    """The ordering IS the rule, so it is asserted directly rather than only
+    through its consequences. Dispatch is a fact about the cycle that a later
+    skip cannot unmake; an absence of evidence ranks below a decision."""
+    assert AUTHORITY[NOT_REACHED] < AUTHORITY[DISABLED] \
+        < AUTHORITY[ENABLED_FAILED] < AUTHORITY[ENABLED_COMPLETED]
+
+
+@pytest.mark.parametrize(
+    "held,offered,expected",
+    [
+        (ENABLED_COMPLETED, DISABLED, ENABLED_COMPLETED),
+        (ENABLED_COMPLETED, NOT_REACHED, ENABLED_COMPLETED),
+        (ENABLED_FAILED, DISABLED, ENABLED_FAILED),
+        (DISABLED, NOT_REACHED, DISABLED),
+        (NOT_REACHED, DISABLED, DISABLED),
+        (NOT_REACHED, ENABLED_COMPLETED, ENABLED_COMPLETED),
+        (ENABLED_FAILED, ENABLED_COMPLETED, ENABLED_COMPLETED),
+        (ENABLED_COMPLETED, "PROBABLY_FINE", ENABLED_COMPLETED),
+    ],
+)
+def test_a_row_is_replaced_only_by_a_strictly_stronger_claim(held, offered, expected):
+    incumbent = {"run_date": "2026-08-14", "execution_arn": "arn:first",
+                 "stages": {"Parity": {"disposition": held,
+                                       "recorded_by_execution_arn": "arn:first"}}}
+    incoming = {"run_date": "2026-08-14", "execution_arn": "arn:second",
+                "stages": {"Parity": {"disposition": offered,
+                                      "recorded_by_execution_arn": "arn:second"}}}
+    merged, ledger = merge_run_scopes(incumbent, incoming)
+    assert merged["stages"]["Parity"]["disposition"] == expected
+    assert merged["counts"][expected] == 1 if expected in DISPOSITIONS else True
+    assert ledger["merged"] is True
+
+
+def test_the_merge_never_raises_on_a_degenerate_incumbent():
+    """An unreadable or foreign incumbent must not strand a cycle forever on a
+    corrupt artifact — it is treated as no incumbent and recorded as such."""
+    incoming = {"run_date": "2026-08-14", "stages":
+                {"Parity": {"disposition": DISABLED}}}
+    for junk in (None, "", [], {"stages": "nope"}, {}):
+        merged, ledger = merge_run_scopes(junk, json.loads(json.dumps(incoming)))
+        assert merged["stages"]["Parity"]["disposition"] == DISABLED
+        assert ledger["merged"] is False
+
+
+def test_the_merged_statement_is_recomputed_not_carried():
+    """The statement is the denominator every downstream grade is rendered
+    against. Carrying either input's is how a surface goes quietly green."""
+    incumbent = {"run_date": "2026-08-14", "statement": "stale.",
+                 "stages": {"A": {"disposition": ENABLED_COMPLETED},
+                            "B": {"disposition": ENABLED_COMPLETED}}}
+    incoming = {"run_date": "2026-08-14", "statement": "also stale.",
+                "stages": {"A": {"disposition": NOT_REACHED},
+                           "C": {"disposition": DISABLED}}}
+    merged, _ = merge_run_scopes(incumbent, incoming)
+    assert merged["statement"] == (
+        "2 of 3 gated stages ran and are graded; 1 disabled by operator flag."
+    )
+    assert merged["graded_stages"] == ["A", "B"]
