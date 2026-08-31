@@ -212,10 +212,22 @@ def evaluate(
         "tolerance_bps": tolerance_bps,
         "sources": {c.source: c.price for c in usable},
     }
-    logger.error(
+    # WARNING, not ERROR: this primitive doesn't know whether ITS OWN
+    # withholding of `value` is the caller's actual behavior — the only live
+    # caller (collectors.daily_closes, observer-mode per config#1277 Option A)
+    # does NOT withhold the number from NAV/PnL, it only flags it, and logs
+    # its own accurate ERROR describing that. Logging ERROR here too paged
+    # Flow Doctor twice for one event, with the low-level message claiming a
+    # "value withheld" outcome that was never true for any deployed caller
+    # (2026-08-31, alpha-engine-config-I9xxx). A future enforcement-mode
+    # caller (Option B/C) that DOES withhold the value should log its own
+    # ERROR at the point it actually happens — same reasoning as observer
+    # mode owning its own alert, never doubled up with this one.
+    logger.warning(
         "L1 cross-source QUARANTINE %s @ %s: %s disagree@%.2fbps > tol=%.1fbps "
-        "— value withheld (NOT recorded), discrepancy emitted; investigate before "
-        "downstream NAV/PnL consumes this date",
+        "— value=None in this decision; caller decides whether that value is "
+        "withheld or merely flagged (see the caller's own log for the actual "
+        "outcome)",
         ticker, date, detail, spread_bps, tolerance_bps,
     )
     return GateDecision(

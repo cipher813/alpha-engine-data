@@ -80,6 +80,26 @@ def test_sources_disagree_quarantined():
     assert "DISAGREE" in d.provenance and "QUARANTINED" in d.provenance
 
 
+def test_quarantine_logs_at_warning_not_error(caplog):
+    """The gate itself must not page: this primitive doesn't know whether ITS
+    withholding of `value` is the caller's actual behavior — the only live
+    caller (collectors.daily_closes, observer-mode) does not withhold the
+    number and logs its own accurate ERROR describing that. An ERROR here
+    too pages Flow Doctor twice for one event with a message that claims a
+    "value withheld" outcome that isn't true for any deployed caller
+    (2026-08-31 regression)."""
+    with caplog.at_level("WARNING", logger="sources.cross_source_gate"):
+        evaluate("XYZ", "2026-06-25", [
+            SourceClose("polygon", 100.00),
+            SourceClose("yfinance", 105.00),
+        ])
+    assert not any(rec.levelname == "ERROR" for rec in caplog.records)
+    assert any(
+        rec.levelname == "WARNING" and "QUARANTINE" in rec.message
+        for rec in caplog.records
+    )
+
+
 def test_just_over_tolerance_quarantines():
     # 8 bps spread with default 7.5 bps tolerance -> quarantine.
     base = 100.0
