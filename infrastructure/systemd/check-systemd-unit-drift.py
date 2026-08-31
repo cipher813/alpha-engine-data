@@ -111,6 +111,24 @@ have inherited the same wrong list. Roots are therefore found by walking
 so a checkout that lands on a box is covered the day it lands, with nothing
 to remember to edit. `--codified-root` still works and is ADDITIVE, for a
 tree outside the search bases.
+
+**A drift/uncodified finding is annotated with `boot-pull.service` health
+(2026-08-31, alpha-engine-config-I9444).** Measured live on the trading box
+(ip-172-31-79-214): `daily-news.timer` and `systemd-unit-drift-check.timer`
+both drifted, and the bare finding ("installed (c78dd9556b6a) != repo
+(7cab59f44f9d)") gave no signal that the box's ONLY reconciliation path
+outside a manual install — `boot-pull.service`, per the 2026-07-13 "queue on
+merge, apply on next boot" ruling on config#2352 — had been failing at
+EVERY boot since 2026-08-28 (crucible-executor's `boot-pull-launcher.sh` was
+never copied to `/usr/local/sbin` on this instance, so systemd could not
+exec it). A human reading that finding has to already know boot-pull exists
+and go check it by hand; `_boot_pull_diagnosis()` does that check itself and,
+when boot-pull.service is loaded and its last run did not succeed, appends
+one diagnostic line naming the actual cause. Best-effort and silent
+everywhere boot-pull.service does not apply — the dashboard box (push-
+deployed on merge, no boot-pull), a laptop, or CI — so its own failure to
+run `systemctl` can never affect the exit code or mask the underlying drift
+finding it is only ever adding CONTEXT to, never replacing.
 """
 
 from __future__ import annotations
@@ -118,6 +136,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import socket
+import subprocess
 import sys
 from pathlib import Path
 
@@ -359,6 +378,62 @@ def check_unit(
     return "clean", f"{name}: OK"
 
 
+def _boot_pull_diagnosis(run=None) -> str | None:
+    """If `boot-pull.service` exists on this box and its last run failed, say so.
+
+    Boot-pull is the trading box's ONLY reconciliation path outside a manual
+    `install-*.sh` run (2026-07-13 ruling on config#2352: "queue on merge,
+    apply on next boot") — when it fails, every unit it manages goes stale
+    silently until the next boot, and a bare "installed != repo" finding
+    gives no signal that this is the actual cause rather than an on-box
+    hand-edit (alpha-engine-config-I9444: `boot-pull-launcher.sh` missing
+    from `/usr/local/sbin` left `boot-pull.service` failing at every boot
+    from 2026-08-28 through 2026-08-31, and that is exactly what produced
+    the `daily-news.timer` / `systemd-unit-drift-check.timer` drift this
+    function now names on sight).
+
+    `run` is injectable for tests; production always calls
+    `subprocess.run`. Best-effort and silent on any box without
+    `boot-pull.service` — the dashboard box updates via deploy-on-merge SSM
+    push instead, and this script also runs on a laptop / in CI where
+    `systemctl` may not exist at all — so this is a diagnostic ANNOTATION,
+    never a second source of findings: its own failure must never raise,
+    change the exit code, or mask the drift finding it only adds context to.
+    """
+    runner = run or subprocess.run
+    try:
+        proc = runner(
+            [
+                "systemctl", "show", "boot-pull.service",
+                "--property=LoadState,ActiveState,Result",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    props = dict(
+        line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line
+    )
+    if props.get("LoadState") != "loaded":
+        return None  # boot-pull.service does not exist on this box
+    result = props.get("Result", "")
+    if props.get("ActiveState") == "failed" or result not in ("", "success"):
+        return (
+            f"boot-pull.service (Result={result or 'unknown'}) is in a FAILED "
+            "state — this box's only reconciliation path outside a manual "
+            "install did not complete its last run, which is the likely cause "
+            "of the drift/uncodified findings above, not an on-box hand-edit; "
+            "see `systemctl status boot-pull.service` and "
+            "/var/log/boot-pull.log on the box (alpha-engine-config-I9444)"
+        )
+    return None
+
+
 def _emit_metrics(counts: dict) -> None:
     """Put the coverage counts to CloudWatch. Best-effort, loudly.
 
@@ -535,6 +610,15 @@ def main() -> int:
             exit_code = max(exit_code, 1)
     if uncodified and args.strict:
         exit_code = max(exit_code, 1)
+
+    # Diagnostic annotation, never a second source of findings: only runs
+    # when there is already something to explain, and never changes
+    # exit_code (computed above) — see _boot_pull_diagnosis's docstring.
+    if buckets["drift"] or uncodified_new:
+        diagnosis = _boot_pull_diagnosis()
+        if diagnosis:
+            print(f"[diagnosis] {diagnosis}")
+            findings.append(diagnosis)
 
     # Console publish runs on EVERY invocation — clean or not, `--report` or
     # not — mirroring crucible-dashboard's box_health_hygiene precedent

@@ -4,8 +4,10 @@ Covers the installed-vs-repo systemd unit drift probe: clean match,
 divergence detection, not-installed (box hosts neither pair) as non-error,
 and missing repo source as a config error. No real AWS/systemd access —
 purely local file comparison, so this is a plain tmp-dir fixture test
-(mirrors the module-load pattern used by test_sf_definition_check_drift.py,
-minus the subprocess mocking since this script never shells out to AWS).
+(mirrors the module-load pattern used by test_sf_definition_check_drift.py).
+The one exception is `_boot_pull_diagnosis` (alpha-engine-config-I9444),
+which does shell out to `systemctl` — those tests inject a fake `run`
+callable rather than touching a real subprocess.
 """
 from __future__ import annotations
 
@@ -736,3 +738,108 @@ class TestCodifiedRootDiscovery:
         assert "[clean] ibgateway.service" in cap.out
         assert "disagreeing copies" in cap.out
         assert "ambiguous=1" in cap.out
+
+
+class _FakeCompleted:
+    def __init__(self, returncode: int, stdout: str):
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+class TestBootPullDiagnosis:
+    """`_boot_pull_diagnosis` (alpha-engine-config-I9444): a drift/uncodified
+    finding is annotated with boot-pull.service health, because a bare
+    hash-mismatch line gives no signal that the box's ONLY reconciliation
+    path outside a manual install failed rather than someone hand-editing a
+    unit file. Diagnostic only — must never raise, never change exit_code,
+    and stay silent everywhere boot-pull.service does not apply."""
+
+    def test_failed_boot_pull_is_named(self, cd):
+        module, _, _ = cd
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return _FakeCompleted(0, "LoadState=loaded\nActiveState=failed\nResult=exit-code\n")
+
+        diagnosis = module._boot_pull_diagnosis(run=fake_run)
+        assert diagnosis is not None
+        assert "boot-pull.service" in diagnosis
+        assert "FAILED" in diagnosis
+        assert calls and calls[0][:2] == ["systemctl", "show"]
+
+    def test_healthy_boot_pull_is_silent(self, cd):
+        module, _, _ = cd
+
+        def fake_run(cmd, **kw):
+            return _FakeCompleted(0, "LoadState=loaded\nActiveState=inactive\nResult=success\n")
+
+        assert module._boot_pull_diagnosis(run=fake_run) is None
+
+    def test_box_without_boot_pull_service_is_silent(self, cd):
+        """The dashboard box (push-deployed on merge) has no boot-pull.service
+        at all — `systemctl show` on a unit that was never loaded returns
+        LoadState=not-found, and that must never be reported as a failure."""
+        module, _, _ = cd
+
+        def fake_run(cmd, **kw):
+            return _FakeCompleted(0, "LoadState=not-found\nActiveState=inactive\nResult=success\n")
+
+        assert module._boot_pull_diagnosis(run=fake_run) is None
+
+    def test_missing_systemctl_is_silent_not_raised(self, cd):
+        """A laptop or CI runner has no systemctl at all — this is a
+        diagnostic annotation, not a hard dependency of the check."""
+        module, _, _ = cd
+
+        def fake_run(cmd, **kw):
+            raise FileNotFoundError("systemctl not found")
+
+        assert module._boot_pull_diagnosis(run=fake_run) is None
+
+    def test_nonzero_returncode_is_silent(self, cd):
+        module, _, _ = cd
+
+        def fake_run(cmd, **kw):
+            return _FakeCompleted(1, "")
+
+        assert module._boot_pull_diagnosis(run=fake_run) is None
+
+    def test_main_appends_diagnosis_to_findings_when_boot_pull_failed(self, cd, monkeypatch, capsys):
+        """End-to-end: a drifted unit plus a failed boot-pull.service produces
+        a console/alert finding set that names BOTH — the drift and its
+        likely cause — not the drift alone."""
+        module, script_dir, installed_dir = cd
+        _write(script_dir / "daily-news.service", "UNIT NEW\n")
+        _write(installed_dir / "daily-news.service", "UNIT OLD\n")
+        for name in module.ALL_UNITS:
+            if name != "daily-news.service":
+                _write(script_dir / name, f"UNIT {name}\n")
+
+        monkeypatch.setattr(
+            module,
+            "_boot_pull_diagnosis",
+            lambda: "boot-pull.service (Result=exit-code) is in a FAILED state",
+        )
+        monkeypatch.setattr("sys.argv", ["check-systemd-unit-drift.py"])
+        exit_code = module.main()
+        out = capsys.readouterr().out
+
+        assert exit_code == 1, "the diagnosis must never change the drift exit code"
+        assert "[diagnosis] boot-pull.service" in out
+
+    def test_main_does_not_call_diagnosis_when_clean(self, cd, monkeypatch, capsys):
+        """No need to shell out to systemctl on every clean run — the
+        annotation only has something to explain once there is a finding."""
+        module, script_dir, installed_dir = cd
+        for name in module.ALL_UNITS:
+            _write(script_dir / name, f"UNIT {name}\n")
+            _write(installed_dir / name, f"UNIT {name}\n")
+
+        called = []
+        monkeypatch.setattr(module, "_boot_pull_diagnosis", lambda: called.append(1))
+        monkeypatch.setattr("sys.argv", ["check-systemd-unit-drift.py"])
+        code = module.main()
+
+        assert code == 0
+        assert not called, "_boot_pull_diagnosis must not run on a clean box"
