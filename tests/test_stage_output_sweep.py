@@ -1423,3 +1423,195 @@ class TestAlertBody:
             "unmeasured": [{"stage": "S", "artifact_id": "a", "verdict": sos.UNMEASURED}],
         })
         assert published["kw"]["severity"] == "warn"
+
+
+# ---------------------------------------------------------------------------
+# gated-forever rows (alpha-engine-config-I9617)
+# ---------------------------------------------------------------------------
+
+#: The 2026-08-29 scheduled weekly run, execution
+#: ``965d925b-f9d6-ce5e-e059-9405433a0724_c0271e3b-a27f-a834-b303-3e3803fffd16``:
+#: ran ~5h and ended at the ``DegradedRun`` terminal. Its
+#: ``WeeklySubstrateHealthCheck`` stage logged
+#: ``STAGE OUTPUT MISSING: 6 declared artifact(s) absent or stale for
+#: run_date=2026-08-28``, and every one of the six was a registry row carrying
+#: ``grace_period_cycles: 999`` — a study whose producer auto-skips when its
+#: own precondition is unmet.
+AUG29_RUN_DATE = "2026-08-28"
+AUG29_EXEC_START = datetime(2026, 8, 29, 9, 0, 0, tzinfo=timezone.utc)
+
+#: (artifact_id, s3_key_template, producing stage) — transcribed from
+#: ARTIFACT_REGISTRY.yaml as of 2026-08-31. All eight rows in the live
+#: registry that carry ``grace_period_cycles: 999``; the six the 2026-08-29
+#: run actually reported are the first five plus ``regime_state_dated``.
+AUG29_GATED_ROWS = [
+    ("backtest_gamma_sweep", "backtest/{trading_day}/gamma_sweep.json", "Backtester"),
+    ("backtest_horizon_net_alpha",
+     "backtest/{trading_day}/horizon_net_alpha.json", "Backtester"),
+    ("backtest_model_version_net_alpha",
+     "backtest/{trading_day}/model_version_net_alpha.json", "Backtester"),
+    ("backtest_double_sort", "backtest/{trading_day}/double_sort.json", "Backtester"),
+    ("backtest_sizing_shootout",
+     "backtest/{trading_day}/sizing_shootout.json", "Backtester"),
+    ("regime_state_dated", "regime/{trading_day}.json", "RegimeSubstrate"),
+]
+
+
+class TestAbsenceDeclaredCorrect:
+    def test_grace_999_is_the_legacy_gated_forever_marker(self):
+        reason = sos.absence_declared_correct(
+            _row("a", "k/{date}.json", "Backtester", grace_period_cycles=999)
+        )
+        assert reason and "grace_period_cycles: 999" in reason
+
+    def test_event_driven_names_its_liveness_anchor(self):
+        reason = sos.absence_declared_correct(
+            _row("a", "k/{date}.json", "Backtester",
+                 cadence="event_driven", liveness_via="config_apply_audit")
+        )
+        assert reason and "event_driven" in reason
+        assert "config_apply_audit" in reason
+
+    def test_an_ordinary_grace_period_is_not_a_gate(self):
+        """The predicate keys on the gated-forever marker, not on grace at
+        all. A newly-onboarded row with ``grace_period_cycles: 2`` is still
+        fully assertable — otherwise the fix would silently mute a third of
+        the registry."""
+        assert sos.absence_declared_correct(
+            _row("a", "k/{date}.json", "Backtester", grace_period_cycles=2)
+        ) is None
+        assert sos.absence_declared_correct(
+            _row("a", "k/{date}.json", "Backtester")
+        ) is None
+
+    def test_a_non_numeric_grace_is_not_treated_as_a_gate(self):
+        """Fail toward asserting: an unparseable declaration is not a licence
+        to stop checking."""
+        assert sos.absence_declared_correct(
+            _row("a", "k/{date}.json", "Backtester", grace_period_cycles="lots")
+        ) is None
+
+    def test_declared_outputs_carries_the_reason(self):
+        decl = sos.declared_outputs(
+            [_row("a", "k/{date}.json", "Backtester", grace_period_cycles=999)],
+            pipeline=PIPELINE,
+        )[0]
+        assert decl["absence_declared_correct"]
+
+
+class TestAugust29GatedReplay:
+    """Replays the 2026-08-29 finding set from the recorded registry rows plus
+    the recorded S3 state (none of the six keys existed). Before the fix all
+    six were ``missing`` and the sweep was one ``--enforce`` flip from
+    terminating a four-hour run on them."""
+
+    def _findings(self, *, gated: bool):
+        rows = [
+            _row(aid, tmpl, stage,
+                 **({"grace_period_cycles": 999} if gated else {}))
+            for aid, tmpl, stage in AUG29_GATED_ROWS
+        ]
+        return sos.evaluate(
+            sos.declared_outputs(rows, pipeline=PIPELINE),
+            run_date=AUG29_RUN_DATE,
+            execution_start=AUG29_EXEC_START,
+            head=_head_from({}),
+            cycle_date=AUG29_RUN_DATE,
+        )
+
+    def test_all_six_are_gated_not_missing(self):
+        findings = self._findings(gated=True)
+        assert len(findings) == 6
+        assert {f["verdict"] for f in findings} == {sos.GATED}
+        summary = sos.summarise(findings)
+        assert summary["defects"] == []
+        assert summary["status"] == "ok"
+        assert len(summary["gated"]) == 6
+        assert summary["counts"][sos.GATED] == 6
+
+    def test_the_same_rows_without_the_gate_are_the_recorded_failure(self):
+        """The pre-fix behaviour, asserted so the guard cannot pass by
+        accident: strip the registry's gated-forever marker and the identical
+        S3 state reproduces exactly the six MISSING findings the run logged."""
+        findings = self._findings(gated=False)
+        assert [f["verdict"] for f in findings] == [sos.MISSING] * 6
+        assert sos.summarise(findings)["status"] == "stage_output_missing"
+
+    def test_the_reason_is_on_the_finding_not_swallowed(self):
+        """A row excused with no reason on the surface is indistinguishable
+        from a row nobody checked."""
+        f = self._findings(gated=True)[0]
+        assert "NOT a defect" in f["detail"]
+        assert "missing suppressed" in f["detail"]
+        assert "grace_period_cycles: 999" in f["detail"]
+
+
+class TestGatedRowBothPolarities:
+    def test_a_gated_row_that_did_write_still_reports_wrote(self):
+        """The downgrade only ever applies to a would-be defect. A gated study
+        whose gate DID clear this week is a real, attributable write."""
+        key = f"backtest/{RUN_DATE}/gamma_sweep.json"
+        decls = sos.declared_outputs(
+            [_row("backtest_gamma_sweep", "backtest/{date}/gamma_sweep.json",
+                  "Backtester", grace_period_cycles=999)],
+            pipeline=PIPELINE,
+        )
+        f = sos.evaluate(
+            decls, run_date=RUN_DATE, execution_start=EXEC_START,
+            head=_head_from({key: EXEC_START + timedelta(hours=2)}),
+            cycle_date=RUN_DATE,
+        )[0]
+        assert f["verdict"] == sos.WROTE
+
+    def test_a_stale_gated_row_is_gated_not_stale(self):
+        """Last cycle's product left behind while this cycle's gate did not
+        clear is the same statement about the gate as an absent key."""
+        key = f"backtest/{RUN_DATE}/gamma_sweep.json"
+        decls = sos.declared_outputs(
+            [_row("backtest_gamma_sweep", "backtest/{date}/gamma_sweep.json",
+                  "Backtester", grace_period_cycles=999)],
+            pipeline=PIPELINE,
+        )
+        f = sos.evaluate(
+            decls, run_date=RUN_DATE, execution_start=EXEC_START,
+            head=_head_from({key: EXEC_START - timedelta(days=21)}),
+            cycle_date=RUN_DATE,
+        )[0]
+        assert f["verdict"] == sos.GATED
+        assert "stale suppressed" in f["detail"]
+
+    def test_a_mandatory_artifact_absent_still_fails_the_run(self):
+        """The polarity that matters: the excuse is per-row and derived from
+        the registry, never a blanket amnesty. A non-gated declared artifact
+        that nobody wrote is still a defect that exits non-zero under
+        --enforce."""
+        decls = sos.declared_outputs(
+            [_row("backtest_report", "backtest/{date}/report.md", "Backtester"),
+             _row("backtest_gamma_sweep", "backtest/{date}/gamma_sweep.json",
+                  "Backtester", grace_period_cycles=999)],
+            pipeline=PIPELINE,
+        )
+        findings = sos.evaluate(
+            decls, run_date=RUN_DATE, execution_start=EXEC_START,
+            head=_head_from({}), cycle_date=RUN_DATE,
+        )
+        summary = sos.summarise(findings)
+        assert [f["artifact_id"] for f in summary["defects"]] == ["backtest_report"]
+        assert [f["artifact_id"] for f in summary["gated"]] == ["backtest_gamma_sweep"]
+        assert summary["status"] == "stage_output_missing"
+
+    def test_unmeasured_is_not_excused_by_the_gate(self):
+        """A check that could not answer is not excused by a gate it never
+        reached — otherwise a permissions regression on a gated row would
+        render as a clean pass."""
+        key = f"backtest/{RUN_DATE}/gamma_sweep.json"
+        decls = sos.declared_outputs(
+            [_row("backtest_gamma_sweep", "backtest/{date}/gamma_sweep.json",
+                  "Backtester", grace_period_cycles=999)],
+            pipeline=PIPELINE,
+        )
+        f = sos.evaluate(
+            decls, run_date=RUN_DATE, execution_start=EXEC_START,
+            head=_head_from({key: "error:403 AccessDenied"}), cycle_date=RUN_DATE,
+        )[0]
+        assert f["verdict"] == sos.UNMEASURED
