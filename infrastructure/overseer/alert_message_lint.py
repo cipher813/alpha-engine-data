@@ -256,6 +256,23 @@ _NOT_AN_INSTRUCTION = re.compile(
 )
 
 
+#: A tell joined to its neighbours by an arrow or a slash is a token in a
+#: SEQUENCE, not a verb aimed at anyone. Live false positive:
+#: `saturday-sf-watch-dispatcher`'s receipt says the resilience agent runs
+#: "(diagnose->fix->merge->rerun)" — a description of what the AUTOMATION does,
+#: matched by the same `diagnose` tell that catches "investigate before the
+#: next session".
+_SEQUENCE_JOINER = re.compile(r"^\s*(?:\u2192|->|/|\u2794|\u27a1)")
+_SEQUENCE_JOINER_BEFORE = re.compile(r"(?:\u2192|->|/|\u2794|\u27a1)\s*$")
+
+
+def _is_sequence_token(text_lower: str, start: int, end: int) -> bool:
+    return bool(
+        _SEQUENCE_JOINER.match(text_lower[end:end + 3])
+        or _SEQUENCE_JOINER_BEFORE.search(text_lower[max(0, start - 3):start])
+    )
+
+
 def _is_instruction(text_lower: str, start: int) -> bool:
     """Is the tell at ``start`` an imperative aimed at the reader?
 
@@ -600,15 +617,23 @@ def lint_text(text: str, relpath: str) -> tuple[list[Finding], list[Waiver]]:
             continue
         low = value.lower()
         for pattern, why in _ALERT001_TELLS:
-            m = next((c for c in re.finditer(pattern, low) if _is_instruction(low, c.start())),
-                     None)
+            m = next(
+                (c for c in re.finditer(pattern, low)
+                 if _is_instruction(low, c.start())
+                 and not _is_sequence_token(low, c.start(), c.end())),
+                None,
+            )
             if m:
                 findings.append(Finding("ALERT001", relpath, lineno, value.strip()[:300],
                                         f"{why} (matched {m.group(0)!r})"))
                 break
         for pattern, why in _ALERT002_TELLS:
-            m = next((c for c in re.finditer(pattern, low) if _is_instruction(low, c.start())),
-                     None)
+            m = next(
+                (c for c in re.finditer(pattern, low)
+                 if _is_instruction(low, c.start())
+                 and not _is_sequence_token(low, c.start(), c.end())),
+                None,
+            )
             if m:
                 findings.append(Finding("ALERT002", relpath, lineno, value.strip()[:300],
                                         f"{why} (matched {m.group(0)!r})"))
@@ -657,6 +682,22 @@ _UI_PATH_SEGMENTS: frozenset[str] = frozenset(
 )
 
 
+#: Publish shapes this lint recognises IN ADDITION to the ones the class
+#: scanner matches. `notify_via_flow_doctor` reaches an operator exactly as
+#: `publish_ops_alert` does, but the class scanner does not match it, so
+#: `saturday-sf-watch-dispatcher/index.py` — a live emitter with two dedup keys
+#: — was out of scope entirely until this was added.
+#:
+#: WHY THIS IS NOT ADDED TO THE SHARED SCANNER INSTEAD. Widening
+#: `alert_class_registry_drift._PUBLISH_CALL_PATTERN` would make the CLASS
+#: guard — enforcing, in seven repos, today — start demanding `alert_classes`
+#: rows for every flow-doctor source in the fleet, on the next PR each of those
+#: repos opens. That is a live-guard behaviour change and it belongs in its own
+#: PR with its own row inventory (alpha-engine-config-I9490), not smuggled in
+#: under a warn-only lint.
+_EXTRA_PUBLISH_SHAPES = re.compile(r"notify_via_flow_doctor\s*\(|notify_via_\w+\s*\(")
+
+
 def _in_scope(relpath: str, text: str) -> bool:
     """A file is graded when it publishes an alert, or is named like an emitter.
 
@@ -671,7 +712,11 @@ def _in_scope(relpath: str, text: str) -> bool:
     parts = Path(relpath).parts[:-1]
     if any(seg in _UI_PATH_SEGMENTS for seg in parts):
         return False
-    if scan._PUBLISH_CALL_PATTERN.search(text) or scan._CLI_CALL_PATTERN.search(text):
+    if (
+        scan._PUBLISH_CALL_PATTERN.search(text)
+        or scan._CLI_CALL_PATTERN.search(text)
+        or _EXTRA_PUBLISH_SHAPES.search(text)
+    ):
         return True
     # Matched against the whole relative path, not just the basename. Every
     # Lambda in `nousergon-data` is `index.py`; the emitter identity lives in

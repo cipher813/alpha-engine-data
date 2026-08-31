@@ -1270,6 +1270,12 @@ def _notify(record: dict, key: str, pipeline_name: str, dispatch: dict) -> bool:
         footer = "_autonomous fix DISABLED (observe-only)_"
     lines.append(footer)
     text = "\n".join(lines)
+    # alert-lint: allow ALERT003 -- this is an INFO-severity per-run RECEIPT, not
+    #   a condition report: it says "the watch ran and here is what it saw about
+    #   this execution". The SF execution IS the episode, so a key that outlived
+    #   one execution would suppress the receipt for the NEXT run of the same
+    #   pipeline -- the opposite of the defect ALERT003 exists to catch. The
+    #   standing conditions this Lambda reports are keyed separately below.
     dedup_key = f"{_FLOW_NAME}:{pipeline_name}:{record.get('execution_arn', key)}"
     try:
         return notify_via_flow_doctor(
