@@ -90,6 +90,20 @@ always in the alarming direction. The verdict set keeps the two apart:
                   postclose SF) writing the artifact minutes before this
                   execution started, not of a silent stage. Not a defect;
                   distinct from ``wrote`` so it stays visible in the counts
+  ``gated``       (alpha-engine-config-I9617) the key is absent or stale AND
+                  the registry row itself declares that its absence is
+                  CORRECT — ``cadence: event_driven`` (the sanctioned
+                  contract: absence is expected, liveness is delegated to the
+                  ``liveness_via`` anchor) or the legacy
+                  ``grace_period_cycles: 999`` alias it replaces. These are
+                  gated best-effort studies whose producer auto-skips when its
+                  own precondition is unmet, so a MISSING verdict on them is a
+                  statement about the gate, not about the run. Counted in
+                  NEITHER ``defects`` NOR ``wrote``, and REPORTED by name in
+                  the verdict document and the log — a row excused silently is
+                  indistinguishable from one nobody checks. A gated row that
+                  DID get written still reports ``wrote``: the downgrade only
+                  ever applies to a would-be ``missing``/``stale``
 
 ``unmeasured`` is deliberately NOT silent. Absence of a measurement is a
 first-class finding with its own exit code and its own alert, because the
@@ -186,6 +200,7 @@ UNMEASURED = "unmeasured"
 UNRESOLVED = "unresolved"
 SKIPPED = "skipped"
 DRY = "dry"
+GATED = "gated"
 
 #: Verdicts that mean "this run has a data defect".
 DEFECT_VERDICTS = frozenset({MISSING, STALE})
@@ -528,6 +543,65 @@ def load_registry_rows(
     return rows
 
 
+#: The registry cadence symbol meaning "this artifact is written ONLY when a
+#: gated producer decides to write, so its ABSENCE is correct". Declared and
+#: validator-enforced in ``nousergon_lib.artifact_freshness``: an
+#: ``event_driven`` row must name a ``liveness_via`` anchor, so producer
+#: liveness is relocated to a signal that CAN go stale rather than lost.
+_CADENCE_ABSENCE_IS_CORRECT = "event_driven"
+
+#: The legacy magic number ``event_driven`` replaced. Still carried by eight
+#: rows in the live registry (the six gated backtester sub-sweeps,
+#: ``backtest_cov_estimator_sweep`` and ``regime_state_dated``). Recognised
+#: here so a row that has not yet migrated is not falsely asserted against —
+#: the migration is tracked separately; this sweep must not depend on it.
+_LEGACY_GATED_FOREVER_GRACE = 999
+
+
+def absence_declared_correct(row: dict) -> str | None:
+    """Why this registry row's ABSENCE is a declared-correct outcome, or None.
+
+    ``ARTIFACT_REGISTRY.yaml`` already states this rule for the OTHER consumer
+    of the same declarations: ``pipeline_stages[].artifacts`` (read by
+    ``krepis.stage_coverage``) deliberately omits every gated-forever row, and
+    ``validate_artifact_registry.py::_validate_pipeline_stages`` Rule 7 fails
+    the build if one is added back. This sweep derives its assertable set from
+    ``produced_by:`` instead, and so re-admitted exactly the rows that rule
+    excludes — alpha-engine-config-I9617.
+
+    Measured on the 2026-08-29 scheduled weekly run
+    (``965d925b-f9d6-ce5e-e059-9405433a0724_...``): all six reported STAGE
+    OUTPUT MISSING findings were gated-forever rows — the five gated
+    Backtester sub-sweeps plus ``regime_state_dated``. Every one of the run's
+    findings was false, and the sweep is one ``--enforce`` flip away from
+    terminating a four-hour run on them.
+
+    Returns a human-readable reason (rendered into the finding's ``detail``)
+    rather than a bool, because a row excused with no reason on the surface is
+    indistinguishable from a row nobody checked.
+    """
+    if row.get("cadence") == _CADENCE_ABSENCE_IS_CORRECT:
+        anchor = row.get("liveness_via")
+        return (
+            "registry declares cadence: event_driven — absence is the correct "
+            "outcome for a gated producer, and producer liveness is delegated "
+            f"to liveness_via={anchor!r}"
+        )
+    grace = row.get("grace_period_cycles")
+    try:
+        gated_forever = grace is not None and int(grace) >= _LEGACY_GATED_FOREVER_GRACE
+    except (TypeError, ValueError):
+        gated_forever = False
+    if gated_forever:
+        return (
+            f"registry declares grace_period_cycles: {grace} — the legacy "
+            "gated-forever marker (superseded by cadence: event_driven). The "
+            "producer auto-skips when its own precondition is unmet, so this "
+            "key's absence is a statement about the gate, not about the run"
+        )
+    return None
+
+
 def declared_outputs(
     rows: Iterable[dict],
     *,
@@ -555,6 +629,7 @@ def declared_outputs(
                     "bucket": row.get("s3_bucket") or default_bucket,
                     "s3_key_template": row.get("s3_key_template"),
                     "severity": row.get("severity", "warning"),
+                    "absence_declared_correct": absence_declared_correct(row),
                 }
             )
     return out
@@ -754,6 +829,19 @@ def evaluate(
                     f"{age.seconds // 3600}h — the declaring stage did not write "
                     f"it on this run"
                 )
+        # alpha-engine-config-I9617 — the registry's own gated-forever
+        # declaration, applied LAST so it can only ever downgrade a would-be
+        # DEFECT. A gated row that DID get written keeps its `wrote` verdict,
+        # and an `unmeasured` row stays unmeasured: a check that could not
+        # answer is not excused by a gate it never reached.
+        gated_reason = declaration.get("absence_declared_correct")
+        if gated_reason and finding["verdict"] in DEFECT_VERDICTS:
+            was = finding["verdict"]
+            finding["verdict"] = GATED
+            finding["detail"] = (
+                f"{finding['detail']} — NOT a defect ({was} suppressed): "
+                f"{gated_reason}"
+            )
         findings.append(finding)
 
     return findings
@@ -766,6 +854,13 @@ def summarise(findings: Sequence[dict]) -> dict:
         counts[finding["verdict"]] = counts.get(finding["verdict"], 0) + 1
     defects = [f for f in findings if f["verdict"] in DEFECT_VERDICTS]
     unmeasured = [f for f in findings if f["verdict"] in UNMEASURED_VERDICTS]
+    # alpha-engine-config-I9617: surfaced as its own list, not folded into the
+    # green number. A row excused by the registry is a fact about the REGISTRY
+    # that has to stay readable — if a gated study is quietly promoted to a
+    # real producer, or a row's grace marker is wrong, this list is where that
+    # shows up. Silent exclusion would make the sweep's own blind spot
+    # invisible (principles.md §2.7).
+    gated = [f for f in findings if f["verdict"] == GATED]
     if defects:
         status = "stage_output_missing"
     elif unmeasured:
@@ -778,6 +873,7 @@ def summarise(findings: Sequence[dict]) -> dict:
         "checked": len(findings),
         "defects": defects,
         "unmeasured": unmeasured,
+        "gated": gated,
     }
 
 
@@ -839,6 +935,7 @@ def sweep(
             "findings": [],
             "defects": [],
             "unmeasured": [],
+            "gated": [],
         }
 
     if s3_client is None:
@@ -883,12 +980,21 @@ def sweep(
         "findings": findings,
         "defects": summary["defects"],
         "unmeasured": summary["unmeasured"],
+        "gated": summary["gated"],
     }
 
     logger.info(
         "Stage-output sweep pipeline=%s run_date=%s enforce=%s run_mode=%s: %s",
         pipeline, run_date, enforce, run_mode, summary["counts"],
     )
+
+    if summary["gated"]:
+        logger.info(
+            "STAGE OUTPUT GATED (not defects, alpha-engine-config-I9617): %d "
+            "declared artifact(s) absent whose registry row declares the "
+            "absence correct: %s",
+            len(summary["gated"]), _describe(summary["gated"]),
+        )
 
     if publish:
         _publish_verdict(s3_client, bucket, document)
@@ -1206,8 +1312,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
     else:
         logger.info(
-            "Stage-output sweep OK: %d declared artifact(s) written by this run",
+            "Stage-output sweep OK: %d declared artifact(s) written by this run"
+            "%s",
             document["checked"],
+            (
+                f" ({len(document['gated'])} gated row(s) excused by the "
+                f"registry — see the verdict artifact)"
+                if document.get("gated") else ""
+            ),
         )
     return code
 
