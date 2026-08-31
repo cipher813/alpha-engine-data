@@ -700,7 +700,24 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: alpha-engine-predictor-inference-no-invocations
-      AlarmDescription: Predictor Lambda not invoked (expected daily)
+      # Kept byte-identical to nous-ergon-ops
+      # infrastructure/cloudwatch/alarms/alpha-engine-predictor-inference-no-invocations.json.
+      # This alarm is one of the 21 dual-owned by this stack AND that tree
+      # (alpha-engine-config-I9009): any push to this repo's main re-stamps the
+      # stack's git-sha tag, which forces CloudFormation to reissue
+      # PutMetricAlarm from THESE literal values even when the template body did
+      # not change. So a divergence here silently reverts that tree, with no
+      # CloudFormation-side signal. Change both or neither.
+      AlarmDescription: >-
+        Predictor Lambda not invoked (expected daily). ABSENCE IS THE SIGNAL:
+        TreatMissingData is `breaching` (alpha-engine-config-I9467) because this
+        alarm's entire job is detecting that the predictor stopped running, and
+        `notBreaching` made the one condition it exists to catch render as green
+        (principles.md 2.7; observability-policy.md OB-9.2a). Replayed over the
+        30 days to 2026-08-31 via get-metric-data: all 30 daily buckets carried
+        Invocations >= 2, so this flip would have fired ZERO times — it adds
+        detection without adding pages. Declared armed in
+        nousergon-data/infrastructure/automation_pause.json:armed_alarms.
       Namespace: AWS/Lambda
       MetricName: Invocations
       Dimensions:
@@ -711,7 +728,13 @@ Resources:
       EvaluationPeriods: 1
       Threshold: 1
       ComparisonOperator: LessThanThreshold
-      TreatMissingData: notBreaching  # weekends/holidays
+      # WAS `notBreaching  # weekends/holidays`. That rationale was measured
+      # false: replayed over the 30 days to 2026-08-31, ALL 30 daily buckets
+      # carried Invocations >= 2 (minimum 2 on 2026-08-04), weekends included —
+      # the predictor is invoked every day, so there was never a weekend gap for
+      # notBreaching to protect. What it did instead was render the one
+      # condition this alarm exists to catch as green (alpha-engine-config-I9467).
+      TreatMissingData: breaching
       AlarmActions:
         - !Ref AlertsTopic
 
