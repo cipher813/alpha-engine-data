@@ -180,6 +180,18 @@ def test_code_freshness_gate_front_loads_the_drift_check(states):
     ]
     assert online == ["CodeFreshnessGate"]
 
+    # alpha-engine-config-I9466: CodeFreshnessGate now hands SUCCESS to the
+    # 2.3a CorrectnessVerdictGate rather than straight to the first morning
+    # work gate. Both are preflights and both are cheap; the ordering is
+    # deliberate -- code freshness must be established BEFORE the correctness
+    # gate runs, because the correctness gate is itself executor code on that
+    # box and a stale checkout would run a stale gate.
+    fresh_success = [
+        c["Next"] for c in states["CheckCodeFreshnessStatus"]["Choices"]
+        if c.get("StringEquals") == "SUCCESS"
+    ]
+    assert fresh_success == ["CorrectnessVerdictGate"]
+
     cmds = "\n".join(
         states["CodeFreshnessGate"]["Parameters"]["Parameters"]["commands"]
     )
@@ -198,14 +210,16 @@ def test_code_freshness_gate_front_loads_the_drift_check(states):
         "are caught too)"
     )
 
-    fresh = [
-        c["Next"] for c in states["CheckCodeFreshnessStatus"]["Choices"]
+    # config#1767 (Phase 2): the Phase-1 shared-spot synchronization hop
+    # (CheckDataSpotLaunched -> ReadDataSpotId) was retired; each Phase-2 spot
+    # now launches lazily from its own CheckSkipMorningEnrich gate.
+    # alpha-engine-config-I9466: freshness success now enters the 2.3a
+    # CorrectnessVerdictGate (asserted above), and it is THAT gate's SUCCESS
+    # which enters the first morning work gate. Both hops are asserted so the
+    # chain cannot be broken in the middle without a test noticing.
+    verdict_success = [
+        c["Next"] for c in states["CheckCorrectnessVerdictStatus"]["Choices"]
         if c.get("StringEquals") == "SUCCESS"
     ]
-    # config#1767 (Phase 2): freshness success enters the first morning work
-    # gate directly — the Phase-1 shared-spot synchronization hop
-    # (CheckDataSpotLaunched -> ReadDataSpotId) this comment used to describe
-    # was retired; each Phase-2 spot now launches lazily from its own
-    # CheckSkipMorningEnrich gate.
-    assert fresh == ["CheckSkipMorningEnrich"]
+    assert verdict_success == ["CheckSkipMorningEnrich"]
     assert states["CheckCodeFreshnessStatus"]["Default"] == "HandleFailure"
