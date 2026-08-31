@@ -842,6 +842,22 @@ alert_classes:
     severities: [warning]
     intake: bus
     response: drain-queue
+  - class: predictor_shadow_leaderboard_unmeasurable_arm
+    # alpha-engine-config-I9336 (crucible-predictor-PR587): a registered
+    # stage=challenger arm (e.g. sota-directional-combine, the champion-arch
+    # candidate) that wrote no comparable shadow prediction within the last
+    # MEASURABILITY_LAG_CYCLES cohort cycles. DELIBERATELY `warning` +
+    # `drain-queue`, never `critical`/`operator` — this is a measurement-
+    # coverage signal (fixed by repairing the shadow write path, or by the
+    # shadow runner's own rotation reaching the starved arm), not a
+    # trading-halt condition, and must not page the one operator chat
+    # (the 2026-08-28 alert-destination-arc lesson: severity alone does not
+    # pick a destination tier, so severity and response are chosen together
+    # here, not severity alone).
+    source: "alpha-engine-predictor/analysis/observe_leaderboard.py::build_observe_leaderboard"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
   - class: predictor_inference
     # alpha-engine-config-I7740 (operator ruling 2026-08-21): new registry
     # row for a previously-undeclared source. One source string covers
