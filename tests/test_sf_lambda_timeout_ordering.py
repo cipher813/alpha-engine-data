@@ -65,7 +65,7 @@ _DEFS = ("step_function.json", "step_function_daily.json", "step_function_eod.js
 _FUNCTION_TIMEOUTS_SEC: dict[str, int] = {
     "alpha-engine-data-spot-dispatcher": 600,
     "alpha-engine-eod-precondition-probe": 30,
-    "alpha-engine-evaluator": 300,
+    "alpha-engine-evaluator": 660,
     "alpha-engine-evaluator-director": 900,
     "alpha-engine-predictor-inference": 900,
     # alpha-engine-config-I7620. Two read-only Step Functions API calls plus a
