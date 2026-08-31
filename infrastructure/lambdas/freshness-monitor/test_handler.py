@@ -569,14 +569,22 @@ def test_handler_alerts_enabled_fires_with_dedup_key(
     assert notify_mock.called
 
     # config-I7713 — a sweep emits exactly ONE page, whose dedup key identifies
-    # the condition SET and the day. The per-artifact key this used to assert
+    # the condition SET. The per-artifact key this used to assert
     # ("freshness_probe_missing_2026-W22") deduped correctly per artifact and
     # was the reason 17 true statements about one cause arrived as 17 pages on
     # 2026-08-19. The artifact is still named — in the body, not in the key.
+    #
+    # config-I9336 — the key is no longer date-stamped (that re-baked the
+    # SAME run-keyed defect one layer up: an unchanged standing condition
+    # re-paged every UTC midnight). It is now a fingerprint of the open
+    # EPISODE set, stable across day rollovers — see
+    # test_digest_dedup_key_stable_across_day_rollover_same_episode below.
     assert publish_mock.call_count == 1, publish_mock.call_args_list
     dedup_key = publish_mock.call_args.kwargs["dedup_key"]
-    assert dedup_key.startswith("freshness_digest_2026-05-30_")
+    assert dedup_key.startswith("freshness_digest_")
+    assert "2026-05-30" not in dedup_key
     assert "artifact_id=probe_missing" in publish_mock.call_args.args[0]
+    assert "driver=missing_no_instance" in publish_mock.call_args.args[0]
 
 
 def test_handler_warning_severity_console_only_no_alert(
@@ -864,9 +872,13 @@ def test_maybe_alert_fires_missing_past_sla(monkeypatch, fixed_now):
     assert call.kwargs["severity"] == "critical"  # spec severity, not bumped
     assert call.kwargs["telegram"] is False
     # config-I7713: the key now identifies the CONDITION SET, not one artifact —
-# that is what lets an unchanged situation stay quiet while a new artifact
-# joining it re-pages. A per-artifact key could not express either.
-    assert call.kwargs["dedup_key"].startswith("freshness_digest_2026-05-30_")
+    # that is what lets an unchanged situation stay quiet while a new artifact
+    # joining it re-pages. A per-artifact key could not express either.
+    # config-I9336: no longer date-stamped — see
+    # test_digest_dedup_key_stable_across_day_rollover_same_episode.
+    assert call.kwargs["dedup_key"].startswith("freshness_digest_")
+    assert "2026-05-30" not in call.kwargs["dedup_key"]
+    assert "driver=missing_no_instance" in call.args[0]
     notify_mock.assert_called_once()
     assert notify_mock.call_args.kwargs["dedup_key"] == call.kwargs["dedup_key"]
 
@@ -4157,9 +4169,302 @@ def test_dedup_key_tracks_the_condition_set_not_the_clock(monkeypatch, fixed_now
         index, [_weekly_spec(index, "a"), _weekly_spec(index, "b"), _weekly_spec(index, "c")],
         fixed_now)
 
-    assert index._digest_dedup_key(two, fixed_now) == index._digest_dedup_key(
-        list(reversed(two)), fixed_now), "order must not change the key"
-    assert index._digest_dedup_key(two, fixed_now) != index._digest_dedup_key(three, fixed_now)
+    assert index._digest_dedup_key(two) == index._digest_dedup_key(
+        list(reversed(two))), "order must not change the key"
+    assert index._digest_dedup_key(two) != index._digest_dedup_key(three)
+
+
+# ── config-I9336: episode-keyed dedup (run-keyed → episode-keyed fix) ───────
+#
+# Measured live (see PR body): `freshness_digest_{date}_{fingerprint}` baked
+# `now.date()` straight into the dedup key, so an UNCHANGED standing
+# incident re-paged CRITICAL on every UTC midnight for as long as it
+# lasted (`director_retro_trend` paged again 2026-08-14 for the exact
+# condition already paged 2026-08-12). These tests pin the fix at both the
+# unit level (`_episode_signature`) and the digest level
+# (`_digest_dedup_key` / a two-sweep handler round trip) — every one of
+# them FAILS against the pre-fix code (the date-stamped key, or a
+# per-artifact `resolve_dedup_key(spec, now)` shaped by the current cycle
+# label, both mint a new key every day the incident continues).
+
+
+def _spec(index_mod, artifact_id, **overrides):
+    from nousergon_lib.artifact_freshness import ArtifactSpec
+    fields = dict(
+        artifact_id=artifact_id, s3_bucket="alpha-engine-research",
+        s3_key_template=f"{artifact_id}/{{date}}.json",
+        cadence="saturday_sf", sla_minutes_after_cron=60,
+        severity="critical", owner_repo="ae-test", created_at=date(2025, 1, 1),
+    )
+    fields.update(overrides)
+    return ArtifactSpec(**fields)
+
+
+def test_episode_signature_missing_stable_while_state_persists(fixed_now):
+    """Two consecutive sweeps over the same unbroken `missing` episode must
+    produce the SAME episode key — the sentinel opened_at carries forward
+    via the (simulated) check_results.json round trip, even a day later."""
+    import index
+    from nousergon_lib.artifact_freshness import CheckResult
+
+    spec = _spec(index, "director_retro_trend")
+    result = CheckResult(state="missing", sla_violated_by_minutes=30209,
+                          canonical_key="director_retro_trend/2026-08-12.json",
+                          reason="absent")
+
+    sweep1 = index._episode_signature(spec, result, prev_episode=None, now=fixed_now)
+    assert sweep1 is not None
+    assert sweep1["state"] == "missing"
+
+    # Sweep 2, TWO DAYS LATER (crosses a UTC-midnight rollover), carries
+    # forward sweep 1's round-tripped sentinel exactly as
+    # `_load_prev_episode_state` would hand it back.
+    later = fixed_now + timedelta(days=2)
+    sweep2 = index._episode_signature(
+        spec, result, prev_episode={"state": sweep1["state"], "opened_at": sweep1["opened_at"]},
+        now=later,
+    )
+    assert sweep2["key"] == sweep1["key"], (
+        "an unbroken missing episode must mint the SAME key across a day "
+        "rollover — a differing key here is the run-keyed regression"
+    )
+
+
+def test_episode_signature_missing_then_stale_then_missing_is_new_episode(fixed_now):
+    """missing → stale → missing must NOT reuse the first missing episode's
+    key — the digest publishes with dedup_window_min=None (forever), so
+    reusing it would silently suppress the second, genuinely new,
+    incident's page forever."""
+    import index
+    from nousergon_lib.artifact_freshness import CheckResult
+
+    spec = _spec(index, "x")
+    first_missing = CheckResult(state="missing", sla_violated_by_minutes=100,
+                                 canonical_key="x/2026-08-01.json", reason="absent")
+    ep1 = index._episode_signature(spec, first_missing, prev_episode=None, now=fixed_now)
+
+    # Recovers: an instance lands (stale, not fresh, but a real instance).
+    recovered = CheckResult(state="stale", last_modified=fixed_now - timedelta(days=1),
+                             sla_violated_by_minutes=50, canonical_key="x/2026-08-05.json",
+                             reason="old instance")
+    ep_stale = index._episode_signature(
+        spec, recovered, prev_episode={"state": ep1["state"], "opened_at": ep1["opened_at"]},
+        now=fixed_now + timedelta(days=4),
+    )
+    assert ep_stale["state"] == "stale"
+    assert ep_stale["key"] != ep1["key"]
+
+    # Goes missing again (e.g. the object was deleted). prev_episode here is
+    # what `_load_prev_episode_state` would hand back from the STALE sweep
+    # (missing rows only persist episode_state/episode_opened_at for
+    # missing/probe_failed — a stale prior round-trips as "no missing
+    # sentinel carried forward", i.e. prev=None from this function's view).
+    second_missing = CheckResult(state="missing", sla_violated_by_minutes=10,
+                                  canonical_key="x/2026-08-10.json", reason="absent again")
+    ep2 = index._episode_signature(
+        spec, second_missing, prev_episode=None, now=fixed_now + timedelta(days=9),
+    )
+    assert ep2["key"] != ep1["key"], (
+        "a second missing episode, after a genuine recovery in between, "
+        "must NOT collide with the first missing episode's (permanently "
+        "suppressing) dedup marker"
+    )
+
+
+def test_episode_signature_stale_derives_from_last_modified_no_persistence_needed(fixed_now):
+    """A `stale` episode's key is derived purely from the freshest
+    instance's own last_modified — stable while nothing new lands, with NO
+    round-trip required, and changes the instant a genuinely newer
+    instance appears (even if it is itself still stale)."""
+    import index
+    from nousergon_lib.artifact_freshness import CheckResult
+
+    spec = _spec(index, "y")
+    frozen_lm = fixed_now - timedelta(days=21)
+    stale_now = CheckResult(state="stale", last_modified=frozen_lm,
+                             sla_violated_by_minutes=30209,
+                             canonical_key="y/2026-08-12.json", reason="old")
+    ep_day1 = index._episode_signature(spec, stale_now, prev_episode=None, now=fixed_now)
+    ep_day3 = index._episode_signature(
+        spec, stale_now, prev_episode=None, now=fixed_now + timedelta(days=2))
+    assert ep_day1["key"] == ep_day3["key"]
+
+    # A newer (still stale) instance lands — the episode is genuinely over.
+    newer_lm = fixed_now - timedelta(days=1)
+    stale_next = CheckResult(state="stale", last_modified=newer_lm,
+                              sla_violated_by_minutes=100,
+                              canonical_key="y/2026-08-14.json", reason="old")
+    ep_next = index._episode_signature(
+        spec, stale_next, prev_episode=None, now=fixed_now + timedelta(days=3))
+    assert ep_next["key"] != ep_day1["key"]
+
+
+def test_digest_dedup_key_stable_across_day_rollover_same_episode(monkeypatch, fixed_now):
+    """The digest-level fingerprint (what actually reaches `publish`) must
+    be identical across two sweeps of the same unbroken episode set, even
+    when they land on different UTC calendar days — the exact defect the
+    pre-fix `freshness_digest_{date}_{fingerprint}` shape had."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    from nousergon_lib.artifact_freshness import CheckResult
+
+    spec = _spec(index, "director_retro_trend")
+    result = CheckResult(state="missing", sla_violated_by_minutes=30209,
+                          canonical_key="director_retro_trend/2026-08-12.json",
+                          reason="absent")
+    episode = index._episode_signature(spec, result, prev_episode=None, now=fixed_now)
+
+    decision_day1 = index._alert_decision(spec, result, fixed_now, episode=episode)
+    decision_day3 = index._alert_decision(
+        spec, result, fixed_now + timedelta(days=2),
+        episode={"key": episode["key"], "state": episode["state"], "opened_at": episode["opened_at"]},
+    )
+    key1 = index._digest_dedup_key([decision_day1])
+    key3 = index._digest_dedup_key([decision_day3])
+    assert key1 == key3, "an unbroken episode must dedup across a UTC day rollover"
+
+
+def test_digest_dedup_key_changes_when_a_new_artifact_episode_opens(monkeypatch, fixed_now):
+    """A genuinely new episode (different artifact_id, or the same artifact
+    with a fresh opened_at) changes the digest fingerprint — dedup must
+    never suppress a fact that actually changed."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    from nousergon_lib.artifact_freshness import CheckResult
+
+    spec = _spec(index, "z")
+    result = CheckResult(state="missing", sla_violated_by_minutes=100,
+                          canonical_key="z/2026-08-01.json", reason="absent")
+    ep_open = index._episode_signature(spec, result, prev_episode=None, now=fixed_now)
+    decision_open = index._alert_decision(spec, result, fixed_now, episode=ep_open)
+
+    later_new_episode = index._episode_signature(
+        spec, result, prev_episode=None, now=fixed_now + timedelta(days=30))
+    decision_new = index._alert_decision(
+        spec, result, fixed_now + timedelta(days=30), episode=later_new_episode)
+
+    assert index._digest_dedup_key([decision_open]) != index._digest_dedup_key([decision_new])
+
+
+def test_digest_enumerates_episode_opened_on_an_earlier_sweep_with_age(monkeypatch, fixed_now):
+    """The digest body composed on a LATER sweep must still name an episode
+    that opened on an earlier one — with its age — so a standing condition
+    can never be invisible even while its dedup key keeps the page quiet."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    from nousergon_lib.artifact_freshness import CheckResult
+
+    spec = _spec(index, "director_retro_trend")
+    result = CheckResult(state="missing", sla_violated_by_minutes=30209,
+                          canonical_key="director_retro_trend/2026-08-12.json",
+                          reason="absent")
+    opened_at = fixed_now.isoformat()
+    episode = {"key": f"freshness_director_retro_trend_missing_{opened_at}",
+               "state": "missing", "opened_at": opened_at}
+
+    later = fixed_now + timedelta(days=3)
+    decision = index._alert_decision(spec, result, later, episode=episode)
+    body = index._compose_digest([decision], later)
+
+    assert "director_retro_trend" in body
+    assert f"episode_open_since={opened_at}" in body
+    assert "episode_age_minutes=4320" in body  # 3 days
+    assert "oldest open episode 4320min" in body
+
+
+def test_evaluate_driver_closed_set_including_unattributed_branch(fixed_now):
+    """The driver classifier is a closed set over CheckResult.state, with an
+    explicit terminal `unattributed` branch for anything outside it —
+    never a silent fallthrough to a plausible-looking default."""
+    import index
+    from nousergon_lib.artifact_freshness import CheckResult
+
+    spec = _spec(index, "w")
+    missing = index._evaluate_driver(
+        spec, CheckResult(state="missing", canonical_key="w/k.json", reason="r"))
+    assert missing["driver"] == "missing_no_instance"
+    assert "s3://alpha-engine-research/w/k.json" in missing["clears_when"]
+
+    stale = index._evaluate_driver(
+        spec, CheckResult(state="stale", last_modified=fixed_now,
+                           canonical_key="w/k.json", reason="r"))
+    assert stale["driver"] == "stale_instance_past_sla"
+
+    probe_failed = index._evaluate_driver(
+        spec, CheckResult(state="probe_failed", canonical_key="w/k.json", reason="403"))
+    assert probe_failed["driver"] == "probe_error"
+
+    fresh = index._evaluate_driver(
+        spec, CheckResult(state="fresh", canonical_key="w/k.json", reason="ok"))
+    assert fresh["driver"] == "not_applicable"
+
+    # A state outside the closed set (defensive — CheckResult.state never
+    # actually emits this today) must land on the TERMINAL unattributed
+    # branch, not silently coerce to one of the real drivers above.
+    unknown = index._evaluate_driver(
+        spec, CheckResult(state="quantum_superposition", canonical_key="w/k.json", reason="r"))
+    assert unknown["driver"] == "unattributed"
+    assert unknown["driver"] not in (
+        "missing_no_instance", "stale_instance_past_sla", "probe_error", "not_applicable",
+    )
+
+
+def test_handler_dedup_key_identical_across_two_sweeps_same_incident(
+    monkeypatch, yaml_registry_body, fake_s3, fixed_now
+):
+    """End-to-end regression pin: two full `handler()` sweeps, three days
+    apart (crossing UTC midnight twice), over the SAME unbroken
+    `probe_missing` incident, must publish the SAME dedup key both times —
+    this is what makes the second sweep's publish() call a no-op dedup
+    skip rather than a second CRITICAL page. Fails against the pre-fix
+    date-stamped digest key (and would have failed against the even older
+    per-artifact resolve_dedup_key(spec, now) shape, whose cycle_window_label
+    also advances with the calendar)."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    fake_s3._registry_body = yaml_registry_body
+
+    import importlib
+    import index
+    importlib.reload(index)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
+
+    # ── Sweep 1 ──
+    publish1 = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    monkeypatch.setattr(index, "publish", publish1)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+    _patch_now(monkeypatch, fixed_now)
+    index.handler({}, None)
+    assert publish1.called
+    key1 = publish1.call_args.kwargs["dedup_key"]
+
+    # Carry sweep 1's check_results.json forward as the ONLY prior-state
+    # input to sweep 2 (real production shape: the daily sweep reads back
+    # its own last write).
+    check_results_body = next(
+        body for (_, k, body) in fake_s3._put_calls
+        if k == "_freshness_monitor/check_results.json"
+    )
+    _keyed_get_object(fake_s3, {index.CHECK_RESULTS_KEY: check_results_body})
+
+    # ── Sweep 2, three days later (>= two UTC-midnight rollovers) ──
+    later = fixed_now + timedelta(days=3)
+    publish2 = mock.Mock(return_value=mock.Mock(dedup_skipped=True, dedup_reason="marker present"))
+    monkeypatch.setattr(index, "publish", publish2)
+    _patch_now(monkeypatch, later)
+    index.handler({}, None)
+    assert publish2.called
+    key2 = publish2.call_args.kwargs["dedup_key"]
+
+    assert key1 == key2, (
+        f"dedup key changed across an unbroken episode ({key1!r} -> "
+        f"{key2!r}) — the run-keyed-not-episode-keyed regression"
+    )
 
 
 def test_publish_dedup_skip_does_not_double_send_telegram(monkeypatch, fixed_now):
@@ -4383,9 +4688,9 @@ def test_never_written_only_changes_the_dedup_key_when_the_set_moves(monkeypatch
     import importlib
     import index
     importlib.reload(index)
-    a = index._digest_dedup_key([], fixed_now, ["x"])
-    b = index._digest_dedup_key([], fixed_now, ["x"])
-    c = index._digest_dedup_key([], fixed_now, ["x", "y"])
+    a = index._digest_dedup_key([], ["x"])
+    b = index._digest_dedup_key([], ["x"])
+    c = index._digest_dedup_key([], ["x", "y"])
     assert a == b and a != c
 
 

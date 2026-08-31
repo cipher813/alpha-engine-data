@@ -24,11 +24,17 @@ invocation:
      — the monitor monitors itself; substrate-health-check daily
      watches the heartbeat.
   5. For misses past SLA (``state ∈ {missing, stale, probe_failed}``),
-     route SNS via :func:`krepis.alerts.publish` (``telegram=False``) and
-     Telegram via flow-doctor forum topics (config#1742 T2 /
-     config#1747) with ``dedup_key=resolve_dedup_key(spec, now)`` — dedup
-     collapses 4×/hour retries to one alert per cycle per artifact.
-     **``severity=warning`` registry rows are console-only** (written to
+     the sweep composes ONE grouped digest page (config-I7713,
+     :func:`_publish_digest`) covering every alerting row, routed via SNS
+     (:func:`krepis.alerts.publish`, ``telegram=False``) and Telegram via
+     flow-doctor forum topics (config#1742 T2 / config#1747). The
+     digest's ``dedup_key`` (:func:`_digest_dedup_key`) is a fingerprint of
+     the SET of currently-open per-artifact EPISODES (an episode is the
+     unbroken span one artifact stays in one alerting state; see
+     :func:`_episode_signature`), never of ``now``'s calendar date — a standing, unchanged episode set
+     dedups across UTC-midnight rollovers instead of re-paging every day
+     the condition simply continues. **``severity=warning`` registry rows
+     are console-only** (written to
      ``check_results.json``; no SNS/Telegram — see ARTIFACT_REGISTRY
      "dashboard-only" convention) — with two config-I3086 exceptions:
      a row listing the live champion arm in ``critical_while_champion_arm``
@@ -90,7 +96,6 @@ from nousergon_lib.artifact_freshness import (
     check_freshness,
     cycle_completion,
     resolve_current_cycle,
-    resolve_dedup_key,
 )
 from nousergon_lib.trading_calendar import last_closed_trading_day, previous_trading_day
 from flow_doctor_telegram import notify_via_flow_doctor
@@ -143,9 +148,14 @@ INTRADAY_ARTIFACT_IDS = frozenset({"open_orders_latest", "freshness_monitor_hear
 #
 # DEDUP. A still-missing artifact would otherwise re-dispatch on every 15-min
 # poll until the heal lands and the next probe sees it fresh. We write an
-# in-progress marker to S3 keyed by the SAME per-cycle dedup label the alert
-# path uses (resolve_dedup_key). The marker's presence within a cooldown window
-# suppresses re-dispatch for that (artifact, cycle-window). The marker lives
+# in-progress marker to S3 keyed by the per-cycle label
+# (:func:`resolve_current_cycle`, via :func:`_recovery_marker_key`) — a
+# DELIBERATELY different, cycle-scoped key from the alert page's episode key
+# (:func:`_episode_signature`): this marker exists to rate-limit repeated
+# backfill DISPATCH attempts within one cycle, not to dedup the operator
+# PAGE across an unbroken episode. The marker's presence within a cooldown
+# window suppresses re-dispatch for that (artifact, cycle-window). The
+# marker lives
 # under the already-granted `_freshness_monitor/` prefix (iam-policy.json
 # S3WriteMonitorArtifacts) so no new write grant is required.
 RECOVERY_MARKER_PREFIX = "_freshness_monitor/_recovery/"
@@ -1348,6 +1358,41 @@ def _load_prev_issue_filed(s3_client: Any) -> dict[str, str]:
         return {}
 
 
+def _load_prev_episode_state(s3_client: Any) -> dict[str, dict[str, str]]:
+    """Previous sweep's per-artifact open-episode sentinel, read back from
+    ``check_results.json`` — the SAME round-trip ``consecutive_miss_runs``
+    / ``issue_filed_url`` already use (config#2055: "carried in
+    check_results.json ... so no new state surface is introduced"). Only
+    ``missing``/``probe_failed`` rows need this: :func:`_episode_signature`
+    derives a ``stale`` row's episode key straight from the freshest
+    instance's own ``last_modified``, with no round-trip required.
+
+    Returns ``{artifact_id: {"state": ..., "opened_at": ...}}``.
+    Missing/malformed prior results degrade to "no open episode carried
+    forward" — the next alerting sweep mints a fresh episode (one extra
+    page is a far smaller cost than a read failure silently gluing two
+    unrelated incidents into one suppressed key forever)."""
+    try:
+        obj = s3_client.get_object(Bucket=REGISTRY_BUCKET, Key=CHECK_RESULTS_KEY)
+        data = json.loads(obj["Body"].read())
+        out: dict[str, dict[str, str]] = {}
+        for row in data.get("results", []):
+            if not isinstance(row, dict):
+                continue
+            aid = row.get("artifact_id")
+            state = row.get("episode_state")
+            opened_at = row.get("episode_opened_at")
+            if aid and state and opened_at:
+                out[aid] = {"state": state, "opened_at": opened_at}
+        return out
+    except Exception as exc:  # noqa: BLE001 — read failure degrades to "no episode carried forward"
+        logger.warning(
+            "previous check_results read failed — episode markers reset: %s",
+            exc,
+        )
+        return {}
+
+
 def _is_confirmed_miss(result: CheckResult) -> bool:
     """The same confirmed-miss shape the alert path fires on: an
     alerting state past its SLA grace (probe_failed has no grace)."""
@@ -1599,6 +1644,8 @@ def _serialize_check_results(
     execution_loop: dict[str, Any] | None = None,
     coverage: dict[str, Any] | None = None,
     never_written_by_id: dict[str, bool | None] | None = None,
+    episode_by_id: dict[str, dict[str, str] | None] | None = None,
+    driver_by_id: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Build the ``check_results.json`` payload — one row per spec for
     the dashboard surface (Phase 5). ``miss_counts``/``coerced_ids``
@@ -1622,10 +1669,20 @@ def _serialize_check_results(
     suppression_by_id = suppression_by_id or {}
     declared_off_by_id = declared_off_by_id or {}
     owning_by_id = owning_by_id or {}
+    episode_by_id = episode_by_id or {}
+    driver_by_id = driver_by_id or {}
     rows = []
     for spec, result in pairs:
         suppression = suppression_by_id.get(spec.artifact_id)
         declared_off = declared_off_by_id.get(spec.artifact_id)
+        # config-I9336 — computed for every row, not only ones that page,
+        # so the console can watch a driver/episode build BEFORE it pages.
+        # `episode_state`/`episode_opened_at` are the two fields
+        # `_load_prev_episode_state` reads back next sweep — the round-trip
+        # is what keeps a `missing`/`probe_failed` sentinel stable across
+        # the whole streak with no new persisted-state surface.
+        episode = episode_by_id.get(spec.artifact_id)
+        driver = driver_by_id.get(spec.artifact_id) or _evaluate_driver(spec, result)
         # §7.4a: the RECORD carries the full owning-item block for every
         # row that had one resolved — including rows whose page was
         # console-only or suppressed. Suppression is a delivery decision,
@@ -1739,6 +1796,17 @@ def _serialize_check_results(
                 "sla_violated_by_minutes": result.sla_violated_by_minutes,
                 "recovery_substituted": result.recovery_substituted,
                 "issue_filed_url": issue_filed_by_id.get(spec.artifact_id),
+                # config-I9336 — driver attribution, EVERY row, every sweep.
+                "driver": driver["driver"],
+                "driver_consequence": driver["consequence"],
+                "driver_clears_when": driver["clears_when"],
+                # config-I9336 — open-episode identity, None when this row
+                # is not currently alerting. `episode_state` +
+                # `episode_opened_at` are the round-trip pair
+                # `_load_prev_episode_state` reads back next sweep.
+                "episode_key": (episode or {}).get("key"),
+                "episode_state": (episode or {}).get("state"),
+                "episode_opened_at": (episode or {}).get("opened_at"),
             }
         )
     return {
@@ -2330,6 +2398,73 @@ def _maybe_dispatch_drain(
 _ALERTING_STATES = frozenset({"missing", "stale", "probe_failed"})
 
 
+# ── Episode identity (dedup fix — run-keyed vs. episode-keyed) ──────────────
+#
+# The digest's dedup key used to be ``freshness_digest_{today}_{fingerprint
+# of alerting artifact_ids}`` — hashing the SET fixed the 17-pages-for-one-
+# cause defect (config-I7713), but baking ``today`` into the key meant an
+# UNCHANGED standing condition still minted a brand-new key every UTC
+# midnight and re-paged, forever, for as long as it lasted (measured live:
+# ``director_retro_trend`` paged CRITICAL again on 2026-08-14 for the exact
+# incident already paged on 2026-08-12, 30209 → 33089 minutes past SLA,
+# nothing about the condition having changed). Same defect class as the
+# router-canary fix in claude-code-config-PR221 (~430 identical ERROR pages
+# over 18 days) — run-keyed rather than episode-keyed.
+#
+# An EPISODE is the unbroken span during which one artifact stays in one
+# alerting state. Its key must be stable for that whole span and change
+# only when the episode genuinely ends:
+#
+#   - ``stale``: the freshest instance's own ``last_modified`` IS the
+#     episode's identity — it does not move while nobody writes a newer
+#     instance, and a newer instance landing (recovery, or a later relapse
+#     with a NEW last_modified) is exactly what should mint a new key. No
+#     persisted state needed; derived straight from this sweep's probe.
+#   - ``missing`` / ``probe_failed``: the probe found no instance at all, so
+#     there is nothing to anchor a signature on. These carry a sentinel
+#     timestamp — minted once, the sweep the state is FIRST observed — and
+#     round-tripped forward via ``check_results.json`` for as long as the
+#     SAME state persists (:func:`_load_prev_episode_state`), the identical
+#     "no new state surface" convention ``consecutive_miss_runs`` /
+#     ``issue_filed_url`` already use. The moment the state changes —
+#     including an interlude where it went ``stale``/``fresh`` in between —
+#     the sentinel resets, so ``missing`` → ``stale`` → ``missing`` opens a
+#     genuinely NEW episode rather than reusing the first one's (now
+#     permanently-suppressing, since the digest publishes with
+#     ``dedup_window_min=None``) marker.
+
+
+def _episode_signature(
+    spec: ArtifactSpec,
+    result: CheckResult,
+    prev_episode: dict[str, str] | None,
+    now: datetime,
+) -> dict[str, str] | None:
+    """This row's open-episode identity, or ``None`` when it is not
+    alerting (no episode is open). See the module note above.
+
+    Returns ``{"key": ..., "state": ..., "opened_at": ...}``. ``state`` +
+    ``opened_at`` are exactly the two fields :func:`_load_prev_episode_state`
+    reads back next sweep to keep a ``missing``/``probe_failed`` sentinel
+    stable across the whole streak.
+    """
+    if result.state not in _ALERTING_STATES:
+        return None
+    if result.state == "stale" and result.last_modified is not None:
+        opened_at = result.last_modified.isoformat()
+    else:
+        prev = prev_episode or {}
+        if prev.get("state") == result.state and prev.get("opened_at"):
+            opened_at = prev["opened_at"]
+        else:
+            opened_at = now.isoformat()
+    return {
+        "key": f"freshness_{spec.artifact_id}_{result.state}_{opened_at}",
+        "state": result.state,
+        "opened_at": opened_at,
+    }
+
+
 # ── Owning-item resolution (observability-policy §7.4a) ─────────────────────
 #
 # alpha-engine-config-I7326 / nous-ergon-ops-PR661. On 2026-08-14 08:00 UTC
@@ -2805,12 +2940,99 @@ def _owning_item_body_fragment(owning: dict[str, Any] | None) -> str:
     return frag
 
 
+# ── Driver attribution — a closed set, computed on EVERY evaluation ─────────
+#
+# An episode-keyed page must earn the "fixed, not muted" reading by saying
+# more per message, not less: what is wrong, WHY (from a closed set the
+# probe already resolves to — never a free-text guess), what happens if
+# nobody acts, and the concrete S3 key that clears it. Computed for every
+# spec/result pair every sweep — including rows that never page — so the
+# field can be watched building toward an incident rather than only
+# appearing the moment one fires.
+_DRIVER_UNATTRIBUTED = "unattributed"
+
+
+def _evaluate_driver(spec: ArtifactSpec, result: CheckResult) -> dict[str, str]:
+    """Attribute this row's freshness state from the CLOSED set
+    :data:`CheckResult.state` already resolves to — ``missing`` (no
+    instance found at all), ``stale`` (an instance exists but predates the
+    freshness floor), ``probe_failed`` (an S3 client error other than 404 —
+    403/network/endpoint fault; the monitor itself may be blind). Every
+    other resolved state (``fresh`` / ``grace_period``) is not late.
+
+    The ``else`` branch is terminal, not a plausible default: it is reached
+    only if ``CheckResult.state`` gains a value this function was not
+    updated for, and says so explicitly rather than silently guessing one
+    of the known drivers.
+    """
+    if result.state == "missing":
+        return {
+            "driver": "missing_no_instance",
+            "consequence": (
+                f"downstream consumers of {spec.artifact_id!r} keep reading "
+                f"a key nothing has written this incident; nothing "
+                f"self-heals — the producer in {spec.owner_repo!r} must "
+                f"write it"
+            ),
+            "clears_when": (
+                f"an object lands at s3://{spec.s3_bucket}/{result.canonical_key}"
+            ),
+        }
+    if result.state == "stale":
+        return {
+            "driver": "stale_instance_past_sla",
+            "consequence": (
+                f"consumers of {spec.artifact_id!r} keep serving the last "
+                f"instance found; it falls further behind the freshness "
+                f"floor every sweep the producer in {spec.owner_repo!r} "
+                f"does not write a newer one"
+            ),
+            "clears_when": (
+                f"a newer object lands under the {spec.artifact_id!r} key "
+                f"family (canonical probe target: "
+                f"s3://{spec.s3_bucket}/{result.canonical_key})"
+            ),
+        }
+    if result.state == "probe_failed":
+        return {
+            "driver": "probe_error",
+            "consequence": (
+                f"the monitor itself cannot see {spec.artifact_id!r} right "
+                f"now — freshness is UNKNOWN, not confirmed fresh; treat as "
+                f"an incident in {spec.owner_repo!r} (or in the monitor's "
+                f"own S3 access) until the probe succeeds again"
+            ),
+            "clears_when": (
+                f"a HEAD/LIST of s3://{spec.s3_bucket}/{result.canonical_key} "
+                f"succeeds again"
+            ),
+        }
+    if result.state in ("fresh", "grace_period"):
+        return {
+            "driver": "not_applicable",
+            "consequence": "none — row is not late",
+            "clears_when": "n/a",
+        }
+    return {
+        "driver": _DRIVER_UNATTRIBUTED,
+        "consequence": (
+            f"state={result.state!r} falls outside this function's closed "
+            f"set — the driver classifier is stale against "
+            f"CheckResult.state and needs updating; treat the gap itself "
+            f"as an incident"
+        ),
+        "clears_when": "unknown until the classifier is updated",
+    }
+
+
 def _alert_decision(spec: ArtifactSpec, result: CheckResult, now: datetime,
                     consecutive_miss_runs: int = 0,
                     producer_suppression: dict[str, Any] | None = None,
                     owning: dict[str, Any] | None = None,
                     never_written: bool | None = None,
-                    declared_off: dict[str, Any] | None = None) -> dict[str, Any] | None:
+                    declared_off: dict[str, Any] | None = None,
+                    episode: dict[str, str] | None = None,
+                    driver: dict[str, str] | None = None) -> dict[str, Any] | None:
     """Decide whether this probe result belongs on the operator page, and
     return the decision. Returns ``None`` when it does not.
 
@@ -2834,10 +3056,11 @@ def _alert_decision(spec: ArtifactSpec, result: CheckResult, now: datetime,
       - resolved severity is ``critical`` (``severity=warning`` rows are
         console-only via ``check_results.json`` — no SNS/Telegram)
 
-    Dedup-key resolution via
-    :func:`nousergon_lib.artifact_freshness.resolve_dedup_key` ⇒
-    at most one alert per (artifact, cadence-window) regardless of
-    how many 15min probes have already fired in this window.
+    This row's per-artifact EPISODE identity (:func:`_episode_signature`)
+    is threaded into the returned decision and folds into
+    :func:`_digest_dedup_key` ⇒ the whole sweep's digest pages at most once
+    per unbroken episode set, regardless of how many 15min probes or UTC
+    day-rollovers occur while the same episodes stay open.
     """
     if result.state not in _ALERTING_STATES:
         return None
@@ -2969,17 +3192,36 @@ def _alert_decision(spec: ArtifactSpec, result: CheckResult, now: datetime,
         )
         return None
 
-    # The per-artifact detail line. Identical field-for-field to the body the
-    # per-artifact page used to send, so nothing an operator or a log grep
-    # relied on lost its shape — it is now one line of a grouped page rather
-    # than a page of its own.
+    driver = driver or _evaluate_driver(spec, result)
+    episode_key = (episode or {}).get("key")
+    episode_opened_at = (episode or {}).get("opened_at")
+    episode_age_minutes = None
+    if episode_opened_at:
+        try:
+            opened_dt = datetime.fromisoformat(episode_opened_at)
+            episode_age_minutes = int(
+                max(0, (now - opened_dt).total_seconds() // 60)
+            )
+        except ValueError:
+            episode_age_minutes = None
+
+    # The per-artifact detail line. Extends the pre-digest per-artifact page
+    # body (field-for-field) with the driver attribution (config-I9336):
+    # what is wrong, WHY from a closed set, what happens if nobody acts, and
+    # the concrete S3 key that clears it — so the answer is on the page, not
+    # just the assignment.
     line = (
         f"artifact_id={spec.artifact_id} "
         f"owner_repo={spec.owner_repo} "
         f"state={result.state} "
         f"key={result.canonical_key} "
         f"sla_violated_by_minutes={result.sla_violated_by_minutes} "
-        f"reason={result.reason}"
+        f"reason={result.reason} "
+        f"driver={driver['driver']} "
+        f"episode_open_since={episode_opened_at} "
+        f"episode_age_minutes={episode_age_minutes} "
+        f"if_unaddressed={driver['consequence']} "
+        f"clears_when={driver['clears_when']}"
     )
     if escalated:
         line += (
@@ -3003,6 +3245,12 @@ def _alert_decision(spec: ArtifactSpec, result: CheckResult, now: datetime,
         "group_key": _cause_group_key(spec),
         "owning": owning,
         "owning_item": owning_item,
+        "driver": driver["driver"],
+        "driver_consequence": driver["consequence"],
+        "driver_clears_when": driver["clears_when"],
+        "episode_key": episode_key,
+        "episode_opened_at": episode_opened_at,
+        "episode_age_minutes": episode_age_minutes,
         "line": line,
     }
 
@@ -3054,11 +3302,18 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
 #   3. `owner_repo` — the last resort, so a row with neither declaration still
 #      lands in a named group rather than in a nameless remainder.
 #
-# Dedup is on the SET, not the artifact: the page re-fires when the set of
-# alerting artifacts CHANGES (something joined or recovered) or when the UTC
-# day rolls over, and stays quiet while the same condition persists. A cooldown
-# would have suppressed the 17th page; this suppresses nothing and says the 17
-# things once.
+# Dedup is on the SET of open EPISODES (config-I9336), not the artifact and
+# not the calendar day: the page re-fires when that set CHANGES — something
+# joined, something's episode closed because a newer instance landed, or a
+# row's driver changed (e.g. stale → probe_failed) — and stays quiet while
+# the same episodes persist, including across UTC-midnight rollovers. The
+# original config-I7713 shape baked ``now``'s date directly into the key,
+# which re-paged an unchanged standing incident every day it continued
+# (measured: ``director_retro_trend`` paged again 2026-08-14 for the same
+# incident already paged 2026-08-12 — the exact defect this fixes). A
+# cooldown would have suppressed the 17th page, or the 2nd day's page;
+# episode-keying suppresses nothing that is still true and says everything
+# that is, once per fact.
 
 
 def _cause_group_key(spec: ArtifactSpec) -> str:
@@ -3086,22 +3341,34 @@ def _cause_group_key(spec: ArtifactSpec) -> str:
 
 def _digest_dedup_key(
     decisions: list[dict[str, Any]],
-    now: datetime,
     unproduced: list[str] | None = None,
 ) -> str:
-    """One key per (distinct set of alerting artifacts, UTC day).
+    """One key per distinct SET of open per-artifact EPISODES
+    (config-I9336) — deliberately NOT per calendar day.
 
-    Hashing the SET is the whole point: an unchanged condition stays quiet, and
-    an artifact joining or recovering changes the key and re-pages, because the
-    situation genuinely changed. A time-based cooldown could not tell those
-    apart and would have to drop the new one.
+    Hashing each decision's own :func:`_episode_signature` key (falling back
+    to the bare ``artifact_id`` for a decision with no episode threaded, so
+    the function degrades safely rather than raising) is what makes an
+    unbroken standing condition dedup FOREVER (the digest publishes with
+    ``dedup_window_min=None``) while it stays unbroken: the episode key for
+    every member is stable across sweeps and across UTC-midnight, so the
+    fingerprint is stable too. An artifact joining, an episode closing
+    (newer instance landed) or a row's driver changing state all change at
+    least one member's episode key, which changes the fingerprint and
+    re-pages — because the situation genuinely changed, which is the only
+    thing that is supposed to re-page.
     """
-    ids = ",".join(sorted(d["artifact_id"] for d in decisions))
+    ids = ",".join(
+        sorted(
+            f"{d['artifact_id']}={d.get('episode_key') or d['artifact_id']}"
+            for d in decisions
+        )
+    )
     # The unproduced set is part of the condition: a registry row that becomes
     # never-written, or stops being, is a change worth re-stating once.
     ids += "|never_written:" + ",".join(sorted(unproduced or []))
     fingerprint = hashlib.sha256(ids.encode("utf-8")).hexdigest()[:16]
-    return f"freshness_digest_{now.date().isoformat()}_{fingerprint}"
+    return f"freshness_digest_{fingerprint}"
 
 
 def _compose_digest(
@@ -3127,6 +3394,18 @@ def _compose_digest(
         f"{len(decisions)} artifact(s) past SLA across {len(groups)} cause(s) "
         f"({n_critical} critical) — freshness sweep {now.isoformat()}"
     )
+    # config-I9336 — every row in `decisions` is an OPEN episode as of THIS
+    # sweep (recomputed fresh each pass, never carried incrementally), so a
+    # standing condition opened on an earlier sweep is enumerated here every
+    # time regardless of whether this sweep's dedup key actually sends a new
+    # message — the ages make a multi-day episode visible even though the
+    # digest itself is quiet while it persists.
+    episode_ages = [
+        d["episode_age_minutes"] for d in decisions
+        if d.get("episode_age_minutes") is not None
+    ]
+    if episode_ages:
+        header += f" · oldest open episode {max(episode_ages)}min"
     if unproduced:
         header += f" · {len(unproduced)} registry row(s) never written"
 
@@ -3192,7 +3471,7 @@ def _publish_digest(
         d["severity"] == "critical" for d in decisions
     ) else "warning"
     body = _compose_digest(decisions, now, never_written)
-    dedup_key = _digest_dedup_key(decisions, now, unproduced)
+    dedup_key = _digest_dedup_key(decisions, unproduced)
 
     publish_result = publish(
         body,
@@ -3816,6 +4095,7 @@ def _run_probe_pass(
     suppression_by_id: dict[str, dict[str, Any]] | None = None,
     declared_off_by_id: dict[str, dict[str, Any]] | None = None,
     prev_issue_filed: dict[str, str] | None = None,
+    prev_episode_state: dict[str, dict[str, str]] | None = None,
 ) -> tuple[
     list[tuple[ArtifactSpec, CheckResult]], int, int, int, dict[str, int],
     dict[str, Any],
@@ -3823,7 +4103,17 @@ def _run_probe_pass(
     """Walk ``specs``, probe each, dispatch confirmed-miss recoveries, and
     alert. Returns ``(pairs, alerted, dispatched, per_spec_exceptions,
     miss_counts, telemetry)`` where ``telemetry`` carries the §7.4a
-    per-artifact owning-item resolutions and one record per page fired.
+    per-artifact owning-item resolutions, one record per page fired, and
+    (config-I9336) every row's episode identity + driver attribution —
+    computed for EVERY row, not only ones that page.
+
+    ``prev_episode_state`` (config-I9336) carries the previous sweep's
+    per-artifact open-episode sentinel (:func:`_load_prev_episode_state`);
+    the intraday mini-rule passes ``None`` and gets a fresh sentinel every
+    tick for any still-``missing``/``probe_failed`` intraday row, mirroring
+    the existing ``prev_miss_counts=None`` intraday tradeoff below — the
+    daily sweep (which also covers the two intraday artifacts) re-syncs the
+    sentinel at least once every 24h.
 
     config-I3282: after the walk, one aggregated event-time drain dispatch
     fires for the pass's critical pages (see :func:`_maybe_dispatch_drain`
@@ -3855,10 +4145,16 @@ def _run_probe_pass(
     # §7.4a (I7326) — one SSM PAT read and one query budget for the whole
     # pass; resolutions are per-artifact and cached inside the state.
     prev_issue_filed = prev_issue_filed or {}
+    prev_episode_state = prev_episode_state or {}
     lookup_state = _new_lookup_state()
     known_artifact_ids = {s.artifact_id for s in specs}
     owning_by_id: dict[str, dict[str, Any]] = {}
     page_records: list[dict[str, Any]] = []
+    # config-I9336 — computed for EVERY row every sweep, not only ones that
+    # page, so both fields can be watched building toward a page rather than
+    # only appearing the moment one fires.
+    episode_by_id: dict[str, dict[str, str] | None] = {}
+    driver_by_id: dict[str, dict[str, str]] = {}
     # Per-pass cache of lazily-created SF/Lambda clients (shared across the
     # walk so a pass dispatching several recoveries reuses one client each).
     aws_clients: dict[str, Any] = {}
@@ -3870,6 +4166,16 @@ def _run_probe_pass(
                 "per-spec exception for %s: %s", spec.artifact_id, exc,
             )
         pairs.append((spec, result))
+
+        # config-I9336 — driver attribution (closed set) on EVERY row, and
+        # this row's open-episode identity (None when not alerting). Both
+        # must run before `_alert_decision` below, which threads them into
+        # the page line and the digest dedup key.
+        driver_by_id[spec.artifact_id] = _evaluate_driver(spec, result)
+        episode = _episode_signature(
+            spec, result, prev_episode_state.get(spec.artifact_id), now,
+        )
+        episode_by_id[spec.artifact_id] = episode
 
         # config#1240 — auto-remediation. Attempt a dispatch on a confirmed
         # miss (independently trapped so a dispatch failure can NEVER sink the
@@ -3987,6 +4293,8 @@ def _run_probe_pass(
                 owning=owning,
                 never_written=never_written,
                 declared_off=(declared_off_by_id or {}).get(spec.artifact_id),
+                episode=episode,
+                driver=driver_by_id[spec.artifact_id],
             )
         paged = decision is not None
         if paged:
@@ -4053,6 +4361,8 @@ def _run_probe_pass(
             "owning_by_id": owning_by_id,
             "page_records": page_records,
             "never_written_by_id": never_written_by_id,
+            "episode_by_id": episode_by_id,
+            "driver_by_id": driver_by_id,
         },
     )
 
@@ -4160,6 +4470,10 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     # self-filed marker with the tracker search, and the pass is where the
     # pages are composed.
     prev_issue_filed = _load_prev_issue_filed(s3)
+    # config-I9336 — the previous sweep's open-episode sentinel, the same
+    # round-trip-through-check_results.json convention as the two reads
+    # above (no new persisted-state surface).
+    prev_episode_state = _load_prev_episode_state(s3)
 
     (pairs, alerted, dispatched, per_spec_exceptions, miss_counts,
      pass_telemetry) = _run_probe_pass(
@@ -4168,9 +4482,12 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         suppression_by_id=suppression_by_id,
         declared_off_by_id=declared_off_by_id,
         prev_issue_filed=prev_issue_filed,
+        prev_episode_state=prev_episode_state,
     )
     owning_by_id = pass_telemetry["owning_by_id"]
     never_written_by_id = pass_telemetry.get("never_written_by_id") or {}
+    episode_by_id = pass_telemetry.get("episode_by_id") or {}
+    driver_by_id = pass_telemetry.get("driver_by_id") or {}
 
     # config#2055 Gap 2 + §7.4a: extended-staleness -> Decision Queue P1,
     # skipped where an item already owns the condition. Runs after the full
@@ -4225,6 +4542,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         execution_loop=execution_loop,
         coverage=coverage,
         never_written_by_id=never_written_by_id,
+        episode_by_id=episode_by_id,
+        driver_by_id=driver_by_id,
     )
     heartbeat = _serialize_heartbeat(pairs, now, started_at)
 
