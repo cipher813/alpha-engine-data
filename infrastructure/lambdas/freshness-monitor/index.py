@@ -4223,8 +4223,34 @@ def _run_probe_pass(
         # owning-item join (config-I7730) because that join's budget gate reads
         # this answer — a never-written row cannot page, so it must not spend a
         # GitHub query.
+        #
+        # alpha-engine-config-I8810 — `spec.cadence == "event_driven"` is ALSO
+        # eligible, independent of `result.state`. An event_driven row's OWN
+        # `check_freshness` result is unconditionally `fresh`
+        # (`nousergon_lib.artifact_freshness` short-circuits it before any age
+        # floor is consulted — event_driven has no cadence to be stale against),
+        # so `result.state == "missing"` can never be true for one and this
+        # probe never ran. That is exactly how `thinktank_inst_ownership`
+        # (`data/inst_ownership/latest.json`, shipped 2026-07-13, zero invoker)
+        # stayed invisible: its row declares `liveness_via:
+        # thinktank_coverage_ledger`, so its OWN key was never once checked for
+        # existence by anything — the anchor's freshness was graded, this key's
+        # was not. The probe itself is unchanged (`_prefix_has_ever_been_written`
+        # still answers True/False/None on the artifact's own key), and the
+        # downstream handling is unchanged too: `never_written=True` does not
+        # page (`_alert_decision`'s first gate already excludes `fresh` from
+        # `_ALERTING_STATES`, so an event_driven row was never going to page
+        # regardless) but IS threaded into `check_results.json` per-row
+        # (`_serialize_check_results`) and into the standing digest section
+        # (`_compose_digest`'s `unproduced` list reads `never_written_by_id`
+        # directly, not through `_alert_decision`) — so the gap renders instead
+        # of reading as a healthy `fresh` row forever. `_NEVER_WRITTEN_PROBE_MAX`
+        # still bounds the per-sweep cost.
         never_written: bool | None = None
-        if result.state == "missing" and len(never_written_by_id) < _NEVER_WRITTEN_PROBE_MAX:
+        if (
+            (result.state == "missing" or spec.cadence == "event_driven")
+            and len(never_written_by_id) < _NEVER_WRITTEN_PROBE_MAX
+        ):
             never_written = _prefix_has_ever_been_written(s3_client, spec, result)
             if never_written is not None:
                 never_written = not never_written

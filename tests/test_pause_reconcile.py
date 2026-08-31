@@ -168,6 +168,80 @@ def test_dark_and_undeclared_component_fires_for_a_target_behind_dark_triggers(m
         [("dark-and-undeclared-component", "worker")]
 
 
+def test_enabled_trigger_silent_target_fires_when_the_live_target_never_runs(mod):
+    """alpha-engine-config-I9469: an ENABLED schedule whose live target has zero
+    invocations must be a finding — the schedule firing is not evidence the
+    downstream work happened."""
+    findings = _reconcile(
+        mod, manifest=_manifest(),
+        rows={"daily": _row("daily"), "worker": _row("worker", "in-service", substrate="lambda")},
+        triggers=[{"surface": "events", "name": "daily", "state": "ENABLED"}],
+        targets={"daily": ["arn:aws:lambda:us-east-1:1:function:worker"]},
+        ran={"worker": 0},
+    )
+    assert [(f["kind"], f["trigger"]) for f in findings] == \
+        [("enabled-trigger-silent-target", "daily")]
+
+
+def test_enabled_trigger_silent_target_does_not_reproduce_the_i9469_false_positive(mod):
+    """The original 9469 audit flagged `alpha-engine-research-thinktank` (0
+    invocations) off name-similarity to `alpha-research-thinktank-daily`. This
+    direction reads the LIVE target map instead: the rule's real target is the
+    dispatcher, which is invoked, so no finding — the retired Lambda is never
+    even consulted because it is not a live target of anything."""
+    findings = _reconcile(
+        mod, manifest=_manifest(),
+        rows={"alpha-research-thinktank-daily": _row("alpha-research-thinktank-daily"),
+              "alpha-engine-thinktank-spot-dispatcher":
+              _row("alpha-engine-thinktank-spot-dispatcher", "in-service", substrate="lambda")},
+        triggers=[{"surface": "events", "name": "alpha-research-thinktank-daily", "state": "ENABLED"}],
+        targets={"alpha-research-thinktank-daily":
+                 ["arn:aws:lambda:us-east-1:1:function:alpha-engine-thinktank-spot-dispatcher"]},
+        ran={"alpha-engine-thinktank-spot-dispatcher": 10},
+    )
+    assert findings == []
+
+
+def test_enabled_trigger_silent_target_skips_a_target_declared_off(mod):
+    """The target's own row already says it is not expected to run — that is
+    direction A/C's territory, not this one's."""
+    findings = _reconcile(
+        mod, manifest=_manifest(),
+        rows={"daily": _row("daily"), "worker": _row("worker", "retired", substrate="lambda")},
+        triggers=[{"surface": "events", "name": "daily", "state": "ENABLED"}],
+        targets={"daily": ["arn:aws:lambda:us-east-1:1:function:worker"]},
+        ran={"worker": 0},
+    )
+    assert findings == []
+
+
+def test_enabled_trigger_silent_target_skips_an_sf_invoked_target(mod):
+    """A target reached by a live Step Functions definition has other live
+    invocation paths this direction cannot see from the trigger map alone."""
+    findings = _reconcile(
+        mod, manifest=_manifest(),
+        rows={"daily": _row("daily"), "worker": _row("worker", "in-service", substrate="lambda")},
+        triggers=[{"surface": "events", "name": "daily", "state": "ENABLED"}],
+        targets={"daily": ["arn:aws:lambda:us-east-1:1:function:worker"]},
+        ran={"worker": 0}, sf={"worker"},
+    )
+    assert findings == []
+
+
+def test_enabled_trigger_silent_target_skips_a_paused_trigger(mod):
+    """A trigger the manifest declares paused but that is live ENABLED is
+    direction A's `running-while-declared-off` — not duplicated here."""
+    findings = _reconcile(
+        mod, manifest=_manifest(paused={"daily": "ruled off"}),
+        rows={"daily": _row("daily", "deprecated"),
+              "worker": _row("worker", "in-service", substrate="lambda")},
+        triggers=[{"surface": "events", "name": "daily", "state": "ENABLED"}],
+        targets={"daily": ["arn:aws:lambda:us-east-1:1:function:worker"]},
+        ran={"worker": 0},
+    )
+    assert [f["kind"] for f in findings] == ["running-while-declared-off"]
+
+
 # ── the two guards that keep the detector from writing false decisions ───────
 
 def test_a_step_functions_stage_is_not_reported_dark(mod):
