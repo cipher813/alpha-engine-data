@@ -1486,6 +1486,38 @@ alert_classes:
     response: operator
     migration_issue: alpha-engine-config-I3302   # also bypasses the email chokepoint itself
 
+  # -- console (nousergon-console) --
+  # The declared-milestone clause journal (alpha-engine-config-I9482). The
+  # console evaluates the phase-2 exit predicate on every index build and, until
+  # I9482, recorded nothing: two clauses went MET -> UNMET inside three days
+  # (2026-08-28 -> 2026-08-31) and nothing paged. It now emits ONE event per
+  # EPISODE -- a maximal run of consecutive builds in which one clause holds one
+  # non-MET status -- with a symmetric `state: cleared` when the clause returns
+  # to MET. `error` on open (a declared exit criterion regressed, or the console
+  # LOST THE ABILITY to grade one -- detection blindness outranks the defect it
+  # hides, so both are error); `info` on the clear.
+  #
+  # DetailType `nousergon.milestone-clause-transition.v1`; detail carries
+  # `identity_key` (stable across the open/clear pair, and carrying nothing
+  # about the build), `clause_id`, `moved` (the binding that changed, with
+  # before/after) and the milestone roll-up. `intake: bus` -- it is put directly
+  # onto `nousergon-alerts` by the console box under its `nousergon-alerts-put-
+  # events` grant, not through the krepis chokepoint, but lands on the same bus
+  # the drain consumes.
+  - class: console_milestone_clause_transition
+    source: "nousergon.console.milestone-journal"
+    severities: [error, info]
+    intake: bus
+    response: drain-queue
+    # overseer-policy.md invariant 4 (alpha-engine-config-I8991/I8996): a
+    # pageable class needs a declared disposition, and `response: drain-queue`
+    # alone is not one -- it says the drain SEES the event, not what the drain
+    # DOES with it. The per-class disposition here is genuinely open: a clause
+    # regression may warrant a T2 diagnosis turn (which clause, what moved,
+    # which repo owns the fix) or a T0 digest fold when the milestone is
+    # already known to be HOLDING on that clause. Tracked, not guessed.
+    migration_issue: alpha-engine-config-I9482
+
 # ── T1 authority tier — named deterministic remediations (overseer-policy.md §6) ──
 # Each entry is a reviewed, non-agentic automation for a known-shape failure
 # whose root cause AND remediation are stable across ≥3 occurrences. The
