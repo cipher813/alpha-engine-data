@@ -93,6 +93,27 @@ jobs:
       # to page when --check fails, so a gated step here would silently
       # reintroduce the exact defect this issue closes.
       - name: Scheduled-automation pause still holds (live) — page on drift
+        # TELEGRAM IS A LIVE GHA TRANSPORT AND MUST BE WIRED EXPLICITLY
+        # (alpha-engine-config-I9209). krepis.telegram resolves both values
+        # through `get_secret`, which reads SSM first and the environment
+        # second. On the laptop and on EC2 the SSM read succeeds, so Telegram
+        # "just works" there; a GHA runner assuming this OIDC role holds no
+        # ssm:GetParameter on /alpha-engine/telegram/*, so the SSM leg fails
+        # and the env leg was never populated — which is why 8 consecutive
+        # runs logged `TELEGRAM_BOT_TOKEN=MISSING TELEGRAM_CHAT_ID=MISSING`
+        # while SNS and EventBridge were separately IAM-denied. Both names are
+        # ORGANISATION-WIDE Actions secrets with ALL-repository visibility
+        # (measured 2026-08-31 via `gh secret list --org nousergon`), so
+        # nothing needed provisioning — only this mapping. It matters
+        # disproportionately: severity="error" is pinned in
+        # automation_pause.py::alert_on_findings precisely because
+        # error/critical are the severities krepis phone-pushes over Telegram
+        # (krepis.alerts.SEVERITY_PHONE_PUSH), so without these two lines the
+        # workflow's whole stated purpose — page Brian with no groom, sweep or
+        # console reader in the loop — is carried by no transport at all.
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python3 infrastructure/automation_pause.py --check --alert-on-fail
 
   # ── FAILURE ALERTING (alpha-engine-config-I9121) ─────────────────────────
