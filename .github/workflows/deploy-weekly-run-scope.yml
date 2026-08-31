@@ -67,6 +67,25 @@ jobs:
         working-directory: alpha-engine-data
         run: bash infrastructure/lambdas/weekly-run-scope/deploy.sh
 
+      # The merge emits the exact operator command whenever it ships code whose
+      # IAM this workflow is NOT allowed to apply (config#6738,
+      # pull-request-policy §4.2 form 3). github-actions-lambda-deploy has no
+      # iam:PutRolePolicy by design — the single-writer rule adopted after 4
+      # IAM-clobber incidents — so a changed iam-policy.json ships as CODE ONLY
+      # and the grant lags. Deliberately does not fail the job: the code deploy
+      # really did succeed, and the standing detector is
+      # nous-ergon-ops/infrastructure/iam/check-drift.py (every PR + daily
+      # 09:35 UTC), which stays red until the command below is run.
+      - name: Emit operator IAM-apply command if iam-policy.json changed
+        if: always()
+        working-directory: alpha-engine-data
+        run: |
+          CHANGED=$(git diff --name-only HEAD^ HEAD -- infrastructure/lambdas/weekly-run-scope/iam-policy.json || true)
+          if [ -z "${CHANGED}" ]; then echo "iam-policy.json unchanged in this merge — no operator step."; exit 0; fi
+          CMD="AWS_PROFILE=ne-admin bash infrastructure/lambdas/weekly-run-scope/deploy.sh --apply-iam"
+          echo "::warning title=Operator IAM apply required::${CMD}"
+          { echo "### Operator step required"; echo ""; echo "\`infrastructure/lambdas/weekly-run-scope/iam-policy.json\` changed in this merge, and this workflow's OIDC role cannot apply IAM (single-writer rule). Run from a checkout of \`nousergon-data\`:"; echo ""; echo '```'; echo "${CMD}"; echo '```'; echo ""; echo "Until it runs: \`nous-ergon-ops/infrastructure/iam/check-drift.py --lambdas-root ../nousergon-data/infrastructure/lambdas\` stays red (daily 09:35 UTC), and the Lambda logs \`run-scope write DECLINED\` instead of merging (alpha-engine-config-I8811). The fix is SAFE without it — a create-only write cannot clobber."; } >> "${GITHUB_STEP_SUMMARY}"
+
       - name: Report deployed version
         working-directory: alpha-engine-data
         run: |

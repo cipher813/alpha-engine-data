@@ -19,6 +19,21 @@
 #   bash infrastructure/lambdas/weekly-run-scope/deploy.sh --apply-iam # re-apply iam-policy.json only (config#2825)
 #   bash infrastructure/lambdas/weekly-run-scope/deploy.sh --dry-run   # show actions, do not apply
 
+# IAM (alpha-engine-config-I8811): iam-policy.json now grants `s3:GetObject` on
+# `backtest/*/run_scope.json` alongside the existing `s3:PutObject`. The Lambda
+# reads the cycle's existing scope so it can MERGE onto it instead of
+# overwriting it — a skip-flagged recovery rerun must not be able to demote a
+# scheduled run's dispatched stage to DISABLED (see index.py::_persist).
+#
+# The GHA auto-deploy path (`deploy-weekly-run-scope.yml`) ships CODE ONLY: its
+# OIDC role has no iam:PutRolePolicy by design (the fleet single-writer rule
+# adopted after 4 IAM-clobber incidents), so this grant reaches the role only
+# through an operator `--apply-iam` run. That lag is SAFE and does not gate the
+# fix: without `s3:GetObject` the handler falls back to a create-only
+# conditional write (`IfNoneMatch: *`), which cannot merge but also cannot
+# clobber — it declines at ERROR and the cycle keeps the scope it has. Applying
+# the grant upgrades declining into merging.
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
