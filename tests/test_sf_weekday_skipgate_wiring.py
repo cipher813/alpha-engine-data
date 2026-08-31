@@ -152,9 +152,11 @@ class TestEntryEdgesRouteThroughGates:
         # CodeFreshnessGate (verify all 3 repo checkouts are on current main
         # BEFORE any pipeline work — the 2026-07-06 incident burned ~40 min
         # before the planner-time deploy-drift preflight refused), whose
-        # SUCCESS verdict enters the first morning work gate
-        # (CheckSkipMorningEnrich) — the Phase-2 equivalent of what used to be
-        # the (now-retired) single-shared-spot CheckDataSpotLaunched hop.
+        # SUCCESS verdict enters the sf-pipeline-policy 2.3a correctness gate
+        # (alpha-engine-config-I9466), whose own SUCCESS enters the first
+        # morning work gate (CheckSkipMorningEnrich) — the Phase-2 equivalent
+        # of what used to be the (now-retired) single-shared-spot
+        # CheckDataSpotLaunched hop.
         online = [
             c["Next"]
             for c in states["SSMReadyChoice"]["Choices"]
@@ -165,7 +167,16 @@ class TestEntryEdgesRouteThroughGates:
             c["Next"] for c in states["CheckCodeFreshnessStatus"]["Choices"]
             if c.get("StringEquals") == "SUCCESS"
         ]
-        assert fresh == ["CheckSkipMorningEnrich"]
+        assert fresh == ["CorrectnessVerdictGate"]
+        verdict = [
+            c["Next"] for c in states["CheckCorrectnessVerdictStatus"]["Choices"]
+            if c.get("StringEquals") == "SUCCESS"
+        ]
+        assert verdict == ["CheckSkipMorningEnrich"], (
+            "the correctness gate must sit BETWEEN code freshness and the first "
+            "morning work gate — before any spot launch, so a non-PASS verdict "
+            "costs ~2 minutes rather than a full data phase"
+        )
 
     def test_morning_enrich_spot_success_enters_append_spot(self, states):
         # config#1767: the enrich fetch now runs on its own ephemeral spot. Its
