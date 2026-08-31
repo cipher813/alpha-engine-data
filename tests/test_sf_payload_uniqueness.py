@@ -285,6 +285,12 @@ _WEEKDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # Lambda-Payload registry.
     "WaitForCodeFreshness": _LIVENESS_POLLER_KEYS,
     "WaitForMorningPlanner": _LIVENESS_POLLER_KEYS,
+    # alpha-engine-config-I9466: the sf-pipeline-policy 2.3a correctness-verdict
+    # gate runs on the trading box (the SF role's s3:GetObject is scoped to three
+    # keys and grants nothing on backtest/ or config/, so a native
+    # aws-sdk:s3:getObject read would need an IAM change in another repo), and so
+    # it polls through the same ssm-liveness-poller contract as the two above.
+    "WaitForCorrectnessVerdict": _LIVENESS_POLLER_KEYS,
     # config#1767 (Phase 2): the data phase (enrich + Arctic append) was relocated
     # onto two independent ephemeral spot boxes via the alpha-engine-data-spot-
     # dispatcher Lambda. Each launch state passes {"workload": <key>,
