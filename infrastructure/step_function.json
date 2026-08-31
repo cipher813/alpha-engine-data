@@ -2084,8 +2084,8 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Eval is observability per ROADMAP \u00a71635 \u2014 submit failures must NOT halt the pipeline. EvalRollingMean still runs against historical data. alpha-engine-config#6722: routes through MarkEvalJudgeDegraded first.",
-                  "Next": "MarkEvalJudgeDegraded",
+                  "Comment": "Eval is observability per ROADMAP \u00a71635 \u2014 submit failures must NOT halt the pipeline. EvalRollingMean still runs against historical data. alpha-engine-config#6722: routes through MarkEvalJudgeDegraded first. | alpha-engine-config-I9636: routes through ExtractEvalJudgeSubmitFirstSaturdayError first, which stamps the PHASE onto the record the Catch just wrote. Five Catches shared $.eval_judge_error with no discriminator, so 'the submit was refused' and 'the spot box never booted' were the same bytes to every reader.",
+                  "Next": "ExtractEvalJudgeSubmitFirstSaturdayError",
                   "ResultPath": "$.eval_judge_error"
                 }
               ],
@@ -2122,8 +2122,8 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Eval is observability \u2014 submit failures must NOT halt the pipeline. alpha-engine-config#6722: routes through MarkEvalJudgeDegraded first.",
-                  "Next": "MarkEvalJudgeDegraded",
+                  "Comment": "Eval is observability \u2014 submit failures must NOT halt the pipeline. alpha-engine-config#6722: routes through MarkEvalJudgeDegraded first. | alpha-engine-config-I9636: routes through ExtractEvalJudgeSubmitWeeklyError first, which stamps the PHASE onto the record the Catch just wrote. Five Catches shared $.eval_judge_error with no discriminator, so 'the submit was refused' and 'the spot box never booted' were the same bytes to every reader.",
+                  "Next": "ExtractEvalJudgeSubmitWeeklyError",
                   "ResultPath": "$.eval_judge_error"
                 }
               ],
@@ -2132,7 +2132,7 @@
             },
             "EvalJudgeSubmitOutcome": {
               "Type": "Choice",
-              "Comment": "Branch on Submit's outcome. Replaces EvalJudgePollChoice, which was deleted with the rest of the poll chain (alpha-engine-config-I9329) \u2014 but NOT its fail-soft Default, which is load-bearing and was earned: alpha-engine-config-I9058 records 2026-08-22, when EvalJudgeSubmitWeekly SUCCEEDED while returning status=ERROR in its payload, the chain skipped straight past Process, decision_artifacts/_eval/latest.json was never rewritten, and NOTHING in the run recorded a degradation; the only signal was a freshness row going stale five days later. That Default is preserved verbatim in meaning here. | ORDER MATTERS. The dry branch is FIRST: on the Friday shell run $.research_dry is true and Submit returns the EMPTY sentinel, and we still want the box to boot, import and probe S3 under --preflight-only \u2014 that is the whole point of the keystone, and it is the only path that exercises the new substrate before Saturday. | A REAL EMPTY plan routes to EvalJudgeEmptyPlan instead of to the spot, which is a DELIBERATE deviation from I9329's issue body ('EMPTY continues to route straight to EvalJudgeProcess'): that instruction was written for a Lambda Process that could emit a clean empty result for free. On a spot box the same routing would launch an instance to grade zero artifacts, and judge_spot_run refuses to run without a plan (exit 2), so it would also FAIL the stage. The Pass state emits the identical result shape at no cost. | ended_sync (alpha-engine-config-I9263) and OK both mean 'there is a plan to judge' now that no provider batch exists to poll.",
+              "Comment": "Branch on Submit's outcome. Replaces EvalJudgePollChoice, which was deleted with the rest of the poll chain (alpha-engine-config-I9329) \u2014 but NOT its fail-soft Default, which is load-bearing and was earned: alpha-engine-config-I9058 records 2026-08-22, when EvalJudgeSubmitWeekly SUCCEEDED while returning status=ERROR in its payload, the chain skipped straight past Process, decision_artifacts/_eval/latest.json was never rewritten, and NOTHING in the run recorded a degradation; the only signal was a freshness row going stale five days later. That Default is preserved verbatim in meaning here. | ORDER MATTERS. The dry branch is FIRST: on the Friday shell run $.research_dry is true and Submit returns the EMPTY sentinel, and we still want the box to boot, import and probe S3 under --preflight-only \u2014 that is the whole point of the keystone, and it is the only path that exercises the new substrate before Saturday. | A REAL EMPTY plan routes to EvalJudgeEmptyPlan instead of to the spot, which is a DELIBERATE deviation from I9329's issue body ('EMPTY continues to route straight to EvalJudgeProcess'): that instruction was written for a Lambda Process that could emit a clean empty result for free. On a spot box the same routing would launch an instance to grade zero artifacts, and judge_spot_run refuses to run without a plan (exit 2), so it would also FAIL the stage. The Pass state emits the identical result shape at no cost. | ended_sync (alpha-engine-config-I9263) and OK both mean 'there is a plan to judge' now that no provider batch exists to poll. | alpha-engine-config-I9636: the Default now routes through ExtractEvalJudgeSubmitOutcomeError. MEASURED on the 2026-08-29 scheduled run (execution 965d925b-f9d6-ce5e-e059-9405433a0724_c0271e3b-a27f-a834-b303-3e3803fffd16): EvalJudgeSubmitWeekly SUCCEEDED returning status=ERROR stage=submit error='Error code: 400 ... Your credit balance is too low to access the Anthropic API', this Default fired, and MarkEvalJudgeDegraded recorded a bare boolean. The run's own terminal never mentioned the eval judge; the cause had to be recovered from 7,858 execution-history events two days later. I9058 made this path VISIBLE \u2014 this makes it LEGIBLE. A Choice Default populates no error field on its own, so without this state the one fact the run was holding is discarded at the moment it becomes a degradation.",
               "Choices": [
                 {
                   "And": [
@@ -2187,7 +2187,7 @@
                   "Next": "PrepareEvalJudgeSpotDispatch"
                 }
               ],
-              "Default": "MarkEvalJudgeDegraded"
+              "Default": "ExtractEvalJudgeSubmitOutcomeError"
             },
             "EvalJudgeEmptyPlan": {
               "Type": "Pass",
@@ -2251,8 +2251,8 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "alpha-engine-config#6722: routes through MarkEvalJudgeDegraded so the run RECORDS that the judge produced nothing, then continues to EvalRollingMean against historical data.",
-                  "Next": "MarkEvalJudgeDegraded",
+                  "Comment": "alpha-engine-config#6722: routes through MarkEvalJudgeDegraded so the run RECORDS that the judge produced nothing, then continues to EvalRollingMean against historical data. | alpha-engine-config-I9636: routes through ExtractEvalJudgeSpotDispatchError first, which stamps the PHASE onto the record the Catch just wrote. Five Catches shared $.eval_judge_error with no discriminator, so 'the submit was refused' and 'the spot box never booted' were the same bytes to every reader.",
+                  "Next": "ExtractEvalJudgeSpotDispatchError",
                   "ResultPath": "$.eval_judge_error"
                 }
               ],
@@ -2314,8 +2314,9 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Next": "MarkEvalJudgeDegraded",
-                  "ResultPath": "$.eval_judge_error"
+                  "Next": "ExtractEvalJudgeSpotBootstrapPollError",
+                  "ResultPath": "$.eval_judge_error",
+                  "Comment": " | alpha-engine-config-I9636: routes through ExtractEvalJudgeSpotBootstrapPollError first, which stamps the PHASE onto the record the Catch just wrote. Five Catches shared $.eval_judge_error with no discriminator, so 'the submit was refused' and 'the spot box never booted' were the same bytes to every reader."
                 }
               ],
               "ResultSelector": {
@@ -2484,8 +2485,8 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Comment": "Eval is observability \u2014 a Process failure must NOT halt the pipeline. Routes through MarkEvalJudgeDegraded then EvalRollingMean, which still runs against historical data. alpha-engine-config#6722.",
-                  "Next": "MarkEvalJudgeDegraded",
+                  "Comment": "Eval is observability \u2014 a Process failure must NOT halt the pipeline. Routes through MarkEvalJudgeDegraded then EvalRollingMean, which still runs against historical data. alpha-engine-config#6722. | alpha-engine-config-I9636: routes through ExtractEvalJudgeProcessTaskError first. Distinct from ExtractEvalJudgeProcessError, which names the CheckEvalJudgeProcessStatus Choice-Default arrival \u2014 the SSM command came back non-Success \u2014 while this one names the sendCommand Task itself failing. Same $.eval_judge_error path, two different incidents.",
+                  "Next": "ExtractEvalJudgeProcessTaskError",
                   "ResultPath": "$.eval_judge_error"
                 }
               ],
@@ -2532,8 +2533,9 @@
                   "ErrorEquals": [
                     "States.ALL"
                   ],
-                  "Next": "MarkEvalJudgeDegraded",
-                  "ResultPath": "$.eval_judge_error"
+                  "Next": "ExtractEvalJudgeProcessPollError",
+                  "ResultPath": "$.eval_judge_error",
+                  "Comment": " | alpha-engine-config-I9636: routes through ExtractEvalJudgeProcessPollError first, which stamps the PHASE onto the record the Catch just wrote. Five Catches shared $.eval_judge_error with no discriminator, so 'the submit was refused' and 'the spot box never booted' were the same bytes to every reader."
                 }
               ],
               "ResultSelector": {
@@ -2651,7 +2653,7 @@
             },
             "MarkEvalJudgeDegraded": {
               "Type": "Pass",
-              "Comment": "alpha-engine-config#6722: shared convergence for every fail-open exit of the eval-judge chain \u2014 the two Submit Catches, the EvalJudgeSubmitOutcome Default (alpha-engine-config-I9058), the spot dispatch/bootstrap/process Catches and the two liveness gates' Defaults. Threads $.research_degraded_local=true without changing the continuation. Under alpha-engine-config-I9329 the set of arrivals grew from four to eight and now includes SUBSTRATE loss, which is why each arrival first passes through an Extract* state that names its phase: 'the box was reclaimed' and 'the judge under-covered the corpus' are different incidents and must not reach the notifier as one.",
+              "Comment": "alpha-engine-config#6722: shared convergence for every fail-open exit of the eval-judge chain \u2014 the two Submit Catches, the EvalJudgeSubmitOutcome Default (alpha-engine-config-I9058), the spot dispatch/bootstrap/process Catches and the two liveness gates' Defaults. Threads $.research_degraded_local=true without changing the continuation. Under alpha-engine-config-I9329 the set of arrivals grew from four to eight and now includes SUBSTRATE loss, which is why each arrival first passes through an Extract* state that names its phase (alpha-engine-config-I9636: that sentence was ASPIRATIONAL when written \u2014 measured on the live definition 2026-08-31 it held for 2 of the 9 arrivals, and the 2026-08-29 run degraded through one of the 6 that had none. All 9 now have one): 'the box was reclaimed' and 'the judge under-covered the corpus' are different incidents and must not reach the notifier as one.",
               "Result": true,
               "ResultPath": "$.research_degraded_local",
               "Next": "EvalRollingMean"
@@ -3041,6 +3043,83 @@
               "Result": true,
               "ResultPath": "$.research_self_test_invocation_failed",
               "Next": "CheckSkipChallengerShadow"
+            },
+            "ExtractEvalJudgeSubmitWeeklyError": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I9636: name the phase for EvalJudgeSubmitWeekly's fail-open exit. The Catch populates $.eval_judge_error with {Error, Cause}, but ALL FIVE eval-judge Catches write that same path, so the record said a phase had failed without ever saying WHICH. Mirrors ExtractEvalJudgeProcessError, whose Comment states the same obligation for the Choice-Default arrivals. Total by construction: $.eval_judge_error is written by the Catch that routes here, so the .$ reference can never miss.",
+              "Parameters": {
+                "phase": "EvalJudgeSubmitWeekly",
+                "source": "EvalJudgeSubmitWeekly.Catch[States.ALL]",
+                "error.$": "$.eval_judge_error"
+              },
+              "ResultPath": "$.eval_judge_error",
+              "Next": "MarkEvalJudgeDegraded"
+            },
+            "ExtractEvalJudgeSubmitFirstSaturdayError": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I9636: name the phase for EvalJudgeSubmitFirstSaturday's fail-open exit. The Catch populates $.eval_judge_error with {Error, Cause}, but ALL FIVE eval-judge Catches write that same path, so the record said a phase had failed without ever saying WHICH. Mirrors ExtractEvalJudgeProcessError, whose Comment states the same obligation for the Choice-Default arrivals. Total by construction: $.eval_judge_error is written by the Catch that routes here, so the .$ reference can never miss.",
+              "Parameters": {
+                "phase": "EvalJudgeSubmitFirstSaturday",
+                "source": "EvalJudgeSubmitFirstSaturday.Catch[States.ALL]",
+                "error.$": "$.eval_judge_error"
+              },
+              "ResultPath": "$.eval_judge_error",
+              "Next": "MarkEvalJudgeDegraded"
+            },
+            "ExtractEvalJudgeSpotDispatchError": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I9636: name the phase for DispatchEvalJudgeSpot's fail-open exit. The Catch populates $.eval_judge_error with {Error, Cause}, but ALL FIVE eval-judge Catches write that same path, so the record said a phase had failed without ever saying WHICH. Mirrors ExtractEvalJudgeProcessError, whose Comment states the same obligation for the Choice-Default arrivals. Total by construction: $.eval_judge_error is written by the Catch that routes here, so the .$ reference can never miss.",
+              "Parameters": {
+                "phase": "EvalJudgeSpotDispatch",
+                "source": "DispatchEvalJudgeSpot.Catch[States.ALL]",
+                "error.$": "$.eval_judge_error"
+              },
+              "ResultPath": "$.eval_judge_error",
+              "Next": "MarkEvalJudgeDegraded"
+            },
+            "ExtractEvalJudgeSpotBootstrapPollError": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I9636: name the phase for WaitForEvalJudgeSpotBootstrap's fail-open exit. The Catch populates $.eval_judge_error with {Error, Cause}, but ALL FIVE eval-judge Catches write that same path, so the record said a phase had failed without ever saying WHICH. Mirrors ExtractEvalJudgeProcessError, whose Comment states the same obligation for the Choice-Default arrivals. Total by construction: $.eval_judge_error is written by the Catch that routes here, so the .$ reference can never miss.",
+              "Parameters": {
+                "phase": "EvalJudgeSpotBootstrapPoll",
+                "source": "WaitForEvalJudgeSpotBootstrap.Catch[States.ALL]",
+                "error.$": "$.eval_judge_error"
+              },
+              "ResultPath": "$.eval_judge_error",
+              "Next": "MarkEvalJudgeDegraded"
+            },
+            "ExtractEvalJudgeProcessPollError": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I9636: name the phase for WaitForEvalJudgeProcess's fail-open exit. The Catch populates $.eval_judge_error with {Error, Cause}, but ALL FIVE eval-judge Catches write that same path, so the record said a phase had failed without ever saying WHICH. Mirrors ExtractEvalJudgeProcessError, whose Comment states the same obligation for the Choice-Default arrivals. Total by construction: $.eval_judge_error is written by the Catch that routes here, so the .$ reference can never miss.",
+              "Parameters": {
+                "phase": "EvalJudgeProcessPoll",
+                "source": "WaitForEvalJudgeProcess.Catch[States.ALL]",
+                "error.$": "$.eval_judge_error"
+              },
+              "ResultPath": "$.eval_judge_error",
+              "Next": "MarkEvalJudgeDegraded"
+            },
+            "ExtractEvalJudgeSubmitOutcomeError": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I9636: carry Submit's OWN payload into the degraded record. States.JsonToString is used rather than picking out .status/.error because this Default is reached by TWO different shapes \u2014 a payload with status=ERROR (which has .error) and a payload missing status entirely (which has neither) \u2014 and an unguarded .$ on the second throws States.Runtime on the fail-open path, the config-I2767 shape. $.eval_judge_submit.Payload is total here: this state is reachable only from a lambda:invoke that SUCCEEDED, since a failed invoke takes the Catch instead.",
+              "Parameters": {
+                "phase": "EvalJudgeSubmit",
+                "source": "EvalJudgeSubmitOutcome.Default",
+                "submit_payload.$": "States.JsonToString($.eval_judge_submit.Payload)"
+              },
+              "ResultPath": "$.eval_judge_error",
+              "Next": "MarkEvalJudgeDegraded"
+            },
+            "ExtractEvalJudgeProcessTaskError": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I9636: name the phase for EvalJudgeProcess's own Task Catch. The seventh of nine arrivals into MarkEvalJudgeDegraded and the last one that named nothing. Total: the Catch that routes here wrote $.eval_judge_error.",
+              "Parameters": {
+                "phase": "EvalJudgeProcess",
+                "source": "EvalJudgeProcess.Catch[States.ALL]",
+                "error.$": "$.eval_judge_error"
+              },
+              "ResultPath": "$.eval_judge_error",
+              "Next": "MarkEvalJudgeDegraded"
             }
           }
         },
