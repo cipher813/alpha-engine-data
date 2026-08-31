@@ -28,6 +28,20 @@ row, ``ReportCard``'s and ``Director``'s are the three the history cannot yet
 contain; they resolve from the run's input flags, and each row records which of
 the two sources decided it (``source``).
 
+**One key per cycle, and more than one execution writes it.**
+``backtest/{run_date}/run_scope.json`` is written by the scheduled Saturday run
+and again by every recovery rerun launched against the same cycle — and a rerun
+is launched to redo ONE stage, so it carries a skip-set for everything else.
+Last-writer-wins therefore hands the cycle's scope to its worst-informed
+author: both artifacts on S3 on 2026-08-31 were written by skip-flagged reruns
+(``watch-rerun-2026-08-22-3``; ``watch-rerun-2026-08-28-13``, written
+2026-08-30T18:47Z, a day and a half after the scheduled run wrote that cycle's
+attestation) and both claim ``Backtester: DISABLED`` for cycles whose
+backtester artifacts exist. ``crucible-evaluator-PR289``
+(``alpha-engine-config-I8811``) stopped the consumer acting on that
+contradiction; :func:`_persist` here stops it being written. The rule is that a
+cycle's scope only ever ACCUMULATES — see ``run_scope.merge_run_scopes``.
+
 **Failure posture — deliberately fail-open, and only here.** A scope block that
 could not be built must not kill a run that produced real trading artifacts, so
 the handler catches, publishes nothing, and returns a block whose every stage is
@@ -41,11 +55,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime, timezone
 
 import boto3
 from krepis.dates import resolve_trading_day
 
-from run_scope import build_run_scope
+from run_scope import build_run_scope, merge_run_scopes, stamp_provenance
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -96,6 +111,168 @@ def _history(client, execution_arn: str) -> list[dict]:
 def _definition(client, state_machine_arn: str) -> dict:
     described = client.describe_state_machine(stateMachineArn=state_machine_arn)
     return json.loads(described["definition"])
+
+
+class ScopeWriteConflictError(RuntimeError):
+    """Raised when the artifact changed under us on every attempt.
+
+    Loud on purpose. The SF's Catch on ``RunScope`` routes it to
+    ``CheckSkipReportCard`` without failing the weekly run, and the cycle keeps
+    whichever scope is already on S3 — the safe direction, since the thing this
+    module must never do is destroy an established claim.
+    """
+
+
+#: Read-merge-write attempts before giving up. Concurrent RunScope executions
+#: over one ``run_date`` are rare (a rerun launched while the scheduled run is
+#: still going); three attempts turn that from a lost write into a retried one.
+_WRITE_ATTEMPTS = 3
+
+
+def _error_code(exc: Exception) -> str:
+    """The S3 error code off a botocore ``ClientError``, duck-typed.
+
+    Duck-typed rather than ``except ClientError`` so this module keeps its
+    single runtime dependency surface and so the tests can drive every branch
+    with a plain exception carrying a ``response``.
+    """
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        code = (response.get("Error") or {}).get("Code")
+        if isinstance(code, str):
+            return code
+    return type(exc).__name__
+
+
+def _read_incumbent(s3, key: str) -> tuple[dict | None, str | None, bool, str]:
+    """The cycle's existing scope artifact, its ETag, and whether we KNOW.
+
+    Returns ``(body, etag, read_ok, note)``. ``read_ok`` is the load-bearing
+    value: True means the incumbent's presence or absence is ESTABLISHED, False
+    means the read itself failed and this execution knows nothing about what is
+    already there. The two are handled differently by :func:`_persist` — an
+    unknown incumbent is never overwritten.
+
+    A 404 is a successful read: the object is established absent. That branch
+    is only reachable because ``iam-policy.json`` also grants a
+    ``backtest/*``-scoped ``s3:ListBucket`` — without it S3 answers 403
+    AccessDenied for a key that does not exist (config#2878), and an absent
+    artifact would be indistinguishable from an unreadable one. Both are safe
+    here, but only one of them can merge.
+    """
+    try:
+        body = s3.get_object(Bucket=BUCKET, Key=key)
+        parsed = json.loads(body["Body"].read())
+        etag = body.get("ETag")
+        if not isinstance(parsed, dict):
+            return None, etag, True, "incumbent body is not a JSON object"
+        return parsed, etag, True, "incumbent read"
+    except Exception as exc:  # noqa: BLE001
+        code = _error_code(exc)
+        if code in ("NoSuchKey", "404", "NoSuchBucket"):
+            return None, None, True, "no incumbent artifact for this cycle"
+        # Every other failure — AccessDenied while the new grant lags the code
+        # deploy, a throttle, a truncated body. NOT fatal, and NOT treated as
+        # absence: `_persist` degrades to a create-only write, which cannot
+        # clobber anything.
+        logger.warning(
+            "could not read the incumbent run scope at s3://%s/%s (%s) — "
+            "falling back to a create-only write, which refuses to overwrite "
+            "an existing artifact rather than clobbering one it cannot read.",
+            BUCKET, key, code,
+        )
+        return None, None, False, f"incumbent unreadable: {code}"
+
+
+def _persist(scope: dict, key: str) -> dict:
+    """Accumulate this execution's scope onto the cycle's, and store it.
+
+    alpha-engine-config-I8811. The write is CONDITIONAL in both directions:
+
+    * incumbent read successfully  -> ``IfMatch`` its ETag, so a concurrent
+      writer between our read and our write loses the race instead of being
+      silently overwritten; a 412 re-reads and re-merges.
+    * incumbent NOT readable       -> ``IfNoneMatch: "*"``, so the write lands
+      only if the key is empty. A 412 here is the guard working: something is
+      already there and this execution cannot merge onto it, so it declines and
+      says so at ERROR rather than replacing a claim it never read.
+
+    The second branch is what makes this fix safe from the moment the code
+    deploys, before the ``s3:GetObject`` grant in ``iam-policy.json`` is
+    applied: without the grant the Lambda cannot merge, but it also cannot
+    destroy — the exact failure this exists to prevent.
+    """
+    s3 = boto3.client("s3")
+    last_error = ""
+    for attempt in range(1, _WRITE_ATTEMPTS + 1):
+        incumbent, etag, read_ok, note = _read_incumbent(s3, key)
+        merged, ledger = merge_run_scopes(incumbent, dict(scope))
+        ledger["incumbent_read"] = {"ok": read_ok, "note": note}
+        ledger["attempt"] = attempt
+        merged["scope_merge"] = ledger
+        for rejected in ledger["rejected"]:
+            # Fail loud: a refused claim is an ERROR line naming both sides, not
+            # a quiet no-op. It is also durable — it ships inside the artifact.
+            logger.error(
+                "run-scope write REFUSED for stage %s: keeping %s established "
+                "by %s; this execution claimed %s. %s "
+                "(alpha-engine-config-I8811)",
+                rejected["stage"], rejected["kept"], rejected["kept_from"],
+                rejected["refused"], rejected["why"],
+            )
+        params = {
+            "Bucket": BUCKET,
+            "Key": key,
+            "Body": json.dumps(merged, indent=2, sort_keys=True).encode("utf-8"),
+            "ContentType": "application/json",
+        }
+        if etag:
+            params["IfMatch"] = etag
+        else:
+            params["IfNoneMatch"] = "*"
+        try:
+            s3.put_object(**params)
+        except Exception as exc:  # noqa: BLE001
+            code = _error_code(exc)
+            if code not in ("PreconditionFailed", "412", "ConditionalRequestConflict"):
+                raise
+            if not read_ok:
+                # Terminal, and correct. We could not read what is there, and
+                # something IS there. Retrying would loop on the same denial.
+                logger.error(
+                    "run-scope write DECLINED at s3://%s/%s — an artifact "
+                    "already exists for this cycle and this execution could "
+                    "not read it (%s), so it will not be overwritten. The "
+                    "cycle keeps the scope it has. Apply the s3:GetObject "
+                    "grant in this lambda's iam-policy.json to restore "
+                    "merging (alpha-engine-config-I8811).",
+                    BUCKET, key, note,
+                )
+                scope["write_declined"] = {
+                    "key": key, "reason": note,
+                    "detail": "an artifact exists and could not be read; "
+                              "refusing to overwrite an unread claim.",
+                }
+                scope["scope_merge"] = ledger
+                return scope
+            last_error = code
+            logger.warning(
+                "run-scope write lost a race at s3://%s/%s (%s, attempt %d/%d)"
+                " — re-reading and re-merging.",
+                BUCKET, key, code, attempt, _WRITE_ATTEMPTS,
+            )
+            continue
+        logger.info(
+            "wrote s3://%s/%s (%s)", BUCKET, key,
+            "merged onto " + str(ledger["incumbent_execution_arn"])
+            if ledger["merged"] else "first writer for this cycle",
+        )
+        return merged
+    raise ScopeWriteConflictError(
+        f"s3://{BUCKET}/{key} changed under every one of {_WRITE_ATTEMPTS} "
+        f"read-merge-write attempts (last: {last_error}). Nothing was written; "
+        "the cycle keeps the scope already on S3."
+    )
 
 
 def handler(event, _context):
@@ -166,13 +343,24 @@ def handler(event, _context):
             f"one. Cause: {type(exc).__name__}."
         )
 
+    scope["written_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    stamp_provenance(scope, execution_arn, scope["written_at"])
     logger.info("run scope: %s", scope["statement"])
 
     if dry_run:
         # The Friday-PM shell run exercises the whole read+derive path (client
-        # construction, the two API grants, the derivation) and writes nothing —
-        # the same dry contract every advisory producer on this pipeline honours.
+        # construction, the API grants, the derivation) and writes nothing —
+        # the same dry contract every advisory producer on this pipeline
+        # honours. It DOES exercise the incumbent read, because that grant is
+        # new (alpha-engine-config-I8811) and a rehearsal that skipped it would
+        # leave a missing `s3:GetObject` to be discovered by the Saturday run
+        # it protects.
         scope["dry_run"] = True
+        if run_date:
+            _, _, read_ok, note = _read_incumbent(
+                boto3.client("s3"), KEY_TEMPLATE.format(run_date=run_date)
+            )
+            scope["incumbent_read"] = {"ok": read_ok, "note": note}
         return scope
 
     if not run_date:
@@ -190,12 +378,4 @@ def handler(event, _context):
         )
         return scope
 
-    key = KEY_TEMPLATE.format(run_date=run_date)
-    boto3.client("s3").put_object(
-        Bucket=BUCKET,
-        Key=key,
-        Body=json.dumps(scope, indent=2, sort_keys=True).encode("utf-8"),
-        ContentType="application/json",
-    )
-    logger.info("wrote s3://%s/%s", BUCKET, key)
-    return scope
+    return _persist(scope, KEY_TEMPLATE.format(run_date=run_date))

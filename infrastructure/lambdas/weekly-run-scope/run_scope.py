@@ -55,6 +55,13 @@ then repeat every week:
     The gate was never entered — the execution ended, or failed, upstream of it.
     Never read as disabled, never read as passing.
 
+One further rule, in section 4 below: the artifact is ONE key per cycle and
+several executions write it, so a row is only ever replaced by a row making a
+STRICTLY STRONGER claim about the same stage (``merge_run_scopes``). A
+skip-flagged recovery rerun can no longer demote a scheduled run's dispatched
+stage to ``DISABLED``, or a deliberate ``DISABLED`` to ``NOT_REACHED``, while a
+rerun that genuinely re-executes a stage still records it.
+
 Nothing here calls AWS; ``index.py`` fetches the definition and the history and
 hands them in. That split is deliberate: it lets the derivation be tested
 against a REAL definition and a REAL execution history as fixtures, which is how
@@ -507,3 +514,243 @@ def graded_stage_names(block: Any) -> list[str]:
         name for name, row in stages.items()
         if isinstance(row, dict) and row.get("disposition") in GRADED_DISPOSITIONS
     )
+
+
+# ---------------------------------------------------------------------------
+# 4. Merge — one cycle's scope, accumulated across every execution that ran it
+# ---------------------------------------------------------------------------
+#
+# ``backtest/{run_date}/run_scope.json`` is ONE key per cycle, and more than one
+# execution writes it: the scheduled Saturday run, then any recovery rerun an
+# operator launches against the same cycle. Until this section existed the last
+# writer won outright, and the last writer is systematically the WORST-informed
+# one — a rerun is launched precisely to redo one stage, so it carries a
+# skip-set for everything else.
+#
+# Both scope artifacts on S3 when this was written were authored that way, not
+# by the run that produced the cycle's numbers:
+#
+#   backtest/2026-08-22/run_scope.json  <- watch-rerun-2026-08-22-3
+#   backtest/2026-08-28/run_scope.json  <- watch-rerun-2026-08-28-13, written
+#                                          2026-08-30T18:47Z, a day and a half
+#                                          AFTER the scheduled run had written
+#                                          that cycle's attestation.json
+#
+# Each claims ``Backtester: DISABLED`` for a cycle whose backtester artifacts
+# demonstrably exist. `crucible-evaluator-PR289` (alpha-engine-config-I8811)
+# fixed the CONSUMER so a scope that contradicts the artifacts can no longer
+# overwrite a measured verdict — it now resolves to an honest UNKNOWN instead of
+# a false PASS. This section fixes the PRODUCER, so the contradiction is not
+# written in the first place.
+#
+# The rule is one line: **a cycle's scope only ever accumulates.** A row is
+# replaced only by a row making a STRICTLY STRONGER claim about the same stage.
+# That is what makes both halves of the requirement hold at once —
+#
+#   * a skip-flagged rerun cannot demote a scheduled run's ENABLED_COMPLETED to
+#     DISABLED, nor a deliberate DISABLED to NOT_REACHED (the race that can
+#     still deny clause 5 after a clean weekly run);
+#   * a rerun that GENUINELY re-runs a stage still records it, because
+#     ENABLED_COMPLETED outranks everything and lands.
+#
+# Immutability was the other candidate and is rejected: it trades a fail-open
+# for a fail-stuck, and a real recovery that executes Backtester must be able to
+# say so.
+
+#: Strength of a row's claim about the cycle. NOT the severity of the outcome —
+#: an ordering over EVIDENCE:
+#:
+#: 0 ``NOT_REACHED``       no evidence at all; the gate was never entered.
+#: 1 ``DISABLED``          a decision was observed — this run skipped the stage.
+#: 2 ``ENABLED_FAILED``    the stage was DISPATCHED (and did not complete).
+#: 3 ``ENABLED_COMPLETED`` the stage was dispatched AND completed.
+#:
+#: 2 sits above 1 because dispatch is a fact about the cycle that a later skip
+#: cannot unmake: if the scheduled run ran Backtester and it failed, a rerun
+#: that skips Backtester has not made the cycle one in which Backtester was
+#: switched off. A disposition outside the closed vocabulary ranks below
+#: everything (``-1``), so it can never displace a recognised row.
+AUTHORITY = {
+    NOT_REACHED: 0,
+    DISABLED: 1,
+    ENABLED_FAILED: 2,
+    ENABLED_COMPLETED: 3,
+}
+
+
+def authority(row: Any) -> int:
+    """The rank of a stage row's claim. Unrecognised ranks below NOT_REACHED."""
+    if not isinstance(row, dict):
+        return -1
+    return AUTHORITY.get(row.get("disposition"), -1)
+
+
+def stamp_provenance(scope: dict, execution_arn: str, recorded_at: str) -> dict:
+    """Record, on every row, WHICH execution established it and when.
+
+    A merged artifact whose rows come from two executions while its top-level
+    ``execution_arn`` names only the last writer is a document that cannot be
+    audited. Every row carries its own author, so a reader can always tell the
+    scheduled run's claims from a rerun's.
+    """
+    for row in (scope.get("stages") or {}).values():
+        if isinstance(row, dict):
+            row.setdefault("recorded_by_execution_arn", execution_arn)
+            row.setdefault("recorded_at", recorded_at)
+    return scope
+
+
+def _recompute(scope: dict) -> dict:
+    """Re-derive counts, graded set and statement from whatever rows survive.
+
+    Never carried over from either input: the statement is the denominator every
+    downstream grade is rendered against, and a stale one is the specific way a
+    surface goes quietly green.
+    """
+    stages = scope.get("stages") or {}
+    counts = {d: 0 for d in sorted(DISPOSITIONS)}
+    unrecognised = 0
+    for row in stages.values():
+        disposition = row.get("disposition") if isinstance(row, dict) else None
+        if disposition in counts:
+            counts[disposition] += 1
+        else:
+            unrecognised += 1
+    scope["counts"] = counts
+    scope["graded_stages"] = sorted(
+        name for name, row in stages.items()
+        if isinstance(row, dict) and row.get("disposition") in GRADED_DISPOSITIONS
+    )
+    if scope.get("degraded"):
+        # A degraded block's statement is not a denominator — it is the
+        # SCOPE UNAVAILABLE sentence, and it survives verbatim. Recomputing it
+        # would render "0 of 0 gated stages ran and are graded", which reads as
+        # a tidy narrow run rather than an unmeasured one. The merge only ever
+        # reaches here with `degraded` still set when there was no incumbent to
+        # merge onto; where there was one, the flag is dropped first and the
+        # surviving rows get a real statement.
+        return scope
+    scope["statement"] = _statement(counts, len(stages))
+    if unrecognised:
+        scope["statement"] += (
+            f" {unrecognised} row(s) carry a disposition outside the closed "
+            "vocabulary and are not graded."
+        )
+    return scope
+
+
+def merge_run_scopes(incumbent: Any, incoming: dict) -> tuple[dict, dict]:
+    """Accumulate ``incoming`` onto the cycle's existing scope. Never raises.
+
+    Returns ``(merged, ledger)``. The ledger is written INTO the artifact as
+    ``scope_merge`` — a refused write that leaves no trace is indistinguishable
+    from a write that never happened, and the whole defect being fixed here is a
+    silent overwrite.
+
+    ``incumbent`` may be anything (absent, a non-dict, a body from an older
+    schema). Anything unusable is treated as no incumbent at all and recorded as
+    such, because refusing to write over an unreadable body would strand the
+    cycle on a corrupt artifact forever.
+    """
+    ledger: dict[str, Any] = {
+        "merged": False,
+        "accepted": [],
+        "rejected": [],
+        "incumbent_execution_arn": None,
+        "incumbent_run_date": None,
+    }
+
+    incoming_stages = incoming.get("stages") if isinstance(incoming, dict) else None
+    if not isinstance(incoming_stages, dict):
+        incoming_stages = {}
+        incoming["stages"] = incoming_stages
+
+    if not isinstance(incumbent, dict) or not isinstance(incumbent.get("stages"), dict):
+        ledger["reason"] = (
+            "no usable incumbent artifact for this cycle — this execution's "
+            "scope is written as-is."
+        )
+        return _recompute(incoming), ledger
+
+    incumbent_stages = incumbent["stages"]
+    ledger.update(
+        merged=True,
+        incumbent_execution_arn=incumbent.get("execution_arn"),
+        incumbent_run_date=incumbent.get("run_date"),
+        incumbent_statement=incumbent.get("statement"),
+        incumbent_degraded=bool(incumbent.get("degraded")),
+    )
+    if incumbent.get("run_date") and incoming.get("run_date") \
+            and incumbent["run_date"] != incoming["run_date"]:
+        # Same key, two different `run_date` fields. Recorded rather than
+        # resolved: the key is the cycle's identity, and a body disagreeing with
+        # it is a fact a reader needs, not one this function should silently
+        # pick a winner for.
+        ledger["run_date_mismatch"] = {
+            "incumbent": incumbent["run_date"], "incoming": incoming["run_date"],
+        }
+
+    merged_stages: dict[str, Any] = {}
+    for name in sorted(set(incumbent_stages) | set(incoming_stages)):
+        held = incumbent_stages.get(name)
+        offered = incoming_stages.get(name)
+        if offered is None:
+            # A stage the incoming derivation does not even mention (a gate
+            # removed from the definition since). Kept: dropping it would shrink
+            # the denominator without saying so.
+            merged_stages[name] = held
+            continue
+        if held is None:
+            merged_stages[name] = offered
+            ledger["accepted"].append({
+                "stage": name, "disposition": offered.get("disposition"),
+                "why": "new stage — the incumbent carried no row for it",
+            })
+            continue
+        if authority(offered) > authority(held):
+            merged_stages[name] = offered
+            ledger["accepted"].append({
+                "stage": name,
+                "was": held.get("disposition"),
+                "now": offered.get("disposition"),
+                "why": "a strictly stronger claim about the same stage",
+            })
+            continue
+        merged_stages[name] = held
+        if offered.get("disposition") != held.get("disposition"):
+            ledger["rejected"].append({
+                "stage": name,
+                "kept": held.get("disposition"),
+                "kept_from": held.get("recorded_by_execution_arn"),
+                "refused": offered.get("disposition"),
+                "refused_from": incoming.get("execution_arn"),
+                "why": (
+                    "a claim about this cycle is only ever replaced by a "
+                    "stronger one; this execution claimed "
+                    f"{offered.get('disposition')} over an established "
+                    f"{held.get('disposition')}."
+                ),
+            })
+
+    merged = dict(incoming)
+    merged["stages"] = merged_stages
+    if merged_stages and merged.get("degraded"):
+        # This execution could not derive a scope, but the cycle HAS one. The
+        # degraded flag would send the consumer to UNKNOWN over rows that are
+        # perfectly good — the same clobber in a different costume. The failure
+        # is kept, in the ledger, where it is a fact about this execution rather
+        # than a verdict about the cycle.
+        ledger["incoming_degraded_reason"] = merged.pop("degraded_reason", None)
+        merged.pop("degraded", None)
+        ledger["incoming_degraded"] = True
+    merged["first_written_at"] = (
+        incumbent.get("first_written_at")
+        or incumbent.get("written_at")
+        or merged.get("written_at")
+    )
+    merged["contributing_executions"] = sorted({
+        arn for row in merged_stages.values()
+        if isinstance(row, dict)
+        and isinstance(arn := row.get("recorded_by_execution_arn"), str) and arn
+    })
+    return _recompute(merged), ledger
