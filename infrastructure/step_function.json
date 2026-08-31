@@ -6694,7 +6694,7 @@
           }
         }
       },
-      "TimeoutSeconds": 300,
+      "TimeoutSeconds": 600,
       "Retry": [
         {
           "ErrorEquals": [

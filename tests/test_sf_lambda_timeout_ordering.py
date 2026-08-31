@@ -146,7 +146,6 @@ _KNOWN_UNBOUND: frozenset[tuple[str, str]] = frozenset(
         # self-deadlines, which is the rule's second branch.
         ("step_function.json", "RationaleClustering"),
         ("step_function.json", "Counterfactual"),
-        ("step_function.json", "ReportCard"),
         ("step_function.json", "DispatchWeeklyFreshnessSpot"),
         ("step_function_daily.json", "PredictorInference"),
         ("step_function_daily.json", "ReinvokePredictor"),
