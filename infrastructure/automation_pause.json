@@ -271,6 +271,9 @@
     },
     "alpha-engine-stage-coverage-sweep-dead": {
       "reason": "ARMED. StageCoverageSweepRan is published FIRST and unconditionally by nousergon_lib.pipeline_status.coverage.publish_sweep at the tail of ne-weekly-freshness-pipeline (Saturday 09:00 UTC) \u2014 a KEPT pipeline under the 2026-08-07 ruling \u2014 so its absence means the reader stopped, never that the week was clean. TreatMissingData=breaching is load-bearing and deliberate (measured live 2026-08-28): notBreaching would render a dead sweep as green, the inversion principles.md 2.7 forbids. EXPECTED RED until the first real sweep publishes, per its own AlarmDescription; it read StateValue=ALARM with ActionsEnabled=true when this entry was written, which is the declared state, not a mute. Born unclassified on creation and reported as [alarm-undeclared] on every run since (alpha-engine-config-I9121)."
+    },
+    "alpha-engine-predictor-inference-no-invocations": {
+      "reason": "alpha-engine-config-I9467 flipped this alarm from TreatMissingData=notBreaching to breaching. It is the daily invocations floor for alpha-engine-predictor-inference and absence IS its signal - while it treated missing data as notBreaching, the one condition it exists to catch (the predictor stopping) rendered green (principles.md 2.7; observability-policy.md OB-9.2a). The producer is running, so this belongs here and not in paused_alarms: replayed over the 30 days to 2026-08-31 via get-metric-data, all 30 daily buckets carried Invocations >= 2, so the flip would have fired zero times over recorded history."
     }
   }
 }
