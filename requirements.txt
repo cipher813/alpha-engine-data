@@ -130,7 +130,7 @@ arcticdb>=6.23.0
 # states in this PR; tests/test_pipeline_status_registry_source_check.py stays
 # RED until the pin carries the rows — the guard against SF JSON landing ahead
 # of the registry entry.
-nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.102
+nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.104
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,
