@@ -63,6 +63,41 @@ def states(sf) -> dict:
 # ── State presence ────────────────────────────────────────────────────────
 
 
+
+def converges_on(states, start, target, limit=6):
+    """Walk ``Next`` from *start* through Pass hops and report whether *target*
+    is reached.
+
+    alpha-engine-config-I9636. Every one of these assertions used to pin
+    ``catch["Next"] == "MarkEvalJudgeDegraded"`` literally, which pinned the
+    EDGE rather than the INVARIANT — and the invariant is that no eval-judge
+    fail-open exit reaches EvalRollingMean unmarked. The literal form made the
+    correct fix (an Extract* hop that names the phase, the shape
+    ExtractEvalJudgeProcessError has used since I9329) look like a regression
+    in fifteen tests, which is a good way to talk a future session out of
+    naming the phase. This form is strictly stronger: it still fails if the
+    edge stops converging, and it stays true when a hop is inserted.
+    """
+    seen = set()
+    cur = start
+    for _ in range(limit):
+        if cur == target:
+            return True
+        if cur in seen or cur not in states:
+            return False
+        seen.add(cur)
+        state = states[cur]
+        if state.get("Type") != "Pass":
+            return False
+        cur = state.get("Next")
+    return False
+
+
+def phase_named_by(states, name):
+    """The ``phase`` an Extract* hop stamps, or None if *name* stamps none."""
+    return (states.get(name, {}).get("Parameters") or {}).get("phase")
+
+
 class TestStatesPresent:
     def test_all_eval_judge_states_exist(self, states):
         for name in (
@@ -388,7 +423,9 @@ class TestEvalJudgeSubmitContract:
         # MarkEvalJudgeDegraded convergence before EvalRollingMean.
         catch = states[state_name]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
-        assert catch["Next"] == "MarkEvalJudgeDegraded"
+        # alpha-engine-config-I9636: through the phase-naming hop.
+        assert converges_on(states, catch["Next"], "MarkEvalJudgeDegraded")
+        assert phase_named_by(states, catch["Next"]) is not None
         assert states["MarkEvalJudgeDegraded"]["Next"] == "EvalRollingMean"
 
 
@@ -455,7 +492,17 @@ class TestEvalJudgeSubmitOutcome:
         assert choices[dry_index]["Next"] == "PrepareEvalJudgeSpotDispatch"
 
     def test_default_is_fail_soft_but_marks_degraded(self, states):
-        assert states["EvalJudgeSubmitOutcome"]["Default"] == "MarkEvalJudgeDegraded"
+        # alpha-engine-config-I9636: the Default now names the phase first.
+        # This is the exact edge the 2026-08-29 scheduled run took, carrying an
+        # Anthropic 400 ("credit balance is too low") in
+        # $.eval_judge_submit.Payload.error that nothing recorded.
+        assert converges_on(
+            states, states["EvalJudgeSubmitOutcome"]["Default"],
+            "MarkEvalJudgeDegraded",
+        )
+        assert phase_named_by(
+            states, states["EvalJudgeSubmitOutcome"]["Default"]
+        ) == "EvalJudgeSubmit"
         assert states["MarkEvalJudgeDegraded"]["Type"] == "Pass"
         assert states["MarkEvalJudgeDegraded"]["Next"] == "EvalRollingMean"
         assert (
@@ -730,7 +777,9 @@ class TestEvalJudgeProcessContract:
     def test_process_catch_routes_to_rolling_mean_not_failure(self, states):
         catch = states["EvalJudgeProcess"]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
-        assert catch["Next"] == "MarkEvalJudgeDegraded"
+        # alpha-engine-config-I9636: through the phase-naming hop.
+        assert converges_on(states, catch["Next"], "MarkEvalJudgeDegraded")
+        assert phase_named_by(states, catch["Next"]) == "EvalJudgeProcess"
         assert states["MarkEvalJudgeDegraded"]["Next"] == "EvalRollingMean"
 
 
@@ -760,7 +809,9 @@ class TestBatchChainNonBlocking:
         # convergence, which itself continues to EvalRollingMean unchanged.
         catch = states[state_name]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
-        assert catch["Next"] == "MarkEvalJudgeDegraded"
+        # alpha-engine-config-I9636: through the phase-naming hop.
+        assert converges_on(states, catch["Next"], "MarkEvalJudgeDegraded")
+        assert phase_named_by(states, catch["Next"]) is not None
         assert catch["Next"] != "HandleFailure"
         assert states["MarkEvalJudgeDegraded"]["Next"] == "EvalRollingMean"
 
@@ -1240,7 +1291,10 @@ class TestSyncRungRouting:
             )
         )
         assert any(cond.get("IsPresent") is True for cond in sync["And"])
-        assert states["EvalJudgeSubmitOutcome"]["Default"] == "MarkEvalJudgeDegraded"
+        assert converges_on(
+            states, states["EvalJudgeSubmitOutcome"]["Default"],
+            "MarkEvalJudgeDegraded",
+        )
 
     def test_process_reads_its_inputs_from_submit_not_from_poll(self, states):
         """The reason skipping Poll is safe at all.
@@ -1260,3 +1314,89 @@ class TestSyncRungRouting:
         the next reader to the wrong provider during an incident."""
         raw = json.dumps(sf)
         assert "Calls anthropic.messages.batches.retrieve" not in raw
+
+
+class TestEveryEvalJudgeDegradationNamesItsPhase:
+    """alpha-engine-config-I9636 — the sibling half of
+    ``test_no_eval_judge_failure_path_reaches_rolling_mean_unmarked``.
+
+    That test makes every fail-open exit VISIBLE. This one makes it LEGIBLE.
+    ``MarkEvalJudgeDegraded`` writes ``$.research_degraded_local = true`` and
+    nothing else, so nine distinct incidents — the submit refused for billing,
+    the plan malformed, the spot request unfulfilled, the box never booted, the
+    judge under-covering the corpus — arrived at the notifier as one boolean.
+
+    Its own ``Comment`` has asserted since I9329 that *"each arrival first
+    passes through an Extract* state that names its phase"*. Measured against
+    the live definition on 2026-08-31 that held for 2 of 9. The 2026-08-29
+    scheduled run degraded through one of the other 7 (``EvalJudgeSubmitOutcome``'s
+    Default, on an Anthropic ``400 ... credit balance is too low``), and the
+    cause had to be recovered from 7,858 execution-history events two days
+    later because the run recorded a bare true. A comment is not a mechanism;
+    this is the mechanism.
+    """
+
+    def _arrivals(self, states):
+        out = []
+        for name, body in states.items():
+            edges = [("Next", body.get("Next")), ("Default", body.get("Default"))]
+            edges += [(f"Choices[{i}]", c.get("Next"))
+                      for i, c in enumerate(body.get("Choices", []))]
+            edges += [(f"Catch[{i}]", c.get("Next"))
+                      for i, c in enumerate(body.get("Catch", []))]
+            out += [(name, kind) for kind, tgt in edges
+                    if tgt == "MarkEvalJudgeDegraded"]
+        return out
+
+    def test_every_arrival_is_a_phase_naming_extract(self, states):
+        unnamed = [
+            (name, kind) for name, kind in self._arrivals(states)
+            if not phase_named_by(states, name)
+        ]
+        assert unnamed == [], (
+            "these edges reach MarkEvalJudgeDegraded without naming which "
+            f"phase degraded: {unnamed}. The degraded record is then a bare "
+            "boolean and the run cannot be diagnosed from its own artifacts."
+        )
+
+    def test_the_extracts_write_the_error_path_and_do_not_change_continuation(
+        self, states,
+    ):
+        for name, _ in self._arrivals(states):
+            hop = states[name]
+            assert hop["Type"] == "Pass", name
+            assert hop["ResultPath"] == "$.eval_judge_error", name
+            assert hop["Next"] == "MarkEvalJudgeDegraded", name
+            assert hop["Parameters"].get("source"), (
+                f"{name} names a phase but not the EDGE it came in on; two "
+                "arrivals can share a phase and mean different things"
+            )
+
+    def test_the_submit_outcome_default_carries_the_payload_it_was_holding(
+        self, states,
+    ):
+        """The 2026-08-29 path specifically.
+
+        Submit returned status=ERROR with the provider's own message in
+        ``.error`` and the SF had it in hand at the Choice. Whatever else this
+        hop does, it must not drop that.
+        """
+        hop = states[states["EvalJudgeSubmitOutcome"]["Default"]]
+        carried = json.dumps(hop["Parameters"])
+        assert "$.eval_judge_submit.Payload" in carried
+        # Total-by-construction: JsonToString on the whole Payload, never a
+        # pick of .status/.error, because this Default is reached BOTH by a
+        # payload that has .error and by one that has no status at all, and
+        # the second throws States.Runtime on an unguarded pick.
+        assert "States.JsonToString" in carried
+
+    def test_no_two_arrivals_claim_the_same_phase_and_source(self, states):
+        seen = {}
+        for name, _ in self._arrivals(states):
+            p = states[name]["Parameters"]
+            key = (p["phase"], p["source"])
+            assert key not in seen, (
+                f"{name} and {seen[key]} both report {key} — two incidents "
+                "collapsed into one label is the defect, one layer up"
+            )
+            seen[key] = name

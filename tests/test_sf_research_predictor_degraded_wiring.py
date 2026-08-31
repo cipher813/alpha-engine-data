@@ -186,9 +186,27 @@ def test_branch_a_owner_catch_routes_through_a_mark_state(branch_a, owner):
     )
     catch = catches[-1]
     assert catch["ErrorEquals"] == ["States.ALL"]
-    assert catch["Next"].startswith("Mark") and catch["Next"].endswith("Degraded")
-    assert catch["Next"] in branch_a
-    assert branch_a[catch["Next"]]["ResultPath"] == "$.research_degraded_local"
+    # alpha-engine-config-I9636: an owner may route through ONE Extract* Pass
+    # that stamps the phase before the shared Mark*Degraded convergence. Nine
+    # arrivals share MarkEvalJudgeDegraded and it records a bare boolean, so
+    # without the hop "the submit was refused for billing" and "the spot box
+    # never booted" are the same bytes on the execution record — which is
+    # exactly why the 2026-08-29 run's degradation could not be diagnosed from
+    # the record and had to be reconstructed from 7,858 history events. The
+    # hop is bounded at one and must name a phase, so it can never become a
+    # place to hide a continuation change.
+    target = catch["Next"]
+    if target.startswith("Extract"):
+        hop = branch_a[target]
+        assert hop["Type"] == "Pass", target
+        assert hop["ResultPath"].endswith("_error"), target
+        assert hop["Parameters"].get("phase"), (
+            f"{target} is an Extract hop that names no phase — the whole point"
+        )
+        target = hop["Next"]
+    assert target.startswith("Mark") and target.endswith("Degraded")
+    assert target in branch_a
+    assert branch_a[target]["ResultPath"] == "$.research_degraded_local"
 
 
 def test_no_state_writes_the_old_dead_thinktank_path(branch_a, branch_b, states):

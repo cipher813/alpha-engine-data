@@ -325,8 +325,12 @@ def _choice_target(definition: dict, choice_name: str, data) -> str:
         # batch API they existed to drive. The Default is the part that
         # mattered and it is unchanged: a submit payload with no status is
         # still fail-soft THROUGH the degraded marker, not past it.
+        # alpha-engine-config-I9636: the Default's immediate target is now the
+        # phase-naming hop (the ExtractLibPinDriftError shape two entries
+        # above), which continues to MarkEvalJudgeDegraded unchanged. A payload
+        # with no status is still fail-soft THROUGH the degraded marker.
         ("EvalJudgeSubmitOutcome", {"eval_judge_submit": {"Payload": {}}},
-         "MarkEvalJudgeDegraded"),  # eval is observability — fail-soft, marked
+         "ExtractEvalJudgeSubmitOutcomeError"),
         # Healthy-path sanity: the guards must not change live semantics.
         ("WeeklyRunDayGateChoice",
          {"weekly_run_day_gate": {"Payload": {"is_weekly_run_day": False}}},
