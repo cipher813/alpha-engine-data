@@ -99,9 +99,12 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Callable, TypeVar
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import alert_class_registry_drift as scan  # noqa: E402
+
+_T = TypeVar("_T")
 
 _GIT = shutil.which("git") or "/usr/bin/git"
 _GH = shutil.which("gh") or "gh"
@@ -152,13 +155,36 @@ def _patterns_from(playbooks: Path) -> list[tuple[str, str, bool]]:
 # ── scanning one repo at one ref ────────────────────────────────────────────
 
 
-def _scan_at(repo_root: Path, ref: str, playbooks_override: Path | None) -> dict[str, set[str]]:
-    """Uncovered source literals in ``repo_root`` at ``ref``.
+def scan_at_ref(repo_root: Path, ref: str, fn: Callable[[Path], _T]) -> _T:
+    """Run ``fn`` against ``repo_root``'s tree as it stands at ``ref``.
 
-    ``ref`` resolving to the checkout's own HEAD is scanned in place; any other
+    ``ref`` resolving to the checkout's own HEAD is read in place; any other
     ref is materialized as a detached ``git worktree`` inside ``repo_root``,
     read, and torn down — the same mechanism ``observability_registry_pr_guard``
     uses, and the reason the caller needs ``fetch-depth: 0``.
+
+    Public and generic because ``alert_message_lint`` needs exactly this
+    base-vs-head materialization and must not carry a second copy of it
+    (``policy-shared-code``): a fork of the worktree teardown is a fork of the
+    ``worktree remove --force`` that keeps a failed run from leaving the graded
+    checkout with a stale registration.
+    """
+    head_sha = _run_git(["rev-parse", "HEAD"], cwd=repo_root).strip()
+    resolved = _run_git(["rev-parse", ref], cwd=repo_root).strip()
+    if resolved == head_sha:
+        return fn(repo_root)
+
+    with tempfile.TemporaryDirectory(prefix="alert-pr-guard-") as tmp:
+        wt = Path(tmp) / "base"
+        _run_git(["worktree", "add", "--detach", "--quiet", str(wt), resolved], cwd=repo_root)
+        try:
+            return fn(wt)
+        finally:
+            _run_git(["worktree", "remove", "--force", str(wt)], cwd=repo_root)
+
+
+def _scan_at(repo_root: Path, ref: str, playbooks_override: Path | None) -> dict[str, set[str]]:
+    """Uncovered source literals in ``repo_root`` at ``ref``.
 
     When the registry file itself lives INSIDE the graded repo (this repo
     grading its own PRs), the ref's OWN copy of ``playbooks.yaml`` is used.
@@ -169,18 +195,7 @@ def _scan_at(repo_root: Path, ref: str, playbooks_override: Path | None) -> dict
         pb = playbooks_override if playbooks_override is not None else root / PLAYBOOKS_REL
         return scan._scan_repo(root, _patterns_from(pb))  # noqa: SLF001
 
-    head_sha = _run_git(["rev-parse", "HEAD"], cwd=repo_root).strip()
-    resolved = _run_git(["rev-parse", ref], cwd=repo_root).strip()
-    if resolved == head_sha:
-        return _do(repo_root)
-
-    with tempfile.TemporaryDirectory(prefix="alert-class-pr-guard-") as tmp:
-        wt = Path(tmp) / "base"
-        _run_git(["worktree", "add", "--detach", "--quiet", str(wt), resolved], cwd=repo_root)
-        try:
-            return _do(wt)
-        finally:
-            _run_git(["worktree", "remove", "--force", str(wt)], cwd=repo_root)
+    return scan_at_ref(repo_root, ref, _do)
 
 
 # ── the pending open companion PR tolerance ─────────────────────────────────
