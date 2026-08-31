@@ -613,6 +613,57 @@ def reconcile(
             ),
         })
 
+    # ── direction E: an ENABLED trigger whose declared downstream is silent ──
+    # alpha-engine-config-I9469. Direction C answers "the trigger is dark — is
+    # the component it feeds still running some other way." This is the
+    # opposite edge: the trigger IS firing, so a live audit of it alone reads
+    # healthy, and the miss is invisible unless something reads the invocation
+    # count of what it actually fires. `#9469` was found by an AD HOC 7-day
+    # CloudWatch sweep across all 72 Lambdas; this makes that sweep a standing
+    # check instead of something that has to be re-run by hand.
+    #
+    # The candidate that made this look real — `alpha-engine-research-thinktank`
+    # at 0 invocations while `alpha-research-thinktank-daily` fires daily — is
+    # NOT what this direction would have flagged, and that is the point: the
+    # rule's LIVE target (`trigger_targets`, a real `list-targets-by-rule` read)
+    # is `alpha-engine-thinktank-spot-dispatcher`, which had 10 invocations in
+    # the same window. The old Lambda was never a live target — its IAM grant
+    # and EventBridge wiring were already removed under `#5777` — so a
+    # name-similarity guess treated a retired resource as "the declared
+    # downstream" where a target-map read would not have. This direction reads
+    # the target map, never the name, which is why it does not reproduce that
+    # false positive.
+    for t in trigs:
+        name, state = t["name"], t["state"]
+        if state != "ENABLED" or name.startswith(_AWS_MANAGED_PREFIX):
+            continue
+        if name in paused:
+            continue  # a manual-invocation-only trigger left enabled by mistake
+            # is direction A's "running-while-declared-off", not this one.
+        for arn in targets_of(t):
+            for row in _rows_for_target(reg, arn):
+                cid = row["component_id"]
+                if cid in sf_live or _declares_off(row):
+                    # SF-invoked or itself declared off — its own service state
+                    # is graded elsewhere (direction A / direction C); grading
+                    # it again here off a single trigger's silence would just
+                    # be a second, weaker copy of those.
+                    continue
+                if invocations_of(cid) > 0:
+                    continue
+                findings.append({
+                    "kind": "enabled-trigger-silent-target", "trigger": name,
+                    "surface": t["surface"],
+                    "detail": (
+                        f"live State=ENABLED and its live target is "
+                        f"{cid!r} (row lifecycle={_lifecycle(row) or 'in-service'}), "
+                        f"but {cid!r} was invoked 0 times since {since:%Y-%m-%d}. "
+                        "The trigger firing on schedule is not evidence the work "
+                        "happened — read the live target map, not the trigger's own "
+                        "State, before treating an enabled schedule as healthy."
+                    ),
+                })
+
     # ── direction D: paused_alarms vs live CloudWatch, both directions ──────
     # Read-only mirror of `automation_pause.alarm_findings()`: justification is
     # RE-DERIVED here from `m` and `paused_names(m)`, never trusted from a
