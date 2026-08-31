@@ -704,6 +704,14 @@ export HOME=/home/ec2-user
 export XDG_CACHE_HOME=/tmp
 export AWS_REGION=us-east-1
 export AWS_DEFAULT_REGION=us-east-1
+# Router addressing (alpha-engine-config-I7409) - undeclared before this, krepis defaulted to
+# exec_context=laptop and RouterUnresolvable'd every flow-doctor diagnosis call on this box.
+export KREPIS_EXEC_CONTEXT=ec2
+export KREPIS_LITELLM_PROXY_URL=https://router.nousergon.ai:8443
+export KREPIS_ROUTER_CREDENTIAL_SECRET=ROUTER_CONSUMER_DATA
+export KREPIS_APPCONFIG_APPLICATION=alpha-engine
+export KREPIS_APPCONFIG_CONFIG_PROFILE=llm-model-registry
+export KREPIS_APPCONFIG_ENVIRONMENT=production
 if ! command -v python3.12 >/dev/null 2>&1; then
     echo "ERROR: python3.12 not found on this spot — the bootstrap installs and asserts it. Refusing to fall back to the AMI python3: requirements.txt is resolved against 3.12 and the wheels differ (alpha-engine-config-I7372)." >&2
     exit 1

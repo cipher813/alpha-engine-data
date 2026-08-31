@@ -171,6 +171,32 @@ python3 -m krepis.aws remove-lambda-env \
   --defer-publish --missing-ok \
   "${LAMBDA_ENV_DENIED_KEYS[@]/#/--unset=}"
 
+# ── Router addressing (alpha-engine-config-I7409) ────────────────────────────
+# `$FUNCTION_NAME` never declared KREPIS_EXEC_CONTEXT, so krepis.router
+# silently defaulted every flow-doctor LLM-diagnosis call it makes to
+# 'laptop' — the only environment where the loopback egress proxy this
+# resolves to (127.0.0.1:8990/8980) actually exists — and every diagnosis
+# attempt failed RouterUnresolvable (measured live 2026-08-31 against a SPY
+# cross-source quarantine alert). `lambda` appears on no registry entry's
+# `reachable_from`, deliberately (LLM_MODEL_REGISTRY.yaml): a Lambda has no
+# local egress proxy, so the router edge (litellm_proxy) is its only path,
+# which model-router-policy §3.4a R27a guarantees is offered in every
+# context. Mirrors crucible-research/infrastructure/deploy.sh's
+# `_apply_router_env`. Its OWN credential (ROUTER_CONSUMER_DATA), not
+# LITELLM_MASTER_KEY — krepis.secrets resolves SSM before os.environ, so a
+# shared secret NAME collapses this Lambda into another consumer's identity
+# at the edge (nous-ergon-ops-PR951 registers it).
+echo "  Applying router addressing (merge, not replace)..."
+aws lambda wait function-updated --function-name "$FUNCTION_NAME" --region "$REGION" 2>/dev/null || sleep 5
+python3 -m krepis.aws merge-lambda-env \
+  --function-name "$FUNCTION_NAME" --region "$REGION" \
+  --set "KREPIS_EXEC_CONTEXT=lambda" \
+  --set "KREPIS_LITELLM_PROXY_URL=${ROUTER_URL:-https://router.nousergon.ai:8443}" \
+  --set "KREPIS_ROUTER_CREDENTIAL_SECRET=${ROUTER_CREDENTIAL_SECRET:-ROUTER_CONSUMER_DATA}" \
+  --set "KREPIS_APPCONFIG_APPLICATION=alpha-engine" \
+  --set "KREPIS_APPCONFIG_CONFIG_PROFILE=llm-model-registry" \
+  --set "KREPIS_APPCONFIG_ENVIRONMENT=production"
+
 # Publish version and update 'live' alias
 echo "  Publishing Lambda version..."
 aws lambda wait function-updated --function-name "$FUNCTION_NAME" --region "$REGION" 2>/dev/null || sleep 5
