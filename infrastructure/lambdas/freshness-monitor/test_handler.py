@@ -2014,6 +2014,42 @@ def test_probe_pass_miss_counter_increments_and_resets(fake_s3, monkeypatch,
     assert counts == {"champion_feed": 0}
 
 
+def test_event_driven_row_probes_its_own_key_for_never_written(fake_s3, monkeypatch, fixed_now):
+    """alpha-engine-config-I8810. An event_driven row's OWN `check_freshness`
+    result is unconditionally `fresh` (nousergon_lib's short-circuit — no age
+    floor applies), so `result.state == "missing"` can never gate this probe
+    for one. `thinktank_inst_ownership` (data/inst_ownership/latest.json,
+    liveness_via=thinktank_coverage_ledger) sat undetected this way: its own
+    key was never once checked for existence. The probe must run off
+    `spec.cadence == "event_driven"` too, independent of `result.state`."""
+    import index
+    spec, fresh_result = _event_driven_pair(index, "thinktank_inst_ownership",
+                                            "thinktank_coverage_ledger")
+    monkeypatch.setattr(index, "_check_one",
+                        lambda s3c, sp, now: (fresh_result, None))
+    fake_s3.list_objects_v2 = mock.Mock(return_value={"KeyCount": 0})
+    _pairs, _a, _d, _e, _counts, telemetry = index._run_probe_pass(
+        fake_s3, [spec], {}, fixed_now)
+    assert telemetry["never_written_by_id"] == {"thinktank_inst_ownership": True}
+    fake_s3.list_objects_v2.assert_called_once()
+
+
+def test_event_driven_row_confirmed_written_is_not_flagged(fake_s3, monkeypatch, fixed_now):
+    """The other half: an event_driven row whose own key HAS been written at
+    least once is not a producer-birth gap, so `never_written` is False, not
+    True — the probe distinguishes the two rather than flagging every
+    event_driven row on principle."""
+    import index
+    spec, fresh_result = _event_driven_pair(index, "thinktank_inst_ownership",
+                                            "thinktank_coverage_ledger")
+    monkeypatch.setattr(index, "_check_one",
+                        lambda s3c, sp, now: (fresh_result, None))
+    fake_s3.list_objects_v2 = mock.Mock(return_value={"KeyCount": 1})
+    _pairs, _a, _d, _e, _counts, telemetry = index._run_probe_pass(
+        fake_s3, [spec], {}, fixed_now)
+    assert telemetry["never_written_by_id"] == {"thinktank_inst_ownership": False}
+
+
 def test_prev_miss_counts_roundtrip_via_check_results(fake_s3, fixed_now):
     """_serialize_check_results persists consecutive_miss_runs and
     _load_prev_miss_counts reads them back — the counter needs no new
