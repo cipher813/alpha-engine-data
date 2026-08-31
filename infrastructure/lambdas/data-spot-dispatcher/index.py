@@ -193,6 +193,33 @@ def _bootstrap_spec() -> SpotBootstrapSpec:
             "FLOW_DOCTOR_ENABLED": "1",
             "ALPHA_ENGINE_DEPLOYED": "1",
             "ALPHA_ENGINE_EXPERIMENT_ID": "reference",
+            # Router addressing (alpha-engine-config-I7409). Without
+            # KREPIS_EXEC_CONTEXT this box never declared where it runs, so
+            # krepis.router silently defaulted flow-doctor's diagnosis calls to
+            # 'laptop' and tried the loopback egress proxy that only exists on
+            # the dashboard box — RouterUnresolvable on every attempt (measured
+            # live 2026-08-31, SPY cross-source quarantine diagnosis).
+            # KREPIS_LITELLM_PROXY_URL overrides krepis's loopback default
+            # (127.0.0.1:8980) to the real routed edge — mirrors
+            # eval-judge-spot-dispatcher / thinktank-spot-dispatcher in
+            # crucible-research, which resolve through the SAME edge from the
+            # SAME kind of ephemeral spot box.
+            "KREPIS_EXEC_CONTEXT": os.environ.get("DATA_SPOT_EXEC_CONTEXT", "ec2"),
+            "KREPIS_LITELLM_PROXY_URL": os.environ.get(
+                "DATA_SPOT_ROUTER_URL", "https://router.nousergon.ai:8443"
+            ),
+            "KREPIS_ROUTER_CREDENTIAL_SECRET": os.environ.get(
+                "DATA_SPOT_ROUTER_CREDENTIAL_SECRET", "ROUTER_CONSUMER_DATA"
+            ),
+            "KREPIS_APPCONFIG_APPLICATION": os.environ.get(
+                "DATA_SPOT_APPCONFIG_APPLICATION", "alpha-engine"
+            ),
+            "KREPIS_APPCONFIG_CONFIG_PROFILE": os.environ.get(
+                "DATA_SPOT_APPCONFIG_CONFIG_PROFILE", "llm-model-registry"
+            ),
+            "KREPIS_APPCONFIG_ENVIRONMENT": os.environ.get(
+                "DATA_SPOT_APPCONFIG_ENVIRONMENT", "production"
+            ),
         },
     )
 
