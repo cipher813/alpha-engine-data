@@ -159,7 +159,7 @@ class HandlerTests(unittest.TestCase):
 
     def test_subsystem_inference_default(self):
         self.index.handler(_encode_subscription_event(
-            _sample_payload(log_group="/aws/lambda/alpha-engine-ec2-lifecycle")
+            _sample_payload(log_group="/aws/lambda/alpha-engine-spot-orphan-reaper")
         ), context=None)
         body = json.loads(self.s3.put_object.call_args_list[0].kwargs["Body"].decode())
         self.assertEqual(body["subsystem"], "infrastructure")

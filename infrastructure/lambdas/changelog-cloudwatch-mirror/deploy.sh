@@ -54,13 +54,11 @@ FILTER_PATTERN='?ERROR ?CRITICAL ?"Task timed out"'
 # back into itself).
 TARGET_FUNCTIONS=(
   "alpha-engine-data-collector"
-  "alpha-engine-ec2-lifecycle"
   "alpha-engine-predictor-health-check"
   "alpha-engine-predictor-inference"
   "alpha-engine-replay-concordance"
   "alpha-engine-replay-counterfactual"
   "alpha-engine-research-alerts"
-  "alpha-engine-research-eval-judge"
   "alpha-engine-research-eval-rolling-mean"
   "alpha-engine-research-rationale-clustering"
   "alpha-engine-research-runner"

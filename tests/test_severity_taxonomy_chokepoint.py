@@ -202,24 +202,6 @@ _REGISTRY: dict[str, dict[str, list[dict]]] = {
             },
         ],
     },
-    "infrastructure/lambdas/sf-watch-reclaim-sweep-handler/index.py": {
-        "_reclaim_escalate": [
-            {
-                "event_class": "SF watch reclaim escalation",
-                "severity": "error",
-                "silent": False,
-                "citation": "reconciled from live code 2026-07-31 — pending taxonomy entry",
-            },
-        ],
-        "_reclaim_note": [
-            {
-                "event_class": "SF watch reclaim note (relaunch info)",
-                "severity": "info",
-                "silent": True,
-                "citation": "reconciled from live code 2026-07-31 — pending taxonomy entry",
-            },
-        ],
-    },
     "infrastructure/lambdas/overseer-liveness-probe/index.py": {
         "_alert": [
             {
@@ -276,24 +258,6 @@ _REGISTRY: dict[str, dict[str, list[dict]]] = {
                 "severity": "critical",
                 "silent": False,
                 "citation": "alpha-engine-config-I6613 (2026-08-08) — pending taxonomy entry",
-            },
-        ],
-    },
-    "infrastructure/lambdas/ci-watch-liveness-probe/index.py": {
-        "_escalate": [
-            {
-                "event_class": "CI-watch reclaim escalation",
-                "severity": "error",
-                "silent": False,
-                "citation": "reconciled from live code 2026-07-31 — pending taxonomy entry",
-            },
-        ],
-        "_note": [
-            {
-                "event_class": "CI-watch reclaim relaunch note",
-                "severity": "info",
-                "silent": True,
-                "citation": "reconciled from live code 2026-07-31 — pending taxonomy entry",
             },
         ],
     },

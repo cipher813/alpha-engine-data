@@ -67,7 +67,7 @@ SCHEMA_VERSION = _vocab.SCHEMA_VERSION
 
 # Map log-group prefix → vocab.yaml subsystem. Order matters — first match
 # wins. The default for unmatched groups is "infrastructure" (covers
-# ec2-lifecycle, changelog-mirror, anything else operator hasn't classified).
+# changelog-mirror and anything else operator hasn't classified).
 _SUBSYSTEM_MAP: tuple[tuple[str, str], ...] = (
     ("/aws/lambda/alpha-engine-predictor", "predictor"),
     ("/aws/lambda/alpha-engine-research", "research"),
