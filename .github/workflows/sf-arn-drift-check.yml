@@ -82,6 +82,7 @@ env:
     EventBridge SF-ARN drift (codified vs live)
     SF LoggingConfiguration drift (codified vs live)
     SF lambda:invoke Lambda-existence check (codified vs live)
+    Lambda timeout drift (codified table vs live)
     SF definition drift (codified vs live vs S3-staged)
     EventBridge Scheduler rule drift (fleet-wide, codified vs live)
     schedule-manifest.json drift (fleet-wide, vs live AWS)
@@ -97,6 +98,8 @@ env:
     2026-08-31 over the 14-day window, the FIRST failing step was
     'Scheduled-automation pause still holds (live)' 42 times, the gate 15,
     'SF definition drift' 3 and the lambda-existence check once.
+    'Lambda timeout drift' joined the surface on 2026-09-01 and is declared
+    with them.
     'Configure AWS credentials via OIDC', 'Publish the arming record'
     and 'Paused-component alarm actions reconciled with the manifest'
     are deliberately NOT declared: the last is REMEDIATION, and a
