@@ -216,6 +216,34 @@ def _is_degraded_run(describe_resp: dict | None) -> bool:
     return (describe_resp.get("error") or "") == "DegradedRun"
 
 
+def _normalize_cause_snippet(snippet: str, *, max_chars: int = _CAUSE_MAX_CHARS) -> str:
+    """Collapse embedded newlines and cap length for a single Telegram line.
+
+    A poll-result `detail` string (ssm-liveness-poller's stderr capture) is
+    frequently multi-line ("...not granted.\\nfatal: unable to access...").
+    Left as-is, ``text.splitlines()`` — including every test and downstream
+    reader that greps for the line starting "Cause:" — sees only the FIRST
+    physical line, silently dropping the rest (alpha-engine-config-I9742: the
+    2026-09-01 execution's real 403 sat on line 2 of a 3-line detail string).
+    """
+    snippet = " ".join(snippet.split())
+    if len(snippet) > max_chars:
+        snippet = snippet[: max_chars - 1] + "…"
+    return snippet
+
+
+# ssm-liveness-poller's `detail` field is the ONE field its own module docs
+# name as "every consumer already carries" — it is deliberately more
+# substantial than the boilerplate describe_execution error/cause this cap
+# otherwise bounds (bounded upstream to ~1500 stderr + ~2000 stdout chars,
+# per ssm-liveness-poller/index.py's _STDERR_TAIL_CHARS / _STDOUT_TAIL_CHARS).
+# Capping it at the same 280 chars as a one-line boilerplate string would
+# have truncated the 2026-09-01 execution's 403 before it appeared — the
+# defect deliverable 5 exists to fix, reintroduced by an over-tight cap
+# instead of a wrong key.
+_DETAILED_CAUSE_MAX_CHARS = 1000
+
+
 def _failure_cause_from(describe_resp: dict | None) -> str:
     if not describe_resp:
         return ""
@@ -225,9 +253,7 @@ def _failure_cause_from(describe_resp: dict | None) -> str:
         snippet = f"{error}: {cause}"
     else:
         snippet = error or cause
-    if len(snippet) > _CAUSE_MAX_CHARS:
-        snippet = snippet[: _CAUSE_MAX_CHARS - 1] + "…"
-    return snippet
+    return _normalize_cause_snippet(snippet) if snippet else snippet
 
 
 def _build_message(
@@ -262,6 +288,7 @@ def _build_message(
     emoji = _DEGRADED_EMOJI if is_degraded else _STATUS_EMOJI.get(status, "\U0001f4e8")
     exec_name = detail.get("name", "") or "(unknown execution)"
     hollow_suspect = False
+    detailed_failure_cause: str | None = None
 
     lines = [f"{emoji} *{label} — {display_status}*"]
 
@@ -286,7 +313,7 @@ def _build_message(
             run_date = parse_run_date_from_execution_name(exec_name)
         if run_date:
             lines.append(f"Run date: {run_date}")
-        digest_lines, hollow_suspect = build_execution_digest(
+        digest_lines, hollow_suspect, detailed_failure_cause = build_execution_digest(
             execution_arn=execution_arn,
             is_preflight=is_preflight,
             execution_start_ms=detail.get("startDate"),
@@ -310,7 +337,18 @@ def _build_message(
             lines.extend(format_eod_artifact_lines(artifact_status))
 
     if status == "FAILED":
-        cause = _failure_cause_from(describe_resp)
+        # sf-pipeline-policy §2.3 corollary: the terminal failure message must
+        # carry the actual error, not the shared Fail state's boilerplate
+        # ("One or more weekday pipeline steps failed."). Prefer the
+        # diagnostic pulled from the poll-result contract embedded in the
+        # execution history; fall back to describe_execution's error/cause
+        # only when no such detail is present (alpha-engine-config-I9742
+        # deliverable 5).
+        cause = (
+            _normalize_cause_snippet(detailed_failure_cause, max_chars=_DETAILED_CAUSE_MAX_CHARS)
+            if detailed_failure_cause
+            else _failure_cause_from(describe_resp)
+        )
         if cause:
             lines.append(f"Cause: {cause}")
 

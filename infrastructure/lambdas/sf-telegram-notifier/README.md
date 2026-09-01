@@ -21,7 +21,7 @@ SF JSON definitions.
 | --- | --- | --- | --- |
 | `RUNNING`   | 🚀 | silent | execution name only |
 | `SUCCEEDED` | ✅ | loud   | run_date, duration, digest |
-| `FAILED`    | 🔴 | loud   | run_date, duration, `error: cause` via `DescribeExecution` (best-effort, truncated at 280 chars) |
+| `FAILED`    | 🔴 | loud   | run_date, duration, digest naming the last state that was doing work, `Cause:` line — the real diagnostic from the terminal Fail state's ssm-liveness-poller `detail` field when present (truncated at 1000 chars), else `error: cause` via `DescribeExecution` (best-effort, truncated at 280 chars) |
 | `TIMED_OUT` | ⏰ | loud   | run_date, duration |
 | `ABORTED`   | ⛔ | loud   | run_date, duration |
 | `FAILED` + `Error=DegradedRun` | 🟠 rendered as **DEGRADED** | loud | same as FAILED — distinct label/emoji so a degraded EOD run does not read as either a clean SUCCEEDED or a generic crash FAILED (alpha-engine-config#5289) |

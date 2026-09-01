@@ -83,6 +83,56 @@ DIGEST_STATE_ORDER: Tuple[str, ...] = (
     "RunDaemon",
 )
 
+# The pipelines' terminal error-handling Task states — the one that SENDS
+# the failure alert, not the one that failed. All three definitions
+# (step_function.json / step_function_daily.json / step_function_eod.json)
+# route every Catch/failure path through a Task named "HandleFailure" (an
+# sns:publish immediately before the terminal Fail state) — verified against
+# all three committed definitions, not assumed from one pipeline
+# (alpha-engine-config-I9742 deliverable 4). With the key fix above,
+# last_workload_state_entered's fallback now fires correctly on every
+# hard-failure run; without this exclusion the fallback would name
+# "HandleFailure" itself on every one of them, converting an alert naming
+# nothing into an alert naming the alerter rather than the state that broke.
+TERMINAL_ERROR_HANDLING_STATES: frozenset[str] = frozenset({
+    "HandleFailure",
+    # `HandleFailure` is not the only alerter. Each weekday pipeline refuses an
+    # unconsidered in-session start through its own sns:publish Task, and those
+    # are the last Task ENTERED on exactly the runs where the digest is read.
+    # Excluding only HandleFailure fixes the common path and leaves the
+    # market-hours refusals naming the alerter — the same defect, narrower.
+    "NotifyMarketHoursBlocked",
+    "NotifyMarketHoursOverrideMalformed",
+    "NotifyMarketHoursUnverified",
+    "TradingDayGateFailed",
+    "WeeklyRunDayGateFailed",
+})
+
+# The counterpart set, and the reason the one above can be a literal at all.
+# Some Task states also sit immediately before a terminal `Fail` and are NOT
+# alerters — they do the pipeline's real work on the way out, so naming one is
+# informative rather than circular:
+#
+#   ForceStopInstance              stops the trading box (a spend leak if it
+#                                  didn't run) — eod's cost-guard tail.
+#   WriteCompletionMarkerDegraded  writes the run's DEGRADED completion marker,
+#   WriteCompletionMarkerDegradedCalendar   which is the artifact every
+#                                  status-keyed consumer reads.
+#
+# Declared rather than inferred because `Next` points at a `Fail` state in both
+# cases, so no structural rule separates them — only what the state DOES does,
+# and that is a judgment this file must state out loud. Together the two sets
+# must EXHAUSTIVELY cover every Task preceding a `Fail` across all three
+# definitions; test_execution_digest.py recomputes that set from the committed
+# definitions and fails on anything in neither, so a newly added terminal state
+# is a red test rather than a wrong name in a red alert
+# (alpha-engine-config-I9742 deliverable 4).
+WORK_STATES_ON_TERMINAL_PATHS: frozenset[str] = frozenset({
+    "ForceStopInstance",
+    "WriteCompletionMarkerDegraded",
+    "WriteCompletionMarkerDegradedCalendar",
+})
+
 # Digest rows kept, before the elision line. Telegram messages are read on a
 # phone; a preopen execution touches ~25 distinct Task states and dumping all
 # of them buries the one that mattered. Truncation is by RELEVANCE (anomalies
@@ -125,11 +175,26 @@ def format_duration_short(duration_sec: int) -> str:
 
 
 def _state_name_from_event(event: dict) -> Optional[str]:
+    """Extract the state name Step Functions attaches to a state-transition event.
+
+    ``TaskStateEntered``/``TaskStateExited`` are HistoryEvent *types*; the
+    detail object Step Functions actually populates for BOTH is
+    ``stateEnteredEventDetails`` / ``stateExitedEventDetails`` — the generic
+    state-transition detail shared by every state type (Task, Pass, Wait,
+    Choice, ...), not a Task-prefixed one (alpha-engine-config-I9742). A
+    plausible ``taskStateEnteredEventDetails`` / ``taskStateExitedEventDetails``
+    is NOT a field the API emits — `taskScheduledEventDetails`,
+    `taskStartedEventDetails`, `taskSucceededEventDetails` and
+    `taskFailedEventDetails` exist for the *Task* event family, which is a
+    different set of event types entirely. Reading the wrong key here
+    silently returned None for every event, unconditionally, for the life of
+    this file.
+    """
     etype = event.get("type")
     if etype == "TaskStateEntered":
-        return (event.get("taskStateEnteredEventDetails") or {}).get("name")
+        return (event.get("stateEnteredEventDetails") or {}).get("name")
     if etype == "TaskStateExited":
-        return (event.get("taskStateExitedEventDetails") or {}).get("name")
+        return (event.get("stateExitedEventDetails") or {}).get("name")
     return None
 
 
@@ -155,13 +220,21 @@ def last_workload_state_entered(events: Sequence[dict]) -> Optional[str]:
     named nothing on the two pipelines that trade real money. Choice and Pass
     states are still excluded, by _state_name_from_event: naming
     "CheckMorningEnrichSpotStatus" would be true and useless.
+
+    TERMINAL_ERROR_HANDLING_STATES is excluded too (alpha-engine-config-I9742
+    deliverable 4): once the key bug above is fixed, ``HandleFailure`` is
+    ENTERED on every hard-failure run — it is the state that sends the
+    alert, always the last Task state entered on a failed execution. Naming
+    it here would report the alerter as the failure, which is worse than the
+    "no workload states" placeholder it replaces: that placeholder was at
+    least honestly empty, this would be confidently wrong.
     """
     last: Optional[str] = None
     for event in events:
         if event.get("type") != "TaskStateEntered":
             continue
         name = _state_name_from_event(event)
-        if not name:
+        if not name or name in TERMINAL_ERROR_HANDLING_STATES:
             continue
         last = name
     return last
@@ -374,6 +447,75 @@ def fetch_execution_history(
     return events
 
 
+# The ssm-liveness-poller poll-result contract (README.md at
+# infrastructure/lambdas/ssm-liveness-poller/): every *_poll key populated by
+# that Lambda carries a `verdict` the SF Choice states branch on and, on the
+# three terminal-failure verdicts below, a non-empty `detail` string holding
+# the actual diagnostic (stderr, timeout description, budget exhaustion).
+# `SUCCESS` / `IN_PROGRESS` are excluded deliberately — a detail string under
+# either of those is not a failure to surface.
+_POLL_FAILURE_VERDICTS: frozenset[str] = frozenset(
+    {"COMMAND_FAILED", "INSTANCE_UNRESPONSIVE", "POLL_BUDGET_EXHAUSTED"}
+)
+
+
+def _find_poll_failure_detail(node: Any) -> Optional[str]:
+    """Depth-first search for a poll-result dict carrying a real failure detail."""
+    if isinstance(node, dict):
+        verdict = node.get("verdict")
+        detail = node.get("detail")
+        if (
+            verdict in _POLL_FAILURE_VERDICTS
+            and isinstance(detail, str)
+            and detail.strip()
+        ):
+            return detail.strip()
+        for value in node.values():
+            found = _find_poll_failure_detail(value)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _find_poll_failure_detail(item)
+            if found:
+                return found
+    return None
+
+
+def extract_detailed_failure_cause(events: Sequence[dict]) -> Optional[str]:
+    """The real error, from the terminal Fail state's own input — not the
+    shared Fail state's boilerplate ``Error``/``Cause`` (sf-pipeline-policy
+    §2.3 corollary; alpha-engine-config-I9742 deliverable 5).
+
+    ``describe_execution``'s ``error``/``cause`` on all three pipelines is
+    the shared ``FailExecution``/``DailyPipelineFailure``/
+    ``EODPipelineFailure`` Fail state's own constant ``Error`` field plus a
+    boilerplate ``Cause`` string ("One or more weekday pipeline steps
+    failed.") — identical for every failure regardless of what broke. The
+    actual diagnostic (e.g. a git push 403) is embedded in the accumulated
+    state input HandleFailure's SNS publish already carries, under whichever
+    ``*_poll`` key ssm-liveness-poller populated on the way there. Returns
+    ``None`` when no such detail is present (a failure the poller contract
+    does not cover), never a guess.
+    """
+    for event in reversed(events):
+        if event.get("type") != "FailStateEntered":
+            continue
+        raw_input = (event.get("stateEnteredEventDetails") or {}).get("input")
+        if not raw_input:
+            continue
+        try:
+            import json as _json
+
+            payload = _json.loads(raw_input)
+        except (ValueError, TypeError):
+            continue
+        found = _find_poll_failure_detail(payload)
+        if found:
+            return found
+    return None
+
+
 def build_execution_digest(
     *,
     execution_arn: str,
@@ -382,16 +524,18 @@ def build_execution_digest(
     run_date: Optional[str],
     sf_client: Any,
     s3_client: Any | None,
-) -> Tuple[List[str], bool]:
-    """Build digest lines + hollow_suspect flag for terminal SF notifications."""
+) -> Tuple[List[str], bool, Optional[str]]:
+    """Build digest lines + hollow_suspect flag + detailed failure cause for
+    terminal SF notifications."""
     if not execution_arn:
-        return ["_(digest unavailable: missing executionArn)_"], False
+        return ["_(digest unavailable: missing executionArn)_"], False, None
     try:
         events = fetch_execution_history(sf_client, execution_arn)
     except Exception as exc:  # noqa: BLE001
         logger.error("get_execution_history failed for %s: %s", execution_arn, exc)
-        return ["_(digest unavailable: history fetch failed)_"], False
+        return ["_(digest unavailable: history fetch failed)_"], False, None
 
+    detailed_failure_cause = extract_detailed_failure_cause(events)
     durations = parse_task_state_durations(events)
     execution_start = _ms_to_datetime(execution_start_ms) or datetime.now(tz=timezone.utc)
     rows = build_state_durations(
@@ -405,6 +549,7 @@ def build_execution_digest(
     return (
         format_digest_lines(rows, last_entered=last_workload_state_entered(events)),
         hollow,
+        detailed_failure_cause,
     )
 
 
