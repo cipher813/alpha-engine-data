@@ -1,0 +1,267 @@
+{
+  "schema": "cost_fanin_stage_census-1.0.0",
+  "comment": "Every work-dispatching stage of ne-weekly-freshness-pipeline, classified by whether it emits an LLM cost record. THE POINT: the coverage block in AggregateCosts declares four stages, and nothing checked the other direction \u2014 a stage could be added to the definition, spend money, and appear in NO set at all. That absence is indistinguishable from a stage that costs nothing (principles.md 2.7: no data is never rendered as green). tests/test_sf_cost_fanin_stage_census.py makes the classification mandatory: a new Lambda or SSM stage fails CI until someone writes down which of the three it is and why. MEASURED BASIS (2026-08-31): the complete set of krepis.llm.LLMClient construction sites in the fleet is crucible-research {evals/judge.py, evals/orchestrator.py, producers/single_agent.py, thinktank/client.py, scripts/live_validate_openrouter_judge.py}, crucible-evaluator {director/agent.py, director/retro.py} and crucible-backtester {replay/runner.py}. Every 'exempt' row below rests on that census; re-measure it before adding one.",
+  "dispositions": {
+    "emits": "Declared in the AggregateCosts coverage block (required_producers or conditional_producers).",
+    "exempt": "The substrate provably contains no paid-model call site. Needs a reason naming why.",
+    "unattributed": "The substrate DOES spend on a paid model and emits no cost record. A DEBT, not an exemption \u2014 must name a tracked issue."
+  },
+  "stages": {
+    "ChallengerShadow": {
+      "disposition": "emits",
+      "substrate": "crucible-research producers/single_agent.py (Lambda alpha-engine-research-runner)",
+      "reason": "Emits single-agent-quant, declared under required_producers. The challenger arm always makes at least one structured model call when it runs, so an empty producer set here is always a defect, never a quiet cycle."
+    },
+    "EvalJudgeProcess": {
+      "disposition": "emits",
+      "substrate": "crucible-research evals/judge.py + evals/orchestrator.py (spot, evals.judge_spot_run)",
+      "reason": "evaljudge-sync required; evaljudge-batch conditional (batch retrieval does not always run)."
+    },
+    "ReplayConcordance": {
+      "disposition": "emits",
+      "substrate": "crucible-backtester replay/runner.py (Lambda alpha-engine-replay-concordance)",
+      "reason": "Emits replay-concordance, declared under required_producers. Every replayed artifact is one paid cheap-model call, and the stage is wall-killed often enough that its budget cannot be sized while its spend is invisible (alpha-engine-config-I7176 item A2)."
+    },
+    "Director": {
+      "disposition": "emits",
+      "substrate": "crucible-evaluator director/agent.py + director/retro.py (Lambda alpha-engine-evaluator-director)",
+      "reason": "director-plan required; director-retro-judge conditional (no prior plan on the first cycle)."
+    },
+    "RAGIngestion": {
+      "disposition": "unattributed",
+      "substrate": "nousergon-lib nousergon_lib/rag/embeddings.py (spot, rag ingestion)",
+      "reason": "Calls the PAID Voyage embedding API (voyage-3-lite) through voyageai.Client directly, not through krepis.llm.LLMClient, so it writes no _cost_raw object and the fan-in check structurally cannot see it. Real spend attributed to nothing. NOT an exemption: recorded here so the silence is a declared debt rather than an absence.",
+      "issue": "alpha-engine-config-I9694"
+    },
+    "Scanner": {
+      "disposition": "exempt",
+      "substrate": "crucible-research lambda/scanner_handler.py",
+      "reason": "no paid-model call site in the substrate. The handler nevertheless calls flush_default_sink() in a finally, so if an LLM call is ever added the producer appears and the fan-in check refuses it as UNDECLARED \u2014 the exemption fails loud rather than absorbing the new spend."
+    },
+    "ScannerLeaderboard": {
+      "disposition": "exempt",
+      "substrate": "crucible-research lambda/scanner_handler.py (leaderboard mode)",
+      "reason": "no paid-model call site in the substrate. The handler nevertheless calls flush_default_sink() in a finally, so if an LLM call is ever added the producer appears and the fan-in check refuses it as UNDECLARED \u2014 the exemption fails loud rather than absorbing the new spend."
+    },
+    "SignalsEnvelope": {
+      "disposition": "exempt",
+      "substrate": "crucible-research lambda/signals_envelope_handler.py",
+      "reason": "no paid-model call site in the substrate. The handler nevertheless calls flush_default_sink() in a finally, so if an LLM call is ever added the producer appears and the fan-in check refuses it as UNDECLARED \u2014 the exemption fails loud rather than absorbing the new spend."
+    },
+    "RationaleClustering": {
+      "disposition": "exempt",
+      "substrate": "crucible-research lambda/rationale_clustering_handler.py",
+      "reason": "no paid-model call site in the substrate. The handler nevertheless calls flush_default_sink() in a finally, so if an LLM call is ever added the producer appears and the fan-in check refuses it as UNDECLARED \u2014 the exemption fails loud rather than absorbing the new spend."
+    },
+    "EvalRollingMean": {
+      "disposition": "exempt",
+      "substrate": "crucible-research lambda/eval_rolling_mean_handler.py",
+      "reason": "no paid-model call site in the substrate. The handler nevertheless calls flush_default_sink() in a finally, so if an LLM call is ever added the producer appears and the fan-in check refuses it as UNDECLARED \u2014 the exemption fails loud rather than absorbing the new spend."
+    },
+    "ResearchSelfTest": {
+      "disposition": "exempt",
+      "substrate": "crucible-research lambda/handler.py (self-test mode)",
+      "reason": "no paid-model call site in the substrate. The handler nevertheless calls flush_default_sink() in a finally, so if an LLM call is ever added the producer appears and the fan-in check refuses it as UNDECLARED \u2014 the exemption fails loud rather than absorbing the new spend."
+    },
+    "EvalJudgeSubmitWeekly": {
+      "disposition": "exempt",
+      "substrate": "crucible-research lambda/eval_judge_submit_handler.py",
+      "reason": "Builds the plan manifest and submits the Anthropic Batch. The tokens are billed on retrieval, and the retrieval is EvalJudgeProcess, which declares evaljudge-batch. Requiring a producer here would demand a record for spend that has not happened yet."
+    },
+    "EvalJudgeSubmitFirstSaturday": {
+      "disposition": "exempt",
+      "substrate": "crucible-research lambda/eval_judge_submit_handler.py",
+      "reason": "Same substrate and same reason as EvalJudgeSubmitWeekly \u2014 the monthly-cadence entry point into the identical Lambda."
+    },
+    "AggregateCosts": {
+      "disposition": "exempt",
+      "substrate": "crucible-research lambda/aggregate_costs_handler.py",
+      "reason": "The aggregator itself. It reads the prefix it would have to have written to, so requiring it would be circular; tests/test_sf_cost_fanin_coverage.py asserts the same property from the declaration side."
+    },
+    "ReportCard": {
+      "disposition": "exempt",
+      "substrate": "crucible-evaluator grading/handler.py (Lambda alpha-engine-evaluator)",
+      "reason": "no paid-model call site in the substrate \u2014 the report card scores measured artifacts. The Director is the evaluator's only model caller and it is a separate Lambda and a separate stage. grading/handler.py flushes the sink in a finally regardless."
+    },
+    "EvaluatorDeployDriftCheck": {
+      "disposition": "exempt",
+      "substrate": "crucible-evaluator grading/handler.py (drift-probe mode)",
+      "reason": "A deploy-parity probe: it returns the deployed SHA and pin set and returns before any scoring work. no paid-model call site in the substrate."
+    },
+    "EvaluatorDirectorDeployDriftCheck": {
+      "disposition": "exempt",
+      "substrate": "crucible-evaluator director/handler.py (drift-probe mode)",
+      "reason": "The Director Lambda invoked in drift-probe mode. It returns before director/agent.py is imported, so the one model call in that image is not reachable on this path; the Director STAGE declares it."
+    },
+    "Counterfactual": {
+      "disposition": "exempt",
+      "substrate": "crucible-backtester replay/counterfactual.py (Lambda alpha-engine-replay-counterfactual)",
+      "reason": "no paid-model call site in the substrate \u2014 the counterfactual recomputes outcomes over already-stored replay artifacts. replay/runner.py, the repo's only LLMClient site, is reached from replay/batch.py and lambda_concordance only."
+    },
+    "WeeklyRunDayGate": {
+      "disposition": "exempt",
+      "substrate": "crucible-predictor (Lambda alpha-engine-predictor-inference, gate mode)",
+      "reason": "Gate mode \u2014 self-gates Thu/Fri/Sat firings to the one real weekly run. crucible-predictor contains no krepis.llm.LLMClient construction site anywhere in the repo."
+    },
+    "LibPinDriftCheck": {
+      "disposition": "exempt",
+      "substrate": "crucible-predictor (Lambda alpha-engine-predictor-inference, gate mode)",
+      "reason": "Gate mode \u2014 compares nousergon-lib pins across the fleet. crucible-predictor contains no krepis.llm.LLMClient construction site anywhere in the repo."
+    },
+    "PipelineContractCheck": {
+      "disposition": "exempt",
+      "substrate": "crucible-predictor (Lambda alpha-engine-predictor-inference, gate mode)",
+      "reason": "Gate mode \u2014 asserts the definition's own contract invariants. crucible-predictor contains no krepis.llm.LLMClient construction site anywhere in the repo."
+    },
+    "RegimeSubstrate": {
+      "disposition": "exempt",
+      "substrate": "crucible-predictor (Lambda alpha-engine-predictor-regime-substrate)",
+      "reason": "Quantitative regime features. no paid-model call site in the substrate anywhere in crucible-predictor."
+    },
+    "RegimeRetrospectiveEval": {
+      "disposition": "exempt",
+      "substrate": "crucible-predictor (Lambda alpha-engine-predictor-regime-retrospective-eval)",
+      "reason": "Scores prior regime calls against realized returns. no paid-model call site in the substrate anywhere in crucible-predictor."
+    },
+    "WeeklyPreflight": {
+      "disposition": "exempt",
+      "substrate": "nousergon-data infrastructure/lambdas/weekly-preflight",
+      "reason": "Preflight sweep over AWS control-plane state. no paid-model call site in the substrate."
+    },
+    "NormalizeRunDates": {
+      "disposition": "exempt",
+      "substrate": "nousergon-data infrastructure/lambdas/weekly-preflight (normalize mode)",
+      "reason": "Resolves run_date to the NYSE trading day. no paid-model call site in the substrate."
+    },
+    "RunScope": {
+      "disposition": "exempt",
+      "substrate": "nousergon-data infrastructure/lambdas/weekly-run-scope",
+      "reason": "Derives per-stage disposition from the execution history. no paid-model call site in the substrate."
+    },
+    "WeeklyCoverageSweep": {
+      "disposition": "exempt",
+      "substrate": "nousergon-data infrastructure/lambdas/weekly-coverage-sweep",
+      "reason": "Rolls up stage-coverage verdicts. no paid-model call site in the substrate."
+    },
+    "SubstrateHealthGate": {
+      "disposition": "exempt",
+      "substrate": "Lambda alpha-engine-substrate-health-gate",
+      "reason": "Pre-spend substrate probe. no paid-model call site in the substrate."
+    },
+    "DispatchWeeklyFreshnessSpot": {
+      "disposition": "exempt",
+      "substrate": "nousergon-data infrastructure/lambdas/weekly-freshness-spot-dispatcher",
+      "reason": "Boots a spot instance and returns. Any model spend belongs to the SSM stage that later runs ON that instance, which is declared separately; attributing it here would double-count."
+    },
+    "RelaunchWeeklyFreshnessSpot": {
+      "disposition": "exempt",
+      "substrate": "nousergon-data infrastructure/lambdas/weekly-freshness-spot-dispatcher",
+      "reason": "Boots a spot instance and returns. Any model spend belongs to the SSM stage that later runs ON that instance, which is declared separately; attributing it here would double-count."
+    },
+    "DispatchEvalJudgeSpot": {
+      "disposition": "exempt",
+      "substrate": "nousergon-data infrastructure/lambdas/eval-judge-spot-dispatcher",
+      "reason": "Boots the judge spot instance and returns. The judge's spend is declared under EvalJudgeProcess, the stage that runs on it."
+    },
+    "MorningEnrich": {
+      "disposition": "exempt",
+      "substrate": "nousergon-data collectors (data spot)",
+      "reason": "Numerical workload \u2014 OHLCV/intraday collection. no paid-model call site in the substrate."
+    },
+    "DataPhase1": {
+      "disposition": "exempt",
+      "substrate": "nousergon-data collectors (data spot)",
+      "reason": "Numerical workload \u2014 the weekly price-cache refresh. no paid-model call site in the substrate."
+    },
+    "DataPhase2": {
+      "disposition": "exempt",
+      "substrate": "nousergon-data collectors (data spot)",
+      "reason": "Numerical workload \u2014 the second weekly collection phase. no paid-model call site in the substrate."
+    },
+    "PredictorTraining": {
+      "disposition": "exempt",
+      "substrate": "crucible-predictor training/ (spot)",
+      "reason": "Numerical workload \u2014 gradient-boosted model training. no paid-model call site in the substrate."
+    },
+    "ResolveZooSpecs": {
+      "disposition": "exempt",
+      "substrate": "crucible-predictor training/model_zoo.py (spot)",
+      "reason": "Numerical workload \u2014 listing rotation specs. no paid-model call site in the substrate."
+    },
+    "TrainSpecDispatch": {
+      "disposition": "exempt",
+      "substrate": "crucible-predictor training/ (spot map)",
+      "reason": "Numerical workload \u2014 one model-zoo spec's training run. no paid-model call site in the substrate."
+    },
+    "ModelZooSelect": {
+      "disposition": "exempt",
+      "substrate": "crucible-predictor training/model_zoo.py (spot)",
+      "reason": "Numerical workload \u2014 champion selection over trained models. no paid-model call site in the substrate."
+    },
+    "Backtester": {
+      "disposition": "exempt",
+      "substrate": "crucible-backtester backtest.py (spot)",
+      "reason": "Numerical workload \u2014 portfolio simulation. no paid-model call site in the substrate."
+    },
+    "PredictorBacktest": {
+      "disposition": "exempt",
+      "substrate": "crucible-backtester (spot)",
+      "reason": "Numerical workload \u2014 predictor-signal backtesting. no paid-model call site in the substrate."
+    },
+    "PortfolioOptimizerBacktest": {
+      "disposition": "exempt",
+      "substrate": "crucible-backtester optimizer/ (spot)",
+      "reason": "Numerical workload \u2014 portfolio-optimizer backtesting. no paid-model call site in the substrate."
+    },
+    "PitParityLookahead": {
+      "disposition": "exempt",
+      "substrate": "crucible-backtester (spot)",
+      "reason": "Numerical workload \u2014 point-in-time lookahead parity. no paid-model call site in the substrate."
+    },
+    "PitParityWalkforward": {
+      "disposition": "exempt",
+      "substrate": "crucible-backtester (spot)",
+      "reason": "Numerical workload \u2014 point-in-time walkforward parity. no paid-model call site in the substrate."
+    },
+    "ParityReplay": {
+      "disposition": "exempt",
+      "substrate": "crucible-backtester (spot)",
+      "reason": "Numerical workload \u2014 the parity replay leg. no paid-model call site in the substrate."
+    },
+    "PitParityCompare": {
+      "disposition": "exempt",
+      "substrate": "crucible-backtester (spot)",
+      "reason": "Numerical workload \u2014 comparing the two parity legs. no paid-model call site in the substrate."
+    },
+    "EvaluatorDiagnostics": {
+      "disposition": "exempt",
+      "substrate": "crucible-evaluator (spot)",
+      "reason": "Numerical workload \u2014 evaluator diagnostics. no paid-model call site in the substrate."
+    },
+    "EvaluatorOptimize": {
+      "disposition": "exempt",
+      "substrate": "crucible-evaluator (spot)",
+      "reason": "Numerical workload \u2014 guardrail-gated parameter optimization. no paid-model call site in the substrate."
+    },
+    "SaturdayHealthCheck": {
+      "disposition": "exempt",
+      "substrate": "crucible-dashboard health_checker.py (dashboard box)",
+      "reason": "Numerical workload \u2014 the weekly health sweep. no paid-model call site in the substrate."
+    },
+    "WeeklySubstrateHealthCheck": {
+      "disposition": "exempt",
+      "substrate": "crucible-dashboard (dashboard box)",
+      "reason": "Numerical workload \u2014 the weekly substrate health sweep. no paid-model call site in the substrate."
+    },
+    "PitParityLookaheadResourceKillCheck": {
+      "disposition": "exempt",
+      "substrate": "krepis.resource_kill probe over the parity spot instance",
+      "reason": "Reads dmesg/exit status to tell an OOM kill from a workload failure. Runs no workload of its own. no paid-model call site in the substrate."
+    },
+    "PitParityWalkforwardResourceKillCheck": {
+      "disposition": "exempt",
+      "substrate": "krepis.resource_kill probe over the parity spot instance",
+      "reason": "Reads dmesg/exit status to tell an OOM kill from a workload failure. Runs no workload of its own. no paid-model call site in the substrate."
+    }
+  }
+}
