@@ -49,8 +49,10 @@ is skipped without credentials and is what proves it has not.
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Iterator
 
@@ -58,70 +60,24 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _INFRA = _REPO_ROOT / "infrastructure"
-_DEFS = ("step_function.json", "step_function_daily.json", "step_function_eod.json")
+sys.path.insert(0, str(_REPO_ROOT))
 
-# Live function timeouts, measured 2026-08-11 via
-# `aws lambda get-function-configuration --query Timeout`.
-_FUNCTION_TIMEOUTS_SEC: dict[str, int] = {
-    "alpha-engine-data-spot-dispatcher": 600,
-    "alpha-engine-eod-precondition-probe": 30,
-    "alpha-engine-evaluator": 660,
-    "alpha-engine-evaluator-director": 900,
-    "alpha-engine-predictor-inference": 900,
-    # alpha-engine-config-I7620. Two read-only Step Functions API calls plus a
-    # pure in-memory derivation — no S3 reads, no spot, no model call. Matches
-    # the --bootstrap timeout in
-    # infrastructure/lambdas/weekly-run-scope/deploy.sh; a generous ceiling here
-    # would let an advisory state hold the tail of the weekly run.
-    "alpha-engine-weekly-run-scope": 60,
-    # alpha-engine-config-I8214. ListExecutions + one DescribeExecution and
-    # GetExecutionHistory per contributing execution, a prefix listing, one
-    # PUT and one marker read-modify-write. Bounded by the cycle's execution
-    # count (single digits), not by the ticker universe. Matches the
-    # --bootstrap timeout in
-    # infrastructure/lambdas/weekly-coverage-sweep/deploy.sh; the SF state's
-    # 240s ceiling is deliberately below it so the SF is the one that binds.
-    # MEASURED 2026-08-22 on the first live invocation: 29.4s at 1024 MB,
-    # 675 MB peak, over a 40-execution walk. The original 120s/256 MB sizing
-    # timed out — at 256 MB the function used 256 of 256 and Lambda scales CPU
-    # with memory, so it was CPU-throttled as well as memory-starved.
-    "alpha-engine-weekly-coverage-sweep": 300,
-    "alpha-engine-predictor-regime-retrospective-eval": 600,
-    "alpha-engine-predictor-regime-substrate": 300,
-    "alpha-engine-replay-concordance": 900,
-    "alpha-engine-replay-counterfactual": 600,
-    "alpha-engine-research-aggregate-costs": 300,
-    # alpha-engine-research-eval-judge-poll and -process were RETIRED by
-    # alpha-engine-config-I9329: the poll states existed to drive a provider
-    # batch API that no longer exists (-I9263), and Process moved onto a
-    # dedicated EC2 spot box because the judge covered 8-15 of ~83 artifacts
-    # inside a 900s function. Their rows are removed rather than left behind —
-    # an entry naming a function no SF invokes is an unchecked claim, and
-    # test_the_codified_function_timeouts_match_live would then assert against
-    # a function whose only remaining property is that it is dead.
-    "alpha-engine-research-eval-judge-submit": 300,
-    # The dispatcher that replaces them. 600s covers the handler's worst case:
-    # a spot launch with capacity rotation and an on-demand fallback, plus the
-    # full 300s SSM-online wait, before the async detached send-command. It
-    # does NOT wait for the bootstrap — the SF's own poll loop does that.
-    # Matches --bootstrap's FN_TIMEOUT in
-    # infrastructure/lambdas/eval-judge-spot-dispatcher/deploy.sh.
-    "alpha-engine-research-eval-judge-spot-dispatcher": 600,
-    # 300 -> 900 by crucible-research infrastructure/deploy.sh in the
-    # alpha-engine-config-I9102 arc (both create AND update paths — the sizing
-    # previously lived only on create, so no merge could ever re-size the live
-    # function). Pinned at the service maximum because the handler is now
-    # self-deadlining; see the guard-band entry below.
-    "alpha-engine-research-eval-rolling-mean": 900,
-    "alpha-engine-research-rationale-clustering": 900,
-    "alpha-engine-research-runner": 900,
-    # 300 -> 450 by crucible-research-PR601 (p95 x 1.5). The Scanner states
-    # moved 600 -> 440 in the same arc so the SF budget binds again.
-    "alpha-engine-research-scanner": 450,
-    "alpha-engine-research-signals-envelope": 300,
-    "alpha-engine-weekly-freshness-spot-dispatcher": 600,
-    "alpha-engine-weekly-preflight": 120,
-}
+from infrastructure.sf_definitions import (  # noqa: E402
+    CODIFIED_FUNCTION_TIMEOUTS_SEC,
+    DEFINITION_FILES as _DEFS,
+    LAMBDA_SERVICE_MAX_SEC as _LAMBDA_SERVICE_MAX_SEC,
+    lambda_invoke_states as _shared_lambda_invoke_states,
+)
+
+# The codified live-timeout table moved to `infrastructure/sf_definitions.py`
+# (alpha-engine-config-I9702 arc, 2026-09-01). It is a claim about the live AWS
+# account, and the test that proves it — `test_the_codified_function_timeouts_
+# match_live` — is skipped without credentials, which is every CI run of this
+# suite. Set NOWHERE in any workflow, it had therefore never executed once.
+# Living in a module rather than a test file lets the daily drift workflow, which
+# does hold credentials, run the same comparison against the same declaration:
+# `infrastructure/step-functions/check-lambda-timeout-drift.py`.
+_FUNCTION_TIMEOUTS_SEC = CODIFIED_FUNCTION_TIMEOUTS_SEC
 
 # States whose SF budget is >= the function timeout, measured 2026-08-11.
 #
@@ -134,6 +90,8 @@ _FUNCTION_TIMEOUTS_SEC: dict[str, int] = {
 #
 # Pinned as an exact set: the gap cannot widen while that issue is open, and
 # an entry cannot outlive its fix without failing.
+_KNOWN_UNBOUND_EXPIRY = "2026-10-01"
+
 _KNOWN_UNBOUND: frozenset[tuple[str, str]] = frozenset(
     {
         ("step_function.json", "SignalsEnvelope"),
@@ -154,10 +112,6 @@ _KNOWN_UNBOUND: frozenset[tuple[str, str]] = frozenset(
     }
 )
 
-
-# Lambda's hard service maximum. A function AT this value cannot be raised, so
-# the SF-vs-function ordering rule inverts for it — see the module docstring.
-_LAMBDA_SERVICE_MAX_SEC = 900
 
 # States deliberately declaring a guard band ABOVE a service-max function.
 # Not exceptions to the rule; instances of the rule's second branch.
@@ -211,25 +165,31 @@ _SERVICE_MAX_GUARD_BAND: dict[tuple[str, str], int] = {
 }
 
 
-def _lambda_invoke_states(states: dict) -> Iterator[tuple[str, str, int | None]]:
-    """``(state_name, function_base_name, TimeoutSeconds)`` for every lambda:invoke.
+def _lambda_invoke_states(definition: str) -> Iterator[tuple[str, str, int | None]]:
+    """``(state_name, function_base_name, TimeoutSeconds)`` per ORDERING-GOVERNED state.
 
-    Recurses into Parallel branches and Map iterators — the weekly Scanner
-    lives inside ``ResearchPredictorParallel``, and a top-level-only scan
-    would silently exempt it, which is the state this test exists for.
+    Delegates to ``infrastructure.sf_definitions``, which is the single walk
+    ``check-lambda-existence.py`` also uses. This test previously carried its
+    own copy, and that copy was wrong in three ways at once — see that module's
+    docstring for the full account. The short version: a full-ARN
+    ``FunctionName`` parsed to the literal string ``"function"``, the
+    completeness guard below whitelisted exactly that mis-parse, and the
+    ``.waitForTaskToken``/``.sync`` resource variants were not matched at all.
+    Four states were therefore exempt from this file for its whole life, three
+    of them on the preopen trading pipeline, and a fourth definition
+    (``step_function_groom.json``) was never walked here at all.
+
+    ``.waitForTaskToken`` states are filtered out because for them the state
+    timeout and the function timeout bound DIFFERENT waits — the function
+    returns after handing off a token and the state waits for someone else to
+    call ``SendTaskSuccess`` — so the ordering rule does not apply. That is a
+    semantic exclusion, not an exemption, and it lives in
+    ``LambdaInvokeState.is_ordering_governed`` so no caller re-derives it.
     """
-    for name, body in states.items():
-        resource = body.get("Resource")
-        if isinstance(resource, str) and resource.endswith(":lambda:invoke"):
-            raw = str((body.get("Parameters") or {}).get("FunctionName") or "")
-            # Either "name:alias" or a full ARN with an optional alias suffix.
-            base = raw.split(":")[-2] if raw.startswith("arn:") else raw.split(":")[0]
-            yield name, base, body.get("TimeoutSeconds")
-        for branch in body.get("Branches") or []:
-            yield from _lambda_invoke_states(branch.get("States") or {})
-        iterator = body.get("Iterator") or body.get("ItemProcessor")
-        if iterator:
-            yield from _lambda_invoke_states(iterator.get("States") or {})
+    for state in _shared_lambda_invoke_states(definition):
+        if not state.is_ordering_governed:
+            continue
+        yield state.state_name, state.normalized_name, state.timeout_seconds
 
 
 def _states(definition: str) -> dict:
@@ -245,7 +205,7 @@ def test_every_lambda_invoke_declares_a_timeout(definition: str) -> None:
     """
     missing = sorted(
         name
-        for name, _, timeout in _lambda_invoke_states(_states(definition))
+        for name, _, timeout in _lambda_invoke_states(definition)
         if timeout is None and (definition, name) not in _KNOWN_UNBOUND
     )
     assert not missing, f"{definition}: lambda:invoke states with no TimeoutSeconds: {missing}"
@@ -259,7 +219,7 @@ def test_the_declared_stage_timeout_is_the_one_that_binds(definition: str) -> No
     error an operator sees is not reproducible. Greater is decorative.
     """
     violations: list[str] = []
-    for name, fn, timeout in _lambda_invoke_states(_states(definition)):
+    for name, fn, timeout in _lambda_invoke_states(definition):
         if (definition, name) in _KNOWN_UNBOUND:
             continue
         fn_timeout = _FUNCTION_TIMEOUTS_SEC.get(fn)
@@ -302,8 +262,13 @@ def test_every_invoked_function_has_a_codified_timeout(definition: str) -> None:
     unknown = sorted(
         {
             fn
-            for _, fn, _ in _lambda_invoke_states(_states(definition))
-            if fn not in _FUNCTION_TIMEOUTS_SEC and not fn.startswith("function")
+            for _, fn, _ in _lambda_invoke_states(definition)
+            # No name-shaped carve-out here. This filter used to read
+            # `and not fn.startswith("function")`, which excluded precisely the
+            # states whose full-ARN FunctionName the old parser reduced to the
+            # literal string "function" — the guard against silent exemption
+            # was the thing granting it.
+            if fn not in _FUNCTION_TIMEOUTS_SEC
         }
     )
     assert not unknown, (
@@ -314,13 +279,13 @@ def test_every_invoked_function_has_a_codified_timeout(definition: str) -> None:
 
 def test_the_known_unbound_set_contains_no_stale_entries() -> None:
     """An exception that outlives its fix silently exempts a healthy stage."""
-    live = {(d, name) for d in _DEFS for name, _, _ in _lambda_invoke_states(_states(d))}
+    live = {(d, name) for d in _DEFS for name, _, _ in _lambda_invoke_states(d)}
     stale = sorted(entry for entry in _KNOWN_UNBOUND if entry not in live)
     assert not stale, f"_KNOWN_UNBOUND names states that no longer exist: {stale}"
 
     still_broken = set()
     for definition, name in _KNOWN_UNBOUND:
-        for state, fn, timeout in _lambda_invoke_states(_states(definition)):
+        for state, fn, timeout in _lambda_invoke_states(definition):
             if state != name:
                 continue
             fn_timeout = _FUNCTION_TIMEOUTS_SEC.get(fn)
@@ -354,6 +319,117 @@ def test_the_codified_function_timeouts_match_live() -> None:
         if live != codified:
             drift.append(f"{fn}: codified {codified}s, live {live}s")
     assert not drift, "\n  ".join(drift)
+
+
+def test_the_known_unbound_set_has_not_outlived_its_deadline() -> None:
+    """An exemption with no deadline is not a deferral, it is a decision.
+
+    Measured across the fleet 2026-09-01: 47 non-empty suppression collections
+    hold 277 live entries between them, and NOT ONE of them fails when an entry
+    ages. Fifteen of twenty-six sampled had not changed by a single entry since
+    the day they were created, and thirteen of the twenty that cite an issue
+    outlive an issue that is already CLOSED — the ticket gets verified and
+    closed, the exemption stays, and from then on nothing in the repo or the
+    backlog knows the defect is still live.
+
+    This set is the best-behaved of them (21 -> 11 over 19 days, four shrink
+    events) and it still has no deadline, which is why the deadline goes here
+    first. When this fails, the fix is to drain entries — never to move the
+    date without a written reason in the same diff.
+    """
+    if not _KNOWN_UNBOUND:
+        return
+    deadline = _dt.date.fromisoformat(_KNOWN_UNBOUND_EXPIRY)
+    today = _dt.date.today()
+    assert today <= deadline, (
+        f"_KNOWN_UNBOUND still holds {len(_KNOWN_UNBOUND)} entries past its "
+        f"{_KNOWN_UNBOUND_EXPIRY} deadline: {sorted(_KNOWN_UNBOUND)}. "
+        "Each is a stage whose declared timeout cannot bind. Fix them, or move "
+        "the deadline WITH a written reason in the same diff — "
+        "alpha-engine-config-I6897."
+    )
+
+
+def test_every_codified_definition_is_walked() -> None:
+    """The guard covered three definitions; four are codified.
+
+    `step_function_groom.json` was never walked here, so its `lambda:invoke`
+    states had no ordering coverage at all — and three of its four synchronous
+    states were inverted (360s declared against a 300s function). Pinning the
+    count against the shared module's list is what stops a fifth definition
+    being added to the fleet and silently escaping this file.
+    """
+    from infrastructure.sf_definitions import SF_DEFINITIONS
+
+    assert set(_DEFS) == {d["definition_file"] for d in SF_DEFINITIONS}
+    assert len(_DEFS) == 4
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("alpha-engine-weekly-preflight", "alpha-engine-weekly-preflight"),
+        ("alpha-engine-predictor-inference:live", "alpha-engine-predictor-inference"),
+        (
+            "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller",
+            "alpha-engine-ssm-liveness-poller",
+        ),
+        (
+            "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-evaluator:live",
+            "alpha-engine-evaluator",
+        ),
+    ],
+)
+def test_a_full_arn_function_name_resolves_to_the_function(raw: str, expected: str) -> None:
+    """The regression test for the defect this file was blind to.
+
+    The old parser took ``raw.split(":")[-2]`` and returned the literal
+    ``"function"`` for every full ARN, and the completeness guard then
+    whitelisted names starting with ``"function"``. Four states were exempt
+    from every assertion in this file for its whole life. All three
+    `FunctionName` shapes the fleet's definitions actually use are pinned here.
+    """
+    from infrastructure.sf_definitions import normalize_function_name
+
+    assert normalize_function_name(raw) == expected
+
+
+def test_no_state_resolves_to_a_placeholder_function_name() -> None:
+    """The shape of the old bug, asserted directly against the live definitions.
+
+    A `normalized_name` of "function" (or empty) means the parser did not
+    understand the `FunctionName` it was given. That must be a failure, never a
+    quiet skip — the previous version of this guard turned exactly that
+    condition into an exemption.
+    """
+    from infrastructure.sf_definitions import all_lambda_invoke_states
+
+    bad = [
+        (s.definition_file, s.state_name, s.function_name)
+        for s in all_lambda_invoke_states()
+        if s.normalized_name in {None, "", "function"}
+    ]
+    assert not bad, f"FunctionName values the walk could not resolve: {bad}"
+
+
+def test_wait_for_task_token_states_are_excluded_from_the_ordering_rule() -> None:
+    """The carve-out is semantic and must stay narrow.
+
+    ``LaunchGroomSpot`` declares 13800s against a 300s function and is CORRECT:
+    the function returns after handing off a task token, so the state's timeout
+    bounds a callback wait the function is not part of. Every OTHER groom state
+    invokes the same Lambda synchronously and is governed. If this ever selects
+    more than the task-token states, the ordering rule has been quietly widened
+    into an exemption.
+    """
+    from infrastructure.sf_definitions import all_lambda_invoke_states
+
+    exempt = {
+        (s.definition_file, s.state_name)
+        for s in all_lambda_invoke_states()
+        if not s.is_ordering_governed
+    }
+    assert exempt == {("step_function_groom.json", "LaunchGroomSpot")}
 
 
 # ── SSM sendCommand stages (alpha-engine-config-I6948) ───────────────────────
@@ -452,7 +528,15 @@ def test_ssm_kills_the_command_before_the_state_gives_up(definition: str) -> Non
     assert not violations, f"{definition}:\n  " + "\n  ".join(violations)
 
 
-@pytest.mark.parametrize("definition", _DEFS)
+# The groom dispatch SF drives spot boxes through its dispatcher Lambda and a
+# task token, never through ssm:sendCommand — so an empty scan there is the
+# correct answer, not a broken walk. Naming it explicitly rather than dropping
+# the assertion keeps the non-emptiness guarantee for every definition that
+# does carry sendCommand stages.
+_DEFS_WITH_SSM_SEND_COMMAND = tuple(d for d in _DEFS if d != "step_function_groom.json")
+
+
+@pytest.mark.parametrize("definition", _DEFS_WITH_SSM_SEND_COMMAND)
 def test_the_ssm_scan_is_not_empty(definition: str) -> None:
     """A recursion bug would make every assertion above vacuously true.
 

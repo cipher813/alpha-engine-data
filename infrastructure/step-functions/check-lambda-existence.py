@@ -55,34 +55,40 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 REPO_ROOT = SCRIPT_DIR.parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
-# repo definition file -> live state machine name. Mirrors
-# check-definition-drift.py's SF_DEFINITIONS mapping (this script defines its
-# own copy rather than importing that hyphenated-filename module, matching
-# how check-drift.py in this same directory is also self-contained).
-SF_DEFINITIONS: tuple[dict, ...] = (
-    {"sf_name": "ne-weekly-freshness-pipeline", "definition_file": "step_function.json"},
-    {"sf_name": "ne-preopen-trading-pipeline", "definition_file": "step_function_daily.json"},
-    {"sf_name": "ne-postclose-trading-pipeline", "definition_file": "step_function_eod.json"},
-    {"sf_name": "alpha-engine-groom-dispatch", "definition_file": "step_function_groom.json"},
+from infrastructure.sf_definitions import (  # noqa: E402
+    SF_DEFINITIONS,
+    lambda_invoke_states,
+    normalize_function_name as _normalize_function_name,
 )
 
-_LAMBDA_INVOKE_RESOURCE_RE = re.compile(
-    r"^arn:aws:states:::lambda:invoke(\.(waitForTaskToken|sync|sync:2))?$"
-)
-# Bare-name shape Lambda function names are allowed to take (letters, digits,
-# - and _, up to 64 chars) — used only to sanity-check extraction, not to
-# validate AWS's actual rules.
-_FULL_ARN_RE = re.compile(r"^arn:aws:lambda:[\w-]+:\d+:function:([^:]+)(:.+)?$")
 
+def _walk_states(states: dict) -> list[dict]:
+    """Thin adapter over the shared walk, kept so this module's unit tests
+    exercise the SHARED implementation rather than a second copy of it.
 
+    ``definition_file`` is irrelevant when ``states`` is supplied — the walk
+    only uses it to label results — so a placeholder is passed.
+    """
+    return [
+        {"state_name": s.state_name, "function_name": s.function_name}
+        for s in lambda_invoke_states("<in-memory>", states)
+    ]
+
+# SF_DEFINITIONS, the lambda:invoke walk and the FunctionName normalizer all
+# moved to `infrastructure/sf_definitions.py` (alpha-engine-config-I9702 arc,
+# 2026-09-01). This script's copies were the CORRECT ones; the second copy —
+# in tests/test_sf_lambda_timeout_ordering.py — had drifted and was wrong in
+# three ways, exempting four states from that guard for its whole life. The
+# defect was not in either copy but in there being two, so the fix is one
+# module both import rather than a repair to the broken half.
 def _load_definition(definition_file: str) -> tuple[dict | None, str | None]:
     """Load one SF definition JSON. Returns (definition, error)."""
     path = REPO_ROOT / "infrastructure" / definition_file
@@ -94,43 +100,6 @@ def _load_definition(definition_file: str) -> tuple[dict | None, str | None]:
         return None, f"{path} is not valid JSON: {exc}"
 
 
-def _normalize_function_name(raw: str) -> str:
-    """Reduce a FunctionName value (bare name, full ARN, or name/ARN with a
-    :version-or-alias qualifier) to the bare function name `lambda
-    get-function --function-name` accepts."""
-    m = _FULL_ARN_RE.match(raw)
-    if m:
-        return m.group(1)
-    # Bare name, possibly with a :qualifier suffix (e.g. "name:live").
-    return raw.split(":", 1)[0]
-
-
-def _walk_states(states: dict) -> list[dict]:
-    """Recursively collect every Task state whose Resource targets
-    lambda:invoke (any .waitForTaskToken/.sync suffix), across Map
-    (Iterator/ItemProcessor) and Parallel (Branches) nesting."""
-    found: list[dict] = []
-    for state_name, state in states.items():
-        if state.get("Type") == "Task":
-            resource = state.get("Resource", "")
-            if _LAMBDA_INVOKE_RESOURCE_RE.match(resource):
-                params = state.get("Parameters", {}) or {}
-                function_name = params.get("FunctionName")
-                found.append(
-                    {"state_name": state_name, "function_name": function_name}
-                )
-        # Map state (older "Iterator" key, newer "ItemProcessor" key).
-        for nested_key in ("Iterator", "ItemProcessor"):
-            nested = state.get(nested_key)
-            if isinstance(nested, dict) and "States" in nested:
-                found.extend(_walk_states(nested["States"]))
-        # Parallel state.
-        for branch in state.get("Branches", []) or []:
-            if "States" in branch:
-                found.extend(_walk_states(branch["States"]))
-    return found
-
-
 def _discover_referenced_functions(sf_name: str, definition_file: str) -> list[dict]:
     """Return one entry per lambda:invoke state discovered in the codified
     definition, or a single error entry if the file can't be loaded/parsed."""
@@ -138,19 +107,15 @@ def _discover_referenced_functions(sf_name: str, definition_file: str) -> list[d
     if error is not None:
         return [{"sf_name": sf_name, "definition_file": definition_file, "error": error}]
 
-    states = definition.get("States", {})
-    invokes = _walk_states(states)
-
     results: list[dict] = []
-    for inv in invokes:
-        function_name = inv["function_name"]
-        if not function_name or not isinstance(function_name, str):
+    for state in lambda_invoke_states(definition_file, definition.get("States", {})):
+        if not state.function_name:
             results.append({
                 "sf_name": sf_name,
                 "definition_file": definition_file,
-                "state_name": inv["state_name"],
+                "state_name": state.state_name,
                 "error": (
-                    f"state {inv['state_name']!r} targets lambda:invoke but "
+                    f"state {state.state_name!r} targets lambda:invoke but "
                     f"has no (or non-string) Parameters.FunctionName"
                 ),
             })
@@ -158,9 +123,9 @@ def _discover_referenced_functions(sf_name: str, definition_file: str) -> list[d
         results.append({
             "sf_name": sf_name,
             "definition_file": definition_file,
-            "state_name": inv["state_name"],
-            "function_name": function_name,
-            "normalized_name": _normalize_function_name(function_name),
+            "state_name": state.state_name,
+            "function_name": state.function_name,
+            "normalized_name": state.normalized_name,
         })
     return results
 

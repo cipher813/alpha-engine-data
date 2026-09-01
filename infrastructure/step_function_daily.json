@@ -736,7 +736,7 @@
           "step": "code-freshness-gate"
         }
       },
-      "TimeoutSeconds": 65,
+      "TimeoutSeconds": 20,
       "Retry": [
         {
           "ErrorEquals": [
@@ -897,7 +897,7 @@
           "step": "correctness-verdict-gate"
         }
       },
-      "TimeoutSeconds": 65,
+      "TimeoutSeconds": 20,
       "Retry": [
         {
           "ErrorEquals": [
@@ -1337,7 +1337,7 @@
           "step": "morning-planner"
         }
       },
-      "TimeoutSeconds": 65,
+      "TimeoutSeconds": 20,
       "Retry": [
         {
           "ErrorEquals": [
