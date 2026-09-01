@@ -64,6 +64,44 @@ permissions:
   id-token: write   # required for OIDC
   contents: read
 
+# WORKFLOW HEALTH SEMANTICS (alpha-engine-config-I9169).
+# Read by alpha-engine-config's scripts/check_scheduled_workflow_health.py out
+# of THIS file, so the declaration cannot outlive the steps it describes. A
+# non-zero exit at a declared finding step is graded `reporting_findings`
+# (visible, not counted unhealthy, and no "this control has never once
+# succeeded" issue filed against it); a failure ANYWHERE else - checkout, an
+# OIDC role that no longer exists, a dependency install - and a run that never
+# started at all are graded exactly as before. Renaming a step below without
+# updating this list is caught by `--validate-declarations`.
+env:
+  WORKFLOW_HEALTH_SEMANTICS: finding-surface
+  WORKFLOW_HEALTH_FINDING_STEPS: |
+    Scheduled-automation pause still holds (live)
+    Overseer playbook arming (declared pause vs live, live)
+    Weekly exercise-cadence drift (manifest vs live SSM)
+    EventBridge SF-ARN drift (codified vs live)
+    SF LoggingConfiguration drift (codified vs live)
+    SF lambda:invoke Lambda-existence check (codified vs live)
+    SF definition drift (codified vs live vs S3-staged)
+    EventBridge Scheduler rule drift (fleet-wide, codified vs live)
+    schedule-manifest.json drift (fleet-wide, vs live AWS)
+    Playbook trigger surface drift (playbooks.yaml vs live AWS)
+    Drift-check gate (fail the job on any failed check above)
+  WORKFLOW_HEALTH_FINDING_ISSUE: alpha-engine-config-I3697
+  WORKFLOW_HEALTH_FINDING_REASON: >-
+    Ten independent drift detectors plus the gate that reddens the job
+    on any of them. Each exits 1 when codified state and live AWS have
+    diverged - the finding, not a broken check. All ten are
+    continue-on-error and still report conclusion=failure to the jobs API,
+    so each must be named here or the workflow stays un-muted: measured
+    2026-08-31 over the 14-day window, the FIRST failing step was
+    'Scheduled-automation pause still holds (live)' 42 times, the gate 15,
+    'SF definition drift' 3 and the lambda-existence check once.
+    'Configure AWS credentials via OIDC', 'Publish the arming record'
+    and 'Paused-component alarm actions reconciled with the manifest'
+    are deliberately NOT declared: the last is REMEDIATION, and a
+    remediation step failing is a real break, not a finding.
+
 jobs:
   drift-check:
     runs-on: ubuntu-latest
