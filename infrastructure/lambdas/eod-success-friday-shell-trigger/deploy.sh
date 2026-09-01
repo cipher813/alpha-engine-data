@@ -154,6 +154,15 @@ if $BOOTSTRAP; then
   fi
 
   # EventBridge rule: Step Functions Execution Status Change for EOD SF SUCCEEDED only
+  #
+  # State resolves via pause_state() (automation_pause.json), not a literal here -
+  # see "State must come from the automation-pause manifest" above (config-I6619).
+  # As of 2026-09-01 that manifest carries this rule DISABLED (Brian ruling,
+  # alpha-engine-config-I9751 item 3: old weekly runs 1x/week, no rehearsal, no
+  # reruns, during the v2 build), superseding the 2026-08-13 un-pause. A
+  # --bootstrap run today creates the rule DISABLED for that reason. Re-enabling
+  # requires a fresh ruling, not a revert of this comment - move the manifest
+  # entry back to `not_paused` only once Brian rules on it.
   echo "  Creating EventBridge rule: ${RULE_NAME}"
   EVENT_PATTERN=$(cat <<EOF
 {
