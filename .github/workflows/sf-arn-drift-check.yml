@@ -137,8 +137,24 @@ jobs:
       # findings, remediation never reached. Repair-then-verify also makes the
       # verify meaningful: a `--check` failure now means remediation ran and did
       # not hold, which is the escalation-worthy condition.
+      #
+      # NOT `continue-on-error`, and it carries an `id` (alpha-engine-config-
+      # I9702 arc, 2026-09-01). This step is REMEDIATION, and the gate's own
+      # comment below already says so — "a remediation step failing is a real
+      # break, not a finding" — but the step was tolerated anyway and was the
+      # ONE step in this workflow with no `id`, so the outcome aggregator that
+      # covers its ten siblings could not see it at all.
+      #
+      # What that hid, measured 2026-09-01 on run 33518203668: every invocation
+      # has been dying on `AccessDenied ... not authorized to perform:
+      # cloudwatch:DisableAlarmActions`. The self-healing loop has never once
+      # been able to heal. Tolerated and unnamed, that read as "remediation ran,
+      # drift persists" rather than "remediation is not permitted", so the
+      # verify step below reported the same five findings run after run — first
+      # failing step 42 times in the 14 days to 2026-08-31 — and the real cause
+      # was a missing IAM action nobody was looking for.
       - name: Paused-component alarm actions reconciled with the manifest (live)
-        continue-on-error: true
+        id: pause_remediation
         run: python3 infrastructure/automation_pause.py --enforce --alarms-only
 
       # Brian ruling 2026-08-07: all scheduled automation paused except the
@@ -211,6 +227,21 @@ jobs:
         id: sf_logging_drift
         continue-on-error: true
         run: python3 infrastructure/step-functions/check-drift.py
+
+      # alpha-engine-config-I9702. The sibling above asks whether a referenced
+      # Lambda EXISTS; this asks whether the timeout this repo has codified for
+      # it is still the timeout it carries. Those timeouts are what
+      # tests/test_sf_lambda_timeout_ordering.py grades every stage's declared
+      # `TimeoutSeconds` against, and they are deployed from four other
+      # repositories — so the table drifts on someone else's merge and nothing
+      # here notices. The assertion existed as a test guarded by
+      # `SF_TIMEOUT_LIVE_CHECK`, set in no workflow anywhere, and had therefore
+      # never run. Belongs on this trigger set by this file's own criterion:
+      # it reads live AWS.
+      - name: Lambda timeout drift (codified table vs live)
+        id: lambda_timeout_drift
+        continue-on-error: true
+        run: python3 infrastructure/step-functions/check-lambda-timeout-drift.py
 
       - name: SF lambda:invoke Lambda-existence check (codified vs live)
         id: sf_lambda_existence
@@ -319,6 +350,7 @@ jobs:
             eventbridge_arn_drift=${{ steps.eventbridge_arn_drift.outcome }}
             sf_logging_drift=${{ steps.sf_logging_drift.outcome }}
             sf_lambda_existence=${{ steps.sf_lambda_existence.outcome }}
+            lambda_timeout_drift=${{ steps.lambda_timeout_drift.outcome }}
             sf_definition_drift=${{ steps.sf_definition_drift.outcome }}
             scheduler_rule_drift=${{ steps.scheduler_rule_drift.outcome }}
             schedule_manifest_drift=${{ steps.schedule_manifest_drift.outcome }}

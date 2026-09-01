@@ -7874,7 +7874,7 @@
           "instance_id.$": "$.ec2_instance_id[0]"
         }
       },
-      "TimeoutSeconds": 90,
+      "TimeoutSeconds": 30,
       "Retry": [
         {
           "ErrorEquals": [

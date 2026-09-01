@@ -22,7 +22,7 @@
         "FunctionName": "alpha-engine-scheduled-groom-dispatcher",
         "Payload.$": "States.JsonMerge($.schedInput, $.decideMarker, false)"
       },
-      "TimeoutSeconds": 360,
+      "TimeoutSeconds": 240,
       "Retry": [
         {
           "ErrorEquals": [
@@ -223,7 +223,7 @@
                 "ResultPath": "$.markerCheckError"
               }
             ],
-            "TimeoutSeconds": 360
+            "TimeoutSeconds": 240
           },
           "CheckRetryBudget": {
             "Type": "Choice",
@@ -490,7 +490,7 @@
           "schedule": "end-of-sf-sweep"
         }
       },
-      "TimeoutSeconds": 360,
+      "TimeoutSeconds": 240,
       "Retry": [
         {
           "ErrorEquals": [
