@@ -90,6 +90,33 @@ Resources:
       Protocol: email
       Endpoint: !Ref AlertEmail
 
+  # alpha-engine-config-I9756 (crucible v2 phase 0, Brian ruling I9751 item
+  # 3a: old weekly runs 1x/week, no reruns, results IGNORED during the v2
+  # build). The parent session created this topic live 2026-09-01
+  # (`aws sns create-topic --name alpha-engine-alerts-muted`, verified no
+  # subscribers) and left it un-codified, with the SaturdayTrigger Input
+  # switch recorded as a BLOCKED operator command (2 `aws events put-targets`
+  # args) because the session's permission classifier would not let it run
+  # `put-targets` directly. That command only rewrites this rule's Input,
+  # which is fully expressible here — sns:CreateTopic is idempotent by name
+  # (returns the existing ARN rather than erroring), so declaring this
+  # resource ADOPTS the live topic into the stack rather than conflicting
+  # with it, and CFN then owns pointing SaturdayTrigger at it on merge. No
+  # AWS mutation was made by this PR's author; the change lands as IaC and
+  # applies via deploy-infrastructure.yml on merge, same as every other
+  # resource in this file.
+  # Deliberately NO AlertsSubscription sibling — the whole point is zero
+  # subscribers, so a forced weekly failure lands here and pages no one.
+  # Re-exam: 2026-09-14 (matches the closes-when measurement date already
+  # set on alpha-engine-config-I9756) — revert SaturdayTrigger's Input back
+  # to AlertsTopic once phase 0 exits or the old pipeline is retired,
+  # whichever comes first.
+  AlertsMutedTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: alpha-engine-alerts-muted
+      DisplayName: Alpha Engine Alerts (muted — crucible v2 build window)
+
   # --------------------------------------------------------------------------
   # DynamoDB — Step Function Execution Mutex (L274 SF MutualExclusionGuard)
   # --------------------------------------------------------------------------
@@ -314,9 +341,18 @@ Resources:
           # {"skip_parity": false} overrides these defaults (InitializeInput's
           # JsonMerge puts user input ABOVE them), and the smoke-pit-parity
           # slice still reproduces the no_orders half in 70s.
+          # sns_topic_arn routed to AlertsMutedTopic, not AlertsTopic
+          # (alpha-engine-config-I9756, crucible v2 phase 0 deliverable 3;
+          # Brian ruling I9751 item 3a — old-weekly results are IGNORED
+          # during the v2 build). AlertsMutedTopic carries zero subscribers
+          # by design, so all 28 sns:publish states this SF reaches land in
+          # a topic that pages nobody. preopen/postclose are untouched —
+          # each carries its own Input, unrelated to this rule. Re-exam
+          # 2026-09-14: revert to "${AlertsTopic}" once phase 0 exits or
+          # the old pipeline is retired.
           Input: !Sub |
             {
-              "sns_topic_arn": "${AlertsTopic}",
+              "sns_topic_arn": "${AlertsMutedTopic}",
               "pipeline_role": "weekly",
               "skip_parity": true
             }
