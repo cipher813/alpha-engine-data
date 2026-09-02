@@ -294,7 +294,16 @@ class TestDeployAssertionIsScopedToItsOwnDispatcher:
         )
 
     def test_scoped_run_ignores_other_dispatchers_rules(self):
-        """The behaviour, not just the flag: I5815's three must not appear."""
+        """The behaviour, not just the flag: a foreign rule must not appear.
+
+        I5815 originally named three foreign schedules; the two
+        alpha-engine-sf-watch-reclaim-sweep-* ones left this list on
+        2026-09-01 (alpha-engine-config-I9756) when their Lambda and its
+        deploy.sh were deleted — a schedule whose codifying deploy.sh no
+        longer exists cannot be discovered fleet-wide, and asserting it
+        would pin a tombstone. expense-collector's still exercises the
+        scoping behaviour end to end.
+        """
         checker = _load_checker()
         rules, _, _ = checker.discover_codified_rules()
         scoped_names = {
@@ -302,8 +311,6 @@ class TestDeployAssertionIsScopedToItsOwnDispatcher:
         }
         for foreign in (
             "alpha-engine-expense-collector-reconcile-monthly",
-            "alpha-engine-sf-watch-reclaim-sweep-0645-daily",
-            "alpha-engine-sf-watch-reclaim-sweep-1445-daily",
         ):
             assert foreign in {r["name"] for r in rules}, (
                 f"{foreign} should still be discovered fleet-wide"

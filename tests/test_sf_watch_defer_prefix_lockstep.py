@@ -1,6 +1,13 @@
 """config#2226 — sf-watch-spot-dispatcher's `_WATCH_PREFIXES` must stay in
 LOCKSTEP with saturday-sf-watch-dispatcher's `PIPELINES` watch prefixes.
 
+NOTE (alpha-engine-config-I9756, 2026-09-01): this module used to carry a
+THIRD lockstep check against sf-watch-reclaim-sweep-handler's own
+`_WATCH_PREFIXES` mirror. That Lambda was deleted live (never CFN-managed,
+not referenced by any Step Function definition) as part of Crucible v2
+phase 0, so the third-copy check and its source-string assertion were
+removed with it — two copies remain in lockstep below.
+
 The canonical watch_log_key is minted ONLY by saturday-sf-watch-dispatcher's
 `_artifact_key(watch_prefix, run_date)`. The spot dispatcher mirrors the
 {pipeline_name: watch_prefix} column so an operator re-fire with an EMPTY
@@ -22,7 +29,6 @@ from pathlib import Path
 _LAMBDAS = Path(__file__).parent.parent / "infrastructure" / "lambdas"
 _SPOT_DISPATCHER = _LAMBDAS / "sf-watch-spot-dispatcher" / "index.py"
 _SATURDAY_DISPATCHER = _LAMBDAS / "saturday-sf-watch-dispatcher" / "index.py"
-_LIVENESS_PROBE = _LAMBDAS / "sf-watch-reclaim-sweep-handler" / "index.py"
 
 
 def _module_assign_value(path: Path, name: str) -> ast.expr:
@@ -77,19 +83,6 @@ def test_spot_dispatcher_watch_prefixes_match_saturday_dispatcher_exactly():
     assert _spot_dispatcher_prefixes() == _saturday_pipeline_prefixes()
 
 
-def test_liveness_probe_sweep_prefixes_match_saturday_dispatcher_exactly():
-    """config#2257: the liveness probe's dropped-failure sweep reads the
-    canonical watch-log key to decide whether a terminal execution is already
-    covered — its `_WATCH_PREFIXES` mirror is the THIRD copy of the
-    {pipeline_name: watch_prefix} column and drifts fail CI here exactly like
-    the spot dispatcher's copy above (a drifted prefix would make the sweep
-    read a wrong/empty log and re-dispatch an already-covered failure)."""
-    value = _module_assign_value(_LIVENESS_PROBE, "_WATCH_PREFIXES")
-    prefixes = ast.literal_eval(value)
-    assert isinstance(prefixes, dict) and prefixes, "_WATCH_PREFIXES must be a non-empty dict"
-    assert prefixes == _saturday_pipeline_prefixes()
-
-
 def test_synthesized_key_shape_matches_artifact_key():
     """The spot dispatcher synthesizes f"{prefix}/{run_date}.json" — the same
     shape as saturday-sf-watch-dispatcher's `_artifact_key`. Guard the shape
@@ -98,5 +91,3 @@ def test_synthesized_key_shape_matches_artifact_key():
     assert 'return f"{watch_prefix}/{run_date}.json"' in saturday_src
     spot_src = _SPOT_DISPATCHER.read_text()
     assert '''f"{prefix}/{fields['run_date']}.json"''' in spot_src
-    probe_src = _LIVENESS_PROBE.read_text()
-    assert 'f"{prefix}/{run_date}.json"' in probe_src
