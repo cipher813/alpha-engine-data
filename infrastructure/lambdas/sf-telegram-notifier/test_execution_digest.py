@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
@@ -28,12 +29,12 @@ def test_parse_task_state_durations_computes_wall_clock():
         {
             "type": "TaskStateEntered",
             "timestamp": base,
-            "taskStateEnteredEventDetails": {"name": "PredictorTraining"},
+            "stateEnteredEventDetails": {"name": "PredictorTraining"},
         },
         {
             "type": "TaskStateExited",
             "timestamp": _ts(base, 120),
-            "taskStateExitedEventDetails": {"name": "PredictorTraining"},
+            "stateExitedEventDetails": {"name": "PredictorTraining"},
         },
     ]
     assert parse_task_state_durations(events)["PredictorTraining"] == 120
@@ -84,16 +85,16 @@ def test_build_execution_digest_hollow_on_fast_predictor():
             {
                 "type": "TaskStateEntered",
                 "timestamp": base,
-                "taskStateEnteredEventDetails": {"name": "PredictorTraining"},
+                "stateEnteredEventDetails": {"name": "PredictorTraining"},
             },
             {
                 "type": "TaskStateExited",
                 "timestamp": _ts(base, 90),
-                "taskStateExitedEventDetails": {"name": "PredictorTraining"},
+                "stateExitedEventDetails": {"name": "PredictorTraining"},
             },
         ],
     }
-    lines, hollow = build_execution_digest(
+    lines, hollow, detailed_cause = build_execution_digest(
         execution_arn="arn:aws:states:us-east-1:123:execution:sm:exec",
         is_preflight=False,
         execution_start_ms=start_ms,
@@ -102,6 +103,7 @@ def test_build_execution_digest_hollow_on_fast_predictor():
         s3_client=None,
     )
     assert hollow is True
+    assert detailed_cause is None
     assert any("PredictorTraining" in line for line in lines)
     assert STATE_DURATION_FLOORS_SEC["PredictorTraining"] == 20 * 60
 
@@ -131,7 +133,7 @@ def test_parse_run_date_from_execution_name_returns_none_for_empty_input():
 def test_history_fetch_failure_surfaces_marker():
     sf = MagicMock()
     sf.get_execution_history.side_effect = RuntimeError("throttled")
-    lines, hollow = build_execution_digest(
+    lines, hollow, detailed_cause = build_execution_digest(
         execution_arn="arn:exec",
         is_preflight=False,
         execution_start_ms=1_700_000_000_000,
@@ -140,6 +142,7 @@ def test_history_fetch_failure_surfaces_marker():
         s3_client=None,
     )
     assert hollow is False
+    assert detailed_cause is None
     assert any("digest unavailable" in line for line in lines)
 
 
@@ -157,7 +160,7 @@ def _entered(base, name, offset=0):
     return {
         "type": "TaskStateEntered",
         "timestamp": _ts(base, offset),
-        "taskStateEnteredEventDetails": {"name": name},
+        "stateEnteredEventDetails": {"name": name},
     }
 
 
@@ -240,7 +243,7 @@ def test_build_execution_digest_names_the_hung_state_end_to_end():
             _entered(base, "MorningEnrich", 30),  # entered, never exited
         ]
     }
-    lines, hollow = build_execution_digest(
+    lines, hollow, detailed_cause = build_execution_digest(
         execution_arn="arn:aws:states:us-east-1:711398986525:execution:"
         "ne-weekly-freshness-pipeline:watch-rerun-2026-08-10-2",
         is_preflight=False,
@@ -251,6 +254,7 @@ def test_build_execution_digest_names_the_hung_state_end_to_end():
     )
     assert lines == ["MorningEnrich — entered, never completed ⚠️"]
     assert hollow is False
+    assert detailed_cause is None
 
 
 # ── Weekday pipelines render at all (alpha-engine-config-I6857) ───────────
@@ -424,3 +428,238 @@ def test_every_weekday_state_name_in_the_order_list_exists_in_a_definition():
 
     unknown_floors = sorted(s for s in ed.STATE_DURATION_FLOORS_SEC if s not in known)
     assert not unknown_floors, f"STATE_DURATION_FLOORS_SEC names states no definition has: {unknown_floors}"
+
+
+# ── The wire format the API actually emits (alpha-engine-config-I9742) ──────
+#
+# `taskStateEnteredEventDetails` / `taskStateExitedEventDetails` are NOT
+# fields the Step Functions API emits — every hand-written fixture above (and
+# the committed `sf_history_preopen_2026-08-11.json`) used to fabricate them,
+# so `_state_name_from_event` returned None unconditionally, and every test
+# passed against a wire format that does not exist. Fixed by reading
+# `stateEnteredEventDetails` / `stateExitedEventDetails` — the SAME generic
+# state-transition detail Step Functions emits for every state type — and
+# regression-guarded here two ways: (a) a schema guard that reddens on the
+# next invented key, (b) a real, untouched, committed GetExecutionHistory
+# response replayed end to end.
+
+# The Step Functions HistoryEvent detail-field names the API actually emits
+# (boto3 stepfunctions get_execution_history response schema). Anything
+# ending in "EventDetails" that is NOT in this set is an invented key —
+# exactly the shape of the alpha-engine-config-I9742 defect.
+_REAL_HISTORY_EVENT_DETAIL_KEYS: frozenset[str] = frozenset(
+    {
+        "activityFailedEventDetails",
+        "activityScheduleFailedEventDetails",
+        "activityScheduledEventDetails",
+        "activityStartedEventDetails",
+        "activitySucceededEventDetails",
+        "activityTimedOutEventDetails",
+        "taskFailedEventDetails",
+        "taskScheduledEventDetails",
+        "taskStartFailedEventDetails",
+        "taskStartedEventDetails",
+        "taskSubmitFailedEventDetails",
+        "taskSubmittedEventDetails",
+        "taskSucceededEventDetails",
+        "taskTimedOutEventDetails",
+        "executionFailedEventDetails",
+        "executionStartedEventDetails",
+        "executionSucceededEventDetails",
+        "executionAbortedEventDetails",
+        "executionTimedOutEventDetails",
+        "executionRedrivenEventDetails",
+        "mapStateStartedEventDetails",
+        "mapIterationStartedEventDetails",
+        "mapIterationSucceededEventDetails",
+        "mapIterationFailedEventDetails",
+        "mapIterationAbortedEventDetails",
+        "lambdaFunctionFailedEventDetails",
+        "lambdaFunctionScheduleFailedEventDetails",
+        "lambdaFunctionScheduledEventDetails",
+        "lambdaFunctionStartFailedEventDetails",
+        "lambdaFunctionStartedEventDetails",
+        "lambdaFunctionSucceededEventDetails",
+        "lambdaFunctionTimedOutEventDetails",
+        "stateEnteredEventDetails",
+        "stateExitedEventDetails",
+        "mapRunStartedEventDetails",
+        "mapRunFailedEventDetails",
+        "mapRunRedrivenEventDetails",
+        "stateMachineAliasUpdatedEventDetails",
+        "stateMachineVersionUpdatedEventDetails",
+    }
+)
+
+
+def test_module_reads_no_event_detail_key_outside_the_real_sf_schema():
+    """Deliverable 3: the next invented key is red at merge, not silent.
+
+    Scans execution_digest.py's own source for every string literal shaped
+    like `<word>EventDetails` and asserts each one is a key the Step
+    Functions API actually emits. This is what would have caught
+    `taskStateEnteredEventDetails` / `taskStateExitedEventDetails` before
+    they shipped — a fixture rebuild alone only proves today's fixture is
+    honest, not that the module can't drift again.
+    """
+    source = (_Path(__file__).resolve().parent / "execution_digest.py").read_text()
+    referenced = set(re.findall(r'"([A-Za-z]+EventDetails)"', source))
+    assert referenced, "expected execution_digest.py to reference at least one *EventDetails key"
+    invented = sorted(referenced - _REAL_HISTORY_EVENT_DETAIL_KEYS)
+    assert not invented, (
+        f"execution_digest.py reads *EventDetails key(s) the Step Functions API "
+        f"does not emit: {invented}"
+    )
+
+
+def _load_real_history_fixture() -> list[dict]:
+    """The real, untouched `GetExecutionHistory` response for
+    `e888a3a4-05a7-4c42-b2a1-904f44e24bd5` (ne-preopen-trading-pipeline,
+    FAILED 2026-09-01) — 122 events, one page, committed verbatim
+    (alpha-engine-config-I9742). Timestamps are parsed back to datetimes,
+    matching what botocore hands the digest (parse_task_state_durations
+    silently drops any event whose timestamp is not one)."""
+    fixture = (
+        _Path(__file__).resolve().parents[3]
+        / "tests"
+        / "fixtures"
+        / "sf_history_preopen_2026-09-01_e888a3a4.json"
+    )
+    payload = _json.loads(fixture.read_text())
+    events = payload["events"]
+    for event in events:
+        event["timestamp"] = datetime.fromisoformat(event["timestamp"])
+    return events
+
+
+def test_real_preopen_failure_history_names_the_state_that_broke():
+    """Closes-when, part 1: replaying the real history through
+    format_digest_lines produces a line naming WaitForCodeFreshness — the
+    state whose SSM poll actually failed (the git-push 403), not
+    HandleFailure, the state that merely sent the alert about it."""
+    events = _load_real_history_fixture()
+    durations = ed.parse_task_state_durations(events)
+    assert durations == {
+        "MarketHoursGate": 2,
+        "AcquireMutex": 0,
+        "DeployDriftCheck": 0,
+        "TradingDayGate": 0,
+        "StartExecutorEC2": 0,
+        "DescribeInstanceInfo": 0,
+        "CodeFreshnessGate": 0,
+        "WaitForCodeFreshness": 62,
+        "HandleFailure": 0,
+    }
+    rows = ed.build_state_durations(
+        durations,
+        is_preflight=False,
+        execution_start=events[0]["timestamp"],
+        run_date="2026-09-01",
+        s3_client=None,
+    )
+    lines = ed.format_digest_lines(rows, last_entered=ed.last_workload_state_entered(events))
+    assert any("WaitForCodeFreshness" in line for line in lines)
+
+
+def test_last_workload_state_entered_excludes_handle_failure():
+    """Deliverable 4: HandleFailure is the state that SENDS the alert, not
+    the one that failed. Without the exclusion, the fallback on a run dying
+    before its first exit would name the alerter instead of the work."""
+    events = _load_real_history_fixture()
+    assert ed.last_workload_state_entered(events) != "HandleFailure"
+    assert ed.last_workload_state_entered(events) == "WaitForCodeFreshness"
+
+
+def test_terminal_error_handling_states_covers_all_three_definitions():
+    """HandleFailure is the shared Task name immediately preceding the
+    terminal Fail state on the weekly, preopen AND postclose definitions —
+    verified against the committed definitions, not assumed from one
+    pipeline (alpha-engine-config-I9742 deliverable 4)."""
+    infra = _Path(__file__).resolve().parents[3] / "infrastructure"
+    for name in ("step_function.json", "step_function_daily.json", "step_function_eod.json"):
+        states = _json.loads((infra / name).read_text())["States"]
+        assert "HandleFailure" in states, f"{name} has no HandleFailure state"
+        assert states["HandleFailure"]["Type"] == "Task"
+    assert "HandleFailure" in ed.TERMINAL_ERROR_HANDLING_STATES
+
+
+def test_every_task_preceding_a_fail_state_is_classified():
+    """Exhaustive, or the next terminal state gets named as the failure.
+
+    ``last_workload_state_entered`` returns the LAST Task entered, so any Task
+    sitting immediately before a terminal ``Fail`` is a candidate to be named
+    on exactly the runs where the digest is read. Two kinds sit there and they
+    must be told apart by what the state DOES, because nothing structural
+    separates them — both have ``Next`` pointing at a ``Fail``:
+
+    - an ALERTER (``HandleFailure``, the market-hours refusals) — naming it
+      reports the alerter as the failure, which is confidently wrong and worse
+      than the honestly-empty placeholder it replaced;
+    - a WORKER on the way out (``ForceStopInstance`` stops the trading box,
+      ``WriteCompletionMarkerDegraded*`` writes the artifact every status-keyed
+      consumer reads) — naming it is informative.
+
+    This recomputes the candidate set from the three committed definitions and
+    fails on anything in neither declared set, so a newly added terminal state
+    is a red test rather than a wrong name inside a red alert
+    (alpha-engine-config-I9742 deliverable 4).
+    """
+    infra = _Path(__file__).resolve().parents[3] / "infrastructure"
+    classified = ed.TERMINAL_ERROR_HANDLING_STATES | ed.WORK_STATES_ON_TERMINAL_PATHS
+    unclassified: dict[str, str] = {}
+    for name in ("step_function.json", "step_function_daily.json", "step_function_eod.json"):
+        states = _json.loads((infra / name).read_text())["States"]
+        fail_states = {k for k, v in states.items() if v.get("Type") == "Fail"}
+        for state_name, body in states.items():
+            if body.get("Type") != "Task":
+                continue
+            if body.get("Next") in fail_states and state_name not in classified:
+                unclassified[state_name] = name
+    assert not unclassified, (
+        "Task states sit immediately before a terminal Fail and are in neither "
+        "TERMINAL_ERROR_HANDLING_STATES (alerters, excluded from the digest "
+        "fallback) nor WORK_STATES_ON_TERMINAL_PATHS (real work, kept). Classify "
+        f"each by what it DOES: {unclassified}"
+    )
+    # And the declared sets must not drift into naming states that no longer
+    # exist — a stale exclusion silently stops excluding the moment a state is
+    # renamed, which is the same failure one layer over.
+    all_states: set[str] = set()
+    for name in ("step_function.json", "step_function_daily.json", "step_function_eod.json"):
+        all_states |= set(_json.loads((infra / name).read_text())["States"])
+    assert classified <= all_states, (
+        f"declared terminal states no longer exist in any definition: {classified - all_states}"
+    )
+
+
+def test_extract_detailed_failure_cause_surfaces_the_real_error():
+    """Deliverable 5 / sf-pipeline-policy §2.3 corollary: the terminal
+    failure message must carry the actual error. describe_execution's own
+    error/cause on this execution is the constant
+    "DailyPipelineFailure: One or more weekday pipeline steps failed." — the
+    same string for every failure. The real diagnostic (the git push 403)
+    lives in the terminal Fail state's own input, under the
+    ssm-liveness-poller `code_freshness_poll` key."""
+    events = _load_real_history_fixture()
+    cause = ed.extract_detailed_failure_cause(events)
+    assert cause is not None
+    assert "403" in cause
+    assert "alpha-engine-config.git" in cause
+    assert "Write access to repository not granted" in cause
+
+
+def test_extract_detailed_failure_cause_returns_none_without_a_poll_failure():
+    """A failure the ssm-liveness-poller contract does not cover returns
+    None rather than a guess — the caller falls back to describe_execution's
+    error/cause."""
+    events = [
+        {
+            "type": "FailStateEntered",
+            "timestamp": datetime(2026, 7, 5, 12, 0, tzinfo=timezone.utc),
+            "stateEnteredEventDetails": {
+                "name": "FailExecution",
+                "input": '{"some_gate": {"verdict": "PASS", "detail": "irrelevant"}}',
+            },
+        }
+    ]
+    assert ed.extract_detailed_failure_cause(events) is None

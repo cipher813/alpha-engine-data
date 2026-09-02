@@ -199,6 +199,66 @@ def test_failed_fetches_and_includes_cause(reset_send_message):
     assert result["status"] == "FAILED"
 
 
+def _real_preopen_failure_events() -> list[dict]:
+    """The real, untouched GetExecutionHistory for
+    e888a3a4-05a7-4c42-b2a1-904f44e24bd5 (ne-preopen-trading-pipeline, FAILED
+    2026-09-01) — alpha-engine-config-I9742. Timestamps stay as the ISO
+    strings botocore already parses to datetime; get_execution_history is
+    mocked here so the digest sees exactly what boto3 would hand it."""
+    from datetime import datetime
+
+    fixture = (
+        Path(__file__).resolve().parents[3]
+        / "tests"
+        / "fixtures"
+        / "sf_history_preopen_2026-09-01_e888a3a4.json"
+    )
+    events = json.loads(fixture.read_text())["events"]
+    for event in events:
+        event["timestamp"] = datetime.fromisoformat(event["timestamp"])
+    return events
+
+
+def test_failed_preopen_names_the_state_and_the_real_error_end_to_end(reset_send_message):
+    """Closes-when: the real 2026-09-01 preopen failure, replayed through the
+    full handler. The alert must name WaitForCodeFreshness (deliverables 1
+    and 4 — not "no workload states in history", and not HandleFailure, the
+    state that merely sent the alert) and must carry the git-push 403
+    (deliverable 5 / sf-pipeline-policy §2.3 corollary), not the boilerplate
+    "One or more weekday pipeline steps failed."."""
+    reset_send_message.get_execution_history.return_value = {
+        "events": _real_preopen_failure_events()
+    }
+    reset_send_message.describe_execution.return_value = {
+        "input": '{"run_date": "2026-09-01", "pipeline_role": "daily"}',
+        "error": "DailyPipelineFailure",
+        "cause": "One or more weekday pipeline steps failed.",
+    }
+    event = _event(
+        "FAILED",
+        sm_arn=WEEKDAY_ARN,
+        startDate=1_756_724_141_102,
+        stopDate=1_756_724_223_779,
+    )
+    result = index.handler(event, None)
+
+    text = _telegram_mod.send_message.call_args.args[0]
+    assert "Pre-open Trading SF — FAILED" in text
+    assert "no workload states in history" not in text
+    assert "WaitForCodeFreshness" in text
+    # HandleFailure legitimately appears as an ordinary completed row (it did
+    # run) — what deliverable 4 forbids is HandleFailure being the ENTERED-
+    # BUT-NEVER-COMPLETED fallback line, which never fires here because
+    # WaitForCodeFreshness already has a row.
+    assert "entered, never completed" not in text
+    assert "Cause:" in text
+    cause_line = [line for line in text.splitlines() if line.startswith("Cause:")][0]
+    assert "403" in cause_line
+    assert "Write access to repository not granted" in cause_line
+    assert "One or more weekday pipeline steps failed." not in cause_line
+    assert result["status"] == "FAILED"
+
+
 def test_failed_with_describe_execution_error_still_sends(reset_send_message):
     """DescribeExecution failures must not block the Telegram send."""
     event = _event("FAILED")
@@ -387,12 +447,12 @@ def test_succeeded_hollow_predictor_training_flags_loud(reset_send_message):
             {
                 "type": "TaskStateEntered",
                 "timestamp": base,
-                "taskStateEnteredEventDetails": {"name": "PredictorTraining"},
+                "stateEnteredEventDetails": {"name": "PredictorTraining"},
             },
             {
                 "type": "TaskStateExited",
                 "timestamp": base.replace(minute=2),
-                "taskStateExitedEventDetails": {"name": "PredictorTraining"},
+                "stateExitedEventDetails": {"name": "PredictorTraining"},
             },
         ],
     }
