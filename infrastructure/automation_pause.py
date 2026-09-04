@@ -161,6 +161,35 @@ DECLARATION_ISSUE_RE = re.compile(r"^alpha-engine-config-I\d+$")
 #: And the date past which the suppression is no longer justified by anything.
 DECLARATION_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+#: Default EventBridge Scheduler group. ``get-schedule``/``update-schedule``
+#: silently assume this when ``--group-name`` is omitted — they do NOT search
+#: every group, they look in exactly this one and return
+#: ``ResourceNotFoundException`` if the schedule lives elsewhere (measured
+#: 2026-09-04: ``get-schedule --name heartbeat`` 404s while the schedule is
+#: live and ENABLED in group ``crucible-v2``). Every schedule this manifest
+#: named before 2026-09-04 happened to live here, which is what let that gap
+#: go unnoticed until Crucible v2 created the first non-default group
+#: (alpha-engine-config-I9994).
+DEFAULT_SCHEDULE_GROUP = "default"
+
+
+def _split_scheduler_name(name: str) -> tuple[str, str]:
+    """Split a manifest/live scheduler name into ``(group, bare_name)``.
+
+    A schedule outside ``DEFAULT_SCHEDULE_GROUP`` is named in the manifest and
+    reported by ``_live_triggers()`` as ``"<group>/<name>"`` — never guessed or
+    searched for, because two different groups may legally hold a schedule of
+    the same bare name and silently picking one would be exactly the kind of
+    inference ``observability-policy.md`` §8.3 forbids for a DISABLED/ENABLED
+    classification. A name with no ``/`` is in ``DEFAULT_SCHEDULE_GROUP``,
+    which covers every schedule this manifest declared before crucible-v2's
+    scheduler group existed and needs no manifest-wide rewrite.
+    """
+    if "/" in name:
+        group, _, bare = name.partition("/")
+        return group, bare
+    return DEFAULT_SCHEDULE_GROUP, name
+
 
 def load_manifest(path: Path = MANIFEST) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -317,7 +346,18 @@ def _live_triggers() -> list[dict]:
                 raise RuntimeError(f"aws {' '.join(cmd)}: {err}")
             page = json.loads(out_text or "{}")
             for row in page.get(key, []):
-                out.append({"surface": surface, "name": row["Name"], "state": row.get("State")})
+                name = row["Name"]
+                if surface == "scheduler":
+                    # `list-schedules` (no --group-name) enumerates EVERY
+                    # group in the account, unlike `get-schedule`/
+                    # `update-schedule` which only ever look in one — so the
+                    # name reported here must carry the group whenever it is
+                    # not the default, or a same-named lookup elsewhere would
+                    # silently resolve to the wrong schedule (or none).
+                    group = row.get("GroupName") or DEFAULT_SCHEDULE_GROUP
+                    if group != DEFAULT_SCHEDULE_GROUP:
+                        name = f"{group}/{name}"
+                out.append({"surface": surface, "name": name, "state": row.get("State")})
             token = page.get("NextToken")
             if not token:
                 break
@@ -396,14 +436,25 @@ def _live_state(surface: str, name: str) -> str | None:
     access — the same failure mode check-schedule-drift.py guards against.
     """
     if surface == "events":
+        if "/" in name:
+            # A group-qualified scheduler name (alpha-engine-config-I9994) is
+            # structurally not a legal EventBridge rule name — the API's own
+            # naming constraint forbids "/" — so `kept_names()`'s "try both
+            # surfaces" loop must not even ask; describe-rule 400s
+            # (ValidationException) rather than 404ing, which `not_found`
+            # cannot distinguish from a real not-found without inspecting the
+            # error text more than this function already does elsewhere.
+            return None
         rc, out, err = _aws(
             ["events", "describe-rule", "--name", name, "--query", "State", "--output", "text"]
         )
         not_found = "ResourceNotFoundException" in err
     else:
-        rc, out, err = _aws(
-            ["scheduler", "get-schedule", "--name", name, "--query", "State", "--output", "text"]
-        )
+        group, bare = _split_scheduler_name(name)
+        args = ["scheduler", "get-schedule", "--name", bare, "--query", "State", "--output", "text"]
+        if group != DEFAULT_SCHEDULE_GROUP:
+            args += ["--group-name", group]
+        rc, out, err = _aws(args)
         not_found = "ResourceNotFoundException" in err
     if rc != 0:
         if not_found:
@@ -420,7 +471,11 @@ def _disable(surface: str, name: str) -> None:
         return
     # Scheduler has no disable verb: update-schedule is a full replace, so the
     # live spec must be round-tripped or every unspecified attribute is lost.
-    rc, out, err = _aws(["scheduler", "get-schedule", "--name", name, "--output", "json"])
+    group, bare = _split_scheduler_name(name)
+    get_args = ["scheduler", "get-schedule", "--name", bare, "--output", "json"]
+    if group != DEFAULT_SCHEDULE_GROUP:
+        get_args += ["--group-name", group]
+    rc, out, err = _aws(get_args)
     if rc != 0:
         raise RuntimeError(f"aws scheduler get-schedule --name {name}: {err}")
     spec = json.loads(out)
