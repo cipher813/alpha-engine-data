@@ -1,7 +1,7 @@
 {
   "Comment": "Alpha Engine EOD Pipeline \u2014 post-market data capture, snapshot capture, reconciliation, daily substrate health check, instance shutdown. Triggered by daemon shutdown on trading EC2.",
   "StartAt": "MarketHoursGate",
-  "TimeoutSeconds": 64800,
+  "TimeoutSeconds": 14400,
   "States": {
     "MarketHoursGate": {
       "Type": "Task",
