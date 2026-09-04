@@ -107,6 +107,13 @@ NON_SERVICE_LIFECYCLES = frozenset({"disabled", "deprecated", "retired"})
 #: carry no fleet row and never will.
 _AWS_MANAGED_PREFIX = "DO-NOT-DELETE-"
 
+#: EventBridge Scheduler puts every schedule in a group, and `get-schedule`
+#: resolves within ONE group — omitting `--group-name` searches only this one.
+#: `list-schedules` spans all of them, so an enumerate-then-describe pass that
+#: drops the group can list schedules it will then fail to describe
+#: (alpha-engine-config-I10009).
+DEFAULT_SCHEDULE_GROUP = "default"
+
 CHECK_ID = "automation-pause-reconcile"
 CHECK_LABEL = "automation pause: manifest vs registry vs live AWS"
 CADENCE_MINUTES = 1440  # the daily sf-arn-drift-check sweep
@@ -144,6 +151,19 @@ def live_triggers() -> list[dict]:
     APIs over disjoint resources, not aliases (alpha-engine-config-I6842: a
     Scheduler-triggered Lambda reads as untriggered when only the first is
     queried). Both are enumerated here or the sweep has a blind surface.
+
+    **A Scheduler schedule is identified by (group, name), not by name**
+    (alpha-engine-config-I10009). `list-schedules` spans every schedule group,
+    but `get-schedule` defaults to the `default` group and raises
+    `ResourceNotFoundException` for a schedule that exists in any other one. So
+    the group is carried on every scheduler row here and handed to every
+    per-schedule call below; dropping it makes this reconciler enumerate
+    schedules it can then never describe. Measured live 2026-09-04: the four
+    `crucible-v2`-group schedules landed on 2026-09-03 (I9994) and every run of
+    `pause-reconcile.yml` since has exited 2 on
+    `get-schedule --name alerts-sweep`, i.e. the pause reconciler — the daily
+    check over the manifest that governs which fleet automation may run — was
+    itself down for two days.
     """
     out: list[dict] = []
     for page in _paginate(["events", "list-rules"], "Rules"):
@@ -151,7 +171,8 @@ def live_triggers() -> list[dict]:
                     "state": page.get("State")})
     for page in _paginate(["scheduler", "list-schedules"], "Schedules"):
         out.append({"surface": "scheduler", "name": page["Name"],
-                    "state": page.get("State")})
+                    "state": page.get("State"),
+                    "group": page.get("GroupName") or DEFAULT_SCHEDULE_GROUP})
     return sorted(out, key=lambda t: (t["surface"], t["name"]))
 
 
@@ -261,7 +282,7 @@ def lambda_invocations(function_name: str, since=None) -> float:
     return sum(float(d.get("Sum") or 0) for d in got.get("Datapoints", []))
 
 
-def is_ephemeral_one_shot(name: str) -> bool:
+def is_ephemeral_one_shot(name: str, group: str = DEFAULT_SCHEDULE_GROUP) -> bool:
     """Does this Scheduler schedule delete itself the moment it fires?
 
     **The class this exists for (alpha-engine-config-I7547).** Two dispatchers
@@ -289,9 +310,18 @@ def is_ephemeral_one_shot(name: str) -> bool:
     proof rather than by assumption — self-deletion after firing is the only way
     that race resolves, and raising on it would make this check fail whenever a
     dispatcher happened to be deferring while it ran.
+
+    ``group`` is REQUIRED for correctness, not an optimisation
+    (alpha-engine-config-I10009). Without it `get-schedule` looks only in the
+    ``default`` group, so a schedule living in any other group raises
+    ``ResourceNotFoundException`` — which this function reads as "it deleted
+    itself" and returns ``True`` for. That is the quiet half of the same bug:
+    every non-default-group schedule would be silently classified an ephemeral
+    one-shot and excused from the register it is missing from.
     """
     try:
-        got = _aws_json(["scheduler", "get-schedule", "--name", name])
+        got = _aws_json(["scheduler", "get-schedule", "--name", name,
+                         "--group-name", group or DEFAULT_SCHEDULE_GROUP])
     except RuntimeError as exc:
         if "ResourceNotFoundException" in str(exc):
             return True
@@ -301,11 +331,15 @@ def is_ephemeral_one_shot(name: str) -> bool:
 
 def trigger_targets(trigger: dict) -> list[str]:
     """The ARNs a trigger invokes. Empty is a legitimate answer (a rule whose
-    targets were removed), and is reported as such rather than skipped."""
+    targets were removed), and is reported as such rather than skipped.
+
+    Scheduler rows carry their group (see `live_triggers`); it is passed
+    through because `get-schedule` resolves only within one group."""
     if trigger["surface"] == "events":
         got = _aws_json(["events", "list-targets-by-rule", "--rule", trigger["name"]])
         return [t["Arn"] for t in got.get("Targets", [])]
-    got = _aws_json(["scheduler", "get-schedule", "--name", trigger["name"]])
+    got = _aws_json(["scheduler", "get-schedule", "--name", trigger["name"],
+                     "--group-name", trigger.get("group") or DEFAULT_SCHEDULE_GROUP])
     arn = (got.get("Target") or {}).get("Arn")
     return [arn] if arn else []
 
@@ -506,7 +540,7 @@ def reconcile(
                 # already-registered dispatcher, not standing scheduled work —
                 # see `is_ephemeral_one_shot`. Probed only here, so a clean run
                 # pays nothing for it.
-                if t["surface"] == "scheduler" and is_ephemeral(name):
+                if t["surface"] == "scheduler" and is_ephemeral(name, t.get("group")):
                     noted.append({
                         "id": name, "kind": "ephemeral-one-shot",
                         "detail": (
