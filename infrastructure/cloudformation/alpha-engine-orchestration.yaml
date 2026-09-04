@@ -249,16 +249,45 @@ Resources:
       Name: alpha-engine-saturday
       # 09:00 UTC chosen so polygon's prior-session daily aggregate has
       # settled (T+1 lag) before MorningEnrich + DataPhase1 fetch it.
-      # THU-SAT (config#1824, Brian-ratified 2026-07-06): the weekly runs
-      # ONE DAY AFTER the week's LAST trading session — Saturday normally,
-      # Friday when Friday is an NYSE holiday, Thursday on a Thu+Fri double
-      # holiday. The cron fires all three days; the SF's WeeklyRunDayGate
-      # (predictor Lambda action=check_weekly_run_day, pure calendar math)
-      # self-selects the single correct firing and Succeed-skips the rest.
-      # Replaces the hand-built one-shot shift used for the 2026-07-03
-      # holiday week.
-      Description: Thu-Sat 09:00 UTC — weekly pipeline fires day after last trading session (WeeklyRunDayGate self-selects; config#1824)
-      ScheduleExpression: 'cron(0 9 ? * THU-SAT *)'
+      #
+      # NARROWED TO SAT-ONLY 2026-09-04 (alpha-engine-config-I9756 deliverable
+      # 1, Brian ruling 2026-09-01 superseding the 2026-08-13 "Friday shell +
+      # Saturday" cadence — see weekly_cadence.json's "off" entry: "old weekly
+      # runs 1x/week, no rehearsal, no reruns, during the v2 build"). The
+      # THU-SAT cron below (config#1824, Brian-ratified 2026-07-06) was
+      # designed so the weekly pipeline runs ONE DAY AFTER the week's LAST
+      # trading session — Saturday normally, Friday on an NYSE Friday
+      # holiday, Thursday on a Thu+Fri double holiday — with the SF's
+      # WeeklyRunDayGate (predictor Lambda action=check_weekly_run_day, pure
+      # calendar math) self-selecting the single correct firing and
+      # Succeed-skipping the rest. That design is CORRECT for holiday weeks
+      # but produces THREE StepFunctions `StartExecution` calls a week even
+      # though two of them Succeed-skip in seconds — measured 2026-09-04: the
+      # week of 2026-08-24 carried starts on Thu 08-27, Fri 08-28 AND Sat
+      # 08-29 from this rule alone, on top of separate rerun-issuer noise.
+      # alpha-engine-config-I9756's closes-when is measured by
+      # `aws stepfunctions list-executions` START COUNT, which does not
+      # distinguish a real run from a 2-second self-skip — so THU-SAT cannot
+      # satisfy "≤1 start per calendar week" no matter how correct the
+      # skip logic is downstream.
+      #
+      # This is a deliberate simplification for the v1-decommission window
+      # (crucible v2 phase 0-4), not a claim that holiday-shift correctness
+      # stopped mattering: a week where Thu or Fri is the true last trading
+      # day now GETS ZERO weekly runs rather than a Fri/Thu run, because
+      # WeeklyRunDayGate only ever sees the Saturday firing. Given the carve-
+      # out at sf-pipeline-policy.md §5 ("the weekly run-day gate fails open
+      # — missing a weekly run is worse than a duplicate"), an under-run is
+      # the historically-accepted failure mode; the newly-unacceptable one
+      # (per this ruling) is a week with more than one start.
+      # Re-exam: 2026-09-14 (matches the closes-when measurement window) or
+      # when phase 0 exits, whichever is first — revert to THU-SAT (or build
+      # the more robust fix of moving the day-gate check upstream of
+      # StartExecution) once the pipeline is off the "stop the bleeding"
+      # posture, per the same re-exam cadence already used for
+      # AlertsMutedTopic below.
+      Description: Sat 09:00 UTC only — canonical weekly run, no THU/FRI pre-fire (alpha-engine-config-I9756 deliverable 1; was THU-SAT self-selecting, config#1824)
+      ScheduleExpression: 'cron(0 9 ? * SAT *)'
       State: ENABLED
       Targets:
         # SINGLE TARGET PER RULE. EventBridge dispatches the cron event

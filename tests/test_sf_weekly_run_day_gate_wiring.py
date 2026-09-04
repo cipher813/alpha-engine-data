@@ -1,15 +1,26 @@
 """Pin the weekly run-day gate wiring (config#1824, Brian-ratified 2026-07-06).
 
-Policy: the weekly pipeline runs ONE calendar day after the LAST trading
-session of its Mon-Fri week — Saturday normally, Friday when Friday is an
-NYSE holiday (real precedent 2026-07-03), Thursday on a Thu+Fri double
-holiday. Mechanism: the EventBridge cron fires THU-SAT and the SF's
-WeeklyRunDayGate (predictor Lambda ``action=check_weekly_run_day``, pure
-calendar math per the config#1430 posture) self-selects the single correct
+Policy (through 2026-09-04): the weekly pipeline runs ONE calendar day after
+the LAST trading session of its Mon-Fri week — Saturday normally, Friday when
+Friday is an NYSE holiday (real precedent 2026-07-03), Thursday on a Thu+Fri
+double holiday. Original mechanism: the EventBridge cron fired THU-SAT and the
+SF's WeeklyRunDayGate (predictor Lambda ``action=check_weekly_run_day``, pure
+calendar math per the config#1430 posture) self-selected the single correct
 firing, Succeed-skipping the rest BEFORE any spend.
 
+**Cron narrowed to SAT-only 2026-09-04** (alpha-engine-config-I9756
+deliverable 1, Brian ruling 2026-09-01): each THU/FRI pre-fire was still a
+counted ``StartExecution`` even when WeeklyRunDayGate Succeed-skipped it in
+seconds, so the multi-day cron could never satisfy the "≤1 start per calendar
+week" bar the v1-decommission window now measures against. See the
+``SaturdayTrigger`` comment in ``alpha-engine-orchestration.yaml`` for the
+known trade-off (a true holiday-shifted week now gets ZERO weekly runs
+instead of a Thu/Fri run) and the re-exam date. The gate itself (points 2-5
+below) is UNCHANGED and still wired — it is simply reached by only one
+firing a week now instead of up to three.
+
 Pins:
-  1. CFN cron is THU-SAT (not the old fixed SAT).
+  1. CFN cron is SAT-only (narrowed from THU-SAT 2026-09-04).
   2. InitializeInput defaults ``skip_weekly_run_day_gate`` false and routes
      into the gate choice first.
   3. The gate applies ONLY to ``pipeline_role == "weekly"`` (scheduled
@@ -39,14 +50,18 @@ def states() -> dict:
 
 
 class TestCronSchedule:
-    def test_saturday_trigger_fires_thu_through_sat(self):
+    def test_saturday_trigger_fires_sat_only(self):
+        """Narrowed 2026-09-04 (alpha-engine-config-I9756 deliverable 1):
+        was THU-SAT self-selecting via WeeklyRunDayGate; now SAT-only so the
+        weekly pipeline never START_EXECUTIONs more than once per calendar
+        week. See the SaturdayTrigger comment for the accepted trade-off."""
         cfn = _CFN.read_text()
         block = cfn.split("SaturdayTrigger:", 1)[1].split("WeekdayPipelineSchedule:", 1)[0]
-        assert "cron(0 9 ? * THU-SAT *)" in block, (
-            "weekly cron must fire THU-SAT so the run-day gate can "
-            "self-select holiday-shortened weeks (config#1824)"
+        assert "cron(0 9 ? * SAT *)" in block, (
+            "weekly cron must fire SAT-only so it never counts more than one "
+            "StartExecution per calendar week (alpha-engine-config-I9756)"
         )
-        assert "cron(0 9 ? * SAT *)" not in block
+        assert "cron(0 9 ? * THU-SAT *)" not in block
 
 
 class TestGateRouting:
