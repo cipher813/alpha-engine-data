@@ -1,7 +1,7 @@
 {
   "Comment": "Alpha Engine Weekday Pipeline — morning polygon enrichment, predictor inference, executor start. Runs Mon-Fri 5:15 AM PT (America/Los_Angeles, DST-aware); schedule is CFN-canonical in cloudformation/alpha-engine-orchestration.yaml — do not hand-edit here. MorningEnrich (added 2026-04-24) overwrites the prior trading day's ArcticDB row with polygon's authoritative OHLCV+VWAP before predictor inference reads it — fixes the 2026-04-17→2026-04-23 silent VWAP outage where the EOD yfinance pass was the only source. EOD yfinance collection runs via the post-close EOD SF on ae-trading. Policy: all SSM steps run on ae-trading (trading_instance_id); ae-dashboard is reserved for Streamlit + nginx + spot-launcher only. alpha-engine-config-I2717/I2722 (2026-07-16): the universe-gap + chronic-polygon-gap self-heal (formerly ChronicGapSelfHeal) and the PredictorHealthCheck/PredictorDriftCheck observability producers were REMOVED from this SF entirely — the heal now runs standalone (weekly_collector.py --daily-heal, EventBridge 09:00 UTC weekdays) and the two health checks now fire on their own direct EventBridge triggers (13:40 UTC weekdays), both off this critical path. See infrastructure/cloudformation/alpha-engine-orchestration.yaml. alpha-engine-config-I6494: after MorningArcticAppend, CheckSkipScanner → Scanner invokes alpha-engine-research-scanner:live (same entrypoint as the Saturday weekly SF) before PredictorInference so weekday universe_membership/{date} + factor profiles stay fresh without running the full Saturday pipeline (distinct from I5489 weekday weekly-SF exercise).",
   "StartAt": "InitializeInput",
-  "TimeoutSeconds": 39600,
+  "TimeoutSeconds": 7200,
   "States": {
     "InitializeInput": {
       "Type": "Pass",

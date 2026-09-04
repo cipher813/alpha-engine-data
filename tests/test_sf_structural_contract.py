@@ -1297,16 +1297,48 @@ def test_sf_file_set_matches_exemption_registry():
     )
 
 
+# alpha-engine-config#10008. The per-definition whole-execution ceiling, in
+# seconds. PRESENCE was already asserted below; the VALUE was not, and the two
+# weekday definitions had drifted to numbers nothing derived and nothing
+# checked — daily=39600 (11h) against a policy ceiling of 7200, eod=64800
+# (18h) against a ≤75-minute wall-clock budget. A ceiling that no test pins is
+# a ceiling that only ever grows, because every individual bump looks safe.
+#
+#   weekly  43200  sf-pipeline-policy.md §4, stated ceiling (12h)
+#   daily    7200  sf-pipeline-policy.md §4, stated ceiling (2h). The window to
+#                  the 06:30 PT market open is 75 min from the 05:15 PT
+#                  trigger; p95 of the 17 successful scheduled runs over
+#                  2026-07-28→09-04 is ~52 min and the longest recovery rerun
+#                  in that span was 102 min, so 2h bounds every real run while
+#                  releasing the SF mutex the same morning. That last part is
+#                  the point: sf-pipeline-policy.md §1.2 makes same-day
+#                  recovery a standing rule, and an 11h ceiling let one hung
+#                  execution hold the mutex past the close and take the
+#                  recovery with it.
+#   eod     14400  sf-pipeline-policy.md §4 gives the eod pipeline a ≤75-min
+#                  wall-clock target and no numeric ceiling (it must "include
+#                  the bounded heal loop"). Derived: 4h is 2.1× the longest
+#                  execution observed over 2026-07-31→09-04 (115 min, a failed
+#                  run on 08-17) and still clears the 22:00 PT
+#                  alpha-engine-stop-trading cost guard by six hours.
+#   groom   15000  unchanged; not a pipeline sf-pipeline-policy.md governs.
+_TOP_LEVEL_TIMEOUT_CEILING = {
+    "step_function.json": 43200,
+    "step_function_daily.json": 7200,
+    "step_function_eod.json": 14400,
+    "step_function_groom.json": 15000,
+}
+
+
 @pytest.mark.parametrize("sf_file", _SF_FILE_NAMES)
 def test_definition_declares_top_level_timeout(sf_file: str):
     """alpha-engine-config#6693: a hung execution with no top-level
     TimeoutSeconds can run to the Step Functions 1-year service maximum,
     invisible to any status-keyed watcher. Covers every file in the
-    exemption registry above (weekly, daily, eod, groom) — all four
-    currently declare one (weekly=43200, daily=39600, eod=64800,
-    groom=15000); a new step_function_*.json landing without one fails
-    here rather than silently inheriting the 1-year default. (Formerly
-    its own module, tests/test_sf_timeout_coverage.py; folded in here on
+    exemption registry above (weekly, daily, eod, groom); a new
+    step_function_*.json landing without one fails here rather than
+    silently inheriting the 1-year default. (Formerly its own module,
+    tests/test_sf_timeout_coverage.py; folded in here on
     #1256/config#6693 to avoid two parallel checkers over the same files
     as config#6684's structural-contract suite.)"""
     definition = _load(sf_file)
@@ -1315,6 +1347,33 @@ def test_definition_declares_top_level_timeout(sf_file: str):
         "to the Step Functions 1-year service maximum invisibly"
     )
     assert isinstance(definition["TimeoutSeconds"], int) and definition["TimeoutSeconds"] > 0
+
+
+def test_every_definition_has_a_codified_ceiling():
+    """A new step_function_*.json must state its ceiling here, with the
+    derivation, rather than inherit whatever number was typed into it."""
+    assert sorted(_TOP_LEVEL_TIMEOUT_CEILING) == _SF_FILE_NAMES, (
+        f"_TOP_LEVEL_TIMEOUT_CEILING covers {sorted(_TOP_LEVEL_TIMEOUT_CEILING)} "
+        f"but the definition registry is {_SF_FILE_NAMES} — add the new file's "
+        f"ceiling and the one-line derivation that justifies it"
+    )
+
+
+@pytest.mark.parametrize("sf_file", _SF_FILE_NAMES)
+def test_top_level_timeout_matches_its_codified_ceiling(sf_file: str):
+    """alpha-engine-config#10008. Presence is not enough: a whole-execution
+    ceiling nothing pins drifts upward one 'safe' bump at a time, and every
+    bump is invisible because no reader knows what the number was derived
+    from. Changing a value here is a deliberate edit to the comment block
+    above it, which is where the derivation lives."""
+    expected = _TOP_LEVEL_TIMEOUT_CEILING[sf_file]
+    actual = _load(sf_file)["TimeoutSeconds"]
+    assert actual == expected, (
+        f"{sf_file}: top-level TimeoutSeconds is {actual}, expected {expected}. "
+        f"See _TOP_LEVEL_TIMEOUT_CEILING in this file for the derivation. If "
+        f"the pipeline genuinely needs a different ceiling, change the map AND "
+        f"its derivation comment in the same diff — sf-pipeline-policy.md §4."
+    )
 
 
 @pytest.mark.parametrize("sf_file", _SF_FILE_NAMES)
