@@ -609,13 +609,30 @@ def test_every_prose_key_uses_the_underscore_marker(manifest):
     # A prose key without the marker becomes a `kept-but-missing` finding, and a
     # trigger name WITH the marker silently drops out of the check. Both fail
     # quietly, so the convention is pinned here rather than left to review.
+    #
+    # A group-qualified Scheduler name (alpha-engine-config-I9994) lives
+    # outside the default group, e.g. "crucible-v2/heartbeat" — the fleet's
+    # own "alpha-"/"DO-NOT-DELETE-" prefix convention is a v1-pipeline habit,
+    # not an AWS naming rule, so a non-default-group name is graded against
+    # the ACTUAL EventBridge Scheduler naming constraint
+    # (``[\.\-_A-Za-z0-9]+``, alphanumeric plus ``.-_``) instead of a
+    # hand-listed prefix list that would need editing for every future group.
+    aws_name_re = re.compile(r"^[.\-_A-Za-z0-9]+$")
     for key, reason in manifest["not_paused"].items():
         if key.startswith("_"):
             continue
-        assert key.startswith(("alpha-", "DO-NOT-DELETE-")), (
-            f"not_paused key {key!r} does not look like a live trigger name; if it "
-            "is a grouping label, prefix it with '_' as the pending block does"
-        )
+        if "/" in key:
+            group, _, bare = key.partition("/")
+            assert group and aws_name_re.match(bare), (
+                f"not_paused key {key!r} does not look like a group-qualified live "
+                "trigger name (\"<group>/<name>\"); if it is a grouping label, "
+                "prefix it with '_' as the pending block does"
+            )
+        else:
+            assert key.startswith(("alpha-", "DO-NOT-DELETE-")), (
+                f"not_paused key {key!r} does not look like a live trigger name; if "
+                "it is a grouping label, prefix it with '_' as the pending block does"
+            )
         assert reason.strip(), f"{key} is kept with no stated reason"
 
 
@@ -1431,3 +1448,139 @@ def test_scope_carve_out_matches_pause_reconcile(module):
     sys.modules.setdefault("pause_reconcile", pause_reconcile)
     spec.loader.exec_module(pause_reconcile)
     assert module.AWS_MANAGED_TRIGGER_PREFIX == pause_reconcile._AWS_MANAGED_PREFIX
+
+
+# ── Scheduler group qualification (alpha-engine-config-I9994) ───────────────
+#
+# `get-schedule`/`update-schedule` only ever look in ONE Scheduler group
+# (`--group-name`, default "default") — unlike `list-schedules`, which
+# enumerates every group unasked. `_live_triggers()` reports a non-default
+# schedule as "<group>/<name>"; `_live_state()`/`_disable()` must split that
+# back apart and pass `--group-name`, or a real, live, ENABLED schedule in a
+# non-default group reads as `kept-but-missing` / cannot be found at all —
+# exactly the finding class this issue was filed to close for the crucible-v2
+# group's four schedules.
+
+
+def test_scheduler_name_splitting(module):
+    assert module._split_scheduler_name("heartbeat") == ("default", "heartbeat")
+    assert module._split_scheduler_name("crucible-v2/heartbeat") == ("crucible-v2", "heartbeat")
+
+
+def test_live_state_passes_group_name_for_a_qualified_scheduler_name(module, monkeypatch):
+    """RED without the fix: `get-schedule --name heartbeat` (no --group-name)
+    404s for a schedule that lives in a non-default group — this asserts the
+    group is actually passed through, not just that a name is split somewhere."""
+    seen = []
+
+    def fake_aws(args):
+        seen.append(args)
+        return 0, "ENABLED", ""
+
+    monkeypatch.setattr(module, "_aws", fake_aws)
+    state = module._live_state("scheduler", "crucible-v2/heartbeat")
+    assert state == "ENABLED"
+    (args,) = seen
+    assert "--name" in args and args[args.index("--name") + 1] == "heartbeat", (
+        f"the bare name must be passed to get-schedule, not the qualified form: {args}"
+    )
+    assert "--group-name" in args and args[args.index("--group-name") + 1] == "crucible-v2", (
+        f"a non-default-group schedule must pass --group-name or AWS looks in "
+        f"the wrong group: {args}"
+    )
+
+
+def test_live_state_omits_group_name_for_the_default_group(module, monkeypatch):
+    """The overwhelming majority of this manifest's scheduler entries are
+    unqualified default-group names — this must keep working exactly as
+    before, with no --group-name flag added where none was ever needed."""
+    seen = []
+
+    def fake_aws(args):
+        seen.append(args)
+        return 0, "DISABLED", ""
+
+    monkeypatch.setattr(module, "_aws", fake_aws)
+    module._live_state("scheduler", "alpha-engine-stop-trading")
+    (args,) = seen
+    assert "--group-name" not in args
+
+
+def test_live_state_never_asks_events_for_a_group_qualified_name(module, monkeypatch):
+    """A "/" is not a legal EventBridge rule name — describe-rule would 400
+    (ValidationException), not 404, so `kept_names()`'s try-both-surfaces loop
+    must recognize this case without ever calling AWS."""
+    def fail_if_called(args):
+        raise AssertionError(f"describe-rule must not be called for a group-qualified "
+                              f"name: {args}")
+
+    monkeypatch.setattr(module, "_aws", fail_if_called)
+    assert module._live_state("events", "crucible-v2/heartbeat") is None
+
+
+def test_live_triggers_qualifies_a_non_default_scheduler_group(module, monkeypatch):
+    """RED without the fix: `_live_triggers()` reported the bare `Name` for
+    every schedule regardless of `GroupName`, so a crucible-v2 schedule and a
+    same-named default-group schedule would have been indistinguishable to
+    every consumer of this list — including `trigger_coverage_findings()`,
+    which matches purely on the reported name."""
+    pages = {
+        ("scheduler", None): json.dumps({
+            "Schedules": [
+                {"Name": "heartbeat", "State": "ENABLED", "GroupName": "crucible-v2"},
+                {"Name": "alpha-engine-stop-trading", "State": "ENABLED", "GroupName": "default"},
+            ],
+            "NextToken": None,
+        }),
+        ("events", None): '{"Rules": [], "NextToken": null}',
+    }
+
+    def fake_aws(args):
+        surface = "events" if "list-rules" in args else "scheduler"
+        return 0, pages[(surface, None)], ""
+
+    monkeypatch.setattr(module, "_aws", fake_aws)
+    names = {t["name"] for t in module._live_triggers()}
+    assert "crucible-v2/heartbeat" in names, (
+        "a non-default-group schedule must be reported group-qualified"
+    )
+    assert "alpha-engine-stop-trading" in names, (
+        "a default-group schedule must stay unqualified — this manifest's "
+        "existing entries must not need a mass rewrite"
+    )
+    assert "heartbeat" not in names, (
+        "the bare, unqualified name must never appear for a non-default-group "
+        "schedule — it would silently match a same-named default-group entry"
+    )
+
+
+def test_group_qualified_kept_schedule_is_not_a_kept_but_missing_finding(
+        module, monkeypatch):
+    """End-to-end RED/GREEN proof at the `check()` level for the actual defect
+    class this issue closes: a crucible-v2 schedule declared `not_paused` must
+    resolve live via _live_state, not read as vanished."""
+    import copy
+
+    fixture = copy.deepcopy(module.load_manifest())
+    fixture["not_paused"]["crucible-v2/heartbeat"] = "test fixture entry"
+
+    def fake_live_state(surface, name):
+        if name == "crucible-v2/heartbeat":
+            # Only the scheduler surface, with the group split correctly, can
+            # see this schedule — exactly what the live AWS API does.
+            group, bare = module._split_scheduler_name(name)
+            if surface == "scheduler" and group == "crucible-v2" and bare == "heartbeat":
+                return "ENABLED"
+            return None
+        return "DISABLED" if name in module.paused_names(fixture) else "ENABLED"
+
+    monkeypatch.setattr(module, "load_manifest", lambda: fixture)
+    monkeypatch.setattr(module, "_live_state", fake_live_state)
+    monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: False)
+    monkeypatch.setattr(module, "_live_triggers", lambda: [])
+
+    findings = module.check()
+    bad = [f for f in findings if f["trigger"] == "crucible-v2/heartbeat"]
+    assert bad == [], (
+        f"a live, ENABLED, group-qualified kept schedule was reported wrong: {bad}"
+    )
