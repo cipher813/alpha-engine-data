@@ -109,12 +109,19 @@ Usage:
                                                     # run by pause-check-alert.yml on its own
                                                     # 4-hourly schedule, needs krepis installed
 
-``--check`` needs ``events:DescribeRule`` + ``scheduler:GetSchedule`` +
+``--check`` needs ``events:DescribeRule`` + ``events:ListRules`` +
+``scheduler:GetSchedule`` + ``scheduler:ListSchedules`` +
 ``cloudwatch:DescribeAlarms``; ``--enforce`` additionally needs
 ``events:DisableRule`` + ``scheduler:UpdateSchedule`` +
-``cloudwatch:EnableAlarmActions`` + ``cloudwatch:DisableAlarmActions``. CI runs
-``--check`` (read-only) and ``--enforce --alarms-only`` (alarm actions only)
-under the ``github-actions-iam-drift-check`` role, daily in
+``cloudwatch:EnableAlarmActions`` + ``cloudwatch:DisableAlarmActions``. The
+``ListRules``/``ListSchedules`` pair is alpha-engine-config-I9959's
+``trigger-undeclared``/``trigger-out-of-scope`` completeness scan — the
+account-wide enumeration ``_live_triggers()`` needs, on top of the per-name
+``DescribeRule``/``GetSchedule`` the rest of ``--check`` already used; both
+are already granted to ``github-actions-iam-drift-check``
+(``pause_reconcile.py`` has called them from the same role since
+alpha-engine-config-I7118). CI runs ``--check`` (read-only) and ``--enforce
+--alarms-only`` (alarm actions only) under that role, daily in
 ``sf-arn-drift-check.yml``; ``pause-check-alert.yml`` runs ONLY
 ``--check --alert-on-fail`` (same role, same read-only permission set) on its
 own schedule so a finding pages even while the groom that would otherwise
@@ -133,6 +140,17 @@ from pathlib import Path
 
 MANIFEST = Path(__file__).parent.resolve() / "automation_pause.json"
 REGION = "us-east-1"
+
+#: SCOPE, made explicit (alpha-engine-config-I9959). The 2026-08-07 ruling's own
+#: text — "shut down all automatic AWS processes ... everything else has its
+#: schedule removed" — covers every EventBridge rule (default bus) and every
+#: EventBridge Scheduler schedule in the account, region us-east-1. The ONE
+#: carve-out is a rule AWS itself creates and manages (e.g. Inspector's ECR
+#: scan rule, ``DO-NOT-DELETE-AmazonInspectorEcrManagedRule``): the fleet owns
+#: none of its lifecycle, so it is not "scheduled automation" this manifest can
+#: classify. This MUST match ``pause_reconcile.py``'s ``_AWS_MANAGED_PREFIX`` —
+#: two literals for one exclusion is a silent-drift risk the test file pins.
+AWS_MANAGED_TRIGGER_PREFIX = "DO-NOT-DELETE-"
 
 #: Every ``paused_alarms`` entry must name the OPEN tracker issue whose closure
 #: ends the pause, in the fleet's own reference grammar. A free-text owner is
@@ -266,6 +284,108 @@ def _aws(args: list[str]) -> tuple[int, str, str]:
         ["aws"] + args + ["--region", REGION], capture_output=True, text=True, check=False
     )
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+
+def _live_triggers() -> list[dict]:
+    """Every EventBridge rule (default bus) and Scheduler schedule live in the
+    account — the enumeration ``trigger_coverage_findings()`` grades for
+    completeness, as opposed to ``_live_state()``'s per-name lookup for the
+    entries the manifest already names.
+
+    Paginated EXPLICITLY, never via ``aws --no-paginate``: ``list-rules`` and
+    ``list-schedules`` each cap at 100 per page, and a truncated first page
+    read as "every trigger" would let an undeclared trigger on page two hide
+    behind a clean run — the exact shape ``aws --no-paginate`` produces
+    (measured elsewhere in the fleet: it returns the first page and no marker,
+    silently). This loops on ``NextToken`` until AWS itself says there is none
+    left, and RAISES on any non-zero AWS exit rather than returning a partial
+    list — a permissions error or a truncated read must never be indistinguishable
+    from "the account holds exactly this many triggers".
+    """
+    out: list[dict] = []
+    for surface, cmd, key in (
+        ("events", ["events", "list-rules"], "Rules"),
+        ("scheduler", ["scheduler", "list-schedules"], "Schedules"),
+    ):
+        token: str | None = None
+        while True:
+            args = list(cmd) + ["--output", "json"]
+            if token:
+                args += ["--next-token", token]
+            rc, out_text, err = _aws(args)
+            if rc != 0:
+                raise RuntimeError(f"aws {' '.join(cmd)}: {err}")
+            page = json.loads(out_text or "{}")
+            for row in page.get(key, []):
+                out.append({"surface": surface, "name": row["Name"], "state": row.get("State")})
+            token = page.get("NextToken")
+            if not token:
+                break
+    return out
+
+
+def trigger_coverage_findings(manifest: dict | None = None,
+                               triggers: list[dict] | None = None) -> list[dict]:
+    """Is every live ENABLED trigger CLASSIFIED — not merely every declared one?
+
+    The trigger-side mirror of ``alarm_coverage_findings()``. ``check()``'s
+    other findings all iterate ``paused_entries()``/``kept_names()`` — the
+    manifest's OWN hand-listed names — so a live, ENABLED trigger named in
+    NEITHER ``paused`` nor ``not_paused`` was invisible to every one of them:
+    the check ran daily, reported, and could not see the one case it most
+    needed to. Found by hand on 2026-09-03 for exactly two triggers
+    (``alpha-engine-preflight-sweep-daily``,
+    ``alpha-engine-preopen-deploy-readiness-probe``; alpha-engine-config-I9937,
+    classified by nousergon-data-PR1635) — nothing would have found a third.
+    This closes that: the population is derived from live AWS
+    (``_live_triggers()``), never from either block, so a name nobody listed
+    is a finding by construction instead of an omission nobody sees.
+
+    SCOPE (alpha-engine-config-I9959, made explicit — see
+    ``AWS_MANAGED_TRIGGER_PREFIX``): every live EventBridge rule and Scheduler
+    schedule in the account, except an AWS-managed rule, which is reported as
+    ``trigger-out-of-scope`` rather than silently filtered — an excluded
+    population that renders nowhere is indistinguishable from one nobody
+    thought to exclude.
+    """
+    m = manifest if manifest is not None else load_manifest()
+    trigs = triggers if triggers is not None else _live_triggers()
+    declared = paused_names(m) | kept_names(m)
+    out: list[dict] = []
+    for t in trigs:
+        name, state, surface = t["name"], t["state"], t["surface"]
+        if name.startswith(AWS_MANAGED_TRIGGER_PREFIX):
+            out.append({
+                "trigger": name, "surface": surface, "kind": "trigger-out-of-scope",
+                "detail": (
+                    "AWS-managed rule — the 2026-08-07 ruling covers the fleet's "
+                    "own scheduled automation, not a rule AWS itself creates and "
+                    "manages (e.g. an Inspector ECR-scan rule); the fleet owns "
+                    "none of its lifecycle. Declared here so the exclusion is "
+                    "visible rather than a silent filter. Needs no paused/"
+                    "not_paused entry."
+                ),
+            })
+            continue
+        if state != "ENABLED":
+            continue
+        if name in declared:
+            continue
+        out.append({
+            "trigger": name, "surface": surface, "kind": "trigger-undeclared",
+            "detail": (
+                "live State=ENABLED, named in neither `paused` nor `not_paused` "
+                "in automation_pause.json — this check has no register saying "
+                "whether it should be running. Classify it: add it to "
+                "`not_paused` with a one-line reason if it is deliberately "
+                "kept, or move it under `paused` if it should be off. An "
+                "unclassified enabled trigger is exactly what "
+                "alpha-engine-preflight-sweep-daily and "
+                "alpha-engine-preopen-deploy-readiness-probe were until "
+                "alpha-engine-config-I9959."
+            ),
+        })
+    return out
 
 
 def _live_state(surface: str, name: str) -> str | None:
@@ -474,6 +594,10 @@ def check() -> list[dict]:
     # starts no scheduled work, so it carries none of the risk that keeps
     # `enforce()` from ever re-enabling a kept-but-disabled TRIGGER.
     findings.extend(alarm_findings())
+
+    # ── completeness: every live trigger CLASSIFIED, not merely every
+    # declared one (alpha-engine-config-I9959) ─────────────────────────────
+    findings.extend(trigger_coverage_findings())
     return findings
 
 
@@ -843,6 +967,8 @@ def main() -> int:
             print("  ✓ every declared alarm's ActionsEnabled matches its current justification")
             print("  ✓ every breaching alarm live in CloudWatch is declared in one block "
                   "or the other")
+            print("  ✓ every live ENABLED trigger in the account is declared paused or "
+                  "kept, or is out of scope")
         for f in findings:
             print(f"  ✗ [{f['kind']}] {f['surface']}:{f['trigger']}")
             print(f"      {f['detail']}")
