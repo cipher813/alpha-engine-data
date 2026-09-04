@@ -82,7 +82,7 @@ def test_shell_input_contract() -> None:
     # it from a fresh ephemeral spot; this script no longer hardcodes the
     # always-on dashboard box id.
     assert "ec2_instance_id" not in obj
-    assert obj["sns_topic_arn"].endswith(":alpha-engine-alerts")
+    assert obj["sns_topic_arn"].endswith(":alpha-engine-alerts-muted")
 
 
 def test_full_input_contract() -> None:
@@ -90,7 +90,7 @@ def test_full_input_contract() -> None:
     assert obj["pipeline_role"] == "weekly"
     assert "shell_run" not in obj, "full weekly run must NOT set shell_run"
     assert "ec2_instance_id" not in obj  # config#2248 — see test_shell_input_contract
-    assert obj["sns_topic_arn"].endswith(":alpha-engine-alerts")
+    assert obj["sns_topic_arn"].endswith(":alpha-engine-alerts-muted")
 
 
 def test_full_input_matches_live_cron_target() -> None:
@@ -112,6 +112,31 @@ def test_full_input_matches_live_cron_target() -> None:
     # through the dispatch path together.
     assert "ec2_instance_id" not in input_block
     assert _dry_run_input("full")["pipeline_role"] == "weekly"
+
+    # alpha-engine-config-I9756 deliverable 3. This test's docstring has
+    # always said the builder "must reproduce the CFN SaturdayTrigger Input",
+    # and until 2026-09-04 it checked three keys and never `sns_topic_arn` —
+    # so when the CFN target was repointed to AlertsMutedTopic and this
+    # script was not, the test stayed green across the drift it names.
+    # (The very next helper's docstring warns about hand-checking NAMED keys;
+    # this assertion is that warning applied to the test above it.)
+    #
+    # Compared by SNS logical resource id rather than by ARN: the CFN side is
+    # a `!Sub` reference (`${AlertsMutedTopic}`) and the script side is an
+    # interpolated literal, so the only thing both sides spell the same way
+    # is the topic NAME.
+    cfn_topic = re.search(r'"sns_topic_arn":\s*"\$\{(\w+)\}"', input_block)
+    assert cfn_topic, "SaturdayTrigger Input declares no sns_topic_arn"
+    expected_name = {
+        "AlertsTopic": "alpha-engine-alerts",
+        "AlertsMutedTopic": "alpha-engine-alerts-muted",
+    }[cfn_topic.group(1)]
+    assert _dry_run_input("full")["sns_topic_arn"].endswith(":" + expected_name), (
+        "the offcycle runner routes the weekly SF somewhere the live cron "
+        "target does not; every execution it starts is graded for routing by "
+        "crucible/gate.py::_clause_old_alerts_muted"
+    )
+    assert _dry_run_input("shell")["sns_topic_arn"].endswith(":" + expected_name)
 
 
 def _lambda_shell_input() -> dict:

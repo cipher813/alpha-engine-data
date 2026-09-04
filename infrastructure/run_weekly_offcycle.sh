@@ -73,7 +73,20 @@ SATURDAY_RULE_ARN="arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${SATURDAY_RULE}"
 # execution — an off-cycle run reproducing the live contracts byte-for-byte
 # now means reproducing THEIR omission of ec2_instance_id too, so this
 # script's launches go through the same dispatch path as the real cron.
-SNS_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:alpha-engine-alerts"
+# alpha-engine-config-I9756 deliverable 3 (crucible v2 phase 0, Brian ruling
+# I9751 item 3a): the v1 weekly's alerts are MUTED for the v2 build window.
+# `SaturdayTrigger` in infrastructure/cloudformation/alpha-engine-orchestration.yaml
+# routes to AlertsMutedTopic; this script is the OTHER way the same state
+# machine gets started, and it still named the paging topic. A recovery run
+# launched here during the graded week therefore filed an execution routed to
+# `alpha-engine-alerts`, and `crucible/gate.py::_clause_old_alerts_muted`
+# grades EVERY execution in the week, not only the scheduled ones — so one
+# shell run was enough to hold phase 0 UNMET on a week that was otherwise
+# clean. Measured 2026-09-04: `friday-shell-2026-08-28-eod-*` and
+# `offcycle-shell-20260828-*` are in the store carrying the paging topic.
+# Re-exam 2026-09-14, with the CFN switch above: revert BOTH to AlertsTopic
+# once phase 0 exits or the v1 pipeline is retired, whichever comes first.
+SNS_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:alpha-engine-alerts-muted"
 
 # Auto re-enable infra (one-time EventBridge Scheduler job + its execution role)
 REENABLE_ROLE_NAME="alpha-engine-offcycle-cron-role"
