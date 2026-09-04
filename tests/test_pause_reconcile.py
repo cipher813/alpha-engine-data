@@ -518,7 +518,7 @@ def test_a_self_deleting_one_shot_is_not_undeclared_scheduled_work(mod):
                    "state": "ENABLED"}],
         targets_of=lambda t: [], sf_invoked=set(), invocations_of=lambda cid: 0,
         alarm_actions_of=lambda n: None,
-        is_ephemeral=lambda name: True, noted=noted,
+        is_ephemeral=lambda name, group=None: True, noted=noted,
     )
     assert findings == []
     assert [(n["kind"], n["id"]) for n in noted] == [
@@ -536,7 +536,7 @@ def test_a_standing_schedule_is_still_a_finding(mod):
         triggers=[{"surface": "scheduler", "name": "some-daily-job", "state": "ENABLED"}],
         targets_of=lambda t: [], sf_invoked=set(), invocations_of=lambda cid: 0,
         alarm_actions_of=lambda n: None,
-        is_ephemeral=lambda name: False,
+        is_ephemeral=lambda name, group=None: False,
     )
     assert [(f["kind"], f["trigger"]) for f in findings] == [
         ("undeclared-enabled", "some-daily-job")]
@@ -550,7 +550,7 @@ def test_the_ephemeral_probe_is_not_called_on_a_clean_run(mod):
         triggers=[{"surface": "scheduler", "name": "kept-job", "state": "ENABLED"}],
         targets_of=lambda t: [], sf_invoked=set(), invocations_of=lambda cid: 0,
         alarm_actions_of=lambda n: None,
-        is_ephemeral=lambda name: calls.append(name) or True,
+        is_ephemeral=lambda name, group=None: calls.append(name) or True,
     )
     assert calls == []
 
@@ -575,6 +575,61 @@ def test_a_real_scheduler_failure_still_raises(mod, monkeypatch):
     monkeypatch.setattr(mod, "_aws_json", _boom)
     with pytest.raises(RuntimeError, match="AccessDenied"):
         mod.is_ephemeral_one_shot("sf-watch-defer-abc-g1")
+
+
+# ── (group, name) is a Scheduler schedule's identity ─────────────────────────
+# alpha-engine-config-I10009. `list-schedules` spans every schedule group;
+# `get-schedule` resolves within ONE, defaulting to `default`. An
+# enumerate-then-describe pass that drops the group lists schedules it can then
+# never describe — measured live 2026-09-04, where the four `crucible-v2`-group
+# schedules landed on 09-03 and every `pause-reconcile.yml` run since exited 2
+# on `get-schedule --name alerts-sweep`.
+
+
+def test_live_triggers_carries_each_schedules_group(mod, monkeypatch):
+    """Without the group on the row there is nothing to pass downstream, and
+    the bug reappears the next time someone makes a non-default group."""
+    def _fake(cmd, key):
+        if cmd[0] == "events":
+            return iter([])
+        return iter([
+            {"Name": "alerts-sweep", "State": "ENABLED", "GroupName": "crucible-v2"},
+            {"Name": "alpha-engine-weekday", "State": "ENABLED", "GroupName": "default"},
+        ])
+    monkeypatch.setattr(mod, "_paginate", _fake)
+    by_name = {t["name"]: t for t in mod.live_triggers()}
+    assert by_name["alerts-sweep"]["group"] == "crucible-v2"
+    assert by_name["alpha-engine-weekday"]["group"] == "default"
+
+
+def test_the_ephemeral_probe_passes_the_group_through(mod, monkeypatch):
+    """The quiet half of the bug: `get-schedule` without `--group-name` raises
+    ResourceNotFoundException for a non-default-group schedule, which this
+    function reads as 'it deleted itself' and returns True for. So the bug
+    does not only break the run — it silently excuses every non-default-group
+    schedule from the register it is missing from."""
+    seen: list[list[str]] = []
+    monkeypatch.setattr(mod, "_aws_json", lambda args: seen.append(args) or {})
+    mod.is_ephemeral_one_shot("alerts-sweep", "crucible-v2")
+    assert seen[0] == ["scheduler", "get-schedule", "--name", "alerts-sweep",
+                       "--group-name", "crucible-v2"]
+
+
+def test_trigger_targets_passes_the_group_through(mod, monkeypatch):
+    seen: list[list[str]] = []
+    monkeypatch.setattr(mod, "_aws_json", lambda args: seen.append(args) or {})
+    mod.trigger_targets({"surface": "scheduler", "name": "alerts-sweep",
+                         "group": "crucible-v2"})
+    assert "--group-name" in seen[0] and "crucible-v2" in seen[0]
+
+
+def test_a_scheduler_row_with_no_group_falls_back_to_default(mod, monkeypatch):
+    """Rows built before this change, and any hand-built row in a caller,
+    must keep resolving rather than crash on a missing key."""
+    seen: list[list[str]] = []
+    monkeypatch.setattr(mod, "_aws_json", lambda args: seen.append(args) or {})
+    mod.trigger_targets({"surface": "scheduler", "name": "alpha-engine-weekday"})
+    assert seen[0][-2:] == ["--group-name", mod.DEFAULT_SCHEDULE_GROUP]
 
 
 def test_the_headline_distinguishes_drift_from_a_broken_detector(mod):
