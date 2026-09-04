@@ -71,6 +71,31 @@ def module():
     return _load_module()
 
 
+@pytest.fixture(autouse=True)
+def clean_trigger_world(module, manifest, monkeypatch, request):
+    """A live-trigger enumeration that exactly matches the manifest's own
+    declarations (alpha-engine-config-I9959).
+
+    ``check()`` now calls ``trigger_coverage_findings()``, which calls
+    ``_live_triggers()`` — a real ``aws events list-rules`` / ``aws scheduler
+    list-schedules`` account-wide enumeration. Every test written before this
+    existed calls ``module.check()`` with no idea that call exists, so without
+    this stub every one of them would reach the network (and fail with
+    NoCredentialsError in CI, which has none by design — the same problem
+    ``classified_world`` solves one level up for the alarm scan it added).
+    Autouse, so the NEXT live read added to ``check()`` cannot reintroduce this
+    either.
+    """
+    if request.node.get_closest_marker("real_trigger_scan") is not None:
+        return
+    live: list[dict] = []
+    for surface, name, _ in module.paused_entries(manifest):
+        live.append({"surface": surface, "name": name, "state": "DISABLED"})
+    for name in module.kept_names(manifest):
+        live.append({"surface": "events", "name": name, "state": "ENABLED"})
+    monkeypatch.setattr(module, "_live_triggers", lambda: live)
+
+
 def test_manifest_parses_and_every_entry_has_a_reason(manifest):
     for surface in ("events_rules", "scheduler_schedules"):
         entries = manifest["paused"][surface]
@@ -1234,3 +1259,175 @@ def test_an_armed_alarm_is_never_reported_as_an_undeclared_silence(module, monke
     findings = module.alarm_coverage_findings()
     assert not [f for f in findings if f["kind"] == "alarm-undeclared-silence"]
     assert {f["kind"] for f in findings} == {"armed-but-silenced"}
+
+
+# ── Completeness: every live trigger CLASSIFIED, not merely every declared
+# one (alpha-engine-config-I9959) ────────────────────────────────────────────
+#
+# `check()`'s other findings all iterate the manifest's OWN hand-listed names
+# (`paused_entries()`, `kept_names()`), so a live, ENABLED trigger named in
+# NEITHER block was invisible to every one of them — the check ran daily,
+# reported, and could not see the case it most needed to. Found by hand on
+# 2026-09-03 for exactly two triggers (alpha-engine-preflight-sweep-daily,
+# alpha-engine-preopen-deploy-readiness-probe; alpha-engine-config-I9937) —
+# nothing would have found a third.
+
+
+def test_trigger_coverage_is_silent_when_live_matches_the_manifest_exactly(
+        module, manifest):
+    """The GREEN direction: the live world `clean_trigger_world` builds from
+    the manifest itself must produce no trigger-side finding."""
+    findings = module.trigger_coverage_findings(manifest)
+    assert not [f for f in findings
+                if f["kind"] in ("trigger-undeclared", "trigger-out-of-scope")]
+
+
+def test_an_undeclared_enabled_trigger_is_a_finding(module, manifest):
+    """The defect this check exists for: a new trigger nobody classified."""
+    live = [{"surface": "events", "name": "alpha-engine-saturday", "state": "ENABLED"},
+            {"surface": "events", "name": "alpha-engine-brand-new-undeclared-rule",
+             "state": "ENABLED"}]
+    findings = module.trigger_coverage_findings(manifest, triggers=live)
+    kinds = {(f["trigger"], f["kind"]) for f in findings}
+    assert ("alpha-engine-brand-new-undeclared-rule", "trigger-undeclared") in kinds
+    assert not any(f["trigger"] == "alpha-engine-saturday" for f in findings)
+
+
+def test_an_undeclared_disabled_trigger_is_not_a_finding(module, manifest):
+    """Only ENABLED is graded here — a disabled, undeclared trigger is dormant
+    and carries no scheduled-work risk; `missing-in-aws`/`kept-but-missing`
+    already cover the declared half of this axis."""
+    live = [{"surface": "scheduler", "name": "some-random-disabled-thing",
+             "state": "DISABLED"}]
+    assert module.trigger_coverage_findings(manifest, triggers=live) == []
+
+
+def test_an_aws_managed_rule_is_reported_out_of_scope_not_silently_dropped(
+        module, manifest):
+    live = [{"surface": "events",
+             "name": "DO-NOT-DELETE-AmazonInspectorEcrManagedRule",
+             "state": "ENABLED"}]
+    findings = module.trigger_coverage_findings(manifest, triggers=live)
+    kinds = {(f["trigger"], f["kind"]) for f in findings}
+    assert ("DO-NOT-DELETE-AmazonInspectorEcrManagedRule", "trigger-out-of-scope") in kinds
+    assert not any(f["kind"] == "trigger-undeclared" for f in findings), (
+        "an AWS-managed rule must never ALSO read as undeclared — one "
+        "condition, one finding"
+    )
+
+
+def test_check_surfaces_trigger_coverage_findings(module, monkeypatch, manifest):
+    """The wiring: `check()` must actually call the new completeness scan,
+    not just have it exist as a dead function."""
+    monkeypatch.setattr(
+        module, "_live_state",
+        lambda surface, name: "DISABLED" if name in module.paused_names(manifest) else "ENABLED")
+    monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: False)
+    monkeypatch.setattr(module, "_live_triggers", lambda: [
+        {"surface": "events", "name": "alpha-engine-mystery-rule", "state": "ENABLED"},
+    ])
+    kinds = {(f["trigger"], f["kind"]) for f in module.check()}
+    assert ("alpha-engine-mystery-rule", "trigger-undeclared") in kinds
+
+
+# ── §7.4 RED proof: the finding must fail without the fix, and clear when the
+# manifest is restored (alpha-engine-config-I9959) ───────────────────────────
+
+
+def test_removing_a_kept_entrys_declaration_from_a_fixture_manifest_is_caught(
+        module, manifest):
+    """Mutates a FIXTURE COPY only — never MANIFEST_PATH / the real file."""
+    import copy
+
+    fixture = copy.deepcopy(manifest)
+    victim = "alpha-engine-preflight-sweep-daily"
+    assert victim in fixture["not_paused"], (
+        "fixture setup is wrong: the victim must be a real, currently-declared "
+        "kept trigger for this to be a meaningful RED proof"
+    )
+    del fixture["not_paused"][victim]
+    assert victim not in fixture["not_paused"], (
+        "the deletion did not change the fixture — a demonstration that "
+        "mutated nothing would prove nothing"
+    )
+    # The rest of the manifest is untouched — same object graph, one key gone.
+    assert fixture["paused"] == manifest["paused"]
+
+    live = [{"surface": "events", "name": victim, "state": "ENABLED"}]
+
+    # RED: with the entry gone, the live-enabled trigger must be reported.
+    red = module.trigger_coverage_findings(fixture, triggers=live)
+    red_kinds = {(f["trigger"], f["kind"]) for f in red}
+    assert (victim, "trigger-undeclared") in red_kinds, (
+        f"removing {victim!r}'s declaration did not surface it as undeclared: {red}"
+    )
+
+    # GREEN: the ORIGINAL (unmutated) manifest still declares it — restoring
+    # the entry (i.e. going back to `manifest` instead of `fixture`) must
+    # clear the finding for the same live state.
+    green = module.trigger_coverage_findings(manifest, triggers=live)
+    assert not [f for f in green if f["trigger"] == victim], (
+        f"the unmutated manifest still declares {victim!r}, but it was still "
+        f"reported: {green}"
+    )
+
+
+# ── the enumeration itself: pagination and fail-loud (alpha-engine-config-I9959) ─
+
+
+@pytest.mark.real_trigger_scan
+def test_live_triggers_pagination_is_followed(module, monkeypatch):
+    """A truncated first page would silently shrink the population an
+    undeclared trigger could hide behind — the `aws --no-paginate` failure
+    mode (first page only, no marker) this loop must never reproduce."""
+    pages = {
+        ("events", None): '{"Rules": [{"Name": "r1", "State": "ENABLED"}], "NextToken": "tok1"}',
+        ("events", "tok1"): '{"Rules": [{"Name": "r2", "State": "DISABLED"}], "NextToken": null}',
+        ("scheduler", None): '{"Schedules": [{"Name": "s1", "State": "ENABLED"}], "NextToken": null}',
+    }
+    seen: list[tuple[str, str | None]] = []
+
+    def fake_aws(args):
+        surface = "events" if "list-rules" in args else "scheduler"
+        token = args[args.index("--next-token") + 1] if "--next-token" in args else None
+        seen.append((surface, token))
+        return 0, pages[(surface, token)], ""
+
+    monkeypatch.setattr(module, "_aws", fake_aws)
+    triggers = module._live_triggers()
+    got = {(t["surface"], t["name"], t["state"]) for t in triggers}
+    assert got == {
+        ("events", "r1", "ENABLED"),
+        ("events", "r2", "DISABLED"),
+        ("scheduler", "s1", "ENABLED"),
+    }
+    assert ("events", "tok1") in seen, "the second page of events:list-rules was never requested"
+
+
+@pytest.mark.real_trigger_scan
+def test_live_triggers_raises_loud_on_an_aws_failure(module, monkeypatch):
+    """A partial listing must never be reported as 'every trigger checked' —
+    RAISE, don't return whatever page came back."""
+    monkeypatch.setattr(module, "_aws", lambda args: (255, "", "AccessDeniedException"))
+    with pytest.raises(RuntimeError, match="AccessDeniedException"):
+        module._live_triggers()
+
+
+def test_scope_carve_out_matches_pause_reconcile(module):
+    """One exclusion, declared once each in two files that must not drift.
+
+    `pause_reconcile.py`'s own account-wide enumeration excludes AWS-managed
+    rules under `_AWS_MANAGED_PREFIX`; this module's `_live_triggers()`-based
+    completeness scan excludes the same population under
+    `AWS_MANAGED_TRIGGER_PREFIX`. Two literals for one exclusion is exactly
+    how the `_reactive-notifier-rules` class of defect (a value no checker
+    reads) reappears one level up — pinned here so the two cannot diverge
+    silently.
+    """
+    pytest.importorskip("boto3")
+    pytest.importorskip("yaml")
+    spec = importlib.util.spec_from_file_location("pause_reconcile", INFRA / "pause_reconcile.py")
+    pause_reconcile = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault("pause_reconcile", pause_reconcile)
+    spec.loader.exec_module(pause_reconcile)
+    assert module.AWS_MANAGED_TRIGGER_PREFIX == pause_reconcile._AWS_MANAGED_PREFIX
