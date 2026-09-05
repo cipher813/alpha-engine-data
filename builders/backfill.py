@@ -294,6 +294,32 @@ def _existing_last_date(lib, symbol: str) -> "pd.Timestamp | None":
 # which upstream call answers short on a given run.
 _MACRO_HISTORY_SHRINK_TOLERANCE_ROWS = 5
 
+# Rolling-window slide allowance for the first-date / row-count checks above.
+# The price cache is BY DESIGN a rolling 10-year, fully re-adjusted window
+# (``collectors/prices.py``: "full replace, not append" because yfinance
+# ``auto_adjust`` retroactively re-adjusts the whole series), and the FRED
+# history window is a trailing N years the same way. So a macro series' FIRST
+# date advances at every source refresh — ~5 NYSE sessions per weekly rebuild,
+# more after a missed Saturday or a freeze that released (``macro/HYOAS``
+# advanced ~85 sessions on 2026-09-05 once alpha-engine-config-I9287 unstuck
+# it). Between rebuilds ``daily_append`` extends the ArcticDB series at the
+# tail, so the rows a rebuild "loses" against ArcticDB equal exactly the
+# sessions the window's start slid. That is a slide, not truncation.
+#
+# Measured origin: the first live Saturday after the I9256 guard landed
+# (2026-09-05 10:48 UTC, weekly SF execution 49a1f4e0-…) it refused all 17
+# macro/sector symbols on ``planned_first > existing_first`` by ONE WEEK
+# (``macro.SPY: planned_first=2016-09-06 > existing_first=2016-08-29``) and
+# DataPhase1 failed the pipeline.
+#
+# Truncation (the I9256 class — VIX3M 2509 -> 16 rows) is a start that jumps
+# forward by more than any rebuild cadence can explain, or a row loss the
+# slide does not account for. Above WARN sessions the slide is logged as a
+# finding (a freeze released, or rebuilds were missed — history really was
+# lost); above MAX it is refused outright.
+_MACRO_WINDOW_SLIDE_WARN_TRADING_DAYS = 30
+_MACRO_WINDOW_SLIDE_MAX_TRADING_DAYS = 252
+
 # Max-date staleness tolerance for the macro write boundary, in NYSE trading
 # days behind the reference date (alpha-engine-config-I9287). A shrink/
 # first-date check is blind to a series that keeps writing NEW versions
@@ -371,23 +397,52 @@ def _history_regression(
     existing_rows: int,
     existing_first: "pd.Timestamp | None",
 ) -> "str | None":
-    """Return a human-readable regression string, or None when the write is safe."""
+    """Return a human-readable regression string, or None when the write is safe.
+
+    A rolling-window source legitimately moves the series start forward at
+    every refresh (see ``_MACRO_WINDOW_SLIDE_*``). The slide, in NYSE
+    sessions, is credited against the row-count floor — a window that lost
+    N rows at the front because it advanced N sessions has not shrunk — and
+    is itself bounded: a start that jumps more than the MAX allowance is a
+    coverage change, not a slide, and is refused.
+    """
     planned_rows, planned_first = _series_row_span(planned)
     if existing_rows == 0:
         return None
-    if planned_rows < existing_rows - _MACRO_HISTORY_SHRINK_TOLERANCE_ROWS:
-        return (
-            f"{label}: planned_rows={planned_rows} < existing_rows={existing_rows} "
-            f"(tolerance {_MACRO_HISTORY_SHRINK_TOLERANCE_ROWS})"
-        )
+    slide = 0
     if (
         planned_first is not None
         and existing_first is not None
         and planned_first > existing_first
     ):
+        from nousergon_lib.dates import trading_days_stale
+
+        slide = trading_days_stale(existing_first.date(), planned_first.date())
+    allowed_loss = _MACRO_HISTORY_SHRINK_TOLERANCE_ROWS + min(
+        slide, _MACRO_WINDOW_SLIDE_MAX_TRADING_DAYS
+    )
+    if planned_rows < existing_rows - allowed_loss:
+        return (
+            f"{label}: planned_rows={planned_rows} < existing_rows={existing_rows} "
+            f"(tolerance {_MACRO_HISTORY_SHRINK_TOLERANCE_ROWS} + window slide "
+            f"{min(slide, _MACRO_WINDOW_SLIDE_MAX_TRADING_DAYS)} sessions)"
+        )
+    if slide > _MACRO_WINDOW_SLIDE_MAX_TRADING_DAYS:
         return (
             f"{label}: planned_first={planned_first.date()} > "
-            f"existing_first={existing_first.date()} (history start moved forward)"
+            f"existing_first={existing_first.date()} by {slide} trading days "
+            f"(history start moved forward past the "
+            f"{_MACRO_WINDOW_SLIDE_MAX_TRADING_DAYS}-session rolling-window "
+            f"allowance — a coverage change, not a slide)"
+        )
+    if slide > _MACRO_WINDOW_SLIDE_WARN_TRADING_DAYS:
+        log.warning(
+            "MACRO_WINDOW_SLIDE %s: history start advanced %d trading days "
+            "(%s -> %s) in one rebuild — more than a weekly cadence explains "
+            "(a frozen source released, or rebuilds were missed); %d rows of "
+            "history before %s are gone from ArcticDB's head version.",
+            label, slide, existing_first.date(), planned_first.date(),
+            max(existing_rows - planned_rows, 0), planned_first.date(),
         )
     return None
 
@@ -610,7 +665,9 @@ def _assert_no_arctic_regression(
     if regressions:
         raise RuntimeError(
             f"Backfill regression preflight failed: {len(regressions)} symbols would regress "
-            f"if backfill proceeded. Source data (predictor/price_cache + daily_closes delta) "
+            f"if backfill proceeded (each entry names its own check: last-date regression, "
+            f"history-length truncation, or frozen-source staleness). For a LAST-DATE "
+            f"regression the source (predictor/price_cache + daily_closes delta) "
             f"ends earlier than what ArcticDB already has. Most common cause: the price cache "
             f"mtime 'current' check skipped the weekly refresh, so the cache lags "
             f"MorningEnrich/daily_append writes — and ``_apply_daily_delta`` failed to bridge "
