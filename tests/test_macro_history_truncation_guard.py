@@ -77,13 +77,67 @@ def test_write_boundary_refuses_the_measured_vix3m_truncation():
     assert len(lib.data["VIX3M"]) == 2509
 
 
-def test_write_boundary_refuses_a_forward_moving_history_start():
-    """Same row count, but the series start slid forward a week — still a loss."""
-    lib = _FakeLib({"VIX3M": _frame("2026-07-31", 16)})
-    planned = _frame("2026-08-07", 16)
+# ── rolling-window slide vs truncation (2026-09-05 weekly SF failure) ─────────
+#
+# The price cache is BY DESIGN a rolling 10-year, fully re-adjusted window
+# (collectors/prices.py: "full replace, not append", yfinance auto_adjust), so
+# its FIRST date advances at every refresh. The first live Saturday after the
+# I9256 guard landed (2026-09-05 10:48 UTC) it refused all 17 macro symbols:
+#
+#     macro.SPY: planned_first=2016-09-06 > existing_first=2016-08-29
+#     macro.HYOAS: planned_first=2023-09-05 > existing_first=2023-05-09
+#
+# A window that slides forward at both ends is not truncation. Truncation is a
+# start that jumps forward by more than any rebuild cadence can explain, or a
+# row loss the slide does not account for.
 
+def test_write_boundary_allows_a_one_week_rolling_window_slide():
+    """The measured 2026-09-05 SPY shape: same length, start one week later."""
+    lib = _FakeLib({"SPY": _frame("2016-08-29", 2514)})
+    planned = _frame("2016-09-06", 2514)
+    _bf._write_macro_series_no_shrink(lib, "SPY", planned)
+    assert lib.writes == [("SPY", 2514)]
+
+
+def test_write_boundary_allows_a_slide_after_a_source_freeze(caplog):
+    """The measured 2026-09-05 HYOAS shape: a 3y FRED window that had been
+    frozen for four months (I9287) and then advanced ~85 sessions at once.
+    Allowed, but LOUD — a start moving more than a few weeks means a freeze
+    released or rebuilds were missed, and the row loss is real."""
+    lib = _FakeLib({"HYOAS": _frame("2023-05-09", 786)})
+    planned = _frame("2023-09-05", 783)
+    with caplog.at_level("WARNING"):
+        _bf._write_macro_series_no_shrink(lib, "HYOAS", planned)
+    assert lib.writes == [("HYOAS", 783)]
+    assert any("MACRO_WINDOW_SLIDE" in r.message for r in caplog.records)
+
+
+def test_write_boundary_allows_a_missed_rebuild_week():
+    """Two weeks of daily_append rows on top of the last rebuild, then a
+    rebuild from a window that slid two weeks: net loss of ~10 rows is the
+    slide, not a truncation."""
+    lib = _FakeLib({"GLD": _frame("2016-08-15", 2524)})
+    planned = _frame("2016-08-29", 2514)
+    _bf._write_macro_series_no_shrink(lib, "GLD", planned)
+    assert lib.writes == [("GLD", 2514)]
+
+
+def test_write_boundary_refuses_a_start_that_jumps_past_the_slide_allowance():
+    """Same row count, start two years later: a frequency/coverage change,
+    not a rolling window — refused."""
+    lib = _FakeLib({"VIX3M": _frame("2016-08-19", 2514)})
+    planned = _frame("2018-08-20", 2514)
     with pytest.raises(RuntimeError, match="history start moved forward"):
         _bf._write_macro_series_no_shrink(lib, "VIX3M", planned)
+    assert lib.writes == []
+
+
+def test_write_boundary_refuses_a_row_loss_the_slide_does_not_explain():
+    """Start unchanged, 30 rows gone from the body/tail — truncation."""
+    lib = _FakeLib({"USO": _frame("2016-08-19", 2514)})
+    planned = _frame("2016-08-19", 2484)
+    with pytest.raises(RuntimeError, match="planned_rows=2484 < existing_rows=2514"):
+        _bf._write_macro_series_no_shrink(lib, "USO", planned)
 
 
 def test_write_boundary_allows_a_normal_append():
