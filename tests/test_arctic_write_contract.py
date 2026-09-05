@@ -245,9 +245,17 @@ def test_backfill_wraps_macro_writes():
         "reference_date=today_str,\n"
         "                    )"
     ) in _BACKFILL_SRC
-    assert "lib.write(symbol, df)" in _BACKFILL_SRC, (
+    # alpha-engine-config-I10054: the payload the wrapper writes is
+    # ``to_write`` — ``df`` for a rolling (adjusted) symbol, and the union of
+    # the retained older rows with ``df`` for a symbol declared in
+    # ``CUMULATIVE_MACRO_SYMBOLS``. Still exactly one terminating write.
+    assert "lib.write(symbol, to_write)" in _BACKFILL_SRC, (
         "the no-shrink wrapper must still terminate in a single lib.write "
         "boundary — no second, unguarded macro write path."
+    )
+    assert _BACKFILL_SRC.count("lib.write(symbol, ") == 1, (
+        "exactly one macro raw-series write boundary — a second one would "
+        "bypass the truncation guard and the cumulative-retention prepend."
     )
 
 

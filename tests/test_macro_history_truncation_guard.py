@@ -103,13 +103,37 @@ def test_write_boundary_allows_a_slide_after_a_source_freeze(caplog):
     """The measured 2026-09-05 HYOAS shape: a 3y FRED window that had been
     frozen for four months (I9287) and then advanced ~85 sessions at once.
     Allowed, but LOUD — a start moving more than a few weeks means a freeze
-    released or rebuilds were missed, and the row loss is real."""
+    released or rebuilds were missed.
+
+    HYOAS is a DECLARED-CUMULATIVE symbol (alpha-engine-config-I10054), so the
+    rows the window slid past are restored by the prepend rather than lost:
+    the SOURCE still slid (the detector must still say so — that is the I9287
+    signal) but ArcticDB's head keeps its 2023-05-09 start."""
     lib = _FakeLib({"HYOAS": _frame("2023-05-09", 786)})
     planned = _frame("2023-09-05", 783)
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("INFO"):
         _bf._write_macro_series_no_shrink(lib, "HYOAS", planned)
-    assert lib.writes == [("HYOAS", 783)]
     assert any("MACRO_WINDOW_SLIDE" in r.message for r in caplog.records)
+    # The written frame is the union, not the source window.
+    (written_symbol, written_rows), = lib.writes
+    assert written_symbol == "HYOAS"
+    assert written_rows > 783
+    assert lib.data["HYOAS"].index[0] == pd.Timestamp("2023-05-09")
+
+
+def test_write_boundary_slide_after_a_freeze_is_lossy_on_an_adjusted_symbol(caplog):
+    """The same shape on an ADJUSTED symbol (auto_adjust ETF) stays rolling:
+    written as-is, and the finding says the history really is gone."""
+    lib = _FakeLib({"GLD": _frame("2023-05-09", 786)})
+    planned = _frame("2023-09-05", 783)
+    with caplog.at_level("WARNING"):
+        _bf._write_macro_series_no_shrink(lib, "GLD", planned)
+    assert lib.writes == [("GLD", 783)]
+    assert any(
+        "MACRO_WINDOW_SLIDE" in r.message
+        and "gone from ArcticDB's head version" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 def test_write_boundary_allows_a_missed_rebuild_week():

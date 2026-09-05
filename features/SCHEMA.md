@@ -91,6 +91,55 @@ and return-basis columns sit adjacent.
 
 ---
 
+## 2b. ArcticDB macro-library retention, per symbol family (I10054)
+
+Every macro source is a **rolling window**: `collectors/prices.py` refreshes
+the price cache as a 10-year yfinance `auto_adjust=True` **full replace**, and
+`collectors/fred_history.py` fetches a trailing `period_years` window the same
+way. `builders/backfill.py` then writes each ArcticDB symbol wholesale
+(`lib.write`), so without intervention the head version loses its oldest week
+every Saturday. ArcticDB keeps prior versions, so nothing is destroyed — but no
+reader sees anything older than the window.
+
+Retention is therefore declared **per symbol family**, and the deciding
+property is the **adjustment basis**, not the data source:
+
+| Family | Symbols | Retention | Why |
+|---|---|---|---|
+| **Un-adjusted indices (cumulative)** | `VIX`, `VIX3M`, `TNX`, `IRX`, `TWO`, `HYOAS`, `BAA10Y` | **Cumulative** — the head version never loses a row it once held | FRED-sourced index levels and yields carry no split/dividend adjustment, so rows already held are on the same scale as fresh rows. Prepending them is exact and seamless. |
+| **Adjusted ETFs / equities** | `SPY`, `GLD`, `USO`, `XL*` sector ETFs, the sub-sector benchmark ETFs, the whole `universe` library | **Rolling** — 10-year window, oldest rows leave the head each rebuild | `auto_adjust=True` retroactively re-adjusts the entire series on every split and dividend, so a row written last year is on a different scale from today's. Splicing would create a silent mid-series seam. This is why `collectors/prices.py` full-replaces rather than appends (`data#1298`). |
+| **`macro/features`** | the derived macro feature frame | **Rolling** — derived from the above | Recomputed wholesale from the macro series each rebuild. |
+
+The cumulative set is **declared, not inferred**:
+`builders/backfill.py::CUMULATIVE_MACRO_SYMBOLS`. It is asserted equal to
+`collectors/fred_history.FRED_HISTORY_MAP`'s keys by
+`tests/test_macro_cumulative_history.py`, so **adding a FRED series without
+ruling on its retention fails CI** rather than silently landing on the rolling
+default. Adding one means: the map entry, the `CUMULATIVE_MACRO_SYMBOLS` entry
+(or a written rationale for leaving it rolling), and a row in the table above.
+
+Mechanism: `builders/backfill.py::_cumulative_prepend` unions the existing rows
+strictly older than the source window's first date with the fresh window before
+the wholesale write; overlapping dates always take the fresh value, and the
+operation is idempotent. Each prepend emits
+`MACRO_HISTORY_PREPENDED symbol=… rows=… first=…`. A declared-cumulative symbol
+whose *written* first date still moved forward is a **refusal**
+(`_cumulative_invariant_violation`) — a cumulative series never slides.
+
+The source-side detectors are unchanged and still judge the **planned** frame:
+a rolling-window slide is still reported (`MACRO_WINDOW_SLIDE`, I9256/PR1642)
+and a source truncation still refuses the write even on a cumulative symbol.
+The prepend closes the loss; it does not hide the defect.
+
+**Target state (not this):** a point-in-time store keeps every raw series
+cumulatively and applies adjustment at *read* time from a factor table, so the
+adjusted view is derived rather than stored. That is the Crucible v2 data-plane
+shape; it needs dividend factors the corporate-actions registry does not yet
+carry. Adjusted series stay rolling until v2 owns the data plane
+(`alpha-engine-config-I10054` option (a), `I9751`).
+
+---
+
 ## 3. Field catalog — units, compute, consumers
 
 Sorted by group, matching `features/registry.py::CATALOG`. Every entry
