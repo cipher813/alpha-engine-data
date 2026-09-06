@@ -341,6 +341,56 @@ _MACRO_STALENESS_TOLERANCE_TRADING_DAYS = 10
 # line a health sweep can grep for, rather than a month later.
 _MACRO_FIRST_WRITE_SIBLING_FRACTION = 0.5
 
+# ── Cumulative-retention registry (alpha-engine-config-I10054, option (a)) ────
+#
+# Every macro source is a ROLLING window: ``collectors/prices.py`` refreshes
+# the price cache as a 10-year yfinance ``auto_adjust=True`` FULL REPLACE, and
+# ``collectors/fred_history.py`` fetches a trailing ``period_years`` window the
+# same way. ``builders/backfill.py`` then writes each ArcticDB symbol wholesale
+# (``lib.write``), so the head version loses its oldest week every Saturday.
+# ArcticDB keeps prior versions, so nothing is destroyed — but no reader sees
+# anything older than the window, which silently contradicts the standing
+# "retain all archives, data is an asset" preference for exactly the series a
+# regime model trains on.
+#
+# The reason this cannot simply be fixed for every symbol is the ADJUSTMENT
+# BASIS. ``auto_adjust=True`` retroactively re-adjusts an ETF/equity series'
+# whole history on every split and dividend, so rows written last year are on a
+# different scale from rows written today; splicing them would create a silent
+# seam mid-series. That is why ``collectors/prices.py`` full-replaces rather
+# than appends in the first place, and it is the contract data#1298 established.
+#
+# FRED-sourced INDICES carry no split/dividend adjustment at all — a VIX close
+# from 2016 means today exactly what it meant in 2016 — so for those, and ONLY
+# those, prepending the rows we already hold is EXACT and seamless. This set is
+# therefore the declared cumulative-retention registry: a symbol is cumulative
+# because it is DECLARED here, never because of anything inferable from its
+# name at write time.
+#
+# It is asserted equal to ``collectors/fred_history.FRED_HISTORY_MAP``'s keys
+# by ``tests/test_macro_cumulative_history.py`` — the single declared FRED
+# source map since alpha-engine-config-I9286 — so adding a FRED series without
+# ruling on its retention fails CI rather than silently landing on the rolling
+# default. Do NOT derive this set from that map at import time: a derived set
+# can never fail that test, and the ruling that FRED == un-adjusted is a
+# JUDGEMENT about the data, not a fact about the map.
+#
+# Ruling: alpha-engine-config-I10054 option (a). Option (b) — cumulative for
+# everything, re-stating old rows onto the current basis from the corporate-
+# actions registry — is correct in principle and is the Crucible v2 data-plane
+# shape (raw series + a factor table, adjustment applied at READ time), but it
+# needs dividend factors the registry does not currently carry. Adjusted
+# ETF/equity series stay rolling until v2 owns the data plane.
+CUMULATIVE_MACRO_SYMBOLS: frozenset[str] = frozenset({
+    "VIX",     # VIXCLS      — CBOE volatility index level
+    "VIX3M",   # VXVCLS      — CBOE 3-month volatility index level
+    "TNX",     # DGS10       — 10y Treasury constant-maturity yield, percent
+    "IRX",     # DTB3        — 3-month T-bill rate, percent
+    "TWO",     # DGS2        — 2y Treasury constant-maturity yield, percent
+    "HYOAS",   # BAMLH0A0HYM2 — ICE BofA US HY index OAS, percent
+    "BAA10Y",  # BAA10Y      — Moody's BAA yield less 10y Treasury, percent
+})
+
 
 def _series_row_span(series_or_df) -> "tuple[int, pd.Timestamp | None]":
     """``(n_rows, first_date)`` for a planned Series/DataFrame."""
@@ -355,24 +405,41 @@ def _series_row_span(series_or_df) -> "tuple[int, pd.Timestamp | None]":
     return len(idx), first.normalize()
 
 
-def _existing_row_span(lib, symbol: str) -> "tuple[int, pd.Timestamp | None]":
-    """``(n_rows, first_date)`` for an existing ArcticDB symbol.
+def _read_existing_macro(lib, symbol: str):
+    """The existing ArcticDB frame for ``symbol``, or None when it has none.
 
-    Returns ``(0, None)`` when the symbol does not exist yet — a first write
-    is never a regression. Any OTHER read failure RAISES: silently treating an
-    unreadable symbol as absent is exactly how a truncating write gets waved
-    through (fail-loud rule, AGENTS.md "no silent degrade on a producer").
+    Returns None when the symbol does not exist yet, or exists but is empty —
+    a first write is never a regression. Any OTHER read failure RAISES:
+    silently treating an unreadable symbol as absent is exactly how a
+    truncating write gets waved through (fail-loud rule, AGENTS.md "no silent
+    degrade on a producer").
     """
     try:
         df = lib.read(symbol).data
     except Exception as exc:
         if _symbol_absent(lib, symbol):
-            return 0, None
+            return None
         raise RuntimeError(
             f"Macro history guard: could not read existing ArcticDB symbol "
             f"{symbol!r} to check for truncation: {exc}"
         ) from exc
     if df is None or df.empty:
+        return None
+    return df
+
+
+def _existing_row_span(lib, symbol: str) -> "tuple[int, pd.Timestamp | None]":
+    """``(n_rows, first_date)`` for an existing ArcticDB symbol.
+
+    Returns ``(0, None)`` when the symbol does not exist yet — see
+    ``_read_existing_macro`` for the fail-loud read contract.
+    """
+    return _existing_span_of(_read_existing_macro(lib, symbol))
+
+
+def _existing_span_of(df) -> "tuple[int, pd.Timestamp | None]":
+    """``(n_rows, first_date)`` for an already-read existing frame."""
+    if df is None or len(df) == 0:
         return 0, None
     first = pd.Timestamp(df.index[0])
     if first.tzinfo is not None:
@@ -396,6 +463,7 @@ def _history_regression(
     planned,
     existing_rows: int,
     existing_first: "pd.Timestamp | None",
+    cumulative: bool = False,
 ) -> "str | None":
     """Return a human-readable regression string, or None when the write is safe.
 
@@ -405,6 +473,17 @@ def _history_regression(
     N rows at the front because it advanced N sessions has not shrunk — and
     is itself bounded: a start that jumps more than the MAX allowance is a
     coverage change, not a slide, and is refused.
+
+    This judges the PLANNED frame — what the SOURCE produced — and it does so
+    identically for cumulative and rolling symbols. ``cumulative`` only
+    corrects the *wording* of the slide finding: for a declared-cumulative
+    symbol (``CUMULATIVE_MACRO_SYMBOLS``) the rows the window slid past are
+    restored by ``_cumulative_prepend`` before the write, so they are NOT
+    gone from ArcticDB's head version. Keeping the detector itself blind to
+    that distinction is deliberate: the prepend closes the LOSS, and a source
+    that answers 16 rows where it answered 2509 last week is still a producer
+    defect that must page (alpha-engine-config-I9256), not a defect the repair
+    is allowed to hide.
     """
     planned_rows, planned_first = _series_row_span(planned)
     if existing_rows == 0:
@@ -440,9 +519,15 @@ def _history_regression(
             "MACRO_WINDOW_SLIDE %s: history start advanced %d trading days "
             "(%s -> %s) in one rebuild — more than a weekly cadence explains "
             "(a frozen source released, or rebuilds were missed); %d rows of "
-            "history before %s are gone from ArcticDB's head version.",
+            "history before %s %s.",
             label, slide, existing_first.date(), planned_first.date(),
             max(existing_rows - planned_rows, 0), planned_first.date(),
+            (
+                "are retained by the cumulative prepend "
+                "(alpha-engine-config-I10054)"
+                if cumulative
+                else "are gone from ArcticDB's head version"
+            ),
         )
     return None
 
@@ -510,6 +595,137 @@ def _warn_if_short_first_write(lib, symbol: str, df: "pd.DataFrame") -> None:
         )
 
 
+def _naive_normalized_index(idx) -> "pd.DatetimeIndex":
+    """``idx`` as a tz-naive, midnight-normalized DatetimeIndex."""
+    out = pd.DatetimeIndex(idx)
+    if out.tz is not None:
+        out = out.tz_convert("UTC").tz_localize(None)
+    return out.normalize()
+
+
+def _cumulative_prepend(symbol: str, existing, planned):
+    """Prepend the existing rows strictly older than ``planned``'s first date.
+
+    alpha-engine-config-I10054 option (a). For a symbol declared in
+    ``CUMULATIVE_MACRO_SYMBOLS`` — un-adjusted, FRED-sourced indices, where
+    splicing is EXACT because no split/dividend re-adjustment ever moves an
+    old row's scale — the wholesale ``lib.write`` becomes the union
+    ``(existing rows older than planned_first) ∪ planned`` instead of the
+    rolling source window alone. Overlapping dates always take the PLANNED
+    (fresh) value: only strictly-older rows are taken from ArcticDB, and the
+    de-duplication below keeps the last occurrence as a second line of
+    defence. The result is idempotent — a second run over the same source
+    finds the same union already at the head and reproduces it exactly.
+
+    Everything not declared cumulative (SPY, GLD, USO, XL*, the sub-sector
+    ETFs) is returned untouched and stays rolling: ``auto_adjust=True``
+    retroactively re-adjusts those series, so old rows are on a different
+    scale and splicing them would create a silent mid-series seam.
+
+    Returns ``(frame_to_write, n_prepended, first_prepended_date)``.
+    """
+    if symbol not in CUMULATIVE_MACRO_SYMBOLS or existing is None or len(existing) == 0:
+        return planned, 0, None
+
+    _, planned_first = _series_row_span(planned)
+    if planned_first is None:
+        return planned, 0, None
+
+    existing_idx = _naive_normalized_index(existing.index)
+    older_mask = existing_idx < planned_first
+    if not bool(older_mask.any()):
+        return planned, 0, None
+
+    older = existing.loc[older_mask]
+    older = older.set_axis(existing_idx[older_mask], axis=0)
+
+    # Shape alignment. A column set that no longer matches means the macro
+    # write schema changed under an existing symbol; splicing across that
+    # would fabricate NaN columns, so the prepend is SKIPPED and said so
+    # loudly. Skipping is safe rather than a silent degrade because the
+    # cumulative invariant asserted by the caller then refuses the write
+    # outright — the loss cannot pass unnoticed either way.
+    if isinstance(planned, pd.DataFrame):
+        if not isinstance(older, pd.DataFrame) or set(older.columns) != set(planned.columns):
+            log.warning(
+                "MACRO_HISTORY_PREPEND_SKIPPED symbol=%s reason=column_mismatch "
+                "existing=%s planned=%s — see alpha-engine-config-I10054.",
+                symbol,
+                sorted(getattr(older, "columns", [])),
+                sorted(planned.columns),
+            )
+            return planned, 0, None
+        older = older[list(planned.columns)]
+    else:
+        # A planned Series (the preflight's shape). Take the matching column
+        # from the stored frame, or the frame's single column.
+        if isinstance(older, pd.DataFrame):
+            candidates = [c for c in (planned.name, "Close") if c in older.columns]
+            if candidates:
+                older = older[candidates[0]]
+            elif older.shape[1] == 1:
+                older = older.iloc[:, 0]
+            else:
+                log.warning(
+                    "MACRO_HISTORY_PREPEND_SKIPPED symbol=%s reason=ambiguous_column "
+                    "existing=%s — see alpha-engine-config-I10054.",
+                    symbol, sorted(older.columns),
+                )
+                return planned, 0, None
+        older = older.rename(planned.name)
+
+    planned_normalized = planned.set_axis(_naive_normalized_index(planned.index), axis=0)
+    merged = pd.concat([older, planned_normalized])
+    merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+    merged.index.name = planned.index.name or "date"
+
+    n_prepended = len(older)
+    first_prepended = pd.Timestamp(older.index[0]).date()
+    log.info(
+        "MACRO_HISTORY_PREPENDED symbol=%s rows=%d first=%s planned_first=%s total=%s",
+        symbol, n_prepended, first_prepended, planned_first.date(), len(merged),
+    )
+    return merged, n_prepended, first_prepended
+
+
+def _cumulative_invariant_violation(
+    symbol: str,
+    to_write,
+    existing_rows: int,
+    existing_first: "pd.Timestamp | None",
+) -> "str | None":
+    """Refuse a declared-cumulative symbol whose WRITTEN series still slides.
+
+    The whole point of ``CUMULATIVE_MACRO_SYMBOLS`` is that the head version
+    of these symbols never loses a row it once held, so any forward movement
+    of the written first date — or any net row loss beyond the restatement
+    tolerance — means the prepend did not do its job (a skipped prepend, an
+    unreadable existing frame, a future call site that bypassed it). That is
+    a refusal, not a warning: publishing a truncated head under a cumulative
+    contract is exactly the silent loss this closes.
+    """
+    if symbol not in CUMULATIVE_MACRO_SYMBOLS or existing_rows == 0:
+        return None
+    written_rows, written_first = _series_row_span(to_write)
+    if (
+        written_first is not None
+        and existing_first is not None
+        and written_first > existing_first
+    ):
+        return (
+            f"macro.{symbol}: written_first={written_first.date()} > "
+            f"existing_first={existing_first.date()} on a symbol declared "
+            f"CUMULATIVE — a cumulative series never slides"
+        )
+    if written_rows < existing_rows - _MACRO_HISTORY_SHRINK_TOLERANCE_ROWS:
+        return (
+            f"macro.{symbol}: written_rows={written_rows} < "
+            f"existing_rows={existing_rows} on a symbol declared CUMULATIVE "
+            f"(tolerance {_MACRO_HISTORY_SHRINK_TOLERANCE_ROWS})"
+        )
+    return None
+
+
 def _write_macro_series_no_shrink(
     lib, symbol: str, df: "pd.DataFrame", reference_date: "str | None" = None,
 ) -> None:
@@ -529,8 +745,12 @@ def _write_macro_series_no_shrink(
     publish. ``reference_date=None`` skips the staleness half of the check
     (no run_date known to the caller) but still enforces no-shrink.
     """
-    existing_rows, existing_first = _existing_row_span(lib, symbol)
-    regression = _history_regression(f"macro.{symbol}", df, existing_rows, existing_first)
+    existing = _read_existing_macro(lib, symbol)
+    existing_rows, existing_first = _existing_span_of(existing)
+    cumulative = symbol in CUMULATIVE_MACRO_SYMBOLS
+    regression = _history_regression(
+        f"macro.{symbol}", df, existing_rows, existing_first, cumulative=cumulative,
+    )
     if regression is not None:
         raise RuntimeError(
             "Macro write refused — it would TRUNCATE an existing series. "
@@ -556,7 +776,22 @@ def _write_macro_series_no_shrink(
         )
     if existing_rows == 0:
         _warn_if_short_first_write(lib, symbol, df)
-    lib.write(symbol, df)
+    # alpha-engine-config-I10054 option (a): un-adjusted (FRED-sourced) series
+    # are cumulative — union the rows we already hold that predate the source
+    # window with the fresh window, so the head version never loses history.
+    # Adjusted ETF/equity series fall through untouched and stay rolling.
+    to_write, _, _ = _cumulative_prepend(symbol, existing, df)
+    violation = _cumulative_invariant_violation(
+        symbol, to_write, existing_rows, existing_first,
+    )
+    if violation is not None:
+        raise RuntimeError(
+            "Macro write refused — it would truncate a series declared "
+            f"CUMULATIVE. {violation}. The rows should have been restored by "
+            "``_cumulative_prepend``; check the MACRO_HISTORY_PREPEND_SKIPPED "
+            "log line for why they were not. See alpha-engine-config-I10054."
+        )
+    lib.write(symbol, to_write)
 
 
 def _assert_no_arctic_regression(
@@ -617,7 +852,10 @@ def _assert_no_arctic_regression(
         # every row before last month — which is exactly how VIX3M went from
         # 2509 rows to 16 while passing this preflight clean twice.
         existing_rows, existing_first = _existing_row_span(macro_lib, key)
-        hist = _history_regression(f"macro.{key}", series, existing_rows, existing_first)
+        hist = _history_regression(
+            f"macro.{key}", series, existing_rows, existing_first,
+            cumulative=key in CUMULATIVE_MACRO_SYMBOLS,
+        )
         if hist is not None:
             regressions.append(hist)
         # STALENESS regression (alpha-engine-config-I9287). Neither check
