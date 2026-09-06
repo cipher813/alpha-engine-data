@@ -75,6 +75,7 @@ exception path is a CW Logs-level surface.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -1525,8 +1526,78 @@ def _prefix_has_ever_been_written(
         return None
 
 
+# ── Per-run LIST cache (alpha-engine-config-I9206) ──────────────────────────
+#
+# MEASURED 2026-09-06 from the laptop against the live registry: for every
+# TEMPLATED spec, `check_freshness` LISTs the whole `_listable_prefix`. Summed
+# per spec that is 106.7s of LISTing; done ONCE per distinct (bucket, prefix)
+# it is 9.7s. The `_prefix_has_ever_been_written` probes are NOT the cost (17
+# probes, 3.0s total). That difference is the whole regression: the daily
+# 12:00 UTC sweep ran in 71s on 2026-08-22, ~100-112s on 08-27..08-31, and has
+# hit its 120s timeout every day since 2026-09-01 (3 Errors/day = the initial
+# invocation plus two async retries), latching
+# `alpha-engine-lambda-errors-freshness-monitor` and
+# `alpha-engine-watch-plane-freshness-monitor-errors` daily.
+#
+# The fix is a per-run dict THE CALLER OWNS, threaded into `check_freshness`.
+# It is not module-level state: a Lambda container is reused across days, and a
+# LIST result cached beyond one invocation would answer a freshness question
+# with yesterday's listing — the exact inversion this monitor exists to catch.
+_CHECK_FRESHNESS_ACCEPTS_LIST_CACHE = (
+    "list_cache" in inspect.signature(check_freshness).parameters
+)
+
+_LIST_CACHE_UNAVAILABLE_WARNING = (
+    "list cache unavailable: installed nousergon-lib predates "
+    "check_freshness(list_cache=); bump the pin — alpha-engine-config-I9206"
+)
+
+
+def _installed_nousergon_lib_version() -> str:
+    """Best-effort version string for the degradation warning only.
+
+    Never raises and never gates behaviour: the capability probe above is the
+    decision, this is the label the operator reads next to it.
+    """
+    try:
+        from importlib.metadata import version
+
+        return version("nousergon-lib")
+    except Exception:  # noqa: BLE001 — a log LABEL, not a decision
+        return "unknown"
+
+
+def _new_list_cache() -> dict:
+    """One LIST cache for one pass, plus the honest report when it is inert.
+
+    FAIL-LOUD carve-out (the repo's default is RAISE, and this is a writer of
+    nothing — a reader):
+      (a) failure mode swallowed: the pinned nousergon-lib predates the
+          `list_cache=` keyword, so every templated spec LISTs its prefix again
+          and the pass runs ~10x its LIST budget — i.e. straight back into the
+          120s timeout this change exists to remove;
+      (b) why the primary deliverable survives: `check_freshness` is called
+          exactly as before and every freshness VERDICT is identical; only the
+          duration degrades;
+      (c) recording surface: this WARNING, emitted once per pass into the
+          Lambda's CloudWatch log group, naming the installed version and the
+          tracked follow-up. A degradation nobody can read is not a
+          degradation, it is a silence.
+    """
+    if not _CHECK_FRESHNESS_ACCEPTS_LIST_CACHE:
+        logger.warning(
+            "%s (installed nousergon-lib==%s)",
+            _LIST_CACHE_UNAVAILABLE_WARNING,
+            _installed_nousergon_lib_version(),
+        )
+    return {}
+
+
 def _check_one(
-    s3_client: Any, spec: ArtifactSpec, now: datetime
+    s3_client: Any,
+    spec: ArtifactSpec,
+    now: datetime,
+    list_cache: dict | None = None,
 ) -> tuple[CheckResult, Exception | None]:
     """Wrap :func:`check_freshness` with a per-spec exception trap.
 
@@ -1534,8 +1605,14 @@ def _check_one(
     ``(synthesized_probe_failed_result, exc)`` on a per-spec error
     (e.g., a malformed key template that fails ``str.format``,
     a transient network blip the substrate didn't classify).
+
+    ``list_cache`` (alpha-engine-config-I9206) is the caller-owned per-run LIST
+    cache. It is threaded only when the installed substrate accepts it; see
+    :func:`_new_list_cache` for what happens when it does not.
     """
     try:
+        if _CHECK_FRESHNESS_ACCEPTS_LIST_CACHE:
+            return check_freshness(s3_client, spec, now, list_cache=list_cache), None
         return check_freshness(s3_client, spec, now), None
     except Exception as exc:  # noqa: BLE001 — per-spec resilience
         result = CheckResult(
@@ -4062,6 +4139,10 @@ def _handle_intraday(s3_client: Any, now: datetime, started_at: float) -> dict:
         remediation_by_id=remediation_by_id,
         suppression_by_id=suppression_by_id,
         declared_off_by_id=declared_off_by_id,
+        # config-I9206 — one cache per INVOCATION, created here and discarded
+        # with the pass. The intraday rule probes two rows, so it gains little;
+        # it is threaded so there is exactly one way check_freshness is called.
+        list_cache=_new_list_cache(),
     )
 
     duration_seconds = round(time.time() - started_at, 2)
@@ -4096,6 +4177,7 @@ def _run_probe_pass(
     declared_off_by_id: dict[str, dict[str, Any]] | None = None,
     prev_issue_filed: dict[str, str] | None = None,
     prev_episode_state: dict[str, dict[str, str]] | None = None,
+    list_cache: dict | None = None,
 ) -> tuple[
     list[tuple[ArtifactSpec, CheckResult]], int, int, int, dict[str, int],
     dict[str, Any],
@@ -4146,6 +4228,11 @@ def _run_probe_pass(
     # pass; resolutions are per-artifact and cached inside the state.
     prev_issue_filed = prev_issue_filed or {}
     prev_episode_state = prev_episode_state or {}
+    # config-I9206 — one LIST cache for this pass. Defaulted here rather than
+    # required, so a caller that forgets it still gets ONE cache for the pass
+    # instead of none; it is never module-level (see _new_list_cache).
+    if list_cache is None:
+        list_cache = _new_list_cache()
     lookup_state = _new_lookup_state()
     known_artifact_ids = {s.artifact_id for s in specs}
     owning_by_id: dict[str, dict[str, Any]] = {}
@@ -4159,7 +4246,7 @@ def _run_probe_pass(
     # walk so a pass dispatching several recoveries reuses one client each).
     aws_clients: dict[str, Any] = {}
     for spec in specs:
-        result, exc = _check_one(s3_client, spec, now)
+        result, exc = _check_one(s3_client, spec, now, list_cache=list_cache)
         if exc is not None:
             per_spec_exceptions += 1
             logger.warning(
@@ -4434,6 +4521,12 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
      remediation_by_id, producer_trigger_by_id, declared_off_input) = (
         load_registry_with_recovery(s3, REGISTRY_BUCKET, REGISTRY_KEY)
     )
+    # config-I9206 — wall-clock phase marks. The 2026-09-01 timeout was
+    # diagnosed by re-deriving the cost from the laptop because the log line
+    # published ONE number for the whole invocation: a duration that grew from
+    # 71s to 120s over ten days, with nothing saying which phase grew. These
+    # marks make the next regression readable from the log alone.
+    t_registry_loaded = time.time()
     logger.info(
         "loaded %d specs from registry (%d with recovery specs, %d with "
         "champion-arm dynamic severity, %d flagged for issue escalation, "
@@ -4491,6 +4584,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         s3, now,
         {t for v in producer_trigger_by_id.values() for t in _declared_triggers(v)},
     )
+    t_inventory_done = time.time()
 
     # Read BEFORE the pass: the §7.4a owning-item resolution unions the
     # self-filed marker with the tracker search, and the pass is where the
@@ -4501,6 +4595,12 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     # above (no new persisted-state surface).
     prev_episode_state = _load_prev_episode_state(s3)
 
+    # config-I9206 — created once per handler invocation, never at module
+    # scope: a warm container outlives a day, and a LIST answer cached across
+    # invocations would answer today's freshness question with yesterday's
+    # listing.
+    list_cache = _new_list_cache()
+
     (pairs, alerted, dispatched, per_spec_exceptions, miss_counts,
      pass_telemetry) = _run_probe_pass(
         s3, specs, recovery_by_id, now, prev_miss_counts,
@@ -4509,7 +4609,11 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         declared_off_by_id=declared_off_by_id,
         prev_issue_filed=prev_issue_filed,
         prev_episode_state=prev_episode_state,
+        # config-I9206 — ONE cache for this invocation, owned by the handler
+        # and discarded with it.
+        list_cache=list_cache,
     )
+    t_spec_loop_done = time.time()
     owning_by_id = pass_telemetry["owning_by_id"]
     never_written_by_id = pass_telemetry.get("never_written_by_id") or {}
     episode_by_id = pass_telemetry.get("episode_by_id") or {}
@@ -4656,14 +4760,41 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         1 for aid, url in issue_filed_by_id.items()
         if url and prev_issue_filed.get(aid) is None  # newly filed, not carried forward
     )
+    # config-I9206 — the phases, published next to the total. Each is the wall
+    # clock between two marks, so they sum to the total by construction:
+    #   registry_load     — load_registry_with_recovery
+    #   producer_inventory— dynamic severity, prior-state reads, producer
+    #                       suppression, declared-off resolution, and the
+    #                       disabled-producer inventory write
+    #   spec_loop         — _run_probe_pass over every spec (the LISTs)
+    #   post_loop         — escalation, execution-loop summary, serialization,
+    #                       dashboard/heartbeat/cycle-verdict writes, dispatch
+    t_end = time.time()
+    phase_seconds = {
+        "registry_load": round(t_registry_loaded - started_at, 2),
+        "producer_inventory": round(t_inventory_done - t_registry_loaded, 2),
+        "spec_loop": round(t_spec_loop_done - t_inventory_done, 2),
+        "post_loop": round(t_end - t_spec_loop_done, 2),
+        "total": round(t_end - started_at, 2),
+    }
     logger.info(
         "freshness-monitor complete: %s checked, %s alerted, %s dispatched, "
-        "%s issues filed, %s per-spec exceptions, duration=%.2fs",
+        "%s issues filed, %s per-spec exceptions, duration=%.2fs | phases: "
+        "registry_load=%.2fs producer_inventory=%.2fs spec_loop=%.2fs "
+        "post_loop=%.2fs total=%.2fs (list_cache=%s, %d distinct prefixes)",
         heartbeat["n_entries_checked"], alerted, dispatched,
         issues_filed_this_run, per_spec_exceptions, heartbeat["duration_seconds"],
+        phase_seconds["registry_load"], phase_seconds["producer_inventory"],
+        phase_seconds["spec_loop"], phase_seconds["post_loop"],
+        phase_seconds["total"],
+        "on" if _CHECK_FRESHNESS_ACCEPTS_LIST_CACHE else "UNAVAILABLE",
+        len(list_cache),
     )
 
     return {
+        "phase_seconds": phase_seconds,
+        "list_cache_supported": _CHECK_FRESHNESS_ACCEPTS_LIST_CACHE,
+        "list_cache_entries": len(list_cache),
         "n_entries_checked": heartbeat["n_entries_checked"],
         "counts": heartbeat["counts"],
         "alerts_enabled": ALERTS_ENABLED,

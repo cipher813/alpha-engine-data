@@ -2000,7 +2000,7 @@ def test_probe_pass_miss_counter_increments_and_resets(fake_s3, monkeypatch,
     from nousergon_lib.artifact_freshness import CheckResult
     spec, missing_result = _warning_spec_and_missing_result(index)
     monkeypatch.setattr(index, "_check_one",
-                        lambda s3c, sp, now: (missing_result, None))
+                        lambda s3c, sp, now, **_kw: (missing_result, None))
     _pairs, _a, _d, _e, counts, _tel = index._run_probe_pass(
         fake_s3, [spec], {}, fixed_now, {"champion_feed": 2})
     assert counts == {"champion_feed": 3}
@@ -2008,7 +2008,7 @@ def test_probe_pass_miss_counter_increments_and_resets(fake_s3, monkeypatch,
     fresh_result = CheckResult(
         state="fresh", reason="ok", canonical_key=spec.s3_key_template)
     monkeypatch.setattr(index, "_check_one",
-                        lambda s3c, sp, now: (fresh_result, None))
+                        lambda s3c, sp, now, **_kw: (fresh_result, None))
     _pairs, _a, _d, _e, counts, _tel = index._run_probe_pass(
         fake_s3, [spec], {}, fixed_now, {"champion_feed": 7})
     assert counts == {"champion_feed": 0}
@@ -2026,7 +2026,7 @@ def test_event_driven_row_probes_its_own_key_for_never_written(fake_s3, monkeypa
     spec, fresh_result = _event_driven_pair(index, "thinktank_inst_ownership",
                                             "thinktank_coverage_ledger")
     monkeypatch.setattr(index, "_check_one",
-                        lambda s3c, sp, now: (fresh_result, None))
+                        lambda s3c, sp, now, **_kw: (fresh_result, None))
     fake_s3.list_objects_v2 = mock.Mock(return_value={"KeyCount": 0})
     _pairs, _a, _d, _e, _counts, telemetry = index._run_probe_pass(
         fake_s3, [spec], {}, fixed_now)
@@ -2043,7 +2043,7 @@ def test_event_driven_row_confirmed_written_is_not_flagged(fake_s3, monkeypatch,
     spec, fresh_result = _event_driven_pair(index, "thinktank_inst_ownership",
                                             "thinktank_coverage_ledger")
     monkeypatch.setattr(index, "_check_one",
-                        lambda s3c, sp, now: (fresh_result, None))
+                        lambda s3c, sp, now, **_kw: (fresh_result, None))
     fake_s3.list_objects_v2 = mock.Mock(return_value={"KeyCount": 1})
     _pairs, _a, _d, _e, _counts, telemetry = index._run_probe_pass(
         fake_s3, [spec], {}, fixed_now)
@@ -5299,3 +5299,152 @@ def test_a_row_with_no_declaration_carries_the_fields_as_false_and_none(
     assert row["declared_off_suppressed"] is False
     assert row["days_declared_off"] is None
     assert row["console_state"] is None
+
+
+# ── Per-run LIST cache + phase timing (alpha-engine-config-I9206) ────────────
+#
+# The daily 12:00 UTC sweep ran in 71s on 2026-08-22, ~100-112s on
+# 08-27..08-31, and hit its 120s timeout every day from 2026-09-01 (3 Errors a
+# day: the initial invocation plus two async retries). Measured cause, from the
+# laptop against the live registry: `check_freshness` LISTs the whole
+# `_listable_prefix` for EVERY templated spec — 106.7s summed per spec against
+# 9.7s once per distinct (bucket, prefix). These tests pin the three things
+# that make that fix real: the cache exists once per invocation, its absence is
+# RECORDED rather than silent, and the next regression is readable from the log.
+
+
+def _reloaded_index(monkeypatch, fake_s3, yaml_registry_body, fixed_now):
+    import importlib
+    import index
+
+    monkeypatch.delenv("FRESHNESS_MONITOR_ENABLED", raising=False)
+    fake_s3._registry_body = yaml_registry_body
+    importlib.reload(index)
+    _patch_now(monkeypatch, fixed_now)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
+    monkeypatch.setattr(
+        index, "publish", mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    )
+    return index
+
+
+def test_one_list_cache_is_created_per_invocation_and_threaded_to_every_spec(
+    fake_s3, monkeypatch, yaml_registry_body, fixed_now
+):
+    """ONE cache per invocation, the SAME object for every spec in it, and a
+    DIFFERENT object on the next invocation.
+
+    The last clause is the one that matters: a module-level cache would be
+    faster still and would answer today's freshness question with yesterday's
+    listing, which is the inversion this monitor exists to catch."""
+    from nousergon_lib.artifact_freshness import CheckResult
+
+    index = _reloaded_index(monkeypatch, fake_s3, yaml_registry_body, fixed_now)
+    monkeypatch.setattr(index, "_CHECK_FRESHNESS_ACCEPTS_LIST_CACHE", True)
+
+    seen: list[list[int]] = []
+
+    def fake_check_freshness(s3c, spec, now, *, list_cache=None):
+        assert list_cache is not None, "the cache must be threaded, not dropped"
+        seen[-1].append(id(list_cache))
+        list_cache["probed"] = True
+        return CheckResult(
+            state="fresh", reason="ok", canonical_key=spec.s3_key_template
+        )
+
+    monkeypatch.setattr(index, "check_freshness", fake_check_freshness)
+
+    seen.append([])
+    first = index.handler({}, None)
+    assert len(set(seen[-1])) == 1, "every spec in a pass shares one cache"
+    assert len(seen[-1]) == first["n_entries_checked"] > 1
+
+    seen.append([])
+    index.handler({}, None)
+    assert len(set(seen[-1])) == 1
+    assert set(seen[-2]).isdisjoint(seen[-1]), (
+        "a cache surviving into the next invocation would serve a stale listing"
+    )
+    assert first["list_cache_supported"] is True
+    assert first["list_cache_entries"] == 1
+
+
+def test_the_intraday_pass_owns_its_own_cache_too(
+    fake_s3, monkeypatch, yaml_registry_body, fixed_now
+):
+    """One way check_freshness is called, not two."""
+    from nousergon_lib.artifact_freshness import CheckResult
+
+    index = _reloaded_index(monkeypatch, fake_s3, yaml_registry_body, fixed_now)
+    monkeypatch.setattr(index, "_CHECK_FRESHNESS_ACCEPTS_LIST_CACHE", True)
+    seen: list[int] = []
+
+    def fake_check_freshness(s3c, spec, now, *, list_cache=None):
+        assert list_cache is not None
+        seen.append(id(list_cache))
+        return CheckResult(
+            state="fresh", reason="ok", canonical_key=spec.s3_key_template
+        )
+
+    monkeypatch.setattr(index, "check_freshness", fake_check_freshness)
+    monkeypatch.setattr(index, "INTRADAY_ARTIFACT_IDS", {"probe_fresh"})
+    index.handler({"mode": "intraday"}, None)
+    assert seen and len(set(seen)) == 1
+
+
+def test_an_unsupported_substrate_degrades_loudly_exactly_once(
+    fake_s3, monkeypatch, yaml_registry_body, fixed_now, caplog
+):
+    """The fail-loud obligation. A pin that predates `list_cache=` must not
+    degrade in silence: the call still happens (every verdict identical), and
+    the degradation is a RECORDED fact naming the pin and the follow-up —
+    once per pass, not once per spec across 185 specs."""
+    index = _reloaded_index(monkeypatch, fake_s3, yaml_registry_body, fixed_now)
+    monkeypatch.setattr(index, "_CHECK_FRESHNESS_ACCEPTS_LIST_CACHE", False)
+
+    with caplog.at_level("WARNING"):
+        result = index.handler({}, None)
+
+    warnings = [
+        r for r in caplog.records
+        if index._LIST_CACHE_UNAVAILABLE_WARNING in r.getMessage()
+    ]
+    assert len(warnings) == 1, [w.getMessage() for w in warnings]
+    text = warnings[0].getMessage()
+    assert "nousergon-lib" in text and "alpha-engine-config-I9206" in text
+    # The pass still ran and still produced verdicts — only the duration
+    # degrades, never the answer.
+    assert result["n_entries_checked"] > 0
+    assert result["list_cache_supported"] is False
+
+
+def test_the_complete_line_publishes_the_phase_breakdown(
+    fake_s3, monkeypatch, yaml_registry_body, fixed_now, caplog
+):
+    """The 2026-09-01 timeout had to be re-derived from the laptop because the
+    log published ONE number for the whole invocation. The phases are published
+    so the next regression is readable from the log alone, and they sum to the
+    total by construction."""
+    index = _reloaded_index(monkeypatch, fake_s3, yaml_registry_body, fixed_now)
+
+    with caplog.at_level("INFO"):
+        result = index.handler({}, None)
+
+    phases = result["phase_seconds"]
+    assert set(phases) == {
+        "registry_load", "producer_inventory", "spec_loop", "post_loop", "total",
+    }
+    for name, value in phases.items():
+        assert isinstance(value, float), name
+        assert value >= 0.0, name
+    parts = phases["registry_load"] + phases["producer_inventory"] + \
+        phases["spec_loop"] + phases["post_loop"]
+    assert abs(parts - phases["total"]) < 0.05, phases
+
+    line = next(
+        r.getMessage() for r in caplog.records
+        if r.getMessage().startswith("freshness-monitor complete:")
+    )
+    for token in ("registry_load=", "producer_inventory=", "spec_loop=",
+                  "post_loop=", "total=", "list_cache="):
+        assert token in line, (token, line)
