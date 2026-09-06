@@ -389,3 +389,74 @@ def test_a_malformed_declaration_is_dropped_and_reported_never_half_applied(stag
     assert upstream_dependencies(bad) == {}
     findings = upstream_dependency_disagreement(stages, bad)
     assert findings and "missing prefix" in findings[0]
+
+
+# ── The dedicated-box acknowledgement is graded BOTH ways (I9329) ────────────
+
+
+def test_the_dedicated_box_declaration_and_the_definition_agree_today(stages, manifest):
+    """Same obligation as the no-dry-path set: the live definition and the
+    manifest must agree, in both directions, at merge time."""
+    assert manifest_disagreement(stages, manifest) == []
+    declared = {e["stage"] for e in manifest["dedicated_box_stages"]}
+    assert declared == {"ResearchPredictorParallel.EvalJudgeProcess"}
+    derived_unsweepable = {s.name for s in stages if s.classification == UNSWEEPABLE}
+    assert declared <= derived_unsweepable
+
+
+def test_a_dedicated_box_entry_for_a_stage_that_became_sweepable_is_a_finding(
+    definition, bindings, tmp_path
+):
+    """The stale direction. Give every launcher a real file on disk and the
+    acknowledged stage is no longer UNSWEEPABLE — the entry now suppresses
+    nothing and must be dropped, loudly."""
+    reachable = derive_stages(definition, bindings, CONTEXT, checkout_root="/nonexistent")
+    for stage in reachable:
+        if not (stage.box_dir and stage.launcher):
+            continue
+        path = tmp_path / stage.box_dir / stage.launcher
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/bash\n# --preflight-only\n")
+    sweepable_stages = derive_stages(definition, bindings, CONTEXT,
+                                     checkout_root=str(tmp_path))
+    ack = {"dedicated_box_stages": [
+        {"stage": "ResearchPredictorParallel.EvalJudgeProcess",
+         "acknowledged": "2026-09-06", "reason": "r"}
+    ]}
+    findings = [f for f in manifest_disagreement(sweepable_stages, ack)
+                if "ResearchPredictorParallel.EvalJudgeProcess" in f]
+    assert findings and "no longer agrees" in findings[0]
+    assert "'sweepable'" in findings[0], (
+        "the finding names what the definition derives now, so the operator "
+        "does not have to re-derive it"
+    )
+
+
+def test_a_dedicated_box_entry_for_a_stage_the_definition_lost_is_a_finding(stages):
+    ack = {"dedicated_box_stages": [
+        {"stage": "StageThatWasRenamed", "acknowledged": "2026-09-06", "reason": "r"}
+    ]}
+    findings = [f for f in manifest_disagreement(stages, ack)
+                if "StageThatWasRenamed" in f]
+    assert findings and "no longer in the definition" in findings[0]
+
+
+def test_an_unacknowledged_unsweepable_stage_raises_no_dedicated_box_finding(stages):
+    """The declaration can never hide a defect: an UNSWEEPABLE stage nobody
+    acknowledged keeps today's behaviour — no finding here, and the sweep's own
+    coverage_defect count fails the run."""
+    assert any(s.classification == UNSWEEPABLE for s in stages)
+    findings = manifest_disagreement(stages, {"dedicated_box_stages": []})
+    assert not [f for f in findings if "dedicated-box" in f]
+
+
+def test_a_stage_acknowledged_in_both_blocks_is_a_contradiction(stages):
+    no_dry = next(s for s in stages if s.classification is NO_DRY_PATH)
+    both = {
+        "no_dry_path_stages": [{"stage": no_dry.name, "reason": "r",
+                                "acknowledged": "2026-09-06"}],
+        "dedicated_box_stages": [{"stage": no_dry.name, "reason": "r",
+                                  "acknowledged": "2026-09-06"}],
+    }
+    findings = manifest_disagreement(stages, both)
+    assert any("contradictory claims" in f for f in findings)
