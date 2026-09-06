@@ -590,7 +590,16 @@ def test_a_missing_verdict_is_filled_in_as_not_attempted_and_fails_the_run():
 
 def _fake_checkout(root: pathlib.Path) -> pathlib.Path:
     """A checkout where every declared launcher exists and implements the flag,
-    so the live definition's stages classify SWEEPABLE and actually run."""
+    so the live definition's stages classify SWEEPABLE and actually run.
+
+    With ONE deliberate exception: a stage acknowledged in the manifest's
+    `dedicated_box_stages` runs on a box its own dispatcher creates, and the
+    sweep's launcher box does not carry that checkout at all. Fabricating its
+    launcher here would model a box that does not exist and would make the
+    acknowledgement read as stale on every run — which is exactly the
+    stale-entry finding manifest_disagreement is supposed to raise, so the
+    fixture must reproduce the real box's contents rather than defeat it.
+    """
     from infrastructure.preflight_sweep_stages import (
         derive_shell_run_bindings,
         derive_stages,
@@ -600,10 +609,13 @@ def _fake_checkout(root: pathlib.Path) -> pathlib.Path:
 
     definition = json.loads(SF_PATH.read_text())
     manifest = load_manifest(MANIFEST_PATH)
+    dedicated = {
+        entry["stage"] for entry in (manifest.get("dedicated_box_stages") or [])
+    }
     bindings = apply_map_bindings(derive_shell_run_bindings(definition), manifest)
     bindings.setdefault("run_date", "2026-08-14")
     for stage in derive_stages(definition, bindings, {"Execution": {"Name": "t", "Id": "t"}}, "/x"):
-        if not (stage.box_dir and stage.launcher):
+        if not (stage.box_dir and stage.launcher) or stage.name in dedicated:
             continue
         path = root / stage.box_dir / stage.launcher
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1056,3 +1068,181 @@ def test_the_derive_only_rehearsal_reports_no_blocking_finding_on_the_real_pipel
     out = json.loads(proc.stdout)
     assert out["coverage_findings"] == []
     assert len(out["stages"]) > 0
+
+
+# ── Dedicated-box stages: acknowledged, never silently excluded (I9329) ──────
+#
+# ResearchPredictorParallel.EvalJudgeProcess threads $.preflight_args and its
+# launcher DOES implement --preflight-only, but nousergon-data-PR1593 moved it
+# onto a spot box that its own dispatcher bootstraps. The sweep's launcher box
+# has no crucible-research checkout and no .venv there, so derivation reports
+# "launcher not present in the checkout" and the stage classified
+# coverage_defect — the SOLE failure input on 7 consecutive nightly runs
+# (2026-08-30..2026-09-06), one short of the streak threshold of 8. The fix is
+# a DECLARED acknowledgement with its own unsweepable kind, not an exclusion:
+# these tests hold the line that acknowledging a gap never hides it.
+
+DEDICATED_STAGE = "ResearchPredictorParallel.EvalJudgeProcess"
+
+
+def _dedicated_result(report):
+    return next(r for r in report.results if r["stage"] == DEDICATED_STAGE)
+
+
+def test_the_dedicated_box_stage_is_acknowledged_in_the_live_manifest():
+    """The declaration is in the manifest, not in this file — a test that
+    carries its own manifest proves the parser works and nothing about the
+    pipeline."""
+    manifest = json.loads(MANIFEST_PATH.read_text())
+    declared = {e["stage"]: e for e in manifest["dedicated_box_stages"]}
+    assert DEDICATED_STAGE in declared
+    entry = declared[DEDICATED_STAGE]
+    assert entry["acknowledged"], "an acknowledgement with no date cannot age"
+    assert entry["reason"].strip(), "an acknowledgement with no reason grades nothing"
+
+
+def test_an_acknowledged_dedicated_box_stage_keeps_its_own_kind_and_does_not_fail_the_run(
+    tmp_path,
+):
+    """The whole deliverable in one test: everything else passes, the run is
+    OK, and the gap is still carried by its own kind rather than by silence."""
+    root = _fake_checkout(tmp_path)
+    run_date = _sweep_run_date()
+    aws = FakeAws(listing={f"backtest/{run_date}/": [
+        {"Key": f"backtest/{run_date}/results/backtest.parquet", "Size": 8123},
+    ]})
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", aws=aws,
+                      runner=_completed(0))
+
+    row = _dedicated_result(report)
+    assert row["verdict"] == ps.UNSWEEPABLE_VERDICT
+    assert row["unsweepable_kind"] == ps.UNSWEEPABLE_DEDICATED_BOX
+    assert row["acknowledged_reason"], "the row must carry the written reason"
+    # Out of the count that fails the run, and into its own.
+    assert report.stages_unsweepable_dedicated_box == 1
+    assert report.stages_unsweepable_coverage_defect == 0
+    assert report.stages_failed == 0
+    assert report.outcome == ps.OUTCOME_OK
+
+
+def test_the_dedicated_box_gap_is_named_on_every_surface_on_that_ok_run(tmp_path):
+    """OK is never bought by hiding the gap: a non-blocking finding, the
+    notification's acknowledged-gaps block, the declared-stage row, and an
+    ATTENTION console row — none of them green, none of them absent."""
+    root = _fake_checkout(tmp_path)
+    run_date = _sweep_run_date()
+    aws = FakeAws(listing={f"backtest/{run_date}/": [
+        {"Key": f"backtest/{run_date}/results/backtest.parquet", "Size": 8123},
+    ]})
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", aws=aws,
+                      runner=_completed(0))
+    assert report.outcome == ps.OUTCOME_OK
+
+    findings = [f for f in report.coverage_findings
+                if f.get("kind") == ps.FINDING_DEDICATED_BOX]
+    assert len(findings) == 1
+    assert findings[0]["stage"] == DEDICATED_STAGE
+    assert findings[0]["blocking"] is False, (
+        "a declared dedicated-box gap must not fail the run"
+    )
+
+    declared = {d["stage"]: d for d in report.declared_stages}
+    assert declared[DEDICATED_STAGE]["dedicated_box_acknowledged"] is True
+
+    ps.emit(report, aws, "arn:sns")
+    _subject, body = aws.notifications[-1]
+    assert DEDICATED_STAGE in body
+    assert "COVERAGE GAPS (acknowledged" in body
+    assert "dedicated-box 1" in body, "the counter line names the new kind"
+
+    envelope = stage_envelope(_dedicated_result(report), "t", "now",
+                              load_cadence(CADENCE_PATH))
+    assert envelope["status"] == ENVELOPE_ATTENTION, (
+        "unreachable is never green and never a silent error"
+    )
+    rollup = rollup_envelope(report.to_dict(), load_cadence(CADENCE_PATH), "now")
+    assert rollup["stages_unsweepable_dedicated_box"] == 1
+    assert rollup["dedicated_box_stages"] == [DEDICATED_STAGE]
+    assert rollup["status"] == ENVELOPE_ATTENTION
+
+
+def test_an_acknowledged_dedicated_box_stage_never_escalates_the_streak():
+    """It is unsweepable on every run BY CONSTRUCTION, so a streak would report
+    the declaration back as a discovery on a schedule, forever."""
+    dedicated = ps.StageResult(
+        stage=DEDICATED_STAGE,
+        verdict=ps.UNSWEEPABLE_VERDICT,
+        unsweepable_kind=ps.UNSWEEPABLE_DEDICATED_BOX,
+    )
+    defect = ps.StageResult(
+        stage="SomeOtherStage",
+        verdict=ps.UNSWEEPABLE_VERDICT,
+        unsweepable_kind=ps.UNSWEEPABLE_COVERAGE_DEFECT,
+    )
+    prior = {"streaks": {
+        DEDICATED_STAGE: {"consecutive_runs": 99, "since": "2026-08-30T08:00:00+00:00"},
+        "SomeOtherStage": {"consecutive_runs": 7, "since": "2026-08-30T08:00:00+00:00"},
+    }}
+    state, findings = update_streaks(prior, [dedicated, defect], "run", "now", 8)
+    assert DEDICATED_STAGE not in state["streaks"], (
+        "the acknowledged stage accrues no streak at all"
+    )
+    assert {f["stage"] for f in findings} == {"SomeOtherStage"}, (
+        "the real coverage defect must still escalate — the exclusion is "
+        "declared per stage, not a blanket softening"
+    )
+
+
+def test_an_unacknowledged_unsweepable_stage_is_unchanged_and_still_fails(tmp_path):
+    """The direction that must NOT move. Drop the declaration and the same
+    stage is a coverage_defect that fails the run, exactly as before."""
+    root = _fake_checkout(tmp_path)
+    manifest = json.loads(MANIFEST_PATH.read_text())
+    manifest["dedicated_box_stages"] = []
+    stripped = tmp_path / "manifest-no-ack.json"
+    stripped.write_text(json.dumps(manifest))
+    report = ps.sweep(SF_PATH, stripped, str(root), "t", runner=_completed(0))
+
+    row = _dedicated_result(report)
+    assert row["unsweepable_kind"] == ps.UNSWEEPABLE_COVERAGE_DEFECT
+    assert row["acknowledged_reason"] is None
+    assert report.stages_unsweepable_coverage_defect == 1
+    assert report.stages_unsweepable_dedicated_box == 0
+    assert report.outcome == ps.OUTCOME_FAILED
+    assert not [f for f in report.coverage_findings
+                if f.get("kind") == ps.FINDING_DEDICATED_BOX]
+
+
+def test_a_stale_dedicated_box_acknowledgement_fails_the_run(tmp_path):
+    """The acknowledgement is graded the other way too. A stage acknowledged as
+    unreachable that the sweep CAN now reach is a blocking finding — an entry
+    that outlives its cause is the silent exclusion this design exists to
+    prevent."""
+    root = _fake_checkout(tmp_path)
+    # Fabricate the launcher the real launcher box does not carry: the stage is
+    # now sweepable, so the declaration is stale.
+    manifest = json.loads(MANIFEST_PATH.read_text())
+    from infrastructure.preflight_sweep_stages import (
+        apply_map_bindings,
+        derive_shell_run_bindings,
+        derive_stages,
+    )
+    definition = json.loads(SF_PATH.read_text())
+    bindings = apply_map_bindings(derive_shell_run_bindings(definition), manifest)
+    bindings.setdefault("run_date", "2026-08-14")
+    stage = next(
+        s for s in derive_stages(definition, bindings,
+                                 {"Execution": {"Name": "t", "Id": "t"}}, "/x")
+        if s.name == DEDICATED_STAGE
+    )
+    path = root / stage.box_dir / stage.launcher
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/bash\n# --preflight-only\n")
+
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", runner=_completed(0))
+    stale = [f for f in report.coverage_findings
+             if f.get("kind") == ps.FINDING_MANIFEST_DISAGREEMENT
+             and DEDICATED_STAGE in f["finding"]]
+    assert stale, report.coverage_findings
+    assert stale[0]["blocking"] is True
+    assert report.outcome == ps.OUTCOME_FAILED

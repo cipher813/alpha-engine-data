@@ -29,16 +29,24 @@ as a pass:
                     NOT a pass and NOT a defect. The verdict vocabulary mirrors
                     ``validators/stage_output_sweep.py`` (I7167) deliberately
                     rather than inventing a parallel one.
-* ``unsweepable`` — the stage could not be exercised. TWO kinds, kept apart
-                    because one is a defect and the other is Tuesday:
+* ``unsweepable`` — the stage could not be exercised. THREE kinds, kept
+                    apart because one is a defect and the others are Tuesday:
                     ``coverage_defect`` (launcher missing, flag unimplemented,
                     command unrenderable) fails the run and pages;
                     ``upstream_pending`` (the stage reads a same-day artifact a
                     preceding stage produces, and that stage has not run for
-                    real today) does neither. The second is DECLARED per stage
-                    in ``preflight_sweep_manifest.json`` and still probed on the
-                    day — a reworded launcher error cannot reclassify a real
-                    failure, and a declaration alone cannot hide one.
+                    real today) does neither; ``dedicated_box`` (the stage is
+                    preflight-capable but runs on a box its own dispatcher
+                    creates, which the sweep's launcher box is not and cannot
+                    become) does neither either. The second and third are both
+                    DECLARED per stage in ``preflight_sweep_manifest.json``:
+                    ``upstream_pending`` is still probed on the day, so a
+                    reworded launcher error cannot reclassify a real failure,
+                    and ``dedicated_box`` is graded both ways by
+                    ``manifest_disagreement`` so an acknowledgement cannot
+                    outlive its cause. A declaration alone never hides a defect,
+                    and an acknowledged stage is NAMED on every surface — it is
+                    an acknowledgement, never a silent exclusion.
 * ``no_dry_path`` — the stage threads no ``$.preflight_args`` and is never
                     exercised at all. A verdict ROW, not just a counter: a count
                     published without its members is unactionable.
@@ -109,6 +117,15 @@ NOT_ATTEMPTED = "not_attempted"
 # the first sweep run emailed "2 failed" on a structurally unmeasurable pair.
 UNSWEEPABLE_COVERAGE_DEFECT = "coverage_defect"
 UNSWEEPABLE_UPSTREAM_PENDING = "upstream_pending"
+# The stage threads $.preflight_args and its launcher DOES implement
+# --preflight-only, but it runs on a DEDICATED box that its own dispatcher
+# bootstraps; the sweep's launcher box does not carry that checkout or its venv
+# and never will, so the stage is structurally unreachable from here however
+# healthy it is. Declared per stage in `dedicated_box_stages`, graded both ways
+# by manifest_disagreement, and named on every surface as a non-blocking
+# coverage finding. Not a defect in the sweep's denominator; not coverage
+# either. alpha-engine-config-I9329.
+UNSWEEPABLE_DEDICATED_BOX = "dedicated_box"
 
 # ── Coverage-finding kinds (closed; add by PR) ───────────────────────────────
 # Every finding carries its own `blocking` flag rather than deriving severity
@@ -120,6 +137,7 @@ FINDING_MANIFEST_DISAGREEMENT = "manifest_disagreement"
 FINDING_MAP_BINDING_DISAGREEMENT = "map_binding_disagreement"
 FINDING_UPSTREAM_DECLARATION = "upstream_declaration"
 FINDING_NO_DRY_PATH = "no_dry_path"
+FINDING_DEDICATED_BOX = "dedicated_box"
 FINDING_MISSING_VERDICT = "missing_verdict"
 
 STREAK_STATE_KEY_SUFFIX = "unsweepable_streaks.json"
@@ -195,6 +213,12 @@ class SweepReport:
     # a coverage defect fails the run, an unmet same-day upstream does not.
     stages_unsweepable_coverage_defect: int = 0
     stages_unsweepable_upstream_pending: int = 0
+    # Acknowledged dedicated-box stages: unreachable from the sweep's own box by
+    # construction, declared in `dedicated_box_stages`. Published as its own
+    # counter rather than folded into either of the two above, so the number of
+    # stages the sweep has DECLARED it cannot reach is readable on its own and
+    # cannot grow without the declaration growing with it.
+    stages_unsweepable_dedicated_box: int = 0
     stages_no_dry_path: int = 0
     # The subset of `stages_no_dry_path` with NO written acknowledgement in
     # preflight_sweep_manifest.json. The distinction decides whether the run
@@ -649,12 +673,23 @@ def update_streaks(
     A stage that produced any verdict other than ``unsweepable`` this run has
     its streak dropped: it became measurable, which is the condition the
     threshold exists to detect the absence of.
+
+    An acknowledged ``dedicated_box`` stage accrues no streak at all. The streak
+    exists to catch a stage that was expected to become measurable and never
+    did; a stage DECLARED unreachable from this box will be unsweepable on every
+    run forever by construction, so escalating it after N runs would report the
+    declaration back as a discovery, on a schedule, permanently. The gap is not
+    dropped — it is carried by the non-blocking ``dedicated_box`` coverage
+    finding, which is named on every run, and by manifest_disagreement, which
+    fails the run if the declaration ever stops matching the definition.
     """
     prior_streaks = (prior or {}).get("streaks", {}) or {}
     streaks: dict[str, Any] = {}
     findings: list[dict[str, Any]] = []
     for result in results:
         if result.verdict != UNSWEEPABLE_VERDICT:
+            continue
+        if result.unsweepable_kind == UNSWEEPABLE_DEDICATED_BOX:
             continue
         previous = prior_streaks.get(result.stage) or {}
         runs = int(previous.get("consecutive_runs", 0)) + 1
@@ -715,7 +750,8 @@ def render_notification(report: SweepReport) -> tuple[str, str]:
         subject = (
             f"[preflight-sweep] no failures — {not_covered} of {report.stages_declared} "
             f"stages not covered ({report.stages_unsweepable_upstream_pending} awaiting "
-            f"upstream / {report.stages_no_dry_path} no dry path / "
+            f"upstream / {report.stages_unsweepable_dedicated_box} dedicated box / "
+            f"{report.stages_no_dry_path} no dry path / "
             f"{report.stages_unmeasured} unmeasured) — {report.run_id}"
         )
     else:
@@ -742,7 +778,8 @@ def render_notification(report: SweepReport) -> tuple[str, str]:
         f"unmeasured {report.stages_unmeasured} | "
         f"unsweepable {report.stages_unsweepable} "
         f"(coverage-defect {report.stages_unsweepable_coverage_defect}, "
-        f"awaiting-upstream {report.stages_unsweepable_upstream_pending}) | "
+        f"awaiting-upstream {report.stages_unsweepable_upstream_pending}, "
+        f"dedicated-box {report.stages_unsweepable_dedicated_box}) | "
         f"no-dry-path {report.stages_no_dry_path} | "
         f"not-attempted {report.stages_not_attempted}",
         "",
@@ -887,6 +924,11 @@ def sweep(
         return report
 
     report.stages_declared = len(stages)
+    dedicated_box = {
+        entry["stage"]: entry
+        for entry in (manifest.get("dedicated_box_stages") or [])
+        if isinstance(entry, dict) and entry.get("stage")
+    }
     report.stages_no_dry_path = sum(1 for s in stages if s.classification == NO_DRY_PATH)
     # The declared stage list, serialised — so `declared - swept` is auditable
     # from the report alone. A scalar nobody can expand is a count published
@@ -898,6 +940,9 @@ def sweep(
             "repo": s.repo,
             "launcher": s.launcher,
             "box_dir": s.box_dir,
+            # Carried on the declared row too, so `declared - swept` can be
+            # reconciled from the report alone without opening the manifest.
+            "dedicated_box_acknowledged": s.name in dedicated_box,
         }
         for s in stages
     ]
@@ -916,16 +961,40 @@ def sweep(
     results: list[StageResult] = []
     for stage in stages:
         if stage.classification == UNSWEEPABLE:
+            # A DECLARED dedicated-box stage is unreachable from this box by
+            # construction, not by defect. It gets its own kind, stays out of
+            # the coverage-defect count and out of the streak, and is NAMED
+            # here and on every downstream surface — the acknowledgement buys a
+            # correct classification, never silence.
+            ack = dedicated_box.get(stage.name)
             results.append(
                 StageResult(
                     stage=stage.name,
                     verdict=UNSWEEPABLE_VERDICT,
-                    unsweepable_kind=UNSWEEPABLE_COVERAGE_DEFECT,
+                    unsweepable_kind=(
+                        UNSWEEPABLE_DEDICATED_BOX if ack else UNSWEEPABLE_COVERAGE_DEFECT
+                    ),
                     repo=stage.repo,
                     launcher=stage.launcher,
                     reason=stage.reason,
+                    acknowledged_reason=(ack or {}).get("reason"),
                 )
             )
+            if ack:
+                report.coverage_findings.append(
+                    _finding(
+                        FINDING_DEDICATED_BOX,
+                        (
+                            f"{stage.name} runs on a DEDICATED box the sweep does not "
+                            f"have and is never exercised by it (launcher="
+                            f"{stage.launcher or 'n/a'}, repo={stage.repo or 'n/a'}; "
+                            f"derivation said: {stage.reason}). Acknowledged "
+                            f"{ack.get('acknowledged')}: {ack['reason']}"
+                        ),
+                        blocking=False,
+                        stage=stage.name,
+                    )
+                )
         elif stage.classification == NO_DRY_PATH:
             # A verdict ROW, not just an increment. Before this, the three
             # no-dry-path stages existed in the report only as the scalar
@@ -1070,7 +1139,14 @@ def sweep(
         1
         for r in results
         if r.verdict == UNSWEEPABLE_VERDICT
-        and r.unsweepable_kind != UNSWEEPABLE_UPSTREAM_PENDING
+        and r.unsweepable_kind
+        not in (UNSWEEPABLE_UPSTREAM_PENDING, UNSWEEPABLE_DEDICATED_BOX)
+    )
+    report.stages_unsweepable_dedicated_box = sum(
+        1
+        for r in results
+        if r.verdict == UNSWEEPABLE_VERDICT
+        and r.unsweepable_kind == UNSWEEPABLE_DEDICATED_BOX
     )
     report.stages_unsweepable_upstream_pending = sum(
         1
@@ -1144,9 +1220,19 @@ def sweep(
     # verdict row and its own coverage finding, and an UNACKNOWLEDGED one both
     # raises a blocking manifest_disagreement finding and is counted in
     # stages_no_dry_path_unacknowledged above, so it still cannot be clean.
+    # An ACKNOWLEDGED dedicated-box stage is excluded from `clean` for the same
+    # reason a ratified no-dry-path stage is: it is a permanent, reviewed
+    # boundary of the denominator, not a same-day measurement gap, so gating
+    # `clean` on it would make `ok` unreachable on every possible day and stop
+    # `last_clean.json` being written at all — a status with one reachable value
+    # grades nothing. The gap is still named on every surface (its own verdict
+    # row with the acknowledgement text, its own non-blocking coverage finding),
+    # and an UNACKNOWLEDGED unsweepable stage is still counted here through
+    # stages_unsweepable_coverage_defect, so nothing can be excluded without the
+    # declaration that names it.
     clean = (
         report.stages_failed == 0
-        and report.stages_unsweepable == 0
+        and (report.stages_unsweepable - report.stages_unsweepable_dedicated_box) == 0
         and report.stages_unmeasured == 0
         and report.stages_not_attempted == 0
         and report.stages_no_dry_path_unacknowledged == 0
