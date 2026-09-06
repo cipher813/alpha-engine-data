@@ -41,10 +41,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      # alpha-engine-config-I10112 (stage 4 of I10109, ruling I9788 option b).
+      # github-actions-cfn-sf-stack-deploy replaces the shared
+      # github-actions-lambda-deploy role for this workflow. Same statements,
+      # copied verbatim; the change is WHO may assume them. On the shared role
+      # cloudformation:CreateStack, states:CreateStateMachine and iam:PassRole
+      # on alpha-engine-* are reachable by 74 workflows in 21 repos. This role's
+      # trust pins repo + refs/heads/main + this workflow's job_workflow_ref, so
+      # adding a workflow to this repo — or opening a PR that adds one — is not
+      # a path to them.
+      #
+      # The role and its inline policy are codified in
+      # nous-ergon-ops/infrastructure/iam/github-actions-cfn-sf-stack-deploy/
+      # (nous-ergon-ops-PR1078) and MUST be live before this merges — the trust
+      # policy is a privilege-boundary document that repo deliberately does not
+      # auto-apply.
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
         with:
-          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-cfn-sf-stack-deploy
           aws-region: us-east-1
 
       - name: Deploy orchestration infrastructure
