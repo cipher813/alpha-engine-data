@@ -117,9 +117,15 @@ _VERDICT_TO_STATUS = {
 # monitored is not: error. An unmet same-day upstream means the stage cannot be
 # exercised until its producer has run for real — the ordinary state on ~6 days
 # of any week: attention, never error, never green (alpha-engine-config#7323).
+# A third cause: the stage is preflight-capable but runs on a DEDICATED box the
+# sweep does not have and cannot become, declared per stage in the manifest's
+# `dedicated_box_stages`. Nothing is broken and nothing is monitored either, so
+# it renders exactly like the acknowledged no-dry-path case — ATTENTION, never
+# error, never green (alpha-engine-config-I9329).
 _UNSWEEPABLE_KIND_TO_STATUS = {
     "coverage_defect": ENVELOPE_ERROR,
     "upstream_pending": ENVELOPE_ATTENTION,
+    "dedicated_box": ENVELOPE_ATTENTION,
 }
 
 
@@ -268,7 +274,12 @@ def rollup_envelope(
     persistent = report.get("persistent_unsweepable_findings", []) or []
     coverage_defects = int(report.get("stages_unsweepable_coverage_defect", 0) or 0)
     upstream_pending = int(report.get("stages_unsweepable_upstream_pending", 0) or 0)
-    if not report.get("stages_unsweepable_coverage_defect") and not upstream_pending:
+    dedicated_box = int(report.get("stages_unsweepable_dedicated_box", 0) or 0)
+    if (
+        not report.get("stages_unsweepable_coverage_defect")
+        and not upstream_pending
+        and not dedicated_box
+    ):
         # A report predating the kind split (or the shell's could-not-measure
         # payload) carries only the total. Attribute it to the loud kind rather
         # than assume the quiet one.
@@ -284,7 +295,7 @@ def rollup_envelope(
         or unobserved
     ):
         status = ENVELOPE_ERROR
-    elif report.get("stages_unmeasured") or upstream_pending or no_dry_path:
+    elif report.get("stages_unmeasured") or upstream_pending or dedicated_box or no_dry_path:
         # Nothing is broken, but the sweep did not cover everything it declares.
         # Rendering that green is the failure mode this component exists to
         # avoid: "no data" is never green (principles.md §2.7).
@@ -313,6 +324,7 @@ def rollup_envelope(
         "stages_unsweepable": report.get("stages_unsweepable", 0),
         "stages_unsweepable_coverage_defect": coverage_defects,
         "stages_unsweepable_upstream_pending": upstream_pending,
+        "stages_unsweepable_dedicated_box": dedicated_box,
         "stages_no_dry_path": no_dry_path,
         "stages_not_attempted": report.get("stages_not_attempted", 0),
         # Named, not counted: which stages have no dry path, and which have
@@ -326,6 +338,12 @@ def rollup_envelope(
             if r.get("verdict") == "unsweepable"
             and r.get("unsweepable_kind") == "upstream_pending"
         ],
+        "dedicated_box_stages": [
+            r.get("stage")
+            for r in results
+            if r.get("verdict") == "unsweepable"
+            and r.get("unsweepable_kind") == "dedicated_box"
+        ],
         "coverage_findings": findings,
         "coverage_findings_blocking": len(blocking),
         "persistent_unsweepable_findings": persistent,
@@ -338,6 +356,7 @@ def rollup_envelope(
             f"{report.get('stages_unmeasured', 0)} unmeasured, "
             f"{coverage_defects} unsweepable (coverage defect), "
             f"{upstream_pending} awaiting upstream, "
+            f"{dedicated_box} on a dedicated box the sweep cannot reach, "
             f"{no_dry_path} with no dry path, "
             f"{unobserved} unobserved of {expected} expected "
             f"({declared} declared, {no_dry_path} acknowledged as having no dry path). "
