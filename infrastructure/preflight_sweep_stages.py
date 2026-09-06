@@ -636,6 +636,17 @@ def manifest_disagreement(stages: list[Stage], manifest: dict) -> list[str]:
     BOTH directions: a stage that quietly stopped having a dry path (the
     denominator shrank), or a manifest entry for a stage that gained one or no
     longer exists (the acknowledgement went stale). Callers fail on either.
+
+    Two acknowledged sets are graded here, not one. ``no_dry_path_stages``
+    acknowledges stages the definition gives no dry path at all;
+    ``dedicated_box_stages`` acknowledges stages that ARE preflight-capable but
+    run on a box the sweep does not have, so derivation classifies them
+    ``UNSWEEPABLE``. Both are graded in the stale direction — an acknowledgement
+    that outlives its cause is how a silent exclusion is born — and neither is
+    graded in a way that lets a declaration hide a real defect: an UNSWEEPABLE
+    stage that nobody acknowledged keeps today's behaviour (``coverage_defect``,
+    and the run fails), which is why there is no `derived - acknowledged`
+    finding for the dedicated-box set here.
     """
     derived = {s.name for s in stages if s.classification == NO_DRY_PATH}
     acknowledged = {entry["stage"] for entry in manifest.get("no_dry_path_stages", [])}
@@ -651,5 +662,39 @@ def manifest_disagreement(stages: list[Stage], manifest: dict) -> list[str]:
             f"manifest acknowledges {name!r} as having no dry path, but the definition "
             "no longer agrees (the stage gained one, was renamed, or was removed) — "
             "drop the stale entry"
+        )
+
+    # The dedicated-box set, graded the same way. A stage acknowledged as
+    # running on a box the sweep does not have, but which no longer derives as
+    # UNSWEEPABLE, has either become reachable (the acknowledgement is now
+    # suppressing nothing and should be dropped so real coverage is claimed) or
+    # changed shape underneath the entry (renamed, removed, or it lost its dry
+    # path, in which case it belongs in no_dry_path_stages instead). Either way
+    # the entry outlived its cause, which is exactly the silent exclusion a
+    # first-class acknowledgement exists to prevent.
+    derived_unsweepable = {s.name for s in stages if s.classification == UNSWEEPABLE}
+    by_name = {s.name: s for s in stages}
+    dedicated = {
+        entry["stage"]
+        for entry in (manifest.get("dedicated_box_stages") or [])
+        if isinstance(entry, dict) and entry.get("stage")
+    }
+    for name in sorted(dedicated - derived_unsweepable):
+        stage = by_name.get(name)
+        if stage is None:
+            became = "the stage is no longer in the definition (renamed or removed)"
+        else:
+            became = f"the definition now derives it {stage.classification!r}"
+        findings.append(
+            f"manifest acknowledges {name!r} as a dedicated-box stage the sweep cannot "
+            f"reach, but the definition no longer agrees — {became}. Drop the stale "
+            "entry: an acknowledgement that outlives its cause is a silent exclusion, "
+            "and while it stands the sweep claims a gap it no longer has"
+        )
+    for name in sorted(dedicated & acknowledged):
+        findings.append(
+            f"stage {name!r} is acknowledged in BOTH no_dry_path_stages and "
+            "dedicated_box_stages — the two make contradictory claims (no dry path at "
+            "all versus preflight-capable on a box the sweep lacks); keep exactly one"
         )
     return findings
