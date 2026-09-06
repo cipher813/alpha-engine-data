@@ -9,11 +9,20 @@ name: Live ArcticDB Smoke
 #
 # Cost: one tail-row S3 read per triggered run (~$0.0001).
 #
-# Auth gate: assumes the existing github-actions-lambda-deploy OIDC
-# role. That role grants S3 read on alpha-engine-research/arcticdb/*
-# (verified via `aws iam get-role-policy` 2026-05-27). Forks without
-# the OIDC trust get a clean skip rather than a failing CI status —
-# the script exits 0 when no AWS creds are in the env.
+# Auth gate: assumes github-actions-arcticdb-smoke-read, an OIDC role
+# whose entire grant is s3:GetObject on alpha-engine-research/arcticdb/*
+# plus the prefix-scoped s3:ListBucket ArcticDB needs to resolve a
+# symbol version. Forks without the OIDC trust get a clean skip rather
+# than a failing CI status — the script exits 0 when no AWS creds are
+# in the env.
+#
+# It used to assume github-actions-lambda-deploy, and that was the only
+# reason the fleet's widest CI identity — ECR push, UpdateFunctionCode,
+# CloudFormation stack update, iam:PassRole, ssm:SendCommand onto the
+# dashboard box — trusted a `pull_request` sub at all. Every other entry
+# in that role's trust is `ref:refs/heads/main`; this one was assumable
+# from a branch nobody had reviewed. alpha-engine-config-I10110 (stage 2
+# of I10109, ruling I9788 option b) split it out.
 
 on:
   pull_request:
@@ -44,7 +53,7 @@ jobs:
         continue-on-error: true
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
         with:
-          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-arcticdb-smoke-read
           aws-region: us-east-1
 
       - name: Set up Python 3.12
