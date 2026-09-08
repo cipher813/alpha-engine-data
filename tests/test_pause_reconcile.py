@@ -632,6 +632,48 @@ def test_a_scheduler_row_with_no_group_falls_back_to_default(mod, monkeypatch):
     assert seen[0][-2:] == ["--group-name", mod.DEFAULT_SCHEDULE_GROUP]
 
 
+# ── the join key must be group-qualified too (alpha-engine-config-I9681) ────
+# `live_triggers()` carries a non-default Scheduler group as a separate field
+# (the two tests above), but `check()`'s direction A matched the BARE name
+# against `paused`/`kept`/the registry — a different join key than
+# `automation_pause.py::_live_triggers()` uses to populate those very sets
+# (`"<group>/<name>"`, per `_split_scheduler_name`'s docstring). Measured
+# live 2026-09-08: all four `crucible-v2`-group schedules (`heartbeat`,
+# `weekly`, `alerts-sweep`, `data-daily`) — declared `not_paused` under keys
+# `crucible-v2/heartbeat` etc. since 2026-09-04 (I9994) — were reported
+# `undeclared-enabled` on every run because bare `"heartbeat"` is not in a
+# `kept` set that only contains `"crucible-v2/heartbeat"`.
+
+def test_a_kept_non_default_group_schedule_is_not_undeclared_enabled(mod):
+    """The exact I9681 defect, induced: a `crucible-v2`-group schedule
+    declared `not_paused` under its group-qualified key must not be flagged
+    just because its live AWS name is bare."""
+    findings = _reconcile(
+        mod,
+        manifest=_manifest(kept={"crucible-v2/heartbeat": "crucible v2 build, KEPT"}),
+        rows={},
+        triggers=[{"surface": "scheduler", "name": "heartbeat", "state": "ENABLED",
+                   "group": "crucible-v2"}],
+    )
+    assert findings == []
+
+
+def test_an_undeclared_non_default_group_schedule_still_fires_qualified(mod):
+    """The other direction: a real gap in a non-default group must still be
+    caught, and reported under the SAME qualified key automation_pause.json
+    would need to declare — not the bare name, which nobody could add there."""
+    findings = mod.reconcile(
+        manifest=_manifest(), rows={},
+        triggers=[{"surface": "scheduler", "name": "stowaway", "state": "ENABLED",
+                   "group": "crucible-v2"}],
+        targets_of=lambda t: [], sf_invoked=set(), invocations_of=lambda cid: 0,
+        alarm_breaching_of=lambda name: True,
+        is_ephemeral=lambda name, group=None: False,
+    )
+    assert [(f["kind"], f["trigger"]) for f in findings] == \
+        [("undeclared-enabled", "crucible-v2/stowaway")]
+
+
 def test_the_headline_distinguishes_drift_from_a_broken_detector(mod):
     """I7547 deliverable 3. GitHub renders both as `failure`; these do not.
 

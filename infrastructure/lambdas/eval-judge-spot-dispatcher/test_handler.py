@@ -72,13 +72,15 @@ class TestDispatch:
     def test_returns_the_four_fields_the_step_function_threads(self, index_mod):
         index, sd = index_mod
         out = index.handler({"run_date": "2026-08-29"}, None)
-        assert out == {
-            "instance_id": "i-evaljudge",
-            "market": "spot",
-            "command_id": "cmd-eval-judge-1",
-            "run_token": out["run_token"],
-        }
+        assert out["instance_id"] == "i-evaljudge"
+        assert out["market"] == "spot"
+        assert out["command_id"] == "cmd-eval-judge-1"
         assert out["run_token"]
+        # alpha-engine-config-I10172: the stage-coverage self-assertion —
+        # never raises even without live AWS credentials in this unit test
+        # (record_verdict is fail-soft), and never alters the SF-threaded
+        # fields above.
+        assert out["stage_coverage"]["stage"] == "DispatchEvalJudgeSpot"
 
     def test_box_carries_the_tag_the_sf_send_command_grant_is_scoped_to(self, index_mod):
         """`alpha-engine-step-functions-role`'s SendCommandEvalJudgeSpot

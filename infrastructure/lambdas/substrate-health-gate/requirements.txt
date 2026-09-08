@@ -1,2 +1,12 @@
-# boto3 is provided by the Lambda python3.12 runtime; no external deps.
-# (File kept so deploy.sh's uniform pip-install packaging step works.)
+# boto3 is provided by the Lambda python3.12 runtime; no external deps beyond
+# krepis. (File kept so deploy.sh's uniform pip-install packaging step works.)
+#
+# alpha-engine-config-I10172: krepis.stage_coverage.assert_stage_coverage is
+# the fleet's ONE stage-coverage assertion implementation (policy-shared-code
+# — this is at least the third adoption in this repo alone). Pinned, not
+# floored (alpha-engine-config-I7635), mirroring the identical pin already
+# carried by weekly-preflight/requirements.txt, weekly-run-scope/
+# requirements.txt and eval-judge-spot-dispatcher/requirements.txt in this
+# same directory — a fourth, different pin here would drift the lockstep
+# these siblings already hold.
+krepis==0.59.41

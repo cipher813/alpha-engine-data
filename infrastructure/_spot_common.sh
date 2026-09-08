@@ -105,6 +105,10 @@ MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-}"
 # between: a window taken after the write would be trivially satisfied by it.
 _STAGE_WINDOW_START="${_STAGE_WINDOW_START:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 
+# The window rule lives in ONE file, sourced by both this file and the
+# spot_data_weekly.sh monolith (alpha-engine-config-I10194 §3).
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_stage_window.sh"
+
 # Derived at launch time
 _INSTANCE_ID=""
 _S3_STAGING_PREFIX=""
