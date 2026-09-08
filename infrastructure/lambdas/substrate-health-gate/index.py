@@ -53,6 +53,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import boto3
@@ -165,8 +166,47 @@ def _parse_disk_used_percent(stdout: str) -> int | None:
     return int(match.group(1))
 
 
+def _assert_stage_coverage(stage: str, started: datetime, run_date: str | None) -> dict:
+    """Record this stage's own output verdict (alpha-engine-config-I10172).
+
+    `SubstrateHealthGate` is an INFRASTRUCTURE/GATE stage: it positively
+    declares in `ARTIFACT_REGISTRY.yaml`'s `pipeline_stages:` that it writes
+    no durable artifact (`output: none`), so the verdict is
+    `COVERED_NO_OUTPUT` regardless of the gate's own HEALTHY /
+    SUBSTRATE_UNHEALTHY finding — the coverage question ("did this stage run
+    and declare itself") is orthogonal to the health question it answers.
+    Measured 2026-09-08: this stage had never once written a
+    `_stage_coverage` verdict — it is the I8228 "never wired" class, not a
+    partition-family or IAM defect.
+
+    Never alters the handler's outcome: an observer that can change the
+    stage it observes is a new failure mode bolted onto the one it reports.
+    Mirrors `weekly-preflight/index.py::_assert_stage_coverage` and
+    `weekly-freshness-spot-dispatcher/index.py::_assert_stage_coverage`
+    (`policy-shared-code` — third adoption of the same shape in this repo).
+    """
+    if not run_date:
+        logger.error(
+            "stage-coverage assertion has no run_date for %s — event carried none",
+            stage,
+        )
+        return {"stage": stage, "status": "UNMEASURED", "reason": "no run_date on state input"}
+    try:
+        from krepis.stage_coverage import assert_stage_coverage
+    except ImportError as exc:
+        logger.error("stage-coverage assertion unavailable for %s: %s", stage, exc)
+        return {"stage": stage, "status": "UNMEASURED", "reason": str(exc)}
+    return assert_stage_coverage(stage, window_start=started, run_date=run_date)
+
+
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG001
     instance_id = event["instance_id"]
+    # Captured at handler ENTRY, before any write this invocation makes
+    # (alpha-engine-config-I7214) — this gate writes no artifact, but the
+    # window is still the contract every other coverage-asserting stage
+    # follows.
+    started = datetime.now(timezone.utc)
+    run_date = str(event.get("run_date", "")).strip() or None
 
     command_id = _send_probe(instance_id)
     outcome = _poll_to_terminal(command_id, instance_id)
@@ -189,6 +229,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
             f"agent process is dead."
         )
         logger.warning(result["message"])
+        result["stage_coverage"] = _assert_stage_coverage("SubstrateHealthGate", started, run_date)
         return result
 
     if outcome["status"] != "Success":
@@ -204,6 +245,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
             f"or under severe resource pressure."
         )
         logger.warning(result["message"])
+        result["stage_coverage"] = _assert_stage_coverage("SubstrateHealthGate", started, run_date)
         return result
 
     used_percent = _parse_disk_used_percent(outcome["stdout"])
@@ -222,6 +264,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
             f"substrate signal failure rather than assuming healthy."
         )
         logger.warning(result["message"])
+        result["stage_coverage"] = _assert_stage_coverage("SubstrateHealthGate", started, run_date)
         return result
 
     if used_percent >= DISK_WARN_PERCENT:
@@ -234,6 +277,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
             f"partial output."
         )
         logger.warning(result["message"])
+        result["stage_coverage"] = _assert_stage_coverage("SubstrateHealthGate", started, run_date)
         return result
 
     result["verdict"] = "HEALTHY"
@@ -242,4 +286,5 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
         f"agent responsive."
     )
     logger.info(result["message"])
+    result["stage_coverage"] = _assert_stage_coverage("SubstrateHealthGate", started, run_date)
     return result

@@ -146,3 +146,82 @@ def test_deferred_outranks_findings(handler_module) -> None:
         should_alert = False
 
     assert handler_module._outcome_for(_Clean()) == "clean"
+
+
+# ── alpha-engine-config-I10175: declared-skip stage exclusion ───────────────
+
+
+class _FakeBody:
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    def read(self) -> bytes:
+        return self._payload
+
+
+class _FakeS3RunScope:
+    """Returns a fixed run_scope.json body, or raises 404, on get_object."""
+
+    def __init__(self, stages: dict | None) -> None:
+        self._stages = stages
+
+    def get_object(self, *, Bucket: str, Key: str):  # noqa: N803 — boto3 shape
+        if self._stages is None:
+            raise RuntimeError("NoSuchKey")
+        return {"Body": _FakeBody(json.dumps({"stages": self._stages}).encode())}
+
+
+def test_declared_skip_excludes_the_disabled_stage(handler_module) -> None:
+    """`Parity`'s row names `entry_state: ParityParallel` — the spine excludes
+    THAT name, not the `Parity` row key, because the spine is keyed by SF
+    Task-state name."""
+    s3 = _FakeS3RunScope(
+        {
+            "Parity": {"disposition": "DISABLED", "entry_state": "ParityParallel"},
+            "MorningEnrich": {"disposition": "ENABLED_COMPLETED"},
+        }
+    )
+    spine, excluded = handler_module._declared_skip_stage_spine(
+        pipeline="ne-weekly-freshness-pipeline",
+        run_date="2026-09-04",
+        bucket="alpha-engine-research",
+        s3_client=s3,
+    )
+    assert excluded == ("ParityParallel",)
+    assert spine is not None
+    assert "ParityParallel" in _default_spine()
+    assert "ParityParallel" not in spine
+    assert "MorningEnrich" in spine  # every other declared stage survives
+
+
+def test_declared_skip_is_a_noop_when_nothing_is_disabled(handler_module) -> None:
+    s3 = _FakeS3RunScope({"MorningEnrich": {"disposition": "ENABLED_COMPLETED"}})
+    spine, excluded = handler_module._declared_skip_stage_spine(
+        pipeline="ne-weekly-freshness-pipeline",
+        run_date="2026-09-04",
+        bucket="alpha-engine-research",
+        s3_client=s3,
+    )
+    assert spine is None
+    assert excluded == ()
+
+
+def test_declared_skip_degrades_to_the_full_spine_on_any_read_failure(handler_module) -> None:
+    """Advisory, best-effort: a missing/unreadable run_scope.json must NEVER
+    fabricate a claim that a stage was disabled — it degrades to today's
+    behaviour (the full declared spine), never to a false COMPLETED."""
+    s3 = _FakeS3RunScope(None)  # raises on get_object
+    spine, excluded = handler_module._declared_skip_stage_spine(
+        pipeline="ne-weekly-freshness-pipeline",
+        run_date="2026-09-04",
+        bucket="alpha-engine-research",
+        s3_client=s3,
+    )
+    assert spine is None
+    assert excluded == ()
+
+
+def _default_spine() -> tuple[str, ...]:
+    from nousergon_lib.pipeline_status.registry import stage_order_for
+
+    return stage_order_for("ne-weekly-freshness-pipeline")

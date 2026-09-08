@@ -88,6 +88,75 @@ OUTCOME_DEFERRED = "deferred"
 SWEEP_STAGE = os.environ.get("SWEEP_STAGE", "WeeklyCoverageSweep")
 
 
+#: `RunScope`'s own artifact key template (mirrors
+#: `weekly-run-scope/index.py::KEY_TEMPLATE`) — the ONE place a cycle records
+#: which declared stages it deliberately did not intend to run this week
+#: (`disposition: DISABLED`, e.g. `skip_parity: true`), versus which it
+#: simply never reached.
+RUN_SCOPE_KEY_TEMPLATE = "backtest/{run_date}/run_scope.json"
+
+
+def _declared_skip_stage_spine(
+    *, pipeline: str, run_date: str, bucket: str, s3_client
+) -> tuple[tuple[str, ...] | None, tuple[str, ...]]:
+    """The declared spine for THIS cycle, minus any stage RunScope recorded
+    as ``DISABLED`` — and which stages were excluded, for the caller to log.
+
+    ``alpha-engine-config-I10175``. ``nousergon_lib.pipeline_status.registry
+    .PIPELINE_STAGE_ORDER`` declares ``ParityParallel`` / ``PitParityCompare``
+    unconditionally for every weekly cycle. A cycle with ``skip_parity: true``
+    (a recorded operator flag on the Saturday EventBridge target since
+    2026-08-13, not a defect) never intends to enter them — and without this
+    exclusion the cycle's completion verdict reads ``INCOMPLETE`` forever,
+    every week, for as long as the flag holds. Measured live on the
+    2026-09-04 cycle after ``alpha-engine-config-I10170``'s observer fix:
+    ``stages 14/16, missing ParityParallel, PitParityCompare``,
+    ``walk_exhausted: false`` — not a truncation artifact.
+
+    Returns ``(None, ())`` — the full declared spine, no caller-side
+    exclusion — on ANY failure to read or parse ``run_scope.json``: this is
+    advisory, best-effort, and NEVER fabricates a claim that a stage was
+    disabled. A missing/unreadable ``run_scope.json`` degrades to today's
+    behaviour (the cycle reads INCOMPLETE if it genuinely is), never to a
+    false COMPLETED.
+    """
+    try:
+        from nousergon_lib.pipeline_status.registry import stage_order_for
+
+        full_spine = stage_order_for(pipeline)
+        if not full_spine:
+            return None, ()
+
+        key = RUN_SCOPE_KEY_TEMPLATE.format(run_date=run_date)
+        body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
+        import json as _json
+
+        scope = _json.loads(body)
+        stages = scope.get("stages") or {}
+        excluded = tuple(
+            sorted(
+                {
+                    str(row.get("entry_state") or name)
+                    for name, row in stages.items()
+                    if isinstance(row, dict) and row.get("disposition") == "DISABLED"
+                }
+                & set(full_spine)
+            )
+        )
+        if not excluded:
+            return None, ()
+        adjusted = tuple(s for s in full_spine if s not in excluded)
+        return adjusted, excluded
+    except Exception as exc:  # noqa: BLE001 — advisory, never blocks the sweep
+        logger.warning(
+            "coverage sweep: could not derive a declared-skip exclusion for "
+            "%s %s from run_scope.json — using the full declared spine "
+            "(%s: %s)",
+            pipeline, run_date, type(exc).__name__, exc,
+        )
+        return None, ()
+
+
 def _outcome_for(sweep) -> str:
     """The handler's verdict. ``deferred`` OUTRANKS ``findings``.
 
@@ -140,6 +209,21 @@ def handler(event, _context):
 
         region = resolve_region()
         s3_client = boto3.client("s3", region_name=region)
+
+        # alpha-engine-config-I10175: a cycle-local exclusion for stages
+        # RunScope recorded as deliberately DISABLED this run (skip_parity
+        # and its kind) — advisory, never fabricated; see the function
+        # docstring for the fail-open contract.
+        stage_spine, excluded_stages = _declared_skip_stage_spine(
+            pipeline=PIPELINE, run_date=run_date, bucket=BUCKET, s3_client=s3_client,
+        )
+        if excluded_stages:
+            logger.info(
+                "coverage sweep %s %s: excluding declared-skip stage(s) from "
+                "the cycle spine (RunScope disposition=DISABLED): %s",
+                PIPELINE, run_date, ", ".join(excluded_stages),
+            )
+
         sweep = read_coverage_sweep(
             pipeline=PIPELINE,
             run_date=run_date,
@@ -149,6 +233,7 @@ def handler(event, _context):
             s3_client=s3_client,
             observer_execution_arn=observer_execution_arn or None,
             observer_stage=SWEEP_STAGE,
+            stage_spine=stage_spine,
         )
     except Exception as exc:  # noqa: BLE001 — a sweep that cannot run says so
         # Deliberate broad catch with a named recording surface: the return
