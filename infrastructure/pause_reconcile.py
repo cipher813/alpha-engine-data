@@ -499,12 +499,33 @@ def reconcile(
         name, state = t["name"], t["state"]
         if name.startswith(_AWS_MANAGED_PREFIX):
             continue
-        row = reg.get(name)
-        declared_off = name in paused or _declares_off(row)
+        # `automation_pause.py::_live_triggers()` reports (and `not_paused`/
+        # `paused`/`pending` therefore declare) a non-default-group Scheduler
+        # schedule as ``"<group>/<name>"`` — see `_split_scheduler_name`'s
+        # docstring and the `crucible-v2/heartbeat` et al. entries in
+        # automation_pause.json (alpha-engine-config-I9994). This module's own
+        # `live_triggers()` above carries the group as a separate field rather
+        # than folding it into `name`, so matching bare `name` against
+        # `paused`/`kept`/the registry silently fails for every schedule
+        # outside the default group — reported `undeclared-enabled` on every
+        # run regardless of what the manifest says (alpha-engine-config-I9681:
+        # measured 2026-09-08, all four `crucible-v2`-group schedules flagged
+        # despite being declared `not_paused` since 2026-09-04/I9994). The join
+        # key below reconstructs the same qualified form so this direction
+        # agrees with automation_pause.py about what a declaration names; the
+        # bare `name` (plus `t["group"]`) is still what is handed to every
+        # AWS-calling helper (`targets_of`, `is_ephemeral`), which need the
+        # unqualified name and the group as separate arguments.
+        group = t.get("group") if t["surface"] == "scheduler" else None
+        declared_name = (
+            f"{group}/{name}" if group and group != DEFAULT_SCHEDULE_GROUP else name
+        )
+        row = reg.get(declared_name) or reg.get(name)
+        declared_off = declared_name in paused or _declares_off(row)
         if state != "ENABLED":
             if not declared_off:
                 findings.append({
-                    "kind": "undeclared-dark", "trigger": name, "surface": t["surface"],
+                    "kind": "undeclared-dark", "trigger": declared_name, "surface": t["surface"],
                     "detail": (
                         f"live State={state}, but no register declares it off: it is not "
                         f"named in automation_pause.json and its observability row says "
@@ -523,7 +544,7 @@ def reconcile(
             # asserting the component is deliberately off while it runs.
             if _declares_off(row):
                 findings.append({
-                    "kind": "running-while-declared-off", "trigger": name,
+                    "kind": "running-while-declared-off", "trigger": declared_name,
                     "surface": t["surface"],
                     "detail": (
                         f"live State=ENABLED while its observability row declares "
@@ -535,7 +556,7 @@ def reconcile(
                         "in-service, or it was not and the trigger goes back off."
                     ),
                 })
-            elif name not in kept and row is None:
+            elif declared_name not in kept and row is None:
                 # A self-deleting one-shot is an in-flight continuation of an
                 # already-registered dispatcher, not standing scheduled work —
                 # see `is_ephemeral_one_shot`. Probed only here, so a clean run
@@ -556,7 +577,8 @@ def reconcile(
                     })
                     continue
                 findings.append({
-                    "kind": "undeclared-enabled", "trigger": name, "surface": t["surface"],
+                    "kind": "undeclared-enabled", "trigger": declared_name,
+                    "surface": t["surface"],
                     "detail": (
                         "live State=ENABLED, named in neither automation_pause.json nor "
                         "the observability registry. Scheduled work is running that no "
