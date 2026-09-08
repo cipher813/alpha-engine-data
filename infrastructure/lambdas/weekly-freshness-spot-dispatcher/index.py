@@ -574,13 +574,25 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         "market": market,
         "command_id": command_id,
         "run_token": run_token,
-        # The stage name is DERIVED, never hardcoded: this one Lambda backs two
-        # SF states — DispatchWeeklyFreshnessSpot and, with force_on_demand,
-        # RelaunchWeeklyFreshnessSpot. A file-level constant would file the
-        # relaunch's verdict under the dispatch's name, so a real miss would be
-        # attributed to a stage that was working (alpha-engine-config-I7214).
+        # The stage name is EXPLICIT, never derived (alpha-engine-config-
+        # I10172): this one Lambda backs two SF states, DispatchWeeklyFresh-
+        # nessSpot and RelaunchWeeklyFreshnessSpot, and both callers pass
+        # `force_on_demand: true` (config-I7119 / config-I7120 — spot-first
+        # would re-enter the pool that just reclaimed the box, and this ONE
+        # box is the shared substrate every stage-liveness gate addresses).
+        # With force_on_demand no longer distinguishing the two callers, the
+        # OLD derivation `"RelaunchWeeklyFreshnessSpot" if force_on_demand
+        # else "DispatchWeeklyFreshnessSpot"` always resolved to the first
+        # branch — DispatchWeeklyFreshnessSpot's own invocations wrote their
+        # verdict under RelaunchWeeklyFreshnessSpot's name, and
+        # DispatchWeeklyFreshnessSpot had ZERO verdicts in any partition,
+        # ever (measured 2026-09-08). Each SF Task now stamps its own
+        # identity as a Payload literal (`sf_stage`); the force_on_demand
+        # heuristic survives only as the fallback for an operator off-cycle
+        # invocation that predates this field.
         "stage_coverage": _assert_stage_coverage(
-            "RelaunchWeeklyFreshnessSpot" if force_on_demand else "DispatchWeeklyFreshnessSpot",
+            str(event.get("sf_stage", "")).strip()
+            or ("RelaunchWeeklyFreshnessSpot" if force_on_demand else "DispatchWeeklyFreshnessSpot"),
             started,
             str(event.get("run_date", "")).strip() or None,
         ),

@@ -72,7 +72,10 @@ def _flatten_states(sf_doc: dict) -> dict:
 _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # config#2249: fast pre-dispatch substrate health gate, immediately
     # before MorningEnrich (alpha-engine-substrate-health-gate Lambda).
-    "SubstrateHealthGate": frozenset({"instance_id.$"}),
+    # alpha-engine-config-I10172: run_date.$ added — this stage had never
+    # once written a _stage_coverage verdict (the I8228 "never wired" class);
+    # its Payload carried no execution identity at all to key one by.
+    "SubstrateHealthGate": frozenset({"instance_id.$", "run_date.$"}),
     # alpha-engine-config-I8214: the stage-coverage sweep at the tail of the
     # run. Deliberately NOT threading execution_arn: the sweep reads the whole
     # CYCLE (every contributing execution for this run_date), not this one
@@ -230,8 +233,17 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # coverage verdict (DispatchWeeklyFreshnessSpot / RelaunchWeeklyFreshnessSpot,
     # both INFRASTRUCTURE/GATE stages) had been writing under an empty
     # run_date since I7214 shipped, because neither Payload carried one.
+    # alpha-engine-config-I10172: sf_stage added — a Payload literal naming
+    # each Task's OWN identity. Both callers pass force_on_demand: true (see
+    # comments above and on RelaunchWeeklyFreshnessSpot below), so the
+    # boolean no longer distinguishes them: the handler's old
+    # force_on_demand-derived stage name always resolved to
+    # RelaunchWeeklyFreshnessSpot, and this state's own invocations wrote
+    # their coverage verdict under the OTHER state's name —
+    # DispatchWeeklyFreshnessSpot had zero verdicts in any partition, ever
+    # (measured 2026-09-08).
     "DispatchWeeklyFreshnessSpot": frozenset(
-        {"execution_id.$", "run_date.$", "force_on_demand"}
+        {"execution_id.$", "run_date.$", "force_on_demand", "sf_stage"}
     ),
     # config-I7119: the SAME dispatcher, invoked to replace a launcher box that
     # was reclaimed mid-run. force_on_demand was added to the dispatcher in
@@ -241,7 +253,7 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # two payloads are now identical. A literal `true`, not a `.$` path: the
     # decision is structural, never execution input.
     "RelaunchWeeklyFreshnessSpot": frozenset(
-        {"execution_id.$", "run_date.$", "force_on_demand"}
+        {"execution_id.$", "run_date.$", "force_on_demand", "sf_stage"}
     ),
 }
 

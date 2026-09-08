@@ -44,6 +44,12 @@
       "Resource": "arn:aws:s3:::alpha-engine-research/_stage_coverage/_sweep/*"
     },
     {
+      "Sid": "ReadRunScopeForDeclaredSkipExclusion",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/backtest/*/run_scope.json"
+    },
+    {
       "Sid": "AugmentTheCompletionMarker",
       "Effect": "Allow",
       "Action": [

@@ -401,6 +401,10 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """
     event = event or {}
     force_on_demand = bool(event.get("force_on_demand", False))
+    # Captured at handler ENTRY, before any write this invocation makes
+    # (alpha-engine-config-I7214).
+    started = datetime.datetime.now(datetime.timezone.utc)
+    run_date = str(event.get("run_date", "")).strip() or None
 
     if not DISPATCH_ENABLED:
         raise RuntimeError(
@@ -482,4 +486,34 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         "market": market,
         "command_id": command_id,
         "run_token": run_token,
+        "stage_coverage": _assert_stage_coverage("DispatchEvalJudgeSpot", started, run_date),
     }
+
+
+def _assert_stage_coverage(stage: str, started: datetime.datetime, run_date: str | None) -> dict:
+    """Record this stage's own output verdict (alpha-engine-config-I10172).
+
+    `DispatchEvalJudgeSpot` is an INFRASTRUCTURE stage declaring
+    `output: variable_cardinality` in `ARTIFACT_REGISTRY.yaml`'s
+    `pipeline_stages:` — the Lambda writes nothing itself (EC2 + SSM API
+    calls only; the async bootstrap command it fires writes its own log at a
+    variable-cardinality key), so the verdict is `COVERED_NO_OUTPUT`.
+    Measured 2026-09-08: this stage had never once written a
+    `_stage_coverage` verdict — the I8228 "never wired" class.
+
+    Never alters the handler's outcome. Mirrors
+    `weekly-freshness-spot-dispatcher/index.py::_assert_stage_coverage`
+    (`policy-shared-code`).
+    """
+    if not run_date:
+        logger.error(
+            "stage-coverage assertion has no run_date for %s — event carried none",
+            stage,
+        )
+        return {"stage": stage, "status": "UNMEASURED", "reason": "no run_date on state input"}
+    try:
+        from krepis.stage_coverage import assert_stage_coverage
+    except ImportError as exc:
+        logger.error("stage-coverage assertion unavailable for %s: %s", stage, exc)
+        return {"stage": stage, "status": "UNMEASURED", "reason": str(exc)}
+    return assert_stage_coverage(stage, window_start=started, run_date=run_date)
