@@ -118,9 +118,28 @@ def test_each_launcher_asserts_its_own_stage(stage: str, script: str) -> None:
 )
 def test_each_launcher_passes_the_run_window(stage: str, script: str) -> None:
     """Without a window, a leftover from a previous cycle satisfies the probe
-    while the consumer reads last week's belief."""
+    while the consumer reads last week's belief.
+
+    Two forms are legal, and BOTH are a window — never an omission:
+
+    - ``--window-start "$_STAGE_WINDOW_START"`` — this execution's start, the
+      original and still-correct semantics for a stage that always re-writes.
+    - ``--window-start "$_<STAGE>_WINDOW"``, assigned from
+      ``resolve_stage_window_start`` — the CYCLE's first-attempt window, for a
+      stage whose workload auto-skips work an earlier attempt of the same
+      cycle already did (`alpha-engine-config-I10194` §3). The scope limit on
+      that second form, and the derivation behind it, are enforced by
+      `tests/test_stage_window_tracks_the_cycle.py`.
+    """
     body = _script(script)
-    assert '--window-start "$_STAGE_WINDOW_START"' in body
+    raw = '--window-start "$_STAGE_WINDOW_START"' in body
+    resolved = "resolve_stage_window_start" in body and re.search(
+        r'--window-start "\$_[A-Z0-9_]+_WINDOW"', body
+    )
+    assert raw or resolved, (
+        f"{script} passes no --window-start at all — an existence-only probe "
+        "cannot tell this run's output from last cycle's leftovers"
+    )
 
 
 @pytest.mark.parametrize(
@@ -250,13 +269,36 @@ def test_weekly_preflight_records_its_no_output_declaration() -> None:
     assert '"stage_coverage"' in body
 
 
-def test_the_spot_dispatcher_derives_which_of_its_two_stages_ran() -> None:
-    """One Lambda, two SF states. Hardcoding either name would file the
-    relaunch's verdict under the dispatch's."""
+def test_the_spot_dispatcher_prefers_the_explicit_sf_stage_identity() -> None:
+    """One Lambda, two SF states, and (alpha-engine-config-I10172) BOTH
+    callers pass `force_on_demand: true` — the boolean no longer
+    distinguishes them, so the old `"RelaunchWeeklyFreshnessSpot" if
+    force_on_demand else "DispatchWeeklyFreshnessSpot"` derivation always
+    took the first branch. DispatchWeeklyFreshnessSpot's own invocations
+    wrote their verdict under RelaunchWeeklyFreshnessSpot's name, and
+    DispatchWeeklyFreshnessSpot had zero verdicts in any partition, ever.
+    Each SF Task now stamps its own name via a Payload literal (`sf_stage`)
+    and the handler must read it FIRST."""
     body = (
         INFRA / "lambdas" / "weekly-freshness-spot-dispatcher" / "index.py"
     ).read_text()
+    assert 'str(event.get("sf_stage", "")).strip()' in body
+    # The force_on_demand derivation survives only as the fallback for an
+    # operator off-cycle invocation that predates the sf_stage field.
     assert '"RelaunchWeeklyFreshnessSpot" if force_on_demand else "DispatchWeeklyFreshnessSpot"' in body
+
+
+def test_both_spot_dispatcher_sf_states_stamp_their_own_identity() -> None:
+    """Guards the SF side of I10172: a Payload literal, not derived, so a
+    future third caller cannot silently fall back to the ambiguous
+    force_on_demand heuristic without a reviewer noticing a missing field."""
+    definition = json.loads(SF_DEFINITION.read_text())
+    states = _states(definition)
+    for name in ("DispatchWeeklyFreshnessSpot", "RelaunchWeeklyFreshnessSpot"):
+        payload = states[name]["Parameters"]["Payload"]
+        assert payload.get("sf_stage") == name, (
+            f"{name}: Payload does not stamp its own sf_stage identity"
+        )
 
 
 # ── alpha-engine-config-I8155: the two Lambdas pass a real run_date ──────────
@@ -392,9 +434,11 @@ def test_the_end_of_run_module_is_gone() -> None:
 # normalized by anything downstream.
 
 #: Every SSM sendCommand state whose command runs a launcher that performs a
-#: stage-coverage assertion. Deliberately excludes the two bare
-#: `aws s3api head-object` resource-kill-check states (PitParityLookaheadKillCheck-
-#: shaped) and ResolveZooSpecs (resolves rotation spec ids only, no assertion).
+#: stage-coverage assertion, PLUS `ResolveZooSpecs`, which invokes the CLI
+#: inline in its own command list (alpha-engine-config-I10197). Deliberately
+#: excludes the two bare `aws s3api head-object` resource-kill-check states
+#: (PitParityLookaheadKillCheck-shaped): those run no launcher, declare no
+#: stage row, and gaining the export would buy nothing.
 _COVERAGE_ASSERTING_SSM_STATES = frozenset({
     "MorningEnrich", "DataPhase1", "RAGIngestion", "DataPhase2",
     "PredictorTraining", "TrainSpecDispatch", "ModelZooSelect",
@@ -402,6 +446,7 @@ _COVERAGE_ASSERTING_SSM_STATES = frozenset({
     "Backtester", "PredictorBacktest", "PortfolioOptimizerBacktest",
     "PitParityLookahead", "PitParityWalkforward", "ParityReplay",
     "PitParityCompare", "EvaluatorDiagnostics", "EvaluatorOptimize",
+    "ResolveZooSpecs",
 })
 
 _EXECUTION_RUN_DATE_EXPORT = "export EXECUTION_RUN_DATE="
@@ -482,13 +527,81 @@ def test_the_resource_kill_check_states_do_not_export_execution_run_date() -> No
             )
 
 
-def test_resolve_zoo_specs_is_not_a_coverage_asserting_state() -> None:
-    """ResolveZooSpecs only lists rotation spec ids — it must stay out of the
-    export set (and out of _COVERAGE_ASSERTING_SSM_STATES above)."""
+# ── alpha-engine-config-I10197: ResolveZooSpecs declares COVERED_NO_OUTPUT ──
+#
+# This file used to carry `test_resolve_zoo_specs_is_not_a_coverage_asserting_
+# state`, pinning the OPPOSITE design decision ("it only lists rotation spec
+# ids — it must stay out of the export set"). `alpha-engine-config-I10172`
+# superseded that decision fleet-wide: a control stage that legitimately
+# writes no durable artifact must still POSITIVELY declare
+# `COVERED_NO_OUTPUT`, because silence is indistinguishable from a stage
+# nobody ever considered — the I8228 "never wired" class. Measured 2026-09-08:
+# `ResolveZooSpecs` had never once written a `_stage_coverage` verdict.
+#
+# The inverted test below replaces it. The deleted test is named here rather
+# than silently dropped: a design decision reversed without a record is
+# relitigated.
+
+
+def test_resolve_zoo_specs_asserts_its_own_coverage() -> None:
+    """`ResolveZooSpecs` runs the CLI inline in its own SSM command list —
+    it has no launcher script of its own to put the assertion in."""
     states = _sf_states()
     text = _ssm_command_text(states["ResolveZooSpecs"])
-    assert CLI_MODULE not in text
-    assert _EXECUTION_RUN_DATE_EXPORT not in text
+    assert CLI_MODULE in text, (
+        "ResolveZooSpecs does not invoke krepis.stage_coverage — it is back "
+        "to the never-wired class alpha-engine-config-I10197 closed"
+    )
+    assert "--stage ResolveZooSpecs" in text, (
+        "ResolveZooSpecs asserts under some OTHER stage name — the "
+        "misattribution class alpha-engine-config-I10172 measured on "
+        "DispatchWeeklyFreshnessSpot"
+    )
+    assert _EXECUTION_RUN_DATE_EXPORT in text
+    assert "$.run_date" in text
+
+
+def test_resolve_zoo_specs_assertion_cannot_pollute_the_spec_array_on_stdout() -> None:
+    """`ParseZooSpecs` lifts this state's StandardOutputContent VERBATIM as
+    the Map's ItemsPath — the state's own Comment says the git-pull preamble
+    is redirected to stderr for exactly this reason. An assertion writing a
+    single line to stdout would make the whole rotation unparseable, which is
+    a far worse outcome than the missing verdict it fixes."""
+    states = _sf_states()
+    text = _ssm_command_text(states["ResolveZooSpecs"])
+    match = re.search(r"[^']*krepis\.stage_coverage[^']*", text)
+    assert match, "no stage_coverage command found"
+    command = match.group(0)
+    assert "1>&2" in command, (
+        f"the assertion does not redirect its stdout to stderr: {command}"
+    )
+
+
+def test_resolve_zoo_specs_assertion_is_observe_mode_and_cannot_fail_the_state() -> None:
+    """The state's own Comment: 'a resolve/parse failure routes to
+    PublishModelZooFailureImmediate' — under `set -eo pipefail` an unguarded
+    assertion would route the whole model-zoo rotation to its failure branch
+    on a coverage CLI hiccup. `|| echo ... >&2` rather than `|| true` keeps an
+    unreachable assertion distinguishable from a covered stage."""
+    states = _sf_states()
+    text = _ssm_command_text(states["ResolveZooSpecs"])
+    match = re.search(r"[^']*krepis\.stage_coverage[^']*", text)
+    assert match
+    command = match.group(0)
+    assert "|| echo" in command, f"assertion is not guarded: {command}"
+    assert "|| true" not in command, (
+        "`|| true` erases the difference between an unreachable assertion and "
+        "a covered stage"
+    )
+
+
+def test_resolve_zoo_specs_assertion_runs_after_the_spec_resolution() -> None:
+    """The window is only meaningful once the workload has run, and the
+    array-emitting command must not be displaced from the tail of the list
+    where its exit status governs the state."""
+    states = _sf_states()
+    text = _ssm_command_text(states["ResolveZooSpecs"])
+    assert text.index("list-rotation-specs") < text.index("krepis.stage_coverage")
 
 
 # ── config-I8155: the Lambda-backed coverage stages get $.run_date too ───────
@@ -642,3 +755,60 @@ def test_stage_coverage_producers_thread_the_execution_arn():
             "indistinguishable from a deploy-time probe's "
             "(alpha-engine-config-I9247)"
         )
+
+
+# ── alpha-engine-config-I10194 §1 step (1): the five partition-split writers ─
+#
+# `Counterfactual`, `RationaleClustering`, `ReplayConcordance`,
+# `EvalRollingMean` and `EvalJudgeSubmitFirstSaturday` are `crucible-research`
+# Lambda handlers. Each derives its OWN `run_date` for the
+# `krepis.stage_coverage.assert_stage_coverage` call from
+# `event["end_time_iso"]` — the RAW calendar `$$.Execution.StartTime` — because
+# none of their Payloads carried `$.run_date` at all. `end_time_iso` is a
+# calendar instant; `$.run_date` is the cycle's TRADING day, stamped once by
+# InitializeInput and never rewritten. They differ on any weekend cycle, and
+# the split is invisible: the verdict still lands under a plausible-looking
+# prefix (the `alpha-engine-config-I8155` class, at the Lambda half).
+#
+# This half of the fix is INERT ON ITS OWN and that is expected: the five
+# handlers must also be changed to PREFER `event.get("run_date")` over the
+# derived value (`alpha-engine-config-I10194` §1 step (2), `crucible-research`,
+# a separate PR). Until that lands the handlers ignore the extra Payload key,
+# so this change is safe to merge first and cannot regress anything.
+#
+# The producer-side assertion belongs HERE regardless: this repo owns the SF
+# definition, so this repo is where the carrier's absence is detectable.
+
+_PARTITION_SPLIT_RESEARCH_STATES = (
+    "Counterfactual",
+    "RationaleClustering",
+    "ReplayConcordance",
+    "EvalRollingMean",
+    "EvalJudgeSubmitFirstSaturday",
+)
+
+
+@pytest.mark.parametrize("name", _PARTITION_SPLIT_RESEARCH_STATES)
+def test_research_lambda_states_carry_the_execution_run_date(name: str) -> None:
+    states = _sf_states()
+    assert name in states, f"{name}: state not found in the live SF definition"
+    payload = (states[name].get("Parameters") or {}).get("Payload") or {}
+    assert payload.get("run_date.$") == "$.run_date", (
+        f"{name}: Payload does not carry run_date.$ = $.run_date — its handler "
+        "must derive a run_date from end_time_iso, which is a CALENDAR instant "
+        "and not the cycle's trading day (alpha-engine-config-I10194 §1)"
+    )
+
+
+@pytest.mark.parametrize("name", _PARTITION_SPLIT_RESEARCH_STATES)
+def test_run_date_is_added_alongside_the_existing_payload_keys(name: str) -> None:
+    """`run_date` is ADDED, never a replacement: `end_time_iso` still drives
+    each handler's own analysis window, and `EvalJudgeSubmitFirstSaturday`'s
+    `date` is the eval cadence's date, a different question again. Removing
+    either would be a silent behaviour change dressed as an identity fix."""
+    states = _sf_states()
+    payload = (states[name].get("Parameters") or {}).get("Payload") or {}
+    if name == "EvalJudgeSubmitFirstSaturday":
+        assert payload.get("date.$") == "$.eval_cadence.eval_date"
+    else:
+        assert payload.get("end_time_iso.$") == "$$.Execution.StartTime"

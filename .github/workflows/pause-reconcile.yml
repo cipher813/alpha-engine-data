@@ -83,6 +83,31 @@ permissions:
   id-token: write   # required for OIDC
   contents: read
 
+# WORKFLOW HEALTH SEMANTICS (alpha-engine-config-I9169, I9553, I9681).
+# Read by alpha-engine-config's scripts/check_scheduled_workflow_health.py out
+# of THIS file, so the declaration cannot outlive the steps it describes. This
+# workflow's own header comment above already states the contract at length
+# ("TWO JOBS, AND THAT IS THE POINT") — the exit code is deliberately
+# unchanged on real drift, only the rendering. `scheduled-workflow-health`
+# graded that design on plain execution health and filed
+# alpha-engine-config-I9681 (0/12 clean over 12 runs): every one of those runs
+# either failed in the `reconcile` job itself (exit 2, the real defect closed
+# below) or in the single declared step here (exit 1, findings). Renaming that
+# step without updating this list is caught by `--validate-declarations`.
+env:
+  WORKFLOW_HEALTH_SEMANTICS: finding-surface
+  WORKFLOW_HEALTH_FINDING_STEPS: |
+    Fail on drift, pass when every trigger is declared
+  WORKFLOW_HEALTH_FINDING_ISSUE: alpha-engine-config-I7118
+  WORKFLOW_HEALTH_FINDING_REASON: >-
+    The `verdict` job's one step fails whenever the reconciler script run by
+    the `reconcile` job above reports drift between automation_pause.json,
+    the observability registry and live AWS - the non-zero exit IS the
+    drift finding, by design (see this file's header comment). The
+    `reconcile` job failing on its OWN step is a different thing - the
+    reconciler could not run at all (AWS denied, a register unreadable) -
+    and is graded on execution health as before, un-muted.
+
 jobs:
   reconcile:
     name: compare the three registers
