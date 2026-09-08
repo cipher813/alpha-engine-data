@@ -412,6 +412,33 @@ def test_the_handler_writes_the_artifact_for_the_run_date(
     assert result["run_date"] == "2026-08-14"
     assert result["calendar_run_date"] == "2026-08-15"
     assert result["stages"]["Parity"]["disabled_by"] == "skip_parity"
+    # alpha-engine-config-I10172: the stage-coverage self-assertion — never
+    # raises without live AWS credentials (record_verdict is fail-soft) and
+    # keyed on the same normalized TRADING day the artifact itself landed on.
+    assert result["stage_coverage"]["stage"] == "RunScope"
+
+
+def test_stage_coverage_assertion_is_import_guarded_and_loud(monkeypatch, definition, real_run_history):
+    """The nousergon-lib/krepis pin may predate the module; an inert
+    assertion must stay distinguishable from a covered stage."""
+    index, _written = _index(monkeypatch, definition=definition, history=real_run_history)
+    body = pathlib.Path(index.__file__).read_text()
+    assert "from krepis.stage_coverage import assert_stage_coverage" in body
+    assert "except ImportError as exc:" in body
+    assert '"status": "UNMEASURED"' in body
+
+
+def test_stage_coverage_is_unmeasured_without_a_run_date(monkeypatch, definition, real_run_history):
+    """`EmptyRunDateError` (or any total derivation failure) must never
+    fabricate a run_date for the coverage assertion — UNMEASURED, not a
+    guessed date (alpha-engine-config-I8155)."""
+    index, _written = _index(monkeypatch, definition=definition, history=real_run_history)
+    result = index.handler({"run_date": "", "execution_arn": "arn:x", "state_machine_arn": "arn:y"}, None)
+    assert result["stage_coverage"] == {
+        "stage": "RunScope",
+        "status": "UNMEASURED",
+        "reason": "no run_date on state input",
+    }
 
 
 def test_a_saturday_run_date_normalizes_to_the_preceding_nyse_session(

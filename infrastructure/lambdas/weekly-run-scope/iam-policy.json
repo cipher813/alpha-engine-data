@@ -46,6 +46,45 @@
           ]
         }
       }
+    },
+    {
+      "Sid": "ReadStageCoverageRegistry",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/_freshness_monitor/*"
+    },
+    {
+      "Sid": "ReadStageCoverageRegistryList",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "_freshness_monitor/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "WriteStageCoverageVerdicts",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/_stage_coverage/*"
+    },
+    {
+      "Sid": "PutAlphaEngineMetrics",
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": {
+        "StringLike": {
+          "cloudwatch:namespace": [
+            "AlphaEngine",
+            "AlphaEngine/*"
+          ]
+        }
+      }
     }
   ]
 }

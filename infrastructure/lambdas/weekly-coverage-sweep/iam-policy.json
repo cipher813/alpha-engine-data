@@ -44,6 +44,25 @@
       "Resource": "arn:aws:s3:::alpha-engine-research/_stage_coverage/_sweep/*"
     },
     {
+      "Sid": "ReadRunScopeForDeclaredSkipExclusion",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/backtest/*/run_scope.json"
+    },
+    {
+      "Sid": "ReadRunScopeForDeclaredSkipExclusionList",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "backtest/*"
+          ]
+        }
+      }
+    },
+    {
       "Sid": "AugmentTheCompletionMarker",
       "Effect": "Allow",
       "Action": [
