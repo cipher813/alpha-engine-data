@@ -106,6 +106,9 @@ class _Sweep:
         cycle=object(),
         partitions_read=("2026-08-21", "2026-08-22"),
         legacy_partition_rows=0,
+        coverage_established=True,
+        deferred=False,
+        deferral_reason=None,
     ):
         self.should_alert = should_alert
         self.cycle = cycle
@@ -117,6 +120,22 @@ class _Sweep:
         # asserted in tests/test_weekly_partition_family_contract.py.
         self.partitions_read = partitions_read
         self.legacy_partition_rows = legacy_partition_rows
+        # alpha-engine-config-I10170. The real CoverageSweep exposes these as
+        # PROPERTIES, so a stub that omits them raises AttributeError rather
+        # than reading as a benign default — which is what happened: every
+        # test in this file failed on `'_Sweep' object has no attribute
+        # 'deferred'` once `_outcome_for` started reading it.
+        #
+        # Defaulting them True/False/None here is deliberate and is the
+        # HEALTHY case: coverage established, nothing deferred. A test that
+        # wants the deferred path passes deferred=True with a reason, so the
+        # two paths stay distinguishable — a stub hardcoding `deferred=False`
+        # would make `_outcome_for`'s deferred branch unreachable and untested
+        # while turning the suite green, which is the shape of defect this
+        # whole issue is about.
+        self.coverage_established = coverage_established
+        self.deferred = deferred
+        self.deferral_reason = deferral_reason
 
     def explain(self):
         return "sweep says so"
@@ -280,3 +299,48 @@ def test_the_marker_is_augmented_in_every_partition_that_was_read():
     )
     index.handler({"run_date": "2026-08-28", "calendar_date": "2026-08-29"}, None)
     assert calls["augment_kwargs"]["also_dates"] == ("2026-08-28", "2026-08-29")
+
+
+def test_deferred_outranks_findings():
+    """`_outcome_for`'s deferred branch, which had no test at all.
+
+    `alpha-engine-config-I10170`: when the cycle cannot support an absence
+    claim, the honest headline is that coverage is not established — not that
+    N stages are absent, which is the assertion the sweep just DECLINED to
+    make. Reporting `findings` there would publish a number the sweep does not
+    stand behind.
+
+    This existed only as a docstring until 2026-09-08. Every test in this file
+    had been failing on `'_Sweep' object has no attribute 'deferred'` because
+    the stub predated the attribute, and the repair that added it could have
+    hardcoded `deferred=False` — turning the suite green while leaving this
+    branch unreachable. That is the same "green over an unexercised path"
+    shape the sweep itself exists to catch, so the branch is asserted here.
+    """
+    index, _ = _install_stubs(
+        sweep=_Sweep(
+            should_alert=True,
+            deferred=True,
+            deferral_reason="cycle in flight — absence not established",
+        )
+    )
+    out = index.handler({"run_date": "2026-08-22"}, None)
+
+    assert out["outcome"] == index.OUTCOME_DEFERRED, (
+        "a deferred sweep reported its findings count as the headline — the "
+        "sweep declined to make that absence claim"
+    )
+    assert out["outcome"] != index.OUTCOME_FINDINGS
+
+
+def test_a_clean_sweep_that_is_not_deferred_is_still_clean():
+    """The other side of the same branch: `deferred` must not swallow a pass.
+
+    Guards against a fix that makes the assertion above true by reporting
+    `deferred` unconditionally.
+    """
+    index, _ = _install_stubs(sweep=_Sweep(should_alert=False))
+    assert index.handler({"run_date": "2026-08-22"}, None)["outcome"] == index.OUTCOME_CLEAN
+
+    index2, _ = _install_stubs(sweep=_Sweep(should_alert=True))
+    assert index2.handler({"run_date": "2026-08-22"}, None)["outcome"] == index2.OUTCOME_FINDINGS
