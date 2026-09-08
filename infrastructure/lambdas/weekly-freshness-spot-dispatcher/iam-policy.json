@@ -49,7 +49,9 @@
       "Action": "iam:PassRole",
       "Resource": "arn:aws:iam::711398986525:role/alpha-engine-executor-role",
       "Condition": {
-        "StringEquals": { "iam:PassedToService": "ec2.amazonaws.com" }
+        "StringEquals": {
+          "iam:PassedToService": "ec2.amazonaws.com"
+        }
       }
     },
     {
@@ -78,10 +80,14 @@
     {
       "Sid": "TerminateWeeklyFreshnessSpotOnError",
       "Effect": "Allow",
-      "Action": ["ec2:TerminateInstances"],
+      "Action": [
+        "ec2:TerminateInstances"
+      ],
       "Resource": "*",
       "Condition": {
-        "StringEquals": { "ec2:ResourceTag/Name": "alpha-engine-weekly-freshness-spot" }
+        "StringEquals": {
+          "ec2:ResourceTag/Name": "alpha-engine-weekly-freshness-spot"
+        }
       }
     },
     {
@@ -89,6 +95,25 @@
       "Effect": "Allow",
       "Action": "sns:Publish",
       "Resource": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts"
+    },
+    {
+      "Sid": "ReadArtifactRegistry",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/_freshness_monitor/ARTIFACT_REGISTRY.yaml"
+    },
+    {
+      "Sid": "ListArtifactRegistryPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "_freshness_monitor/*"
+          ]
+        }
+      }
     },
     {
       "Sid": "WriteStageCoverageVerdicts",
