@@ -30,16 +30,26 @@ success terminal. The sweep reads Step Functions and S3 and writes S3 and one
 metric; it has no reason to need a box. Mirrors ``weekly-run-scope``, the
 sibling that reads the same execution history for the same pipeline.
 
-**Failure posture — fail-open, and never silent.** Three outcomes, and the
-third is the one that must not be collapsed into either of the others:
+**Failure posture — fail-open, and never silent.** FOUR outcomes, and the
+last two are the ones that must not be collapsed into either of the first:
 
 - ``clean`` — the sweep ran and found no gap.
 - ``findings`` — the sweep ran and found a gap. It has already paged from
   inside ``nousergon_lib`` (``krepis.alerts``, deduped per pipeline+run_date).
-- ``unavailable`` — **the sweep did not run.** "Found nothing" and "did not
-  run" are different facts and only the second means the surface is unobserved
-  (``principles.md`` §2.7). This handler returns it as its own outcome so the
-  SF can page for it, because a sweep that never ran cannot page for itself.
+- ``deferred`` — **the sweep ran and the cycle could not support the claim.**
+  ``alpha-engine-config-I10170``. ``absent`` means "expected, entered, and
+  recorded nothing", which only a cycle that has stopped changing can support;
+  when the cycle is still in flight, or its contributor walk was truncated on
+  a non-COMPLETED verdict, the sweep WITHHOLDS the absent count rather than
+  asserting it. Withholding is not silence: the sweep still pages, naming
+  every would-be-absent stage and the re-sweep command, and
+  ``publish_sweep`` emits ``StageCoverageSweepDeferred=1`` on its own metric
+  rather than letting the deferral be inferred from another metric's silence.
+- ``unavailable`` — **the sweep did not run.** "Found nothing", "could not
+  establish" and "did not run" are three different facts and only the last
+  means the reader itself is dead (``principles.md`` §2.7). This handler
+  returns it as its own outcome so the SF can page for it, because a sweep
+  that never ran cannot page for itself.
 
 It never raises: this state sits DOWNSTREAM of the pipeline's real success
 terminal, and an observe-only tail that fails a completed run is a worse defect
@@ -58,12 +68,38 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 BUCKET = os.environ.get("RESEARCH_BUCKET", "alpha-engine-research")
 PIPELINE = os.environ.get("PIPELINE", "ne-weekly-freshness-pipeline")
 
-#: The three outcomes, closed. The SF's Choice matches these literals; adding a
-#: fourth without a matching Choice branch lands on the Default, which is
+#: The four outcomes, closed. The SF's Choice matches these literals; adding a
+#: fifth without a matching Choice branch lands on the Default, which is
 #: ``unavailable`` — the honest fall-through, never ``clean``.
 OUTCOME_CLEAN = "clean"
 OUTCOME_FINDINGS = "findings"
 OUTCOME_UNAVAILABLE = "unavailable"
+#: The sweep RAN, and the cycle could not support the claim it was asked to
+#: make (``alpha-engine-config-I10170``). Distinct from all three above: it is
+#: not clean, it is not a finding about a stage, and the sweep did not fail.
+#: The SF Choice has a branch for it; without one it lands on the Default,
+#: which is ``unavailable`` — still honest, just less precise.
+OUTCOME_DEFERRED = "deferred"
+
+#: The pipeline state this handler IS. It is executing while it grades, so it
+#: can never have written a verdict about its own completion — reporting it
+#: ``absent`` is a false positive guaranteed on every run, and it was one of
+#: the 13 on 2026-09-04 (``alpha-engine-config-I10170``).
+SWEEP_STAGE = os.environ.get("SWEEP_STAGE", "WeeklyCoverageSweep")
+
+
+def _outcome_for(sweep) -> str:
+    """The handler's verdict. ``deferred`` OUTRANKS ``findings``.
+
+    ``alpha-engine-config-I10170``. When the cycle cannot support an absence
+    claim, the honest headline is that coverage is not established — not that
+    N stages are absent, which is the assertion the sweep just declined to
+    make. Findings that DID land are still real and still page from inside
+    ``nousergon_lib``; they are reported in the explanation either way.
+    """
+    if sweep.deferred:
+        return OUTCOME_DEFERRED
+    return OUTCOME_FINDINGS if sweep.should_alert else OUTCOME_CLEAN
 
 
 def handler(event, _context):
@@ -74,6 +110,15 @@ def handler(event, _context):
     # Absent => a single-partition sweep, which is the post-cutover shape.
     calendar_date = (event or {}).get("calendar_date") or ""
     state_machine_arn = (event or {}).get("state_machine_arn") or ""
+    # alpha-engine-config-I10170: THE OBSERVER. This handler runs as a state
+    # INSIDE the execution it is grading, so that execution is RUNNING at the
+    # instant it grades — on every run, forever. Measured on the live
+    # 2026-09-04 cycle: the sweep at 21:39:18Z declared the cycle in_flight
+    # and paged 13 absences in the same artifact; watch-rerun-2026-09-04-4,
+    # the execution it called RUNNING, stopped at 21:39:19Z, two hops later.
+    # Naming the observer lets nousergon_lib count its entered states (real
+    # work) without letting its status make its own cycle non-terminal.
+    observer_execution_arn = (event or {}).get("observer_execution_arn") or ""
     dry_run = bool((event or {}).get("dry_run"))
 
     if not run_date:
@@ -102,6 +147,8 @@ def handler(event, _context):
             state_machine_arn=state_machine_arn or None,
             bucket=BUCKET,
             s3_client=s3_client,
+            observer_execution_arn=observer_execution_arn or None,
+            observer_stage=SWEEP_STAGE,
         )
     except Exception as exc:  # noqa: BLE001 — a sweep that cannot run says so
         # Deliberate broad catch with a named recording surface: the return
@@ -133,7 +180,7 @@ def handler(event, _context):
         # detect. What ``dry_run`` withholds is the WRITES and the page, never
         # the verdict.
         return {
-            "outcome": OUTCOME_FINDINGS if sweep.should_alert else OUTCOME_CLEAN,
+            "outcome": _outcome_for(sweep),
             "dry_run": True,
             "run_date": run_date,
             "partitions_read": list(sweep.partitions_read),
@@ -202,8 +249,10 @@ def handler(event, _context):
             logger.exception("coverage sweep finding could not be paged")
 
     return {
-        "outcome": OUTCOME_FINDINGS if sweep.should_alert else OUTCOME_CLEAN,
+        "outcome": _outcome_for(sweep),
         "run_date": run_date,
+        "coverage_established": sweep.coverage_established,
+        "deferral_reason": sweep.deferral_reason,
         "partitions_read": list(sweep.partitions_read),
         "legacy_partition_rows": sweep.legacy_partition_rows,
         "explanation": explanation,

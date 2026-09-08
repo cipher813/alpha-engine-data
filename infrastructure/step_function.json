@@ -9012,7 +9012,7 @@
       "Comment": "alpha-engine-config-I6891: the clean Friday-PM preflight terminal. Byte-equivalent in outcome to the End: true NotifyShellRunComplete previously carried \u2014 a green preflight still ends SUCCEEDED and still writes no completion marker; only the degraded edge changed."
     },
     "WeeklyCoverageSweep": {
-      "Comment": "WeeklyCoverageSweep (alpha-engine-config-I8214, carrying I8154 deliverable 4 and I8186's state-machine half) \u2014 runs nousergon_lib's stage-coverage sweep over THIS cycle and augments the completion marker the previous state just wrote with the cycle's real shape. WHY IT EXISTS: the sweep's READER shipped in nousergon-lib and nothing called it, so it detected nothing. This state is its caller. PLACEMENT: immediately after WriteCompletionMarker, deliberately \u2014 the marker must exist before it can be augmented. The marker the SF writes claims only 'this SF execution reached its terminal' (claim: sf_execution_terminal, cycle_verdict: unknown); this state is what upgrades that to a cycle verdict. On 2026-08-22 the marker was written by an execution that entered 1 of 16 declared stages and said nothing about it. WHY A LAMBDA AND NOT AN SSM COMMAND: this pipeline has no always-on box \u2014 $.ec2_instance_id is an ephemeral spot, and since alpha-engine-config-I8162 a recovery run whose every box stage is skipped carries NO instance id at all, which is exactly the run that most needs a coverage verdict. A sweep dereferencing it would throw States.Runtime one state after the pipeline's own success terminal. Mirrors weekly-run-scope, the sibling Lambda that reads the same execution history for the same pipeline. OBSERVE-ONLY TAIL, a design constraint not an omission: everything from here down is downstream of the real success terminal and must never turn a completed weekly run into a failure (sf-pipeline-policy \u00a72.1 blast radius). Every terminal below is a Succeed, and the Catch routes to the unobserved terminal rather than to a failure. THREE OUTCOMES AND 'DID NOT RUN' IS NOT ONE OF THE OTHER TWO: the handler returns outcome clean / findings / unavailable. Findings have ALREADY paged from inside the handler (krepis.alerts, deduped per pipeline+run_date), so nothing pages again here; 'unavailable' is the one case the sweep cannot page for itself, so the state machine does it. Collapsing unavailable into findings renders an unobserved surface as a detection, and collapsing it into clean renders it green (principles.md \u00a72.7). PREFLIGHT-AWARE: dry_run.$ = $.research_dry \u2014 the Friday-PM shell run exercises the whole read path and every IAM grant, and writes nothing. TIMEOUT: 240s, deliberately BELOW the Lambda's own 300s so the SF ceiling is the one that binds (tests/test_sf_lambda_timeout_ordering.py). MEASURED, not guessed: the first live invocation on 2026-08-22 took 29.4s at 1024 MB with a 675 MB peak, walking 40 executions of the cycle. The original 90s/120s/256MB sizing TIMED OUT at 120s \u2014 at 256 MB the function used 256 of 256 MB and Lambda scales CPU with memory, so it was throttled as well as starved. 240s is ~8x the measured runtime; the budget bounds an unbounded walk, it does not size the work. DEGRADED PATH DELIBERATELY NOT WIRED: WriteCompletionMarkerDegraded must keep flowing straight into DegradedRun (a Fail state) or sf-telegram-notifier's 'Error: DegradedRun' consumer contract breaks (alpha-engine-config-I6891). A degraded cycle's coverage is swept out-of-band instead. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day, with calendar_date passed as the LEGACY family. The sweep unions both _stage_coverage partitions (canonical first; a verdict in the trading-day partition wins a duplicate) until the 2026-09-05 cutover, so this cycle reports against ONE logical cycle and pages no false absences. Its dry run on 2026-08-22 logged '9 covered / 1 findings / 28 absent of 39 expected' - the 28 were in the sibling partition. nousergon-lib read_coverage_sweep(calendar_date=...) is the reader half; the pin in infrastructure/lambdas/weekly-coverage-sweep/requirements.txt is what carries it.",
+      "Comment": "WeeklyCoverageSweep (alpha-engine-config-I8214, carrying I8154 deliverable 4 and I8186's state-machine half) \u2014 runs nousergon_lib's stage-coverage sweep over THIS cycle and augments the completion marker the previous state just wrote with the cycle's real shape. WHY IT EXISTS: the sweep's READER shipped in nousergon-lib and nothing called it, so it detected nothing. This state is its caller. PLACEMENT: immediately after WriteCompletionMarker, deliberately \u2014 the marker must exist before it can be augmented. The marker the SF writes claims only 'this SF execution reached its terminal' (claim: sf_execution_terminal, cycle_verdict: unknown); this state is what upgrades that to a cycle verdict. On 2026-08-22 the marker was written by an execution that entered 1 of 16 declared stages and said nothing about it. WHY A LAMBDA AND NOT AN SSM COMMAND: this pipeline has no always-on box \u2014 $.ec2_instance_id is an ephemeral spot, and since alpha-engine-config-I8162 a recovery run whose every box stage is skipped carries NO instance id at all, which is exactly the run that most needs a coverage verdict. A sweep dereferencing it would throw States.Runtime one state after the pipeline's own success terminal. Mirrors weekly-run-scope, the sibling Lambda that reads the same execution history for the same pipeline. OBSERVE-ONLY TAIL, a design constraint not an omission: everything from here down is downstream of the real success terminal and must never turn a completed weekly run into a failure (sf-pipeline-policy \u00a72.1 blast radius). Every terminal below is a Succeed, and the Catch routes to the unobserved terminal rather than to a failure. THREE OUTCOMES AND 'DID NOT RUN' IS NOT ONE OF THE OTHER TWO: the handler returns outcome clean / findings / unavailable. Findings have ALREADY paged from inside the handler (krepis.alerts, deduped per pipeline+run_date), so nothing pages again here; 'unavailable' is the one case the sweep cannot page for itself, so the state machine does it. Collapsing unavailable into findings renders an unobserved surface as a detection, and collapsing it into clean renders it green (principles.md \u00a72.7). PREFLIGHT-AWARE: dry_run.$ = $.research_dry \u2014 the Friday-PM shell run exercises the whole read path and every IAM grant, and writes nothing. TIMEOUT: 240s, deliberately BELOW the Lambda's own 300s so the SF ceiling is the one that binds (tests/test_sf_lambda_timeout_ordering.py). MEASURED, not guessed: the first live invocation on 2026-08-22 took 29.4s at 1024 MB with a 675 MB peak, walking 40 executions of the cycle. The original 90s/120s/256MB sizing TIMED OUT at 120s \u2014 at 256 MB the function used 256 of 256 MB and Lambda scales CPU with memory, so it was throttled as well as starved. 240s is ~8x the measured runtime; the budget bounds an unbounded walk, it does not size the work. DEGRADED PATH DELIBERATELY NOT WIRED: WriteCompletionMarkerDegraded must keep flowing straight into DegradedRun (a Fail state) or sf-telegram-notifier's 'Error: DegradedRun' consumer contract breaks (alpha-engine-config-I6891). A degraded cycle's coverage is swept out-of-band instead. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day, with calendar_date passed as the LEGACY family. The sweep unions both _stage_coverage partitions (canonical first; a verdict in the trading-day partition wins a duplicate) until the 2026-09-05 cutover, so this cycle reports against ONE logical cycle and pages no false absences. Its dry run on 2026-08-22 logged '9 covered / 1 findings / 28 absent of 39 expected' - the 28 were in the sibling partition. nousergon-lib read_coverage_sweep(calendar_date=...) is the reader half; the pin in infrastructure/lambdas/weekly-coverage-sweep/requirements.txt is what carries it. | alpha-engine-config-I10170 \u2014 THE OBSERVER. observer_execution_arn.$ = $$.Execution.Id. This state runs INSIDE the execution it grades, so that execution is RUNNING at the instant it grades, on every run, forever. Measured on the live 2026-09-04 cycle: the sweep at 21:39:18Z wrote cycle.verdict in_flight / still_running and paged 13 stages absent in the SAME artifact, while watch-rerun-2026-09-04-4 - the execution it called RUNNING - stopped at 21:39:19Z, one second later, two hops past this state. The 2026-08-28 artifact carries the identical pair, so this was the mechanism's normal state and not an incident. Two consequences, and the second reaches other systems: (1) IN_FLIGHT could never mean what it says, so a cycle genuinely still running was indistinguishable from every healthy one; (2) augment_marker stamped cycle_verdict in_flight and did_work false onto the completion marker of a COMPLETED cycle - the object every gate:* Verified-when predicate reads, which is alpha-engine-config-I8186 re-created with the sign flipped. Naming the observer lets nousergon_lib count this execution's entered states (real work) without letting its status make its own cycle non-terminal; ANY OTHER running execution still yields in_flight, so the honest 'not yet gradeable' answer survives for the case that means it. A FOURTH OUTCOME: 'deferred' - the sweep ran and the cycle could not support the absence claim, so the absent count is WITHHELD rather than asserted. Its own Choice branch and terminal below; collapsing it into 'clean' renders an unestablished surface green and collapsing it into 'findings' reports an assertion the sweep just declined to make.",
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
@@ -9021,6 +9021,7 @@
           "run_date.$": "$.run_date",
           "dry_run.$": "$.research_dry",
           "state_machine_arn.$": "$$.StateMachine.Id",
+          "observer_execution_arn.$": "$$.Execution.Id",
           "calendar_date.$": "$.calendar_date"
         }
       },
@@ -9056,7 +9057,7 @@
     },
     "CheckWeeklyCoverageSweepOutcome": {
       "Type": "Choice",
-      "Comment": "The handler's outcome IS the verdict; each value gets its own named terminal so the execution history says which happened. $.coverage_sweep.outcome is safe to dereference un-guarded: the sole predecessor pins it via ResultSelector (config#2275 rule 3b). The Default is the UNOBSERVED terminal, not the clean one \u2014 an outcome this Choice does not recognise is an unknown state of the coverage surface, and unknown is never rendered green.",
+      "Comment": "The handler's outcome IS the verdict; each value gets its own named terminal so the execution history says which happened. $.coverage_sweep.outcome is safe to dereference un-guarded: the sole predecessor pins it via ResultSelector (config#2275 rule 3b). The Default is the UNOBSERVED terminal, not the clean one \u2014 an outcome this Choice does not recognise is an unknown state of the coverage surface, and unknown is never rendered green. | alpha-engine-config-I10170: 'deferred' is the fourth outcome and has its own branch. It is NOT unavailable (the sweep ran) and NOT clean (coverage was not established).",
       "Choices": [
         {
           "Variable": "$.coverage_sweep.outcome",
@@ -9067,6 +9068,11 @@
           "Variable": "$.coverage_sweep.outcome",
           "StringEquals": "findings",
           "Next": "WeeklyCoverageSweepFindings"
+        },
+        {
+          "Variable": "$.coverage_sweep.outcome",
+          "StringEquals": "deferred",
+          "Next": "WeeklyCoverageSweepDeferred"
         }
       ],
       "Default": "WeeklyCoverageSweepUnavailable"
@@ -9115,6 +9121,43 @@
     "WeeklyCoverageSweepUnobserved": {
       "Type": "Succeed",
       "Comment": "Terminal for the did-not-run case, named for what is true \u2014 the coverage surface is unobserved for this cycle \u2014 rather than for the run, which completed."
+    },
+    "WeeklyCoverageSweepDeferred": {
+      "Type": "Task",
+      "Comment": "outcome=deferred (alpha-engine-config-I10170): the sweep RAN and declined to assert an absence its own cycle cannot support - the cycle is still IN_FLIGHT, or its ListExecutions contributor walk was truncated on a non-COMPLETED verdict, and under either condition a stage that has not finished is indistinguishable from one that finished and recorded nothing. WHY THIS PAGES: withholding is not silence. nousergon_lib withholds the StageCoverageSweepAbsent datapoint (publishing 0 would render an unestablished surface green - principles.md 2.7) and publishes StageCoverageSweepDeferred=1 in its place, so the deferral has its own datapoint rather than being inferred from another metric's silence; alpha-engine-stage-coverage-deferred alarms on it. The sweep has ALSO already paged from inside the handler on the coverage_deferred alert condition, which names every would-be-absent stage and the re-sweep command - this state's notification is the state-machine-visible record of the same fact, and both are deduped by krepis.alerts per pipeline+run_date. Succeed rather than Fail: the weekly run completed, and failing the execution would retroactively mark a good run bad (alpha-engine-config-I8045). | alpha-engine-config-I8809: PARTITION FAMILY = trading_day (pass-through). This state does not KEY on the date; it carries $.run_date into a notification body. Named here anyway because the contract test requires every state touching a run-date variable to state which family it means - an undeclared site is how the split reappeared once already.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline - stage-coverage sweep DEFERRED",
+        "Message.$": "States.Format('The weekly run for {} completed, and the stage-coverage sweep ran but could not establish coverage: the cycle was not terminal, or its contributor walk was truncated on a non-COMPLETED verdict. The absent count is WITHHELD, not zero - this is an UNESTABLISHED surface, not a clean result. Read s3://alpha-engine-research/_stage_coverage/_sweep/ne-weekly-freshness-pipeline/{}.json - its deferral_reason names the condition and absent_stages names every stage that had no verdict at sweep time. Re-sweep once the cycle is terminal by invoking the alpha-engine-weekly-coverage-sweep Lambda with run_date {} and state_machine_arn arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline (omit observer_execution_arn - an out-of-band re-sweep observes from outside the cycle).', $.run_date, $.run_date, $.run_date)"
+      },
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#1819 notifier convention: a failed notify must not fail the run.",
+          "Next": "WeeklyCoverageSweepUnestablished",
+          "ResultPath": "$.coverage_sweep_notify_error"
+        }
+      ],
+      "ResultPath": "$.coverage_sweep_notify_result",
+      "Next": "WeeklyCoverageSweepUnestablished"
+    },
+    "WeeklyCoverageSweepUnestablished": {
+      "Type": "Succeed",
+      "Comment": "The coverage of this cycle is UNESTABLISHED - the sweep ran, declined to assert an absence the cycle could not support, and said so (alpha-engine-config-I10170). Named separately from WeeklyCoverageSweepClean and WeeklyCoverageSweepUnobserved so the execution history says which of the three happened; a terminal shared with 'clean' would make the distinction unreadable in exactly the place an operator looks first."
     },
     "WriteCompletionMarkerDegraded": {
       "Type": "Task",

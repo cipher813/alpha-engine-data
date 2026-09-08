@@ -82,8 +82,21 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # sweep unions it with the trading-day family until the 2026-09-05 cutover,
     # so one cycle split across both reads as one cycle instead of ~28 false
     # absences. Removed with the fallback at the cutover.
+    # alpha-engine-config-I10170: +observer_execution_arn.$ ($$.Execution.Id).
+    # This state runs INSIDE the execution it grades, so that execution is
+    # RUNNING whenever it grades — measured on the live 2026-09-04 cycle, the
+    # sweep declared the cycle in_flight and paged 13 absences in the same
+    # artifact one second before that execution succeeded. Naming the observer
+    # lets its entered states count without its status making its own cycle
+    # non-terminal. Any OTHER running execution still yields in_flight.
     "WeeklyCoverageSweep": frozenset(
-        {"run_date.$", "calendar_date.$", "dry_run.$", "state_machine_arn.$"}
+        {
+            "run_date.$",
+            "calendar_date.$",
+            "dry_run.$",
+            "state_machine_arn.$",
+            "observer_execution_arn.$",
+        }
     ),
     # alpha-engine-config-I8809: the weekly graph's ONE date normalization —
     # calendar date in, cycle trading day out. Reuses alpha-engine-weekly-preflight
