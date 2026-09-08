@@ -146,7 +146,8 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # alpha-engine-config-I7726 — same research-runner Lambda, different mode.
     "ResearchSelfTest": frozenset({"mode", "date.$"}),
     "EvalJudgeSubmitFirstSaturday": frozenset(
-        {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days"}
+        {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days",
+         "run_date.$"}
     ),
     "EvalJudgeSubmitWeekly": frozenset(
         {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days"}
@@ -161,8 +162,23 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "DispatchEvalJudgeSpot": frozenset(
         {"execution_id.$", "run_date.$", "pipeline_role", "force_on_demand.$"}
     ),
-    "EvalRollingMean": frozenset({"end_time_iso.$"}),
-    "RationaleClustering": frozenset({"dry_run_llm.$", "end_time_iso.$"}),
+    # alpha-engine-config-I10194 §1: `run_date.$` was ADDED to these five
+    # states. All five are crucible-research Lambda handlers that derive their
+    # own run_date for the krepis.stage_coverage verdict from
+    # `end_time_iso` — the RAW calendar `$$.Execution.StartTime` — because no
+    # Payload carried `$.run_date` at all. The two differ on any weekend
+    # cycle, so the verdict lands under a plausible-looking but wrong prefix
+    # (the I8155 class, at the Lambda half). `end_time_iso` STAYS: it is the
+    # trailing analysis window's right edge, a different question.
+    #
+    # This half is INERT until crucible-research's handlers prefer
+    # `event.get("run_date")` (I10194 §1 step (2), a separate PR) — the
+    # handlers ignore the extra key today, which is what makes it safe to
+    # merge first.
+    "EvalRollingMean": frozenset({"end_time_iso.$", "run_date.$"}),
+    "RationaleClustering": frozenset(
+        {"dry_run_llm.$", "end_time_iso.$", "run_date.$"}
+    ),
     "ReplayConcordance": frozenset(
         {
             "dry_run_llm.$",
@@ -170,10 +186,11 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
             "max_artifacts",
             "target_models",
             "window_days",
+            "run_date.$",
         }
     ),
     "Counterfactual": frozenset(
-        {"dry_run_llm.$", "end_time_iso.$", "max_depth", "window_days"}
+        {"dry_run_llm.$", "end_time_iso.$", "max_depth", "window_days", "run_date.$"}
     ),
     # `coverage` (config-I7179) is the fan-in declaration: which stages must
     # have produced a cost record by the time the aggregator reads
