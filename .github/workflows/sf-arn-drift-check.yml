@@ -87,6 +87,7 @@ env:
     EventBridge Scheduler rule drift (fleet-wide, codified vs live)
     schedule-manifest.json drift (fleet-wide, vs live AWS)
     Playbook trigger surface drift (playbooks.yaml vs live AWS)
+    Duration-floor calibration drift (STATE_DURATION_FLOORS_SEC vs live SF history)
     Drift-check gate (fail the job on any failed check above)
   WORKFLOW_HEALTH_FINDING_ISSUE: alpha-engine-config-I3697
   WORKFLOW_HEALTH_FINDING_REASON: >-
@@ -312,6 +313,33 @@ jobs:
         if: github.event_name != 'push'
         run: python3 infrastructure/overseer/trigger_surface_drift.py
 
+      # alpha-engine-config-I10164 part 2. execution_digest.py's
+      # STATE_DURATION_FLOORS_SEC is a hand-typed table — the exact defect
+      # class this workflow's other ten checks already guard against, one
+      # level up: those compare codified infrastructure against live AWS;
+      # this compares a codified NUMBER against what live SF execution
+      # history says it should be. Two entries rotted silently in the same
+      # commit (config-I6857) before anyone measured either: one sat above
+      # the median of every healthy run (chronic false positive, caught only
+      # because it happened to fire), the other sat below every genuine run
+      # and missed a confirmed-broken execution (never caught at all). This
+      # step is the periodic re-derivation so a third entry cannot rot the
+      # same way without a daily, gated signal.
+      #
+      # boto3, not the `aws` CLI subprocess shape the other checks in this
+      # file use: floor_calibration.py shares its execution-history parsing
+      # (parse_task_state_durations, fetch_execution_history) with
+      # execution_digest.py itself — the Lambda's own runtime code — so the
+      # calibration math is checked against literally the same function the
+      # digest renders from, not a reimplementation that could drift from it.
+      - name: Install boto3 for the floor-calibration check
+        run: pip install --quiet boto3
+
+      - name: Duration-floor calibration drift (STATE_DURATION_FLOORS_SEC vs live SF history)
+        id: floor_calibration_drift
+        continue-on-error: true
+        run: python3 infrastructure/lambdas/sf-telegram-notifier/floor_calibration.py --check
+
       # ── THE GATE ────────────────────────────────────────────────────────────
       # alpha-engine-config-I9121. Every check above is INDEPENDENT — a
       # different codified source against a different live AWS surface — but
@@ -358,6 +386,7 @@ jobs:
             scheduler_rule_drift=${{ steps.scheduler_rule_drift.outcome }}
             schedule_manifest_drift=${{ steps.schedule_manifest_drift.outcome }}
             trigger_surface_drift=${{ steps.trigger_surface_drift.outcome }}
+            floor_calibration_drift=${{ steps.floor_calibration_drift.outcome }}
         run: |
           failed=0
           echo "### Drift-check outcomes" >> "$GITHUB_STEP_SUMMARY"
