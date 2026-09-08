@@ -106,6 +106,48 @@ def test_poll_morning_enrich_spot_floor_still_catches_a_genuinely_hollow_run():
     assert rows[0].anomaly is True
 
 
+def test_poll_morning_arctic_append_spot_floor_is_the_recalibrated_value():
+    # alpha-engine-config-I10164 part 1: the prior 8m (480s) floor was also
+    # unmeasured (config-I6857) and sat BELOW every genuine run (min 1474.9s
+    # across n=29 Success-status executions), so it never false-positived —
+    # but it also missed a confirmed-broken 929.7s run, the mirror-image
+    # defect. Recalibrated to 1200s, ~19% below the measured genuine minimum.
+    assert STATE_DURATION_FLOORS_SEC["PollMorningArcticAppendSpot"] == 1200
+
+
+def test_poll_morning_arctic_append_spot_floor_clears_the_measured_minimum_genuine_run():
+    # The fastest genuine (arctic_append_poll.Status == "Success") run
+    # measured (500c7956-..., 1474.9s) must NOT breach the new floor.
+    start = datetime(2026, 7, 5, 12, 0, 0, tzinfo=timezone.utc)
+    rows = build_state_durations(
+        {"PollMorningArcticAppendSpot": 1475},
+        is_preflight=False,
+        execution_start=start,
+        run_date="2026-07-04",
+        s3_client=None,
+    )
+    assert rows[0].floor_breach is False
+
+
+def test_poll_morning_arctic_append_spot_floor_still_catches_a_confirmed_broken_run():
+    # 929.7s (b9d76d5c-..., 2026-07-14) is a CONFIRMED broken run — its
+    # arctic_append_poll.Status read "Failed" (SSM StandardErrorContent:
+    # a pip-cache-permission failure, "failed to run commands: exit status
+    # 1") even though the overall SF execution completed SUCCEEDED. The old
+    # 480s floor MISSED this one (929.7s > 480s); the recalibrated 1200s
+    # floor must catch it.
+    start = datetime(2026, 7, 5, 12, 0, 0, tzinfo=timezone.utc)
+    rows = build_state_durations(
+        {"PollMorningArcticAppendSpot": 930},
+        is_preflight=False,
+        execution_start=start,
+        run_date="2026-07-04",
+        s3_client=None,
+    )
+    assert rows[0].floor_breach is True
+    assert rows[0].anomaly is True
+
+
 def test_format_digest_sorts_anomalies_visually():
     rows = [
         StateDuration("Backtester", 600, 600, False, False),

@@ -60,6 +60,12 @@ NON_CHECK_STEPS = {
     "Paused-component alarm actions reconciled with the manifest (live)",
     # A report, not an assertion. `if: always()` already makes it reachable.
     "Publish the arming record",
+    # Setup, not a check: installs a dependency the next step needs. Its own
+    # failure already fails the job outright (no continue-on-error) rather
+    # than being read as a finding, which is correct — a broken pip install
+    # is an infrastructure break, not a drift finding (alpha-engine-config-
+    # I10164 part 2).
+    "Install boto3 for the floor-calibration check",
 }
 
 
