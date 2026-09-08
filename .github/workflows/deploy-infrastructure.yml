@@ -101,11 +101,8 @@ jobs:
       # in this job's own log/output either way). Pure stdlib
       # (datetime/zoneinfo) — no pip install, so it can't itself fail on a
       # dependency problem and mask the real deploy failure this step exists
-      # to annotate. NOT yet threaded into notify-main-failure's Telegram
-      # alert (see that job's comment) — a follow-up PR wires
-      # `blast_radius_message` in once nousergon-lib-PR343 merges and this
-      # job's `outputs.blast_radius_message` (still declared below) gets a
-      # safe main-SHA-pinned consumer.
+      # to annotate. Threaded into notify-main-failure's Telegram alert below
+      # (alpha-engine-config-I7935) via `outputs.blast_radius_message`.
       - name: Compute blast radius (I7800)
         id: blast_radius
         if: always()
@@ -119,17 +116,17 @@ jobs:
   # Alert (Telegram) on genuine post-merge failure of this workflow on the
   # default branch. Reusable workflow + transport in nousergon-lib. config#1128.
   #
-  # alpha-engine-config-I7800: deliberately pinned to the SAME merged main SHA
-  # this job used before this PR (unchanged) — NOT to nousergon-lib-PR343's
-  # branch commit. That branch commit becomes unreachable and garbage-
-  # collectable the moment PR343 is squash-merged (this org squash-merges with
-  # delete_branch_on_merge=true), which would silently break the ONE workflow
-  # whose job is to notify when something else already failed. Threading
-  # blast_radius_message through here is deliberately deferred to a follow-up
-  # PR opened after nousergon-lib-PR343 merges and re-pins this line to the
-  # resulting main SHA — this PR carries no reference to an unmerged commit.
+  # alpha-engine-config-I7935: pinned to nousergon-lib-PR343's squash-merge
+  # commit on nousergon-lib@main (fe3fbbb5e1969b4eb4e767bb1a9e94ff9cd6ec33,
+  # verified 0 commits behind main — a real main commit, never a branch/PR
+  # commit that could be garbage-collected). That commit added the opt-in
+  # `blast_radius_message` input this job now threads through, naming the
+  # concrete downstream consequence (which scheduled pipeline halts, and
+  # when) in the fallback Telegram alert.
   notify-main-failure:
     needs: [deploy-infrastructure]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@fe3fbbb5e1969b4eb4e767bb1a9e94ff9cd6ec33 # main
+    with:
+      blast_radius_message: ${{ needs.deploy-infrastructure.outputs.blast_radius_message }}
     secrets: inherit
