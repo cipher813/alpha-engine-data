@@ -25,6 +25,18 @@ source "$SCRIPT_DIR/_spot_common.sh"
 _SPOT_NAME="${_SPOT_NAME:-data-phase1}"
 _SSM_SLUG="${_SSM_SLUG:-spot-data-phase1}"
 _PROCESS_NAME="${_PROCESS_NAME:-data-phase1}"
+# alpha-engine-config-I10194 §3 — DECLARED, not defaulted (see the
+# `_STAGE_WINDOW_TRACKS_CYCLE` block in _spot_common.sh for the full
+# rationale and the measured 2026-09-04 evidence). `weekly_collector.py
+# --phase 1` runs eight phases that auto-skip when this cycle's output is
+# already on S3 (`constituents`, `macro`, `metron_valuation_medians`,
+# `features`, `historical_constituents`, `short_interest`,
+# `universe_classification`, `fundamentals` — every `_phase_collect` in
+# `_run_phase1` that does not pass `supports_auto_skip=False`), so on a rerun
+# this stage legitimately writes nothing new and its own valid output
+# predates this execution. The bare assignment is deliberate: `${VAR:-1}`
+# here would be the I6922 swallow.
+_STAGE_WINDOW_TRACKS_CYCLE=1
 # alpha-engine-config-I7176 / -I9201 (2026-08-28): 5400 -> 6600, DERIVED from
 # the two most recent cold runs rather than estimated. Measured span from the
 # DataPhase1 StateEntered event to the last CheckDataPhase1Status entry, one
@@ -192,6 +204,13 @@ emit_heartbeat
 # infrastructure/_spot_common.sh — a carrier other code rewrites is exactly the
 # defect alpha-engine-config-I8155 fixes. EXECUTION_RUN_DATE is exported by
 # step_function.json from $.run_date and is never normalized by anything.
-"$LIB_PYTHON" -m krepis.stage_coverage assert --stage DataPhase1 --window-start "$_STAGE_WINDOW_START" --run-date "$EXECUTION_RUN_DATE" || echo "WARNING: stage-coverage assertion did not run for DataPhase1 (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
+#
+# --window-start is RESOLVED, not taken raw: this stage auto-skips phases an
+# earlier attempt of the same cycle already completed, so on a rerun the raw
+# "$_STAGE_WINDOW_START" starts AFTER this cycle's own output and reads it as
+# a previous week's leftover (alpha-engine-config-I10194 §3). The resolver
+# never raises and always prints a window.
+_DATA_PHASE1_WINDOW="$(resolve_stage_window_start DataPhase1 "${EXECUTION_RUN_DATE:-}")"
+"$LIB_PYTHON" -m krepis.stage_coverage assert --stage DataPhase1 --window-start "$_DATA_PHASE1_WINDOW" --run-date "$EXECUTION_RUN_DATE" || echo "WARNING: stage-coverage assertion did not run for DataPhase1 (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
 
 echo "==> DataPhase1 complete."

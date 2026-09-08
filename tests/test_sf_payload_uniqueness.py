@@ -72,7 +72,10 @@ def _flatten_states(sf_doc: dict) -> dict:
 _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # config#2249: fast pre-dispatch substrate health gate, immediately
     # before MorningEnrich (alpha-engine-substrate-health-gate Lambda).
-    "SubstrateHealthGate": frozenset({"instance_id.$"}),
+    # alpha-engine-config-I10172: run_date.$ added — this stage had never
+    # once written a _stage_coverage verdict (the I8228 "never wired" class);
+    # its Payload carried no execution identity at all to key one by.
+    "SubstrateHealthGate": frozenset({"instance_id.$", "run_date.$"}),
     # alpha-engine-config-I8214: the stage-coverage sweep at the tail of the
     # run. Deliberately NOT threading execution_arn: the sweep reads the whole
     # CYCLE (every contributing execution for this run_date), not this one
@@ -143,7 +146,8 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # alpha-engine-config-I7726 — same research-runner Lambda, different mode.
     "ResearchSelfTest": frozenset({"mode", "date.$"}),
     "EvalJudgeSubmitFirstSaturday": frozenset(
-        {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days"}
+        {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days",
+         "run_date.$"}
     ),
     "EvalJudgeSubmitWeekly": frozenset(
         {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days"}
@@ -158,8 +162,23 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "DispatchEvalJudgeSpot": frozenset(
         {"execution_id.$", "run_date.$", "pipeline_role", "force_on_demand.$"}
     ),
-    "EvalRollingMean": frozenset({"end_time_iso.$"}),
-    "RationaleClustering": frozenset({"dry_run_llm.$", "end_time_iso.$"}),
+    # alpha-engine-config-I10194 §1: `run_date.$` was ADDED to these five
+    # states. All five are crucible-research Lambda handlers that derive their
+    # own run_date for the krepis.stage_coverage verdict from
+    # `end_time_iso` — the RAW calendar `$$.Execution.StartTime` — because no
+    # Payload carried `$.run_date` at all. The two differ on any weekend
+    # cycle, so the verdict lands under a plausible-looking but wrong prefix
+    # (the I8155 class, at the Lambda half). `end_time_iso` STAYS: it is the
+    # trailing analysis window's right edge, a different question.
+    #
+    # This half is INERT until crucible-research's handlers prefer
+    # `event.get("run_date")` (I10194 §1 step (2), a separate PR) — the
+    # handlers ignore the extra key today, which is what makes it safe to
+    # merge first.
+    "EvalRollingMean": frozenset({"end_time_iso.$", "run_date.$"}),
+    "RationaleClustering": frozenset(
+        {"dry_run_llm.$", "end_time_iso.$", "run_date.$"}
+    ),
     "ReplayConcordance": frozenset(
         {
             "dry_run_llm.$",
@@ -167,10 +186,11 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
             "max_artifacts",
             "target_models",
             "window_days",
+            "run_date.$",
         }
     ),
     "Counterfactual": frozenset(
-        {"dry_run_llm.$", "end_time_iso.$", "max_depth", "window_days"}
+        {"dry_run_llm.$", "end_time_iso.$", "max_depth", "window_days", "run_date.$"}
     ),
     # `coverage` (config-I7179) is the fan-in declaration: which stages must
     # have produced a cost record by the time the aggregator reads
@@ -230,8 +250,17 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # coverage verdict (DispatchWeeklyFreshnessSpot / RelaunchWeeklyFreshnessSpot,
     # both INFRASTRUCTURE/GATE stages) had been writing under an empty
     # run_date since I7214 shipped, because neither Payload carried one.
+    # alpha-engine-config-I10172: sf_stage added — a Payload literal naming
+    # each Task's OWN identity. Both callers pass force_on_demand: true (see
+    # comments above and on RelaunchWeeklyFreshnessSpot below), so the
+    # boolean no longer distinguishes them: the handler's old
+    # force_on_demand-derived stage name always resolved to
+    # RelaunchWeeklyFreshnessSpot, and this state's own invocations wrote
+    # their coverage verdict under the OTHER state's name —
+    # DispatchWeeklyFreshnessSpot had zero verdicts in any partition, ever
+    # (measured 2026-09-08).
     "DispatchWeeklyFreshnessSpot": frozenset(
-        {"execution_id.$", "run_date.$", "force_on_demand"}
+        {"execution_id.$", "run_date.$", "force_on_demand", "sf_stage"}
     ),
     # config-I7119: the SAME dispatcher, invoked to replace a launcher box that
     # was reclaimed mid-run. force_on_demand was added to the dispatcher in
@@ -241,7 +270,7 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # two payloads are now identical. A literal `true`, not a `.$` path: the
     # decision is structural, never execution input.
     "RelaunchWeeklyFreshnessSpot": frozenset(
-        {"execution_id.$", "run_date.$", "force_on_demand"}
+        {"execution_id.$", "run_date.$", "force_on_demand", "sf_stage"}
     ),
 }
 
