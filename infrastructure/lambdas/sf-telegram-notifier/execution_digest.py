@@ -39,8 +39,68 @@ STATE_DURATION_FLOORS_SEC: Mapping[str, int] = {
     # not the Launch states: a Launch returns in ~20s having only dispatched
     # the spot request, so a floor there would fire on every healthy run,
     # while the poll loop is what actually spans the workload.
-    "PollMorningEnrichSpot": 8 * 60,
-    "PollMorningArcticAppendSpot": 8 * 60,
+    #
+    # PollMorningEnrichSpot RECALIBRATED 2026-09-08 (alpha-engine-config-I10164):
+    # the prior 8m floor was never measured — `git log -S` on this file shows it
+    # was introduced in one commit (7430b545, config-I6857) that reused the
+    # unrelated ModelZooTrainMap weekly floor's literal, with no distribution
+    # pulled. It fired 🟡 on a SUCCEEDED 2026-09-08 run
+    # (98e1983a-1845-4867-9eac-e55f2cab26cb) that completed in 4m. Measured
+    # against all 34 SUCCEEDED ne-preopen-trading-pipeline executions in the
+    # account's full history (76 executions, no earlier page) that carried this
+    # state: min 106.8s / p10 228.2s / median 273.7s / p90 516.9s / max 1169.6s.
+    # The 8m (480s) floor sat ABOVE the median — most healthy runs breached it.
+    # Cross-checked against workload OUTPUT, not just duration: the SSM command
+    # output for the 4m 2026-09-08 run and for two of the slowest runs on record
+    # (cf9ff0a5, 15.7m; ae4532ac, 19.5m) all show the same ~903-ticker
+    # constituents universe and ~924-929/929 "Polygon grouped-daily" coverage —
+    # duration does not track work done here, so a fast run is not a
+    # short-scope run. New floor: 90s, ~15% below the measured minimum (106.8s)
+    # of a genuine run, so normal variance clears it while a truly degenerate
+    # run — the spot dispatcher returning without launching real work, or the
+    # SSM command dying before the constituents fetch even starts (all 34
+    # measured runs take >=106.8s to reach that point) — still trips it.
+    # PollMorningArcticAppendSpot's own 8m floor was NOT touched here: it is a
+    # different state with its own distribution, out of scope for this
+    # investigation and tracked separately in I10164.
+    "PollMorningEnrichSpot": 90,
+    #
+    # PollMorningArcticAppendSpot RECALIBRATED 2026-09-08 (alpha-engine-config-
+    # I10164 part 1). The prior 8m (480s) floor was ALSO unmeasured (same
+    # config-I6857 commit, same reused ModelZooTrainMap literal) — but unlike
+    # PollMorningEnrichSpot it never produced a false positive, because it sat
+    # BELOW every genuine run rather than above the median. That is not
+    # evidence it was right: it means the floor was too LOW to catch a real
+    # failure, the mirror-image defect.
+    #
+    # Measured against all 34 SUCCEEDED ne-preopen-trading-pipeline executions
+    # in the account's full history that carried this state — but duration
+    # alone does not separate genuine from broken here the way it does for
+    # PollMorningEnrichSpot: this state's Task output carries a companion
+    # `arctic_append_poll.Status` field (the raw ssm:GetCommandInvocation
+    # result), which is ground truth for whether the spot command itself
+    # actually succeeded. Splitting on THAT (not just duration) found:
+    #   Success (n=29): min 1474.9s / p10 1535.4s / median 1919.4s /
+    #     p90 2403.1s / max 5595.5s.
+    #   Failed  (n=5): 121.3s, 260.3s, 929.7s, 3806.4s, 4808.3s.
+    # The three short Failed runs are a genuinely broken spot command (SSM
+    # StandardErrorContent: "WARNING: The directory '/home/ec2-user/.cache/
+    # pip' ... failed to run commands: exit status 1", and one "Undeliverable")
+    # that the SF execution still recorded as SUCCEEDED overall — an
+    # independent verification that a FAST run here is not a short-scope run,
+    # it is a broken one, exactly the class part 2's mechanism exists to keep
+    # catching. The old 480s floor caught two of the three (121.3s, 260.3s)
+    # but MISSED the third (929.7s > 480s) — a false negative on a confirmed-
+    # broken run, not a hypothetical.
+    # New floor: 1200s (20m), ~19% below the measured genuine minimum
+    # (1474.9s) — clears every one of the 29 genuine runs with margin, and now
+    # catches all three known-broken short runs (121.3s, 260.3s, 929.7s < 1200s
+    # all breach). The two long-duration Failed runs (3806.4s, 4808.3s) are
+    # NOT caught by any duration floor — a slow failure is a different
+    # detection problem (an attestation/output check, not a minimum-duration
+    # check) and is filed separately (alpha-engine-config-I10189), not folded
+    # into this recalibration.
+    "PollMorningArcticAppendSpot": 20 * 60,
     "Scanner": 60,
 }
 
