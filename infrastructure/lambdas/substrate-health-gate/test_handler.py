@@ -70,6 +70,45 @@ def test_healthy_low_disk_usage():
     assert out["disk_used_percent"] == 42
 
 
+# ── alpha-engine-config-I10172: the stage-coverage self-assertion ───────────
+
+
+def test_stage_coverage_is_unmeasured_without_a_run_date():
+    """No run_date on the event (an operator off-cycle invocation, or a test
+    fixture predating I8155) must report UNMEASURED, never fabricate a date
+    (alpha-engine-config-I8155) and never attempt the krepis import/AWS call."""
+    ssm = _ssm_stub(invocation_sequence=[_df_success(42)])
+    with mock.patch.object(index, "_ssm", ssm), mock.patch.object(time, "sleep"):
+        out = index.handler(_event(), None)
+    assert out["stage_coverage"] == {
+        "stage": "SubstrateHealthGate",
+        "status": "UNMEASURED",
+        "reason": "no run_date on state input",
+    }
+
+
+def test_stage_coverage_is_asserted_on_every_verdict_path():
+    """The coverage question ('did this stage run and declare itself') is
+    orthogonal to the health question — asserted whether the gate finds
+    HEALTHY or SUBSTRATE_UNHEALTHY, so a real miss is never masked by a
+    non-terminal early return."""
+    ssm = _ssm_stub(invocation_sequence=[_df_success(100)])
+    with mock.patch.object(index, "_ssm", ssm), mock.patch.object(time, "sleep"):
+        out = index.handler(_event(run_date="2026-09-04"), None)
+    assert out["verdict"] == "SUBSTRATE_UNHEALTHY"
+    assert out["stage_coverage"]["stage"] == "SubstrateHealthGate"
+
+
+def test_stage_coverage_assertion_is_import_guarded_and_loud():
+    """The nousergon-lib/krepis pin may predate the module; an inert
+    assertion must stay distinguishable from a covered stage and must not
+    change the gate's own verdict."""
+    body = (Path(__file__).parent / "index.py").read_text()
+    assert "from krepis.stage_coverage import assert_stage_coverage" in body
+    assert "except ImportError as exc:" in body
+    assert "UNMEASURED" in body
+
+
 def test_disk_full_verdict_is_named_substrate_unhealthy():
     """The issue's headline scenario: disk 100% full must produce a NAMED
     SubstrateUnhealthy verdict (not a generic failure)."""

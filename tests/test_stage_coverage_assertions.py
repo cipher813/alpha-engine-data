@@ -250,13 +250,36 @@ def test_weekly_preflight_records_its_no_output_declaration() -> None:
     assert '"stage_coverage"' in body
 
 
-def test_the_spot_dispatcher_derives_which_of_its_two_stages_ran() -> None:
-    """One Lambda, two SF states. Hardcoding either name would file the
-    relaunch's verdict under the dispatch's."""
+def test_the_spot_dispatcher_prefers_the_explicit_sf_stage_identity() -> None:
+    """One Lambda, two SF states, and (alpha-engine-config-I10172) BOTH
+    callers pass `force_on_demand: true` — the boolean no longer
+    distinguishes them, so the old `"RelaunchWeeklyFreshnessSpot" if
+    force_on_demand else "DispatchWeeklyFreshnessSpot"` derivation always
+    took the first branch. DispatchWeeklyFreshnessSpot's own invocations
+    wrote their verdict under RelaunchWeeklyFreshnessSpot's name, and
+    DispatchWeeklyFreshnessSpot had zero verdicts in any partition, ever.
+    Each SF Task now stamps its own name via a Payload literal (`sf_stage`)
+    and the handler must read it FIRST."""
     body = (
         INFRA / "lambdas" / "weekly-freshness-spot-dispatcher" / "index.py"
     ).read_text()
+    assert 'str(event.get("sf_stage", "")).strip()' in body
+    # The force_on_demand derivation survives only as the fallback for an
+    # operator off-cycle invocation that predates the sf_stage field.
     assert '"RelaunchWeeklyFreshnessSpot" if force_on_demand else "DispatchWeeklyFreshnessSpot"' in body
+
+
+def test_both_spot_dispatcher_sf_states_stamp_their_own_identity() -> None:
+    """Guards the SF side of I10172: a Payload literal, not derived, so a
+    future third caller cannot silently fall back to the ambiguous
+    force_on_demand heuristic without a reviewer noticing a missing field."""
+    definition = json.loads(SF_DEFINITION.read_text())
+    states = _states(definition)
+    for name in ("DispatchWeeklyFreshnessSpot", "RelaunchWeeklyFreshnessSpot"):
+        payload = states[name]["Parameters"]["Payload"]
+        assert payload.get("sf_stage") == name, (
+            f"{name}: Payload does not stamp its own sf_stage identity"
+        )
 
 
 # ── alpha-engine-config-I8155: the two Lambdas pass a real run_date ──────────
