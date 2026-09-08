@@ -275,7 +275,43 @@ def _persist(scope: dict, key: str) -> dict:
     )
 
 
+def _assert_stage_coverage(stage: str, started: datetime, run_date: str | None) -> dict:
+    """Record this stage's own output verdict (alpha-engine-config-I10172).
+
+    `RunScope` declares `output: registered` / `artifacts: [weekly_run_scope]`
+    in `ARTIFACT_REGISTRY.yaml` — this is a real producer, not a gate, so the
+    verdict depends on whether `backtest/{run_date}/run_scope.json` actually
+    landed in-window. Measured 2026-09-08: this stage had never once written
+    a `_stage_coverage` verdict — the I8228 "never wired" class.
+
+    ``run_date`` here is `event["run_date"]` — by the time `RunScope` runs,
+    downstream of `NormalizeRunDates` (alpha-engine-config-I8809), that is
+    already the cycle's TRADING day, the same value `_persist` above keys the
+    artifact by. Never fabricated: a missing/blank run_date reports
+    UNMEASURED rather than defaulting to any derived date
+    (alpha-engine-config-I8155). Never alters the handler's outcome — an
+    observer that can change the stage it observes is a new failure mode
+    bolted onto the one it reports. Mirrors
+    `weekly-preflight/index.py::_assert_stage_coverage` (`policy-shared-code`).
+    """
+    if not run_date:
+        logger.error(
+            "stage-coverage assertion has no run_date for %s — event carried none",
+            stage,
+        )
+        return {"stage": stage, "status": "UNMEASURED", "reason": "no run_date on state input"}
+    try:
+        from krepis.stage_coverage import assert_stage_coverage
+    except ImportError as exc:
+        logger.error("stage-coverage assertion unavailable for %s: %s", stage, exc)
+        return {"stage": stage, "status": "UNMEASURED", "reason": str(exc)}
+    return assert_stage_coverage(stage, window_start=started, run_date=run_date)
+
+
 def handler(event, _context):
+    # Captured at handler ENTRY, before any write this invocation makes
+    # (alpha-engine-config-I7214).
+    _stage_coverage_started = datetime.now(timezone.utc)
     calendar_run_date = event.get("run_date") or ""
     execution_arn = event.get("execution_arn") or ""
     state_machine_arn = event.get("state_machine_arn") or ""
@@ -376,6 +412,13 @@ def handler(event, _context):
             "run_date never resolved — not writing an artifact for this "
             "execution (calendar_run_date=%r)", calendar_run_date,
         )
+        scope["stage_coverage"] = _assert_stage_coverage(
+            "RunScope", _stage_coverage_started, None
+        )
         return scope
 
-    return _persist(scope, KEY_TEMPLATE.format(run_date=run_date))
+    written = _persist(scope, KEY_TEMPLATE.format(run_date=run_date))
+    written["stage_coverage"] = _assert_stage_coverage(
+        "RunScope", _stage_coverage_started, run_date
+    )
+    return written

@@ -120,6 +120,24 @@ AMI_ID="ami-0c421724a94bba6d6"      # Amazon Linux 2023 x86_64
 # plus pip install + preflight. If the workload legitimately needs longer,
 # bump this — don't silently rely on the orphan reaper.
 MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-5400}"
+
+# alpha-engine-config-I10194 §3 — DECLARED, not defaulted (full rationale and
+# the measured 2026-09-04 evidence live in _spot_common.sh's
+# `_STAGE_WINDOW_TRACKS_CYCLE` block). This script's SF-wired mode is
+# `--phase2-only` -> `weekly_collector.py --phase 2` -> `_run_phase2`, whose
+# `alternative` phase auto-skips when this cycle's output is already on S3;
+# the script's other modes reach `_run_phase1` (eight auto-skipping phases)
+# as well. So a rerun of DataPhase2 legitimately writes nothing new and its
+# own valid output predates this execution. The bare assignment is
+# deliberate: `${VAR:-1}` here would be the I6922 swallow.
+#
+# This is the CLASS, not the instance: I10194 §3 measured the defect on
+# DataPhase1, and DataPhase2 shares the auto-skip property that causes it.
+# MorningEnrich deliberately does NOT declare this — every phase in
+# `_run_morning_enrich` goes through `_maybe_phase`, which pins
+# `supports_auto_skip=False`, so for that stage the current
+# "this execution's start" semantics remain the correct leftover detector.
+_STAGE_WINDOW_TRACKS_CYCLE=1
 # Set to 1 only by the --max-runtime-seconds flag: the rag-only 4h-cap
 # override below must not clobber an explicit operator value. MUST be
 # default-initialized here — this script runs under `set -u`, and the flag
@@ -220,6 +238,10 @@ LIB_PYTHON="${LIB_PYTHON:-/home/ec2-user/alpha-engine-dashboard/.venv/bin/python
 # Restated here rather than sourced: this script does NOT source
 # _spot_common.sh (it carries its own run_ssm/launch pair, see the header).
 _STAGE_WINDOW_START="${_STAGE_WINDOW_START:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+
+# The window rule lives in ONE file, sourced by both this file and the
+# spot_data_weekly.sh monolith (alpha-engine-config-I10194 §3).
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_stage_window.sh"
 
 # ── Parse flags ──────────────────────────────────────────────────────────────
 # RUN_MODE values:
@@ -1148,7 +1170,13 @@ PHASE2_ONLY
     # code rewrites is exactly the defect alpha-engine-config-I8155 fixes.
     # EXECUTION_RUN_DATE is exported by step_function.json from $.run_date
     # and is never normalized by anything.
-    "$LIB_PYTHON" -m krepis.stage_coverage assert --stage DataPhase2 --window-start "$_STAGE_WINDOW_START" --run-date "$EXECUTION_RUN_DATE" || echo "WARNING: stage-coverage assertion did not run for DataPhase2 (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
+    # --window-start is RESOLVED, not taken raw (alpha-engine-config-I10194
+    # §3): this stage auto-skips phases an earlier attempt of the same cycle
+    # already completed, so on a rerun the raw "$_STAGE_WINDOW_START" starts
+    # AFTER this cycle's own output and reads it as a previous week's
+    # leftover. The resolver never raises and always prints a window.
+    _DATA_PHASE2_WINDOW="$(resolve_stage_window_start DataPhase2 "${EXECUTION_RUN_DATE:-}")"
+    "$LIB_PYTHON" -m krepis.stage_coverage assert --stage DataPhase2 --window-start "$_DATA_PHASE2_WINDOW" --run-date "$EXECUTION_RUN_DATE" || echo "WARNING: stage-coverage assertion did not run for DataPhase2 (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
     exit 0
 fi
 
