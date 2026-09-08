@@ -66,6 +66,46 @@ def test_preflight_suppresses_floor_breach():
     assert rows[0].floor_breach is False
 
 
+def test_poll_morning_enrich_spot_floor_is_the_recalibrated_value():
+    # alpha-engine-config-I10164: the prior 8m floor was unmeasured and sat
+    # above the median of every healthy run (median 273.7s across n=34
+    # SUCCEEDED executions), firing a chronic false positive. Recalibrated to
+    # 90s, ~15% below the measured minimum genuine duration (106.8s).
+    assert STATE_DURATION_FLOORS_SEC["PollMorningEnrichSpot"] == 90
+
+
+def test_poll_morning_enrich_spot_floor_clears_the_measured_minimum_genuine_run():
+    # The slowest-to-clear genuine run measured (operator-recovery-2026-08-13,
+    # 106.8s) must NOT breach the new floor — a floor still firing on the
+    # fastest observed healthy run would be the same defect class recalibrated
+    # to a different wrong number.
+    start = datetime(2026, 7, 5, 12, 0, 0, tzinfo=timezone.utc)
+    rows = build_state_durations(
+        {"PollMorningEnrichSpot": 107},
+        is_preflight=False,
+        execution_start=start,
+        run_date="2026-07-04",
+        s3_client=None,
+    )
+    assert rows[0].floor_breach is False
+
+
+def test_poll_morning_enrich_spot_floor_still_catches_a_genuinely_hollow_run():
+    # A run that returns before the constituents fetch even starts (no
+    # measured genuine run, n=34, completes in under 90s) must still trip
+    # HOLLOW-SUSPECT.
+    start = datetime(2026, 7, 5, 12, 0, 0, tzinfo=timezone.utc)
+    rows = build_state_durations(
+        {"PollMorningEnrichSpot": 45},
+        is_preflight=False,
+        execution_start=start,
+        run_date="2026-07-04",
+        s3_client=None,
+    )
+    assert rows[0].floor_breach is True
+    assert rows[0].anomaly is True
+
+
 def test_format_digest_sorts_anomalies_visually():
     rows = [
         StateDuration("Backtester", 600, 600, False, False),

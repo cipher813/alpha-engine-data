@@ -39,7 +39,31 @@ STATE_DURATION_FLOORS_SEC: Mapping[str, int] = {
     # not the Launch states: a Launch returns in ~20s having only dispatched
     # the spot request, so a floor there would fire on every healthy run,
     # while the poll loop is what actually spans the workload.
-    "PollMorningEnrichSpot": 8 * 60,
+    #
+    # PollMorningEnrichSpot RECALIBRATED 2026-09-08 (alpha-engine-config-I10164):
+    # the prior 8m floor was never measured — `git log -S` on this file shows it
+    # was introduced in one commit (7430b545, config-I6857) that reused the
+    # unrelated ModelZooTrainMap weekly floor's literal, with no distribution
+    # pulled. It fired 🟡 on a SUCCEEDED 2026-09-08 run
+    # (98e1983a-1845-4867-9eac-e55f2cab26cb) that completed in 4m. Measured
+    # against all 34 SUCCEEDED ne-preopen-trading-pipeline executions in the
+    # account's full history (76 executions, no earlier page) that carried this
+    # state: min 106.8s / p10 228.2s / median 273.7s / p90 516.9s / max 1169.6s.
+    # The 8m (480s) floor sat ABOVE the median — most healthy runs breached it.
+    # Cross-checked against workload OUTPUT, not just duration: the SSM command
+    # output for the 4m 2026-09-08 run and for two of the slowest runs on record
+    # (cf9ff0a5, 15.7m; ae4532ac, 19.5m) all show the same ~903-ticker
+    # constituents universe and ~924-929/929 "Polygon grouped-daily" coverage —
+    # duration does not track work done here, so a fast run is not a
+    # short-scope run. New floor: 90s, ~15% below the measured minimum (106.8s)
+    # of a genuine run, so normal variance clears it while a truly degenerate
+    # run — the spot dispatcher returning without launching real work, or the
+    # SSM command dying before the constituents fetch even starts (all 34
+    # measured runs take >=106.8s to reach that point) — still trips it.
+    # PollMorningArcticAppendSpot's own 8m floor was NOT touched here: it is a
+    # different state with its own distribution, out of scope for this
+    # investigation and tracked separately in I10164.
+    "PollMorningEnrichSpot": 90,
     "PollMorningArcticAppendSpot": 8 * 60,
     "Scanner": 60,
 }
