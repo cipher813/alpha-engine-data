@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "_doc": "Budgets/quotas SSoT for the expense-collector Lambda + console Expenses page. Live copy: s3://alpha-engine-research/config/expense_budgets.json (operator-edited: aws s3 cp expense_budgets.seed.json s3://alpha-engine-research/config/expense_budgets.json — or edit the live object directly). monthly_budget_usd null = no budget line (row shows spend without over/under pacing). fixed_monthly_usd on a key with no live adapter renders a flat-subscription row, so future subscriptions are config-only additions.",
-  "updated": "2026-07-19",
+  "updated": "2026-09-08",
   "providers": {
     "aws": {
       "label": "AWS",
@@ -23,7 +23,8 @@
     },
     "deepseek": {
       "label": "DeepSeek",
-      "monthly_budget_usd": 10.0
+      "monthly_budget_usd": 35.0,
+      "note": "Raised from $10 (set 2026-07-17, b9f287e9) — stale: that number predates three material widenings of DeepSeek's real routing footprint that were never revisited against it. (1) 2026-08-14 (config-I6562/-I7326): director/retro.py's retro judge was silently broken for 24 days (OpenRouter 400 on every call) and incurred ~$0 real DeepSeek spend; the fix routes it through krepis.router's `high` group, whose primary resolves to deepseek-v4-pro. (2) 2026-08-25 (config-I8350): reconcile-llm-model-registry had been red since 08-22 with DeepSeek pricing understated ~3x (in 0.435->1.32, out 0.87->3.96 per-unit) — corrected, but confirms DeepSeek is high's primary and one of ultra's arms. (3) 2026-09-04 (config-I9975, crucible v2 phase-0 router arc): `med` now serves from DeepSeek alone; `low`/`high`/`ultra` are deepseek+zhipu. None of that is misrouting — llm-provider-model-policy.md LPM-1 already prices the PRC/DeepSeek jurisdiction acceptance at ~$2K/mo at full volume, so a $10 placeholder was never meant to be the ceiling. 2026-09 MTD $2.71 -> projected $10.16 is the FIRST full month reflecting (3), 4 days in; $35 gives ~3.4x headroom over that projection while the new steady-state settles. Re-exam tracked as alpha-engine-config-I10279 (2026-10-08) against a full month of post-I9975 data."
     },
     "neon": {
       "label": "Neon Postgres",
