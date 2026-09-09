@@ -496,7 +496,47 @@ def _history_regression(
     ):
         from nousergon_lib.dates import trading_days_stale
 
-        slide = trading_days_stale(existing_first.date(), planned_first.date())
+        try:
+            from krepis.trading_calendar import (
+                TradingCalendarRangeError as _CalendarRangeError,
+            )
+        except ImportError:
+            # Pinned krepis predates the I10127 coverage guard entirely (it
+            # never raises this) — nothing to catch, and the except below is
+            # unreachable, matching today's (pre-fix) behaviour exactly.
+            _CalendarRangeError = ()
+
+        try:
+            slide = trading_days_stale(existing_first.date(), planned_first.date())
+        except _CalendarRangeError as exc:
+            # alpha-engine-config-I10267: krepis>=0.59.52 (I10127) correctly
+            # refuses a trading-day-precise answer for any date before
+            # NYSE_CALENDAR_COVERS_FROM (2016-01-01) — the holiday table has
+            # no data at all that far back. A declared-CUMULATIVE FRED symbol
+            # (CUMULATIVE_MACRO_SYMBOLS) can legitimately span dates that old
+            # (BAA10Y/TWO/VIX etc. go back to the 1980s), so this is not an
+            # error condition, just a range the live calendar cannot resolve.
+            # Catching the specific krepis range-error class (not bare
+            # Exception) keeps an unrelated bug in `trading_days_stale` fail
+            # loud as before. Fall back to a business-day count — an
+            # always-available, calendar-independent, slightly conservative
+            # (holiday-blind, so marginally over-generous) estimate — logged
+            # loudly so the approximation is greppable. This does not weaken
+            # the integrity check for the case that can actually reach it: a
+            # declared-cumulative symbol's WRITTEN result is independently
+            # verified by `_cumulative_invariant_violation` after
+            # `_cumulative_prepend`, using plain date/row comparisons with no
+            # calendar dependency, so a wrong slide credit here cannot mask a
+            # real loss. A non-cumulative (rolling yfinance) symbol never
+            # reaches this branch in practice — its window is always within
+            # the last ~10 years.
+            slide = int(np.busday_count(existing_first.date(), planned_first.date()))
+            log.info(
+                "MACRO_SLIDE_PRECALENDAR_FALLBACK %s existing_first=%s "
+                "planned_first=%s busday_slide=%d reason=%s — see "
+                "alpha-engine-config-I10267.",
+                label, existing_first.date(), planned_first.date(), slide, exc,
+            )
     allowed_loss = _MACRO_HISTORY_SHRINK_TOLERANCE_ROWS + min(
         slide, _MACRO_WINDOW_SLIDE_MAX_TRADING_DAYS
     )
