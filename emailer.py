@@ -42,6 +42,13 @@ def _build_email(step_name: str, results: dict, date_str: str) -> tuple[str, str
         else:
             duration_str = f"{secs:.0f}s"
     except Exception:
+        # CARVE-OUT (alpha-engine-config-I10226): (a) failure mode swallowed —
+        # `results["started_at"]`/`["completed_at"]` missing or unparseable.
+        # (c) no recording surface — this only formats a cosmetic duration
+        # substring for the notification email body/subject; it writes no
+        # data and feeds no downstream consumer, so a blank `duration_str` is
+        # the correct degraded rendering, not a corruption. See
+        # `.debug-swallow-allowlist.yaml`.
         pass
 
     status_icon = "OK" if status == "OK" else "PARTIAL" if status == "PARTIAL" else "FAILED"

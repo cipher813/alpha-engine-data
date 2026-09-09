@@ -818,6 +818,16 @@ def _load_cached_fundamentals(s3, bucket: str, date_str: str) -> dict[str, dict]
             log.info("Loaded cached fundamentals from s3://%s/%s (%d tickers)", bucket, key, len(data))
             return data
         except Exception:
+            # CARVE-OUT (alpha-engine-config-I10226): (a) failure mode
+            # swallowed — the exact-date S3 key missing or unreadable. (c)
+            # recording surface — none needed at THIS step because it is a
+            # documented in-band fallback cascade: control falls through to
+            # the "Scan for most recent fundamentals file" block below, whose
+            # own failure IS recorded loud (`log.warning` at line ~838), and
+            # whose total-absence outcome is ALSO recorded (`log.info` at
+            # line ~840). This is a read-side cache lookup, not a writer —
+            # nothing is persisted here, so no data is silently corrupted.
+            # See `.debug-swallow-allowlist.yaml`.
             pass
 
     # Scan for most recent fundamentals file
