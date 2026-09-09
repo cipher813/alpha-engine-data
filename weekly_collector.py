@@ -587,8 +587,11 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                 db_path = None
 
         if db_path:
-            # supports_auto_skip=False: writes the shared mutable research.db (no
-            # dated artifact to validate) → markers + watchdog only.
+            # supports_auto_skip=False: writes the shared mutable research.db.
+            # It ALSO writes backups/research_{run_date}.db since
+            # alpha-engine-config-I10202, but that dated object is a backup of
+            # the shared database rather than this phase's own product, so the
+            # auto-skip validator still has nothing phase-specific to check.
             results["collectors"]["universe_returns"] = _phase_collect(
                 reg, "universe_returns",
                 lambda: universe_returns.collect(
@@ -599,6 +602,7 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                         "sector_map_key", "reference/price_cache/sector_map.json"
                     ),
                     dry_run=dry_run,
+                    run_date=run_date,
                 ),
                 supports_auto_skip=False,
             )
@@ -621,6 +625,7 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                     signals_prefix=ur_cfg.get("signals_prefix", "signals"),
                     dry_run=dry_run,
                     forward_days=int(sr_cfg.get("forward_days", 21)),
+                    run_date=run_date,
                 ),
                 supports_auto_skip=False,
             )
