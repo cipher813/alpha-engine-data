@@ -1,0 +1,73 @@
+schema_version: 1
+# Allowlist for `tests/test_no_debug_only_swallows.py` — every entry below is
+# a debug-only-or-pass `except Exception` swallow detected by
+# `nousergon_lib.testing.debug_swallow_guard`, individually triaged and
+# carved out for the reason named. This repo's own AGENTS.md states there is
+# NO graceful-degrade carve-out for a WRITER here — every entry below is
+# either a genuinely non-data-bearing cosmetic path, or an already-documented
+# in-band fallback whose ultimate failure state is recorded loud elsewhere in
+# the same function. Any swallow found on a write path was fixed (RAISE or
+# RECORD-LOUD), never allowlisted — see alpha-engine-config-I10226.
+entries:
+  - path: collectors/alternative.py
+    line: 1572
+    reason: >-
+      (a) failure mode swallowed: s3.get_object against
+      archive/revisions/{date}.json fails/404s for every checked date.
+      (c) no recording surface needed — the comment immediately above this
+      block (line ~1549) already establishes no writer of that S3 key exists
+      anywhere in this codebase, so the loop 404s by construction; it is
+      documented dead code kept only as a non-regressing safety net, and
+      result["revision_4w"] is already None on entry and stays None, so
+      nothing is silently degraded from a populated value.
+    expires: "2027-03-10"
+    tracking: alpha-engine-config-I10226
+  - path: emailer.py
+    line: 44
+    reason: >-
+      (a) failure mode swallowed: results["started_at"]/["completed_at"]
+      missing or unparseable. (c) no recording surface — this only formats a
+      cosmetic duration substring for the notification email subject/body;
+      it writes no data and feeds no downstream consumer, so a blank
+      duration_str is the correct degraded rendering, not a corruption.
+    expires: "2027-03-10"
+    tracking: alpha-engine-config-I10226
+  - path: features/compute.py
+    line: 820
+    reason: >-
+      (a) failure mode swallowed: the exact-date S3 fundamentals key missing
+      or unreadable. (c) recording surface: none needed at this step —
+      control falls through to the "scan for most recent fundamentals file"
+      fallback a few lines below, whose own failure IS recorded loud
+      (log.warning at ~line 838) and whose total-absence outcome is ALSO
+      recorded (log.info at ~line 840). Read-side cache lookup, not a
+      writer — nothing is persisted here.
+    expires: "2027-03-10"
+    tracking: alpha-engine-config-I10226
+  - path: weekly_collector.py
+    line: 1809
+    reason: >-
+      (a) failure mode swallowed: results["started_at"]/["completed_at"]
+      missing or unparseable. (c) no recording surface — cosmetic duration
+      suffix for the logger.info summary line immediately below; writes no
+      data, feeds no downstream consumer.
+    expires: "2027-03-10"
+    tracking: alpha-engine-config-I10226
+  - path: weekly_collector.py
+    line: 3060
+    reason: >-
+      (a) failure mode swallowed: results["started_at"]/["completed_at"]
+      missing or unparseable. (c) no recording surface — cosmetic duration
+      suffix for the logger.info summary line immediately below; writes no
+      data, feeds no downstream consumer.
+    expires: "2027-03-10"
+    tracking: alpha-engine-config-I10226
+  - path: weekly_collector.py
+    line: 3221
+    reason: >-
+      (a) failure mode swallowed: results["started_at"]/["completed_at"]
+      missing or unparseable. (c) no recording surface — cosmetic duration
+      suffix for the logger.info summary line immediately below; writes no
+      data, feeds no downstream consumer.
+    expires: "2027-03-10"
+    tracking: alpha-engine-config-I10226

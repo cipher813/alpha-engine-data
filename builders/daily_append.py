@@ -1132,8 +1132,24 @@ def _splice_restate_bar(bar, price_scale: float):
         vol = float(restated["Volume"])
         if np.isfinite(vol):
             restated["Volume"] = round(vol / price_scale)
-    except Exception:  # noqa: BLE001 - absent/NaN volume, prices still restated
-        pass
+    except Exception as exc:  # noqa: BLE001 - absent/NaN volume, prices still restated
+        # RECORD-LOUD (alpha-engine-config-I10226): the caller writes `restated`
+        # onto ArcticDB regardless — a write-path producer surface, and this repo's
+        # own AGENTS.md forbids a silent graceful-degrade on any writer here. Volume
+        # left un-scaled while prices ARE scaled is an inconsistent OHLCV row, not a
+        # benign default; log.error so it is visible to the flow-doctor / operator
+        # rather than landing in ArcticDB unannounced. No outer handler wraps the
+        # `_splice_basis_guard` call site (unlike `_ensure_history_restated` just
+        # above it in the main loop), so raising here would abort the whole daily
+        # append batch for one field on one ticker — recording loud and returning
+        # the partially-restated bar matches this file's existing basis-guard
+        # disposition (log.warning + continue) rather than a blast-radius raise.
+        log.error(
+            "daily_append splice restate: Volume field absent/non-finite while "
+            "restating prices by factor %.6g — row written with UN-restated "
+            "Volume (price/volume basis now inconsistent): %s",
+            price_scale, exc,
+        )
     return restated
 
 

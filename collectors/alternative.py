@@ -1570,6 +1570,15 @@ def _fetch_revisions(ticker: str, bucket: str, run_date: str) -> dict:
                 except Exception:
                     continue
         except Exception:
+            # CARVE-OUT (alpha-engine-config-I10226): the comment at the top of
+            # this fallback block (line ~1549) already establishes (a) the
+            # failure mode — no writer of `archive/revisions/{date}.json` exists
+            # in this codebase, so every `s3.get_object` here 404s by
+            # construction — and (c) there is no recording surface because this
+            # is documented dead code kept only as a non-regressing safety net;
+            # `result["revision_4w"]` is already `None` on entry and stays
+            # `None`, so nothing is silently degraded from a populated value.
+            # See `.debug-swallow-allowlist.yaml`.
             pass
 
     return result
@@ -1662,8 +1671,14 @@ def _fetch_options(ticker: str, run_date: str) -> dict:
                             result["iv_rank"] = round(
                                 float((rolling_vol < atm_iv).sum() / len(rolling_vol) * 100), 1
                             )
-                except Exception:
-                    pass
+                except Exception as e:
+                    # RECORD-LOUD (alpha-engine-config-I10226): a swallow here
+                    # returns `result` with `iv_rank` silently missing — this
+                    # repo's own AGENTS.md forbids a graceful-degrade carve-out
+                    # on a collector that returns partial data. Recording
+                    # surface: logger.warning, mirroring this function's own
+                    # outer "Options fetch failed" idiom two frames down.
+                    logger.warning("IV rank computation failed for %s: %s", ticker, e)
 
                 # Expected move
                 if atm_iv > 0 and best_dte > 0:

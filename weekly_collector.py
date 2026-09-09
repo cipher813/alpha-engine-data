@@ -1807,6 +1807,13 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
         end = datetime.fromisoformat(results["completed_at"])
         duration = f" in {(end - start).total_seconds():.0f}s"
     except Exception:
+        # CARVE-OUT (alpha-engine-config-I10226): (a) failure mode
+        # swallowed — `results["started_at"]`/`["completed_at"]` missing or
+        # unparseable. (c) no recording surface — this only formats a
+        # cosmetic duration suffix for the `logger.info` summary line right
+        # below; it writes no data and feeds no downstream consumer, so a
+        # blank `duration` is the correct degraded rendering, not a
+        # corruption. See `.debug-swallow-allowlist.yaml`.
         pass
     logger.info(
         "Morning enrichment %s for %s: %s%s",
@@ -3051,6 +3058,13 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         end = datetime.fromisoformat(results["completed_at"])
         duration = f" in {(end - start).total_seconds():.0f}s"
     except Exception:
+        # CARVE-OUT (alpha-engine-config-I10226): (a) failure mode
+        # swallowed — `results["started_at"]`/`["completed_at"]` missing or
+        # unparseable. (c) no recording surface — this only formats a
+        # cosmetic duration suffix for the `logger.info` summary line right
+        # below; it writes no data and feeds no downstream consumer, so a
+        # blank `duration` is the correct degraded rendering, not a
+        # corruption. See `.debug-swallow-allowlist.yaml`.
         pass
     logger.info("Daily collection %s: %s%s", results["status"].upper(),
                 ", ".join(f"{k}={v.get('status', '?')}" for k, v in results["collectors"].items()),
@@ -3205,6 +3219,13 @@ def _finalize(
         end = datetime.fromisoformat(results["completed_at"])
         duration = f" in {(end - start).total_seconds():.0f}s"
     except Exception:
+        # CARVE-OUT (alpha-engine-config-I10226): (a) failure mode
+        # swallowed — `results["started_at"]`/`["completed_at"]` missing or
+        # unparseable. (c) no recording surface — this only formats a
+        # cosmetic duration suffix for the `logger.info` summary line right
+        # below; it writes no data and feeds no downstream consumer, so a
+        # blank `duration` is the correct degraded rendering, not a
+        # corruption. See `.debug-swallow-allowlist.yaml`.
         pass
 
     phase_label = f"Phase {phase} " if phase else ""

@@ -591,8 +591,18 @@ def _fetch_market_prices() -> dict:
                 s = df[ticker]["Close"].dropna()
                 if len(s) >= 20:
                     return round(((s.iloc[-1] / s.iloc[-20]) - 1) * 100, 2)
-            except Exception:
-                pass
+            except Exception as e:
+                # RECORD-LOUD (alpha-engine-config-I10226): this repo's own
+                # AGENTS.md forbids a silent graceful-degrade carve-out on a
+                # collector returning partial data — a swallowed failure here
+                # leaves this one macro field silently None. Kept as a local,
+                # per-ticker try (not raised into the outer `except Exception
+                # as e: logger.warning("yfinance macro download failed...")`
+                # a few lines below) because raising would null ALL seven
+                # macro fields in `result` for one metric's failure, a wider
+                # blast radius than today's per-field granularity. Recording
+                # surface: logger.warning, named per-ticker.
+                logger.warning("30d return computation failed for %s: %s", ticker, e)
             return None
 
         result["oil_wti"] = _last_close("CL=F")
