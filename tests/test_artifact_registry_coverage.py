@@ -273,8 +273,16 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "collectors/prices.py": 1,
     "collectors/short_interest.py": 1,
     "collectors/universe_classification.py": 1,  # market_data/universe_classification/{date,latest}.json — sector/country/industry for the ~900 universe board
-    "collectors/signal_returns.py": 1,
-    "collectors/universe_returns.py": 1,
+    # alpha-engine-config-I10202: the research.db PUT sites MOVED out of these
+    # two collectors into collectors/research_db_upload.py, which writes the
+    # pointer AND the dated backup in one call. They are pinned at 0 by absence
+    # — the entries are gone rather than set to zero — and the guard test
+    # `test_no_collector_writes_the_pointer_without_the_backup` in
+    # tests/test_research_db_dated_backup.py is what keeps them from coming
+    # back: a direct `upload_file(db_path, bucket, "research.db")` in either
+    # file would write the pointer while leaving the dated series unwritten,
+    # which is the 59-day outage this arc fixed.
+    "collectors/research_db_upload.py": 2,  # research.db + backups/research_{date}.db — the pointer is registered as research_db_backup and the dated series as research_db_dated_backup in ARTIFACT_REGISTRY.yaml (alpha-engine-config-I10202)
     # corporate_actions/actions/{action_id}.json + applied/{store}/{action_id}.json —
     # EVENT-DRIVEN corporate-action provenance records (config#1431), written only
     # when a split is detected/applied. NOT a periodic freshness-SLA artifact: there

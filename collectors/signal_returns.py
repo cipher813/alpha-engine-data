@@ -35,6 +35,9 @@ import pandas as pd
 from botocore.exceptions import ClientError
 from nousergon_lib.quant.horizons import DEFAULT_POLICY, HorizonPolicy
 
+from collectors.research_db_upload import upload_research_db
+from dates import default_run_date
+
 logger = logging.getLogger(__name__)
 
 # Default prediction horizon. Matches the predictor's canonical training
@@ -79,6 +82,7 @@ def collect(
     signals_prefix: str = "signals",
     dry_run: bool = False,
     forward_days: int = _DEFAULT_FORWARD_DAYS,
+    run_date: str | None = None,
 ) -> dict:
     """Seed and backfill signal performance tables in research.db.
 
@@ -186,14 +190,14 @@ def collect(
             db_path, forward_days=forward_days,
         )
 
-    # Upload updated research.db back to S3
+    # Upload updated research.db back to S3 — pointer AND dated backup through
+    # the single owning writer (alpha-engine-config-I10202). See
+    # collectors/research_db_upload.py for why they may not be written apart.
+    #
+    # No try/except: a producer write that fails must fail the run.
     total_written = sum(r.get("rows_written", 0) for r in results.values())
     if not dry_run and total_written > 0:
-        try:
-            s3.upload_file(db_path, bucket, "research.db")
-            logger.info("Uploaded research.db to s3://%s/research.db", bucket)
-        except Exception as e:
-            logger.warning("Failed to upload research.db: %s", e)
+        upload_research_db(s3, db_path, bucket, run_date or default_run_date())
 
     has_errors = any(r.get("status") == "error" for r in results.values())
     return {

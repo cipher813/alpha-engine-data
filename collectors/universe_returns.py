@@ -63,6 +63,9 @@ import pandas as pd
 from nousergon_lib.trading_calendar import add_trading_days as _add_trading_days
 from polygon_client import PolygonForbiddenError
 
+from collectors.research_db_upload import upload_research_db
+from dates import default_run_date
+
 logger = logging.getLogger(__name__)
 
 # -- Sector ETF mapping ------------------------------------------------------
@@ -208,6 +211,7 @@ def collect(
     sector_map_key: str = "data/sector_map.json",
     max_lookback_trading_days: int = 90,
     dry_run: bool = False,
+    run_date: str | None = None,
 ) -> dict:
     """
     Populate universe_returns table with forward returns for every trading day.
@@ -296,13 +300,15 @@ def collect(
             logger.warning("universe_returns: failed for %s: %s", eval_date, e)
             errors.append({"date": eval_date, "error": str(e)})
 
-    # Upload updated research.db back to S3
+    # Upload updated research.db back to S3 — BOTH the live pointer and the
+    # dated backup, through the one writer that owns them (alpha-engine-config-
+    # I10202). Writing the pointer alone here is what let the dated series die
+    # unnoticed for 59 days while its freshness row read healthy.
+    #
+    # No try/except: a failed producer write must fail the run. The previous
+    # WARNING-and-continue is why nothing went red.
     if not dry_run and total_inserted > 0:
-        try:
-            s3.upload_file(db_path, bucket, "research.db")
-            logger.info("Uploaded research.db to s3://%s/research.db", bucket)
-        except Exception as e:
-            logger.warning("Failed to upload research.db: %s", e)
+        upload_research_db(s3, db_path, bucket, run_date or default_run_date())
 
     # Any real error (exception or "no rows computed" after pre-filter) is a
     # hard failure under the no-silent-fails rule. The old `partial` path was
