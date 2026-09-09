@@ -11,4 +11,4 @@ nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.116
 # strict interpreter block first shipped in 0.59.6, and `>=0.14.0` let the
 # build resolve whatever PyPI happened to serve — a floor 45 minors below what
 # the handler imports is a pin that says nothing and fails on nothing.
-krepis==0.59.41  # alpha-engine-config-I8155: the released StageVerdict run_date contract
+krepis==0.59.54  # alpha-engine-config-I8155: the released StageVerdict run_date contract  # bumped 0.59.41 -> 0.59.54: nousergon-lib v0.124.116 (root requirements.txt) floors krepis>=0.59.52; alpha-engine-config-I10226 lockstep gap, run 34309659890
